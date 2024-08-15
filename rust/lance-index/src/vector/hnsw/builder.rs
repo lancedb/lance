@@ -758,7 +758,7 @@ impl IvfSubIndex for HNSW {
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
 
         thread_local! {
-            static VISITED_GENERATOR: RefCell<Option<VisitedGenerator>> = RefCell::new(None);
+            static VISITED_GENERATOR: RefCell<Option<VisitedGenerator>> = const { RefCell::new(None) };
         }
 
         (1..len)
@@ -769,12 +769,7 @@ impl IvfSubIndex for HNSW {
                 let local_levels: Vec<u16> = chunk
                     .into_par_iter()
                     .map(|&node| {
-                        hnsw.inner.nodes[node as usize]
-                            .read()
-                            .unwrap()
-                            .level_neighbors
-                            .len() as u16
-                            - 1
+                        hnsw.inner.nodes[node].read().unwrap().level_neighbors.len() as u16 - 1
                     })
                     .collect();
                 chunk
@@ -783,7 +778,7 @@ impl IvfSubIndex for HNSW {
                     .for_each(|(index, &node)| {
                         let dist_calc = storage.dist_calculator_from_id(node as u32);
                         let node_level = local_levels[index];
-                        let mut current_node = hnsw.inner.nodes[node as usize].write().unwrap();
+                        let mut current_node = hnsw.inner.nodes[node].write().unwrap();
                         chunk
                             .iter()
                             .enumerate()
