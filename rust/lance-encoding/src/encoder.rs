@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, env, sync::Arc};
 
+use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
@@ -30,7 +31,8 @@ use crate::{
         logical::{list::ListFieldEncoder, primitive::PrimitiveFieldEncoder},
         physical::{
             basic::BasicEncoder, binary::BinaryEncoder, dictionary::DictionaryEncoder,
-            fixed_size_list::FslEncoder, value::ValueEncoder,
+            fixed_size_binary::FixedSizeBinaryEncoder, fixed_size_list::FslEncoder,
+            value::ValueEncoder,
         },
     },
     format::pb,
@@ -280,6 +282,13 @@ fn get_compression_scheme(field_meta: Option<&HashMap<String, String>>) -> Compr
         .unwrap_or(CompressionScheme::None)
 }
 
+const BINARY_DATATYPES: [DataType; 4] = [
+    DataType::Binary,
+    DataType::LargeBinary,
+    DataType::Utf8,
+    DataType::LargeUtf8,
+];
+
 impl CoreArrayEncodingStrategy {
     fn can_use_fsst(data_type: &DataType, data_size: u64, version: LanceFileVersion) -> bool {
         version >= LanceFileVersion::V2_1
@@ -287,7 +296,27 @@ impl CoreArrayEncodingStrategy {
             && data_size > 4 * 1024 * 1024
     }
 
-    fn array_encoder_from_type(
+    fn default_binary_encoder(
+        arrays: &[ArrayRef],
+        data_type: &DataType,
+        data_size: u64,
+        version: LanceFileVersion,
+    ) -> Result<Box<dyn ArrayEncoder>> {
+        let bin_indices_encoder =
+            Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
+        let bin_bytes_encoder =
+            Self::choose_array_encoder(arrays, &DataType::UInt8, data_size, false, version, None)?;
+
+        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
+        if Self::can_use_fsst(data_type, data_size, version) {
+            Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+        } else {
+            Ok(bin_encoder)
+        }
+    }
+
+    fn choose_array_encoder(
+        arrays: &[ArrayRef],
         data_type: &DataType,
         data_size: u64,
         use_dict_encoding: bool,
@@ -297,7 +326,8 @@ impl CoreArrayEncodingStrategy {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
-                    Self::array_encoder_from_type(
+                    Self::choose_array_encoder(
+                        arrays,
                         inner.data_type(),
                         data_size,
                         use_dict_encoding,
@@ -309,9 +339,10 @@ impl CoreArrayEncodingStrategy {
             }
             DataType::Dictionary(key_type, value_type) => {
                 let key_encoder =
-                    Self::array_encoder_from_type(key_type, data_size, false, version, None)?;
-                let value_encoder =
-                    Self::array_encoder_from_type(value_type, data_size, false, version, None)?;
+                    Self::choose_array_encoder(arrays, key_type, data_size, false, version, None)?;
+                let value_encoder = Self::choose_array_encoder(
+                    arrays, value_type, data_size, false, version, None,
+                )?;
 
                 Ok(Box::new(AlreadyDictionaryEncoder::new(
                     key_encoder,
@@ -320,14 +351,16 @@ impl CoreArrayEncodingStrategy {
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
-                    let dict_indices_encoder = Self::array_encoder_from_type(
+                    let dict_indices_encoder = Self::choose_array_encoder(
+                        arrays,
                         &DataType::UInt8,
                         data_size,
                         false,
                         version,
                         None,
                     )?;
-                    let dict_items_encoder = Self::array_encoder_from_type(
+                    let dict_items_encoder = Self::choose_array_encoder(
+                        arrays,
                         &DataType::Utf8,
                         data_size,
                         false,
@@ -339,29 +372,29 @@ impl CoreArrayEncodingStrategy {
                         dict_indices_encoder,
                         dict_items_encoder,
                     )))
-                } else {
-                    let bin_indices_encoder = Self::array_encoder_from_type(
-                        &DataType::UInt64,
-                        data_size,
-                        false,
-                        version,
-                        None,
-                    )?;
-                    let bin_bytes_encoder = Self::array_encoder_from_type(
-                        &DataType::UInt8,
-                        data_size,
-                        false,
-                        version,
-                        None,
-                    )?;
+                }
+                // The parent datatype should be binary or utf8 to use the fixed size encoding
+                // The variable 'data_type' is passed through recursion so comparing with it would be incorrect
+                else if BINARY_DATATYPES.contains(arrays[0].data_type()) {
+                    if let Some(byte_width) = check_fixed_size_encoding(arrays, version) {
+                        // use FixedSizeBinaryEncoder
+                        let bytes_encoder = Self::choose_array_encoder(
+                            arrays,
+                            &DataType::UInt8,
+                            data_size,
+                            false,
+                            version,
+                            None,
+                        )?;
 
-                    let bin_encoder =
-                        Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
-                    if Self::can_use_fsst(data_type, data_size, version) {
-                        Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+                        Ok(Box::new(BasicEncoder::new(Box::new(
+                            FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
+                        ))))
                     } else {
-                        Ok(bin_encoder)
+                        Self::default_binary_encoder(arrays, data_type, data_size, version)
                     }
+                } else {
+                    Self::default_binary_encoder(arrays, data_type, data_size, version)
                 }
             }
             DataType::Struct(fields) => {
@@ -370,7 +403,8 @@ impl CoreArrayEncodingStrategy {
 
                 for i in 0..num_fields {
                     let inner_datatype = fields[i].data_type();
-                    let inner_encoder = Self::array_encoder_from_type(
+                    let inner_encoder = Self::choose_array_encoder(
+                        arrays,
                         inner_datatype,
                         data_size,
                         use_dict_encoding,
@@ -430,6 +464,79 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     true
 }
 
+fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> Option<u64> {
+    if version < LanceFileVersion::V2_1 || arrays.is_empty() {
+        return None;
+    }
+
+    // make sure no array has an empty string
+    if !arrays.iter().all(|arr| {
+        if let Some(arr) = arr.as_string_opt::<i32>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        } else if let Some(arr) = arr.as_binary_opt::<i32>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        } else if let Some(arr) = arr.as_string_opt::<i64>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        } else if let Some(arr) = arr.as_binary_opt::<i64>() {
+            arr.iter().flatten().all(|s| !s.is_empty())
+        } else {
+            panic!("wrong dtype");
+        }
+    }) {
+        return None;
+    }
+
+    let lengths = arrays
+        .iter()
+        .flat_map(|arr| {
+            if let Some(arr) = arr.as_string_opt::<i32>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(arr) = arr.as_binary_opt::<i32>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(arr) = arr.as_string_opt::<i64>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(arr) = arr.as_binary_opt::<i64>() {
+                let offsets = arr.offsets().inner();
+                offsets
+                    .windows(2)
+                    .map(|w| (w[1] - w[0]) as u64)
+                    .collect::<Vec<_>>()
+            } else {
+                panic!("wrong dtype");
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // find first non-zero value in lengths
+    let first_non_zero = lengths.iter().position(|&x| x != 0);
+    if let Some(first_non_zero) = first_non_zero {
+        // make sure all lengths are equal to first_non_zero length or zero
+        if !lengths
+            .iter()
+            .all(|&x| x == 0 || x == lengths[first_non_zero])
+        {
+            return None;
+        }
+
+        // set the byte width
+        Some(lengths[first_non_zero])
+    } else {
+        None
+    }
+}
+
 impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     fn create_array_encoder(
         &self,
@@ -441,9 +548,12 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             .map(|arr| arr.get_buffer_memory_size() as u64)
             .sum::<u64>();
         let data_type = arrays[0].data_type();
+
         let use_dict_encoding = data_type == &DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
-        Self::array_encoder_from_type(
+
+        Self::choose_array_encoder(
+            arrays,
             data_type,
             data_size,
             use_dict_encoding,
@@ -885,7 +995,10 @@ pub mod tests {
     use arrow_array::{ArrayRef, StringArray};
     use std::sync::Arc;
 
+    use crate::version::LanceFileVersion;
+
     use super::check_dict_encoding;
+    use super::check_fixed_size_encoding;
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
         let arr = StringArray::from(arr);
@@ -925,5 +1038,85 @@ pub mod tests {
     #[test]
     fn test_dict_encoding_should_not_be_applied_for_smaller_than_threshold_arrays() {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
+    }
+
+    fn is_fixed_size_encoding_applicable(
+        arrays: Vec<Vec<Option<&str>>>,
+        version: LanceFileVersion,
+    ) -> bool {
+        let mut final_arrays = Vec::new();
+        for arr in arrays {
+            let arr = StringArray::from(arr);
+            let arr = Arc::new(arr) as ArrayRef;
+            final_arrays.push(arr);
+        }
+
+        check_fixed_size_encoding(&final_arrays.clone(), version).is_some()
+    }
+
+    #[test]
+    fn test_fixed_size_binary_encoding_applicable() {
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), Some("b")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("abc"), Some("de")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("pqr"), None]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("pqr"), Some("")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some(""), Some("")]],
+            LanceFileVersion::V2_1
+        ));
+    }
+
+    #[test]
+    fn test_fixed_size_binary_encoding_applicable_multiple_arrays() {
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), Some("b")], vec![Some("c"), Some("d")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("ab"), Some("bc")], vec![Some("c"), Some("d")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some("ab"), None], vec![None, Some("d")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(is_fixed_size_encoding_applicable(
+            vec![vec![Some("a"), None], vec![None, Some("d")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![Some(""), None], vec![None, Some("")]],
+            LanceFileVersion::V2_1
+        ));
+
+        assert!(!is_fixed_size_encoding_applicable(
+            vec![vec![None, None], vec![None, None]],
+            LanceFileVersion::V2_1
+        ));
     }
 }

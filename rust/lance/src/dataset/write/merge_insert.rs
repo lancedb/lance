@@ -43,7 +43,7 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::new_session_context};
+use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -592,7 +592,7 @@ impl MergeInsertJob {
     ) -> Result<Vec<Fragment>> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = new_session_context(LanceExecutionOptions {
+        let session_ctx = get_session_context(LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         });
