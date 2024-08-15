@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, ops::Range, sync::Arc, u32, vec};
+use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
 use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::bit_util;
