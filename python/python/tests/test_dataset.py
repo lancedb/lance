@@ -1586,6 +1586,51 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows != 12
 
 
+def test_io_buffer_size(tmp_path: Path):
+    # This regresses a deadlock issue that was happening when the
+    # batch size was very large (in bytes) so that batches would be
+    # bigger than the I/O buffer size
+    #
+    # In this test we create 4 pages of data, 2 for each column.  We
+    # then set the I/O buffer size to 5000 bytes so that we only read
+    # 1 page at a time and set the batch size to 2M rows so that we
+    # read in all 4 pages for a single batch.
+    #
+    # The scheduler will schedule in this order: C0P0, C1P0, C0P1, C1P1
+    #
+    # The deadlock would happen because the decoder was decoding in this
+    # order: C0P0, C0P1, C1P0, C1P1.
+    #
+    # The decoder will wait for C0P1 but the scheduler will only have scheduled
+    # C1P0 and so deadlock would happen.
+    #
+    # The fix was to change the decoder to decode in the same order as the
+    # scheduler.
+    base_dir = tmp_path / "dataset"
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.uint64(), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+
 def test_scan_no_columns(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(100)})

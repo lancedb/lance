@@ -5,6 +5,7 @@ use std::{
     collections::{BinaryHeap, VecDeque},
     ops::Range,
     sync::Arc,
+    u64,
 };
 
 use arrow_array::{cast::AsArray, ArrayRef, StructArray};
@@ -260,8 +261,12 @@ impl ChildState {
         }
     }
 
-    // Wait for the next set of rows to arrive.
-    async fn wait(&mut self, num_rows: u64) -> Result<()> {
+    // Wait for the next set of rows to arrive
+    //
+    // Wait until we have at least `num_rows` available but stop if
+    // rows_awaited reaches `awaited_limit` (because we need to wait from
+    // other columns at that point)
+    async fn wait(&mut self, num_rows: u64, awaited_limit: u64) -> Result<u64> {
         trace!(
             "Struct child {} waiting for {} rows and {} are available already",
             self.field_index,
@@ -273,7 +278,8 @@ impl ChildState {
             if next_decoder.unawaited() > 0 {
                 let rows_to_wait = remaining.min(next_decoder.unawaited());
                 trace!(
-                    "Struct await an additional {} rows from the current page",
+                    "Struct child {} await an additional {} rows from the current page",
+                    self.field_index,
                     rows_to_wait
                 );
                 // Even though we wait for X rows we might actually end up
@@ -286,29 +292,37 @@ impl ChildState {
                 // before we can start decoding.
                 next_decoder.wait(rows_to_wait).await?;
                 let newly_avail = next_decoder.avail() - previously_avail;
-                self.rows_available += newly_avail;
                 trace!(
-                    "The await loaded {} rows and now {} are available",
-                    newly_avail,
-                    self.rows_available
+                    "Struct child {} await loaded {} rows",
+                    self.field_index,
+                    newly_avail
                 );
-                // Need to use saturating_sub here because we might have asked for range
-                // 0-1000 and this page we just loaded might cover 900-1100 and so newly_avail
-                // is 200 but rows_unawaited is only 100
-                //
-                // TODO: Unit tests may not be covering this branch right now
-                self.rows_unawaited = self.rows_unawaited.saturating_sub(newly_avail);
+                self.rows_available += newly_avail;
+                self.rows_unawaited = self.rows_unawaited.checked_sub(newly_avail).unwrap();
                 remaining -= rows_to_wait;
-                if remaining == 0 {
+                if remaining == 0 || self.rows_unawaited < awaited_limit {
                     break;
                 }
             }
         }
-        if remaining > 0 {
-            Err(Error::Internal { message: format!("The struct field at index {} is still waiting for {} rows but ran out of scheduled pages", self.field_index, remaining), location: location!() })
-        } else {
-            Ok(())
+        let awaited = num_rows - remaining;
+        trace!(
+            "Struct child {} awaited {} new rows and now {} are available and {} remain unawaited",
+            self.field_index,
+            awaited,
+            self.rows_available,
+            self.rows_unawaited,
+        );
+        if awaited == 0 {
+            return Err(Error::Internal {
+                message: format!(
+                    "Ran out of page decoders before satisfying request for {} rows",
+                    num_rows
+                ),
+                location: location!(),
+            });
         }
+        Ok(awaited)
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<CompositeDecodeTask> {
@@ -344,6 +358,28 @@ impl ChildState {
     }
 }
 
+struct WaitOrder<'a> {
+    child: &'a mut ChildState,
+    to_await: u64,
+}
+
+impl Eq for WaitOrder<'_> {}
+impl PartialEq for WaitOrder<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.child.rows_unawaited == other.child.rows_unawaited
+    }
+}
+impl Ord for WaitOrder<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.child.rows_unawaited.cmp(&other.child.rows_unawaited)
+    }
+}
+impl PartialOrd for WaitOrder<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug)]
 pub struct SimpleStructDecoder {
     children: Vec<ChildState>,
@@ -363,6 +399,39 @@ impl SimpleStructDecoder {
             child_fields,
             data_type,
         }
+    }
+
+    async fn do_wait(&mut self, num_rows: u64) -> Result<()> {
+        let mut wait_orders = self
+            .children
+            .iter_mut()
+            .map(|child| WaitOrder {
+                child,
+                to_await: num_rows,
+            })
+            .collect::<BinaryHeap<_>>();
+        while !wait_orders.is_empty() {
+            let mut next_waiter = wait_orders.pop().unwrap();
+            let next_limit = wait_orders
+                .peek()
+                .map(|w| w.child.rows_unawaited)
+                .unwrap_or(0);
+            log::trace!(
+                "Struct child {} waiting for {} rows but stop if we pass {}",
+                next_waiter.child.field_index,
+                next_waiter.to_await,
+                next_limit
+            );
+            let awaited = next_waiter
+                .child
+                .wait(next_waiter.to_await, next_limit)
+                .await?;
+            next_waiter.to_await -= awaited;
+            if next_waiter.to_await > 0 {
+                wait_orders.push(next_waiter);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -384,13 +453,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
     }
 
     fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
-        async move {
-            for child in self.children.iter_mut() {
-                child.wait(num_rows).await?;
-            }
-            Ok(())
-        }
-        .boxed()
+        self.do_wait(num_rows).boxed()
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {

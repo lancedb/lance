@@ -250,6 +250,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
+        io_buffer_size: Optional[int] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -281,6 +282,9 @@ class LanceDataset(pa.dataset.Dataset):
                 }
         batch_size: int, default None
             The max size of batches returned.
+        io_buffer_size: int, default None
+            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
+            for more information.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -344,6 +348,7 @@ class LanceDataset(pa.dataset.Dataset):
             .limit(limit)
             .offset(offset)
             .batch_size(batch_size)
+            .io_buffer_size(io_buffer_size)
             .batch_readahead(batch_readahead)
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
@@ -401,6 +406,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         fast_search: bool = False,
         full_text_query: Optional[Union[str, dict]] = None,
+        io_buffer_size: Optional[int] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -434,6 +440,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         batch_size: int, optional
             The number of rows to read at a time.
+        io_buffer_size: int, default None
+            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
+            for more information.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -473,6 +482,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
@@ -533,6 +543,7 @@ class LanceDataset(pa.dataset.Dataset):
         with_row_address: bool = False,
         use_stats: bool = True,
         full_text_query: Optional[Union[str, dict]] = None,
+        io_buffer_size: Optional[int] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -553,6 +564,7 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
@@ -2135,6 +2147,7 @@ class ScannerBuilder:
         self._columns_with_transform = None
         self._nearest = None
         self._batch_size: Optional[int] = None
+        self._io_buffer_size: Optional[int] = None
         self._batch_readahead: Optional[int] = None
         self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
@@ -2150,7 +2163,36 @@ class ScannerBuilder:
         self._batch_size = batch_size
         return self
 
+    def io_buffer_size(self, io_buffer_size: int) -> ScannerBuilder:
+        """
+        Set the I/O buffer size for the Scanner
+
+        This is the amount of RAM that will be reserved for holding I/O received from
+        storage before it is processed.  This is used to control the amount of memory
+        used by the scanner.  If the buffer is full then the scanner will block until
+        the buffer is processed.
+
+        Generally this should scale with the number of concurrent I/O threads.  The
+        default is 2GiB which comfortably provides enough space for somewhere between
+        32 and 256 concurrent I/O threads.
+
+        This value is not a hard cap on the amount of RAM the scanner will use.  Some
+        space is used for the compute (which can be controlled by the batch size) and
+        Lance does not keep track of memory after it is returned to the user.
+
+        Currently, if there is a single batch of data which is larger than the io buffer
+        size then the scanner will deadlock.  This is a known issue and will be fixed in
+        a future release.
+
+        This parameter is only used when reading v2 files
+        """
+        self._io_buffer_size = io_buffer_size
+        return self
+
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
+        """
+        This parameter is ignored when reading v2 files
+        """
         if nbatches is not None and int(nbatches) < 0:
             raise ValueError("batch_readahead must be non-negative")
         self._batch_readahead = nbatches
@@ -2169,6 +2211,10 @@ class ScannerBuilder:
         If set to False, the scanner may read fragments concurrently and yield
         batches out of order. This may improve performance since it allows more
         concurrency in the scan, but can also use more memory.
+
+        This parameter is ignored when using v2 files.  In the v2 file format
+        there is no penalty to scanning in order and so all scans will scan in
+        order.
         """
         self._scan_in_order = scan_in_order
         return self
@@ -2371,6 +2417,7 @@ class ScannerBuilder:
             self._offset,
             self._nearest,
             self._batch_size,
+            self._io_buffer_size,
             self._batch_readahead,
             self._fragment_readahead,
             self._scan_in_order,
