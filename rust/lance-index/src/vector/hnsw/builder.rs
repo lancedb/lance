@@ -108,6 +108,15 @@ impl HnswBuildParams {
     }
 }
 
+/// Edge structure used for construction only
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Edge {
+    origin: u32,
+    level: u16,
+    distance: OrderedFloat,
+    destination: u32,
+}
+
 /// Build a HNSW graph.
 ///
 /// Currently, the HNSW graph is fully built in memory.
@@ -385,7 +394,7 @@ impl HnswBuilder {
         node: u32,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
-    ) -> (u16, Vec<(u32, u16, OrderedFloat, u32)>) {
+    ) -> (u16, Vec<Edge>) {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
         let mut ep = OrderedNode::new(
@@ -406,7 +415,7 @@ impl HnswBuilder {
             let cur_level = HnswLevelView::new(level, nodes);
             ep = greedy_search(&cur_level, ep, &dist_calc);
         }
-        let mut rev_edges: Vec<(u32, u16, OrderedFloat, u32)> = Vec::new();
+        let mut rev_edges: Vec<Edge> = Vec::new();
         {
             let mut current_node = nodes[node as usize].write().unwrap();
             for level in (0..=target_level).rev() {
@@ -419,7 +428,12 @@ impl HnswBuilder {
                 self.prune(storage, &mut current_node, level);
 
                 for ordered_node in &current_node.level_neighbors_ranked[level as usize] {
-                    rev_edges.push((ordered_node.id, level, ordered_node.dist, node));
+                    rev_edges.push(Edge {
+                        origin: ordered_node.id,
+                        level,
+                        distance: ordered_node.dist,
+                        destination: node,
+                    });
                 }
 
                 ep = neighbors[0].clone();
@@ -441,10 +455,6 @@ impl HnswBuilder {
                 .iter()
                 .map(|unpruned_edge| {
                     let level = level as u16;
-                    let m_max = match level {
-                        0 => self.params.m * 2,
-                        _ => self.params.m,
-                    };
                     current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
                 })
                 .collect();
@@ -792,7 +802,7 @@ impl IvfSubIndex for HNSW {
 
                 // Phase II: Perform queries on the structure before this chunk to get more
                 // candidate edges, and perform edge pruning
-                let forward_results: Vec<(u16, Vec<(u32, u16, OrderedFloat, u32)>)> = chunk
+                let forward_results: Vec<(u16, Vec<Edge>)> = chunk
                     .into_par_iter()
                     .map(|&node| {
                         VISITED_GENERATOR.with(|visited_gen| {
@@ -810,7 +820,7 @@ impl IvfSubIndex for HNSW {
                     .collect();
 
                 // Phase III: Flatten and perform a sort on the pruned and reversed edges
-                let mut edges: Vec<&(u32, u16, OrderedFloat, u32)> = forward_results
+                let mut edges: Vec<&Edge> = forward_results
                     .iter()
                     .flat_map(|(_, vec)| vec.iter())
                     .collect();
@@ -822,7 +832,7 @@ impl IvfSubIndex for HNSW {
                     .par_iter()
                     .enumerate()
                     .filter_map(|(index, edge)| {
-                        if index == 0 || edge.0 != edges[index - 1].0 {
+                        if index == 0 || edge.origin != edges[index - 1].origin {
                             Some(index)
                         } else {
                             None
@@ -832,32 +842,35 @@ impl IvfSubIndex for HNSW {
 
                 // Phase V: Process each contiguous subarray in parallel
                 start_indices.into_par_iter().for_each(|start_index| {
-                    let node = edges[start_index].0;
+                    let node = edges[start_index].origin;
                     let end_index = edges[start_index..]
                         .iter()
-                        .position(|edge| edge.0 != node)
+                        .position(|edge| edge.origin != node)
                         .map_or(edges.len(), |rel_idx| start_index + rel_idx);
 
                     let mut unpruned_neighbors_per_level_rev: Vec<Vec<OrderedNode>> = Vec::new();
-                    let mut current_level = edges[start_index].1;
+                    let mut current_level = edges[start_index].level;
                     let mut level_edges: Vec<OrderedNode> = Vec::new();
 
                     for _ in 0..current_level {
                         unpruned_neighbors_per_level_rev.push(Vec::new());
                     }
 
-                    for &&(_, level, dist, neighbor) in &edges[start_index..end_index] {
-                        if level != current_level {
+                    for &&edge in &edges[start_index..end_index] {
+                        if edge.level != current_level {
                             unpruned_neighbors_per_level_rev.push(level_edges);
                             // Push empty vectors for skipped levels
-                            while current_level + 1 < level {
+                            while current_level + 1 < edge.level {
                                 unpruned_neighbors_per_level_rev.push(Vec::new());
                                 current_level += 1;
                             }
                             level_edges = Vec::new();
-                            current_level = level;
+                            current_level = edge.level;
                         }
-                        level_edges.push(OrderedNode { dist, id: neighbor });
+                        level_edges.push(OrderedNode {
+                            dist: edge.distance,
+                            id: edge.destination,
+                        });
                     }
                     unpruned_neighbors_per_level_rev.push(level_edges); // Push the last level's edges
 
