@@ -9,6 +9,7 @@ use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
+use snafu::{location, Location};
 
 use lance_core::{datatypes::Field, Result};
 
@@ -46,10 +47,12 @@ pub struct PrimitiveFieldScheduler {
     page_schedulers: Vec<PrimitivePage>,
     num_rows: u64,
     should_validate: bool,
+    column_index: u32,
 }
 
 impl PrimitiveFieldScheduler {
     pub fn new(
+        column_index: u32,
         data_type: DataType,
         pages: Arc<[PageInfo]>,
         buffers: ColumnBuffers,
@@ -78,6 +81,7 @@ impl PrimitiveFieldScheduler {
             page_schedulers,
             num_rows,
             should_validate,
+            column_index,
         }
     }
 }
@@ -171,6 +175,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.scheduler.data_type.clone(),
+            column_index: self.scheduler.column_index,
             unloaded_physical_decoder: Some(physical_decoder),
             physical_decoder: None,
             rows_drained: 0,
@@ -216,6 +221,7 @@ pub struct PrimitiveFieldDecoder {
     should_validate: bool,
     num_rows: u64,
     rows_drained: u64,
+    column_index: u32,
 }
 
 impl PrimitiveFieldDecoder {
@@ -232,6 +238,7 @@ impl PrimitiveFieldDecoder {
             should_validate,
             num_rows,
             rows_drained: 0,
+            column_index: u32::MAX,
         }
     }
 }
@@ -269,7 +276,13 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-    fn wait(&mut self, _: u64) -> BoxFuture<Result<()>> {
+    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
+        log::trace!(
+            "PrimitiveFieldDecoder::wait for {} rows on column {} (page has {} rows)",
+            num_rows,
+            self.column_index,
+            self.num_rows
+        );
         async move {
             let physical_decoder = self.unloaded_physical_decoder.take().unwrap().await?;
             self.physical_decoder = Some(Arc::from(physical_decoder));
@@ -279,6 +292,13 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        if self.physical_decoder.as_ref().is_none() {
+            return Err(lance_core::Error::Internal {
+                message: format!("drain was called on primitive field decoder for data type {} on column {} but the decoder was never awaited", self.data_type, self.column_index),
+                location: location!(),
+            });
+        }
+
         let rows_to_skip = self.rows_drained;
         let rows_to_take = num_rows;
 

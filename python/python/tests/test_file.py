@@ -139,6 +139,26 @@ def test_with_nulls(tmp_path):
     )
 
 
+def test_batch_sizes(tmp_path):
+    # Need a big string so there aren't too many rows per page because we
+    # want to test different page sizes:
+    #  - batch that spans multiple pages (including more than 2)
+    #  - batch that is smaller than a page (including much smaller)
+    my_str = b"0" * 299593
+
+    data = [[my_str] for _ in range(1009)]
+    tab = pa.table({"val": data})
+
+    path = str(tmp_path / "foo.lance")
+    with LanceFileWriter(path) as writer:
+        writer.write_batch(tab)
+
+    reader = LanceFileReader(path)
+
+    for batch_size in range(10, 1050, 10):
+        reader.read_all(batch_size=batch_size).to_table()
+
+
 def test_round_trip(tmp_path):
     path = tmp_path / "foo.lance"
     schema = pa.schema([pa.field("a", pa.int64())])

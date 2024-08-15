@@ -286,8 +286,12 @@ impl ChildState {
                 // before we can start decoding.
                 next_decoder.wait(rows_to_wait).await?;
                 let newly_avail = next_decoder.avail() - previously_avail;
-                trace!("The await loaded {} rows", newly_avail);
                 self.rows_available += newly_avail;
+                trace!(
+                    "The await loaded {} rows and now {} are available",
+                    newly_avail,
+                    self.rows_available
+                );
                 // Need to use saturating_sub here because we might have asked for range
                 // 0-1000 and this page we just loaded might cover 900-1100 and so newly_avail
                 // is 200 but rows_unawaited is only 100
@@ -309,8 +313,13 @@ impl ChildState {
 
     fn drain(&mut self, num_rows: u64) -> Result<CompositeDecodeTask> {
         trace!("Struct draining {} rows", num_rows);
-        debug_assert!(self.rows_available >= num_rows);
 
+        trace!(
+            "Draining {} rows from struct page with {} rows available",
+            num_rows,
+            self.rows_available
+        );
+        assert!(self.rows_available >= num_rows);
         self.rows_available -= num_rows;
         let mut remaining = num_rows;
         let mut composite = CompositeDecodeTask {
