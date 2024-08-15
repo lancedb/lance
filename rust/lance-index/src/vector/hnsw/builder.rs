@@ -749,6 +749,11 @@ impl IvfSubIndex for HNSW {
 
         let chunk_size = hnsw.inner.params.ef_construction;
 
+        let cpu_core_count = num_cpus::get();
+        if cpu_core_count > chunk_size {
+            log::warn!("ef_construction {} is set lower than available cpu cores {}. HNSW construction parallelism is limited.", chunk_size, cpu_core_count);
+        }
+
         let len = storage.len();
         hnsw.inner.level_count[0].fetch_add(1, Ordering::Relaxed);
 
