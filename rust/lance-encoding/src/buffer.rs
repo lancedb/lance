@@ -5,7 +5,7 @@
 
 use std::{ops::Deref, ptr::NonNull, sync::Arc};
 
-use arrow_buffer::Buffer;
+use arrow_buffer::{ArrowNativeType, Buffer, ScalarBuffer};
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
@@ -22,10 +22,49 @@ use lance_core::{Error, Result};
 ///
 /// If you need to clone a LanceBuffer you can use borrow_and_clone() which will make sure that the buffer
 /// is in borrowed mode before cloning.  This is a zero copy operation (but requires &mut self).
-#[derive(Debug)]
 pub enum LanceBuffer {
     Borrowed(Buffer),
     Owned(Vec<u8>),
+}
+
+// Compares equality of the buffers, ignoring owned / unowned status
+impl PartialEq for LanceBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Borrowed(l0), Self::Borrowed(r0)) => l0 == r0,
+            (Self::Owned(l0), Self::Owned(r0)) => l0 == r0,
+            (Self::Borrowed(l0), Self::Owned(r0)) => l0.as_slice() == r0.as_slice(),
+            (Self::Owned(l0), Self::Borrowed(r0)) => l0.as_slice() == r0.as_slice(),
+        }
+    }
+}
+
+impl Eq for LanceBuffer {}
+
+impl std::fmt::Debug for LanceBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let preview = if self.len() > 10 {
+            format!("0x{}...", hex::encode_upper(&self[..10]))
+        } else {
+            format!("0x{}", hex::encode_upper(self.as_ref()))
+        };
+        match self {
+            Self::Borrowed(buffer) => write!(
+                f,
+                "LanceBuffer::Borrowed(bytes={} #bytes={})",
+                preview,
+                buffer.len()
+            ),
+            Self::Owned(buffer) => {
+                write!(
+                    f,
+                    "LanceBuffer::Owned(bytes={} #bytes={})",
+                    preview,
+                    buffer.len()
+                )
+            }
+        }
+    }
 }
 
 impl LanceBuffer {
@@ -43,6 +82,26 @@ impl LanceBuffer {
             Self::Borrowed(buffer) => buffer,
             Self::Owned(buffer) => Buffer::from_vec(buffer),
         }
+    }
+
+    /// Returns an owned buffer of the given size with all bits set to 0
+    pub fn all_unset(len: usize) -> Self {
+        Self::Owned(vec![0; len])
+    }
+
+    /// Returns an owned buffer of the given size with all bits set to 1
+    pub fn all_set(len: usize) -> Self {
+        Self::Owned(vec![0xff; len])
+    }
+
+    /// Returns the length of the buffer
+    pub fn empty() -> Self {
+        Self::Owned(Vec::new())
+    }
+
+    /// Converts the buffer into a hex string
+    pub fn as_hex(&self) -> String {
+        format!("{:x?}", self.as_ref())
     }
 
     /// Create a LanceBuffer from a bytes::Bytes object
@@ -113,6 +172,102 @@ impl LanceBuffer {
                 location: location!(),
             }),
         }
+    }
+
+    /// Reinterprets a Vec<T> as a LanceBuffer
+    ///
+    /// Note that this creates a borrowed buffer.  It is not possible to safely
+    /// reinterpret a Vec<T> into a Vec<u8> in rust due to this constraint from
+    /// [`Vec::from_raw_parts`]:
+    ///
+    /// > `T` needs to have the same alignment as what `ptr` was allocated with.
+    /// > (`T` having a less strict alignment is not sufficient, the alignment really
+    /// > needs to be equal to satisfy the [`dealloc`] requirement that memory must be
+    /// > allocated and deallocated with the same layout.)
+    ///
+    /// However, we can safely reinterpret Vec<T> into &[u8] which is what happens here.
+    pub fn reinterpret_vec<T: ArrowNativeType>(vec: Vec<T>) -> Self {
+        Self::Borrowed(Buffer::from_vec(vec))
+    }
+
+    /// Reinterprets a LanceBuffer into a Vec<T>
+    ///
+    /// Unfortunately, there is no way to do this safely in Rust without a copy, even if
+    /// the source is Vec<u8>.
+    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
+        ScalarBuffer::<T>::from(self.borrow_and_clone().into_buffer())
+    }
+
+    /// Concatenates multiple buffers into a single buffer, consuming the input buffers
+    ///
+    /// If there is only one buffer, it will be returned as is
+    pub fn concat_into_one(buffers: Vec<LanceBuffer>) -> Self {
+        if buffers.len() == 1 {
+            return buffers.into_iter().next().unwrap();
+        }
+
+        let mut total_len = 0;
+        for buffer in &buffers {
+            total_len += buffer.len();
+        }
+
+        let mut data = Vec::with_capacity(total_len);
+        for buffer in buffers {
+            data.extend_from_slice(buffer.as_ref());
+        }
+
+        Self::Owned(data)
+    }
+
+    /// Zips multiple buffers into a single buffer, consuming the input buffers
+    ///
+    /// Unlike concat_into_one this "zips" the buffers, interleaving the values
+    pub fn zip_into_one(buffers: Vec<(LanceBuffer, u64)>, num_values: u64) -> Result<Self> {
+        let bytes_per_value = buffers.iter().map(|(_, bits_per_value)| {
+            if bits_per_value % 8 == 0 {
+                Ok(bits_per_value / 8)
+            } else {
+                Err(Error::InvalidInput { source: format!("LanceBuffer::zip_into_one only supports full-byte buffers currently and received a buffer with {} bits per value", bits_per_value).into(), location: location!() })
+            }
+        }).collect::<Result<Vec<_>>>()?;
+        let total_bytes_per_value = bytes_per_value.iter().sum::<u64>();
+        let total_bytes = (total_bytes_per_value * num_values) as usize;
+
+        let mut zipped = vec![0_u8; total_bytes];
+        let mut buffer_ptrs = buffers
+            .iter()
+            .zip(bytes_per_value)
+            .map(|((buffer, _), bytes_per_value)| (buffer.as_ptr(), bytes_per_value as usize))
+            .collect::<Vec<_>>();
+
+        let mut zipped_ptr = zipped.as_mut_ptr();
+        unsafe {
+            let end = zipped_ptr.add(total_bytes);
+            while zipped_ptr < end {
+                for (buf, bytes_per_value) in buffer_ptrs.iter_mut() {
+                    std::ptr::copy_nonoverlapping(*buf, zipped_ptr, *bytes_per_value);
+                    zipped_ptr = zipped_ptr.add(*bytes_per_value);
+                    *buf = buf.add(*bytes_per_value);
+                }
+            }
+        }
+
+        Ok(LanceBuffer::Owned(zipped))
+    }
+
+    /// Create a LanceBuffer from a slice
+    ///
+    /// This is NOT a zero-copy operation.  We can't even create a borrowed buffer because
+    /// we have no way of extending the lifetime of the slice.
+    pub fn copy_slice(slice: &[u8]) -> Self {
+        Self::Owned(slice.to_vec())
+    }
+}
+
+// Mostly useful for unit testing.  It is zero-copy
+impl<const N: usize> From<[u8; N]> for LanceBuffer {
+    fn from(value: [u8; N]) -> Self {
+        LanceBuffer::Owned(Vec::from(value))
     }
 }
 
