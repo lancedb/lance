@@ -442,24 +442,6 @@ impl HnswBuilder {
         rev_edges
     }
 
-    fn insert_backward(
-        &self,
-        node: u32,
-        unpruned_neighbors_per_level_rev: Vec<Vec<OrderedNode>>,
-        storage: &impl VectorStore,
-    ) {
-        let nodes = &self.nodes;
-        for (level, unpruned_neighbors) in unpruned_neighbors_per_level_rev.iter().enumerate() {
-            let mut current_node = nodes[node as usize].write().unwrap();
-            unpruned_neighbors.iter().for_each(|unpruned_edge| {
-                let level = level as u16;
-                debug_assert!(unpruned_edge.id != node, "Bad edge generated");
-                current_node.add_neighbor(unpruned_edge.id, unpruned_edge.dist, level);
-            });
-            self.prune(storage, &mut current_node, level as u16);
-        }
-    }
-
     fn search_level(
         &self,
         ep: &OrderedNode,
@@ -841,34 +823,20 @@ impl IvfSubIndex for HNSW {
                 .for_each(|(start_index, end_index)| {
                     let node = edges[start_index].origin;
 
-                    let mut unpruned_neighbors_per_level_rev: Vec<Vec<OrderedNode>> = Vec::new();
-                    let mut current_level = edges[start_index].level;
-                    let mut level_edges: Vec<OrderedNode> = Vec::new();
-
-                    for _ in 0..current_level {
-                        unpruned_neighbors_per_level_rev.push(Vec::new());
-                    }
+                    let mut current_node = hnsw.inner.nodes[node as usize].write().unwrap();
 
                     for &&edge in &edges[start_index..end_index] {
-                        if edge.level != current_level {
-                            unpruned_neighbors_per_level_rev.push(level_edges);
-                            // Push empty vectors for skipped levels
-                            while current_level + 1 < edge.level {
-                                unpruned_neighbors_per_level_rev.push(Vec::new());
-                                current_level += 1;
-                            }
-                            level_edges = Vec::new();
-                            current_level = edge.level;
-                        }
-                        level_edges.push(OrderedNode {
-                            dist: edge.distance,
-                            id: edge.destination,
-                        });
-                    }
-                    unpruned_neighbors_per_level_rev.push(level_edges); // Push the last level's edges
+                        debug_assert!(edge.destination != edge.origin, "Bad edge generated");
 
-                    hnsw.inner
-                        .insert_backward(node, unpruned_neighbors_per_level_rev, storage);
+                        let m_max = match edge.level {
+                            0 => hnsw.inner.params.m * 2,
+                            _ => hnsw.inner.params.m,
+                        };
+                        if edge.distance < current_node.cutoff(edge.level, m_max) {
+                            current_node.add_neighbor(edge.destination, edge.distance, edge.level);
+                        }
+                        hnsw.inner.prune(storage, &mut current_node, edge.level);
+                    }
                 });
 
             start = end;
