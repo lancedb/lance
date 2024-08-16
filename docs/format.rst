@@ -92,7 +92,7 @@ and benchmarking upcoming features.
 
 The following values are supported:
 
-.. list-table: File Versions
+.. list-table:: File Versions
     :widths: 20 20 20 40
     :header-rows: 1
   
