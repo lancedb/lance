@@ -265,12 +265,13 @@ impl ChildState {
     // Wait until we have at least `num_rows` available but stop if
     // rows_awaited reaches `awaited_limit` (because we need to wait from
     // other columns at that point)
-    async fn wait(&mut self, num_rows: u64, awaited_limit: u64) -> Result<u64> {
+    async fn wait(&mut self, num_rows: u64, unawaited_limit: u64) -> Result<()> {
         trace!(
-            "Struct child {} waiting for {} rows and {} are available already",
+            "Struct child {} waiting for {} rows and {} are available already (but stop if unawaited passes {})",
             self.field_index,
             num_rows,
-            self.rows_available
+            self.rows_available,
+            unawaited_limit,
         );
         let mut remaining = num_rows.saturating_sub(self.rows_available);
         for next_decoder in &mut self.scheduled {
@@ -300,7 +301,7 @@ impl ChildState {
                 );
                 self.rows_unawaited = self.rows_unawaited.checked_sub(newly_avail).unwrap();
                 remaining -= rows_to_wait;
-                if remaining == 0 || self.rows_unawaited < awaited_limit {
+                if remaining == 0 || self.rows_unawaited < unawaited_limit {
                     break;
                 }
             }
@@ -322,7 +323,7 @@ impl ChildState {
                 location: location!(),
             });
         }
-        Ok(awaited)
+        Ok(())
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<CompositeDecodeTask> {
@@ -358,20 +359,18 @@ impl ChildState {
     }
 }
 
-struct WaitOrder<'a> {
-    child: &'a mut ChildState,
-    to_await: u64,
-}
+// Wrapper around ChildState that orders using rows_unawaited
+struct WaitOrder<'a>(&'a mut ChildState);
 
 impl Eq for WaitOrder<'_> {}
 impl PartialEq for WaitOrder<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.child.rows_unawaited == other.child.rows_unawaited
+        self.0.rows_unawaited == other.0.rows_unawaited
     }
 }
 impl Ord for WaitOrder<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.child.rows_unawaited.cmp(&other.child.rows_unawaited)
+        self.0.rows_unawaited.cmp(&other.0.rows_unawaited)
     }
 }
 impl PartialOrd for WaitOrder<'_> {
@@ -405,29 +404,24 @@ impl SimpleStructDecoder {
         let mut wait_orders = self
             .children
             .iter_mut()
-            .map(|child| WaitOrder {
-                child,
-                to_await: num_rows,
+            .filter_map(|child| {
+                if child.rows_available < num_rows {
+                    Some(WaitOrder(child))
+                } else {
+                    None
+                }
             })
             .collect::<BinaryHeap<_>>();
         while !wait_orders.is_empty() {
-            let mut next_waiter = wait_orders.pop().unwrap();
-            let next_limit = wait_orders
-                .peek()
-                .map(|w| w.child.rows_unawaited)
-                .unwrap_or(0);
+            let next_waiter = wait_orders.pop().unwrap();
+            let next_limit = wait_orders.peek().map(|w| w.0.rows_unawaited).unwrap_or(0);
+            next_waiter.0.wait(num_rows, next_limit).await?;
             log::trace!(
-                "Struct child {} waiting for {} rows but stop if we pass {}",
-                next_waiter.child.field_index,
-                next_waiter.to_await,
-                next_limit
+                "Struct child {} finished await pass and now {} are available",
+                next_waiter.0.field_index,
+                next_waiter.0.rows_available
             );
-            let awaited = next_waiter
-                .child
-                .wait(next_waiter.to_await, next_limit)
-                .await?;
-            next_waiter.to_await -= awaited;
-            if next_waiter.to_await > 0 {
+            if next_waiter.0.rows_available < num_rows {
                 wait_orders.push(next_waiter);
             }
         }
