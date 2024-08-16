@@ -406,6 +406,29 @@ impl Scanner {
         self
     }
 
+    /// Set the I/O buffer size
+    ///
+    /// This is the amount of RAM that will be reserved for holding I/O received from
+    /// storage before it is processed.  This is used to control the amount of memory
+    /// used by the scanner.  If the buffer is full then the scanner will block until
+    /// the buffer is processed.
+    ///
+    /// Generally this should scale with the number of concurrent I/O threads.  The
+    /// default is 2GiB which comfortably provides enough space for somewhere between
+    /// 32 and 256 concurrent I/O threads.
+    ///
+    /// This value is not a hard cap on the amount of RAM the scanner will use.  Some
+    /// space is used for the compute (which can be controlled by the batch size) and
+    /// Lance does not keep track of memory after it is returned to the user.
+    ///
+    /// Currently, if there is a single batch of data which is larger than the io buffer
+    /// size then the scanner will deadlock.  This is a known issue and will be fixed in
+    /// a future release.
+    pub fn io_buffer_size(&mut self, size: u64) -> &mut Self {
+        self.io_buffer_size = Some(size);
+        self
+    }
+
     /// Set the prefetch size.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
         self.batch_readahead = nbatches;
@@ -1919,14 +1942,14 @@ mod test {
                 // If there is a filter then a late materialization pass is added
                 // and that uses coalesce batches which can yield slightly larger
                 // than requested batch sizes.
-                dbg!(vec![8, 10, 10, 10, 10, 10, 10])
+                vec![8, 10, 10, 10, 10, 10, 10]
             } else {
-                dbg!(vec![8, 2, 8, 2, 8, 2, 8, 2, 8, 2])
+                vec![8, 2, 8, 2, 8, 2, 8, 2, 8, 2]
             };
             let mut stream = builder.try_into_stream().await.unwrap();
             for expected_len in expected_lens {
                 assert_eq!(
-                    dbg!(stream.next().await.unwrap().unwrap().num_rows()),
+                    stream.next().await.unwrap().unwrap().num_rows(),
                     expected_len as usize
                 );
             }
