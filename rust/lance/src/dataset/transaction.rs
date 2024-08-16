@@ -22,17 +22,17 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge | Project |
-//! |------------------|--------|--------|------------------|--------------|---------|-------|---------|
-//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    | ❌      |
-//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    | ❌      |
-//! | Overwrite/Create | ✅     | ✅     | ✅               | ✅           | ✅      | ✅    | ✅      |
-//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    | ✅      |
-//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    | ❌      |
-//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    | ❌      |
-//! | Project          | ✅     | ✅     | ❌               | ❌           | ✅      | ❌    | ✅      |
+//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project |
+//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|
+//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      |
+//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      |
+//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      |
+//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      |
+//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      |
+//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      |
+//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      |
 //!
-//! (1) Delete and rewrite are compatible with each other and themselves only if
+//! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
 
 use std::{collections::HashSet, sync::Arc};
