@@ -76,6 +76,20 @@ def test_optimize_max_bytes(tmp_path: Path):
         mode="overwrite",
     )
 
+    # Same test but use Compaction.plan
+    plan = Compaction.plan(
+        dataset,
+        options=dict(
+            target_rows_per_fragment=100 * 1024, max_bytes_per_file=1000, batch_size=128
+        ),
+    )
+    results = [task.execute(dataset) for task in plan.tasks]
+    metrics = Compaction.commit(dataset, results)
+    assert metrics.fragments_removed == 2
+    assert metrics.fragments_added == 4
+    assert metrics.files_removed == 2
+    assert metrics.files_added == 4
+
     # max_bytes_per_file is still too small but the batch size
     # is so large we read the entire input in a single batch
     metrics = dataset.optimize.compact_files(
