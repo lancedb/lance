@@ -60,7 +60,6 @@ impl TableProvider for Dataset {
             schema_ref.clone()
         };
 
-        // Curious that TableProvider has no offset?
         let scan_range = limit.map(|l| (0..l as u64));
         let plan: Arc<dyn ExecutionPlan> =
             scanner.scan(false, false, false, scan_range, projections.into());
