@@ -394,7 +394,7 @@ impl HnswBuilder {
         node: u32,
         visited_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
-    ) -> (u16, Vec<Edge>) {
+    ) -> Vec<Edge> {
         let nodes = &self.nodes;
         let target_level = nodes[node as usize].read().unwrap().level_neighbors.len() as u16 - 1;
         let mut ep = OrderedNode::new(
@@ -439,7 +439,7 @@ impl HnswBuilder {
                 ep = neighbors[0].clone();
             }
         }
-        (target_level, rev_edges)
+        rev_edges
     }
 
     fn insert_backward(
@@ -795,7 +795,7 @@ impl IvfSubIndex for HNSW {
 
             // Phase II: Perform queries on the structure before this chunk to get more
             // candidate edges, and perform edge pruning
-            let forward_results: Vec<(u16, Vec<Edge>)> = (start..end)
+            let forward_results: Vec<Vec<Edge>> = (start..end)
                 .into_par_iter()
                 .map(|node| {
                     VISITED_GENERATOR.with(|visited_gen| {
@@ -813,10 +813,7 @@ impl IvfSubIndex for HNSW {
                 .collect();
 
             // Phase III: Flatten and perform a sort on the pruned and reversed edges
-            let mut edges: Vec<&Edge> = forward_results
-                .iter()
-                .flat_map(|(_, vec)| vec.iter())
-                .collect();
+            let mut edges: Vec<&Edge> = forward_results.iter().flatten().collect();
 
             edges.par_sort_unstable();
 
