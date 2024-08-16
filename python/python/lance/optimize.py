@@ -27,6 +27,15 @@ class CompactionOptions(TypedDict):
     need compaction, but does affect how they are re-written if selected.
     (default: 1024)
     """
+    max_bytes_per_file: Optional[int]
+    """
+    Max number of bytes in a single file.  This does not affect which
+    fragments need compaction, but does affect how they are re-written if
+    selected.  If this value is too small you may end up with fragments
+    that are smaller than `target_rows_per_fragment`.
+
+    The default will use the default from ``write_dataset``.
+    """
     materialize_deletions: Optional[bool]
     """
     Whether to compact fragments with soft deleted rows so they are no
@@ -42,4 +51,11 @@ class CompactionOptions(TypedDict):
     """
     The number of threads to use when performing compaction. If not
     specified, defaults to the number of cores on the machine.
+    """
+    batch_size: Optional[int]
+    """
+    The batch size to use when scanning input fragments.  You may want
+    to reduce this if you are running out of memory during compaction.
+
+    The default will use the same default from ``scanner``.
     """

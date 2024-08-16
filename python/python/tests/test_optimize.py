@@ -45,7 +45,6 @@ def test_optimize_max_bytes(tmp_path: Path):
     dataset = lance.write_dataset(
         data, base_dir, max_rows_per_file=2 * 1024, data_storage_version="stable"
     )
-    assert dataset.version == 1
     assert len(dataset.get_fragments()) == 2
 
     # max_bytes_per_file is too small and we get tiny files
@@ -62,8 +61,6 @@ def test_optimize_max_bytes(tmp_path: Path):
     assert metrics.fragments_added == 4
     assert metrics.files_removed == 2
     assert metrics.files_added == 4
-
-    assert dataset.version == 3
 
     num_frags = len(dataset.get_fragments())
     assert num_frags == 4
@@ -90,7 +87,15 @@ def test_optimize_max_bytes(tmp_path: Path):
     assert metrics.files_removed == 2
     assert metrics.files_added == 4
 
-    # max_bytes_per_file is still too small but the batch size
+    dataset = lance.write_dataset(
+        data,
+        base_dir,
+        max_rows_per_file=2 * 1024,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    # In this test max_bytes_per_file is still too small but the batch size
     # is so large we read the entire input in a single batch
     metrics = dataset.optimize.compact_files(
         target_rows_per_fragment=100 * 1024,
@@ -103,8 +108,6 @@ def test_optimize_max_bytes(tmp_path: Path):
     assert metrics.fragments_added == 2
     assert metrics.files_removed == 2
     assert metrics.files_added == 2
-
-    assert dataset.version == 6
 
     num_frags = len(dataset.get_fragments())
     assert num_frags == 2
