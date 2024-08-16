@@ -777,7 +777,7 @@ impl IvfSubIndex for HNSW {
 
             // Phase II: Perform queries on the structure before this chunk to get more
             // candidate edges, and perform edge pruning
-            let forward_results: Vec<Vec<Edge>> = (start..end)
+            let forward_results: Vec<Vec<Edge>> = (start..end) // the returned edges are already reversed
                 .into_par_iter()
                 .map(|node| {
                     VISITED_GENERATOR.with(|visited_gen| {
