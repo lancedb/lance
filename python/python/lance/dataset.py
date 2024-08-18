@@ -2558,6 +2558,7 @@ class DatasetOptimizer:
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
         batch_size: Optional[int] = None,
+        force_migrate_legacy_format: bool = False,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -2620,6 +2621,7 @@ class DatasetOptimizer:
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
             batch_size=batch_size,
+            force_migrate_legacy_format=force_migrate_legacy_format,
         )
         return Compaction.execute(self._dataset, opts)
 
