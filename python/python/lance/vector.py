@@ -188,10 +188,7 @@ def train_ivf_centroids_on_accelerator(
 
 
 def _collate_fn(batch):
-    # for b in batch:
-    #     b[column] = b[column].pin_memory()
-
-    return batch
+    return batch[0]
 
 
 def compute_partitions(
@@ -240,7 +237,6 @@ def compute_partitions(
         with_row_id=True,
         columns=[column],
     )
-
     loader = torch.utils.data.DataLoader(
         torch_ds,
         num_workers=num_workers,
@@ -260,34 +256,30 @@ def compute_partitions(
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
             for batch in loader:
-                part_and_ids = []
-                for b in batch:
-                    vecs = b[column].reshape(-1, kmeans.centroids.shape[1])
+                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
 
-                    partitions = kmeans.transform(vecs)
-                    ids = b["_rowid"].reshape(-1)
-                    # this is expected to be true, so just assert
-                    assert vecs.shape[0] == ids.shape[0]
-                    part_and_ids.append((partitions, ids))
+                partitions = kmeans.transform(vecs)
+                ids = batch["_rowid"].reshape(-1)
+                # this is expected to be true, so just assert
+                assert vecs.shape[0] == ids.shape[0]
 
-                for partitions, ids in part_and_ids:
-                    # Ignore any invalid vectors.
-                    mask = (partitions.isfinite()).cpu()
-                    ids = ids[mask].cpu().numpy()
-                    partitions = partitions.cpu()[mask].numpy()
+                # Ignore any invalid vectors.
+                mask = (partitions.isfinite()).cpu()
+                ids = ids[mask].numpy()
+                partitions = partitions.cpu()[mask].numpy()
 
-                    part_batch = pa.RecordBatch.from_arrays(
-                        [ids.cpu().numpy(), partitions.cpu().numpy()],
-                        schema=output_schema,
+                part_batch = pa.RecordBatch.from_arrays(
+                    [ids, partitions],
+                    schema=output_schema,
+                )
+                if len(part_batch) < len(ids):
+                    logging.warning(
+                        "%s vectors are ignored during partition assignment",
+                        len(part_batch) - len(ids),
                     )
-                    if len(part_batch) < len(ids):
-                        logging.warning(
-                            "%s vectors are ignored during partition assignment",
-                            len(part_batch) - len(ids),
-                        )
 
-                    progress.update(part_batch.num_rows)
-                    yield part_batch
+                progress.update(part_batch.num_rows)
+                yield part_batch
 
     rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
     if dst_dataset_uri is None:
