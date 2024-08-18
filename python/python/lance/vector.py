@@ -8,11 +8,10 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
-from line_profiler import profile
 
 from . import write_dataset
 from .dependencies import _check_for_numpy, torch
@@ -196,9 +195,8 @@ def compute_partitions(
     dataset: LanceDataset,
     column: str,
     kmeans: Any,  # KMeans
-    batch_size: int = 1024 * 10 * 2,
+    batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
-    num_workers: int = 4,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -225,11 +223,6 @@ def compute_partitions(
     """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
-    if kmeans.device.type == "cuda":
-        import torch.multiprocessing as mp
-
-        mp.set_start_method("spawn")
-
     num_rows = dataset.count_rows()
 
     torch_ds = PytorchLanceDataset(
@@ -240,7 +233,6 @@ def compute_partitions(
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
-        # num_workers=1,
         batch_size=1,
         pin_memory=True,
         collate_fn=_collate_fn,

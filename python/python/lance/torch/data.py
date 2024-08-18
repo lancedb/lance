@@ -31,7 +31,6 @@ from ..sampler import (
 __all__ = ["LanceDataset"]
 
 
-@profile
 def _to_tensor(
     batch: pa.RecordBatch,
     *,
@@ -43,8 +42,6 @@ def _to_tensor(
 
     for col in batch.schema.names:
         arr: pa.Array = batch[col]
-        if pa.types.is_uint64(arr.type) and uint64_as_int64:
-            arr = arr.cast(pa.int64())
 
         tensor: torch.Tensor = None
         if (
@@ -57,7 +54,7 @@ def _to_tensor(
             np_tensor = arr.values.to_numpy(zero_copy_only=True).reshape(
                 -1, arr.type.list_size
             )
-            tensor = torch.tensor(np_tensor)
+            tensor = torch.from_numpy(np_tensor)
             del np_tensor
         elif (
             pa.types.is_integer(arr.type)
@@ -65,6 +62,9 @@ def _to_tensor(
             or pa.types.is_boolean(arr.type)
         ):
             tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
+
+            if uint64_as_int64 and tensor.dtype == torch.uint64:
+                tensor = tensor.to(torch.int64)
         elif hf_converter is not None:
             tensor = hf_converter.to_pytorch(col, arr)
 
@@ -130,8 +130,13 @@ def _buffer_arrow_batches(
     buffer = []
     cur_size = 0
     for item in it:
-        if cur_size > 0 and cur_size + item.num_rows > buffer_size:
-            yield concat_batches(buffer)
+        if cur_size > 0 and cur_size + item.num_rows >= buffer_size:
+            if len(buffer) == 1:
+                # Most of the time, we are in the happy situation where we have a single
+                # batch to yield.
+                yield buffer[0]
+            else:
+                yield concat_batches(buffer)
             buffer = []
             cur_size = 0
 
@@ -244,7 +249,6 @@ class LanceDataset(torch.utils.data.IterableDataset):
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
-    @profile
     def __iter__(self):
         if self.sampler is None:
             if self.rank is not None and self.world_size is not None:
