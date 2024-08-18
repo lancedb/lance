@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
+from line_profiler import profile
 
 from . import write_dataset
 from .dependencies import _check_for_numpy, torch
@@ -239,7 +240,7 @@ def compute_partitions(
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
-        num_workers=num_workers,
+        # num_workers=1,
         batch_size=1,
         pin_memory=True,
         collate_fn=_collate_fn,
@@ -265,11 +266,11 @@ def compute_partitions(
 
                 # Ignore any invalid vectors.
                 mask = (partitions.isfinite()).cpu()
-                ids = ids[mask].numpy()
-                partitions = partitions.cpu()[mask].numpy()
+                ids = ids[mask]
+                partitions = partitions.cpu()[mask]
 
                 part_batch = pa.RecordBatch.from_arrays(
-                    [ids, partitions],
+                    [ids.numpy(), partitions.cpu().numpy()],
                     schema=output_schema,
                 )
                 if len(part_batch) < len(ids):

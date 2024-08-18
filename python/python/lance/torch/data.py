@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
+from line_profiler import profile
 
 import lance
 from lance._dataset.cache import CachedDataset
@@ -30,6 +31,7 @@ from ..sampler import (
 __all__ = ["LanceDataset"]
 
 
+@profile
 def _to_tensor(
     batch: pa.RecordBatch,
     *,
@@ -52,9 +54,9 @@ def _to_tensor(
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
-            np_arrs = arr.to_numpy(zero_copy_only=False)
-            np_tensor = np.stack(np_arrs)
-            del np_arrs
+            np_tensor = arr.values.to_numpy(zero_copy_only=True).reshape(
+                -1, arr.type.list_size
+            )
             tensor = torch.tensor(np_tensor)
             del np_tensor
         elif (
@@ -242,6 +244,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
+    @profile
     def __iter__(self):
         if self.sampler is None:
             if self.rank is not None and self.world_size is not None:
