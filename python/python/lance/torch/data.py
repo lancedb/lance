@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
-from line_profiler import profile
 
 import lance
 from lance._dataset.cache import CachedDataset
@@ -227,7 +226,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.rank = rank
         self.world_size = world_size
         if rank is not None and world_size is not None:
-            warnings.warn("rank and world_size are deprecated")
+            warnings.warn("rank and world_size are deprecated", DeprecationWarning)
         self.sampler: Optional[Sampler] = sampler
 
         if filter is not None and self.samples > 0 or self.samples is None:

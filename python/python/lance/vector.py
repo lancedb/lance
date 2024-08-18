@@ -197,6 +197,7 @@ def compute_partitions(
     kmeans: Any,  # KMeans
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
+    allow_cuda_tf32: bool = True,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -213,8 +214,8 @@ def compute_partitions(
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
-    num_workers: int, default 4
-        Number of workers for PyTorch DataLoader.
+    allow_tf32: bool, default True
+        Whether to allow tf32 for matmul on CUDA.
 
     Returns
     -------
@@ -222,6 +223,8 @@ def compute_partitions(
         The absolute path of the partition dataset.
     """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
+
+    torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
     num_rows = dataset.count_rows()
 
