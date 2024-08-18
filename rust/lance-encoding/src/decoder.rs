@@ -921,14 +921,21 @@ impl DecodeBatchScheduler {
         filter: &FilterExpression,
         io: Arc<dyn EncodingsIo>,
         mut schedule_action: impl FnMut(Result<DecoderMessage>) -> bool,
+        // If specified, this will be used as the top_level_row for all scheduling
+        // tasks.  This is used by list scheduling to ensure all items scheduling
+        // tasks are scheduled at the same top level row.
+        top_level_row_override: Option<u64>,
     ) {
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         trace!(
-            "Scheduling {} ranges across {}..{} ({} rows)",
+            "Scheduling {} ranges across {}..{} ({} rows){}",
             ranges.len(),
             ranges.first().unwrap().start,
             ranges.last().unwrap().end,
-            rows_requested
+            rows_requested,
+            top_level_row_override
+                .map(|o| format!(" (top_level_row_override={})", o))
+                .unwrap_or_default()
         );
 
         let mut context = SchedulerContext::new(io);
@@ -942,7 +949,8 @@ impl DecodeBatchScheduler {
         let mut rows_to_schedule = root_job.num_rows();
         trace!("Scheduled ranges refined to {} rows", rows_to_schedule);
         while rows_to_schedule > 0 {
-            let maybe_next_scan_line = root_job.schedule_next(&mut context, num_rows_scheduled);
+            let top_level_row = top_level_row_override.unwrap_or(num_rows_scheduled);
+            let maybe_next_scan_line = root_job.schedule_next(&mut context, top_level_row);
             if let Err(schedule_next_err) = maybe_next_scan_line {
                 schedule_action(Err(schedule_next_err));
                 return;
@@ -974,12 +982,19 @@ impl DecodeBatchScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
         io: Arc<dyn EncodingsIo>,
+        top_level_row_override: Option<u64>,
     ) -> Result<Vec<DecoderMessage>> {
         let mut decode_messages = Vec::new();
-        self.do_schedule_ranges(ranges, filter, io, |msg| {
-            decode_messages.push(msg);
-            true
-        });
+        self.do_schedule_ranges(
+            ranges,
+            filter,
+            io,
+            |msg| {
+                decode_messages.push(msg);
+                true
+            },
+            top_level_row_override,
+        );
         decode_messages.into_iter().collect::<Result<Vec<_>>>()
     }
 
@@ -1000,19 +1015,25 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        self.do_schedule_ranges(ranges, filter, scheduler, |msg| {
-            match sink.send(msg) {
-                Ok(_) => true,
-                Err(SendError { .. }) => {
-                    // The receiver has gone away.  We can't do anything about it
-                    // so just ignore the error.
-                    debug!(
+        self.do_schedule_ranges(
+            ranges,
+            filter,
+            scheduler,
+            |msg| {
+                match sink.send(msg) {
+                    Ok(_) => true,
+                    Err(SendError { .. }) => {
+                        // The receiver has gone away.  We can't do anything about it
+                        // so just ignore the error.
+                        debug!(
                         "schedule_ranges aborting early since decoder appears to have been dropped"
                     );
-                    false
+                        false
+                    }
                 }
-            }
-        })
+            },
+            None,
+        )
     }
 
     /// Schedules the load of a range of rows
@@ -1187,15 +1208,13 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        let avail = self.root_decoder.avail();
-        trace!("Top level page has {} rows already available", avail);
-        if avail < to_take {
-            trace!(
-                "Top level page waiting for an additional {} rows",
-                to_take - avail
-            );
-            self.root_decoder.wait(to_take).await?;
-        }
+        let loaded_need = self.rows_drained + to_take;
+        trace!(
+            "Waiting for I/O (desire at least {} loaded rows)",
+            loaded_need
+        );
+        self.root_decoder.wait_for_loaded(loaded_need).await?;
+
         let next_task = self.root_decoder.drain(to_take)?;
         self.rows_drained += to_take;
         Ok(Some(next_task))
@@ -1549,14 +1568,24 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
             location: location!(),
         })
     }
-    /// Waits for enough data to be loaded to decode `num_rows` of data
-    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>>;
+    /// Waits until at least `num_rows` have been loaded
+    fn wait_for_loaded(&mut self, num_rows: u64) -> BoxFuture<Result<()>>;
+    /// The number of rows loaded so far
+    fn rows_loaded(&self) -> u64;
+    /// The number of rows that still need loading
+    fn rows_unloaded(&self) -> u64 {
+        self.num_rows() - self.rows_loaded()
+    }
+    /// The total number of rows in the field
+    fn num_rows(&self) -> u64;
+    /// The number of rows that have been drained so far
+    fn rows_drained(&self) -> u64;
+    /// The number of rows that are still available to drain
+    fn rows_left(&self) -> u64 {
+        self.num_rows() - self.rows_drained()
+    }
     /// Creates a task to decode `num_rows` of data into an array
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
-    /// The number of rows that are in the page but haven't yet been "waited"
-    fn unawaited(&self) -> u64;
-    /// The number of rows that have been "waited" but not yet decoded
-    fn avail(&self) -> u64;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
 }

@@ -39,27 +39,34 @@ impl SimulatedScheduler {
     pub fn new(data: Bytes) -> Self {
         Self { data }
     }
-
-    fn satisfy_request(&self, req: Range<u64>) -> Bytes {
-        if req.is_empty() {
-            // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
-            panic!("Empty request")
-        }
-        self.data.slice(req.start as usize..req.end as usize)
-    }
 }
 
 impl EncodingsIo for SimulatedScheduler {
     fn submit_request(
         &self,
         ranges: Vec<Range<u64>>,
-        _priority: u64,
+        priority: u64,
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
-        std::future::ready(Ok(ranges
+        let data = ranges
             .into_iter()
-            .map(|range| self.satisfy_request(range))
-            .collect::<Vec<_>>()))
-        .boxed()
+            .map(|range| {
+                if range.is_empty() {
+                    // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
+                    panic!("Empty request")
+                }
+                self.data.slice(range.start as usize..range.end as usize)
+            })
+            .collect();
+
+        // Need to make sure our scheduling priority matches our decode order.  If the decoder does
+        // not decode lowest to highest priority requests then deadlock can occur.
+        log::trace!("Scheduled request with priority {}", priority);
+        std::future::ready(data)
+            .map(move |data| {
+                log::trace!("Decoded request with priority {}", priority);
+                Ok(data)
+            })
+            .boxed()
     }
 }
 

@@ -318,11 +318,12 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
+    top_level_row: u64,
 ) -> Result<IndirectlyLoaded> {
-    let num_offsets = offsets_decoder.unawaited();
+    let num_offsets = offsets_decoder.num_rows();
     // We know the offsets are a primitive array and thus will not need additional
     // pages.  We can use a dummy receiver to match the decoder API
-    offsets_decoder.wait(num_offsets).await?;
+    offsets_decoder.wait_for_loaded(num_offsets).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
     let offsets = decode_task.task.decode()?;
 
@@ -359,6 +360,7 @@ async fn indirect_schedule_task(
         // Can't push filters into list items
         &FilterExpression::no_filter(),
         io,
+        Some(top_level_row),
     )?;
 
     for message in indirect_messages {
@@ -440,6 +442,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             items_scheduler,
             items_type,
             io,
+            top_level_row,
         ));
 
         // Return a decoder
@@ -448,7 +451,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
             item_decoder: None,
             rows_drained: 0,
-            lists_available: 0,
+            rows_loaded: 0,
             item_field_name: self.scheduler.item_field_name.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
@@ -568,9 +571,9 @@ struct ListPageDecoder {
     offsets: Vec<u64>,
     validity: BooleanBuffer,
     item_decoder: Option<SimpleStructDecoder>,
-    lists_available: u64,
     num_rows: u64,
     rows_drained: u64,
+    rows_loaded: u64,
     item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
@@ -646,7 +649,7 @@ impl DecodeArrayTask for ListDecodeTask {
 }
 
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         async move {
             // wait for the indirect I/O to finish, run the scheduler for the indirect
             // I/O and then wait for enough items to arrive
@@ -665,42 +668,39 @@ impl LogicalPageDecoder for ListPageDecoder {
                 self.validity = indirectly_loaded.validity;
                 self.item_decoder = indirectly_loaded.root_decoder;
             }
-            trace!(
-                "List decoder is waiting for {} rows and {} are already available and {} are unawaited",
-                num_rows,
-                self.lists_available,
-                self.num_rows - self.rows_drained
-            );
-            if self.lists_available >= num_rows {
-                self.lists_available -= num_rows;
+            if self.rows_loaded >= loaded_need {
                 return Ok(());
             }
-            let num_rows = num_rows - self.lists_available;
-            self.lists_available = 0;
-            let offset_wait_start = self.rows_drained + self.lists_available;
-            let item_start = self.offsets[offset_wait_start as usize];
-            let items_needed =
-                self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
-            if items_needed > 0 {
-                trace!("Waiting on list items page for {} items", items_needed);
-                self.item_decoder.as_mut().unwrap().wait(items_needed).await?;
-            }
-            // This is technically undercounting a little.  It's possible that we loaded a big items
-            // page with many items and then only needed a few of them for the requested lists.  However,
-            // to find the exact number of lists that are available we would need to walk through the item
-            // lengths and it's faster to just undercount here.
-            self.lists_available += num_rows;
+
+            // Ideally this would be self.offsets[loaded_need] but it would be very difficult for
+            // the scheduler to schedule things in that order.  Unfortantely, when scheduling lists,
+            // we schedule and entire page of lists at the same priority.  As a result, we need to
+            // decode the entire page of lists all at once.
+            let items_loaded_need = *self.offsets.last().unwrap();
+            trace!(
+                "List decoder is waiting for {} rows to be loaded and {}/{} are already loaded.  To satisfy this we need {} loaded items",
+                loaded_need,
+                self.rows_loaded,
+                self.num_rows,
+                items_loaded_need,
+            );
+
+            let items_loaded = if items_loaded_need > 0 {
+                self.item_decoder.as_mut().unwrap().wait_for_loaded(items_loaded_need).await?;
+                self.item_decoder.as_ref().unwrap().rows_loaded()
+            } else {
+                0
+            };
+
+            self.rows_loaded = self.num_rows;
+            trace!("List decoder now has {} loaded items which corresponds to {} loaded rows", items_loaded, self.rows_loaded);
+
             Ok(())
         }
         .boxed()
     }
 
-    fn unawaited(&self) -> u64 {
-        self.num_rows - self.lists_available - self.rows_drained
-    }
-
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
-        self.lists_available -= num_rows;
         // We already have the offsets but need to drain the item pages
         let mut actual_num_rows = num_rows;
         let item_start = self.offsets[self.rows_drained as usize];
@@ -745,8 +745,9 @@ impl LogicalPageDecoder for ListPageDecoder {
         };
 
         self.rows_drained += num_rows;
+        let has_more = self.rows_left() > 0;
         Ok(NextDecodeTask {
-            has_more: self.avail() > 0 || self.unawaited() > 0,
+            has_more,
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,
@@ -759,8 +760,16 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
-    fn avail(&self) -> u64 {
-        self.lists_available
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+
+    fn rows_loaded(&self) -> u64 {
+        self.rows_loaded
+    }
+
+    fn rows_drained(&self) -> u64 {
+        self.rows_drained
     }
 
     fn data_type(&self) -> &DataType {

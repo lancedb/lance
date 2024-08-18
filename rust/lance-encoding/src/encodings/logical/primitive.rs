@@ -276,10 +276,10 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         log::trace!(
             "PrimitiveFieldDecoder::wait for {} rows on column {} (page has {} rows)",
-            num_rows,
+            loaded_need,
             self.column_index,
             self.num_rows
         );
@@ -319,20 +319,24 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         })
     }
 
-    fn unawaited(&self) -> u64 {
+    fn rows_loaded(&self) -> u64 {
         if self.unloaded_physical_decoder.is_some() {
-            self.num_rows
-        } else {
             0
+        } else {
+            self.num_rows
         }
     }
 
-    fn avail(&self) -> u64 {
+    fn rows_drained(&self) -> u64 {
         if self.unloaded_physical_decoder.is_some() {
             0
         } else {
-            self.num_rows - self.rows_drained
+            self.rows_drained
         }
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
     }
 
     fn data_type(&self) -> &DataType {
