@@ -187,12 +187,20 @@ def train_ivf_centroids_on_accelerator(
     return centroids, kmeans
 
 
+def _collate_fn(batch):
+    # for b in batch:
+    #     b[column] = b[column].pin_memory()
+
+    return batch
+
+
 def compute_partitions(
     dataset: LanceDataset,
     column: str,
     kmeans: Any,  # KMeans
-    batch_size: int = 10240,
+    batch_size: int = 1024 * 10 * 2,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
+    num_workers: int = 4,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -209,6 +217,8 @@ def compute_partitions(
     dst_dataset_uri: Union[str, Path], optional
         The path to store the partitions.  If not specified a random
         directory is used instead
+    num_workers: int, default 4
+        Number of workers for PyTorch DataLoader.
 
     Returns
     -------
@@ -217,6 +227,11 @@ def compute_partitions(
     """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
+    if kmeans.device.type == "cuda":
+        import torch.multiprocessing as mp
+
+        mp.set_start_method("spawn")
+
     num_rows = dataset.count_rows()
 
     torch_ds = PytorchLanceDataset(
@@ -224,6 +239,14 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
+    )
+
+    loader = torch.utils.data.DataLoader(
+        torch_ds,
+        num_workers=num_workers,
+        batch_size=1,
+        pin_memory=True,
+        collate_fn=_collate_fn,
     )
     output_schema = pa.schema(
         [
@@ -236,35 +259,37 @@ def compute_partitions(
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
-            for batch in torch_ds:
-                batch: Dict[str, torch.Tensor] = batch
-                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+            for batch in loader:
+                part_and_ids = []
+                for b in batch:
+                    vecs = b[column].reshape(-1, kmeans.centroids.shape[1])
 
-                vecs.to(kmeans.device)
-                partitions = kmeans.transform(vecs).cpu().numpy()
-                ids = batch["_rowid"].reshape(-1).cpu().numpy()
+                    partitions = kmeans.transform(vecs)
+                    ids = b["_rowid"].reshape(-1)
+                    # this is expected to be true, so just assert
+                    assert vecs.shape[0] == ids.shape[0]
+                    part_and_ids.append((partitions, ids))
 
-                # this is expected to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
+                for partitions, ids in part_and_ids:
+                    # Ignore any invalid vectors.
+                    mask = (partitions.isfinite()).cpu()
+                    ids = ids[mask].cpu().numpy()
+                    partitions = partitions.cpu()[mask].numpy()
 
-                # Ignore any invalid vectors.
-                ids = ids[partitions >= 0]
-                partitions = partitions[partitions >= 0]
-                part_batch = pa.RecordBatch.from_arrays(
-                    [ids, partitions],
-                    schema=output_schema,
-                )
-                if len(part_batch) < len(ids):
-                    logging.warning(
-                        "%s vectors are ignored during partition assignment",
-                        len(part_batch) - len(ids),
+                    part_batch = pa.RecordBatch.from_arrays(
+                        [ids.cpu().numpy(), partitions.cpu().numpy()],
+                        schema=output_schema,
                     )
+                    if len(part_batch) < len(ids):
+                        logging.warning(
+                            "%s vectors are ignored during partition assignment",
+                            len(part_batch) - len(ids),
+                        )
 
-                progress.update(part_batch.num_rows)
-                yield part_batch
+                    progress.update(part_batch.num_rows)
+                    yield part_batch
 
     rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
-
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
     ds = write_dataset(
@@ -272,7 +297,7 @@ def compute_partitions(
         dst_dataset_uri,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
-        data_storage_version="legacy",
+        data_storage_version="stable",
     )
     assert len(ds.get_fragments()) == 1
     files = ds.get_fragments()[0].data_files()

@@ -183,9 +183,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
-        rank: int, optional
+        rank: int, optional (deprecated)
             If set, the rank (idx) of this process in distributed training / inference.
-        world_size: int, optional
+        world_size: int, optional (deprecated)
             If set, the total number of processes in distributed training / inference.
         shard_granularity: str, optional
             The basic unit of sharding data. If set to "fragment", each worker will get
@@ -216,30 +216,15 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self._hf_converter = None
 
         # As Shared Dataset
+        self.shard_granularity = shard_granularity
         self.rank = rank
         self.world_size = world_size
-        self.shard_granularity = shard_granularity
-        if sampler is None:
-            if shard_granularity is None:
-                if rank is not None or world_size is not None:
-                    warnings.warn(
-                        "rank and world_size are deprecated,"
-                        + " use ShardedFragmentSampler instead.",
-                    )
-                    sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
-                else:
-                    sampler = FullScanSampler()
-            elif shard_granularity == "batch":
-                sampler = ShardedBatchSampler(rank, world_size)
-            elif shard_granularity == "fragment":
-                sampler = ShardedFragmentSampler(rank, world_size)
-            else:
-                raise ValueError("Invalid shard_granularity: {}")
+        if rank is not None and world_size is not None:
+            warnings.warn("rank and world_size are deprecated")
+        self.sampler: Optional[Sampler] = sampler
 
         if filter is not None and self.samples > 0 or self.samples is None:
             raise ValueError("`filter` is not supported with `samples`")
-
-        self.sampler: Sampler = sampler
 
         # Dataset with huggingface metadata
         if (
@@ -258,6 +243,32 @@ class LanceDataset(torch.utils.data.IterableDataset):
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
     def __iter__(self):
+        if self.sampler is None:
+            if self.rank is not None and self.world_size is not None:
+                rank = self.rank
+                world_size = self.world_size
+            else:
+                worker_info = torch.utils.data.get_worker_info()
+                if worker_info is not None:
+                    rank = worker_info.id
+                    world_size = worker_info.num_workers
+                else:
+                    rank = None
+                    world_size = None
+            if self.shard_granularity is None:
+                if rank is not None and world_size is not None:
+                    sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
+                else:
+                    sampler = FullScanSampler()
+            elif self.shard_granularity == "batch":
+                sampler = ShardedBatchSampler(rank, world_size)
+            elif self.shard_granularity == "fragment":
+                sampler = ShardedFragmentSampler(rank, world_size)
+            else:
+                raise ValueError("Invalid shard_granularity: {}")
+        else:
+            sampler = self.sampler
+
         stream: Iterable[pa.RecordBatch]
         if self.cached_ds:
             stream = self.cached_ds
@@ -270,7 +281,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     batch_size=self.batch_size,
                 )
             else:
-                raw_stream = self.sampler(
+                raw_stream = sampler(
                     self.dataset,
                     columns=self.columns,
                     filter=self.filter,
