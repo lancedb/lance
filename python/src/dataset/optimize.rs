@@ -53,6 +53,9 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
             "batch_size" => {
                 opts.batch_size = value.extract()?;
             }
+            "force_migrate_legacy_format" => {
+                opts.force_migrate_legacy_format = value.extract()?;
+            }
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Invalid compaction option: {}",

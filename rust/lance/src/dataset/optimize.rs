@@ -87,6 +87,7 @@ use std::sync::{Arc, RwLock};
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_table::io::deletion::read_deletion_file;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -143,6 +144,9 @@ pub struct CompactionOptions {
     /// specified then the default (see
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
     pub batch_size: Option<usize>,
+    /// Whether to force generate the latest Stable format files version
+    /// for new fragments that are writter during compaction.
+    pub force_migrate_legacy_format: bool,
 }
 
 impl Default for CompactionOptions {
@@ -156,6 +160,7 @@ impl Default for CompactionOptions {
             num_threads: num_cpus::get(),
             max_bytes_per_file: None,
             batch_size: None,
+            force_migrate_legacy_format: false,
         }
     }
 }
@@ -668,6 +673,9 @@ async fn rewrite_files(
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         params.max_bytes_per_file = max_bytes_per_file;
+    }
+    if options.force_migrate_legacy_format {
+        params.data_storage_version = Some(LanceFileVersion::Stable);
     }
     let mut new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
