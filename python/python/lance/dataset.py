@@ -2603,6 +2603,8 @@ class DatasetOptimizer:
             to reduce this if you are running out of memory during compaction.
 
             The default will use the same default from ``scanner``.
+        force_migrate_legacy_format: bool, optional, default False
+            If True, will write new fragments in the current stable file format
 
         Returns
         -------
