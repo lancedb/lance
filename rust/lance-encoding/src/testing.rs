@@ -58,8 +58,6 @@ impl EncodingsIo for SimulatedScheduler {
             })
             .collect();
 
-        // Need to make sure our scheduling priority matches our decode order.  If the decoder does
-        // not decode lowest to highest priority requests then deadlock can occur.
         log::trace!("Scheduled request with priority {}", priority);
         std::future::ready(data)
             .map(move |data| {
