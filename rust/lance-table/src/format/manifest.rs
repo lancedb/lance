@@ -439,9 +439,9 @@ impl TryFrom<pb::Manifest> for Manifest {
                 if fragments.is_empty() {
                     // No fragments to inspect, best we can do is look at writer flags
                     if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                        DataStorageFormat::new(LanceFileVersion::Legacy)
-                    } else {
                         DataStorageFormat::new(LanceFileVersion::Stable)
+                    } else {
+                        DataStorageFormat::new(LanceFileVersion::Legacy)
                     }
                 } else {
                     // If there are fragments, they are a better indicator
