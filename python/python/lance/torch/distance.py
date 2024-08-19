@@ -120,7 +120,9 @@ def argmin_l2(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
     y = y.reshape(1, y.shape[0], -1)
     dists = torch.cdist(x, y, p=2.0).reshape(-1, y.shape[1])
     min_dists, idx = torch.min(dists, dim=1, keepdim=True)
-    return min_dists, idx
+    # We are using squared L2 distance today.
+    # TODO: change this to L2 distance (which is a breaking change?)
+    return min_dists.pow(2), idx
 
 
 @torch.jit.script
