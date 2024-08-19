@@ -187,11 +187,13 @@ def test_transform_vectors_with_precomputed_parts(
 
 @pytest.mark.benchmark(group="shuffle_vectors")
 def test_shuffle_vectors(test_large_dataset, tmpdir, benchmark):
-    ivf = rand_ivf(test_dataset)
-    pq = rand_pq(test_dataset, ivf)
-    builder = IndicesBuilder(test_dataset, "vector")
+    ivf = rand_ivf(test_large_dataset)
+    pq = rand_pq(test_large_dataset, ivf)
+    builder = IndicesBuilder(test_large_dataset, "vector")
     transformed_uri = str(tmpdir / "output.lance")
-    builder.transform_vectors(ivf, pq, transformed_uri)
+    part_ids_path = str(tmpdir / "part_ids")
+    gen_rand_part_ids(test_large_dataset, part_ids_path)
+    builder.transform_vectors(ivf, pq, transformed_uri, None, part_ids_path)
     shuffle_out = str(tmpdir)
     benchmark.pedantic(
         builder.shuffle_transformed_vectors,
