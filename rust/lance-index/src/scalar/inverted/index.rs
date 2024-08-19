@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::buffer::ScalarBuffer;
-use arrow::datatypes::{self, Float32Type, UInt64Type};
+use arrow::datatypes::{self, Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, Float32Array, OffsetSizeTrait, RecordBatch, StringArray, UInt32Array,
     UInt64Array,
@@ -43,6 +43,7 @@ pub const DOCS_FILE: &str = "docs.lance";
 pub const TOKEN_COL: &str = "_token";
 pub const TOKEN_ID_COL: &str = "_token_id";
 pub const FREQUENCY_COL: &str = "_frequency";
+pub const POSITION_COL: &str = "_position";
 pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 lazy_static! {
@@ -408,12 +409,17 @@ impl InvertedListReader {
                 let token_id = token_id as usize;
                 let offset = self.offsets[token_id];
                 let batch = self.reader.read_range(offset..offset + length).await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
-                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
-                Result::Ok(PostingList::new(
-                    row_ids.values().clone(),
-                    frequencies.values().clone(),
-                ))
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
+                let frequencies = batch[FREQUENCY_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .clone();
+                // the positions column may not exist for old indices
+                // in that case, phrase query is not supported
+                let positions = batch
+                    .column_by_name(POSITION_COL)
+                    .map(|col| col.as_primitive::<UInt32Type>().values().clone());
+                Result::Ok(PostingList::new(row_ids, frequencies, positions))
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))
@@ -424,6 +430,7 @@ impl InvertedListReader {
 pub struct PostingList {
     pub row_ids: ScalarBuffer<u64>,
     pub frequencies: ScalarBuffer<f32>,
+    pub positions: Option<ScalarBuffer<u32>>,
 }
 
 impl DeepSizeOf for PostingList {
@@ -434,10 +441,15 @@ impl DeepSizeOf for PostingList {
 }
 
 impl PostingList {
-    pub fn new(row_ids: ScalarBuffer<u64>, frequencies: ScalarBuffer<f32>) -> Self {
+    pub fn new(
+        row_ids: ScalarBuffer<u64>,
+        frequencies: ScalarBuffer<f32>,
+        positions: Option<ScalarBuffer<u32>>,
+    ) -> Self {
         Self {
             row_ids,
             frequencies,
+            positions,
         }
     }
 
@@ -449,8 +461,12 @@ impl PostingList {
         self.len() == 0
     }
 
-    pub fn doc(&self, i: usize) -> (u64, f32) {
-        (self.row_ids[i], self.frequencies[i])
+    pub fn doc(&self, i: usize) -> DocInfo {
+        DocInfo::new(
+            self.row_ids[i],
+            self.frequencies[i],
+            self.positions.as_ref().map(|p| p[i]),
+        )
     }
 
     pub fn row_id(&self, i: usize) -> u64 {
@@ -501,6 +517,50 @@ impl PostingListBuilder {
             ],
         )?;
         Ok(batch)
+    }
+}
+
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct DocInfo {
+    pub row_id: u64,
+    pub frequency: f32,
+    pub position: Option<u32>,
+}
+
+impl DocInfo {
+    pub fn new(row_id: u64, frequency: f32, position: Option<u32>) -> Self {
+        Self {
+            row_id,
+            frequency,
+            position,
+        }
+    }
+}
+
+impl Eq for DocInfo {}
+
+impl PartialEq for DocInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.row_id == other.row_id && self.position == other.position
+    }
+}
+
+impl PartialOrd for DocInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // compare by row_id first, then by position
+        self.row_id.partial_cmp(&other.row_id).and_then(|cmp| {
+            if cmp == std::cmp::Ordering::Equal {
+                self.position.partial_cmp(&other.position)
+            } else {
+                Some(cmp)
+            }
+        })
+    }
+}
+
+impl Ord for DocInfo {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
     }
 }
 

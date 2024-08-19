@@ -12,7 +12,7 @@ use tracing::instrument;
 
 use super::builder::OrderedDoc;
 use super::index::{idf, K1};
-use super::PostingList;
+use super::{DocInfo, PostingList};
 
 #[derive(Clone)]
 pub struct PostingIterator {
@@ -40,7 +40,7 @@ impl PartialOrd for PostingIterator {
 impl Ord for PostingIterator {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self.doc(), other.doc()) {
-            (Some((doc1, _)), Some((doc2, _))) => doc1.cmp(&doc2),
+            (Some(doc1), Some(doc2)) => doc1.cmp(&doc2),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
@@ -70,7 +70,7 @@ impl PostingIterator {
         self.approximate_upper_bound
     }
 
-    fn doc(&self) -> Option<(u64, f32)> {
+    fn doc(&self) -> Option<DocInfo> {
         if self.index < self.list.len() {
             Some(self.list.doc(self.index))
         } else {
@@ -142,18 +142,18 @@ impl Wand {
     }
 
     // calculate the score of the document
-    fn score(&self, doc: u64, scorer: &impl Fn(u64, f32) -> f32) -> f32 {
+    fn score(&self, doc_id: u64, scorer: &impl Fn(u64, f32) -> f32) -> f32 {
         let mut score = 0.0;
         for posting in &self.postings {
-            let (cur_doc, freq) = posting.doc().unwrap();
-            if cur_doc > doc {
+            let cur_doc = posting.doc().unwrap();
+            if cur_doc.row_id > doc_id {
                 // the posting list is sorted by its current doc id,
                 // so we can break early once we find the current doc id is less than the doc id we are looking for
                 break;
             }
-            debug_assert!(cur_doc == doc);
+            debug_assert!(cur_doc.row_id == doc_id);
 
-            score += posting.approximate_upper_bound() * scorer(doc, freq);
+            score += posting.approximate_upper_bound() * scorer(doc_id, cur_doc.frequency);
         }
         score
     }
@@ -163,31 +163,31 @@ impl Wand {
     async fn next(&mut self) -> Result<Option<u64>> {
         self.postings.sort_unstable();
         while let Some(pivot_posting) = self.find_pivot_term() {
-            let (doc, _) = pivot_posting
+            let doc = pivot_posting
                 .doc()
                 .expect("pivot posting should have at least one document");
 
             let cur_doc = self.cur_doc.unwrap_or(0);
-            if self.cur_doc.is_some() && doc <= cur_doc {
+            if self.cur_doc.is_some() && doc.row_id <= cur_doc {
                 // the pivot doc id is less than the current doc id,
                 // that means this doc id has been processed before, so skip it
                 self.move_terms(cur_doc + 1);
             } else if self
                 .postings
                 .first()
-                .and_then(|posting| posting.doc().map(|(d, _)| d))
+                .and_then(|posting| posting.doc().map(|d| d.row_id))
                 .expect("the postings can't be empty")
-                == doc
+                == doc.row_id
             {
                 // all the posting iterators have reached this doc id,
                 // so that means the sum of upper bound of all terms is not less than the threshold,
                 // this document is a candidate
-                self.cur_doc = Some(doc);
-                return Ok(Some(doc));
+                self.cur_doc = Some(doc.row_id);
+                return Ok(Some(doc.row_id));
             } else {
                 // some posting iterators haven't reached this doc id,
                 // so move such terms to the doc id
-                self.move_terms(doc);
+                self.move_terms(doc.row_id);
             }
         }
         Ok(None)
@@ -213,7 +213,7 @@ impl Wand {
     fn move_terms<'b>(&mut self, least_id: u64) {
         for posting in self.postings.iter_mut() {
             match posting.doc() {
-                Some((d, _)) if d < least_id => {
+                Some(d) if d.row_id < least_id => {
                     posting.next(least_id);
                 }
                 _ => break,
