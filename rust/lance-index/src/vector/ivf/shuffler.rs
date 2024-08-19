@@ -201,8 +201,7 @@ impl PartitionListBuilder {
             }))
         }
 
-        let part_ids = batch[PART_ID_COLUMN]
-            .as_primitive::<UInt32Type>();
+        let part_ids = batch[PART_ID_COLUMN].as_primitive::<UInt32Type>();
 
         let part_id = part_ids.value(0) as usize;
 
