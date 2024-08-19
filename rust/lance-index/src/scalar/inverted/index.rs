@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::AsArray;
+use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
@@ -474,17 +474,29 @@ impl PostingList {
     }
 }
 
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct PostingListBuilder {
     pub row_ids: Vec<u64>,
     pub frequencies: Vec<f32>,
+    pub positions: Option<Vec<Vec<u32>>>,
+}
+
+impl Default for PostingListBuilder {
+    fn default() -> Self {
+        Self {
+            row_ids: Vec::new(),
+            frequencies: Vec::new(),
+            positions: Some(Vec::new()),
+        }
+    }
 }
 
 impl PostingListBuilder {
-    pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>) -> Self {
+    pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>, positions: Option<Vec<Vec<u32>>>) -> Self {
         Self {
             row_ids,
             frequencies,
+            positions,
         }
     }
 
@@ -503,19 +515,36 @@ impl PostingListBuilder {
         let row_id_col = UInt64Array::from_iter_values(indices.iter().map(|&i| self.row_ids[i]));
         let frequency_col =
             Float32Array::from_iter_values(indices.iter().map(|&i| self.frequencies[i]));
+        let position_col = self.positions.as_ref().map(|positions| {
+            let mut position_col_builder =
+                ListBuilder::with_capacity(UInt32Builder::new(), self.len());
+            for i in indices {
+                let term_positions = &positions[i];
+                let position_builder = position_col_builder.values();
+                position_builder.append_slice(term_positions);
+                position_col_builder.append(true);
+            }
+            position_col_builder.finish()
+        });
 
-        let schema = arrow_schema::Schema::new(vec![
+        let mut fields = vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
             arrow_schema::Field::new(FREQUENCY_COL, DataType::Float32, false),
-        ]);
-
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(row_id_col) as ArrayRef,
-                Arc::new(frequency_col) as ArrayRef,
-            ],
-        )?;
+        ];
+        let mut columns = vec![
+            Arc::new(row_id_col) as ArrayRef,
+            Arc::new(frequency_col) as ArrayRef,
+        ];
+        if let Some(position_col) = position_col {
+            fields.push(arrow_schema::Field::new(
+                POSITION_COL,
+                DataType::List(Field::new("item", DataType::UInt32, false).into()),
+                false,
+            ));
+            columns.push(Arc::new(position_col));
+        }
+        let schema = arrow_schema::Schema::new(fields);
+        let batch = RecordBatch::try_new(Arc::new(schema), columns)?;
         Ok(batch)
     }
 }
