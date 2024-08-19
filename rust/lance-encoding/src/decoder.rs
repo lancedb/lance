@@ -236,6 +236,7 @@ use tracing::instrument;
 
 use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
+use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
@@ -622,7 +623,7 @@ impl CoreFieldDecoderStrategy {
     }
 
     fn is_primitive(data_type: &DataType) -> bool {
-        if data_type.is_primitive() | data_type.is_binary_like() {
+        if data_type.is_primitive() {
             true
         } else {
             match data_type {
@@ -676,6 +677,78 @@ impl CoreFieldDecoderStrategy {
             pb::array_encoding::ArrayEncoding::PackedStruct(_)
         )
     }
+
+    fn create_list_scheduler<'a>(
+        &self,
+        list_field: &Field,
+        column_infos: &mut ColumnInfoIter,
+        buffers: FileBuffers,
+        offsets_column: &ColumnInfo,
+        chain: DecoderMiddlewareChainCursor<'a>,
+    ) -> Result<ChosenFieldScheduler<'a>> {
+        Self::ensure_values_encoded(offsets_column, chain.current_path())?;
+        let offsets_column_buffers = ColumnBuffers {
+            file_buffers: buffers,
+            positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
+        };
+        let (chain, items_scheduler) = chain.new_child(
+            /*child_idx=*/ 0,
+            &list_field.children[0],
+            column_infos,
+            buffers,
+        )?;
+        let items_scheduler = items_scheduler?;
+
+        let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
+            .page_infos
+            .iter()
+            .filter(|offsets_page| offsets_page.num_rows > 0)
+            .map(|offsets_page| {
+                if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
+                    &offsets_page.encoding.array_encoding
+                {
+                    let inner = PageInfo {
+                        buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
+                        encoding: list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
+                        num_rows: offsets_page.num_rows,
+                    };
+                    (
+                        inner,
+                        OffsetPageInfo {
+                            offsets_in_page: offsets_page.num_rows,
+                            null_offset_adjustment: list_encoding.null_offset_adjustment,
+                            num_items_referenced_by_page: list_encoding.num_items,
+                        },
+                    )
+                } else {
+                    // TODO: Should probably return Err here
+                    panic!("Expected a list column");
+                }
+            })
+            .unzip();
+        let inner = Arc::new(PrimitiveFieldScheduler::new(
+            offsets_column.index,
+            DataType::UInt64,
+            Arc::from(inner_infos.into_boxed_slice()),
+            offsets_column_buffers,
+            self.validate_data,
+        )) as Arc<dyn FieldScheduler>;
+        let offset_type = if matches!(list_field.data_type(), DataType::List(_)) {
+            DataType::Int32
+        } else {
+            DataType::Int64
+        };
+        Ok((
+            chain,
+            Ok(Arc::new(ListFieldScheduler::new(
+                inner,
+                items_scheduler,
+                items_field.clone(),
+                offset_type,
+                null_offset_adjustments,
+            )) as Arc<dyn FieldScheduler>),
+        ))
+    }
 }
 
 impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
@@ -696,6 +769,60 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 buffers,
             )?;
             return Ok((chain, Ok(scheduler)));
+        } else if data_type.is_binary_like() {
+            let column_info = column_infos.next().unwrap();
+            if let Some(page_info) = column_info.page_infos.first() {
+                if matches!(
+                    page_info.encoding,
+                    pb::ArrayEncoding {
+                        array_encoding: Some(pb::array_encoding::ArrayEncoding::List(..))
+                    }
+                ) {
+                    let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
+                        DataType::List(Arc::new(ArrowField::new("item", DataType::UInt8, false)))
+                    } else {
+                        DataType::LargeList(Arc::new(ArrowField::new(
+                            "item",
+                            DataType::UInt8,
+                            false,
+                        )))
+                    };
+                    let list_field = Field::try_from(ArrowField::new(
+                        field.name.clone(),
+                        list_type,
+                        field.nullable,
+                    ))
+                    .unwrap();
+                    let (chain, list_scheduler) = self.create_list_scheduler(
+                        &list_field,
+                        column_infos,
+                        buffers,
+                        column_info,
+                        chain,
+                    )?;
+                    let binary_scheduler = Arc::new(BinaryFieldScheduler::new(
+                        list_scheduler?,
+                        field.data_type().clone(),
+                    ));
+                    return Ok((chain, Ok(binary_scheduler)));
+                } else {
+                    let scheduler = self.create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        column_info,
+                        buffers,
+                    )?;
+                    return Ok((chain, Ok(scheduler)));
+                }
+            } else {
+                let scheduler = self.create_primitive_scheduler(
+                    &data_type,
+                    chain.current_path(),
+                    column_info,
+                    buffers,
+                )?;
+                return Ok((chain, Ok(scheduler)));
+            }
         }
         match &data_type {
             DataType::FixedSizeList(inner, _dimension) => {
@@ -735,71 +862,9 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     })
                 }
             }
-            DataType::List(items_field) | DataType::LargeList(items_field) => {
-                let offsets_column = column_infos.expect_next()?.clone();
-                column_infos.next_top_level();
-                Self::ensure_values_encoded(offsets_column.as_ref(), chain.current_path())?;
-                let offsets_column_buffers = ColumnBuffers {
-                    file_buffers: buffers,
-                    positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
-                };
-                let (chain, items_scheduler) = chain.new_child(
-                    /*child_idx=*/ 0,
-                    &field.children[0],
-                    column_infos,
-                    buffers,
-                )?;
-                let items_scheduler = items_scheduler?;
-
-                let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
-                    .page_infos
-                    .iter()
-                    .filter(|offsets_page| offsets_page.num_rows > 0)
-                    .map(|offsets_page| {
-                        if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
-                            &offsets_page.encoding.array_encoding
-                        {
-                            let inner = PageInfo {
-                                buffer_offsets_and_sizes: offsets_page
-                                    .buffer_offsets_and_sizes
-                                    .clone(),
-                                encoding: list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
-                                num_rows: offsets_page.num_rows,
-                            };
-                            (
-                                inner,
-                                OffsetPageInfo {
-                                    offsets_in_page: offsets_page.num_rows,
-                                    null_offset_adjustment: list_encoding.null_offset_adjustment,
-                                    num_items_referenced_by_page: list_encoding.num_items,
-                                },
-                            )
-                        } else {
-                            // TODO: Should probably return Err here
-                            panic!("Expected a list column");
-                        }
-                    })
-                    .unzip();
-                let inner = Arc::new(PrimitiveFieldScheduler::new(
-                    offsets_column.index,
-                    DataType::UInt64,
-                    Arc::from(inner_infos.into_boxed_slice()),
-                    offsets_column_buffers,
-                    self.validate_data,
-                )) as Arc<dyn FieldScheduler>;
-                let offset_type = if matches!(data_type, DataType::List(_)) {
-                    DataType::Int32
-                } else {
-                    DataType::Int64
-                };
-                let list_scheduler = Ok(Arc::new(ListFieldScheduler::new(
-                    inner,
-                    items_scheduler,
-                    items_field.clone(),
-                    offset_type,
-                    null_offset_adjustments,
-                )) as Arc<dyn FieldScheduler>);
-                Ok((chain, list_scheduler))
+            DataType::List(_) | DataType::LargeList(_) => {
+                let offsets_column = column_infos.next().unwrap();
+                self.create_list_scheduler(field, column_infos, buffers, offsets_column, chain)
             }
             DataType::Struct(fields) => {
                 let column_info = column_infos.expect_next()?;
