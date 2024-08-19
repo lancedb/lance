@@ -3,6 +3,7 @@
 
 use lance_core::Error;
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
+use lance_file::version::LanceFileVersion;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
@@ -300,6 +301,33 @@ impl Fragment {
     pub fn has_legacy_files(&self) -> bool {
         // If any file in a fragment is legacy then all files in the fragment must be
         self.files[0].is_legacy_file()
+    }
+
+    // Helper method to infer the Lance version from a set of fragments
+    pub fn try_infer_version(fragments: &[Self]) -> Result<LanceFileVersion> {
+        // Otherwise we need to check the actual file versions
+        // Determine version from first file
+        let sample_file = &fragments[0].files[0];
+        let file_version = LanceFileVersion::try_from_major_minor(
+            sample_file.file_major_version,
+            sample_file.file_minor_version,
+        )?;
+        // Ensure all files match
+        for frag in fragments {
+            for file in &frag.files {
+                let this_file_version = LanceFileVersion::try_from_major_minor(
+                    file.file_major_version,
+                    file.file_minor_version,
+                )?;
+                if file_version != this_file_version {
+                    return Err(Error::invalid_input(
+                        "All data files must have the same version",
+                        location!(),
+                    ));
+                }
+            }
+        }
+        Ok(file_version)
     }
 }
 
