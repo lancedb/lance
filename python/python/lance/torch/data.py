@@ -129,7 +129,7 @@ def _buffer_arrow_batches(
     buffer = []
     cur_size = 0
     for item in it:
-        if cur_size > 0 and cur_size + item.num_rows >= buffer_size:
+        if cur_size > 0 and cur_size + item.num_rows > buffer_size:
             if len(buffer) == 1:
                 # Most of the time, we are in the happy situation where we have a single
                 # batch to yield.
