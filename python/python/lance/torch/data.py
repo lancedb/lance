@@ -60,7 +60,7 @@ def _to_tensor(
             or pa.types.is_floating(arr.type)
             or pa.types.is_boolean(arr.type)
         ):
-            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
+            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=True))
 
             if uint64_as_int64 and tensor.dtype == torch.uint64:
                 tensor = tensor.to(torch.int64)
