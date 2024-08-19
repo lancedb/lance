@@ -252,7 +252,11 @@ def compute_partitions(
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
             for batch in loader:
-                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+                vecs = (
+                    batch[column]
+                    .to(kmeans.device)
+                    .reshape(-1, kmeans.centroids.shape[1])
+                )
 
                 partitions = kmeans.transform(vecs)
                 ids = batch["_rowid"].reshape(-1)
