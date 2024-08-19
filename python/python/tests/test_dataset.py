@@ -1626,6 +1626,65 @@ def test_io_buffer_size(tmp_path: Path):
         schema=schema,
         data_storage_version="stable",
         max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This test is similar but the first column is a list column.  The I/O to grab
+    # the list items will span multiple requests and it is important that all of
+    # those requests share the priority of the parent list
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array([[0]] * 1024 * 1024, pa.list_(pa.uint64())),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # Next we consider the case where the column is a struct column and we want to
+    # make sure we don't decode too deeply into the struct child
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [{"foo": i} for i in range(1024 * 1024)],
+                        pa.struct([pa.field("foo", pa.uint64())]),
+                    ),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.struct([pa.field("foo", pa.uint64())]), "b": pa.uint64()}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
     )
 
     dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
