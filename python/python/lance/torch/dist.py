@@ -3,8 +3,6 @@
 
 """ Pytorch Distributed Utilities """
 
-import os
-
 import torch.distributed as dist
 import torch.utils.data
 
