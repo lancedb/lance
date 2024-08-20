@@ -63,7 +63,7 @@ def get_mp_rank() -> int:
 
 def get_global_world_size() -> int:
     """
-    Get the global world size for the distributed training setup.
+    Get the global world size across distributed and multiprocessing contexts.
 
     Returns:
         int: The global world size, defaulting to 1 if not set in the environment.
@@ -73,7 +73,7 @@ def get_global_world_size() -> int:
 
 def get_global_rank() -> int:
     """
-    Get the global rank of the current process in the distributed training setup.
+    Get the global rank of the current process across distributed and multiprocessing contexts.
 
     Returns:
         int: The global rank of the current process.
