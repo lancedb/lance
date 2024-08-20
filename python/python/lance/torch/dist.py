@@ -35,14 +35,6 @@ def get_dist_rank() -> int:
     return 0
 
 
-def get_dist_local_rank() -> int:
-    return get_dist_rank() % get_dist_local_world_size()
-
-
-def get_dist_local_world_size() -> int:
-    return int(os.environ.get("LOCAL_WORLD_SIZE", 1))
-
-
 def get_mp_world_size() -> int:
     """
     Get the number of worker processes for the current DataLoader.
@@ -67,3 +59,23 @@ def get_mp_rank() -> int:
     if (worker_info := torch.utils.data.get_worker_info()) is not None:
         return worker_info.id
     return 0
+
+
+def get_global_world_size() -> int:
+    """
+    Get the global world size for the distributed training setup.
+
+    Returns:
+        int: The global world size, defaulting to 1 if not set in the environment.
+    """
+    return get_dist_world_size() * get_mp_world_size()
+
+
+def get_global_rank() -> int:
+    """
+    Get the global rank of the current process in the distributed training setup.
+
+    Returns:
+        int: The global rank of the current process.
+    """
+    return get_dist_rank() * get_mp_world_size() + get_mp_rank()
