@@ -307,14 +307,11 @@ impl Fragment {
     pub fn try_infer_version(fragments: &[Self]) -> Result<Option<LanceFileVersion>> {
         // Otherwise we need to check the actual file versions
         // Determine version from first file
-        let sample_file = if let Some(sample_file) = fragments
+        let Some(sample_file) = fragments
             .iter()
-            .filter(|f| f.files.len() > 0)
-            .next()
+            .find(|f| !f.files.is_empty())
             .map(|f| &f.files[0])
-        {
-            sample_file
-        } else {
+        else {
             return Ok(None);
         };
         let file_version = LanceFileVersion::try_from_major_minor(

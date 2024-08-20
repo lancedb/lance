@@ -204,7 +204,7 @@ fn fix_data_storage_version(manifest: &mut Manifest) -> Result<()> {
             Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
                 message: format!(
                     "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
-                    e.to_string()
+                    e
                 ),
                 location: location!(),
             })? {
