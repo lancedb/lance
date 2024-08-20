@@ -369,10 +369,13 @@ def test_filter(tmp_path: Path):
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
 
 
-def test_limit_offset(tmp_path: Path):
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
+def test_limit_offset(tmp_path: Path, data_storage_version: str):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
+    lance.write_dataset(
+        table, base_dir, data_storage_version=data_storage_version, max_rows_per_file=10
+    )
     dataset = lance.dataset(base_dir)
 
     # test just limit
@@ -383,6 +386,24 @@ def test_limit_offset(tmp_path: Path):
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
+
+    # Slicing in the middle of fragments
+    assert dataset.to_table(offset=5, limit=20) == table.slice(5, 20)
+
+    # Slicing within a single fragment
+    assert dataset.to_table(offset=5, limit=3) == table.slice(5, 3)
+
+    # Skipping entire fragments
+    assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
+
+    # Limit past the end
+    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+
+    # Invalid limit / offset
+    with pytest.raises(ValueError, match="Offset must be non-negative"):
+        assert dataset.to_table(offset=-1, limit=10) == table.slice(50, 50)
+    with pytest.raises(ValueError, match="Limit must be non-negative"):
+        assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
 
 
 def test_relative_paths(tmp_path: Path):

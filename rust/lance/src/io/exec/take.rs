@@ -385,6 +385,7 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
+            None,
             scan_schema,
             10,
             10,
@@ -420,6 +421,7 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
+            None,
             scan_schema,
             10,
             10,
@@ -455,6 +457,7 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
+            None,
             scan_schema,
             10,
             10,
@@ -475,6 +478,7 @@ mod tests {
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
+            None,
             Arc::new(dataset.schema().project(&["i"])?),
             10,
             10,
