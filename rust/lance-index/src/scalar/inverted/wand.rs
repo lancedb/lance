@@ -5,6 +5,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
+use arrow::datatypes::Int32Type;
+use arrow_array::PrimitiveArray;
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::Result;
@@ -17,6 +19,7 @@ use super::{DocInfo, PostingList};
 #[derive(Clone)]
 pub struct PostingIterator {
     token_id: u32,
+    position: i32,
     list: PostingList,
     index: usize,
     mask: Arc<RowIdMask>,
@@ -51,6 +54,7 @@ impl Ord for PostingIterator {
 impl PostingIterator {
     pub(crate) fn new(
         token_id: u32,
+        position: i32,
         list: PostingList,
         num_doc: usize,
         mask: Arc<RowIdMask>,
@@ -58,6 +62,7 @@ impl PostingIterator {
         let approximate_upper_bound = idf(list.len(), num_doc) * (K1 + 1.0);
         Self {
             token_id,
+            position,
             list,
             index: 0,
             mask,
@@ -76,6 +81,10 @@ impl PostingIterator {
         } else {
             None
         }
+    }
+
+    fn positions(&self, row_id: u64) -> Option<PrimitiveArray<Int32Type>> {
+        self.list.positions(row_id)
     }
 
     // move to the next row id that is greater than or equal to least_id
@@ -113,6 +122,7 @@ impl Wand {
     // search the top-k documents that contain the query
     pub(crate) async fn search(
         &mut self,
+        is_phrase_query: bool,
         limit: usize,
         factor: f32,
         scorer: impl Fn(u64, f32) -> f32,
@@ -121,7 +131,24 @@ impl Wand {
             return Ok(vec![]);
         }
 
+        let num_query_tokens = self.postings.len();
+
         while let Some(doc) = self.next().await? {
+            if is_phrase_query {
+                // all the tokens should be in the same document cause it's a phrase query
+                if self.postings.len() != num_query_tokens {
+                    break;
+                }
+                if let Some(last) = self.postings.last() {
+                    if last.doc().unwrap().row_id != doc {
+                        continue;
+                    }
+                }
+
+                if !self.check_positions() {
+                    continue;
+                }
+            }
             let score = self.score(doc, &scorer);
             if self.candidates.len() < limit {
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
@@ -228,5 +255,82 @@ impl Wand {
                 break;
             }
         }
+    }
+
+    fn check_positions(&self) -> bool {
+        let mut position_iters = self
+            .postings
+            .iter()
+            .map(|posting| {
+                PositionIterator::new(
+                    posting
+                        .positions(posting.doc().unwrap().row_id)
+                        .expect("positions must exist"),
+                    posting.position,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        loop {
+            let mut max_pos = None;
+            let mut all_same = true;
+            for iter in &position_iters {
+                match (iter.position(), max_pos) {
+                    (Some(pos), None) => {
+                        max_pos = Some(pos);
+                    }
+                    (Some(pos), Some(max)) => {
+                        if pos > max {
+                            max_pos = Some(pos);
+                        }
+                        if pos != max {
+                            all_same = false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+
+            if all_same {
+                return true;
+            }
+
+            position_iters.iter_mut().for_each(|iter| {
+                iter.next(max_pos.unwrap());
+            });
+        }
+    }
+}
+
+struct PositionIterator {
+    positions: PrimitiveArray<Int32Type>,
+    pub position_in_query: i32,
+    index: usize,
+}
+
+impl PositionIterator {
+    fn new(positions: PrimitiveArray<Int32Type>, position_in_query: i32) -> Self {
+        Self {
+            positions,
+            position_in_query,
+            index: 0,
+        }
+    }
+
+    fn position(&self) -> Option<i32> {
+        if self.index < self.positions.len() {
+            Some(self.positions.value(self.index) - self.position_in_query)
+        } else {
+            None
+        }
+    }
+
+    fn next(&mut self, least_pos: i32) -> Option<i32> {
+        let least_pos = least_pos + self.position_in_query;
+        self.index = self
+            .positions
+            .values()
+            .partition_point(|&pos| pos < least_pos);
+        self.position()
     }
 }

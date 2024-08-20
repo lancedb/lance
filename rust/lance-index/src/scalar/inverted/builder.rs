@@ -9,7 +9,7 @@ use crate::scalar::{IndexReader, IndexStore};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow::datatypes::{self, Float32Type, UInt32Type, UInt64Type};
+use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
@@ -110,8 +110,8 @@ pub async fn update_index(
                 let token_id = token_set.add(token.text.to_owned());
                 token_occurrences
                     .entry(token_id)
-                    .and_modify(|positions: &mut Vec<u32>| positions.push(token.position as u32))
-                    .or_insert_with(|| vec![token.position as u32]);
+                    .and_modify(|positions: &mut Vec<i32>| positions.push(token.position as i32))
+                    .or_insert_with(|| vec![token.position as i32]);
                 token_cnt += 1;
             }
             invert_list.add(token_occurrences, row_id);
@@ -176,7 +176,7 @@ impl InvertedList {
             } else {
                 reader.num_rows()
             };
-            let batch = reader.read_range(offset..next_offset).await?;
+            let batch = reader.read_range(offset..next_offset, None).await?;
             let row_ids_col = batch[ROW_ID].as_primitive::<UInt64Type>().values();
             let frequencies_col = batch[FREQUENCY_COL].as_primitive::<Float32Type>().values();
             let positions_col = batch.column_by_name(POSITION_COL).map(|col| {
@@ -185,7 +185,7 @@ impl InvertedList {
                     .map(|positions| {
                         positions
                             .unwrap()
-                            .as_primitive::<UInt32Type>()
+                            .as_primitive::<Int32Type>()
                             .values()
                             .to_vec()
                     })
@@ -233,7 +233,7 @@ impl InvertedList {
 
     // for efficiency, we don't check if the row_id exists
     // we assume that the row_id is unique and doesn't exist in the list
-    pub fn add(&mut self, token_occurrences: HashMap<u32, Vec<u32>>, row_id: u64) {
+    pub fn add(&mut self, token_occurrences: HashMap<u32, Vec<i32>>, row_id: u64) {
         for (token_id, term_positions) in token_occurrences {
             let token_id = token_id as usize;
             if token_id >= self.inverted_list.len() {
@@ -348,6 +348,25 @@ mod tests {
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
+
+        // test phrase query
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(2));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(0));
     }
 
     #[tokio::test]
