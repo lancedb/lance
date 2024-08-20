@@ -697,9 +697,12 @@ impl BTreeIndex {
             page_lookup,
             store,
             sub_index,
-            index_cache: Arc::new(Cache::builder().weigher(|_, v: &Arc<dyn ScalarIndex>| {
-                v.deep_size_of() as u32
-            }).max_capacity(1024 * 1024 * 1024 * 4).build()),
+            index_cache: Arc::new(
+                Cache::builder()
+                    .weigher(|_, v: &Arc<dyn ScalarIndex>| v.deep_size_of() as u32)
+                    .max_capacity(1024 * 1024 * 1024 * 4)
+                    .build(),
+            ),
         }
     }
 

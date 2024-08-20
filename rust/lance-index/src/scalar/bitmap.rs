@@ -172,7 +172,7 @@ impl ScalarIndex for BitmapIndex {
                 let mut union_bitmap = RowIdTreeMap::default();
 
                 for (_, bitmap) in range_iter {
-                    union_bitmap |= bitmap.clone();
+                    union_bitmap |= bitmap;
                 }
 
                 union_bitmap
@@ -182,7 +182,7 @@ impl ScalarIndex for BitmapIndex {
                 for val in values {
                     let key = OrderableScalarValue(val.clone());
                     if let Some(bitmap) = self.index_map.get(&key) {
-                        union_bitmap |= bitmap.clone();
+                        union_bitmap |= bitmap;
                     }
                 }
 
