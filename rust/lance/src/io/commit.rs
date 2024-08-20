@@ -196,28 +196,27 @@ async fn migrate_manifest(
 
 fn fix_data_storage_version(manifest: &mut Manifest) -> Result<()> {
     let data_storage_version = manifest.data_storage_format.lance_file_version()?;
-    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy
-        && manifest.fragments.len() > 0
-    {
+    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
         // Due to bugs in 0.16 it is possible the dataset's data storage version does not
         // match the file version.  As a result, we need to check and see if they are out
         // of sync.
-        let actual_file_version =
+        if let Some(actual_file_version) =
             Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
                 message: format!(
                     "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
                     e.to_string()
                 ),
                 location: location!(),
-            })?;
-        if actual_file_version > data_storage_version {
-            log::warn!(
-                "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
-                data_storage_version,
-                actual_file_version
-            );
-            manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
-        }
+            })? {
+                if actual_file_version > data_storage_version {
+                    log::warn!(
+                        "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
+                        data_storage_version,
+                        actual_file_version
+                    );
+                    manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
+                }
+            }
     }
     Ok(())
 }
