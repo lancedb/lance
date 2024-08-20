@@ -6,6 +6,7 @@ from pathlib import Path
 
 import lance
 import pyarrow as pa
+import pytest
 
 
 def prep_dataset(tmp_path: Path, version, name: str):
@@ -37,3 +38,27 @@ def test_add_data_storage_version(tmp_path: Path):
     check_dataset("v2_no_files.lance", "2.0")
     check_dataset("v1_with_files.lance", "0.1")
     check_dataset("v2_with_files.lance", "2.0")
+
+
+def test_fix_data_storage_version(tmp_path: Path):
+    """
+    In versions above 0.15 and below 0.17 we wrote the data storage version but
+    we might have written it incorrectly.  In version 0.17 we fixed the inference
+    rules.  However, this means a dataset could exist that has v2 files and a
+    data storage version of 0.1.  Or, worse, it is even possible to have created
+    a dataset with a mix of 0.1 and 2.0 files.  The former, we can fix automatically
+    and the latter we can at least detect and advise the user rollback their dataset.
+    """
+    ds = prep_dataset(tmp_path, "v0.16.0", "wrong_data_version_can_fix.lance")
+    assert ds.data_storage_version == "0.1"
+
+    ds.delete("false")
+    assert ds.data_storage_version == "2.0"
+
+    ds = prep_dataset(tmp_path, "v0.16.0", "wrong_data_version_no_fix.lance")
+    assert ds.data_storage_version == "0.1"
+
+    with pytest.raises(
+        OSError, match="The dataset contains a mixture of file versions"
+    ):
+        ds.delete("false")

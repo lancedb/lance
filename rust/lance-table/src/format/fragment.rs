@@ -321,7 +321,10 @@ impl Fragment {
                 )?;
                 if file_version != this_file_version {
                     return Err(Error::invalid_input(
-                        "All data files must have the same version",
+                        format!(
+                            "All data files must have the same version.  Detected both {} and {}",
+                            file_version, this_file_version
+                        ),
                         location!(),
                     ));
                 }
