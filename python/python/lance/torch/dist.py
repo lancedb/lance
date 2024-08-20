@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+""" Pytorch Distributed Utilities """
+
 import os
 
 import torch.distributed as dist
