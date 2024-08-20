@@ -521,6 +521,7 @@ impl RowIdTreeMap {
 impl std::ops::BitOr<Self> for RowIdTreeMap {
     type Output = Self;
 
+    #[inline(always)]
     fn bitor(mut self, rhs: Self) -> Self::Output {
         self |= rhs;
         self
@@ -530,6 +531,7 @@ impl std::ops::BitOr<Self> for RowIdTreeMap {
 impl std::ops::BitOr<&Self> for RowIdTreeMap {
     type Output = Self;
 
+    #[inline(always)]
     fn bitor(mut self, rhs: &Self) -> Self::Output {
         self |= rhs;
         self
@@ -537,12 +539,14 @@ impl std::ops::BitOr<&Self> for RowIdTreeMap {
 }
 
 impl std::ops::BitOrAssign<Self> for RowIdTreeMap {
+    #[inline(always)]
     fn bitor_assign(&mut self, rhs: Self) {
         std::ops::BitOrAssign::<&Self>::bitor_assign(self, &rhs);
     }
 }
 
 impl std::ops::BitOrAssign<&Self> for RowIdTreeMap {
+    #[inline(always)]
     fn bitor_assign(&mut self, rhs: &Self) {
         for (fragment, rhs_set) in &rhs.inner {
             match self.inner.get_mut(fragment) {
