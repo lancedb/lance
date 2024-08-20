@@ -467,7 +467,7 @@ impl InvertedListReader {
                 .await?;
             Result::Ok(batch
                 .column_by_name(POSITION_COL)
-                .ok_or(Error::Index { message: format!("the index was built with old version which doesn't support phrase query, please re-create the index"), location: location!() })?
+                .ok_or(Error::Index { message: "the index was built with old version which doesn't support phrase query, please re-create the index".to_owned(), location: location!() })?
                 .as_list::<i32>()
                 .clone())
         }).await.map_err(|e| Error::io(e.to_string(), location!()))
