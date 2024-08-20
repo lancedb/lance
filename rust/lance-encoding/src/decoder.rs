@@ -1233,7 +1233,7 @@ impl BatchDecodeStream {
                 if size_bytes > BATCH_SIZE_BYTES_WARNING {
                     emitted_batch_size_warning.call_once(|| {
                         let size_mb = size_bytes / 1024 / 1024;
-                        warn!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+                        debug!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
                     });
                 }
                 Ok(batch)
