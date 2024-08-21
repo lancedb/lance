@@ -16,7 +16,7 @@ use snafu::{location, Location};
 use crate::{
     decoder::{
         DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-        NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     format::pb,
@@ -100,7 +100,7 @@ impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine> {
         let mut decoders = Vec::new();
         if !self.initialized {
@@ -121,9 +121,7 @@ impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
             let mut next_child = self.children.pop().unwrap();
             trace!("Scheduling more rows for child {}", next_child.col_idx);
             let scoped = context.push(next_child.col_name, next_child.col_idx);
-            let child_scan = next_child
-                .job
-                .schedule_next(scoped.context, top_level_row)?;
+            let child_scan = next_child.job.schedule_next(scoped.context, priority)?;
             trace!(
                 "Scheduled {} rows for child {}",
                 child_scan.rows_scheduled,
@@ -219,6 +217,8 @@ struct ChildState {
     rows_loaded: u64,
     // Rows that have drained
     rows_drained: u64,
+    // Rows that have been popped (the decoder has been completely drained and removed from `scheduled`)
+    rows_popped: u64,
     // Total number of rows in the struct
     num_rows: u64,
     // The field index in the struct (used for debugging / logging)
@@ -256,6 +256,7 @@ impl ChildState {
             scheduled: VecDeque::new(),
             rows_loaded: 0,
             rows_drained: 0,
+            rows_popped: 0,
             num_rows,
             field_index,
         }
@@ -267,62 +268,54 @@ impl ChildState {
     // go above that limit.
     async fn wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
         trace!(
-            "Struct child {} waiting for at least {} rows to be loaded and {} are loaded already",
+            "Struct child {} waiting for more than {} rows to be loaded and {} are fully loaded already",
             self.field_index,
             loaded_need,
             self.rows_loaded,
         );
-        let mut current_need = loaded_need;
-        let mut loaded = 0;
+        let mut fully_loaded = self.rows_popped;
         for (page_idx, next_decoder) in self.scheduled.iter_mut().enumerate() {
             if next_decoder.rows_unloaded() > 0 {
-                let need_for_page = next_decoder.num_rows().min(current_need);
+                let mut current_need = loaded_need;
+                current_need -= fully_loaded;
+                let rows_in_page = next_decoder.num_rows();
+                let need_for_page = (rows_in_page - 1).min(current_need);
                 trace!(
-                    "Struct child {} page {} will wait until {} rows loaded",
+                    "Struct child {} page {} will wait until more than {} rows loaded from page with {} rows",
                     self.field_index,
                     page_idx,
-                    need_for_page
+                    need_for_page,
+                    rows_in_page,
                 );
-                // Even though we wait for X rows we might actually end up
-                // loading more than that
-                let previously_loaded = next_decoder.rows_loaded();
                 // We might only await part of a page.  This is important for things
                 // like the struct<struct<...>> case where we have one outer page, one
                 // middle page, and then a bunch of inner pages.  If we await the entire
                 // middle page then we will have to wait for all the inner pages to arrive
                 // before we can start decoding.
                 next_decoder.wait_for_loaded(need_for_page).await?;
-                let newly_loaded = next_decoder.rows_loaded() - previously_loaded;
-                self.rows_loaded += newly_loaded;
-                loaded += newly_loaded;
+                let now_loaded = next_decoder.rows_loaded();
+                fully_loaded += now_loaded;
                 trace!(
-                    "Struct child {} page {} await loaded {} rows and now {} are loaded",
+                    "Struct child {} page {} await and now has {} loaded rows and we have {} fully loaded",
                     self.field_index,
                     page_idx,
-                    newly_loaded,
-                    self.rows_loaded
+                    now_loaded,
+                    fully_loaded
                 );
+            } else {
+                fully_loaded += next_decoder.num_rows();
             }
-            current_need = current_need.saturating_sub(next_decoder.rows_loaded());
-            if current_need == 0 {
+            if fully_loaded > loaded_need {
                 break;
             }
         }
+        self.rows_loaded = fully_loaded;
         trace!(
             "Struct child {} loaded {} new rows and now {} are loaded",
             self.field_index,
-            loaded,
+            fully_loaded,
             self.rows_loaded
         );
-        if loaded == 0 {
-            return Err(Error::Internal {
-                message: format!(
-                    "Ran out of page decoders before satisfying request for {} rows",
-                    loaded_need
-                ),
-                location: location!(),
-            });
-        }
         Ok(())
     }
 
@@ -346,6 +339,7 @@ impl ChildState {
             let next_task = next.drain(rows_to_take)?;
             if next.rows_left() == 0 {
                 trace!("Completely drained page");
+                self.rows_popped += next.num_rows();
                 self.scheduled.pop_front();
             }
             remaining -= rows_to_take;
@@ -402,12 +396,12 @@ impl SimpleStructDecoder {
         }
     }
 
-    async fn do_waited_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
+    async fn do_wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
         let mut wait_orders = self
             .children
             .iter_mut()
             .filter_map(|child| {
-                if child.rows_loaded < loaded_need {
+                if child.rows_loaded <= loaded_need {
                     Some(WaitOrder(child))
                 } else {
                     None
@@ -419,17 +413,17 @@ impl SimpleStructDecoder {
             let next_highest = wait_orders
                 .peek()
                 .map(|w| w.0.rows_loaded)
-                .unwrap_or(u64::MAX - 1);
+                .unwrap_or(u64::MAX);
             // Wait until you have the number of rows needed, or at least more than the
             // next highest waiter
-            let limit = loaded_need.min(next_highest + 1);
+            let limit = loaded_need.min(next_highest);
             next_waiter.0.wait_for_loaded(limit).await?;
             log::trace!(
                 "Struct child {} finished await pass and now {} are loaded",
                 next_waiter.0.field_index,
                 next_waiter.0.rows_loaded
             );
-            if next_waiter.0.rows_loaded < loaded_need {
+            if next_waiter.0.rows_loaded <= loaded_need {
                 wait_orders.push(next_waiter);
             }
         }
@@ -455,7 +449,7 @@ impl LogicalPageDecoder for SimpleStructDecoder {
     }
 
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
-        self.do_waited_for_loaded(loaded_need).boxed()
+        self.do_wait_for_loaded(loaded_need).boxed()
     }
 
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
