@@ -17,6 +17,7 @@ use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use snafu::{location, Location};
 
 use super::index::*;
@@ -68,7 +69,17 @@ impl InvertedIndexBuilder {
         token_set_writer.write_record_batch(token_set_batch).await?;
         token_set_writer.finish().await?;
 
+        // calculate the max BM25 score for each posting list
+        let max_scores = self
+            .invert_list
+            .inverted_list
+            .par_iter()
+            .map(|list| list.calculate_max_score(&self.docs))
+            .collect::<Vec<_>>();
+        let max_scores = serde_json::to_string(&max_scores)?;
         let invert_list_batch = self.invert_list.to_batch()?;
+        let invert_list_batch =
+            invert_list_batch.add_metadata("max_scores".to_owned(), max_scores)?;
         let mut invert_list_writer = dest_store
             .new_index_file(INVERT_LIST_FILE, invert_list_batch.schema())
             .await?;

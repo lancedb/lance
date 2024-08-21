@@ -4,6 +4,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
+use std::usize;
 
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
@@ -55,7 +56,10 @@ impl PostingIterator {
         num_doc: usize,
         mask: Arc<RowIdMask>,
     ) -> Self {
-        let approximate_upper_bound = idf(list.len(), num_doc) * (K1 + 1.0);
+        let approximate_upper_bound = match list.max_score() {
+            Some(max_score) => max_score,
+            None => idf(list.len(), num_doc) * (K1 + 1.0),
+        };
         Self {
             token_id,
             list,
@@ -96,15 +100,17 @@ impl PostingIterator {
 pub struct Wand {
     threshold: f32, // multiple of factor and the minimum score of the top-k documents
     cur_doc: Option<u64>,
+    num_docs: usize,
     postings: Vec<PostingIterator>,
     candidates: BinaryHeap<Reverse<OrderedDoc>>,
 }
 
 impl Wand {
-    pub(crate) fn new(postings: impl Iterator<Item = PostingIterator>) -> Self {
+    pub(crate) fn new(num_docs: usize, postings: impl Iterator<Item = PostingIterator>) -> Self {
         Self {
             threshold: 0.0,
             cur_doc: None,
+            num_docs,
             postings: postings.collect(),
             candidates: BinaryHeap::new(),
         }
@@ -152,8 +158,8 @@ impl Wand {
                 break;
             }
             debug_assert!(cur_doc == doc);
-
-            score += posting.approximate_upper_bound() * scorer(doc, freq);
+            let idf = idf(posting.list.len(), self.num_docs);
+            score += idf * (K1 + 1.0) * scorer(doc, freq);
         }
         score
     }
@@ -169,16 +175,8 @@ impl Wand {
 
             let cur_doc = self.cur_doc.unwrap_or(0);
             if self.cur_doc.is_some() && doc <= cur_doc {
-                // the pivot doc id is less than the current doc id,
-                // that means this doc id has been processed before, so skip it
-                self.move_terms(cur_doc + 1);
-            } else if self
-                .postings
-                .first()
-                .and_then(|posting| posting.doc().map(|(d, _)| d))
-                .expect("the postings can't be empty")
-                == doc
-            {
+                self.move_term(cur_doc + 1);
+            } else if self.postings[0].doc().unwrap().0 == doc {
                 // all the posting iterators have reached this doc id,
                 // so that means the sum of upper bound of all terms is not less than the threshold,
                 // this document is a candidate
@@ -187,7 +185,7 @@ impl Wand {
             } else {
                 // some posting iterators haven't reached this doc id,
                 // so move such terms to the doc id
-                self.move_terms(doc);
+                self.move_term(doc);
             }
         }
         Ok(None)
@@ -210,15 +208,9 @@ impl Wand {
     // pick the term that has the maximum upper bound and the current doc id is less than the given doc id
     // so that we can move the posting iterator to the next doc id that is possible to be candidate
     #[instrument(level = "debug", skip_all)]
-    fn move_terms<'b>(&mut self, least_id: u64) {
-        for posting in self.postings.iter_mut() {
-            match posting.doc() {
-                Some((d, _)) if d < least_id => {
-                    posting.next(least_id);
-                }
-                _ => break,
-            }
-        }
+    fn move_term(&mut self, least_id: u64) {
+        let picked = self.pick_term(least_id);
+        self.postings[picked].next(least_id);
 
         self.postings.sort_unstable();
         while let Some(last) = self.postings.last() {
@@ -228,5 +220,21 @@ impl Wand {
                 break;
             }
         }
+    }
+
+    fn pick_term(&self, least_id: u64) -> usize {
+        let mut least_length = usize::MAX;
+        let mut pick_index = 0;
+        for (i, posting) in self.postings.iter().enumerate() {
+            let (doc, _) = posting.doc().unwrap();
+            if doc >= least_id {
+                break;
+            }
+            if posting.list.len() < least_length {
+                least_length = posting.list.len();
+                pick_index = i;
+            }
+        }
+        pick_index
     }
 }
