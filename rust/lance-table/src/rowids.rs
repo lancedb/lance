@@ -178,6 +178,8 @@ impl RowIdSequence {
             offset = cutoff;
         }
 
+        self.0.retain(|segment| segment.len() != 0);
+
         Ok(())
     }
 
@@ -815,6 +817,17 @@ mod test {
             },
             U64Segment::Array(vec![35].into()),
         ]);
+        assert_eq!(sequence, expected);
+    }
+
+    #[test]
+    fn test_row_id_mask_everything() {
+        let mut sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::SortedArray(vec![7, 9].into()),
+        ]);
+        sequence.mask(0..sequence.len() as u32).unwrap();
+        let expected = RowIdSequence(vec![]);
         assert_eq!(sequence, expected);
     }
 }

@@ -21,6 +21,7 @@ use futures::TryStreamExt;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::mask::RowIdMask;
 use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::tokio::spawn_cpu;
 use lance_table::format::Fragment;
 use lance_table::format::Index;
 use lance_table::rowids::RowIdSequence;
@@ -152,7 +153,7 @@ impl DatasetPreFilter {
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
-                    let allow_list = tokio::task::spawn_blocking(move || {
+                    let allow_list = spawn_cpu(move || {
                         row_ids_and_deletions.into_iter().fold(
                             RowIdTreeMap::new(),
                             |mut allow_list, (row_ids, deletion_vector)| {

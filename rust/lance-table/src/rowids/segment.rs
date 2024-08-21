@@ -412,9 +412,8 @@ impl U64Segment {
         // To get minimum, need to find the first value that is not masked.
         let first_unmasked = (0..self.len())
             .zip(positions.iter().cycle())
-            .filter(|(sequential_i, i)| **i != *sequential_i as u32)
+            .find(|(sequential_i, i)| **i != *sequential_i as u32)
             .map(|(sequential_i, _)| sequential_i)
-            .next()
             .unwrap();
         let min = self.get(first_unmasked).unwrap();
 
@@ -434,19 +433,17 @@ impl U64Segment {
             sorted,
         };
 
-        let make_new_iter = || {
-            let mut positions = positions.iter().copied().peekable();
-            self.iter().enumerate().filter_map(move |(i, val)| {
-                if let Some(next_pos) = positions.peek() {
-                    if *next_pos == i as u32 {
-                        positions.next();
-                        return None;
-                    }
+        let mut positions = positions.iter().copied().peekable();
+        let sequence = self.iter().enumerate().filter_map(move |(i, val)| {
+            if let Some(next_pos) = positions.peek() {
+                if *next_pos == i as u32 {
+                    positions.next();
+                    return None;
                 }
-                Some(val)
-            })
-        };
-        *self = Self::from_stats_and_sequence(stats, make_new_iter())
+            }
+            Some(val)
+        });
+        *self = Self::from_stats_and_sequence(stats, sequence)
     }
 }
 
