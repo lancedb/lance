@@ -139,7 +139,7 @@ impl DatasetPreFilter {
                     let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
                     Ok::<_, crate::Error>((row_ids?, deletion_vector?))
                 })
-                .buffer_unordered(10)
+                .buffer_unordered(dataset.object_store().io_parallelism()? as usize)
                 .try_collect::<Vec<_>>()
                 .await
         }
@@ -154,7 +154,7 @@ impl DatasetPreFilter {
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
                     let allow_list = spawn_cpu(move || {
-                        row_ids_and_deletions.into_iter().fold(
+                        Ok(row_ids_and_deletions.into_iter().fold(
                             RowIdTreeMap::new(),
                             |mut allow_list, (row_ids, deletion_vector)| {
                                 let seq = if let Some(deletion_vector) = deletion_vector {
@@ -168,7 +168,7 @@ impl DatasetPreFilter {
                                 allow_list |= treemap;
                                 allow_list
                             },
-                        )
+                        ))
                     })
                     .await?;
 
