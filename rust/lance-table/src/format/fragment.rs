@@ -304,10 +304,16 @@ impl Fragment {
     }
 
     // Helper method to infer the Lance version from a set of fragments
-    pub fn try_infer_version(fragments: &[Self]) -> Result<LanceFileVersion> {
+    pub fn try_infer_version(fragments: &[Self]) -> Result<Option<LanceFileVersion>> {
         // Otherwise we need to check the actual file versions
         // Determine version from first file
-        let sample_file = &fragments[0].files[0];
+        let Some(sample_file) = fragments
+            .iter()
+            .find(|f| !f.files.is_empty())
+            .map(|f| &f.files[0])
+        else {
+            return Ok(None);
+        };
         let file_version = LanceFileVersion::try_from_major_minor(
             sample_file.file_major_version,
             sample_file.file_minor_version,
@@ -321,13 +327,16 @@ impl Fragment {
                 )?;
                 if file_version != this_file_version {
                     return Err(Error::invalid_input(
-                        "All data files must have the same version",
+                        format!(
+                            "All data files must have the same version.  Detected both {} and {}",
+                            file_version, this_file_version
+                        ),
                         location!(),
                     ));
                 }
             }
         }
-        Ok(file_version)
+        Ok(Some(file_version))
     }
 }
 
