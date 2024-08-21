@@ -4,7 +4,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::usize;
 
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdMask;
