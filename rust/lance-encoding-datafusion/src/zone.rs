@@ -22,7 +22,7 @@ use futures::{future::BoxFuture, FutureExt};
 use lance_encoding::{
     decoder::{
         decode_batch, ColumnInfo, DecoderMiddlewareChain, FieldScheduler, FilterExpression,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
         encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedBuffer, EncodedColumn,
@@ -356,7 +356,7 @@ impl SchedulingJob for EmptySchedulingJob {
     fn schedule_next(
         &mut self,
         _context: &mut SchedulerContext,
-        _top_level_row: u64,
+        _priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine> {
         Ok(ScheduledScanLine {
             rows_scheduled: 0,

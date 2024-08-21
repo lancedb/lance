@@ -1679,6 +1679,61 @@ def test_io_buffer_size(tmp_path: Path):
 
     dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
 
+    # Another scenario.  Each list item is a page in itself and we have two list
+    # columns
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.list_(pa.uint64())})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Same scenario as above except now it's a list<list<int>>
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.list_(pa.list_(pa.uint64())), "b": pa.list_(pa.list_(pa.uint64()))}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
     # Next we consider the case where the column is a struct column and we want to
     # make sure we don't decode too deeply into the struct child
 

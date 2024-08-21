@@ -20,8 +20,9 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression,
-        LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
+        LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::logical::r#struct::SimpleStructScheduler,
@@ -318,12 +319,12 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
-    top_level_row: u64,
+    priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();
     // We know the offsets are a primitive array and thus will not need additional
     // pages.  We can use a dummy receiver to match the decoder API
-    offsets_decoder.wait_for_loaded(num_offsets).await?;
+    offsets_decoder.wait_for_loaded(num_offsets - 1).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
     let offsets = decode_task.task.decode()?;
 
@@ -331,10 +332,12 @@ async fn indirect_schedule_task(
         decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
 
     trace!(
-        "Indirectly scheduling items ranges {:?} from list items column with {} rows",
+        "Indirectly scheduling items ranges {:?} from list items column with {} rows (and priority {:?})",
         item_ranges,
-        items_scheduler.num_rows()
+        items_scheduler.num_rows(),
+        priority
     );
+    let offsets: Arc<[u64]> = offsets.into();
 
     // All requested lists are empty
     if item_ranges.is_empty() {
@@ -355,12 +358,14 @@ async fn indirect_schedule_task(
         DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields);
     let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
+    let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
+
     let indirect_messages = indirect_scheduler.schedule_ranges_to_vec(
         &item_ranges,
         // Can't push filters into list items
         &FilterExpression::no_filter(),
         io,
-        Some(top_level_row),
+        Some(priority),
     )?;
 
     for message in indirect_messages {
@@ -410,9 +415,9 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<crate::decoder::ScheduledScanLine> {
-        let next_offsets = self.offsets.schedule_next(context, top_level_row)?;
+        let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
         trace!(
@@ -442,12 +447,12 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             items_scheduler,
             items_type,
             io,
-            top_level_row,
+            priority.box_clone(),
         ));
 
         // Return a decoder
         let decoder = Box::new(ListPageDecoder {
-            offsets: Vec::new(),
+            offsets: Arc::new([]),
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
             item_decoder: None,
             rows_drained: 0,
@@ -568,7 +573,7 @@ impl FieldScheduler for ListFieldScheduler {
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
     // offsets and validity will have already been decoded as part of the indirect I/O
-    offsets: Vec<u64>,
+    offsets: Arc<[u64]>,
     validity: BooleanBuffer,
     item_decoder: Option<SimpleStructDecoder>,
     num_rows: u64,
@@ -648,6 +653,21 @@ impl DecodeArrayTask for ListDecodeTask {
     }
 }
 
+// Helper method that performs binary search.  However, once the
+// target is found it walks past any duplicates.  E.g. if the
+// input list is [0, 3, 5, 5, 5, 7] then this will only return
+// 0, 1, 4, or 5.
+fn binary_search_to_end(to_search: &[u64], target: u64) -> u64 {
+    let mut result = match to_search.binary_search(&target) {
+        Ok(idx) => idx,
+        Err(idx) => idx - 1,
+    };
+    while result < (to_search.len() - 1) && to_search[result + 1] == target {
+        result += 1;
+    }
+    result as u64
+}
+
 impl LogicalPageDecoder for ListPageDecoder {
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         async move {
@@ -668,32 +688,33 @@ impl LogicalPageDecoder for ListPageDecoder {
                 self.validity = indirectly_loaded.validity;
                 self.item_decoder = indirectly_loaded.root_decoder;
             }
-            if self.rows_loaded >= loaded_need {
+            if self.rows_loaded > loaded_need {
                 return Ok(());
             }
 
-            // Ideally this would be self.offsets[loaded_need] but it would be very difficult for
-            // the scheduler to schedule things in that order.  Unfortantely, when scheduling lists,
-            // we schedule and entire page of lists at the same priority.  As a result, we need to
-            // decode the entire page of lists all at once.
-            let items_loaded_need = *self.offsets.last().unwrap();
+            let mut boundary = loaded_need as usize;
+            debug_assert!(boundary < self.num_rows as usize);
+            while boundary + 2 < self.offsets.len() && self.offsets[boundary] == self.offsets[boundary + 1] {
+                boundary += 1;
+            }
+            let items_needed = self.offsets[boundary + 1].saturating_sub(1);
             trace!(
-                "List decoder is waiting for {} rows to be loaded and {}/{} are already loaded.  To satisfy this we need {} loaded items",
+                "List decoder is waiting for more than {} rows to be loaded and {}/{} are already loaded.  To satisfy this we need more than {} loaded items",
                 loaded_need,
                 self.rows_loaded,
                 self.num_rows,
-                items_loaded_need,
+                items_needed,
             );
 
-            let items_loaded = if items_loaded_need > 0 {
-                self.item_decoder.as_mut().unwrap().wait_for_loaded(items_loaded_need).await?;
-                self.item_decoder.as_ref().unwrap().rows_loaded()
+            let items_loaded = if let Some(item_decoder) = self.item_decoder.as_mut() {
+                item_decoder.wait_for_loaded(items_needed).await?;
+                item_decoder.rows_loaded()
             } else {
                 0
             };
 
-            self.rows_loaded = self.num_rows;
-            trace!("List decoder now has {} loaded items which corresponds to {} loaded rows", items_loaded, self.rows_loaded);
+            self.rows_loaded = binary_search_to_end(&self.offsets, items_loaded);
+            trace!("List decoder now has {} loaded rows", self.rows_loaded);
 
             Ok(())
         }
@@ -778,7 +799,7 @@ impl LogicalPageDecoder for ListPageDecoder {
 }
 
 struct IndirectlyLoaded {
-    offsets: Vec<u64>,
+    offsets: Arc<[u64]>,
     validity: BooleanBuffer,
     root_decoder: Option<SimpleStructDecoder>,
 }
@@ -1216,8 +1237,14 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_nested_list() {
+    async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_list() {
+        let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
         check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 

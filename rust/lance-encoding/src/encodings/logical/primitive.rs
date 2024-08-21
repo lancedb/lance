@@ -16,8 +16,8 @@ use lance_core::{datatypes::Field, Result};
 use crate::{
     decoder::{
         DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
-        PageInfo, PageScheduler, PrimitivePageDecoder, ScheduledScanLine, SchedulerContext,
-        SchedulingJob,
+        PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine,
+        SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
@@ -113,7 +113,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine> {
         debug_assert!(self.range_idx < self.ranges.len());
         // Get our current range
@@ -168,10 +168,11 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
-        let physical_decoder =
-            cur_page
-                .scheduler
-                .schedule_ranges(&ranges_in_page, context.io(), top_level_row);
+        let physical_decoder = cur_page.scheduler.schedule_ranges(
+            &ranges_in_page,
+            context.io(),
+            priority.current_priority(),
+        );
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.scheduler.data_type.clone(),
@@ -278,7 +279,7 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         log::trace!(
-            "PrimitiveFieldDecoder::wait for {} rows on column {} (page has {} rows)",
+            "primitive wait for more than {} rows on column {} (page has {} rows)",
             loaded_need,
             self.column_index,
             self.num_rows
