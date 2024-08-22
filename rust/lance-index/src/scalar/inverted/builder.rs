@@ -9,7 +9,7 @@ use crate::scalar::{IndexReader, IndexStore};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
-use arrow::datatypes::{self, Float32Type, UInt64Type};
+use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::RecordBatch;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
@@ -115,17 +115,17 @@ pub async fn update_index(
             let Some(doc) = doc else { continue };
             let row_id = *row_id;
             let mut token_stream = tokenizer.token_stream(doc);
-            let mut row_token_cnt = HashMap::new();
+            let mut token_occurrences = HashMap::new();
             let mut token_cnt = 0;
             while let Some(token) = token_stream.next() {
                 let token_id = token_set.add(token.text.to_owned());
-                row_token_cnt
+                token_occurrences
                     .entry(token_id)
-                    .and_modify(|cnt| *cnt += 1)
-                    .or_insert(1);
+                    .and_modify(|positions: &mut Vec<i32>| positions.push(token.position as i32))
+                    .or_insert_with(|| vec![token.position as i32]);
                 token_cnt += 1;
             }
-            invert_list.add(row_token_cnt, row_id);
+            invert_list.add(token_occurrences, row_id);
             docs.add(row_id, token_cnt);
         }
     }
@@ -187,12 +187,25 @@ impl InvertedList {
             } else {
                 reader.num_rows()
             };
-            let batch = reader.read_range(offset..next_offset).await?;
+            let batch = reader.read_range(offset..next_offset, None).await?;
             let row_ids_col = batch[ROW_ID].as_primitive::<UInt64Type>().values();
             let frequencies_col = batch[FREQUENCY_COL].as_primitive::<Float32Type>().values();
+            let positions_col = batch.column_by_name(POSITION_COL).map(|col| {
+                col.as_list::<i32>()
+                    .iter()
+                    .map(|positions| {
+                        positions
+                            .unwrap()
+                            .as_primitive::<Int32Type>()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect_vec()
+            });
             inverted_list.push(PostingListBuilder::new(
                 row_ids_col.to_vec(),
                 frequencies_col.to_vec(),
+                positions_col,
             ));
         }
 
@@ -203,28 +216,36 @@ impl InvertedList {
         for list in self.inverted_list.iter_mut() {
             let mut new_row_ids = Vec::new();
             let mut new_freqs = Vec::new();
+            let mut new_positions = list.positions.as_ref().map(|_| Vec::new());
 
             for i in 0..list.len() {
                 let row_id = list.row_ids[i];
                 let freq = list.frequencies[i];
+                let positions = list
+                    .positions
+                    .as_ref()
+                    .map(|positions| positions[i].clone());
 
                 match mapping.get(&row_id) {
                     Some(Some(new_row_id)) => {
                         new_row_ids.push(*new_row_id);
                         new_freqs.push(freq);
+                        if let Some(new_positions) = new_positions.as_mut() {
+                            new_positions.push(positions.unwrap());
+                        }
                     }
                     _ => continue,
                 }
             }
 
-            *list = PostingListBuilder::new(new_row_ids, new_freqs);
+            *list = PostingListBuilder::new(new_row_ids, new_freqs, new_positions);
         }
     }
 
     // for efficiency, we don't check if the row_id exists
     // we assume that the row_id is unique and doesn't exist in the list
-    pub fn add(&mut self, token_cnt: HashMap<u32, u32>, row_id: u64) {
-        for (token_id, freq) in token_cnt {
+    pub fn add(&mut self, token_occurrences: HashMap<u32, Vec<i32>>, row_id: u64) {
+        for (token_id, term_positions) in token_occurrences {
             let token_id = token_id as usize;
             if token_id >= self.inverted_list.len() {
                 self.inverted_list
@@ -232,7 +253,10 @@ impl InvertedList {
             }
             let list = &mut self.inverted_list[token_id];
             list.row_ids.push(row_id);
-            list.frequencies.push(freq as f32);
+            list.frequencies.push(term_positions.len() as f32);
+            if let Some(positions) = list.positions.as_mut() {
+                positions.push(term_positions);
+            }
         }
     }
 }
@@ -335,6 +359,39 @@ mod tests {
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
+
+        // test phrase query
+        // for non-phrasal query, the order of the tokens doesn't matter
+        // so there should be 4 documents that contain "database" or "lance"
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(4));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(2));
+        assert!(row_ids.contains(3));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(2));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(0));
     }
 
     #[tokio::test]
