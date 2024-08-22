@@ -1097,7 +1097,7 @@ impl Dataset {
     pub async fn count_deleted_rows(&self) -> Result<usize> {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.count_deletions().await })
-            .buffer_unordered(self.object_store.io_parallelism() as usize)
+            .buffer_unordered(self.object_store.io_parallelism())
             .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
             .await
     }
@@ -1213,7 +1213,7 @@ impl Dataset {
     pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.physical_rows().await })
-            .buffered(self.object_store.io_parallelism() as usize)
+            .buffered(self.object_store.io_parallelism())
             .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
             .await
@@ -1246,7 +1246,7 @@ impl Dataset {
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })
-            .buffer_unordered(self.object_store.io_parallelism() as usize)
+            .buffer_unordered(self.object_store.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
 
@@ -3347,8 +3347,8 @@ mod tests {
         .unwrap();
         dataset.validate().await.unwrap();
 
-        assert!(dataset.num_small_files(1024).await.unwrap() > 0);
-        assert!(dataset.num_small_files(512).await.unwrap() == 0);
+        assert!(dataset.num_small_files(1024).await > 0);
+        assert!(dataset.num_small_files(512).await == 0);
     }
 
     #[tokio::test]

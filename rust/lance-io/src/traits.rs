@@ -87,7 +87,7 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn block_size(&self) -> usize;
 
     /// Suggest optimal I/O parallelism per storage device.
-    fn io_parallelism(&self) -> u32;
+    fn io_parallelism(&self) -> usize;
 
     /// Object/File Size.
     async fn size(&self) -> object_store::Result<usize>;

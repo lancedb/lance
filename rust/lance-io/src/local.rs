@@ -123,7 +123,7 @@ impl Reader for LocalObjectReader {
         self.block_size
     }
 
-    fn io_parallelism(&self) -> u32 {
+    fn io_parallelism(&self) -> usize {
         DEFAULT_LOCAL_IO_PARALLELISM
     }
 

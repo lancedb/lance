@@ -419,7 +419,10 @@ impl ScanScheduler {
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
-        let io_queue = Arc::new(IoQueue::new(io_capacity, config.io_buffer_size_bytes));
+        let io_queue = Arc::new(IoQueue::new(
+            io_capacity as u32,
+            config.io_buffer_size_bytes,
+        ));
         let scheduler = Self {
             object_store,
             io_queue: io_queue.clone(),

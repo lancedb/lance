@@ -469,7 +469,7 @@ pub async fn plan_compaction(
                 Err(e) => Err(e),
             }
         })
-        .buffered(dataset.object_store().io_parallelism() as usize);
+        .buffered(dataset.object_store().io_parallelism());
 
     let index_fragmaps = load_index_fragmaps(dataset).await?;
     let indices_containing_frag = |frag_id: u32| {

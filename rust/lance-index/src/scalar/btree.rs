@@ -765,7 +765,7 @@ impl BTreeIndex {
             idx: 0,
         }
         .map(|fut| fut.map_err(DataFusionError::from))
-        .buffered(self.store.io_parallelism() as usize)
+        .buffered(self.store.io_parallelism())
         .boxed();
         Ok(RecordBatchStreamAdapter::new(schema, batches))
     }

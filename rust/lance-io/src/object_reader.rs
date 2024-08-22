@@ -85,7 +85,7 @@ impl Reader for CloudObjectReader {
         self.block_size
     }
 
-    fn io_parallelism(&self) -> u32 {
+    fn io_parallelism(&self) -> usize {
         DEFAULT_CLOUD_IO_PARALLELISM
     }
 

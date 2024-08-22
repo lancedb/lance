@@ -193,7 +193,7 @@ impl IndexStore for LanceIndexStore {
         self
     }
 
-    fn io_parallelism(&self) -> u32 {
+    fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
     }
 

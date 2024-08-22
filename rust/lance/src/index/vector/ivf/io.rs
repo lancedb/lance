@@ -405,7 +405,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     part_reader.schema(),
                 )
             })
-            .buffered(object_store.io_parallelism() as usize)
+            .buffered(object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         writer.write(&batches).await?;
@@ -429,7 +429,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         aux_part_reader.schema(),
                     )
                 })
-                .buffered(object_store.io_parallelism() as usize)
+                .buffered(object_store.io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await?;
             std::mem::drop(aux_part_reader);

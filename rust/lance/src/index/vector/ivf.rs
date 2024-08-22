@@ -1356,7 +1356,7 @@ pub(crate) async fn remap_index_file(
 
     let mut task_stream = stream::iter(tasks.into_iter())
         .map(|task| task.load_and_remap(reader.clone(), index, mapping))
-        .buffered(object_store.io_parallelism() as usize);
+        .buffered(object_store.io_parallelism());
 
     let mut ivf = IvfModel {
         centroids: index.ivf.centroids.clone(),

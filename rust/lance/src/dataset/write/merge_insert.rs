@@ -957,7 +957,7 @@ impl MergeInsertJob {
                     }
                 }
             })
-            .buffer_unordered(dataset.object_store.io_parallelism() as usize);
+            .buffer_unordered(dataset.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {

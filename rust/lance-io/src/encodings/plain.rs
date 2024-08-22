@@ -364,7 +364,7 @@ impl<'a> PlainDecoder<'a> {
                 let shifted_indices = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
-            .buffered(self.reader.io_parallelism() as usize)
+            .buffered(self.reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
@@ -430,7 +430,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
-            .buffered(self.reader.io_parallelism() as usize)
+            .buffered(self.reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();

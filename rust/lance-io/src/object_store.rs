@@ -42,9 +42,9 @@ use lance_core::{Error, Result};
 // Note: the number of threads here also impacts the number of files
 // we need to read in some situations.  So keeping this at 8 keeps the
 // RAM on our scanner down.
-pub const DEFAULT_LOCAL_IO_PARALLELISM: u32 = 8;
+pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 // Cloud disks often need many many threads to saturate the network
-pub const DEFAULT_CLOUD_IO_PARALLELISM: u32 = 64;
+pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -94,7 +94,7 @@ pub struct ObjectStore {
     scheme: String,
     block_size: usize,
     pub use_constant_size_upload_parts: bool,
-    io_parallelism: u32,
+    io_parallelism: usize,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -467,7 +467,7 @@ impl ObjectStore {
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
-            io_parallelism: get_num_compute_intensive_cpus() as u32,
+            io_parallelism: get_num_compute_intensive_cpus(),
         }
     }
 
@@ -484,13 +484,13 @@ impl ObjectStore {
         self.block_size = new_size;
     }
 
-    pub fn set_io_parallelism(&mut self, io_parallelism: u32) {
+    pub fn set_io_parallelism(&mut self, io_parallelism: usize) {
         self.io_parallelism = io_parallelism;
     }
 
-    pub fn io_parallelism(&self) -> u32 {
+    pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
-            .map(|val| val.parse::<u32>().unwrap())
+            .map(|val| val.parse::<usize>().unwrap())
             .unwrap_or(self.io_parallelism)
     }
 
@@ -847,7 +847,7 @@ async fn configure_store(
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
-            io_parallelism: get_num_compute_intensive_cpus() as u32,
+            io_parallelism: get_num_compute_intensive_cpus(),
         }),
         unknown_scheme => {
             if let Some(provider) = registry.providers.get(unknown_scheme) {
@@ -870,7 +870,7 @@ impl ObjectStore {
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
         use_constant_size_upload_parts: bool,
-        io_parallelism: u32,
+        io_parallelism: usize,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));

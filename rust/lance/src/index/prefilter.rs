@@ -105,7 +105,7 @@ impl DatasetPreFilter {
         .collect::<Vec<_>>()
         .await;
         let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
-            .buffer_unordered(dataset.object_store.io_parallelism() as usize);
+            .buffer_unordered(dataset.object_store.io_parallelism());
 
         let mut deleted_ids = RowIdTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
