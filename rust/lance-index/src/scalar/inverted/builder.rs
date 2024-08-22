@@ -361,9 +361,23 @@ mod tests {
         assert!(row_ids.contains(3));
 
         // test phrase query
+        // for non-phrasal query, the order of the tokens doesn't matter
+        // so there should be 4 documents that contain "database" or "lance"
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(3)),
+                FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(4));
+        assert!(row_ids.contains(0));
+        assert!(row_ids.contains(1));
+        assert!(row_ids.contains(2));
+        assert!(row_ids.contains(3));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();
@@ -373,7 +387,7 @@ mod tests {
 
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(3)),
+                FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();

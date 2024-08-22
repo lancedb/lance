@@ -107,7 +107,10 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
-    /// Read the range of rows from the file
+    /// Read the range of rows from the file.
+    /// If projection is Some, only return the columns in the projection,
+    /// nested columns like Some(&["x.y"]) are not supported.
+    /// If projection is None, return all columns.
     async fn read_range(
         &self,
         range: std::ops::Range<usize>,
