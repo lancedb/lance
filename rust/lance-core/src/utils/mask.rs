@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, io::Read};
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use crate::Result;
@@ -23,7 +24,7 @@ use super::address::RowAddress;
 ///
 /// If both the allow_list and the block_list are None (the default) then
 /// all row ids are selected
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, DeepSizeOf)]
 pub struct RowIdMask {
     /// If Some then only these row ids are selected
     pub allow_list: Option<RowIdTreeMap>,
@@ -273,7 +274,7 @@ impl std::ops::BitOr for RowIdMask {
 ///
 /// This is similar to a [RoaringTreemap] but it is optimized for the case where
 /// entire fragments are selected or deselected.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, DeepSizeOf)]
 pub struct RowIdTreeMap {
     /// The contents of the set. If there is a pair (k, Full) then the entire
     /// fragment k is selected. If there is a pair (k, Partial(v)) then the
@@ -285,6 +286,15 @@ pub struct RowIdTreeMap {
 enum RowIdSelection {
     Full,
     Partial(RoaringBitmap),
+}
+
+impl DeepSizeOf for RowIdSelection {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        match self {
+            Self::Full => 0,
+            Self::Partial(bitmap) => bitmap.serialized_size(),
+        }
+    }
 }
 
 impl RowIdTreeMap {
