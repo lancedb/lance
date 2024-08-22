@@ -87,6 +87,7 @@ use std::sync::{Arc, RwLock};
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::DatasetIndexExt;
 use lance_table::io::deletion::read_deletion_file;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -153,7 +154,8 @@ impl Default for CompactionOptions {
             max_rows_per_group: 1024,
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
-            num_threads: num_cpus::get(),
+            // TODO: Should this be based on # I/O threads?
+            num_threads: get_num_compute_intensive_cpus(),
             max_bytes_per_file: None,
             batch_size: None,
         }
@@ -467,7 +469,7 @@ pub async fn plan_compaction(
                 Err(e) => Err(e),
             }
         })
-        .buffered(num_cpus::get() * 2);
+        .buffered(dataset.object_store().io_parallelism() as usize);
 
     let index_fragmaps = load_index_fragmaps(dataset).await?;
     let indices_containing_frag = |frag_id: u32| {

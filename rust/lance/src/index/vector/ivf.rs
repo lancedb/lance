@@ -26,7 +26,10 @@ use futures::{
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
-use lance_core::{datatypes::Field, traits::DatasetTakeRows, Error, Result, ROW_ID_FIELD};
+use lance_core::{
+    datatypes::Field, traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error,
+    Result, ROW_ID_FIELD,
+};
 use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
@@ -783,7 +786,7 @@ impl VectorIndex for IVFIndex {
         let part_ids = partition_ids.values().to_vec();
         let batches = stream::iter(part_ids)
             .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
@@ -1181,7 +1184,6 @@ async fn scan_index_field_stream(
     column: &str,
 ) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
-    scanner.batch_readahead(num_cpus::get() * 2);
     scanner.project(&[column])?;
     scanner.with_row_id();
     scanner.try_into_stream().await
@@ -1354,7 +1356,7 @@ pub(crate) async fn remap_index_file(
 
     let mut task_stream = stream::iter(tasks.into_iter())
         .map(|task| task.load_and_remap(reader.clone(), index, mapping))
-        .buffered(num_cpus::get());
+        .buffered(object_store.io_parallelism() as usize);
 
     let mut ivf = IvfModel {
         centroids: index.ivf.centroids.clone(),

@@ -130,7 +130,7 @@ pub async fn take(
         })
         .collect::<Vec<_>>();
     let take_stream = futures::stream::iter(take_tasks)
-        .buffered(num_cpus::get() * 4)
+        .buffered(dataset.object_store.io_parallelism() as usize)
         .map_err(|err| DataFusionError::External(err.into()))
         .boxed();
     let take_stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -253,7 +253,7 @@ pub async fn take_rows(
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(4 * num_cpus::get())
+            .buffered(dataset.object_store.io_parallelism() as usize)
             .try_collect()
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
@@ -293,7 +293,7 @@ pub async fn take_rows(
             .map(|(fragment, indices)| {
                 do_take(fragment, indices, projection.physical_schema.clone(), true)
             })
-            .buffered(4 * num_cpus::get())
+            .buffered(dataset.object_store.io_parallelism() as usize)
             .try_collect::<Vec<_>>()
             .await?;
 

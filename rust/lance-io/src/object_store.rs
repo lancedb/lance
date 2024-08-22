@@ -488,20 +488,10 @@ impl ObjectStore {
         self.io_parallelism = io_parallelism;
     }
 
-    pub fn io_parallelism(&self) -> Result<u32> {
+    pub fn io_parallelism(&self) -> u32 {
         std::env::var("LANCE_IO_THREADS")
-            .map(|val| {
-                val.parse::<u32>().map_err(|parse_err| {
-                    Error::invalid_input(
-                        format!(
-                            "The LANCE_IO_THREADS variable is not set to an integer: {}",
-                            parse_err
-                        ),
-                        location!(),
-                    )
-                })
-            })
-            .unwrap_or(Ok(self.io_parallelism))
+            .map(|val| val.parse::<u32>().unwrap())
+            .unwrap_or(self.io_parallelism)
     }
 
     /// Open a file for path.

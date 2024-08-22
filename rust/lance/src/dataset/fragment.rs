@@ -19,6 +19,7 @@ use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
@@ -1719,7 +1720,7 @@ impl FragmentReader {
                 range.start as u32..range.end as u32,
                 DEFAULT_BATCH_READ_SIZE,
             )?
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
@@ -1741,7 +1742,7 @@ impl FragmentReader {
         let batches = self
             .take(indices, u32::MAX)
             .await?
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)

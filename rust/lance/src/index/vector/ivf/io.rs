@@ -16,7 +16,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
-use lance_core::utils::tokio::spawn_cpu;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
 use lance_file::reader::FileReader;
 use lance_file::writer::FileWriter;
@@ -49,7 +49,7 @@ use crate::Result;
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 lazy_static::lazy_static! {
-    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = num_cpus::get();
+    static ref HNSW_PARTITIONS_BUILD_PARALLEL: usize = get_num_compute_intensive_cpus();
 }
 
 /// Merge streams with the same partition id and collect PQ codes and row IDs.
@@ -405,7 +405,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                     part_reader.schema(),
                 )
             })
-            .buffered(num_cpus::get())
+            .buffered(object_store.io_parallelism() as usize)
             .try_collect::<Vec<_>>()
             .await?;
         writer.write(&batches).await?;
@@ -429,7 +429,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
                         aux_part_reader.schema(),
                     )
                 })
-                .buffered(num_cpus::get())
+                .buffered(object_store.io_parallelism() as usize)
                 .try_collect::<Vec<_>>()
                 .await?;
             std::mem::drop(aux_part_reader);

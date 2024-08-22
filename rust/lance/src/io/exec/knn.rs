@@ -22,7 +22,7 @@ use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
 use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::ROW_ID_FIELD;
+use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
 use lance_index::vector::{
     flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
 };
@@ -194,7 +194,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                         .map_err(|e| DataFusionError::Execution(e.to_string()))
                 }
             })
-            .buffer_unordered(num_cpus::get());
+            .buffer_unordered(get_num_compute_intensive_cpus());
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
@@ -644,7 +644,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             .await
                     }
                 })
-                .buffered(num_cpus::get())
+                .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
         )))
     }

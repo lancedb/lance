@@ -46,6 +46,7 @@ Preview releases receive the same level of testing as regular releases.
    Lance Formats <./format>
    Arrays <./arrays>
    Integrations <./integrations/integrations>
+   Performance Guide <./performance>
    API References <./api/api>
    Contributor Guide <./contributing>
    Examples <./examples/examples>

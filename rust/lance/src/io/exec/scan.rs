@@ -156,7 +156,7 @@ impl LanceStream {
         io_buffer_size: u64,
     ) -> Result<Self> {
         let project_schema = projection.clone();
-        let io_parallelism = dataset.object_store.io_parallelism()?;
+        let io_parallelism = dataset.object_store.io_parallelism();
         let frag_parallelism = fragment_parallelism
             .unwrap_or_else(|| {
                 // This is somewhat aggressive.  It assumes a single page per column.  If there are many pages per

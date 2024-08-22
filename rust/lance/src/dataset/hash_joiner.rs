@@ -12,6 +12,7 @@ use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use arrow_select::interleave::interleave;
 use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use snafu::{location, Location};
 use tokio::task;
 
@@ -78,7 +79,7 @@ impl HashJoiner {
         let map = Arc::new(map);
 
         futures::stream::iter(batches.iter().enumerate().map(Ok::<_, Error>))
-            .try_for_each_concurrent(num_cpus::get(), |(batch_i, batch)| {
+            .try_for_each_concurrent(get_num_compute_intensive_cpus(), |(batch_i, batch)| {
                 // A clone of map we can send to a new thread
                 let map = map.clone();
                 async move {
@@ -199,7 +200,7 @@ impl HashJoiner {
                     }
                 }
             })
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
 

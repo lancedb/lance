@@ -34,6 +34,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
@@ -67,9 +68,6 @@ use snafu::{location, Location};
 use lance_datafusion::expr::parse_substrait;
 
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
-
-// Same as pyarrow Dataset::scanner()
-pub const DEFAULT_BATCH_READAHEAD: usize = 16;
 
 // Same as pyarrow Dataset::scanner()
 pub const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
@@ -222,7 +220,7 @@ impl Scanner {
             filter: None,
             full_text_query: None,
             batch_size: None,
-            batch_readahead: DEFAULT_BATCH_READAHEAD,
+            batch_readahead: get_num_compute_intensive_cpus(),
             fragment_readahead: None,
             io_buffer_size: None,
             limit: None,

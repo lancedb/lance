@@ -29,7 +29,10 @@ use futures::{
     stream::{self},
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
-use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
+use lance_core::{
+    utils::{mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
+    Error, Result,
+};
 use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -762,7 +765,7 @@ impl BTreeIndex {
             idx: 0,
         }
         .map(|fut| fut.map_err(DataFusionError::from))
-        .buffered(num_cpus::get())
+        .buffered(self.store.io_parallelism() as usize)
         .boxed();
         Ok(RecordBatchStreamAdapter::new(schema, batches))
     }
@@ -879,7 +882,9 @@ impl ScalarIndex for BTreeIndex {
             })
             .collect::<Vec<_>>();
         stream::iter(page_tasks)
-            .buffered(num_cpus::get())
+            // I/O and compute mixed here but important case is index in cache so
+            // use compute intensive thread count
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<RowIdTreeMap>()
             .await
     }

@@ -452,7 +452,7 @@ impl MergeInsertJob {
             self.dataset.clone(),
             index_mapper,
             Arc::new(self.dataset.schema().project_by_schema(schema.as_ref())?),
-            num_cpus::get(),
+            get_num_compute_intensive_cpus(),
         )?) as Arc<dyn ExecutionPlan>;
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
@@ -957,7 +957,7 @@ impl MergeInsertJob {
                     }
                 }
             })
-            .buffer_unordered(num_cpus::get() * 4);
+            .buffer_unordered(dataset.object_store.io_parallelism() as usize);
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {

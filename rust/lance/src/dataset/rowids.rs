@@ -64,7 +64,7 @@ pub fn load_row_id_sequences<'a>(
         .map(|fragment| {
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
-        .buffer_unordered(num_cpus::get())
+        .buffer_unordered(dataset.object_store.io_parallelism() as usize)
 }
 
 pub async fn get_row_id_index(

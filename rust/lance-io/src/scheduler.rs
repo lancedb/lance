@@ -405,7 +405,7 @@ impl SchedulerConfig {
     /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
     pub fn max_bandwidth(store: &ObjectStore) -> Self {
         Self {
-            io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism().unwrap() as u64,
+            io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism() as u64,
         }
     }
 }
@@ -418,7 +418,7 @@ impl ScanScheduler {
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        let io_capacity = object_store.io_parallelism().unwrap();
+        let io_capacity = object_store.io_parallelism();
         let io_queue = Arc::new(IoQueue::new(io_capacity, config.io_buffer_size_bytes));
         let scheduler = Self {
             object_store,
