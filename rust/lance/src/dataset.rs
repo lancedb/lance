@@ -1210,13 +1210,13 @@ impl Dataset {
     /// group. These are considered too small because reading many of them is
     /// much less efficient than reading a single file because the separate files
     /// split up what would otherwise be single IO requests into multiple.
-    pub async fn num_small_files(&self, max_rows_per_group: usize) -> Result<usize> {
-        Ok(futures::stream::iter(self.get_fragments())
+    pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
+        futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.physical_rows().await })
             .buffered(self.object_store.io_parallelism() as usize)
             .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
-            .await)
+            .await
     }
 
     pub async fn validate(&self) -> Result<()> {
