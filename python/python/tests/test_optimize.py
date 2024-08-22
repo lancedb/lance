@@ -313,3 +313,49 @@ def test_dataset_distributed_optimize(tmp_path: Path):
     assert metrics.fragments_added == 1
     # Compaction occurs in two transactions so it increments the version by 2.
     assert dataset.version == 3
+
+
+def test_migration_via_fragment_apis(tmp_path):
+    """
+    This test is a regression of a case where we were using fragment APIs to migrate
+    from v1 to v2 but that left the dataset in a state where it had v2 files but wasn't
+    marked with the v2 writer flag.
+    """
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    # Create v1 dataset
+    ds = lance.write_dataset(
+        data, tmp_path / "dataset", max_rows_per_file=200, data_storage_version="legacy"
+    )
+
+    # Create empty v2 dataset
+    lance.write_dataset(
+        data_obj=[],
+        uri=tmp_path / "dataset2",
+        schema=ds.schema,
+        data_storage_version="stable",
+    )
+
+    # Add v2 files
+    fragments = []
+    for frag in ds.get_fragments():
+        reader = ds.scanner(fragments=[frag])
+        fragments.append(
+            lance.LanceFragment.create(
+                dataset_uri=tmp_path / "dataset2",
+                data=reader,
+                fragment_id=frag.fragment_id,
+                data_storage_version="stable",
+            )
+        )
+
+    # Commit
+    operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
+    ds2 = lance.LanceDataset.commit(tmp_path / "dataset2", operation)
+
+    # Compact, dataset should still be v2
+    ds2.optimize.compact_files()
+
+    ds2 = lance.dataset(tmp_path / "dataset2")
+
+    assert ds2.data_storage_version == "2.0"

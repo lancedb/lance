@@ -681,6 +681,10 @@ impl FilterPlan {
     pub fn has_refine(&self) -> bool {
         self.refine_expr.is_some()
     }
+
+    pub fn has_any_filter(&self) -> bool {
+        self.refine_expr.is_some() || self.index_query.is_some()
+    }
 }
 
 pub trait PlannerIndexExt {

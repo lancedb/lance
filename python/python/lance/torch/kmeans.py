@@ -86,7 +86,10 @@ class KMeans:
         self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
-            data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
+            np_tensor = data.values.to_numpy(zero_copy_only=True).reshape(
+                -1, data.type.list_size
+            )
+            data = torch.from_numpy(np_tensor)
         elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):

@@ -148,7 +148,7 @@ impl InvertedIndex {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut wand = Wand::new(postings.into_iter());
+        let mut wand = Wand::new(self.docs.len(), postings.into_iter());
         wand.search(is_phrase_query, limit, wand_factor, |doc, freq| {
             let doc_norm =
                 K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / self.docs.average_length());
@@ -354,6 +354,7 @@ impl TokenSet {
 struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
+    max_scores: Option<Vec<f32>>,
 
     // cache
     posting_cache: Cache<u32, PostingList>,
@@ -385,6 +386,11 @@ impl InvertedListReader {
             .ok_or_else(|| Error::io("offsets not found".to_string(), location!()))?;
         let offsets: Vec<usize> = serde_json::from_str(offsets)?;
 
+        let max_scores = match reader.schema().metadata.get("max_scores") {
+            Some(max_scores) => serde_json::from_str(max_scores)?,
+            None => None,
+        };
+
         let posting_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
@@ -396,6 +402,7 @@ impl InvertedListReader {
         Ok(Self {
             reader,
             offsets,
+            max_scores,
             posting_cache,
             position_cache,
         })
@@ -427,22 +434,15 @@ impl InvertedListReader {
                     .reader
                     .read_range(offset..offset + length, Some(&[ROW_ID, FREQUENCY_COL]))
                     .await?;
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values().clone();
-                let frequencies = batch[FREQUENCY_COL]
-                    .as_primitive::<Float32Type>()
-                    .values()
-                    .clone();
-                // the positions column may not exist for old indices
-                // in that case, phrase query is not supported
-                // let positions = if is_phrase_query {
-                //     Some(batch
-                //         .column_by_name(POSITION_COL)
-                //         .ok_or(Error::Index { message: format!("the index was built with old version which doesn't support phrase query, please re-create the index"), location: location!() })?
-                //         .as_list::<i32>().clone())
-                // } else {
-                //     None
-                // };
-                Result::Ok(PostingList::new(row_ids, frequencies, None))
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+                let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
+                Result::Ok(PostingList::new(
+                    row_ids.values().clone(),
+                    frequencies.values().clone(),
+                    self.max_scores
+                        .as_ref()
+                        .map(|max_scores| max_scores[token_id]),
+                ))
             })
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))?;
@@ -478,6 +478,7 @@ impl InvertedListReader {
 pub struct PostingList {
     pub row_ids: ScalarBuffer<u64>,
     pub frequencies: ScalarBuffer<f32>,
+    pub max_score: Option<f32>,
     pub positions: Option<ListArray>,
 }
 
@@ -492,12 +493,13 @@ impl PostingList {
     pub fn new(
         row_ids: ScalarBuffer<u64>,
         frequencies: ScalarBuffer<f32>,
-        positions: Option<ListArray>,
+        max_score: Option<f32>,
     ) -> Self {
         Self {
             row_ids,
             frequencies,
-            positions,
+            max_score,
+            positions: None,
         }
     }
 
@@ -518,6 +520,10 @@ impl PostingList {
         self.positions
             .as_ref()
             .map(|positions| positions.value(pos).as_primitive::<Int32Type>().clone())
+    }
+
+    pub fn max_score(&self) -> Option<f32> {
+        self.max_score
     }
 
     pub fn row_id(&self, i: usize) -> u64 {
@@ -557,6 +563,21 @@ impl PostingListBuilder {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn calculate_max_score(&self, docs: &DocSet) -> f32 {
+        // score(q, D) = IDF(q) * (f(q, D) * (k1 + 1)) / (f(q, D) + k1 * (1 - b + b * |D| / avgdl))
+        let num_docs = docs.len();
+        let avgdl = docs.average_length();
+        let mut max_score = 0.0;
+        for (&row_id, &freq) in self.row_ids.iter().zip(self.frequencies.iter()) {
+            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
+            let score = idf(self.len(), num_docs) * (K1 + 1.0) * freq / (freq + doc_norm);
+            if score > max_score {
+                max_score = score;
+            }
+        }
+        max_score
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {

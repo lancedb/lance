@@ -6,7 +6,7 @@ use arrow_array::{Array, FixedSizeListArray};
 use arrow_data::ArrayData;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::io::ObjectStore;
-use lance_index::vector::ivf::shuffler::{load_partitioned_shuffles, shuffle_vectors};
+use lance_index::vector::ivf::shuffler::{shuffle_vectors, IvfShuffler};
 use lance_index::vector::{
     ivf::{storage::IvfModel, IvfBuildParams},
     pq::{PQBuildParams, ProductQuantizer},
@@ -300,7 +300,7 @@ async fn do_load_shuffled_vectors(
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
     let (_, path) = object_store_from_uri_or_path(dir_path).await?;
-    let streams = load_partitioned_shuffles(path.clone(), filenames)
+    let streams = IvfShuffler::load_partitioned_shuffles(&path, filenames)
         .await
         .infer_error()?;
 

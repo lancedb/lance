@@ -329,6 +329,29 @@ impl Transaction {
         })
     }
 
+    fn data_storage_format_from_files(
+        fragments: &[Fragment],
+        user_requested: Option<LanceFileVersion>,
+    ) -> Result<DataStorageFormat> {
+        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
+            // Ensure user-requested matches data files
+            if let Some(user_requested) = user_requested {
+                if user_requested != file_version {
+                    return Err(Error::invalid_input(
+                    format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
+                    location!(),
+                ));
+                }
+            }
+            Ok(DataStorageFormat::new(file_version))
+        } else {
+            // If no files use user-requested or default
+            Ok(user_requested
+                .map(DataStorageFormat::new)
+                .unwrap_or_default())
+        }
+    }
+
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -568,21 +591,26 @@ impl Transaction {
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
-        let data_storage_format = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => storage_format.clone(),
-            (None, Some(true)) => DataStorageFormat::new(LanceFileVersion::Legacy),
-            (None, Some(false)) => DataStorageFormat::new(LanceFileVersion::V2_0),
-            (None, None) => DataStorageFormat::default(),
+        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
+            (None, Some(true)) => Some(LanceFileVersion::Legacy),
+            (None, Some(false)) => Some(LanceFileVersion::V2_0),
+            (None, None) => None,
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
             if matches!(self.operation, Operation::Overwrite { .. }) {
-                prev_manifest.data_storage_format = data_storage_format;
+                prev_manifest.data_storage_format = Self::data_storage_format_from_files(
+                    &prev_manifest.fragments,
+                    user_requested_version,
+                )?;
             }
             prev_manifest
         } else {
+            let data_storage_format =
+                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
             Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
         };
 

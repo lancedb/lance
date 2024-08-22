@@ -225,15 +225,16 @@ class FragmentSampler(Sampler):
         with_row_id: bool = False,
         **kwargs,
     ) -> Generator[pa.RecordBatch, None, None]:
-        for fragment in self.iter_fragments(dataset, *args, **kwargs):
-            for batch in fragment.to_batches(
-                batch_size=batch_size,
-                columns=columns,
-                filter=filter,
-                with_row_id=with_row_id,
-                batch_readahead=batch_readahead,
-            ):
-                yield batch
+        fragments = self.iter_fragments(dataset, *args, **kwargs)
+        scanner = dataset.scanner(
+            batch_size=batch_size,
+            columns=columns,
+            filter=filter,
+            with_row_id=with_row_id,
+            batch_readahead=batch_readahead,
+            fragments=list(fragments),
+        )
+        yield from scanner.to_batches()
 
     @abstractmethod
     def iter_fragments(

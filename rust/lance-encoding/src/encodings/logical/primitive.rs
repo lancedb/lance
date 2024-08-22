@@ -16,8 +16,8 @@ use lance_core::{datatypes::Field, Result};
 use crate::{
     decoder::{
         DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
-        PageInfo, PageScheduler, PrimitivePageDecoder, ScheduledScanLine, SchedulerContext,
-        SchedulingJob,
+        PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine,
+        SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
@@ -113,7 +113,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine> {
         debug_assert!(self.range_idx < self.ranges.len());
         // Get our current range
@@ -168,10 +168,11 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         self.global_row_offset += cur_page.num_rows;
         self.page_idx += 1;
 
-        let physical_decoder =
-            cur_page
-                .scheduler
-                .schedule_ranges(&ranges_in_page, context.io(), top_level_row);
+        let physical_decoder = cur_page.scheduler.schedule_ranges(
+            &ranges_in_page,
+            context.io(),
+            priority.current_priority(),
+        );
 
         let logical_decoder = PrimitiveFieldDecoder {
             data_type: self.scheduler.data_type.clone(),
@@ -276,10 +277,10 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
 impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // TODO: In the future, at some point, we may consider partially waiting for primitive pages by
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
-    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         log::trace!(
-            "PrimitiveFieldDecoder::wait for {} rows on column {} (page has {} rows)",
-            num_rows,
+            "primitive wait for more than {} rows on column {} (page has {} rows)",
+            loaded_need,
             self.column_index,
             self.num_rows
         );
@@ -319,20 +320,24 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         })
     }
 
-    fn unawaited(&self) -> u64 {
+    fn rows_loaded(&self) -> u64 {
         if self.unloaded_physical_decoder.is_some() {
-            self.num_rows
-        } else {
             0
+        } else {
+            self.num_rows
         }
     }
 
-    fn avail(&self) -> u64 {
+    fn rows_drained(&self) -> u64 {
         if self.unloaded_physical_decoder.is_some() {
             0
         } else {
-            self.num_rows - self.rows_drained
+            self.rows_drained
         }
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
     }
 
     fn data_type(&self) -> &DataType {

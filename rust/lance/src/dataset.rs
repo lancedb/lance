@@ -15,6 +15,7 @@ use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
+use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
@@ -706,6 +707,14 @@ impl Dataset {
         &self.manifest
     }
 
+    pub(crate) fn is_legacy_storage(&self) -> bool {
+        self.manifest
+            .data_storage_format
+            .lance_file_version()
+            .unwrap()
+            == LanceFileVersion::Legacy
+    }
+
     pub async fn latest_manifest(&self) -> Result<Manifest> {
         read_manifest(
             &self.object_store,
@@ -940,13 +949,17 @@ impl Dataset {
                 .count_rows()
                 .await? as usize)
         } else {
-            let cnts = stream::iter(self.get_fragments())
-                .map(|f| async move { f.count_rows().await })
-                .buffer_unordered(16)
-                .try_collect::<Vec<_>>()
-                .await?;
-            Ok(cnts.iter().sum())
+            self.count_all_rows().await
         }
+    }
+
+    pub(crate) async fn count_all_rows(&self) -> Result<usize> {
+        let cnts = stream::iter(self.get_fragments())
+            .map(|f| async move { f.count_rows().await })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(cnts.iter().sum())
     }
 
     /// Take rows by indices.
