@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt};
 use log::warn;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
+use object_store::{path::Path, ObjectStore as OSObjectStore};
 use snafu::{location, Location};
 
 use super::{
@@ -116,8 +116,12 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 // step 1: copy path -> object_store_manifest_path
                 let object_store_manifest_path = manifest_path(base_path, version);
                 let manifest_path = Path::parse(path)?;
+                let staging = make_staging_manifest_path(&manifest_path)?;
+                // TODO: remove copy-rename once we upgrade object_store crate
+                object_store.copy(&manifest_path, &staging).await?;
                 object_store
-                    .copy(&manifest_path, &object_store_manifest_path)
+                    .inner
+                    .rename(&staging, &object_store_manifest_path)
                     .await?;
 
                 // step 2: update external store to finalize path
@@ -128,13 +132,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         object_store_manifest_path.as_ref(),
                     )
                     .await?;
-
-                // step 3: delete the staging path
-                match object_store.inner.delete(&manifest_path).await {
-                    Ok(_) => {}
-                    Err(ObjectStoreError::NotFound { .. }) => {}
-                    Err(e) => return Err(e.into()),
-                }
 
                 Ok(object_store_manifest_path)
             }
