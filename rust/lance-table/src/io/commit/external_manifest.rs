@@ -124,11 +124,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     .rename(&staging, &object_store_manifest_path)
                     .await?;
 
-                // step 2: write _latest.manifest
-                write_latest_manifest(&manifest_path, base_path, object_store.inner.as_ref())
-                    .await?;
-
-                // step 3: update external store to finalize path
+                // step 2: update external store to finalize path
                 self.external_manifest_store
                     .put_if_exists(
                         base_path.as_ref(),
@@ -264,7 +260,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
         ))?;
 
         // update the _latest.manifest pointer
-        write_latest_manifest(&path, base_path, &object_store.inner).await?;
 
         // step 5: flip the external store to point to the final location
         self.external_manifest_store

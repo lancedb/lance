@@ -226,21 +226,6 @@ fn make_staging_manifest_path(base: &Path) -> Result<Path> {
     })
 }
 
-async fn write_latest_manifest(
-    from_path: &Path,
-    base_path: &Path,
-    object_store: &dyn OSObjectStore,
-) -> Result<()> {
-    let latest_path = latest_manifest_path(base_path);
-    let staging_path = make_staging_manifest_path(from_path)?;
-    object_store
-        .copy(from_path, &staging_path)
-        .await
-        .map_err(|err| CommitError::OtherError(err.into()))?;
-    object_store.rename(&staging_path, &latest_path).await?;
-    Ok(())
-}
-
 #[cfg(feature = "dynamodb")]
 const DDB_URL_QUERY_KEY: &str = "ddbTableName";
 
@@ -538,8 +523,6 @@ impl CommitHandler for UnsafeCommitHandler {
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
 
-        write_latest_manifest(&version_path, base_path, &object_store.inner).await?;
-
         Ok(())
     }
 }
@@ -612,8 +595,6 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
             }
         }
         let res = manifest_writer(object_store, manifest, indices, &path).await;
-
-        write_latest_manifest(&path, base_path, &object_store.inner).await?;
 
         // Release the lock
         lease.release(res.is_ok()).await?;
@@ -693,8 +674,6 @@ impl CommitHandler for RenameCommitHandler {
                 return Err(CommitError::OtherError(e.into()));
             }
         };
-
-        write_latest_manifest(&path, base_path, &object_store.inner).await?;
 
         res
     }
