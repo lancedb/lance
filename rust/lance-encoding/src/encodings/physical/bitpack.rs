@@ -81,8 +81,9 @@ where
     T: ArrowPrimitiveType,
     T::Native: PrimInt + AsPrimitive<i64>,
 {
-    let mut add_signed_bit = false;
     let mut min_leading_bits: Option<u64> = None;
+    let mut all_negative = true;
+    let mut all_positive = true;
     for val in arr.iter() {
         if val.is_none() {
             continue;
@@ -94,14 +95,15 @@ where
 
         if val.to_i64().unwrap() < 0i64 {
             min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_ones() as u64));
-            add_signed_bit = true;
+            all_positive = false;
         } else {
             min_leading_bits = min_leading_bits.map(|bits| bits.min(val.leading_zeros() as u64));
+            all_negative = false;
         }
     }
 
     let mut min_leading_bits = arr.data_type().byte_width() as u64 * 8 - min_leading_bits?;
-    if add_signed_bit {
+    if !all_negative && !all_positive {
         // Need extra sign bit
         min_leading_bits += 1;
     }
@@ -109,7 +111,7 @@ where
     let num_bits = min_leading_bits.max(1);
     Some(BitpackParams {
         num_bits,
-        signed: add_signed_bit,
+        signed: !all_negative && !all_positive,
     })
 }
 #[derive(Debug)]
@@ -717,8 +719,17 @@ pub mod test {
         assert_eq!(4, result.num_bits);
         assert!(result.signed);
 
-        // check that it doesn't add a sign bit if it doesn't need to
+        // check that it doesn't add a sign bit if it all values are positive
         let values = Int32Array::from(vec![1, 2, 7]);
+        let arr = Arc::new(values);
+        let result = bitpack_params(arr);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(3, result.num_bits);
+        assert!(!result.signed);
+
+        // check that it doesn't add a sign bit if it all values are negative
+        let values = Int32Array::from(vec![-1, -2, -7]);
         let arr = Arc::new(values);
         let result = bitpack_params(arr);
         assert!(result.is_some());
