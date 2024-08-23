@@ -18,7 +18,7 @@ use deepsize::DeepSizeOf;
 use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{Error, Result, ROW_ID};
 use lazy_static::lazy_static;
 use moka::future::Cache;
@@ -127,7 +127,11 @@ impl InvertedIndex {
             .unwrap_or(usize::MAX);
         let wand_factor = query.wand_factor.unwrap_or(1.0);
 
-        let mask = prefilter.mask();
+        let mask = if prefilter.is_empty() {
+            Arc::new(RowIdMask::all_rows())
+        } else {
+            prefilter.mask()
+        };
         let is_phrase_query = is_phrase_query(&query.query);
         let postings = stream::iter(token_ids)
             .enumerate()
