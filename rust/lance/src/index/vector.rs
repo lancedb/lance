@@ -252,17 +252,15 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
-            dataset.clone(),
-            column.to_owned(),
-            dataset.indices_dir().child(uuid),
+        build_ivf_pq_index(
+            dataset,
+            column,
+            name,
+            uuid,
             params.metric_type,
-            Box::new(shuffler),
-            Some(ivf_params.clone()),
-            Some(pq_params.clone()),
-            (),
-        )?
-        .build()
+            ivf_params,
+            pq_params,
+        )
         .await?;
     } else if is_ivf_hnsw(stages) {
         let len = stages.len();
