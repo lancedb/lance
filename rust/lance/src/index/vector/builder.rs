@@ -485,7 +485,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         // maintain the IVF partitions
         let mut storage_ivf = IvfModel::empty();
         let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap());
-        let mut partition_storage_metadata = Vec::with_capacity(partition_sizes.len());
         let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
         let obj_store = Arc::new(ObjectStore::local());
         let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
@@ -494,7 +493,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             log::info!("merging partition {}/{}", part_id, ivf.num_partitions());
             if storage_size == 0 {
                 storage_ivf.add_partition(0);
-                partition_storage_metadata.push(quantizer.metadata(None)?.to_string());
             } else {
                 let storage_part_path = self.temp_dir.child(format!("storage_part{}", part_id));
                 let reader = FileReader::try_open(
@@ -522,14 +520,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 }
                 storage_writer.as_mut().unwrap().write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
-                partition_storage_metadata.push(
-                    reader
-                        .schema()
-                        .metadata
-                        .get(STORAGE_METADATA_KEY)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
             }
 
             if index_size == 0 {
@@ -574,9 +564,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             .add_global_buffer(storage_ivf_pb.encode_to_vec().into())
             .await?;
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
+        // For now, each partition's metadata is just the quantizer,
+        // it's all the same for now, so we just take the first one
+        let storage_partition_metadata = vec![quantizer.metadata(None)?.to_string()];
         storage_writer.add_schema_metadata(
             STORAGE_METADATA_KEY,
-            serde_json::to_string(&partition_storage_metadata)?,
+            serde_json::to_string(&storage_partition_metadata)?,
         );
 
         let index_ivf_pb = pb::Ivf::try_from(&index_ivf)?;

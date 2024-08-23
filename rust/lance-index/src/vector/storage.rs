@@ -243,7 +243,9 @@ impl IvfQuantizationStorage {
         };
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
-            self.metadata[part_id].clone(),
+            // TODO: this is a hack, cause the metadata is just the quantizer metadata
+            // it's all the same for all partitions, so now we store only one copy of it
+            self.metadata[0].clone(),
         )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }
