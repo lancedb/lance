@@ -541,7 +541,6 @@ async fn build_and_write_pq_storage(
 mod tests {
     use super::*;
 
-    use crate::index::vector::v2;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
     use crate::Dataset;
     use arrow_array::RecordBatchIterator;
@@ -597,7 +596,7 @@ mod tests {
             .unwrap();
         let _ivf_idx = idx
             .as_any()
-            .downcast_ref::<v2::IvfPq>()
+            .downcast_ref::<IVFIndex>()
             .expect("Invalid index type");
 
         //let indices = /ds.

@@ -2755,7 +2755,7 @@ mod tests {
             .open_generic_index("vector", indices[0].uuid.to_string().as_str())
             .await
             .unwrap();
-        let ivf_idx = idx.as_any().downcast_ref::<v2::IvfPq>().unwrap();
+        let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
 
         assert!(ivf_idx
             .ivf_model()
@@ -2768,9 +2768,16 @@ mod tests {
             .iter()
             .all(|v| (0.0..=1.0).contains(v)));
 
+        let pq_idx = ivf_idx
+            .sub_index
+            .as_any()
+            .downcast_ref::<PQIndex>()
+            .unwrap();
+
         // PQ code is on residual space
-        let pq: ProductQuantizer = ivf_idx.quantizer().try_into().unwrap();
-        pq.codebook
+        pq_idx
+            .pq
+            .codebook
             .values()
             .as_primitive::<Float32Type>()
             .values()
