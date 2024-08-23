@@ -15,13 +15,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayBuilder, FixedSizeListBuilder, StructBuilder, UInt32Builder, UInt64Builder, UInt8Builder,
+    ArrayBuilder, FixedSizeListBuilder, Float32Builder, StructBuilder, UInt32Builder,
+    UInt64Builder, UInt8Builder,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::UInt32Type;
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
-use arrow_array::{FixedSizeListArray, UInt8Array};
+use arrow_array::{FixedSizeListArray, Float32Array, UInt8Array};
 use arrow_array::{ListArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Fields};
 use futures::stream::repeat_with;
@@ -143,6 +144,28 @@ impl PartitionBuilder {
                                 .values()
                                 .as_any_mut()
                                 .downcast_mut::<UInt8Builder>()
+                                .unwrap()
+                                .append_slice(values.values());
+                        }
+                        DataType::Float32 => {
+                            let values = col
+                                .values()
+                                .as_any()
+                                .downcast_ref::<Float32Array>()
+                                .unwrap();
+                            let fsl_builder = self
+                                .builder
+                                .field_builder::<FixedSizeListBuilder<Box<dyn ArrayBuilder>>>(
+                                    field_idx,
+                                )
+                                .unwrap();
+                            for _ in 0..col.len() {
+                                fsl_builder.append(true);
+                            }
+                            fsl_builder
+                                .values()
+                                .as_any_mut()
+                                .downcast_mut::<Float32Builder>()
                                 .unwrap()
                                 .append_slice(values.values());
                         }

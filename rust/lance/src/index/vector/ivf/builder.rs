@@ -51,6 +51,7 @@ pub(super) async fn build_partitions(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: &mut IvfModel,
+    pq: ProductQuantizer,
     metric_type: MetricType,
     part_range: Range<u32>,
     precomputed_partitons: Option<HashMap<u64, u32>>,
@@ -76,7 +77,9 @@ pub(super) async fn build_partitions(
         ivf.centroids.clone().unwrap(),
         metric_type,
         column,
+        pq.clone(),
         Some(part_range),
+        true,
     );
 
     let stream = shuffle_dataset(
@@ -195,7 +198,7 @@ pub async fn write_vector_storage(
     data: impl RecordBatchStream + Unpin + 'static,
     num_rows: u64,
     centroids: FixedSizeListArray,
-    _pq: ProductQuantizer,
+    pq: ProductQuantizer,
     distance_type: DistanceType,
     column: &str,
     writer: ObjectWriter,
@@ -206,7 +209,9 @@ pub async fn write_vector_storage(
         centroids,
         distance_type,
         column,
+        pq,
         None,
+        true,
     ));
 
     let data = if let Some(partitions_ds_uri) = precomputed_partitions_ds_uri {

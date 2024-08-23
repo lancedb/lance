@@ -172,9 +172,6 @@ impl Transformer for ResidualTransform {
 
         // Replace original column with residual column.
         let batch = batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?;
-
-        // let residual_field = Field::new(RESIDUAL_COLUMN, residual_arr.data_type().clone(), false);
-        // let batch = batch.try_with_column(residual_field, Arc::new(residual_arr))?;
         Ok(batch)
     }
 }
