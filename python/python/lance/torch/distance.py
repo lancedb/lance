@@ -115,6 +115,17 @@ def cosine_distance(
 
 
 @torch.jit.script
+def argmin_l2(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    x = x.reshape(1, x.shape[0], -1)
+    y = y.reshape(1, y.shape[0], -1)
+    dists = torch.cdist(x, y, p=2.0).reshape(-1, y.shape[1])
+    min_dists, idx = torch.min(dists, dim=1, keepdim=True)
+    # We are using squared L2 distance today.
+    # TODO: change this to L2 distance (which is a breaking change?)
+    return min_dists.pow(2), idx
+
+
+@torch.jit.script
 def pairwise_l2(
     x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -177,8 +188,7 @@ def _l2_distance(
     if y2 is None:
         y2 = (y * y).sum(dim=1)
     for sub_vectors in x.split(split_size):
-        dists = pairwise_l2(sub_vectors, y, y2)
-        min_dists, idx = torch.min(dists, dim=1, keepdim=True)
+        min_dists, idx = argmin_l2(sub_vectors, y)
         part_ids.append(idx)
         distances.append(min_dists)
 

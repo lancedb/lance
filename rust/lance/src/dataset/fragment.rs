@@ -46,7 +46,6 @@ use super::updater::Updater;
 use super::WriteParams;
 use crate::arrow::*;
 use crate::dataset::Dataset;
-use crate::utils::default_deadlock_prevention_timeout;
 
 /// A Fragment of a Lance [`Dataset`].
 ///
@@ -88,6 +87,9 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Return the number of rows in the file
     fn len(&self) -> u32;
+
+    /// Schema of the reader
+    fn projection(&self) -> &Arc<Schema>;
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -142,8 +144,20 @@ fn ranges_to_tasks(
         .boxed()
 }
 
+#[derive(Clone, Debug)]
+struct V1Reader {
+    reader: FileReader,
+    projection: Arc<Schema>,
+}
+
+impl V1Reader {
+    fn new(reader: FileReader, projection: Arc<Schema>) -> Self {
+        Self { reader, projection }
+    }
+}
+
 #[async_trait::async_trait]
-impl GenericFileReader for FileReader {
+impl GenericFileReader for V1Reader {
     /// Reads the requested range of rows from the file, returning as a stream
     fn read_range_tasks(
         &self,
@@ -156,7 +170,7 @@ impl GenericFileReader for FileReader {
         let mut ranges = Vec::new();
         let mut batch_idx = 0;
         while remaining > 0 {
-            let next_batch_len = self.num_rows_in_batch(batch_idx) as u32;
+            let next_batch_len = self.reader.num_rows_in_batch(batch_idx) as u32;
             let next_batch_idx = batch_idx;
             batch_idx += 1;
             if to_skip >= next_batch_len {
@@ -172,7 +186,7 @@ impl GenericFileReader for FileReader {
                 ranges.push((next_batch_idx, (chunk_start as usize..chunk_end as usize)));
             }
         }
-        Ok(ranges_to_tasks(self, ranges, projection))
+        Ok(ranges_to_tasks(&self.reader, ranges, projection))
     }
 
     fn read_all_tasks(
@@ -180,9 +194,9 @@ impl GenericFileReader for FileReader {
         batch_size: u32,
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
-        let ranges = (0..self.num_batches())
+        let ranges = (0..self.reader.num_batches())
             .flat_map(move |batch_idx| {
-                let rows_in_batch = self.num_rows_in_batch(batch_idx as i32);
+                let rows_in_batch = self.reader.num_rows_in_batch(batch_idx as i32);
                 (0..rows_in_batch)
                     .step_by(batch_size as usize)
                     .map(move |start| {
@@ -191,7 +205,7 @@ impl GenericFileReader for FileReader {
                     })
             })
             .collect::<Vec<_>>();
-        Ok(ranges_to_tasks(self, ranges, projection))
+        Ok(ranges_to_tasks(&self.reader, ranges, projection))
     }
 
     fn take_all_tasks(
@@ -201,7 +215,7 @@ impl GenericFileReader for FileReader {
         projection: Arc<Schema>,
     ) -> Result<ReadBatchTaskStream> {
         let indices_vec = indices.to_vec();
-        let reader = self.clone();
+        let reader = self.reader.clone();
         // In the new path the row id is added by the fragment and not the file
         let task_fut = async move { reader.take(&indices_vec, projection.as_ref()).await }.boxed();
         let task = std::future::ready(ReadBatchTask {
@@ -212,9 +226,13 @@ impl GenericFileReader for FileReader {
         Ok(futures::stream::once(task).boxed())
     }
 
+    fn projection(&self) -> &Arc<Schema> {
+        &self.projection
+    }
+
     /// Return the number of rows in the file
     fn len(&self) -> u32 {
-        self.len() as u32
+        self.reader.len() as u32
     }
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
@@ -225,12 +243,12 @@ impl GenericFileReader for FileReader {
         true
     }
 
-    fn as_legacy_opt(&self) -> Option<&Self> {
-        Some(self)
+    fn as_legacy_opt(&self) -> Option<&FileReader> {
+        Some(&self.reader)
     }
 
-    fn as_legacy_opt_mut(&mut self) -> Option<&mut Self> {
-        Some(self)
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+        Some(&mut self.reader)
     }
 }
 
@@ -242,16 +260,19 @@ mod v2_adapter {
     #[derive(Debug, Clone)]
     pub struct Reader {
         reader: Arc<v2::reader::FileReader>,
+        projection: Arc<Schema>,
         field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
     }
 
     impl Reader {
         pub fn new(
             reader: Arc<v2::reader::FileReader>,
+            projection: Arc<Schema>,
             field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
         ) -> Self {
             Self {
                 reader,
+                projection,
                 field_id_to_column_idx,
             }
         }
@@ -345,6 +366,10 @@ mod v2_adapter {
                 .boxed())
         }
 
+        fn projection(&self) -> &Arc<Schema> {
+            &self.projection
+        }
+
         /// Return the number of rows in the file
         fn len(&self) -> u32 {
             self.reader.metadata().num_rows as u32
@@ -424,6 +449,11 @@ impl FileFragment {
         self.metadata.id as usize
     }
 
+    /// The number of data files in this fragment.
+    pub fn num_data_files(&self) -> usize {
+        self.metadata.files.len()
+    }
+
     /// Open a FileFragment with a given default projection.
     ///
     /// All read operations (other than `read_projected`) will use the supplied
@@ -444,7 +474,7 @@ impl FileFragment {
         projection: &Schema,
         with_row_id: bool,
         with_row_address: bool,
-        scan_scheduler: Option<Arc<ScanScheduler>>,
+        scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, scan_scheduler);
         let deletion_vec_load =
@@ -505,8 +535,9 @@ impl FileFragment {
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
-        scan_scheduler: Option<Arc<ScanScheduler>>,
-    ) -> Result<Option<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
+        scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
+        file_idx: usize,
+    ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
         let data_file_schema = data_file.schema(full_schema);
@@ -532,7 +563,8 @@ impl FileFragment {
                 let initialized_schema = reader
                     .schema()
                     .project_by_schema(schema_per_file.as_ref())?;
-                Ok(Some((Box::new(reader), Arc::new(initialized_schema))))
+                let reader = V1Reader::new(reader, Arc::new(initialized_schema));
+                Ok(Some(Box::new(reader)))
             } else {
                 Ok(None)
             }
@@ -540,16 +572,19 @@ impl FileFragment {
             Ok(None)
         } else {
             let path = self.dataset.data_dir().child(data_file.path.as_str());
-            let store_scheduler = scan_scheduler.unwrap_or_else(|| {
-                ScanScheduler::new(
-                    self.dataset.object_store.clone(),
-                    SchedulerConfig {
-                        io_buffer_size_bytes: 256 * 1024 * 1024,
-                        deadlock_prevention_timeout: default_deadlock_prevention_timeout(),
-                    },
+            let (store_scheduler, priority_offset) = scan_scheduler.unwrap_or_else(|| {
+                (
+                    ScanScheduler::new(
+                        self.dataset.object_store.clone(),
+                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    ),
+                    0,
                 )
             });
-            let file_scheduler = store_scheduler.open_file(&path).await?;
+            let priority = file_idx as u64 + priority_offset;
+            let file_scheduler = store_scheduler
+                .open_file_with_priority(&path, priority)
+                .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
@@ -574,23 +609,28 @@ impl FileFragment {
                         }
                     }),
             ));
-            let reader = v2_adapter::Reader::new(reader, field_id_to_column_idx);
-            Ok(Some((Box::new(reader), schema_per_file)))
+            let reader = v2_adapter::Reader::new(reader, schema_per_file, field_id_to_column_idx);
+            Ok(Some(Box::new(reader)))
         }
     }
 
     async fn open_readers(
         &self,
         projection: &Schema,
-        scan_scheduler: Option<Arc<ScanScheduler>>,
-    ) -> Result<Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>> {
+        scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
+    ) -> Result<Vec<Box<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
-        for data_file in &self.metadata.files {
-            if let Some((reader, schema)) = self
-                .open_reader(data_file, Some(projection), scan_scheduler.clone())
+        for (file_idx, data_file) in self.metadata.files.iter().enumerate() {
+            if let Some(reader) = self
+                .open_reader(
+                    data_file,
+                    Some(projection),
+                    scan_scheduler.clone(),
+                    file_idx,
+                )
                 .await?
             {
-                opened_files.push((reader, schema));
+                opened_files.push(reader);
             }
         }
 
@@ -681,8 +721,8 @@ impl FileFragment {
 
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
-        let (reader, _) = self
-            .open_reader(some_file, None, None)
+        let reader = self
+            .open_reader(some_file, None, None, 0)
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!(
@@ -775,8 +815,8 @@ impl FileFragment {
         }
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
-            let (reader, _) = self
-                .open_reader(data_file, None, None)
+            let reader = self
+                .open_reader(data_file, None, None, 0)
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -1223,7 +1263,7 @@ impl From<FileFragment> for Fragment {
 #[derive(Debug)]
 pub struct FragmentReader {
     /// Readers and schema of each opened data file.
-    readers: Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>,
+    readers: Vec<Box<dyn GenericFileReader>>,
 
     /// The output schema. The defines the order in which the columns are returned.
     output_schema: ArrowSchema,
@@ -1266,7 +1306,7 @@ impl Clone for FragmentReader {
             readers: self
                 .readers
                 .iter()
-                .map(|(reader, schema)| (reader.clone_box(), schema.clone()))
+                .map(|reader| reader.clone_box())
                 .collect::<Vec<_>>(),
             output_schema: self.output_schema.clone(),
             deletion_vec: self.deletion_vec.clone(),
@@ -1307,15 +1347,15 @@ impl FragmentReader {
         fragment_id: usize,
         deletion_vec: Option<Arc<DeletionVector>>,
         row_id_sequence: Option<Arc<RowIdSequence>>,
-        readers: Vec<(Box<dyn GenericFileReader>, Arc<Schema>)>,
+        readers: Vec<Box<dyn GenericFileReader>>,
         output_schema: ArrowSchema,
         num_rows: usize,
         num_physical_rows: usize,
     ) -> Result<Self> {
-        if let Some(legacy_reader) = readers.first().and_then(|reader| reader.0.as_legacy_opt()) {
+        if let Some(legacy_reader) = readers.first().and_then(|reader| reader.as_legacy_opt()) {
             let num_batches = legacy_reader.num_batches();
             for reader in readers.iter().skip(1) {
-                if let Some(other_legacy) = reader.0.as_legacy_opt() {
+                if let Some(other_legacy) = reader.as_legacy_opt() {
                     if other_legacy.num_batches() != num_batches {
                         return Err(Error::io(
                                 "Cannot create FragmentReader from data files with different number of batches"
@@ -1372,12 +1412,12 @@ impl FragmentReader {
     /// in place until v1 is removed.  v2 uses a different mechanism for pushdown and so there
     /// is little benefit in updating the v1 pushdown node.
     pub(crate) fn legacy_num_batches(&self) -> usize {
-        let legacy_reader = self.readers[0].0.as_legacy();
+        let legacy_reader = self.readers[0].as_legacy();
         let num_batches = legacy_reader.num_batches();
         assert!(
             self.readers
                 .iter()
-                .all(|r| r.0.as_legacy().num_batches() == num_batches),
+                .all(|r| r.as_legacy().num_batches() == num_batches),
             "Data files have varying number of batches, which is not yet supported."
         );
         num_batches
@@ -1391,7 +1431,7 @@ impl FragmentReader {
     /// use streams, the updater still needs to know the batch size in v1 so that it can create
     /// files with the same batch size.
     pub(crate) fn legacy_num_rows_in_batch(&self, batch_id: u32) -> Option<u32> {
-        if let Some(legacy_reader) = self.readers.first().and_then(|r| r.0.as_legacy_opt()) {
+        if let Some(legacy_reader) = self.readers.first().and_then(|r| r.as_legacy_opt()) {
             if batch_id < legacy_reader.num_batches() as u32 {
                 Some(legacy_reader.num_rows_in_batch(batch_id as i32) as u32)
             } else {
@@ -1412,10 +1452,10 @@ impl FragmentReader {
         projection: Option<&Schema>,
     ) -> Result<Option<RecordBatch>> {
         let mut stats_batches = vec![];
-        for (reader, schema) in self.readers.iter() {
+        for reader in self.readers.iter() {
             let schema = match projection {
-                Some(projection) => Arc::new(schema.intersection(projection)?),
-                None => schema.clone(),
+                Some(projection) => Arc::new(reader.projection().intersection(projection)?),
+                None => reader.projection().clone(),
             };
             let reader = reader.as_legacy();
             if let Some(stats_batch) = reader.read_page_stats(&schema.field_ids()).await? {
@@ -1444,14 +1484,14 @@ impl FragmentReader {
         params: impl Into<ReadBatchParams> + Clone,
         projection: &Schema,
     ) -> Result<RecordBatch> {
-        let first_reader = self.readers[0].0.as_legacy();
+        let first_reader = self.readers[0].as_legacy();
         // All batches have the same size in v1, except for the last one.
         let batch_offset = batch_id * first_reader.num_rows_in_batch(0);
         let rows_in_batch = first_reader.num_rows_in_batch(batch_id as i32);
 
         let batches = if !projection.fields.is_empty() {
-            let read_tasks = self.readers.iter().map(|(reader, schema)| {
-                let projection = schema.intersection(projection);
+            let read_tasks = self.readers.iter().map(|reader| {
+                let projection = reader.projection().intersection(projection);
                 let params = params.clone();
 
                 let reader = reader.as_legacy();
@@ -1552,7 +1592,7 @@ impl FragmentReader {
         &self,
         params: ReadBatchParams,
         batch_size: u32,
-        read_fn: impl Fn(&dyn GenericFileReader, &Arc<Schema>) -> Result<ReadBatchTaskStream>,
+        read_fn: impl Fn(&dyn GenericFileReader) -> Result<ReadBatchTaskStream>,
     ) -> Result<ReadBatchFutStream> {
         let total_num_rows = self.num_physical_rows as u32;
         // Note that the fragment length might be considerably smaller if there are deleted rows.
@@ -1604,15 +1644,15 @@ impl FragmentReader {
             let read_streams = self
                 .readers
                 .iter()
-                .filter_map(|(reader, schema)| {
+                .filter_map(|reader| {
                     // Normally we filter out empty readers in the open_readers method
                     // However, we will keep the first empty reader to use for row id
                     // purposes on some legacy paths and so we need to filter that out
                     // here.
-                    if schema.fields.is_empty() {
+                    if reader.projection().fields.is_empty() {
                         None
                     } else {
-                        Some(read_fn(reader.as_ref(), schema))
+                        Some(read_fn(reader.as_ref()))
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -1653,22 +1693,20 @@ impl FragmentReader {
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),
             batch_size,
-            move |reader, schema| {
+            move |reader| {
                 reader.read_range_tasks(
                     range.start as u64..range.end as u64,
                     batch_size,
-                    schema.clone(),
+                    reader.projection().clone(),
                 )
             },
         )
     }
 
     pub fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
-        self.new_read_impl(
-            ReadBatchParams::RangeFull,
-            batch_size,
-            move |reader, schema| reader.read_all_tasks(batch_size, schema.clone()),
-        )
+        self.new_read_impl(ReadBatchParams::RangeFull, batch_size, move |reader| {
+            reader.read_all_tasks(batch_size, reader.projection().clone())
+        })
     }
 
     // Legacy function that reads a range of data and concatenates the results
@@ -1693,7 +1731,7 @@ impl FragmentReader {
         self.new_read_impl(
             ReadBatchParams::Indices(indices_arr),
             batch_size,
-            move |reader, schema| reader.take_all_tasks(indices, batch_size, schema.clone()),
+            move |reader| reader.take_all_tasks(indices, batch_size, reader.projection().clone()),
         )
     }
 

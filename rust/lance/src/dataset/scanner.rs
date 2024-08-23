@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -13,6 +14,7 @@ use async_recursion::async_recursion;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -402,6 +404,29 @@ impl Scanner {
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the I/O buffer size
+    ///
+    /// This is the amount of RAM that will be reserved for holding I/O received from
+    /// storage before it is processed.  This is used to control the amount of memory
+    /// used by the scanner.  If the buffer is full then the scanner will block until
+    /// the buffer is processed.
+    ///
+    /// Generally this should scale with the number of concurrent I/O threads.  The
+    /// default is 2GiB which comfortably provides enough space for somewhere between
+    /// 32 and 256 concurrent I/O threads.
+    ///
+    /// This value is not a hard cap on the amount of RAM the scanner will use.  Some
+    /// space is used for the compute (which can be controlled by the batch size) and
+    /// Lance does not keep track of memory after it is returned to the user.
+    ///
+    /// Currently, if there is a single batch of data which is larger than the io buffer
+    /// size then the scanner will deadlock.  This is a known issue and will be fixed in
+    /// a future release.
+    pub fn io_buffer_size(&mut self, size: u64) -> &mut Self {
+        self.io_buffer_size = Some(size);
         self
     }
 
@@ -890,6 +915,22 @@ impl Scanner {
             FilterPlan::default()
         };
 
+        let scan_range = if filter_plan.has_any_filter() {
+            // If there is a filter we can't pushdown limit / offset
+            None
+        } else {
+            match (self.limit, self.offset) {
+                (None, None) => None,
+                (Some(limit), None) => Some(0..limit as u64),
+                (None, Some(offset)) => {
+                    let num_rows = self.dataset.count_all_rows().await?;
+                    Some(offset as u64..num_rows as u64)
+                }
+                (Some(limit), Some(offset)) => Some(offset as u64..(offset + limit) as u64),
+            }
+        };
+        let mut use_limit_node = true;
+
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
             (Some(_), None) => {
@@ -950,7 +991,19 @@ impl Scanner {
                         } else {
                             self.projection_plan.physical_schema.clone()
                         };
-                        self.scan(with_row_id, self.with_row_address, false, schema)
+                        if !self.dataset.is_legacy_storage() {
+                            // If this is a v2 dataset then we can pushdown limit/offset (via
+                            // scan_range and we zero out limit/offset so we don't apply it
+                            // twice)
+                            use_limit_node = false;
+                        }
+                        self.scan(
+                            with_row_id,
+                            self.with_row_address,
+                            false,
+                            scan_range,
+                            schema,
+                        )
                     }
                 }
             }
@@ -1026,7 +1079,7 @@ impl Scanner {
         }
 
         // Stage 4: limit / offset
-        if (self.limit.unwrap_or(0) > 0) || self.offset.is_some() {
+        if use_limit_node && (self.limit.unwrap_or(0) > 0 || self.offset.is_some()) {
             plan = self.limit_node(plan);
         }
 
@@ -1207,7 +1260,7 @@ impl Scanner {
                 self.scalar_indexed_scan(&vector_scan_projection, index_query)
                     .await?
             } else {
-                self.scan(true, false, true, vector_scan_projection)
+                self.scan(true, false, true, None, vector_scan_projection)
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 let planner = Planner::new(plan.schema());
@@ -1252,6 +1305,8 @@ impl Scanner {
                 true,
                 vector_scan_projection,
                 Arc::new(unindexed_fragments),
+                // Can't pushdown limit/offset in an ANN search
+                None,
                 // We are re-ordering anyways, so no need to get data in data
                 // in a deterministic order.
                 false,
@@ -1390,6 +1445,8 @@ impl Scanner {
                 false,
                 Arc::new(schema.clone()),
                 missing_frags.into(),
+                // No pushdown of limit/offset when doing scalar indexed scan
+                None,
                 false,
             );
             let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
@@ -1424,6 +1481,7 @@ impl Scanner {
         with_row_id: bool,
         with_row_address: bool,
         with_make_deletions_null: bool,
+        range: Option<Range<u64>>,
         projection: Arc<Schema>,
     ) -> Arc<dyn ExecutionPlan> {
         let fragments = if let Some(fragment) = self.fragments.as_ref() {
@@ -1443,10 +1501,12 @@ impl Scanner {
             with_make_deletions_null,
             projection,
             fragments,
+            range,
             ordered,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_fragments(
         &self,
         with_row_id: bool,
@@ -1454,11 +1514,13 @@ impl Scanner {
         with_make_deletions_null: bool,
         projection: Arc<Schema>,
         fragments: Arc<Vec<Fragment>>,
+        range: Option<Range<u64>>,
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
             fragments,
+            range,
             projection,
             self.get_batch_size(),
             self.batch_readahead,
@@ -1596,7 +1658,7 @@ impl Scanner {
                 // of the filter columns to determine the valid row ids.
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
                 let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-                let filter_input = self.scan(true, false, true, filter_schema);
+                let filter_input = self.scan(true, false, true, None, filter_schema);
                 let planner = Planner::new(filter_input.schema());
                 let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
                 let filtered_row_ids =
@@ -1618,9 +1680,10 @@ impl Scanner {
         projection: &Schema,
         batch_readahead: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let coalesced = Arc::new(CoalesceBatchesExec::new(input, self.get_batch_size()));
         Ok(Arc::new(TakeExec::try_new(
             self.dataset.clone(),
-            input,
+            coalesced,
             Arc::new(projection.clone()),
             batch_readahead,
         )?))
@@ -1913,8 +1976,16 @@ mod test {
             if use_filter {
                 builder.filter("i IS NOT NULL").unwrap();
             }
+            let expected_lens = if use_filter {
+                // If there is a filter then a late materialization pass is added
+                // and that uses coalesce batches which can yield slightly larger
+                // than requested batch sizes.
+                vec![8, 10, 10, 10, 10, 10, 10]
+            } else {
+                vec![8, 2, 8, 2, 8, 2, 8, 2, 8, 2]
+            };
             let mut stream = builder.try_into_stream().await.unwrap();
-            for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
+            for expected_len in expected_lens {
                 assert_eq!(
                     stream.next().await.unwrap().unwrap().num_rows(),
                     expected_len as usize
@@ -4078,8 +4149,9 @@ mod test {
             },
             "ProjectionExec: expr=[s@2 as s]
   Take: columns=\"i, _rowid, s\"
-    FilterExec: i@0 > 10 AND i@0 < 20
-      LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: i@0 > 10 AND i@0 < 20
+        LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
@@ -4098,10 +4170,11 @@ mod test {
             |scan| scan.nearest("vec", &q, 5),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    FilterExec: _distance@2 IS NOT NULL
-      SortExec: TopK(fetch=5), expr=...
-        KNNVectorDistance: metric=l2
-          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@2 IS NOT NULL
+        SortExec: TopK(fetch=5), expr=...
+          KNNVectorDistance: metric=l2
+            LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4113,9 +4186,10 @@ mod test {
             |scan| scan.nearest("vec", &q, 42),
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, i, s, vec\"
-    SortExec: TopK(fetch=42), expr=...
-      ANNSubIndex: name=..., k=42, deltas=1
-        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: TopK(fetch=42), expr=...
+        ANNSubIndex: name=..., k=42, deltas=1
+          ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4124,13 +4198,15 @@ mod test {
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=10), expr=...
-        KNNVectorDistance: metric=l2
-          Take: columns=\"_distance, _rowid, vec\"
-            SortExec: TopK(fetch=40), expr=...
-              ANNSubIndex: name=..., k=40, deltas=1
-                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=10), expr=...
+          KNNVectorDistance: metric=l2
+            Take: columns=\"_distance, _rowid, vec\"
+              CoalesceBatchesExec: target_batch_size=8192
+                SortExec: TopK(fetch=40), expr=...
+                  ANNSubIndex: name=..., k=40, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4140,10 +4216,11 @@ mod test {
             |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
   Take: columns=\"vec, _rowid, _distance, i, s\"
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=13), expr=...
-        KNNVectorDistance: metric=l2
-          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=13), expr=...
+          KNNVectorDistance: metric=l2
+            LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4159,11 +4236,13 @@ mod test {
             },
             "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
   Take: columns=\"_distance, _rowid, i, s, vec\"
-    FilterExec: i@2 > 10
-      Take: columns=\"_distance, _rowid, i\"
-        SortExec: TopK(fetch=17), expr=...
-          ANNSubIndex: name=..., k=17, deltas=1
-            ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: i@2 > 10
+        Take: columns=\"_distance, _rowid, i\"
+          CoalesceBatchesExec: target_batch_size=8192
+            SortExec: TopK(fetch=17), expr=...
+              ANNSubIndex: name=..., k=17, deltas=1
+                ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4178,11 +4257,12 @@ mod test {
             },
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, i, s, vec\"
-    SortExec: TopK(fetch=17), expr=...
-      ANNSubIndex: name=..., k=17, deltas=1
-        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-        FilterExec: i@0 > 10
-          LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: TopK(fetch=17), expr=...
+        ANNSubIndex: name=..., k=17, deltas=1
+          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          FilterExec: i@0 > 10
+            LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4194,20 +4274,22 @@ mod test {
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=6), expr=...
-        KNNVectorDistance: metric=l2
-          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-            UnionExec
-              ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=6), expr=...
-                    KNNVectorDistance: metric=l2
-                      LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=6), expr=...
-                  ANNSubIndex: name=..., k=6, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=6), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=6), expr=...
+                      KNNVectorDistance: metric=l2
+                        LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+                Take: columns=\"_distance, _rowid, vec\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=6), expr=...
+                      ANNSubIndex: name=..., k=6, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4217,22 +4299,25 @@ mod test {
             |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    FilterExec: i@3 > 10
-      Take: columns=\"_rowid, vec, _distance, i\"
-        FilterExec: _distance@... IS NOT NULL
-          SortExec: TopK(fetch=15), expr=...
-            KNNVectorDistance: metric=l2
-              RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-                UnionExec
-                  ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
-                    FilterExec: _distance@... IS NOT NULL
-                      SortExec: TopK(fetch=15), expr=...
-                        KNNVectorDistance: metric=l2
-                          LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-                  Take: columns=\"_distance, _rowid, vec\"
-                    SortExec: TopK(fetch=15), expr=...
-                      ANNSubIndex: name=..., k=15, deltas=1
-                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: i@3 > 10
+        Take: columns=\"_rowid, vec, _distance, i\"
+          CoalesceBatchesExec: target_batch_size=8192
+            FilterExec: _distance@... IS NOT NULL
+              SortExec: TopK(fetch=15), expr=...
+                KNNVectorDistance: metric=l2
+                  RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+                    UnionExec
+                      ProjectionExec: expr=[_distance@2 as _distance, _rowid@1 as _rowid, vec@0 as vec]
+                        FilterExec: _distance@... IS NOT NULL
+                          SortExec: TopK(fetch=15), expr=...
+                            KNNVectorDistance: metric=l2
+                              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
+                      Take: columns=\"_distance, _rowid, vec\"
+                        CoalesceBatchesExec: target_batch_size=8192
+                          SortExec: TopK(fetch=15), expr=...
+                            ANNSubIndex: name=..., k=15, deltas=1
+                              ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await?;
 
@@ -4249,23 +4334,25 @@ mod test {
             // only to be taken again later. We should fix this.
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=5), expr=...
-        KNNVectorDistance: metric=l2
-          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-            UnionExec
-              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=5), expr=...
-                    KNNVectorDistance: metric=l2
-                      FilterExec: i@1 > 10
-                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=5), expr=...
-                  ANNSubIndex: name=..., k=5, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                    FilterExec: i@0 > 10
-                      LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=5), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=5), expr=...
+                      KNNVectorDistance: metric=l2
+                        FilterExec: i@1 > 10
+                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+                Take: columns=\"_distance, _rowid, vec\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=5), expr=...
+                      ANNSubIndex: name=..., k=5, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        FilterExec: i@0 > 10
+                          LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -4285,10 +4372,11 @@ mod test {
             },
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
   Take: columns=\"_distance, _rowid, i, s, vec\"
-    SortExec: TopK(fetch=5), expr=...
-      ANNSubIndex: name=..., k=5, deltas=1
-        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-        ScalarIndexQuery: query=i > 10",
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: TopK(fetch=5), expr=...
+        ANNSubIndex: name=..., k=5, deltas=1
+          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -4304,22 +4392,24 @@ mod test {
             },
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=8), expr=...
-        KNNVectorDistance: metric=l2
-          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-            UnionExec
-              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=8), expr=...
-                    KNNVectorDistance: metric=l2
-                      FilterExec: i@1 > 10
-                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=8), expr=...
-                  ANNSubIndex: name=..., k=8, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                    ScalarIndexQuery: query=i > 10",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=8), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=8), expr=...
+                      KNNVectorDistance: metric=l2
+                        FilterExec: i@1 > 10
+                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+                Take: columns=\"_distance, _rowid, vec\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=8), expr=...
+                      ANNSubIndex: name=..., k=8, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -4335,22 +4425,24 @@ mod test {
             },
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
   Take: columns=\"_rowid, vec, _distance, i, s\"
-    FilterExec: _distance@... IS NOT NULL
-      SortExec: TopK(fetch=11), expr=...
-        KNNVectorDistance: metric=l2
-          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-            UnionExec
-              ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
-                FilterExec: _distance@... IS NOT NULL
-                  SortExec: TopK(fetch=11), expr=...
-                    KNNVectorDistance: metric=l2
-                      FilterExec: i@1 > 10
-                        LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-              Take: columns=\"_distance, _rowid, vec\"
-                SortExec: TopK(fetch=11), expr=...
-                  ANNSubIndex: name=..., k=11, deltas=1
-                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1
-                    ScalarIndexQuery: query=i > 10",
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: _distance@... IS NOT NULL
+        SortExec: TopK(fetch=11), expr=...
+          KNNVectorDistance: metric=l2
+            RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+              UnionExec
+                ProjectionExec: expr=[_distance@3 as _distance, _rowid@2 as _rowid, vec@0 as vec]
+                  FilterExec: _distance@... IS NOT NULL
+                    SortExec: TopK(fetch=11), expr=...
+                      KNNVectorDistance: metric=l2
+                        FilterExec: i@1 > 10
+                          LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
+                Take: columns=\"_distance, _rowid, vec\"
+                  CoalesceBatchesExec: target_batch_size=8192
+                    SortExec: TopK(fetch=11), expr=...
+                      ANNSubIndex: name=..., k=11, deltas=1
+                        ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+                        ScalarIndexQuery: query=i > 10",
         )
         .await?;
 
@@ -4361,7 +4453,8 @@ mod test {
             |scan| scan.project(&["s"])?.filter("i > 10"),
             "ProjectionExec: expr=[s@1 as s]
   Take: columns=\"_rowid, s\"
-    MaterializeIndex: query=i > 10",
+    CoalesceBatchesExec: target_batch_size=8192
+      MaterializeIndex: query=i > 10",
         )
         .await?;
 
@@ -4388,7 +4481,8 @@ mod test {
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
       Take: columns=\"_rowid, s\"
-        MaterializeIndex: query=i > 10
+        CoalesceBatchesExec: target_batch_size=8192
+          MaterializeIndex: query=i > 10
       ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
         FilterExec: i@1 > 10
           LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
@@ -4447,7 +4541,8 @@ mod test {
     RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
       UnionExec
         Take: columns=\"_rowid, s\"
-          MaterializeIndex: query=i > 10
+          CoalesceBatchesExec: target_batch_size=8192
+            MaterializeIndex: query=i > 10
         ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
           FilterExec: i@1 > 10
             LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
@@ -4519,9 +4614,10 @@ mod test {
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
             Take: columns=\"_distance, _rowid, vec\"
-              SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
-                ANNSubIndex: name=idx, k=34, deltas=1
-                  ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
+              CoalesceBatchesExec: target_batch_size=8192
+                SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
+                  ANNSubIndex: name=idx, k=34, deltas=1
+                    ANNIvfPartition: uuid=..., nprobes=1, deltas=1",
         )
         .await
         .unwrap();

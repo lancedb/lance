@@ -20,8 +20,9 @@ use lance_core::{Error, Result};
 
 use crate::{
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression,
-        LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
+        LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
     encodings::logical::r#struct::SimpleStructScheduler,
@@ -318,11 +319,12 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
+    priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
-    let num_offsets = offsets_decoder.unawaited();
+    let num_offsets = offsets_decoder.num_rows();
     // We know the offsets are a primitive array and thus will not need additional
     // pages.  We can use a dummy receiver to match the decoder API
-    offsets_decoder.wait(num_offsets).await?;
+    offsets_decoder.wait_for_loaded(num_offsets - 1).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
     let offsets = decode_task.task.decode()?;
 
@@ -330,10 +332,12 @@ async fn indirect_schedule_task(
         decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
 
     trace!(
-        "Indirectly scheduling items ranges {:?} from list items column with {} rows",
+        "Indirectly scheduling items ranges {:?} from list items column with {} rows (and priority {:?})",
         item_ranges,
-        items_scheduler.num_rows()
+        items_scheduler.num_rows(),
+        priority
     );
+    let offsets: Arc<[u64]> = offsets.into();
 
     // All requested lists are empty
     if item_ranges.is_empty() {
@@ -354,11 +358,14 @@ async fn indirect_schedule_task(
         DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields);
     let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
+    let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
+
     let indirect_messages = indirect_scheduler.schedule_ranges_to_vec(
         &item_ranges,
         // Can't push filters into list items
         &FilterExpression::no_filter(),
         io,
+        Some(priority),
     )?;
 
     for message in indirect_messages {
@@ -408,9 +415,9 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<crate::decoder::ScheduledScanLine> {
-        let next_offsets = self.offsets.schedule_next(context, top_level_row)?;
+        let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
         trace!(
@@ -440,15 +447,16 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             items_scheduler,
             items_type,
             io,
+            priority.box_clone(),
         ));
 
         // Return a decoder
         let decoder = Box::new(ListPageDecoder {
-            offsets: Vec::new(),
+            offsets: Arc::new([]),
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
             item_decoder: None,
             rows_drained: 0,
-            lists_available: 0,
+            rows_loaded: 0,
             item_field_name: self.scheduler.item_field_name.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
@@ -565,12 +573,12 @@ impl FieldScheduler for ListFieldScheduler {
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
     // offsets and validity will have already been decoded as part of the indirect I/O
-    offsets: Vec<u64>,
+    offsets: Arc<[u64]>,
     validity: BooleanBuffer,
     item_decoder: Option<SimpleStructDecoder>,
-    lists_available: u64,
     num_rows: u64,
     rows_drained: u64,
+    rows_loaded: u64,
     item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
@@ -645,8 +653,23 @@ impl DecodeArrayTask for ListDecodeTask {
     }
 }
 
+// Helper method that performs binary search.  However, once the
+// target is found it walks past any duplicates.  E.g. if the
+// input list is [0, 3, 5, 5, 5, 7] then this will only return
+// 0, 1, 4, or 5.
+fn binary_search_to_end(to_search: &[u64], target: u64) -> u64 {
+    let mut result = match to_search.binary_search(&target) {
+        Ok(idx) => idx,
+        Err(idx) => idx - 1,
+    };
+    while result < (to_search.len() - 1) && to_search[result + 1] == target {
+        result += 1;
+    }
+    result as u64
+}
+
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait(&mut self, num_rows: u64) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         async move {
             // wait for the indirect I/O to finish, run the scheduler for the indirect
             // I/O and then wait for enough items to arrive
@@ -665,51 +688,40 @@ impl LogicalPageDecoder for ListPageDecoder {
                 self.validity = indirectly_loaded.validity;
                 self.item_decoder = indirectly_loaded.root_decoder;
             }
-            trace!(
-                "List decoder is waiting for {} rows and {} are already available and {} are unawaited",
-                num_rows,
-                self.lists_available,
-                self.num_rows - self.rows_drained
-            );
-            if self.lists_available >= num_rows {
-                self.lists_available -= num_rows;
+            if self.rows_loaded > loaded_need {
                 return Ok(());
             }
-            let num_rows = num_rows - self.lists_available;
-            self.lists_available = 0;
-            let offset_wait_start = self.rows_drained + self.lists_available;
-            let item_start = self.offsets[offset_wait_start as usize];
-            let mut items_needed =
-                self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
-            if items_needed > 0 {
-                // First discount any already available items
-                let items_already_available = self.item_decoder.as_mut().unwrap().avail();
-                trace!(
-                    "List's items decoder needs {} items and already has {} items available",
-                    items_needed,
-                    items_already_available,
-                );
-                items_needed = items_needed.saturating_sub(items_already_available);
-                if items_needed > 0 {
-                    self.item_decoder.as_mut().unwrap().wait(items_needed).await?;
-                }
+
+            let mut boundary = loaded_need as usize;
+            debug_assert!(boundary < self.num_rows as usize);
+            while boundary + 2 < self.offsets.len() && self.offsets[boundary] == self.offsets[boundary + 1] {
+                boundary += 1;
             }
-            // This is technically undercounting a little.  It's possible that we loaded a big items
-            // page with many items and then only needed a few of them for the requested lists.  However,
-            // to find the exact number of lists that are available we would need to walk through the item
-            // lengths and it's faster to just undercount here.
-            self.lists_available += num_rows;
+            let items_needed = self.offsets[boundary + 1].saturating_sub(1);
+            trace!(
+                "List decoder is waiting for more than {} rows to be loaded and {}/{} are already loaded.  To satisfy this we need more than {} loaded items",
+                loaded_need,
+                self.rows_loaded,
+                self.num_rows,
+                items_needed,
+            );
+
+            let items_loaded = if let Some(item_decoder) = self.item_decoder.as_mut() {
+                item_decoder.wait_for_loaded(items_needed).await?;
+                item_decoder.rows_loaded()
+            } else {
+                0
+            };
+
+            self.rows_loaded = binary_search_to_end(&self.offsets, items_loaded);
+            trace!("List decoder now has {} loaded rows", self.rows_loaded);
+
             Ok(())
         }
         .boxed()
     }
 
-    fn unawaited(&self) -> u64 {
-        self.num_rows - self.lists_available - self.rows_drained
-    }
-
     fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
-        self.lists_available -= num_rows;
         // We already have the offsets but need to drain the item pages
         let mut actual_num_rows = num_rows;
         let item_start = self.offsets[self.rows_drained as usize];
@@ -754,8 +766,9 @@ impl LogicalPageDecoder for ListPageDecoder {
         };
 
         self.rows_drained += num_rows;
+        let has_more = self.rows_left() > 0;
         Ok(NextDecodeTask {
-            has_more: self.avail() > 0 || self.unawaited() > 0,
+            has_more,
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,
@@ -768,8 +781,16 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
-    fn avail(&self) -> u64 {
-        self.lists_available
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+
+    fn rows_loaded(&self) -> u64 {
+        self.rows_loaded
+    }
+
+    fn rows_drained(&self) -> u64 {
+        self.rows_drained
     }
 
     fn data_type(&self) -> &DataType {
@@ -778,7 +799,7 @@ impl LogicalPageDecoder for ListPageDecoder {
 }
 
 struct IndirectlyLoaded {
-    offsets: Vec<u64>,
+    offsets: Arc<[u64]>,
     validity: BooleanBuffer,
     root_decoder: Option<SimpleStructDecoder>,
 }
@@ -1216,8 +1237,14 @@ mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_nested_list() {
+    async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_list() {
+        let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
         check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 

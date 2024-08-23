@@ -122,6 +122,13 @@ pub struct CompactionOptions {
     /// This does not affect which fragments need compaction, but does affect
     /// how they are re-written if selected.
     pub max_rows_per_group: usize,
+    /// Max number of bytes per file
+    ///
+    /// This does not affect which frgamnets need compaction, but does affect
+    /// how they are re-written if selected.
+    ///
+    /// If not specified then the default (see [`WriteParams`]) will be used.
+    pub max_bytes_per_file: Option<usize>,
     /// Whether to compact fragments with deletions so there are no deletions.
     /// Defaults to true.
     pub materialize_deletions: bool,
@@ -132,6 +139,10 @@ pub struct CompactionOptions {
     pub materialize_deletions_threshold: f32,
     /// The number of threads to use. Defaults to the number of cores.
     pub num_threads: usize,
+    /// The batch size to use when scanning the input fragments.  If not
+    /// specified then the default (see
+    /// [`crate::dataset::Scanner::batch_size`]) will be used.
+    pub batch_size: Option<usize>,
 }
 
 impl Default for CompactionOptions {
@@ -143,6 +154,8 @@ impl Default for CompactionOptions {
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
             num_threads: num_cpus::get(),
+            max_bytes_per_file: None,
+            batch_size: None,
         }
     }
 }
@@ -630,6 +643,9 @@ async fn rewrite_files(
     // If we aren't using move-stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
     let mut scanner = dataset.scan();
+    if let Some(batch_size) = options.batch_size {
+        scanner.batch_size(batch_size);
+    }
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
@@ -644,12 +660,15 @@ async fn rewrite_files(
         (None, data)
     };
 
-    let params = WriteParams {
+    let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
         ..Default::default()
     };
+    if let Some(max_bytes_per_file) = options.max_bytes_per_file {
+        params.max_bytes_per_file = max_bytes_per_file;
+    }
     let mut new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
@@ -719,12 +738,24 @@ async fn rechunk_stable_row_ids(
             let deletions = read_deletion_file(&dataset.base, frag, dataset.object_store()).await?;
             if let Some(deletions) = deletions {
                 let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.into_iter().map(|x| x as usize))?;
+                new_seq.mask(deletions.into_iter())?;
                 *seq = Arc::new(new_seq);
             }
             Ok::<(), crate::Error>(())
         })
         .await?;
+
+    debug_assert_eq!(
+        { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
+        {
+            new_fragments
+                .iter()
+                .map(|frag| frag.physical_rows.unwrap() as u64)
+                .sum::<u64>()
+        },
+        "{:?}",
+        old_sequences
+    );
 
     let new_sequences = lance_table::rowids::rechunk_sequences(
         old_sequences

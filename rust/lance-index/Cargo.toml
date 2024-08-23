@@ -56,6 +56,7 @@ tracing.workspace = true
 tempfile.workspace = true
 crossbeam-queue.workspace = true
 bytes.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 approx.workspace = true
@@ -64,6 +65,7 @@ criterion.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
 tempfile.workspace = true
+test-log.workspace = true
 datafusion-sql.workspace = true
 random_word = { version = "0.4.3", features = ["en"] }
 

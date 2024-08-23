@@ -453,11 +453,13 @@ impl Dataset {
         offset: Option<i64>,
         nearest: Option<&Bound<PyDict>>,
         batch_size: Option<usize>,
+        io_buffer_size: Option<u64>,
         batch_readahead: Option<usize>,
         fragment_readahead: Option<usize>,
         scan_in_order: Option<bool>,
         fragments: Option<Vec<FileFragment>>,
         with_row_id: Option<bool>,
+        with_row_address: Option<bool>,
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
@@ -532,6 +534,9 @@ impl Dataset {
         if let Some(batch_size) = batch_size {
             scanner.batch_size(batch_size);
         }
+        if let Some(io_buffer_size) = io_buffer_size {
+            scanner.io_buffer_size(io_buffer_size);
+        }
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
         }
@@ -544,6 +549,10 @@ impl Dataset {
 
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
+        }
+
+        if with_row_address.unwrap_or(false) {
+            scanner.with_row_address();
         }
 
         if let Some(use_stats) = use_stats {

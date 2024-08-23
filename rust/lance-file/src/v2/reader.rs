@@ -7,7 +7,10 @@ use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use deepsize::{Context, DeepSizeOf};
-use futures::{stream::BoxStream, Stream, StreamExt};
+use futures::{
+    stream::{self, BoxStream},
+    Stream, StreamExt,
+};
 use lance_encoding::{
     decoder::{
         BatchDecodeStream, ColumnInfo, DecodeBatchScheduler, DecoderMiddlewareChain,
@@ -578,6 +581,26 @@ impl FileReader {
         Ok(self.metadata.column_infos.to_vec())
     }
 
+    fn check_scheduler_on_drop(
+        stream: BoxStream<'static, ReadBatchTask>,
+        scheduler_handle: tokio::task::JoinHandle<()>,
+    ) -> BoxStream<'static, ReadBatchTask> {
+        // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
+        // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
+        // when the stream finishes.
+        let mut scheduler_handle = Some(scheduler_handle);
+        let check_scheduler = stream::unfold((), move |_| {
+            let handle = scheduler_handle.take();
+            async move {
+                if let Some(handle) = handle {
+                    handle.await.unwrap();
+                }
+                None
+            }
+        });
+        stream.chain(check_scheduler).boxed()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn do_read_range(
         column_infos: Vec<Arc<ColumnInfo>>,
@@ -590,11 +613,20 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
-            "Reading range {:?} with batch_size {} from columns {:?}",
+            "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
             range,
             batch_size,
-            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+            num_rows,
+            column_infos.len(),
+            projection.schema.fields.len(),
         );
+
+        if range.is_empty() {
+            return Err(Error::InvalidInput {
+                source: format!("Cannot read empty range {:?} from file", range).into(),
+                location: location!(),
+            });
+        }
 
         let mut decode_scheduler = DecodeBatchScheduler::try_new(
             &projection.schema,
@@ -612,11 +644,14 @@ impl FileReader {
 
         let num_rows_to_read = range.end - range.start;
 
-        tokio::task::spawn(async move {
-            decode_scheduler.schedule_range(range, &filter, tx, scheduler)
+        let scheduler_handle = tokio::task::spawn(async move {
+            decode_scheduler.schedule_range(range, &filter, tx, scheduler);
         });
 
-        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
+        let batches =
+            BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream();
+
+        Ok(Self::check_scheduler_on_drop(batches, scheduler_handle))
     }
 
     fn read_range(
@@ -680,11 +715,14 @@ impl FileReader {
 
         let num_rows_to_read = indices.len() as u64;
 
-        tokio::task::spawn(async move {
+        let scheduler_handle = tokio::task::spawn(async move {
             decode_scheduler.schedule_take(&indices, &FilterExpression::no_filter(), tx, scheduler)
         });
 
-        Ok(BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream())
+        let batches =
+            BatchDecodeStream::new(rx, batch_size, num_rows_to_read, root_decoder).into_stream();
+
+        Ok(Self::check_scheduler_on_drop(batches, scheduler_handle))
     }
 
     fn take_rows(
@@ -994,11 +1032,13 @@ pub mod tests {
     use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
-        decoder::{decode_batch, DecoderMiddlewareChain, FilterExpression},
+        decoder::{decode_batch, DecodeBatchScheduler, DecoderMiddlewareChain, FilterExpression},
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
+        EncodingsIo,
     };
     use lance_io::stream::RecordBatchStream;
     use log::debug;
+    use tokio::sync::mpsc;
 
     use crate::v2::{
         reader::{EncodedBatchReaderExt, FileReader, ReaderProjection},
@@ -1353,6 +1393,94 @@ pub mod tests {
             .unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), total_rows);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_drop_in_progress() {
+        let fs = FsFixture::default();
+        let (_, data) = create_some_file(&fs).await;
+        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            DecoderMiddlewareChain::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut batches = file_reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                (total_rows / 10) as u32,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .unwrap();
+
+        drop(file_reader);
+
+        let batch = batches.next().await.unwrap().unwrap();
+        assert!(batch.num_rows() > 0);
+
+        // Drop in-progress scan
+        drop(batches);
+    }
+
+    #[tokio::test]
+    async fn drop_while_scheduling() {
+        // This is a bit of a white-box test, pokes at the internals.  We want to
+        // test the case where the read stream is dropped before the scheduling
+        // thread finishes.  We can't do that in a black-box fashion because the
+        // scheduling thread runs in the background and there is no easy way to
+        // pause / gate it.
+
+        // It's a regression for a bug where the scheduling thread would panic
+        // if the stream was dropped before it finished.
+
+        let fs = FsFixture::default();
+        let (schema, data) = create_some_file(&fs).await;
+        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            None,
+            DecoderMiddlewareChain::default(),
+        )
+        .await
+        .unwrap();
+
+        let projection = FileReader::default_projection(&schema);
+        let column_infos = file_reader
+            .collect_columns_from_projection(&projection)
+            .unwrap();
+        let mut decode_scheduler = DecodeBatchScheduler::try_new(
+            &projection.schema,
+            &projection.column_indices,
+            &column_infos,
+            &vec![],
+            total_rows as u64,
+            &DecoderMiddlewareChain::default(),
+            &(file_reader.scheduler.clone() as Arc<dyn EncodingsIo>),
+        )
+        .unwrap();
+
+        let range = 0..total_rows as u64;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Simulate the stream / decoder being dropped
+        drop(rx);
+
+        // Scheduling should not panic
+        decode_scheduler.schedule_range(
+            range,
+            &FilterExpression::no_filter(),
+            tx,
+            file_reader.scheduler.clone(),
+        )
     }
 
     #[tokio::test]

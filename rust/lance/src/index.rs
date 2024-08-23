@@ -343,6 +343,51 @@ impl DatasetIndexExt for Dataset {
         Ok(loaded_indices)
     }
 
+    async fn commit_existing_index(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        index_id: Uuid,
+    ) -> Result<()> {
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            });
+        };
+
+        let new_idx = IndexMetadata {
+            uuid: index_id,
+            name: index_name.to_string(),
+            fields: vec![field.id],
+            dataset_version: self.manifest.version,
+            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+        };
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let new_manifest = commit_transaction(
+            self,
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+        )
+        .await?;
+
+        self.manifest = Arc::new(new_manifest);
+
+        Ok(())
+    }
+
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
         Ok(self
             .load_indices()
@@ -458,6 +503,7 @@ impl DatasetIndexExt for Dataset {
             .map(|idx| idx.statistics())
             .collect::<Result<Vec<_>>>()?;
 
+        let index_type = indices[0].index_type().to_string();
         let unindexed_fragments = self.unindexed_fragments(index_name).await?;
         let mut num_unindexed_rows = 0;
         for f in unindexed_fragments.iter() {
@@ -471,7 +517,7 @@ impl DatasetIndexExt for Dataset {
         let num_indexed_rows = self.count_rows(None).await? - num_unindexed_rows;
 
         let stats = json!({
-            "index_type": indices_stats[0]["index_type"],
+            "index_type": index_type,
             "name": index_name,
             "num_indices": metadatas.len(),
             "indices": indices_stats,
@@ -601,7 +647,7 @@ impl DatasetIndexInternalExt for Dataset {
             (0, 3) => {
                 let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
-                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                    SchedulerConfig::max_bandwidth(&self.object_store),
                 );
                 let file = scheduler.open_file(&index_file).await?;
                 let reader =

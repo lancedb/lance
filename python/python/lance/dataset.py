@@ -247,8 +247,10 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
+        io_buffer_size: Optional[int] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -280,6 +282,9 @@ class LanceDataset(pa.dataset.Dataset):
                 }
         batch_size: int, default None
             The max size of batches returned.
+        io_buffer_size: int, default None
+            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
+            for more information.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -343,11 +348,13 @@ class LanceDataset(pa.dataset.Dataset):
             .limit(limit)
             .offset(offset)
             .batch_size(batch_size)
+            .io_buffer_size(io_buffer_size)
             .batch_readahead(batch_readahead)
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
             .with_row_id(with_row_id)
+            .with_row_address(with_row_address)
             .use_stats(use_stats)
             .fast_search(fast_search)
         )
@@ -395,9 +402,11 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         use_stats: bool = True,
         fast_search: bool = False,
         full_text_query: Optional[Union[str, dict]] = None,
+        io_buffer_size: Optional[int] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -431,6 +440,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         batch_size: int, optional
             The number of rows to read at a time.
+        io_buffer_size: int, default None
+            The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
+            for more information.
         batch_readahead: int, optional
             The number of batches to read ahead.
         fragment_readahead: int, optional
@@ -443,6 +455,8 @@ class LanceDataset(pa.dataset.Dataset):
             Run filter before the vector search.
         with_row_id: bool, default False
             Return row ID.
+        with_row_address: bool, default False
+            Return row address
         use_stats: bool, default True
             Use stats pushdown during filters.
         full_text_query: str or dict, optional
@@ -468,11 +482,13 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             use_stats=use_stats,
             fast_search=fast_search,
             full_text_query=full_text_query,
@@ -524,8 +540,10 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         prefilter: bool = False,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         use_stats: bool = True,
         full_text_query: Optional[Union[str, dict]] = None,
+        io_buffer_size: Optional[int] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -546,11 +564,13 @@ class LanceDataset(pa.dataset.Dataset):
             offset=offset,
             nearest=nearest,
             batch_size=batch_size,
+            io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             use_stats=use_stats,
             full_text_query=full_text_query,
         ).to_batches()
@@ -2127,11 +2147,13 @@ class ScannerBuilder:
         self._columns_with_transform = None
         self._nearest = None
         self._batch_size: Optional[int] = None
+        self._io_buffer_size: Optional[int] = None
         self._batch_readahead: Optional[int] = None
         self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
         self._fragments = None
         self._with_row_id = False
+        self._with_row_address = False
         self._use_stats = True
         self._fast_search = None
         self._full_text_query = None
@@ -2141,7 +2163,36 @@ class ScannerBuilder:
         self._batch_size = batch_size
         return self
 
+    def io_buffer_size(self, io_buffer_size: int) -> ScannerBuilder:
+        """
+        Set the I/O buffer size for the Scanner
+
+        This is the amount of RAM that will be reserved for holding I/O received from
+        storage before it is processed.  This is used to control the amount of memory
+        used by the scanner.  If the buffer is full then the scanner will block until
+        the buffer is processed.
+
+        Generally this should scale with the number of concurrent I/O threads.  The
+        default is 2GiB which comfortably provides enough space for somewhere between
+        32 and 256 concurrent I/O threads.
+
+        This value is not a hard cap on the amount of RAM the scanner will use.  Some
+        space is used for the compute (which can be controlled by the batch size) and
+        Lance does not keep track of memory after it is returned to the user.
+
+        Currently, if there is a single batch of data which is larger than the io buffer
+        size then the scanner will deadlock.  This is a known issue and will be fixed in
+        a future release.
+
+        This parameter is only used when reading v2 files
+        """
+        self._io_buffer_size = io_buffer_size
+        return self
+
     def batch_readahead(self, nbatches: Optional[int] = None) -> ScannerBuilder:
+        """
+        This parameter is ignored when reading v2 files
+        """
         if nbatches is not None and int(nbatches) < 0:
             raise ValueError("batch_readahead must be non-negative")
         self._batch_readahead = nbatches
@@ -2160,6 +2211,10 @@ class ScannerBuilder:
         If set to False, the scanner may read fragments concurrently and yield
         batches out of order. This may improve performance since it allows more
         concurrency in the scan, but can also use more memory.
+
+        This parameter is ignored when using v2 files.  In the v2 file format
+        there is no penalty to scanning in order and so all scans will scan in
+        order.
         """
         self._scan_in_order = scan_in_order
         return self
@@ -2234,6 +2289,19 @@ class ScannerBuilder:
     def with_row_id(self, with_row_id: bool = True) -> ScannerBuilder:
         """Enable returns with row IDs."""
         self._with_row_id = with_row_id
+        return self
+
+    def with_row_address(self, with_row_address: bool = True) -> ScannerBuilder:
+        """
+        Enables returns with row addresses.
+
+        Row addresses are a unique but unstable identifier for each row in the
+        dataset that consists of the fragment id (upper 32 bits) and the row
+        offset in the fragment (lower 32 bits).  Row IDs are generally preferred
+        since they do not change when a row is modified or compacted.  However,
+        row addresses may be useful in some advanced use cases.
+        """
+        self._with_row_address = with_row_address
         return self
 
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
@@ -2349,11 +2417,13 @@ class ScannerBuilder:
             self._offset,
             self._nearest,
             self._batch_size,
+            self._io_buffer_size,
             self._batch_readahead,
             self._fragment_readahead,
             self._scan_in_order,
             self._fragments,
             self._with_row_id,
+            self._with_row_address,
             self._use_stats,
             self._substrait_filter,
             self._fast_search,
@@ -2483,9 +2553,11 @@ class DatasetOptimizer:
         *,
         target_rows_per_fragment: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
+        max_bytes_per_file: Optional[int] = None,
         materialize_deletions: bool = True,
         materialize_deletions_threshold: float = 0.1,
         num_threads: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> CompactionMetrics:
         """Compacts small files in the dataset, reducing total number of files.
 
@@ -2509,6 +2581,13 @@ class DatasetOptimizer:
         max_rows_per_group: int, default 1024
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
+        max_bytes_per_file: Optional[int], default None
+            Max number of bytes in a single file.  This does not affect which
+            fragments need compaction, but does affect how they are re-written if
+            selected.  If this value is too small you may end up with fragments
+            that are smaller than `target_rows_per_fragment`.
+
+            The default will use the default from ``write_dataset``.
         materialize_deletions: bool, default True
             Whether to compact fragments with soft deleted rows so they are no
             longer present in the file.
@@ -2518,6 +2597,11 @@ class DatasetOptimizer:
         num_threads: int, optional
             The number of threads to use when performing compaction. If not
             specified, defaults to the number of cores on the machine.
+        batch_size: int, optional
+            The batch size to use when scanning input fragments.  You may want
+            to reduce this if you are running out of memory during compaction.
+
+            The default will use the same default from ``scanner``.
 
         Returns
         -------
@@ -2531,9 +2615,11 @@ class DatasetOptimizer:
         opts = dict(
             target_rows_per_fragment=target_rows_per_fragment,
             max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
             materialize_deletions=materialize_deletions,
             materialize_deletions_threshold=materialize_deletions_threshold,
             num_threads=num_threads,
+            batch_size=batch_size,
         )
         return Compaction.execute(self._dataset, opts)
 

@@ -14,8 +14,8 @@ use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partitions;
 use num_traits::Float;
-use rayon::prelude::*;
 use snafu::{location, Location};
+use tracing::instrument;
 
 use super::transform::Transformer;
 
@@ -77,15 +77,12 @@ where
     });
 
     let residuals = vectors_slice
-        .par_chunks(dimension)
+        .chunks_exact(dimension)
         .enumerate()
         .flat_map(|(idx, vector)| {
             let part_id = part_ids.value(idx) as usize;
             let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
-            vector
-                .par_iter()
-                .zip(c.par_iter())
-                .map(|(v, cent)| *v - *cent)
+            vector.iter().zip(c.iter()).map(|(v, cent)| *v - *cent)
         })
         .collect::<Vec<_>>();
     let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
@@ -144,6 +141,7 @@ impl Transformer for ResidualTransform {
     /// Replace the original vector in the [`RecordBatch`] to residual vectors.
     ///
     /// The new [`RecordBatch`] will have a new column named [`RESIDUAL_COLUMN`].
+    #[instrument(name = "ResidualTransform::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let part_ids = batch.column_by_name(&self.part_col).ok_or(Error::Index {
             message: format!(

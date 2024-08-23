@@ -145,15 +145,59 @@ def rand_pq(rand_dataset, rand_ivf):
     return pq
 
 
+def gen_rand_part_ids(dataset, dest_uri):
+    row_ids = dataset.to_table(with_row_address=True, columns=[])
+    part_ids = np.random.randint(0, 35000, size=row_ids.num_rows, dtype=np.uint32)
+    table = pa.table({"row_id": row_ids.column(0), "partition": part_ids})
+    lance.write_dataset(table, dest_uri, max_rows_per_file=row_ids.num_rows)
+
+
 @pytest.mark.benchmark(group="transform_vectors")
-def test_transform_vectors(test_dataset, tmpdir_factory, benchmark):
+def test_transform_vectors_no_precomputed_parts(test, tmpdir, benchmark):
     ivf = rand_ivf(test_dataset)
     pq = rand_pq(test_dataset, ivf)
-    builder = IndicesBuilder(test_dataset)
-    dst_uri = str(tmpdir_factory.mktemp("transformed") / "output.lance")
+    builder = IndicesBuilder(test_dataset, "vector")
+    dst_uri = str(tmpdir / "output.lance")
+
     benchmark.pedantic(
         builder.transform_vectors,
-        args=["vector", ivf, pq, dst_uri],
+        args=[ivf, pq, dst_uri],
+        iterations=1,
+        rounds=1,
+    )
+
+
+@pytest.mark.benchmark(group="transform_vectors")
+def test_transform_vectors_with_precomputed_parts(
+    test_large_dataset, tmpdir, benchmark
+):
+    ivf = rand_ivf(test_large_dataset)
+    pq = rand_pq(test_large_dataset, ivf)
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    dst_uri = str(tmpdir / "output.lance")
+    part_ids_path = str(tmpdir / "part_ids")
+    gen_rand_part_ids(test_large_dataset, part_ids_path)
+    benchmark.pedantic(
+        builder.transform_vectors,
+        args=[ivf, pq, dst_uri, None, part_ids_path],
+        iterations=1,
+        rounds=1,
+    )
+
+
+@pytest.mark.benchmark(group="shuffle_vectors")
+def test_shuffle_vectors(test_large_dataset, tmpdir, benchmark):
+    ivf = rand_ivf(test_large_dataset)
+    pq = rand_pq(test_large_dataset, ivf)
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    transformed_uri = str(tmpdir / "output.lance")
+    part_ids_path = str(tmpdir / "part_ids")
+    gen_rand_part_ids(test_large_dataset, part_ids_path)
+    builder.transform_vectors(ivf, pq, transformed_uri, None, part_ids_path)
+    shuffle_out = str(tmpdir)
+    benchmark.pedantic(
+        builder.shuffle_transformed_vectors,
+        args=[["output.lance"], shuffle_out, ivf],
         iterations=1,
         rounds=1,
     )

@@ -16,6 +16,7 @@ from unittest import mock
 
 import lance
 import lance.fragment
+import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import polars as pl
@@ -368,10 +369,13 @@ def test_filter(tmp_path: Path):
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
 
 
-def test_limit_offset(tmp_path: Path):
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
+def test_limit_offset(tmp_path: Path, data_storage_version: str):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
+    lance.write_dataset(
+        table, base_dir, data_storage_version=data_storage_version, max_rows_per_file=10
+    )
     dataset = lance.dataset(base_dir)
 
     # test just limit
@@ -382,6 +386,24 @@ def test_limit_offset(tmp_path: Path):
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
+
+    # Slicing in the middle of fragments
+    assert dataset.to_table(offset=5, limit=20) == table.slice(5, 20)
+
+    # Slicing within a single fragment
+    assert dataset.to_table(offset=5, limit=3) == table.slice(5, 3)
+
+    # Skipping entire fragments
+    assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
+
+    # Limit past the end
+    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+
+    # Invalid limit / offset
+    with pytest.raises(ValueError, match="Offset must be non-negative"):
+        assert dataset.to_table(offset=-1, limit=10) == table.slice(50, 50)
+    with pytest.raises(ValueError, match="Limit must be non-negative"):
+        assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
 
 
 def test_relative_paths(tmp_path: Path):
@@ -1585,6 +1607,165 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows != 12
 
 
+def test_io_buffer_size(tmp_path: Path):
+    # This regresses a deadlock issue that was happening when the
+    # batch size was very large (in bytes) so that batches would be
+    # bigger than the I/O buffer size
+    #
+    # In this test we create 4 pages of data, 2 for each column.  We
+    # then set the I/O buffer size to 5000 bytes so that we only read
+    # 1 page at a time and set the batch size to 2M rows so that we
+    # read in all 4 pages for a single batch.
+    #
+    # The scheduler will schedule in this order: C0P0, C1P0, C0P1, C1P1
+    #
+    # The deadlock would happen because the decoder was decoding in this
+    # order: C0P0, C0P1, C1P0, C1P1.
+    #
+    # The decoder will wait for C0P1 but the scheduler will only have scheduled
+    # C1P0 and so deadlock would happen.
+    #
+    # The fix was to change the decoder to decode in the same order as the
+    # scheduler.
+    base_dir = tmp_path / "dataset"
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.uint64(), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This test is similar but the first column is a list column.  The I/O to grab
+    # the list items will span multiple requests and it is important that all of
+    # those requests share the priority of the parent list
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array([[0]] * 1024 * 1024, pa.list_(pa.uint64())),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # Another scenario.  Each list item is a page in itself and we have two list
+    # columns
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.list_(pa.uint64())})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Same scenario as above except now it's a list<list<int>>
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.list_(pa.list_(pa.uint64())), "b": pa.list_(pa.list_(pa.uint64()))}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Next we consider the case where the column is a struct column and we want to
+    # make sure we don't decode too deeply into the struct child
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [{"foo": i} for i in range(1024 * 1024)],
+                        pa.struct([pa.field("foo", pa.uint64())]),
+                    ),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.struct([pa.field("foo", pa.uint64())]), "b": pa.uint64()}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+
 def test_scan_no_columns(tmp_path: Path):
     base_dir = tmp_path / "dataset"
     df = pd.DataFrame({"a": range(100)})
@@ -1994,3 +2175,14 @@ def test_legacy_dataset(tmp_path: Path):
 
     fragment = list(dataset.get_fragments())[0]
     assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+
+
+def test_late_materialization_batch_size(tmp_path: Path):
+    table = pa.table({"filter": np.arange(32 * 32), "values": np.arange(32 * 32)})
+    dataset = lance.write_dataset(
+        table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
+    )
+    for batch in dataset.to_batches(
+        columns=["values"], filter="filter % 2 == 0", batch_size=32
+    ):
+        assert batch.num_rows == 32

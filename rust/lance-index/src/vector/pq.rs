@@ -17,9 +17,9 @@ use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
 use prost::Message;
-use rayon::prelude::*;
 use snafu::{location, Location};
 use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADTA_KEY};
+use tracing::instrument;
 
 pub mod builder;
 mod distance;
@@ -93,6 +93,11 @@ impl ProductQuantizer {
         })
     }
 
+    pub fn use_residual(&self) -> bool {
+        matches!(self.distance_type, DistanceType::L2 | DistanceType::Cosine)
+    }
+
+    #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
     fn transform<T: ArrowPrimitiveType>(&self, vectors: &dyn Array) -> Result<ArrayRef>
     where
         T::Native: Float + L2 + Dot,
@@ -115,8 +120,8 @@ impl ProductQuantizer {
         let sub_dim = dim / num_sub_vectors;
         let values = flatten_data
             .values()
-            .par_chunks(dim)
-            .map(|vector| {
+            .chunks_exact(dim)
+            .flat_map(|vector| {
                 vector
                     .chunks_exact(sub_dim)
                     .enumerate()
@@ -132,7 +137,6 @@ impl ProductQuantizer {
                     })
                     .collect::<Vec<_>>()
             })
-            .flatten()
             .collect::<Vec<_>>();
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(

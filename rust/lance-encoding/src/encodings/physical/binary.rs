@@ -8,6 +8,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
+use futures::TryFutureExt;
 use futures::{future::BoxFuture, FutureExt};
 
 use crate::decoder::LogicalPageDecoder;
@@ -109,6 +110,13 @@ impl BinaryPageScheduler {
     }
 }
 
+struct IndirectData {
+    decoded_indices: UInt64Array,
+    offsets_type: DataType,
+    validity: BooleanBuffer,
+    bytes_decoder_fut: BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>,
+}
+
 impl PageScheduler for BinaryPageScheduler {
     fn schedule_ranges(
         &self,
@@ -200,21 +208,34 @@ impl PageScheduler for BinaryPageScheduler {
             let (indices, validity) = indices_builder.into_parts();
             let decoded_indices = UInt64Array::from(indices);
 
-            // Schedule the bytes for decoding
-            let bytes_page_decoder =
+            // In the indirect task we schedule the bytes, but we do not await them.  We don't want to
+            // await the bytes until the decoder is ready for them so that we don't release the backpressure
+            // too early
+            let bytes_decoder_fut =
                 copy_bytes_scheduler.schedule_ranges(&bytes_ranges, &copy_scheduler, top_level_row);
 
-            let bytes_decoder: Box<dyn PrimitivePageDecoder> = bytes_page_decoder.await?;
-
-            Ok(Box::new(BinaryPageDecoder {
+            Ok(IndirectData {
                 decoded_indices,
                 validity,
                 offsets_type,
-                bytes_decoder,
-            }) as Box<dyn PrimitivePageDecoder>)
+                bytes_decoder_fut,
+            })
         })
         // Propagate join panic
         .map(|join_handle| join_handle.unwrap())
+        .and_then(|indirect_data| {
+            async move {
+                // Later, this will be called once the decoder actually starts polling.  At that point
+                // we await the bytes (releasing the backpressure)
+                let bytes_decoder = indirect_data.bytes_decoder_fut.await?;
+                Ok(Box::new(BinaryPageDecoder {
+                    decoded_indices: indirect_data.decoded_indices,
+                    offsets_type: indirect_data.offsets_type,
+                    validity: indirect_data.validity,
+                    bytes_decoder,
+                }) as Box<dyn PrimitivePageDecoder>)
+            }
+        })
         .boxed()
     }
 }
@@ -604,7 +625,7 @@ pub mod tests {
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_few_rows_bigger_than_max_page_size() {
+    async fn test_bigger_than_max_page_size() {
         // Create an array with one single 32MiB string
         let big_string = String::from_iter((0..(32 * 1024 * 1024)).map(|_| '0'));
         let string_array = StringArray::from(vec![
@@ -621,6 +642,19 @@ pub mod tests {
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
+            HashMap::new(),
+        )
+        .await;
+
+        // This is a regression testing the case where a page with X rows is split into Y parts
+        // where the number of parts is not evenly divisible by the number of rows.  In this
+        // case we are splitting 90 rows into 4 parts.
+        let big_string = String::from_iter((0..(1000 * 1000)).map(|_| '0'));
+        let string_array = StringArray::from_iter_values((0..90).map(|_| big_string.clone()));
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &TestCases::default(),
             HashMap::new(),
         )
         .await;

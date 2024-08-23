@@ -16,6 +16,7 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 use lance_linalg::kernels::normalize_fsl;
+use tracing::instrument;
 
 /// Transform of a Vector Matrix.
 ///
@@ -54,6 +55,7 @@ impl NormalizeTransformer {
 }
 
 impl Transformer for NormalizeTransformer {
+    #[instrument(name = "NormalizeTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch
             .column_by_name(&self.input_column)
@@ -107,6 +109,7 @@ where
 }
 
 impl Transformer for KeepFiniteVectors {
+    #[instrument(name = "KeepFiniteVectors::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
             message: format!(

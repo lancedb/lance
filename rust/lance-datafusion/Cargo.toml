@@ -25,6 +25,7 @@ datafusion-substrait = { version = "40.0", optional = true }
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
+lazy_static.workspace = true
 log.workspace = true
 prost.workspace = true
 snafu.workspace = true

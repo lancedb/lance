@@ -436,10 +436,16 @@ impl TryFrom<pb::Manifest> for Manifest {
 
         let data_storage_format = match p.data_format {
             None => {
-                if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
-                    DataStorageFormat::new(LanceFileVersion::V2_0)
+                if let Some(inferred_version) = Fragment::try_infer_version(fragments.as_ref())? {
+                    // If there are fragments, they are a better indicator
+                    DataStorageFormat::new(inferred_version)
                 } else {
-                    DataStorageFormat::new(LanceFileVersion::Legacy)
+                    // No fragments to inspect, best we can do is look at writer flags
+                    if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
+                        DataStorageFormat::new(LanceFileVersion::Stable)
+                    } else {
+                        DataStorageFormat::new(LanceFileVersion::Legacy)
+                    }
                 }
             }
             Some(format) => DataStorageFormat::from(format),

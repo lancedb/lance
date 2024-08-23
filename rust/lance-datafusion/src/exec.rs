@@ -24,6 +24,7 @@ use datafusion::{
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use lazy_static::lazy_static;
 
 use futures::stream;
 use lance_arrow::SchemaExt;
@@ -208,6 +209,31 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
+lazy_static! {
+    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
+        new_session_context(LanceExecutionOptions::default());
+    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
+        new_session_context(LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        })
+    };
+}
+
+pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
+    let session_ctx: SessionContext;
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
+        if options.use_spilling() {
+            session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+        } else {
+            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
+        }
+    } else {
+        session_ctx = new_session_context(options)
+    }
+    session_ctx
+}
+
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
@@ -215,7 +241,8 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let session_ctx = new_session_context(options);
+    let session_ctx = get_session_context(options);
+
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);

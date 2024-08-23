@@ -22,17 +22,17 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge | Project |
-//! |------------------|--------|--------|------------------|--------------|---------|-------|---------|
-//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    | ❌      |
-//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    | ❌      |
-//! | Overwrite/Create | ✅     | ✅     | ✅               | ✅           | ✅      | ✅    | ✅      |
-//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    | ✅      |
-//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    | ❌      |
-//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    | ❌      |
-//! | Project          | ✅     | ✅     | ❌               | ❌           | ✅      | ❌    | ✅      |
+//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project |
+//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|
+//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      |
+//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      |
+//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      |
+//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      |
+//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      |
+//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      |
+//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      |
 //!
-//! (1) Delete and rewrite are compatible with each other and themselves only if
+//! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
 
 use std::{collections::HashSet, sync::Arc};
@@ -329,6 +329,29 @@ impl Transaction {
         })
     }
 
+    fn data_storage_format_from_files(
+        fragments: &[Fragment],
+        user_requested: Option<LanceFileVersion>,
+    ) -> Result<DataStorageFormat> {
+        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
+            // Ensure user-requested matches data files
+            if let Some(user_requested) = user_requested {
+                if user_requested != file_version {
+                    return Err(Error::invalid_input(
+                    format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
+                    location!(),
+                ));
+                }
+            }
+            Ok(DataStorageFormat::new(file_version))
+        } else {
+            // If no files use user-requested or default
+            Ok(user_requested
+                .map(DataStorageFormat::new)
+                .unwrap_or_default())
+        }
+    }
+
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -452,6 +475,7 @@ impl Transaction {
                         }
                     }
                 });
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
                 removed_fragment_ids,
@@ -475,6 +499,7 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Overwrite { ref fragments, .. } => {
                 let mut new_fragments =
@@ -535,7 +560,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -556,7 +581,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Restore { .. } => {
                 unreachable!()
@@ -566,21 +591,26 @@ impl Transaction {
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
-        let data_storage_format = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => storage_format.clone(),
-            (None, Some(true)) => DataStorageFormat::new(LanceFileVersion::Legacy),
-            (None, Some(false)) => DataStorageFormat::new(LanceFileVersion::V2_0),
-            (None, None) => DataStorageFormat::default(),
+        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
+            (None, Some(true)) => Some(LanceFileVersion::Legacy),
+            (None, Some(false)) => Some(LanceFileVersion::V2_0),
+            (None, None) => None,
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
             if matches!(self.operation, Operation::Overwrite { .. }) {
-                prev_manifest.data_storage_format = data_storage_format;
+                prev_manifest.data_storage_format = Self::data_storage_format_from_files(
+                    &prev_manifest.fragments,
+                    user_requested_version,
+                )?;
             }
             prev_manifest
         } else {
+            let data_storage_format =
+                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
             Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
         };
 
@@ -606,7 +636,7 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema) {
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -616,6 +646,17 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+        });
+
+        // We might have also removed all fragments that an index was covering, so
+        // we should remove those indices as well.
+        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
+        indices.retain(|existing_index| {
+            existing_index
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
+                .unwrap_or(true)
         });
     }
 

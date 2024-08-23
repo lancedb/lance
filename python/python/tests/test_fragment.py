@@ -270,3 +270,29 @@ def test_fragment_v2(tmp_path):
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)
     assert "minor_version: 3" in format_fragment(fragments[0], ds)
+
+
+def test_mixed_fragment_versions(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    # Create empty v2 dataset
+    ds = lance.write_dataset(
+        data_obj=[],
+        uri=tmp_path / "dataset2",
+        schema=data.schema,
+        data_storage_version="stable",
+    )
+
+    # Add one v1 file and one v2 file
+    fragments = []
+    fragments.append(
+        lance.LanceFragment.create(ds.uri, data, data_storage_version="legacy")
+    )
+    fragments.append(
+        lance.LanceFragment.create(ds.uri, data, data_storage_version="stable")
+    )
+
+    # Attempt to commit
+    operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
+    with pytest.raises(OSError, match="All data files must have the same version"):
+        lance.LanceDataset.commit(ds.uri, operation)

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
-    TryStreamExt,
+    Stream, TryStreamExt,
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
@@ -87,7 +87,7 @@ use crate::{
 };
 
 pub mod builder;
-mod io;
+pub mod io;
 pub mod v2;
 
 /// IVF Index.
@@ -753,7 +753,25 @@ impl Index for IVFIndex {
     }
 
     fn index_type(&self) -> IndexType {
-        IndexType::Vector
+        if self.sub_index.as_any().downcast_ref::<PQIndex>().is_some() {
+            IndexType::IvfPq
+        } else if self
+            .sub_index
+            .as_any()
+            .downcast_ref::<HNSWIndex<ScalarQuantizer>>()
+            .is_some()
+        {
+            IndexType::IvfHnswSq
+        } else if self
+            .sub_index
+            .as_any()
+            .downcast_ref::<HNSWIndex<ProductQuantizer>>()
+            .is_some()
+        {
+            IndexType::IvfHnswPq
+        } else {
+            IndexType::Vector
+        }
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
@@ -766,7 +784,7 @@ impl Index for IVFIndex {
         let centroid_vecs = centroids_to_vectors(self.ivf.centroids.as_ref().unwrap())?;
 
         Ok(serde_json::to_value(IvfIndexStatistics {
-            index_type: "IVF".to_string(),
+            index_type: self.index_type().to_string(),
             uuid: self.uuid.clone(),
             uri: to_local_path(self.reader.path()),
             metric_type: self.metric_type.to_string(),
@@ -941,6 +959,31 @@ pub struct IvfPQIndexMetadata {
 
     /// Transforms to be applied before search.
     transforms: Vec<pb::Transform>,
+}
+
+impl IvfPQIndexMetadata {
+    /// Create a new IvfPQIndexMetadata object
+    pub fn new(
+        name: String,
+        column: String,
+        dataset_version: u64,
+        metric_type: MetricType,
+        ivf: IvfModel,
+        pq: ProductQuantizer,
+        transforms: Vec<pb::Transform>,
+    ) -> Self {
+        let dimension = ivf.dimension() as u32;
+        Self {
+            name,
+            column,
+            dimension,
+            dataset_version,
+            metric_type,
+            ivf,
+            pq,
+            transforms,
+        }
+    }
 }
 
 /// Convert a IvfPQIndex to protobuf payload
@@ -1444,6 +1487,41 @@ async fn write_ivf_pq_file(
     let pos = writer.write_protobuf(&metadata).await?;
     // TODO: for now the IVF_PQ index file format hasn't been updated, so keep the old version,
     // change it to latest version value after refactoring the IVF_PQ
+    writer.write_magics(pos, 0, 1, MAGIC).await?;
+    writer.shutdown().await?;
+
+    Ok(())
+}
+
+pub async fn write_ivf_pq_file_from_existing_index(
+    dataset: &Dataset,
+    column: &str,
+    index_name: &str,
+    index_id: Uuid,
+    mut ivf: IvfModel,
+    pq: ProductQuantizer,
+    streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
+) -> Result<()> {
+    let obj_store = dataset.object_store();
+    let path = dataset
+        .indices_dir()
+        .child(index_id.to_string())
+        .child("index.idx");
+    let mut writer = obj_store.create(&path).await?;
+    write_pq_partitions(&mut writer, &mut ivf, Some(streams), None).await?;
+
+    let metadata = IvfPQIndexMetadata::new(
+        index_name.to_string(),
+        column.to_string(),
+        dataset.version().version,
+        pq.distance_type,
+        ivf,
+        pq,
+        vec![],
+    );
+
+    let metadata = pb::Index::try_from(&metadata)?;
+    let pos = writer.write_protobuf(&metadata).await?;
     writer.write_magics(pos, 0, 1, MAGIC).await?;
     writer.shutdown().await?;
 

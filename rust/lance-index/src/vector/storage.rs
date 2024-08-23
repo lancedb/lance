@@ -223,18 +223,24 @@ impl IvfQuantizationStorage {
 
     pub async fn load_partition<Q: Quantization>(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        let batches = self
-            .reader
-            .read_stream(
-                ReadBatchParams::Range(range),
-                4096,
-                16,
-                FilterExpression::no_filter(),
-            )?
-            .try_collect::<Vec<_>>()
-            .await?;
-        let schema = Arc::new(self.reader.schema().as_ref().into());
-        let batch = concat_batches(&schema, batches.iter())?;
+        let batch = if range.is_empty() {
+            let schema = self.reader.schema();
+            let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
+            RecordBatch::new_empty(Arc::new(arrow_schema))
+        } else {
+            let batches = self
+                .reader
+                .read_stream(
+                    ReadBatchParams::Range(range),
+                    u32::MAX,
+                    16,
+                    FilterExpression::no_filter(),
+                )?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let schema = Arc::new(self.reader.schema().as_ref().into());
+            concat_batches(&schema, batches.iter())?
+        };
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.metadata[part_id].clone(),
