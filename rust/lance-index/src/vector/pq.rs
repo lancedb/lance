@@ -93,10 +93,6 @@ impl ProductQuantizer {
         })
     }
 
-    pub fn use_residual(&self) -> bool {
-        matches!(self.distance_type, DistanceType::L2 | DistanceType::Cosine)
-    }
-
     #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
     fn transform<T: ArrowPrimitiveType>(&self, vectors: &dyn Array) -> Result<ArrayRef>
     where
