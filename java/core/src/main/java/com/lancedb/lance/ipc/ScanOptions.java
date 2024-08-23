@@ -28,6 +28,10 @@ public class ScanOptions {
   private final Optional<List<String>> columns;
   private final Optional<String> filter;
   private final Optional<ByteBuffer> substraitFilter;
+  private final Optional<Long> limit;
+  private final Optional<Long> offset;
+  private final boolean withRowId;
+  private final int batchReadahead;
 
   /**
    * Constructor for LanceScanOptions.
@@ -39,10 +43,15 @@ public class ScanOptions {
    *                  Otherwise, only columns present in the List will be scanned.
    * @param filter    (Optional) Filter expression. Optional.empty() for no filter.
    * @param substraitFilter (Optional) Substrait filter expression.
+   * @param limit     (Optional) Maximum number of rows to return.
+   * @param offset    (Optional) Number of rows to skip before returning results.
+   * @param withRowId Whether to include the row ID in the results.
+   * @param batchReadahead Number of batches to read ahead.
    */
   public ScanOptions(Optional<List<Integer>> fragmentIds, Optional<Long> batchSize,
       Optional<List<String>> columns, Optional<String> filter,
-      Optional<ByteBuffer> substraitFilter) {
+      Optional<ByteBuffer> substraitFilter, Optional<Long> limit,
+      Optional<Long> offset, boolean withRowId, int batchReadahead) {
     Preconditions.checkArgument(!(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
     this.fragmentIds = fragmentIds;
@@ -50,6 +59,10 @@ public class ScanOptions {
     this.columns = columns;
     this.filter = filter;
     this.substraitFilter = substraitFilter;
+    this.limit = limit;
+    this.offset = offset;
+    this.withRowId = withRowId;
+    this.batchReadahead = batchReadahead;
   }
 
   /**
@@ -71,30 +84,66 @@ public class ScanOptions {
   }
 
   /**
-   * Get the projected columns.
+   * Get the columns.
    *
-   * @return Optional containing the list of projected columns if specified, otherwise empty.
+   * @return Optional containing the columns if specified, otherwise empty.
    */
   public Optional<List<String>> getColumns() {
     return columns;
   }
 
   /**
-   * Get the filter expression.
+   * Get the filter.
    *
-   * @return Optional containing the filter expression if specified, otherwise empty.
+   * @return Optional containing the filter if specified, otherwise empty.
    */
   public Optional<String> getFilter() {
     return filter;
   }
 
   /**
-   * Get the substrait filter expression.
+   * Get the substrait filter.
    *
-   * @return Optional containing the substrait filter expression if specified, otherwise empty.
+   * @return Optional containing the substrait filter if specified, otherwise empty.
    */
   public Optional<ByteBuffer> getSubstraitFilter() {
     return substraitFilter;
+  }
+
+  /**
+   * Get the limit.
+   *
+   * @return Optional containing the limit if specified, otherwise empty.
+   */
+  public Optional<Long> getLimit() {
+    return limit;
+  }
+
+  /**
+   * Get the offset.
+   *
+   * @return Optional containing the offset if specified, otherwise empty.
+   */
+  public Optional<Long> getOffset() {
+    return offset;
+  }
+
+  /**
+   * Get whether to include the row ID.
+   *
+   * @return true if row ID should be included, false otherwise.
+   */
+  public boolean isWithRowId() {
+    return withRowId;
+  }
+
+  /**
+   * Get the batch readahead.
+   *
+   * @return the number of batches to read ahead.
+   */
+  public int getBatchReadahead() {
+    return batchReadahead;
   }
 
   /**
@@ -106,6 +155,10 @@ public class ScanOptions {
     private Optional<List<String>> columns = Optional.empty();
     private Optional<String> filter = Optional.empty();
     private Optional<ByteBuffer> substraitFilter = Optional.empty();
+    private Optional<Long> limit = Optional.empty();
+    private Optional<Long> offset = Optional.empty();
+    private boolean withRowId = false;
+    private int batchReadahead = 16;
 
     public Builder() {}
 
@@ -120,12 +173,16 @@ public class ScanOptions {
       this.columns = options.getColumns();
       this.filter = options.getFilter();
       this.substraitFilter = options.getSubstraitFilter();
+      this.limit = options.getLimit();
+      this.offset = options.getOffset();
+      this.withRowId = options.isWithRowId();
+      this.batchReadahead = options.getBatchReadahead();
     }
 
     /**
-     * Set the fragment IDs.
+     * Set the fragment ids.
      *
-     * @param fragmentIds fragment ids to scan
+     * @param fragmentIds the id of the fragments to scan
      * @return Builder instance for method chaining.
      */
     public Builder fragmentIds(List<Integer> fragmentIds) {
@@ -145,38 +202,79 @@ public class ScanOptions {
     }
 
     /**
-     * Set the projected columns.
+     * Set the columns.
      *
-     * @param columns List of projected columns.
+     * @param columns Projected columns.
      * @return Builder instance for method chaining.
      */
     public Builder columns(List<String> columns) {
-      Preconditions.checkNotNull(columns);
       this.columns = Optional.of(columns);
       return this;
     }
 
     /**
-     * Set the filter expression.
+     * Set the filter.
      *
      * @param filter Filter expression.
      * @return Builder instance for method chaining.
      */
     public Builder filter(String filter) {
-      Preconditions.checkNotNull(filter);
       this.filter = Optional.of(filter);
       return this;
     }
 
     /**
-     * Set the substrait filter expression.
+     * Set the substrait filter.
      *
-     * @param substraitFilter Filter expression.
+     * @param substraitFilter Substrait filter expression.
      * @return Builder instance for method chaining.
      */
     public Builder substraitFilter(ByteBuffer substraitFilter) {
-      Preconditions.checkNotNull(substraitFilter);
       this.substraitFilter = Optional.of(substraitFilter);
+      return this;
+    }
+
+    /**
+     * Set the limit.
+     *
+     * @param limit Maximum number of rows to return.
+     * @return Builder instance for method chaining.
+     */
+    public Builder limit(long limit) {
+      this.limit = Optional.of(limit);
+      return this;
+    }
+
+    /**
+     * Set the offset.
+     *
+     * @param offset Number of rows to skip before returning results.
+     * @return Builder instance for method chaining.
+     */
+    public Builder offset(long offset) {
+      this.offset = Optional.of(offset);
+      return this;
+    }
+
+    /**
+     * Set whether to include the row ID.
+     *
+     * @param withRowId true to include row ID, false otherwise.
+     * @return Builder instance for method chaining.
+     */
+    public Builder withRowId(boolean withRowId) {
+      this.withRowId = withRowId;
+      return this;
+    }
+
+    /**
+     * Set the batch readahead.
+     *
+     * @param batchReadahead Number of batches to read ahead.
+     * @return Builder instance for method chaining.
+     */
+    public Builder batchReadahead(int batchReadahead) {
+      this.batchReadahead = batchReadahead;
       return this;
     }
 
@@ -186,7 +284,8 @@ public class ScanOptions {
      * @return LanceScanOptions instance with the specified parameters.
      */
     public ScanOptions build() {
-      return new ScanOptions(fragmentIds, batchSize, columns, filter, substraitFilter);
+      return new ScanOptions(fragmentIds, batchSize, columns, filter, substraitFilter,
+          limit, offset, withRowId, batchReadahead);
     }
   }
 }

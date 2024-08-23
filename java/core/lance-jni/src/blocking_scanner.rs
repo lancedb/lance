@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
+use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{objects::JObject, sys::jlong, JNIEnv};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -71,6 +72,10 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     substrait_filter_obj: JObject, // Optional<ByteBuffer>
     filter_obj: JObject,           // Optional<String>
     batch_size_obj: JObject,       // Optional<Long>
+    limit_obj: JObject,            // Optional<Integer>
+    offset_obj: JObject,           // Optional<Integer>
+    with_row_id: jboolean,         // boolean
+    batch_readahead: jint,         // int
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -81,7 +86,11 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
             columns_obj,
             substrait_filter_obj,
             filter_obj,
-            batch_size_obj
+            batch_size_obj,
+            limit_obj,
+            offset_obj,
+            with_row_id,
+            batch_readahead
         )
     )
 }
@@ -94,11 +103,18 @@ fn inner_create_scanner<'local>(
     substrait_filter_obj: JObject,
     filter_obj: JObject,
     batch_size_obj: JObject,
+    limit_obj: JObject,
+    offset_obj: JObject,
+    with_row_id: jboolean,
+    batch_readahead: jint,
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+    
     let mut scanner = dataset_guard.inner.scan();
+
+    // handle frament_ids
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
@@ -112,22 +128,37 @@ fn inner_create_scanner<'local>(
         scanner.with_fragments(fragments);
     }
     drop(dataset_guard);
+
     let columns_opt = env.get_strings_opt(&columns_obj)?;
     if let Some(columns) = columns_opt {
         scanner.project(&columns)?;
     };
+
     let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
         RT.block_on(async { scanner.filter_substrait(substrait).await })?;
     }
+
     let filter_opt = env.get_string_opt(&filter_obj)?;
     if let Some(filter) = filter_opt {
         scanner.filter(filter.as_str())?;
     }
+
     let batch_size_opt = env.get_long_opt(&batch_size_obj)?;
     if let Some(batch_size) = batch_size_opt {
         scanner.batch_size(batch_size as usize);
     }
+
+    let limit_opt = env.get_long_opt(&limit_obj)?;
+    let offset_opt = env.get_long_opt(&offset_obj)?;
+    scanner.limit(limit_opt, offset_opt)
+        .map_err(|err| Error::input_error(err.to_string()))?;
+
+    if with_row_id == JNI_TRUE {
+        scanner.with_row_id();
+    }
+
+    scanner.batch_readahead(batch_readahead as usize);    
     let scanner = BlockingScanner::create(scanner);
     scanner.into_java(env)
 }
