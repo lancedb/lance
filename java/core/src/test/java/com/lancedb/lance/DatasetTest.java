@@ -88,11 +88,22 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         assertEquals(1, dataset.latestVersion());
+  
+        // Write first batch of data
         try (Dataset dataset2 = testDataset.write(1, 5)) {
           assertEquals(1, dataset.version());
           assertEquals(2, dataset.latestVersion());
           assertEquals(2, dataset2.version());
           assertEquals(2, dataset2.latestVersion());
+  
+          // Open dataset with version 1
+          DatasetOpenOptions options1 = new DatasetOpenOptions().version(1);
+          try (Dataset datasetV1 = Dataset.open(datasetPath, allocator, options1)) {
+            assertEquals(1, datasetV1.version());
+            assertEquals(2, datasetV1.latestVersion());
+          }
+  
+          // Write second batch of data
           try (Dataset dataset3 = testDataset.write(2, 3)) {
             assertEquals(1, dataset.version());
             assertEquals(3, dataset.latestVersion());
@@ -100,6 +111,19 @@ public class DatasetTest {
             assertEquals(3, dataset2.latestVersion());
             assertEquals(3, dataset3.version());
             assertEquals(3, dataset3.latestVersion());
+  
+            // Open dataset with version 2
+            DatasetOpenOptions options2 = new DatasetOpenOptions().version(2);
+            try (Dataset datasetV2 = Dataset.open(datasetPath, allocator, options2)) {
+              assertEquals(2, datasetV2.version());
+              assertEquals(3, datasetV2.latestVersion());
+            }
+  
+            // Open dataset with latest version (3)
+            try (Dataset datasetLatest = Dataset.open(datasetPath, allocator)) {
+              assertEquals(3, datasetLatest.version());
+              assertEquals(3, datasetLatest.latestVersion());
+            }
           }
         }
       }

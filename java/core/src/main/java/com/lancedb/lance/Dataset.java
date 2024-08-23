@@ -113,20 +113,30 @@ public class Dataset implements Closeable {
    * @return Dataset
    */
   public static Dataset open(String path, BufferAllocator allocator) {
+    return open(path, allocator, new DatasetOpenOptions());
+  }
+
+  /**
+   * Open a dataset from the specified path with additional options.
+   *
+   * @param path      file path
+   * @param allocator Arrow buffer allocator.
+   * @param options   the open options
+   * @return Dataset
+   */
+  public static Dataset open(String path, BufferAllocator allocator, DatasetOpenOptions options) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
-    Dataset dataset = openNative(path);
+    Preconditions.checkNotNull(options);
+    Dataset dataset = openNative(path, options.getVersion(),
+      options.getBlockSize(), options.getIndexCacheSize(),
+      options.getMetadataCacheSize());
     dataset.allocator = allocator;
     return dataset;
   }
 
-  /**
-   * Opens a dataset from the specified path using the native library.
-   *
-   * @param path The file path of the dataset to open.
-   * @return A new instance of {@link Dataset} linked to the opened dataset.
-   */
-  public static native Dataset openNative(String path);
+  private static native Dataset openNative(String path, Optional<Integer> version,
+      Optional<Integer> blockSize, int indexCacheSize, int metadataCacheSize);
 
   /**
    * Create a new version of dataset.

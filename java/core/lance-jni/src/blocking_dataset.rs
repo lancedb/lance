@@ -27,8 +27,10 @@ use jni::objects::JString;
 use jni::sys::jint;
 use jni::sys::jlong;
 use jni::{objects::JObject, JNIEnv};
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, WriteParams};
+use lance::dataset::{Dataset, ReadParams, WriteParams};
+use lance::io::ObjectStoreParams;
 use lance::table::format::Fragment;
 use lance_io::object_store::ObjectStoreRegistry;
 use std::iter::empty;
@@ -51,8 +53,30 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
-    pub fn open(uri: &str) -> Result<Self> {
-        let inner = RT.block_on(Dataset::open(uri))?;
+    pub fn open(
+        uri: &str,
+        version: Option<i32>,
+        block_size: Option<i32>,
+        index_cache_size: i32,
+        metadata_cache_size: i32,
+    ) -> Result<Self> {
+        let params = ReadParams {
+            index_cache_size: index_cache_size as usize,
+            metadata_cache_size: metadata_cache_size as usize,
+            store_options: Some(ObjectStoreParams {
+                block_size: block_size.map(|size| size as usize),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut builder = DatasetBuilder::from_uri(uri).with_read_params(params);
+
+        if let Some(ver) = version {
+            builder = builder.with_version(ver as u64);
+        }
+
+        let inner = RT.block_on(builder.load())?;
         Ok(Self { inner })
     }
 
@@ -280,7 +304,6 @@ fn inner_release_native_dataset(env: &mut JNIEnv, obj: JObject) -> Result<()> {
     dataset.close();
     Ok(())
 }
-
 //////////////////
 // Read Methods //
 //////////////////
@@ -289,13 +312,44 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
+    version_obj: JObject,    // Optional<Integer>
+    block_size_obj: JObject, // Optional<Integer>
+    index_cache_size_object: jint,
+    metadata_cache_size_object: jint,
 ) -> JObject<'local> {
-    ok_or_throw!(env, inner_open_native(&mut env, path))
+    ok_or_throw!(
+        env,
+        inner_open_native(
+            &mut env,
+            path,
+            version_obj,
+            block_size_obj,
+            index_cache_size_object,
+            metadata_cache_size_object
+        )
+    )
 }
 
-fn inner_open_native<'local>(env: &mut JNIEnv<'local>, path: JString) -> Result<JObject<'local>> {
+fn inner_open_native<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    version_obj: JObject,    // Optional<Integer>
+    block_size_obj: JObject, // Optional<Integer>
+    index_cache_size_object: jint,
+    metadata_cache_size_object: jint,
+) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
-    let dataset = BlockingDataset::open(&path_str)?;
+    let version = env.get_int_opt(&version_obj)?;
+    let block_size = env.get_int_opt(&block_size_obj)?;
+    let index_cache_size = index_cache_size_object as i32;
+    let metadata_cache_size = metadata_cache_size_object as i32;
+    let dataset = BlockingDataset::open(
+        &path_str,
+        version,
+        block_size,
+        index_cache_size,
+        metadata_cache_size,
+    )?;
     dataset.into_java(env)
 }
 
