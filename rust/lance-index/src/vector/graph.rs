@@ -336,22 +336,37 @@ pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
     dist_calc: &impl DistCalculator,
+    prefetch_distance: Option<usize>,
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
     loop {
         let neighbors = graph.neighbors(current);
-        let distances = neighbors
-            .iter()
-            .map(|neighbor| dist_calc.distance(*neighbor));
-
         let mut next = None;
-        for (neighbor, dist) in neighbors.iter().zip(distances) {
+
+        let mut process_neighbor = |neighbor: u32| {
+            let dist = dist_calc.distance(neighbor).into();
             if dist < closest_dist {
                 closest_dist = dist;
-                next = Some(*neighbor);
+                next = Some(neighbor);
             }
-        }
+        };
+        match prefetch_distance {
+            Some(look_ahead) => {
+                for i in 0..neighbors.len().saturating_sub(look_ahead) {
+                    dist_calc.prefetch(neighbors[i + look_ahead]);
+                    process_neighbor(neighbors[i]);
+                }
+                for neighbor in &neighbors[neighbors.len().saturating_sub(look_ahead)..] {
+                    process_neighbor(*neighbor);
+                }
+            }
+            None => {
+                for neighbor in neighbors.iter() {
+                    process_neighbor(*neighbor);
+                }
+            }
+        };
 
         if let Some(next) = next {
             current = next;

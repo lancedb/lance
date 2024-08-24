@@ -174,7 +174,12 @@ impl HNSW {
         let nodes = &self.nodes();
         for level in (0..self.max_level()).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc);
+            ep = greedy_search(
+                &cur_level,
+                ep,
+                &dist_calc,
+                self.inner.params.prefetch_distance,
+            );
         }
 
         let bottom_level = HnswBottomView::new(nodes);
@@ -403,7 +408,7 @@ impl HnswBuilder {
         let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
