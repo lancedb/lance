@@ -139,7 +139,7 @@ impl DatasetPreFilter {
                     let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
                     Ok::<_, crate::Error>((row_ids?, deletion_vector?))
                 })
-                .buffer_unordered(dataset.object_store().io_parallelism()? as usize)
+                .buffer_unordered(dataset.object_store().io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await
         }
