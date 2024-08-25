@@ -209,7 +209,7 @@ impl LanceBuffer {
     /// Concatenates multiple buffers into a single buffer, consuming the input buffers
     ///
     /// If there is only one buffer, it will be returned as is
-    pub fn concat_into_one(buffers: Vec<LanceBuffer>) -> Self {
+    pub fn concat_into_one(buffers: Vec<Self>) -> Self {
         if buffers.len() == 1 {
             return buffers.into_iter().next().unwrap();
         }
@@ -230,7 +230,7 @@ impl LanceBuffer {
     /// Zips multiple buffers into a single buffer, consuming the input buffers
     ///
     /// Unlike concat_into_one this "zips" the buffers, interleaving the values
-    pub fn zip_into_one(buffers: Vec<(LanceBuffer, u64)>, num_values: u64) -> Result<Self> {
+    pub fn zip_into_one(buffers: Vec<(Self, u64)>, num_values: u64) -> Result<Self> {
         let bytes_per_value = buffers.iter().map(|(_, bits_per_value)| {
             if bits_per_value % 8 == 0 {
                 Ok(bits_per_value / 8)
@@ -260,7 +260,7 @@ impl LanceBuffer {
             }
         }
 
-        Ok(LanceBuffer::Owned(zipped))
+        Ok(Self::Owned(zipped))
     }
 
     /// Create a LanceBuffer from a slice
@@ -275,7 +275,7 @@ impl LanceBuffer {
 // Mostly useful for unit testing.  It is zero-copy
 impl<const N: usize> From<[u8; N]> for LanceBuffer {
     fn from(value: [u8; N]) -> Self {
-        LanceBuffer::Owned(Vec::from(value))
+        Self::Owned(Vec::from(value))
     }
 }
 
