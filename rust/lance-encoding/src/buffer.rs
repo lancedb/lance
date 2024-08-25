@@ -101,7 +101,7 @@ impl LanceBuffer {
 
     /// Converts the buffer into a hex string
     pub fn as_hex(&self) -> String {
-        format!("{:x?}", self.as_ref())
+        hex::encode_upper(self)
     }
 
     /// Create a LanceBuffer from a bytes::Bytes object
@@ -380,5 +380,11 @@ mod tests {
         let expected = LanceBuffer::Owned(expected);
 
         assert_eq!(expected, zipped);
+    }
+
+    #[test]
+    fn test_hex() {
+        let buf = LanceBuffer::Owned(vec![1, 2, 15, 20]);
+        assert_eq!("01020F14", buf.as_hex());
     }
 }
