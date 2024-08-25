@@ -174,6 +174,14 @@ impl LanceBuffer {
         }
     }
 
+    /// Make an owned copy of the buffer (always does a copy of the data)
+    pub fn deep_copy(&self) -> Self {
+        match self {
+            Self::Borrowed(buffer) => Self::Owned(buffer.to_vec()),
+            Self::Owned(buffer) => Self::Owned(buffer.clone()),
+        }
+    }
+
     /// Reinterprets a Vec<T> as a LanceBuffer
     ///
     /// Note that this creates a borrowed buffer.  It is not possible to safely
@@ -297,5 +305,80 @@ impl From<Vec<u8>> for LanceBuffer {
 impl From<Buffer> for LanceBuffer {
     fn from(buffer: Buffer) -> Self {
         Self::Borrowed(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_buffer::Buffer;
+
+    use super::LanceBuffer;
+
+    #[test]
+    fn test_eq() {
+        let buf = LanceBuffer::Borrowed(Buffer::from_vec(vec![1_u8, 2, 3]));
+        let buf2 = LanceBuffer::Owned(vec![1, 2, 3]);
+        assert_eq!(buf, buf2);
+    }
+
+    #[test]
+    fn test_reinterpret_vec() {
+        let vec = vec![1_u32, 2, 3];
+        let mut buf = LanceBuffer::reinterpret_vec(vec);
+
+        let mut expected = Vec::with_capacity(12);
+        expected.extend_from_slice(&1_u32.to_ne_bytes());
+        expected.extend_from_slice(&2_u32.to_ne_bytes());
+        expected.extend_from_slice(&3_u32.to_ne_bytes());
+        let expected = LanceBuffer::Owned(expected);
+
+        assert_eq!(expected, buf);
+        assert_eq!(buf.borrow_to_typed_slice::<u32>().as_ref(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_concat() {
+        let buf1 = LanceBuffer::Owned(vec![1_u8, 2, 3]);
+        let buf2 = LanceBuffer::Owned(vec![4_u8, 5, 6]);
+        let buf3 = LanceBuffer::Owned(vec![7_u8, 8, 9]);
+
+        let expected = LanceBuffer::Owned(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            expected,
+            LanceBuffer::concat_into_one(vec![buf1, buf2, buf3])
+        );
+
+        let empty = LanceBuffer::empty();
+        assert_eq!(
+            LanceBuffer::empty(),
+            LanceBuffer::concat_into_one(vec![empty])
+        );
+
+        let expected = LanceBuffer::Owned(vec![1, 2, 3]);
+        assert_eq!(
+            expected,
+            LanceBuffer::concat_into_one(vec![expected.deep_copy(), LanceBuffer::empty()])
+        );
+    }
+
+    #[test]
+    fn test_zip() {
+        let buf1 = LanceBuffer::Owned(vec![1_u8, 2, 3]);
+        let buf2 = LanceBuffer::reinterpret_vec(vec![1_u16, 2, 3]);
+        let buf3 = LanceBuffer::reinterpret_vec(vec![1_u32, 2, 3]);
+
+        let zipped = LanceBuffer::zip_into_one(vec![(buf1, 8), (buf2, 16), (buf3, 32)], 3).unwrap();
+
+        assert_eq!(zipped.len(), 21);
+
+        let mut expected = Vec::with_capacity(21);
+        for i in 1..4 {
+            expected.push(i as u8);
+            expected.extend_from_slice(&(i as u16).to_ne_bytes());
+            expected.extend_from_slice(&(i as u32).to_ne_bytes());
+        }
+        let expected = LanceBuffer::Owned(expected);
+
+        assert_eq!(expected, zipped);
     }
 }

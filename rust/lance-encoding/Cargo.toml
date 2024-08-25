@@ -24,6 +24,7 @@ arrow-select.workspace = true
 bytes.workspace = true
 futures.workspace = true
 fsst.workspace = true
+hex = "*"
 log.workspace = true
 num_cpus.workspace = true
 num-traits.workspace = true
