@@ -10,7 +10,7 @@ use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
-    data::{AllNullDataBlock, DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock},
+    data::{AllNullDataBlock, DataBlock, NullableDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
     format::pb,
@@ -160,18 +160,18 @@ struct BasicPageDecoder {
 }
 
 impl PrimitivePageDecoder for BasicPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         match &self.mode {
             DataNullStatus::Some(decoders) => {
                 let validity = decoders.validity.decode(rows_to_skip, num_rows)?;
-                let validity = validity.try_into_layout::<FixedWidthDataBlock>()?;
+                let validity = validity.as_fixed_width()?;
                 let values = decoders.values.decode(rows_to_skip, num_rows)?;
-                Ok(Box::new(NullableDataBlock {
-                    data: values,
+                Ok(DataBlock::Nullable(NullableDataBlock {
+                    data: Box::new(values),
                     nulls: validity.data,
                 }))
             }
-            DataNullStatus::All => Ok(Box::new(AllNullDataBlock {
+            DataNullStatus::All => Ok(DataBlock::AllNull(AllNullDataBlock {
                 num_values: num_rows,
             })),
             DataNullStatus::None(values) => values.decode(rows_to_skip, num_rows),
