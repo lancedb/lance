@@ -22,6 +22,8 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.ipc.Query;
+import com.lancedb.lance.ipc.Query.DistanceType;
 import com.lancedb.lance.ipc.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
@@ -358,55 +360,55 @@ public class ScannerTest {
   }
 
   @Test
-    void testDatasetScannerCombinedParams() throws Exception {
-      String datasetPath = tempDir.resolve("dataset_scanner_combined_params").toString();
-      try (BufferAllocator allocator = new RootAllocator()) {
-        TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-        testDataset.createEmptyDataset().close();
-        int totalRows = 600;
-        int limit = 200;
-        int offset = 300;
-        int batchSize = 50;
-        try (Dataset dataset = testDataset.write(1, totalRows)) {
-          try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
-              .limit(limit)
-              .offset(offset)
-              .withRowId(true)
-              .batchSize(batchSize)
-              .batchReadahead(3)
-              .build())) {
-            try (ArrowReader reader = scanner.scanBatches()) {
-              VectorSchemaRoot root = reader.getVectorSchemaRoot();
-              List<String> fieldNames = root.getSchema().getFields().stream()
-                  .map(Field::getName)
-                  .collect(Collectors.toList());
-              assertTrue(fieldNames.contains("_rowid"), "Schema should contain _rowid column");
-              assertTrue(fieldNames.contains("id"), "Schema should contain id column");
+  void testDatasetScannerCombinedParams() throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_combined_params").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 600;
+      int limit = 200;
+      int offset = 300;
+      int batchSize = 50;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
+            .limit(limit)
+            .offset(offset)
+            .withRowId(true)
+            .batchSize(batchSize)
+            .batchReadahead(3)
+            .build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            List<String> fieldNames = root.getSchema().getFields().stream()
+                .map(Field::getName)
+                .collect(Collectors.toList());
+            assertTrue(fieldNames.contains("_rowid"), "Schema should contain _rowid column");
+            assertTrue(fieldNames.contains("id"), "Schema should contain id column");
 
-              int rowCount = 0;
-              int expectedIdStart = offset;
-              while (reader.loadNextBatch()) {
-                List<FieldVector> fieldVectors = root.getFieldVectors();
-                assertTrue(fieldVectors.stream().anyMatch(vector -> vector.getName().equals("_rowid")));
-                IntVector idVector = (IntVector) root.getVector("id");
-                int batchRowCount = root.getRowCount();
-                rowCount += batchRowCount;
-                assertTrue(batchRowCount <= batchSize, "Batch size should not exceed " + batchSize);
+            int rowCount = 0;
+            int expectedIdStart = offset;
+            while (reader.loadNextBatch()) {
+              List<FieldVector> fieldVectors = root.getFieldVectors();
+              assertTrue(fieldVectors.stream().anyMatch(vector -> vector.getName().equals("_rowid")));
+              IntVector idVector = (IntVector) root.getVector("id");
+              int batchRowCount = root.getRowCount();
+              rowCount += batchRowCount;
+              assertTrue(batchRowCount <= batchSize, "Batch size should not exceed " + batchSize);
 
-                for (int i = 0; i < batchRowCount; i++) {
-                  int expectedId = expectedIdStart + i;
-                  assertEquals(expectedId, idVector.get(i), 
-                      "Mismatch at row " + (rowCount - batchRowCount + i) + 
-                      ". Expected: " + expectedId + ", Actual: " + idVector.get(i));
-                }
-                expectedIdStart += batchRowCount;
+              for (int i = 0; i < batchRowCount; i++) {
+                int expectedId = expectedIdStart + i;
+                assertEquals(expectedId, idVector.get(i), 
+                    "Mismatch at row " + (rowCount - batchRowCount + i) + 
+                    ". Expected: " + expectedId + ", Actual: " + idVector.get(i));
               }
-              assertEquals(limit, rowCount, "Total rows should match the limit");
+              expectedIdStart += batchRowCount;
             }
+            assertEquals(limit, rowCount, "Total rows should match the limit");
           }
         }
       }
     }
+  }
 
   private void validScanResult(Dataset dataset, int fragmentId, int rowCount) throws Exception {
     try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(fragmentId)).build())) {

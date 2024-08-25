@@ -20,6 +20,8 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 import com.lancedb.lance.test.JniTestHelper;
+import com.lancedb.lance.ipc.Query;
+import com.lancedb.lance.ipc.Query.DistanceType;
 
 public class JNITest {
   @Test
@@ -30,5 +32,19 @@ public class JNITest {
   @Test
   public void testIntsOpt() {
     JniTestHelper.parseIntsOpt(Optional.of(Arrays.asList(1, 2, 3)));
+  }
+
+  @Test
+  public void testQuery() {
+    JniTestHelper.parseQuery(Optional.of(new Query.Builder()
+      .setColumn("column")
+      .setKey(new float[] {1.0f, 2.0f, 3.0f})
+      .setK(10)
+      .setNprobes(20)
+      .setEf(30)
+      .setRefineFactor(40)
+      .setMetricType(DistanceType.L2)
+      .setUseIndex(true)
+      .build();
   }
 }

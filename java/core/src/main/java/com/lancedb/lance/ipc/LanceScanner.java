@@ -58,7 +58,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
     Preconditions.checkNotNull(allocator);
     LanceScanner scanner = createScanner(dataset, options.getFragmentIds(), options.getColumns(),
         options.getSubstraitFilter(), options.getFilter(), options.getBatchSize(),
-        options.getLimit(), options.getOffset(),
+        options.getLimit(), options.getOffset(), options.getNearest(),
         options.isWithRowId(), options.getBatchReadahead());
     scanner.allocator = allocator;
     scanner.dataset = dataset;
@@ -69,7 +69,8 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
   static native LanceScanner createScanner(Dataset dataset, Optional<List<Integer>> fragmentIds,
       Optional<List<String>> columns, Optional<ByteBuffer> substraitFilter,
       Optional<String> filter, Optional<Long> batchSize, Optional<Long> limit,
-      Optional<Long> offset, boolean withRowId, int batchReadahead);
+      Optional<Long> offset, Optional<Query> query, boolean withRowId, int batchReadahead
+      );
 
   /**
    * Closes this scanner and releases any system resources associated with it. If

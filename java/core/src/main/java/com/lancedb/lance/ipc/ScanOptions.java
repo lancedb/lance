@@ -17,6 +17,7 @@ package com.lancedb.lance.ipc;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+
 import org.apache.arrow.util.Preconditions;
 
 /**
@@ -30,6 +31,7 @@ public class ScanOptions {
   private final Optional<ByteBuffer> substraitFilter;
   private final Optional<Long> limit;
   private final Optional<Long> offset;
+  private final Optional<Query> nearest;
   private final boolean withRowId;
   private final int batchReadahead;
 
@@ -46,12 +48,13 @@ public class ScanOptions {
    * @param limit     (Optional) Maximum number of rows to return.
    * @param offset    (Optional) Number of rows to skip before returning results.
    * @param withRowId Whether to include the row ID in the results.
+   * @param nearest   (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
    */
   public ScanOptions(Optional<List<Integer>> fragmentIds, Optional<Long> batchSize,
       Optional<List<String>> columns, Optional<String> filter,
       Optional<ByteBuffer> substraitFilter, Optional<Long> limit,
-      Optional<Long> offset, boolean withRowId, int batchReadahead) {
+      Optional<Long> offset, Optional<Query> nearest, boolean withRowId, int batchReadahead) {
     Preconditions.checkArgument(!(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
     this.fragmentIds = fragmentIds;
@@ -61,6 +64,7 @@ public class ScanOptions {
     this.substraitFilter = substraitFilter;
     this.limit = limit;
     this.offset = offset;
+    this.nearest = nearest;
     this.withRowId = withRowId;
     this.batchReadahead = batchReadahead;
   }
@@ -129,6 +133,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get the nearest neighbor query.
+   *
+   * @return Optional containing the nearest neighbor query if specified, otherwise empty.
+   */
+  public Optional<Query> getNearest() {
+    return nearest;
+  }
+
+  /**
    * Get whether to include the row ID.
    *
    * @return true if row ID should be included, false otherwise.
@@ -157,6 +170,7 @@ public class ScanOptions {
     private Optional<ByteBuffer> substraitFilter = Optional.empty();
     private Optional<Long> limit = Optional.empty();
     private Optional<Long> offset = Optional.empty();
+    private Optional<Query> nearest = Optional.empty();
     private boolean withRowId = false;
     private int batchReadahead = 16;
 
@@ -175,6 +189,7 @@ public class ScanOptions {
       this.substraitFilter = options.getSubstraitFilter();
       this.limit = options.getLimit();
       this.offset = options.getOffset();
+      this.nearest = options.getNearest();
       this.withRowId = options.isWithRowId();
       this.batchReadahead = options.getBatchReadahead();
     }
@@ -257,6 +272,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set the nearest neighbor query.
+     *
+     * @param nearest The nearest neighbor query.
+     * @return Builder instance for method chaining.
+     */
+    public Builder nearest(Query nearest) {
+      this.nearest = Optional.of(nearest);
+      return this;
+    }
+
+    /**
      * Set whether to include the row ID.
      *
      * @param withRowId true to include row ID, false otherwise.
@@ -285,7 +311,7 @@ public class ScanOptions {
      */
     public ScanOptions build() {
       return new ScanOptions(fragmentIds, batchSize, columns, filter, substraitFilter,
-          limit, offset, withRowId, batchReadahead);
+          limit, offset, nearest, withRowId, batchReadahead);
     }
   }
 }

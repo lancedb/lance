@@ -13,11 +13,18 @@
 // limitations under the License.
 
 use core::slice;
+use std::sync::Arc;
 
 use crate::error::Result;
-use jni::objects::{JByteBuffer, JObjectArray, JString};
+use crate::utils::get_query;
+use crate::Error;
+use arrow::array::{ArrayRef, Float32Array};
+use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
+use lance::error::Error as LanceError;
+use lance_index::vector::Query;
+use lance_linalg::distance::DistanceType;
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -61,6 +68,42 @@ pub trait JNIEnvExt {
 
     /// Get Option<&[u8]> from Java Optional<ByteBuffer>.
     fn get_bytes_opt(&mut self, obj: &JObject) -> Result<Option<&[u8]>>;
+
+    // Get String from Java Object with given method name.
+    fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String>;
+    // Get float array from Java Object with given method name.
+    fn get_vec_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<f32>>;
+    // Get int as usize from Java Object with given method name.
+    fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize>;
+    // Get boolean from Java Object with given method name.
+    fn get_boolean_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<bool>;
+    // Get Option<uszie> from Java Object Optional<Integer> with given method name.
+    fn get_optional_usize_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<usize>>;
+    // Get Option<i32> from Java Object Optional<Integer> with given method name.
+    fn get_optional_i32_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<i32>>;
+    // Get Option<i32> from Java Object Optional<Integer> with given method name.
+    fn get_optional_u32_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<u32>>;
+
+    fn get_optional_integer_from_method<T>(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<T>>
+    where
+        T: TryFrom<i32>,
+        <T as TryFrom<i32>>::Error: std::fmt::Debug;
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
@@ -171,6 +214,86 @@ impl JNIEnvExt for JNIEnv<'_> {
         })
     }
 
+    fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String> {
+        let string_obj = self
+            .call_method(obj, method_name, "()Ljava/lang/String;", &[])?
+            .l()?;
+        let jstring = JString::from(string_obj);
+        let rust_string = self.get_string(&jstring)?.into();
+        Ok(rust_string)
+    }
+
+    fn get_vec_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<f32>> {
+        let array: JFloatArray = self.call_method(obj, method_name, "()[F", &[])?.l()?.into();
+        let length = self.get_array_length(&array)?;
+        let mut buffer = vec![0.0f32; length as usize];
+        self.get_float_array_region(&array, 0, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize> {
+        Ok(self.call_method(obj, method_name, "()I", &[])?.i()? as usize)
+    }
+
+    fn get_boolean_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<bool> {
+        Ok(self.call_method(obj, method_name, "()Z", &[])?.z()?)
+    }
+
+    fn get_optional_i32_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<i32>> {
+        self.get_optional_integer_from_method(obj, method_name)
+    }
+
+    fn get_optional_u32_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<u32>> {
+        self.get_optional_integer_from_method(obj, method_name)
+    }
+
+    fn get_optional_usize_from_method(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<usize>> {
+        self.get_optional_integer_from_method(obj, method_name)
+    }
+
+    fn get_optional_integer_from_method<T>(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+    ) -> Result<Option<T>>
+    where
+        T: TryFrom<i32>,
+        <T as TryFrom<i32>>::Error: std::fmt::Debug,
+    {
+        let java_object: JObject = self
+            .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
+            .l()?
+            .into();
+        let rust_obj = if self
+            .call_method(&java_object, "isPresent", "()Z", &[])?
+            .z()?
+        {
+            let inner_jobj: JObject = self
+                .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
+                .l()?
+                .into();
+            let inner_value = self.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
+            Some(T::try_from(inner_value).map_err(|e| {
+                Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
+            })?)
+        } else {
+            None
+        };
+        Ok(rust_obj)
+    }
+
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
         F: FnOnce(&mut JNIEnv, &JObject) -> Result<T>,
@@ -204,4 +327,13 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIntsOpt(
     list_obj: JObject, // Optional<List<Integer>>
 ) {
     ok_or_throw_without_return!(env, env.get_ints_opt(&list_obj));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseQuery(
+    mut env: JNIEnv,
+    _obj: JObject,
+    query_opt: JObject, // Optional<TmpQuery>
+) {
+    ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
 }
