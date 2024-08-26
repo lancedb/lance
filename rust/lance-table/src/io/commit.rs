@@ -57,7 +57,6 @@ use {
 
 use crate::format::{Index, Manifest};
 
-const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 
@@ -73,10 +72,6 @@ pub type ManifestWriter = for<'a> fn(
 pub fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
         .child(format!("{version}.{MANIFEST_EXTENSION}"))
-}
-
-pub fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
 }
 
 #[derive(Debug)]

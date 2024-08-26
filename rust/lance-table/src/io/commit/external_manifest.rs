@@ -259,8 +259,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
             )
         ))?;
 
-        // update the _latest.manifest pointer
-
         // step 5: flip the external store to point to the final location
         self.external_manifest_store
             .put_if_exists(base_path.as_ref(), manifest.version, path.as_ref())
