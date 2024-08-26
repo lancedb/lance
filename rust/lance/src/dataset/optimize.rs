@@ -138,8 +138,10 @@ pub struct CompactionOptions {
     /// lower) will materialize deletions for all fragments with deletions.
     /// Setting above 1.0 will never materialize deletions.
     pub materialize_deletions_threshold: f32,
-    /// The number of threads to use. Defaults to the number of cores.
-    pub num_threads: usize,
+    /// The number of threads to use (how many compaction tasks to run in parallel).
+    /// Defaults to the number of compute-intensive CPUs.  Not used when running
+    /// tasks manually using [`plan_compaction`]
+    pub num_threads: Option<usize>,
     /// The batch size to use when scanning the input fragments.  If not
     /// specified then the default (see
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
@@ -154,8 +156,7 @@ impl Default for CompactionOptions {
             max_rows_per_group: 1024,
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
-            // TODO: Should this be based on # I/O threads?
-            num_threads: get_num_compute_intensive_cpus(),
+            num_threads: None,
             max_bytes_per_file: None,
             batch_size: None,
         }
@@ -222,7 +223,11 @@ pub async fn compact_files(
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
-        .buffer_unordered(options.num_threads);
+        .buffer_unordered(
+            options
+                .num_threads
+                .unwrap_or_else(|| get_num_compute_intensive_cpus()),
+        );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
