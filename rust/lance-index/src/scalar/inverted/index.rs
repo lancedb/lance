@@ -286,7 +286,6 @@ impl TokenSet {
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
             arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
-            arrow_schema::Field::new(FREQUENCY_COL, DataType::UInt64, false),
         ]);
 
         let batch = RecordBatch::try_new(
