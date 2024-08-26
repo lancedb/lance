@@ -152,7 +152,7 @@ impl<'a> CleanupTask<'a> {
             .commit_handler
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
-            .try_for_each_concurrent(num_cpus::get(), |path| {
+            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |path| {
                 self.process_manifest_file(path, &inspection, tagged_versions)
             })
             .await?;
@@ -275,7 +275,7 @@ impl<'a> CleanupTask<'a> {
             .collect::<Vec<_>>()
             .await;
         let manifest_bytes_removed = stream::iter(manifest_bytes_removed)
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(self.dataset.object_store.io_parallelism())
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;
 

@@ -19,6 +19,7 @@ use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID};
 use lazy_static::lazy_static;
 use moka::future::Cache;
@@ -144,7 +145,8 @@ impl InvertedIndex {
                     mask.clone(),
                 ))
             })
-            .buffered(num_cpus::get())
+            // Use compute count since data hopefully cached
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
 

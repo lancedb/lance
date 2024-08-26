@@ -12,6 +12,8 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 lance-arrow.workspace = true
 lance-core.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
@@ -33,8 +35,6 @@ deepsize.workspace = true
 futures.workspace = true
 lazy_static.workspace = true
 log.workspace = true
-num_cpus.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 pin-project.workspace = true
 prost.workspace = true
 shellexpand.workspace = true

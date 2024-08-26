@@ -156,7 +156,7 @@ impl LanceStream {
         io_buffer_size: u64,
     ) -> Result<Self> {
         let project_schema = projection.clone();
-        let io_parallelism = dataset.object_store.io_parallelism()?;
+        let io_parallelism = dataset.object_store.io_parallelism();
         let frag_parallelism = fragment_parallelism
             .unwrap_or_else(|| {
                 // This is somewhat aggressive.  It assumes a single page per column.  If there are many pages per
@@ -164,9 +164,9 @@ impl LanceStream {
                 // answer though and so we err on the side of speed over memory.  Users can tone down fragment_parallelism
                 // by hand if needed.
                 if projection.fields.is_empty() {
-                    io_parallelism as usize
+                    io_parallelism
                 } else {
-                    bit_util::ceil(io_parallelism as usize, projection.fields.len())
+                    bit_util::ceil(io_parallelism, projection.fields.len())
                 }
             })
             // fragment_readhead=0 doesn't make sense so we just bump it to 1

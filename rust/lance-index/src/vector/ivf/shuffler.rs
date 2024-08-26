@@ -27,6 +27,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::reader::FileReader;
@@ -324,7 +325,7 @@ pub async fn shuffle_dataset(
                     ivf.transform(&batch)
                 })
             })
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(get_num_compute_intensive_cpus())
             .map(|res| match res {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(Error::io(err.to_string(), location!())),

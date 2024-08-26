@@ -11,6 +11,7 @@ use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 use snafu::{location, Location};
@@ -336,8 +337,8 @@ impl HnswBuilder {
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>();
 
-        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get()));
-        for _ in 0..num_cpus::get() {
+        let visited_generator_queue = Arc::new(ArrayQueue::new(get_num_compute_intensive_cpus()));
+        for _ in 0..get_num_compute_intensive_cpus() {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
@@ -616,8 +617,9 @@ impl IvfSubIndex for HNSW {
             }
         }
 
-        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
-        for _ in 0..num_cpus::get() * 2 {
+        let visited_generator_queue =
+            Arc::new(ArrayQueue::new(get_num_compute_intensive_cpus() * 2));
+        for _ in 0..get_num_compute_intensive_cpus() * 2 {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
