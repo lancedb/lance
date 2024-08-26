@@ -24,6 +24,7 @@ use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
+use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::traits::{Reader, Writer};
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
@@ -120,6 +121,10 @@ impl Reader for LocalObjectReader {
 
     fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    fn io_parallelism(&self) -> usize {
+        DEFAULT_LOCAL_IO_PARALLELISM
     }
 
     /// Returns the file size.

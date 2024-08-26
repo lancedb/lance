@@ -340,7 +340,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
                     .await?;
                 Result::Ok((chunk, chunk_offset, array))
             })
-            .buffered(num_cpus::get())
+            .buffered(self.reader.io_parallelism())
             .try_for_each(|(chunk, chunk_offset, array)| {
                 let array: &GenericByteArray<T> = array.as_bytes();
 

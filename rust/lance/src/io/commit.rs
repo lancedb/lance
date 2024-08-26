@@ -361,7 +361,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(num_cpus::get() * 2)
+        .buffered(dataset.object_store.io_parallelism())
         .boxed();
 
     new_fragments.try_collect().await

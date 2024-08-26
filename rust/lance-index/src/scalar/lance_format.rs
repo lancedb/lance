@@ -193,6 +193,10 @@ impl IndexStore for LanceIndexStore {
         self
     }
 
+    fn io_parallelism(&self) -> usize {
+        self.object_store.io_parallelism()
+    }
+
     async fn new_index_file(
         &self,
         name: &str,

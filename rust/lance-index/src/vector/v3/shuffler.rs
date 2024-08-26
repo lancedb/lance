@@ -11,7 +11,10 @@ use arrow_array::{RecordBatch, UInt32Array};
 use future::join_all;
 use futures::prelude::*;
 use lance_arrow::RecordBatchExt;
-use lance_core::{utils::tokio::spawn_cpu, Error, Result};
+use lance_core::{
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+    Error, Result,
+};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -123,7 +126,7 @@ impl Shuffler for IvfShuffler {
                     Ok::<Vec<Vec<RecordBatch>>, Error>(partition_buffers)
                 })
             })
-            .buffered(num_cpus::get());
+            .buffered(get_num_compute_intensive_cpus());
 
         // part_id:           |       0        |       1        |       3        |
         // partition_buffers: |[batch,batch,..]|[batch,batch,..]|[batch,batch,..]|
