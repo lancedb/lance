@@ -229,17 +229,38 @@ impl ScalarIndex for InvertedIndex {
     where
         Self: Sized,
     {
-        let token_reader = store.open_index_file(TOKENS_FILE).await?;
-        let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-        let docs_reader = store.open_index_file(DOCS_FILE).await?;
+        let tokens_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let token_reader = store.open_index_file(TOKENS_FILE).await?;
+                let tokens = TokenSet::load(token_reader).await?;
+                Result::Ok(tokens)
+            }
+        });
+        let invert_list_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
+                let invert_list = InvertedListReader::new(invert_list_reader)?;
+                Result::Ok(Arc::new(invert_list))
+            }
+        });
+        let docs_fut = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let docs_reader = store.open_index_file(DOCS_FILE).await?;
+                let docs = DocSet::load(docs_reader).await?;
+                Result::Ok(docs)
+            }
+        });
 
-        let tokens = TokenSet::load(token_reader).await?;
-        let inverted_list = InvertedListReader::new(invert_list_reader)?;
-        let docs = DocSet::load(docs_reader).await?;
+        let tokens = tokens_fut.await??;
+        let inverted_list = invert_list_fut.await??;
+        let docs = docs_fut.await??;
 
         Ok(Arc::new(Self {
             tokens,
-            inverted_list: Arc::new(inverted_list),
+            inverted_list,
             docs,
         }))
     }
