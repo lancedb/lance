@@ -94,7 +94,7 @@ impl LanceBuffer {
         Self::Owned(vec![0xff; len])
     }
 
-    /// Returns the length of the buffer
+    /// Creates an empty buffer
     pub fn empty() -> Self {
         Self::Owned(Vec::new())
     }
@@ -272,7 +272,7 @@ impl LanceBuffer {
     }
 }
 
-// Mostly useful for unit testing.  It is zero-copy
+// Mostly useful for unit testing.  It does a copy of the data.
 impl<const N: usize> From<[u8; N]> for LanceBuffer {
     fn from(value: [u8; N]) -> Self {
         Self::Owned(Vec::from(value))

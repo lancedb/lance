@@ -54,3 +54,7 @@ pprof = { workspace = true }
 [[bench]]
 name = "decoder"
 harness = false
+
+[[bench]]
+name = "buffer"
+harness = false
