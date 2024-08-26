@@ -270,12 +270,13 @@ impl LanceBuffer {
     pub fn copy_slice(slice: &[u8]) -> Self {
         Self::Owned(slice.to_vec())
     }
-}
 
-// Mostly useful for unit testing.  It does a copy of the data.
-impl<const N: usize> From<[u8; N]> for LanceBuffer {
-    fn from(value: [u8; N]) -> Self {
-        Self::Owned(Vec::from(value))
+    /// Create a LanceBuffer from an array (fixed-size slice)
+    ///
+    /// This is NOT a zero-copy operation.  The slice memory could be on the stack and
+    /// thus we can't forget it.
+    pub fn copy_array<const N: usize>(array: [u8; N]) -> Self {
+        Self::Owned(Vec::from(array))
     }
 }
 
@@ -295,6 +296,8 @@ impl Deref for LanceBuffer {
         self.as_ref()
     }
 }
+
+// All `From` implementations are zero-copy
 
 impl From<Vec<u8>> for LanceBuffer {
     fn from(buffer: Vec<u8>) -> Self {
