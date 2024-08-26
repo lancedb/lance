@@ -226,7 +226,7 @@ pub async fn compact_files(
         .buffer_unordered(
             options
                 .num_threads
-                .unwrap_or_else(|| get_num_compute_intensive_cpus()),
+                .unwrap_or_else(get_num_compute_intensive_cpus),
         );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
