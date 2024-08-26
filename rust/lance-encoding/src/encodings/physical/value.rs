@@ -736,6 +736,15 @@ pub(crate) mod tests {
                     ),
                 ),
             ),
+            // check that it works for all negative integers even if type is signed
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(-10, -20),
+                    ),
+                ),
+            ),
             // check that all 0 works for signed type
             (
                 DataType::Int32,
