@@ -2,30 +2,33 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
+use std::vec;
 
 use arrow_array::builder::{ArrayBuilder, StringBuilder};
+use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
-use arrow_array::{make_array, Array, ArrayRef, DictionaryArray, StringArray, UInt8Array};
+use arrow_array::{
+    make_array, new_null_array, Array, ArrayRef, DictionaryArray, StringArray, UInt8Array,
+};
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::DataTypeExt;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
+use std::collections::HashMap;
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, DictionaryDataBlock, NullableDataBlock, VariableWidthBlock};
-use crate::format::pb::nullable::AllNull;
+use crate::data::{
+    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
+};
+use crate::decoder::LogicalPageDecoder;
+use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
+use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
     EncodingsIo,
 };
-
-use crate::decoder::LogicalPageDecoder;
-use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
-
-use arrow_schema::DataType;
-use lance_core::Result;
-use std::collections::HashMap;
-
-use arrow_array::cast::AsArray;
 
 #[derive(Debug)]
 pub struct DictionaryPageScheduler {
@@ -36,12 +39,10 @@ pub struct DictionaryPageScheduler {
     // If true, decode the dictionary items.  If false, leave them dictionary encoded (e.g. the
     // output type is probably a dictionary type)
     should_decode_dict: bool,
-    data_type: DataType,
 }
 
 impl DictionaryPageScheduler {
     pub fn new(
-        data_type: DataType,
         indices_scheduler: Arc<dyn PageScheduler>,
         items_scheduler: Arc<dyn PageScheduler>,
         num_dictionary_items: u32,
@@ -52,7 +53,6 @@ impl DictionaryPageScheduler {
             items_scheduler,
             num_dictionary_items,
             should_decode_dict,
-            data_type,
         }
     }
 }
@@ -114,7 +114,6 @@ impl PageScheduler for DictionaryPageScheduler {
             .boxed()
         } else {
             let num_dictionary_items = self.num_dictionary_items;
-            let data_type = self.data_type.clone();
             tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
@@ -128,7 +127,6 @@ impl PageScheduler for DictionaryPageScheduler {
                 Ok(Box::new(DirectDictionaryPageDecoder {
                     decoded_dict,
                     indices_decoder,
-                    data_type,
                 }) as Box<dyn PrimitivePageDecoder>)
             })
             .map(|join_handle| join_handle.unwrap())
@@ -138,48 +136,21 @@ impl PageScheduler for DictionaryPageScheduler {
 }
 
 struct DirectDictionaryPageDecoder {
-    data_type: DataType,
     decoded_dict: DataBlock,
     indices_decoder: Box<dyn PrimitivePageDecoder>,
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
-        let indices = self.indices_decoder.decode(rows_to_skip, num_rows)?;
+        let indices = self
+            .indices_decoder
+            .decode(rows_to_skip, num_rows)?
+            .as_fixed_width()?;
         let dict = self.decoded_dict.try_clone()?;
-        match indices {
-            DataBlock::AllNull(num_rows) => Ok(DataBlock::AllNull(num_rows)),
-            DataBlock::FixedWidth(indices) => Ok(DataBlock::Dictionary(DictionaryDataBlock {
-                indices,
-                dictionary: Box::new(dict),
-            })),
-            DataBlock::Nullable(indices) => {
-                // Writers should normalize nulls into the dictionary so this path doesn't need
-                // to be encountered on read.
-                let (key_type, value_type) = match &self.data_type {
-                    DataType::Dictionary(key_type, value_type) => {
-                        (key_type.as_ref().clone(), value_type.as_ref().clone())
-                    }
-                    _ => panic!(
-                        "Unexpected data block type for dictionary: {:?}",
-                        self.data_type
-                    ),
-                };
-                let dict_arrow = dict.into_arrow(value_type, false)?;
-                let indices_arrow = DataBlock::Nullable(indices).into_arrow(key_type, false)?;
-                let dict_data = indices_arrow
-                    .into_builder()
-                    .add_child_data(dict_arrow)
-                    .data_type(self.data_type.clone())
-                    .build()?;
-                let dict_array = make_array(dict_data);
-                Ok(DataBlock::from_array(dict_array))
-            }
-            _ => panic!(
-                "Unexpected data block type for dictionary indices: {:?}",
-                indices
-            ),
-        }
+        Ok(DataBlock::Dictionary(DictionaryDataBlock {
+            indices,
+            dictionary: Box::new(dict),
+        }))
     }
 }
 
@@ -255,56 +226,62 @@ impl AlreadyDictionaryEncoder {
 }
 
 impl ArrayEncoder for AlreadyDictionaryEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        // If we get multiple dictionary arrays and they don't all have the same dictionary
-        // then we need to normalize the indices.  Otherwise we might have something like:
-        //
-        // First chunk ["hello", "foo"], [0, 0, 1, 1, 1]
-        // Second chunk ["bar", "world"], [0, 1, 0, 1, 1]
-        //
-        // If we simply encode as ["hello", "foo", "bar", "world"], [0, 0, 1, 1, 1, 0, 1, 0, 1, 1]
-        // then we will get the wrong answer.
-        //
-        // A simple way to do this today is to just concatenate all the arrays.
-        //
-        // TODO: We could be more efficient here by checking if the dictionaries are the same
-        //       Also, if they aren't, we can possibly do something cheaper than concatenating
-        let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
-        let array = arrow_select::concat::concat(&array_refs)?;
-        let array_dict = array.as_any_dictionary();
-        let indices = make_array(array_dict.keys().to_data());
-        let items = array_dict.values().clone();
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let DataType::Dictionary(key_type, value_type) = data_type else {
+            panic!("Expected dictionary type");
+        };
 
-        if items.is_empty() {
-            return Ok(EncodedArray {
-                buffers: Vec::default(),
-                encoding: pb::ArrayEncoding {
-                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
-                        pb::Nullable {
-                            nullability: Some(pb::nullable::Nullability::AllNulls(AllNull {})),
-                        },
-                    ))),
-                },
-            });
-        }
+        println!("Before");
+        let dict_data = match data {
+            DataBlock::Dictionary(dict_data) => dict_data,
+            DataBlock::AllNull(all_null) => {
+                // In 2.1 this won't happen, kind of annoying to materialize a bunch of nulls
+                let indices = UInt8Array::from(vec![0; all_null.num_values as usize]);
+                let indices = arrow_cast::cast(&indices, key_type.as_ref()).unwrap();
+                let indices = indices.into_data();
+                let values = new_null_array(value_type, 1);
+                DictionaryDataBlock {
+                    indices: FixedWidthDataBlock {
+                        bits_per_value: key_type.byte_width() as u64 * 8,
+                        data: LanceBuffer::Borrowed(indices.buffers()[0].clone()),
+                        num_values: all_null.num_values,
+                    },
+                    dictionary: Box::new(DataBlock::from_array(values)),
+                }
+            }
+            _ => panic!("Expected dictionary data"),
+        };
+        println!("After");
+        let num_dictionary_items = dict_data.dictionary.num_values() as u32;
 
-        let dictionary_size = items.len() as u32;
-        let encoded_indices = self.indices_encoder.encode(&[indices], buffer_index)?;
-        let encoded_items = self.items_encoder.encode(&[items], buffer_index)?;
-        let mut all_buffers = encoded_indices.buffers;
-        all_buffers.extend(encoded_items.buffers);
+        let encoded_indices = self.indices_encoder.encode(
+            DataBlock::FixedWidth(dict_data.indices),
+            key_type,
+            buffer_index,
+        )?;
+        let encoded_items =
+            self.items_encoder
+                .encode(*dict_data.dictionary, value_type, buffer_index)?;
+
+        let encoded = DataBlock::Dictionary(DictionaryDataBlock {
+            dictionary: Box::new(encoded_items.data),
+            indices: encoded_indices.data.as_fixed_width()?,
+        });
+
+        let encoding = ProtobufUtils::dict_encoding(
+            encoded_indices.encoding,
+            encoded_items.encoding,
+            num_dictionary_items,
+        );
 
         Ok(EncodedArray {
-            buffers: all_buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::Dictionary(Box::new(
-                    pb::Dictionary {
-                        indices: Some(Box::new(encoded_indices.encoding)),
-                        items: Some(Box::new(encoded_items.encoding)),
-                        num_dictionary_items: dictionary_size,
-                    },
-                ))),
-            },
+            data: encoded,
+            encoding,
         })
     }
 }
@@ -327,37 +304,33 @@ impl DictionaryEncoder {
     }
 }
 
-fn encode_dict_indices_and_items(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
+fn encode_dict_indices_and_items(string_array: &StringArray) -> (ArrayRef, ArrayRef) {
     let mut arr_hashmap: HashMap<&str, u8> = HashMap::new();
     // We start with a dict index of 1 because the value 0 is reserved for nulls
     // The dict indices are adjusted by subtracting 1 later during decode
     let mut curr_dict_index = 1;
-    let total_capacity = arrays.iter().map(|arr| arr.len()).sum();
+    let total_capacity = string_array.len();
 
     let mut dict_indices = Vec::with_capacity(total_capacity);
     let mut dict_builder = StringBuilder::new();
 
-    for arr in arrays.iter() {
-        let string_array = arrow_array::cast::as_string_array(arr);
+    for i in 0..string_array.len() {
+        if !string_array.is_valid(i) {
+            // null value
+            dict_indices.push(0);
+            continue;
+        }
 
-        for i in 0..string_array.len() {
-            if !string_array.is_valid(i) {
-                // null value
-                dict_indices.push(0);
-                continue;
-            }
+        let st = string_array.value(i);
 
-            let st = string_array.value(i);
+        let hashmap_entry = *arr_hashmap.entry(st).or_insert(curr_dict_index);
+        dict_indices.push(hashmap_entry);
 
-            let hashmap_entry = *arr_hashmap.entry(st).or_insert(curr_dict_index);
-            dict_indices.push(hashmap_entry);
-
-            // if item didn't exist in the hashmap, add it to the dictionary
-            // and increment the dictionary index
-            if hashmap_entry == curr_dict_index {
-                dict_builder.append_value(st);
-                curr_dict_index += 1;
-            }
+        // if item didn't exist in the hashmap, add it to the dictionary
+        // and increment the dictionary index
+        if hashmap_entry == curr_dict_index {
+            dict_builder.append_value(st);
+            curr_dict_index += 1;
         }
     }
 
@@ -378,33 +351,52 @@ fn encode_dict_indices_and_items(arrays: &[ArrayRef]) -> (ArrayRef, ArrayRef) {
 }
 
 impl ArrayEncoder for DictionaryEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let (index_array, items_array) = encode_dict_indices_and_items(arrays);
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        if !matches!(data_type, DataType::Utf8) {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "DictionaryEncoder only supports string arrays but got {}",
+                    data_type
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+        // We only support string arrays for now
+        let str_data = make_array(data.into_arrow(DataType::Utf8, false)?);
 
-        let encoded_indices = self
-            .indices_encoder
-            .encode(&[index_array.clone()], buffer_index)?;
+        let (index_array, items_array) = encode_dict_indices_and_items(str_data.as_string());
+        let dict_size = items_array.len() as u32;
+        let index_data = DataBlock::from(index_array);
+        let items_data = DataBlock::from(items_array);
+
+        let encoded_indices =
+            self.indices_encoder
+                .encode(index_data, &DataType::UInt8, buffer_index)?;
 
         let encoded_items = self
             .items_encoder
-            .encode(&[items_array.clone()], buffer_index)?;
+            .encode(items_data, &DataType::Utf8, buffer_index)?;
 
-        let mut encoded_buffers = encoded_indices.buffers;
-        encoded_buffers.extend(encoded_items.buffers);
+        let encoded_data = DataBlock::Dictionary(DictionaryDataBlock {
+            indices: encoded_indices.data.as_fixed_width()?,
+            dictionary: Box::new(encoded_items.data),
+        });
 
-        let dict_size = items_array.len() as u32;
+        let encoding = ProtobufUtils::dict_encoding(
+            encoded_indices.encoding,
+            encoded_items.encoding,
+            dict_size,
+        );
 
         Ok(EncodedArray {
-            buffers: encoded_buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::Dictionary(Box::new(
-                    pb::Dictionary {
-                        indices: Some(Box::new(encoded_indices.encoding)),
-                        items: Some(Box::new(encoded_items.encoding)),
-                        num_dictionary_items: dict_size,
-                    },
-                ))),
-            },
+            data: encoded_data,
+            encoding,
         })
     }
 }
@@ -431,11 +423,17 @@ pub mod tests {
     #[test]
     fn test_encode_dict_nulls() {
         // Null entries in string arrays should be adjusted
-        let string_array1 = Arc::new(StringArray::from(vec![None, Some("foo"), Some("bar")]));
-        let string_array2 = Arc::new(StringArray::from(vec![Some("bar"), None, Some("foo")]));
-        let string_array3 = Arc::new(StringArray::from(vec![None as Option<&str>, None]));
-        let (dict_indices, dict_items) =
-            encode_dict_indices_and_items(&[string_array1, string_array2, string_array3]);
+        let string_array = Arc::new(StringArray::from(vec![
+            None,
+            Some("foo"),
+            Some("bar"),
+            Some("bar"),
+            None,
+            Some("foo"),
+            None,
+            None,
+        ]));
+        let (dict_indices, dict_items) = encode_dict_indices_and_items(&string_array);
 
         let expected_indices = Arc::new(UInt8Array::from(vec![0, 1, 2, 2, 0, 1, 0, 0])) as ArrayRef;
         let expected_items = Arc::new(StringArray::from(vec!["foo", "bar"])) as ArrayRef;

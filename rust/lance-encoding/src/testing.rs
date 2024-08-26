@@ -16,13 +16,14 @@ use lance_core::Result;
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
+    buffer::LanceBuffer,
     decoder::{
         BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
         DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedBuffer,
-        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedPage,
+        EncodingOptions, FieldEncoder, FieldEncodingStrategy,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
     version::LanceFileVersion,
@@ -363,18 +364,17 @@ impl SimulatedWriter {
         }
     }
 
-    fn write_buffer(&mut self, buffer: EncodedBuffer) -> (u64, u64) {
+    fn write_buffer(&mut self, buffer: LanceBuffer) -> (u64, u64) {
         let offset = self.encoded_data.len() as u64;
-        for part in buffer.parts.iter() {
-            self.encoded_data.extend_from_slice(part);
-        }
+        self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
         (offset, size)
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {
         trace!("Encoded page {:?}", encoded_page);
-        let (page_buffers, page_encoding) = encoded_page.array.into_parts();
+        let page_buffers = encoded_page.array.data.into_buffers();
+        let page_encoding = encoded_page.array.encoding;
         let buffer_offsets_and_sizes = page_buffers
             .into_iter()
             .map(|b| self.write_buffer(b))

@@ -3,13 +3,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::ArrayData;
 use arrow::datatypes::{
     ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
     UInt64Type, UInt8Type,
 };
 use arrow::util::bit_util::ceil;
-use arrow_array::{cast::AsArray, Array, ArrayRef, PrimitiveArray};
+use arrow_array::{cast::AsArray, Array, PrimitiveArray};
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
@@ -22,11 +21,9 @@ use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock};
-use crate::encoder::{BitpackingBufferMeta, EncodedBufferMeta};
-use crate::{
-    decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{BufferEncoder, EncodedBuffer},
-};
+use crate::decoder::{PageScheduler, PrimitivePageDecoder};
+use crate::encoder::{ArrayEncoder, EncodedArray};
+use crate::format::ProtobufUtils;
 
 #[derive(Debug)]
 pub struct BitpackParams {
@@ -37,7 +34,7 @@ pub struct BitpackParams {
 
 // Compute the number of bits to use for each item, if this array can be encoded using
 // bitpacking encoding. Returns `None` if the type or array data is not supported.
-pub fn bitpack_params(arr: ArrayRef) -> Option<BitpackParams> {
+pub fn bitpack_params(arr: &dyn Array) -> Option<BitpackParams> {
     match arr.data_type() {
         DataType::UInt8 => bitpack_params_for_type::<UInt8Type>(arr.as_primitive()),
         DataType::UInt16 => bitpack_params_for_type::<UInt16Type>(arr.as_primitive()),
@@ -113,12 +110,12 @@ where
     })
 }
 #[derive(Debug)]
-pub struct BitpackingBufferEncoder {
+pub struct BitpackedArrayEncoder {
     num_bits: u64,
     signed_type: bool,
 }
 
-impl BitpackingBufferEncoder {
+impl BitpackedArrayEncoder {
     pub fn new(num_bits: u64, signed_type: bool) -> Self {
         Self {
             num_bits,
@@ -127,101 +124,67 @@ impl BitpackingBufferEncoder {
     }
 }
 
-impl BufferEncoder for BitpackingBufferEncoder {
-    fn encode(&self, arrays: &[ArrayRef]) -> Result<(EncodedBuffer, EncodedBufferMeta)> {
+impl ArrayEncoder for BitpackedArrayEncoder {
+    fn encode(
+        &self,
+        data: DataBlock,
+        _data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
         // calculate the total number of bytes we need to allocate for the destination.
         // this will be the number of items in the source array times the number of bits.
-        let count_items = arrays.iter().map(|arr| arr.len()).sum::<usize>();
-        let dst_bytes_total = ceil(count_items * self.num_bits as usize, 8);
+        let dst_bytes_total = ceil(data.num_values() as usize * self.num_bits as usize, 8);
 
         let mut dst_buffer = vec![0u8; dst_bytes_total];
         let mut dst_idx = 0;
         let mut dst_offset = 0;
-        for arr in arrays {
-            pack_array(
-                arr.clone(),
-                self.num_bits,
-                &mut dst_buffer,
-                &mut dst_idx,
-                &mut dst_offset,
-            )?;
-        }
 
-        let data_type = arrays[0].data_type();
-        Ok((
-            EncodedBuffer {
-                parts: vec![dst_buffer.into()],
-            },
-            EncodedBufferMeta {
-                bits_per_value: (data_type.byte_width() * 8) as u64,
-                bitpacking: Some(BitpackingBufferMeta {
-                    bits_per_value: self.num_bits,
-                    signed: self.signed_type,
-                }),
-                compression_scheme: None,
-            },
-        ))
-    }
-}
+        let DataBlock::FixedWidth(unpacked) = data else {
+            return Err(Error::InvalidInput {
+                source: "Bitpacking only supports fixed width data blocks".into(),
+                location: location!(),
+            });
+        };
 
-fn pack_array(
-    arr: ArrayRef,
-    num_bits: u64,
-    dst: &mut [u8],
-    dst_idx: &mut usize,
-    dst_offset: &mut u8,
-) -> Result<()> {
-    match arr.data_type() {
-        DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64 => {
-            pack_buffers(
-                arr.to_data(),
-                num_bits,
-                arr.data_type().byte_width(),
-                dst,
-                dst_idx,
-                dst_offset,
-            );
+        pack_bits(
+            &unpacked.data,
+            self.num_bits,
+            &mut dst_buffer,
+            &mut dst_idx,
+            &mut dst_offset,
+        );
 
-            Ok(())
-        }
-        _ => Err(Error::InvalidInput {
-            source: format!("Invalid data type for bitpacking: {}", arr.data_type()).into(),
-            location: location!(),
-        }),
-    }
-}
+        let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.num_bits,
+            data: LanceBuffer::Owned(dst_buffer),
+            num_values: unpacked.num_values,
+        });
 
-fn pack_buffers(
-    data: ArrayData,
-    num_bits: u64,
-    byte_len: usize,
-    dst: &mut [u8],
-    dst_idx: &mut usize,
-    dst_offset: &mut u8,
-) {
-    let buffers = data.buffers();
-    debug_assert_eq!(buffers.len(), 1);
-    for buffer in buffers {
-        pack_bits(buffer, num_bits, byte_len, dst, dst_idx, dst_offset);
+        let bitpacked_buffer_index = *buffer_index;
+        *buffer_index += 1;
+
+        let encoding = ProtobufUtils::bitpacked_encoding(
+            self.num_bits,
+            unpacked.bits_per_value,
+            bitpacked_buffer_index,
+            self.signed_type,
+        );
+
+        Ok(EncodedArray {
+            data: packed,
+            encoding,
+        })
     }
 }
 
 fn pack_bits(
-    src: &[u8],
+    src: &LanceBuffer,
     num_bits: u64,
-    byte_len: usize,
     dst: &mut [u8],
     dst_idx: &mut usize,
     dst_offset: &mut u8,
 ) {
-    let bit_len = byte_len as u64 * 8;
+    let bit_len = src.len() as u64 * 8;
 
     let mask = u64::MAX >> (64 - num_bits);
 
@@ -270,7 +233,7 @@ fn pack_bits(
                 to_next_byte = 0;
             }
 
-            src_idx += byte_len - partial_bytes_written + to_next_byte;
+            src_idx += src.len() - partial_bytes_written + to_next_byte;
         }
     }
 }
@@ -614,15 +577,27 @@ fn rows_in_buffer(
 
 #[cfg(test)]
 pub mod test {
+    use crate::{
+        format::pb,
+        testing::{check_round_trip_encoding_generated, ArrayGeneratorProvider},
+        version::LanceFileVersion,
+    };
+
     use super::*;
-    use std::sync::Arc;
+    use std::{marker::PhantomData, sync::Arc};
 
     use arrow_array::{
         types::{UInt16Type, UInt8Type},
-        Float64Array, Int32Array,
+        ArrayRef, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
 
-    use lance_datagen::{array::fill, gen, ArrayGenerator, ArrayGeneratorExt, RowCount};
+    use arrow_schema::Field;
+    use lance_datagen::{
+        array::{fill, rand_with_distribution},
+        gen, ArrayGenerator, ArrayGeneratorExt, RowCount,
+    };
+    use rand::distributions::Uniform;
 
     #[test]
     fn test_bitpack_params() {
@@ -647,7 +622,7 @@ pub mod test {
                 while arr.null_count() == arr.len() {
                     arr = gen_array(fill::<$data_type>(max).with_random_nulls($null_probability));
                 }
-                let result = bitpack_params(arr);
+                let result = bitpack_params(arr.as_ref());
                 assert!(result.is_some());
                 assert_eq!($num_bits, result.unwrap().num_bits);
             };
@@ -703,15 +678,15 @@ pub mod test {
 
         // test that it returns None for datatypes that don't support bitpacking
         let arr = Float64Array::from_iter_values(vec![0.1, 0.2, 0.3]);
-        let result = bitpack_params(Arc::new(arr));
+        let result = bitpack_params(&arr);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_num_compressed_bits_signed_types() {
         let values = Int32Array::from(vec![1, 2, -7]);
-        let arr = Arc::new(values);
-        let result = bitpack_params(arr);
+        let arr = values;
+        let result = bitpack_params(&arr);
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(4, result.num_bits);
@@ -719,8 +694,8 @@ pub mod test {
 
         // check that it doesn't add a sign bit if it doesn't need to
         let values = Int32Array::from(vec![1, 2, 7]);
-        let arr = Arc::new(values);
-        let result = bitpack_params(arr);
+        let arr = values;
+        let result = bitpack_params(&arr);
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(3, result.num_bits);
@@ -766,5 +741,384 @@ pub mod test {
 
         let result = compute_start_offset(10, 5, 5, 0, None);
         assert_eq!(StartOffset::SkipFull(8), result);
+    }
+
+    #[test_log::test(test)]
+    fn test_will_bitpack_allowed_types_when_possible() {
+        let test_cases: Vec<(DataType, ArrayRef, u64)> = vec![
+            (
+                DataType::UInt8,
+                Arc::new(UInt8Array::from_iter_values(vec![0, 1, 2, 3, 4, 5])),
+                3, // bits per value
+            ),
+            (
+                DataType::UInt16,
+                Arc::new(UInt16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
+                11,
+            ),
+            (
+                DataType::UInt32,
+                Arc::new(UInt32Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 16])),
+                19,
+            ),
+            (
+                DataType::UInt64,
+                Arc::new(UInt64Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 32])),
+                35,
+            ),
+            (
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, -5])),
+                4,
+            ),
+            (
+                // check it will not pack with signed bit if all values of signed type are positive
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, 5])),
+                3,
+            ),
+            (
+                DataType::Int16,
+                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, -4, 5 << 8])),
+                12,
+            ),
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from_iter_values(vec![0, 1, 2, 3, 4, -5 << 16])),
+                20,
+            ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from_iter_values(vec![
+                    0,
+                    1,
+                    2,
+                    -3,
+                    -4,
+                    -5 << 32,
+                ])),
+                36,
+            ),
+        ];
+
+        for (data_type, arr, bits_per_value) in test_cases {
+            let mut buffed_index = 1;
+            let params = bitpack_params(arr.as_ref()).unwrap();
+            let encoder = BitpackedArrayEncoder {
+                num_bits: params.num_bits,
+                signed_type: params.signed,
+            };
+            let data = DataBlock::from_array(arr);
+            let result = encoder.encode(data, &data_type, &mut buffed_index).unwrap();
+
+            let data = result.data.as_fixed_width().unwrap();
+            assert_eq!(bits_per_value, data.bits_per_value);
+
+            let array_encoding = result.encoding.array_encoding.unwrap();
+
+            match array_encoding {
+                pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => {
+                    assert_eq!(bits_per_value, bitpacked.compressed_bits_per_value);
+                    assert_eq!(
+                        (data_type.byte_width() * 8) as u64,
+                        bitpacked.uncompressed_bits_per_value
+                    );
+                }
+                _ => {
+                    panic!("Array did not use bitpacking encoding")
+                }
+            }
+        }
+
+        // check it will otherwise use flat encoding
+        let test_cases: Vec<(DataType, ArrayRef)> = vec![
+            // it should use flat encoding for datatypes that don't support bitpacking
+            (
+                DataType::Float32,
+                Arc::new(Float32Array::from_iter_values(vec![0.1, 0.2, 0.3])),
+            ),
+            // it should still use flat encoding if bitpacked encoding would be packed
+            // into the full byte range
+            (
+                DataType::UInt8,
+                Arc::new(UInt8Array::from_iter_values(vec![0, 1, 2, 3, 4, 250])),
+            ),
+            (
+                DataType::UInt16,
+                Arc::new(UInt16Array::from_iter_values(vec![0, 1, 2, 3, 4, 250 << 8])),
+            ),
+            (
+                DataType::UInt32,
+                Arc::new(UInt32Array::from_iter_values(vec![
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    250 << 24,
+                ])),
+            ),
+            (
+                DataType::UInt64,
+                Arc::new(UInt64Array::from_iter_values(vec![
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    250 << 56,
+                ])),
+            ),
+            (
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![-100])),
+            ),
+            (
+                DataType::Int16,
+                Arc::new(Int16Array::from_iter_values(vec![-100 << 8])),
+            ),
+            (
+                DataType::Int32,
+                Arc::new(Int32Array::from_iter_values(vec![-100 << 24])),
+            ),
+            (
+                DataType::Int64,
+                Arc::new(Int64Array::from_iter_values(vec![-100 << 56])),
+            ),
+        ];
+
+        for (data_type, arr) in test_cases {
+            if let Some(params) = bitpack_params(arr.as_ref()) {
+                assert_eq!(params.num_bits, data_type.byte_width() as u64 * 8);
+            }
+        }
+    }
+
+    struct DistributionArrayGeneratorProvider<
+        DataType,
+        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+    >
+    where
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+    {
+        phantom: PhantomData<DataType>,
+        distribution: Dist,
+    }
+
+    impl<DataType, Dist> DistributionArrayGeneratorProvider<DataType, Dist>
+    where
+        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+    {
+        fn new(dist: Dist) -> Self {
+            Self {
+                distribution: dist,
+                phantom: Default::default(),
+            }
+        }
+    }
+
+    impl<DataType, Dist> ArrayGeneratorProvider for DistributionArrayGeneratorProvider<DataType, Dist>
+    where
+        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
+        DataType::Native: Copy + 'static,
+        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
+        DataType: ArrowPrimitiveType,
+    {
+        fn provide(&self) -> Box<dyn ArrayGenerator> {
+            rand_with_distribution::<DataType, Dist>(self.distribution.clone())
+        }
+
+        fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
+            Box::new(Self {
+                phantom: self.phantom,
+                distribution: self.distribution.clone(),
+            })
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_primitive() {
+        let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
+            // check less than one byte for multi-byte type
+            (
+                DataType::UInt32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
+                        Uniform::new(0, 19),
+                    ),
+                ),
+            ),
+            // // check that more than one byte for multi-byte type
+            (
+                DataType::UInt32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
+                        Uniform::new(5 << 7, 6 << 7),
+                    ),
+                ),
+            ),
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        Uniform::new(5 << 42, 6 << 42),
+                    ),
+                ),
+            ),
+            // check less than one byte for single-byte type
+            (
+                DataType::UInt8,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt8Type, Uniform<u8>>::new(
+                        Uniform::new(0, 19),
+                    ),
+                ),
+            ),
+            // check less than one byte for single-byte type
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        Uniform::new(129, 259),
+                    ),
+                ),
+            ),
+            // check byte aligned for single byte
+            (
+                DataType::UInt32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
+                        // this range should always give 8 bits
+                        Uniform::new(200, 250),
+                    ),
+                ),
+            ),
+            // check where the num_bits divides evenly into the bit length of the type
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        Uniform::new(1, 3), // 2 bits
+                    ),
+                ),
+            ),
+            // check byte aligned for multiple bytes
+            (
+                DataType::UInt32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
+                        // this range should always always give 16 bits
+                        Uniform::new(200 << 8, 250 << 8),
+                    ),
+                ),
+            ),
+            // check byte aligned where the num bits doesn't divide evenly into the byte length
+            (
+                DataType::UInt64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
+                        // this range should always give 24 hits
+                        Uniform::new(200 << 16, 250 << 16),
+                    ),
+                ),
+            ),
+            // check that we can still encode an all-0 array
+            (
+                DataType::UInt32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
+                        // this range should always always give 16 bits
+                        Uniform::new(0, 1),
+                    ),
+                ),
+            ),
+            // check for signed types
+            (
+                DataType::Int16,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int16Type, Uniform<i16>>::new(
+                        Uniform::new(-5, 5),
+                    ),
+                ),
+            ),
+            (
+                DataType::Int64,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
+                        Uniform::new(-(5 << 42), 6 << 42),
+                    ),
+                ),
+            ),
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(-(5 << 7), 6 << 7),
+                    ),
+                ),
+            ),
+            // check signed where packed to < 1 byte for multi-byte type
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(-19, 19),
+                    ),
+                ),
+            ),
+            // check signed byte aligned to single byte
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        // this range should always give 8 bits
+                        Uniform::new(-120, 120),
+                    ),
+                ),
+            ),
+            // check signed byte aligned to multiple bytes
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        // this range should always give 16 bits
+                        Uniform::new(-120 << 8, 120 << 8),
+                    ),
+                ),
+            ),
+            // check that it works for all positive integers even if type is signed
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(10, 20),
+                    ),
+                ),
+            ),
+            // check that all 0 works for signed type
+            (
+                DataType::Int32,
+                Box::new(
+                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
+                        Uniform::new(0, 1),
+                    ),
+                ),
+            ),
+        ];
+
+        for (data_type, array_gen_provider) in bitpacked_test_cases {
+            let field = Field::new("", data_type.clone(), false);
+            check_round_trip_encoding_generated(
+                field,
+                array_gen_provider.copy(),
+                LanceFileVersion::V2_1,
+            )
+            .await;
+        }
     }
 }

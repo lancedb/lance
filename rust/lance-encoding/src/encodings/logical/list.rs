@@ -19,6 +19,8 @@ use tokio::task::JoinHandle;
 use lance_core::{Error, Result};
 
 use crate::{
+    buffer::LanceBuffer,
+    data::{DataBlock, FixedWidthDataBlock},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
         LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
@@ -1056,7 +1058,12 @@ impl ListOffsetsEncoder {
                 null_offset_adjustment,
             );
         }
-        inner_encoder.encode(&[Arc::new(UInt64Array::from(offsets))], buffer_index)
+        let offsets_data = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(offsets),
+            num_values: num_offsets,
+        });
+        inner_encoder.encode(offsets_data, &DataType::UInt64, buffer_index)
     }
 
     fn do_encode(
@@ -1092,7 +1099,7 @@ impl ListOffsetsEncoder {
             inner_encoder,
         )?;
         Ok(EncodedArray {
-            buffers: encoded_offsets.buffers,
+            data: encoded_offsets.data,
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::List(Box::new(
                     pb::List {

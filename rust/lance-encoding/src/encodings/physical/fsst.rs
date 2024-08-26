@@ -3,10 +3,8 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow_array::{cast::AsArray, Array, BinaryArray};
-use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
-use arrow_select::concat::concat;
 use futures::{future::BoxFuture, FutureExt};
 
 use lance_core::Result;
@@ -16,7 +14,7 @@ use crate::{
     data::{DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -134,52 +132,64 @@ impl FsstArrayEncoder {
 impl ArrayEncoder for FsstArrayEncoder {
     fn encode(
         &self,
-        arrays: &[arrow_array::ArrayRef],
+        data: DataBlock,
+        data_type: &DataType,
         buffer_index: &mut u32,
-    ) -> lance_core::Result<crate::encoder::EncodedArray> {
-        // Currently, fsst encoder expects one buffer, so let us concatenate
-        let concat_array = concat(&arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>())?;
-        let (offsets, values) = match concat_array.data_type() {
-            DataType::Utf8 => {
-                let str_array = concat_array.as_string();
-                (str_array.offsets().inner(), str_array.values())
+    ) -> lance_core::Result<EncodedArray> {
+        let (mut data, nulls) = match data {
+            DataBlock::Nullable(nullable) => {
+                let data = nullable.data.as_variable_width().unwrap();
+                (data, Some(nullable.nulls))
             }
-            DataType::Binary => {
-                let bin_array = concat_array.as_binary();
-                (bin_array.offsets().inner(), bin_array.values())
-            }
-            _ => panic!("Received neither Utf8 nor Binary array from inner encoder"),
+            DataBlock::VariableWidth(variable) => (variable, None),
+            _ => panic!("Expected variable width data block"),
         };
+        assert_eq!(data.bits_per_offset, 32);
+        let num_values = data.num_values;
+        let offsets = data.offsets.borrow_to_typed_slice::<i32>();
+        let offsets_slice = offsets.as_ref();
+        let bytes_data = data.data.into_buffer();
+        // Currently, fsst encoder expects one buffer, so let us concatenate
 
-        let mut dest_offsets = vec![0_i32; offsets.len() * 2];
-        let mut dest_values = vec![0_u8; values.len() * 2];
+        let mut dest_offsets = vec![0_i32; offsets_slice.len() * 2];
+        let mut dest_values = vec![0_u8; bytes_data.len() * 2];
         let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
 
         fsst::fsst::compress(
             &mut symbol_table,
-            values.as_slice(),
-            offsets,
+            bytes_data.as_slice(),
+            offsets_slice,
             &mut dest_values,
             &mut dest_offsets,
         )?;
 
-        let dest_array = Arc::new(BinaryArray::new(
-            OffsetBuffer::new(ScalarBuffer::from(dest_offsets)),
-            Buffer::from(dest_values),
-            concat_array.nulls().cloned(),
-        ));
+        let dest_offset = LanceBuffer::reinterpret_vec(dest_offsets);
+        let dest_values = LanceBuffer::Owned(dest_values);
+        let dest_data = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: 32,
+            data: dest_values,
+            num_values,
+            offsets: dest_offset,
+        });
 
-        let inner_encoded = self.inner_encoder.encode(&[dest_array], buffer_index)?;
+        let data_block = if let Some(nulls) = nulls {
+            DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(dest_data),
+                nulls,
+            })
+        } else {
+            dest_data
+        };
+
+        let inner_encoded = self
+            .inner_encoder
+            .encode(data_block, data_type, buffer_index)?;
+
+        let encoding = ProtobufUtils::fsst(inner_encoded.encoding, symbol_table);
+
         Ok(EncodedArray {
-            buffers: inner_encoded.buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::Fsst(Box::new(
-                    pb::Fsst {
-                        binary: Some(Box::new(inner_encoded.encoding)),
-                        symbol_table,
-                    },
-                ))),
-            },
+            data: inner_encoded.data,
+            encoding,
         })
     }
 }
