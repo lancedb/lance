@@ -24,6 +24,7 @@ arrow-select.workspace = true
 bytes.workspace = true
 futures.workspace = true
 fsst.workspace = true
+hex = "0.4.3"
 log.workspace = true
 num-traits.workspace = true
 prost.workspace = true
@@ -51,4 +52,8 @@ pprof = { workspace = true }
 
 [[bench]]
 name = "decoder"
+harness = false
+
+[[bench]]
+name = "buffer"
 harness = false
