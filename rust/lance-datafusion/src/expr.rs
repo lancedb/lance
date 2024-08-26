@@ -22,9 +22,11 @@ use {
     },
     datafusion_substrait::substrait::proto::{
         expression_reference::ExprType,
+        extensions::{simple_extension_declaration::MappingType, SimpleExtensionDeclaration},
         plan_rel::RelType,
+        r#type::{Kind, Struct},
         read_rel::{NamedTable, ReadType},
-        rel, ExtendedExpression, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
+        rel, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
     },
     lance_core::{Error, Result},
     prost::Message,
@@ -467,6 +469,52 @@ pub fn encode_substrait(expr: Expr, schema: Arc<Schema>) -> Result<Vec<u8>> {
     }
 }
 
+#[cfg(feature = "substrait")]
+fn remove_extension_types(
+    substrait_schema: &NamedStruct,
+    arrow_schema: Arc<Schema>,
+) -> Result<(NamedStruct, Arc<Schema>)> {
+    let fields = substrait_schema.r#struct.as_ref().unwrap();
+    if fields.types.len() != arrow_schema.fields.len() {
+        return Err(Error::InvalidInput {
+            source: "the number of fields in the provided substrait schema did not match the number of fields in the input schema.".into(),
+            location: location!(),
+        });
+    }
+    let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
+    let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
+    for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields.iter()) {
+        if !matches!(
+            substrait_field.kind.as_ref().unwrap(),
+            Kind::UserDefined(_) | Kind::UserDefinedTypeReference(_)
+        ) {
+            kept_substrait_fields.push(substrait_field.clone());
+            kept_arrow_fields.push(arrow_field.clone());
+        }
+    }
+    let new_arrow_schema = Arc::new(Schema::new(kept_arrow_fields));
+    let new_substrait_schema = NamedStruct {
+        names: vec![],
+        r#struct: Some(Struct {
+            nullability: fields.nullability,
+            type_variation_reference: fields.type_variation_reference,
+            types: kept_substrait_fields,
+        }),
+    };
+    Ok((new_substrait_schema, new_arrow_schema))
+}
+
+#[cfg(feature = "substrait")]
+fn remove_type_extensions(
+    declarations: &Vec<SimpleExtensionDeclaration>,
+) -> Vec<SimpleExtensionDeclaration> {
+    declarations
+        .iter()
+        .filter(|d| matches!(d.mapping_type, Some(MappingType::ExtensionFunction(_))))
+        .cloned()
+        .collect()
+}
+
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression
@@ -501,14 +549,17 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
         }),
     }?;
 
+    let (substrait_schema, input_schema) =
+        remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
+
     // Datafusion's substrait consumer only supports Plan (not ExtendedExpression) and so
     // we need to create a dummy plan with a single project node
     let plan = Plan {
         version: None,
-        extensions: envelope.extensions.clone(),
+        extensions: remove_type_extensions(&envelope.extensions),
         advanced_extensions: envelope.advanced_extensions.clone(),
-        expected_type_urls: envelope.expected_type_urls.clone(),
-        extension_uris: envelope.extension_uris.clone(),
+        expected_type_urls: vec![],
+        extension_uris: vec![],
         relations: vec![PlanRel {
             rel_type: Some(RelType::Root(RelRoot {
                 input: Some(Rel {
@@ -517,7 +568,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
                         input: Some(Box::new(Rel {
                             rel_type: Some(rel::RelType::Read(Box::new(ReadRel {
                                 common: None,
-                                base_schema: envelope.base_schema.clone(),
+                                base_schema: Some(substrait_schema),
                                 filter: None,
                                 best_effort_filter: None,
                                 projection: None,
