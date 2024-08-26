@@ -651,7 +651,7 @@ impl CommitHandler for RenameCommitHandler {
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
-        let res = match object_store
+        match object_store
             .inner
             .rename_if_not_exists(&tmp_path, &path)
             .await
@@ -668,9 +668,7 @@ impl CommitHandler for RenameCommitHandler {
                 // Something else went wrong
                 return Err(CommitError::OtherError(e.into()));
             }
-        };
-
-        res
+        }
     }
 }
 
