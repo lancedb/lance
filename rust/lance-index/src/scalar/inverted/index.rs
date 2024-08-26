@@ -266,7 +266,7 @@ impl ScalarIndex for InvertedIndex {
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct TokenSet {
     // token -> (token_id, frequency)
-    tokens: HashMap<String, (u32, u64)>,
+    tokens: HashMap<String, u32>,
     next_id: u32,
 }
 
@@ -274,22 +274,18 @@ impl TokenSet {
     pub fn to_batch(&self) -> Result<RecordBatch> {
         let mut tokens = Vec::with_capacity(self.tokens.len());
         let mut token_ids = Vec::with_capacity(self.tokens.len());
-        let mut frequencies = Vec::with_capacity(self.tokens.len());
-        self.tokens
-            .iter()
-            .for_each(|(token, (token_id, frequency))| {
-                tokens.push(token.clone());
-                token_ids.push(*token_id);
-                frequencies.push(*frequency);
-            });
-        let token_col = StringArray::from(tokens);
-        let token_id_col = UInt32Array::from(token_ids);
-        let frequency_col = UInt64Array::from(frequencies);
+        self.tokens.iter().for_each(|(token, token_id)| {
+            tokens.push(token.clone());
+            token_ids.push(*token_id);
+        });
+        let mut indices = (0..self.tokens.len()).collect_vec();
+        indices.sort_unstable_by_key(|&i| tokens[i].as_str());
+        let token_col = StringArray::from_iter_values(indices.iter().map(|&i| tokens[i].as_str()));
+        let token_id_col = UInt32Array::from_iter_values(indices.iter().map(|&i| token_ids[i]));
 
         let schema = arrow_schema::Schema::new(vec![
             arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
             arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
-            arrow_schema::Field::new(FREQUENCY_COL, DataType::UInt64, false),
         ]);
 
         let batch = RecordBatch::try_new(
@@ -297,7 +293,6 @@ impl TokenSet {
             vec![
                 Arc::new(token_col) as ArrayRef,
                 Arc::new(token_id_col) as ArrayRef,
-                Arc::new(frequency_col) as ArrayRef,
             ],
         )?;
         Ok(batch)
@@ -310,15 +305,10 @@ impl TokenSet {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
         let token_col = batch[TOKEN_COL].as_string::<i32>();
         let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
-        let frequency_col = batch[FREQUENCY_COL].as_primitive::<datatypes::UInt64Type>();
 
-        for ((token, &token_id), &frequency) in token_col
-            .iter()
-            .zip(token_id_col.values().iter())
-            .zip(frequency_col.values().iter())
-        {
+        for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
             let token = token.unwrap();
-            tokens.insert(token.to_owned(), (token_id, frequency));
+            tokens.insert(token.to_owned(), token_id);
             next_id = next_id.max(token_id + 1);
         }
 
@@ -327,12 +317,7 @@ impl TokenSet {
 
     pub fn add(&mut self, token: String) -> u32 {
         let next_id = self.next_id();
-        let token_id = self
-            .tokens
-            .entry(token)
-            .and_modify(|(_, freq)| *freq += 1)
-            .or_insert((next_id, 1))
-            .0;
+        let token_id = *self.tokens.entry(token).or_insert(next_id);
 
         // add token if it doesn't exist
         if token_id == next_id {
@@ -343,7 +328,7 @@ impl TokenSet {
     }
 
     pub fn get(&self, token: &str) -> Option<u32> {
-        self.tokens.get(token).map(|(token_id, _)| *token_id)
+        self.tokens.get(token).copied()
     }
 
     pub fn next_id(&self) -> u32 {
