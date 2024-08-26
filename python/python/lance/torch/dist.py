@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-""" Pytorch Distributed Utilities """
+"""Pytorch Distributed Utilities"""
 
 import torch.distributed as dist
 import torch.utils.data
@@ -71,7 +71,8 @@ def get_global_world_size() -> int:
 
 def get_global_rank() -> int:
     """
-    Get the global rank of the current process across distributed and multiprocessing contexts.
+    Get the global rank of the current process across distributed and
+    multiprocessing contexts.
 
     Returns:
         int: The global rank of the current process.
