@@ -138,7 +138,7 @@ insert operation would be more efficient:
   # be a unique key or id of some kind.
   dataset.merge_insert("name") \
          .when_matched_update_all() \
-         .execute()
+         .execute(new_table)
 
 Note that, similar to the update operation, rows that are modified will
 be removed and inserted back into the table, changing their position to
@@ -167,7 +167,7 @@ this:
   # This will insert Carla but leave Bob unchanged
   dataset.merge_insert("name") \
          .when_not_matched_insert_all() \
-         .execute()
+         .execute(new_table)
 
 Update or Insert (Upsert)
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -191,7 +191,7 @@ the merge insert operation to do this as well:
   dataset.merge_insert("name") \
          .when_matched_update_all() \
          .when_not_matched_insert_all() \
-         .execute()
+         .execute(new_table)
 
 Replace a Portion of Data
 ^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -214,7 +214,7 @@ example:
   dataset.merge_insert("name") \
          .when_not_matched_insert_all() \
          .when_not_matched_by_source_delete("age >= 40") \
-         .execute()
+         .execute(new_table)
 
 
 Evolving the schema

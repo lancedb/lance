@@ -35,11 +35,6 @@ use tokio::io::AsyncWriteExt;
 
 use crate::encodings::{AsyncIndex, Decoder};
 
-/// Parallelism factor decides how many run parallel I/O issued per CPU core.
-/// This is a heuristic value, with the assumption NVME and S3/GCS can
-/// handles large mount of parallel I/O & large disk-queue.
-const PARALLELISM_FACTOR: usize = 4;
-
 /// Encoder for plain encoding.
 ///
 pub struct PlainEncoder<'a> {
@@ -369,7 +364,7 @@ impl<'a> PlainDecoder<'a> {
                 let shifted_indices = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &shifted_indices, None)?)
             })
-            .buffered(num_cpus::get())
+            .buffered(self.reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();
@@ -435,7 +430,7 @@ impl<'a> Decoder for PlainDecoder<'a> {
                 let adjusted_offsets = sub(&request, &UInt32Array::new_scalar(start))?;
                 Ok::<ArrayRef, Error>(take(&array, &adjusted_offsets, None)?)
             })
-            .buffered(num_cpus::get() * PARALLELISM_FACTOR)
+            .buffered(self.reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         let references = arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>();

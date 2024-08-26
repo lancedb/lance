@@ -11,6 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -1054,7 +1055,7 @@ impl Dataset {
                 let new_fragment = f.delete(predicate).await?.map(|f| f.metadata);
                 Ok((old_fragment, new_fragment))
             })
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(get_num_compute_intensive_cpus())
             // Drop the fragments that were deleted.
             .try_for_each(|(old_fragment, new_fragment)| {
                 if let Some(new_fragment) = new_fragment {
@@ -1096,7 +1097,7 @@ impl Dataset {
     pub async fn count_deleted_rows(&self) -> Result<usize> {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.count_deletions().await })
-            .buffer_unordered(num_cpus::get() * 4)
+            .buffer_unordered(self.object_store.io_parallelism())
             .try_fold(0, |acc, x| futures::future::ready(Ok(acc + x)))
             .await
     }
@@ -1212,7 +1213,7 @@ impl Dataset {
     pub async fn num_small_files(&self, max_rows_per_group: usize) -> usize {
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.physical_rows().await })
-            .buffered(num_cpus::get() * 4)
+            .buffered(self.object_store.io_parallelism())
             .try_filter(|row_count| futures::future::ready(*row_count < max_rows_per_group))
             .count()
             .await
@@ -1245,7 +1246,7 @@ impl Dataset {
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })
-            .buffer_unordered(num_cpus::get() * 4)
+            .buffer_unordered(self.object_store.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
 

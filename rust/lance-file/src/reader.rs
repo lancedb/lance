@@ -232,6 +232,10 @@ impl FileReader {
         Self::try_new_with_fragment_id(object_store, path, schema, 0, 0, max_field_id, None).await
     }
 
+    fn io_parallelism(&self) -> usize {
+        self.object_reader.io_parallelism()
+    }
+
     /// Requested projection of the data in this file, excluding the row id column.
     pub fn schema(&self) -> &Schema {
         &self.schema
@@ -287,7 +291,7 @@ impl FileReader {
                 .map(|(batch_id, range)| async move {
                     self.read_batch(batch_id, range, projection).await
                 })
-                .buffered(num_cpus::get())
+                .buffered(self.io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await?;
         if batches.len() == 1 {
@@ -322,7 +326,7 @@ impl FileReader {
                         .await
                 }
             })
-            .buffered(num_cpus::get() * 4)
+            .buffered(self.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -368,7 +372,7 @@ impl FileReader {
                     )
                     .await
                 })
-                .buffered(num_cpus::get())
+                .buffered(self.io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await?;
 
@@ -432,7 +436,7 @@ pub async fn read_batch(
         // We box this because otherwise we get a higher-order lifetime error.
         let arrs = stream::iter(&schema.fields)
             .map(|f| async { read_array(reader, f, batch_id, &reader.page_table, params).await })
-            .buffered(num_cpus::get() * 4)
+            .buffered(reader.io_parallelism())
             .try_collect::<Vec<_>>()
             .boxed();
         let arrs = arrs.await?;

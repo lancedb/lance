@@ -12,6 +12,7 @@ use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
 use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
@@ -117,7 +118,7 @@ impl PQBuildParams {
                 )
                 .await
             })
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         let mut codebook_builder = PrimitiveBuilder::<T>::with_capacity(num_centroids * dimension);
