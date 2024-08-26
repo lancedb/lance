@@ -11,7 +11,7 @@
 // The tests are linux only because
 // GHA Mac runner doesn't have docker, which is required to run dynamodb-local
 // Windows FS can't handle concurrent copy
-#[cfg(all(test, feature = "dynamodb_tests"))]
+#[cfg(all(test, target_os = "linux", feature = "dynamodb_tests"))]
 mod test {
     macro_rules! base_uri {
         () => {
