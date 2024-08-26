@@ -333,25 +333,23 @@ impl Transaction {
         fragments: &[Fragment],
         user_requested: Option<LanceFileVersion>,
     ) -> Result<DataStorageFormat> {
-        // If no files use user-requested or default
-        if fragments.is_empty() {
-            return Ok(user_requested
-                .map(DataStorageFormat::new)
-                .unwrap_or_default());
-        }
-        // Otherwise we need to check the actual file versions
-        let file_version = Fragment::try_infer_version(fragments)?;
-
-        // Ensure user-requested matches data files
-        if let Some(user_requested) = user_requested {
-            if user_requested != file_version {
-                return Err(Error::invalid_input(
+        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
+            // Ensure user-requested matches data files
+            if let Some(user_requested) = user_requested {
+                if user_requested != file_version {
+                    return Err(Error::invalid_input(
                     format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
                     location!(),
                 ));
+                }
             }
+            Ok(DataStorageFormat::new(file_version))
+        } else {
+            // If no files use user-requested or default
+            Ok(user_requested
+                .map(DataStorageFormat::new)
+                .unwrap_or_default())
         }
-        Ok(DataStorageFormat::new(file_version))
     }
 
     pub(crate) async fn restore_old_manifest(

@@ -109,8 +109,16 @@ impl IndexReader for FileReader {
             .await
     }
 
-    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
-        self.read_range(range, self.schema()).await
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let projection = match projection {
+            Some(projection) => self.schema().project(projection)?,
+            None => self.schema().clone(),
+        };
+        self.read_range(range, &projection).await
     }
 
     async fn num_batches(&self) -> u32 {
@@ -132,12 +140,30 @@ impl IndexReader for v2::reader::FileReader {
         unimplemented!("v2 format has no concept of row groups")
     }
 
-    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let projected_schema = match projection {
+            Some(projection) => Arc::new(self.schema().project(projection)?),
+            None => self.schema().clone(),
+        };
+        let column_indices = projected_schema
+            .fields
+            .iter()
+            .map(|f| f.id as u32)
+            .collect();
+        let projection = v2::reader::ReaderProjection {
+            schema: projected_schema,
+            column_indices,
+        };
         let batches = self
-            .read_stream(
+            .read_stream_projected(
                 ReadBatchParams::Range(range),
                 u32::MAX,
                 u32::MAX,
+                &projection,
                 FilterExpression::no_filter(),
             )?
             .try_collect::<Vec<_>>()
@@ -241,7 +267,7 @@ impl IndexStore for LanceIndexStore {
 
             for offset in (0..reader.num_rows()).step_by(4096) {
                 let next_offset = min(offset + 4096, reader.num_rows());
-                let batch = reader.read_range(offset..next_offset).await?;
+                let batch = reader.read_range(offset..next_offset, None).await?;
                 writer.write_record_batch(batch).await?;
             }
             writer.finish().await?;

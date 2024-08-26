@@ -214,7 +214,7 @@ impl ScalarIndex for BitmapIndex {
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let serialized_lookup = page_lookup_file
-            .read_range(0..page_lookup_file.num_rows())
+            .read_range(0..page_lookup_file.num_rows(), None)
             .await?;
 
         Ok(Arc::new(Self::try_from_serialized(

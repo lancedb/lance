@@ -738,12 +738,24 @@ async fn rechunk_stable_row_ids(
             let deletions = read_deletion_file(&dataset.base, frag, dataset.object_store()).await?;
             if let Some(deletions) = deletions {
                 let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.into_iter().map(|x| x as usize))?;
+                new_seq.mask(deletions.into_iter())?;
                 *seq = Arc::new(new_seq);
             }
             Ok::<(), crate::Error>(())
         })
         .await?;
+
+    debug_assert_eq!(
+        { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
+        {
+            new_fragments
+                .iter()
+                .map(|frag| frag.physical_rows.unwrap() as u64)
+                .sum::<u64>()
+        },
+        "{:?}",
+        old_sequences
+    );
 
     let new_sequences = lance_table::rowids::rechunk_sequences(
         old_sequences

@@ -924,7 +924,7 @@ impl DecodeBatchScheduler {
         // If specified, this will be used as the top_level_row for all scheduling
         // tasks.  This is used by list scheduling to ensure all items scheduling
         // tasks are scheduled at the same top level row.
-        top_level_row_override: Option<u64>,
+        priority: Option<Box<dyn PriorityRange>>,
     ) {
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         trace!(
@@ -933,8 +933,9 @@ impl DecodeBatchScheduler {
             ranges.first().unwrap().start,
             ranges.last().unwrap().end,
             rows_requested,
-            top_level_row_override
-                .map(|o| format!(" (top_level_row_override={})", o))
+            priority
+                .as_ref()
+                .map(|p| format!(" (priority={:?})", p))
                 .unwrap_or_default()
         );
 
@@ -947,15 +948,16 @@ impl DecodeBatchScheduler {
         let mut root_job = maybe_root_job.unwrap();
         let mut num_rows_scheduled = 0;
         let mut rows_to_schedule = root_job.num_rows();
+        let mut priority = priority.unwrap_or(Box::new(SimplePriorityRange::new(0)));
         trace!("Scheduled ranges refined to {} rows", rows_to_schedule);
         while rows_to_schedule > 0 {
-            let top_level_row = top_level_row_override.unwrap_or(num_rows_scheduled);
-            let maybe_next_scan_line = root_job.schedule_next(&mut context, top_level_row);
+            let maybe_next_scan_line = root_job.schedule_next(&mut context, priority.as_ref());
             if let Err(schedule_next_err) = maybe_next_scan_line {
                 schedule_action(Err(schedule_next_err));
                 return;
             }
             let next_scan_line = maybe_next_scan_line.unwrap();
+            priority.advance(next_scan_line.rows_scheduled);
             num_rows_scheduled += next_scan_line.rows_scheduled;
             rows_to_schedule -= next_scan_line.rows_scheduled;
             trace!(
@@ -982,7 +984,7 @@ impl DecodeBatchScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
         io: Arc<dyn EncodingsIo>,
-        top_level_row_override: Option<u64>,
+        priority: Option<Box<dyn PriorityRange>>,
     ) -> Result<Vec<DecoderMessage>> {
         let mut decode_messages = Vec::new();
         self.do_schedule_ranges(
@@ -993,7 +995,7 @@ impl DecodeBatchScheduler {
                 decode_messages.push(msg);
                 true
             },
-            top_level_row_override,
+            priority,
         );
         decode_messages.into_iter().collect::<Result<Vec<_>>>()
     }
@@ -1208,9 +1210,10 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        let loaded_need = self.rows_drained + to_take;
+        // wait_for_loaded waits for *>* loaded_need (not >=) so we do a -1 here
+        let loaded_need = self.rows_drained + to_take - 1;
         trace!(
-            "Waiting for I/O (desire at least {} loaded rows)",
+            "Waiting for I/O (desire at least {} fully loaded rows)",
             loaded_need
         );
         self.root_decoder.wait_for_loaded(loaded_need).await?;
@@ -1233,7 +1236,7 @@ impl BatchDecodeStream {
                 if size_bytes > BATCH_SIZE_BYTES_WARNING {
                     emitted_batch_size_warning.call_once(|| {
                         let size_mb = size_bytes / 1024 / 1024;
-                        warn!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+                        debug!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
                     });
                 }
                 Ok(batch)
@@ -1349,6 +1352,113 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>;
 }
 
+/// A trait to control the priority of I/O
+pub trait PriorityRange: std::fmt::Debug + Send + Sync {
+    fn advance(&mut self, num_rows: u64);
+    fn current_priority(&self) -> u64;
+    fn box_clone(&self) -> Box<dyn PriorityRange>;
+}
+
+/// A simple priority scheme for top-level fields with no parent
+/// repetition
+#[derive(Debug)]
+pub struct SimplePriorityRange {
+    priority: u64,
+}
+
+impl SimplePriorityRange {
+    fn new(priority: u64) -> Self {
+        Self { priority }
+    }
+}
+
+impl PriorityRange for SimplePriorityRange {
+    fn advance(&mut self, num_rows: u64) {
+        self.priority += num_rows;
+    }
+
+    fn current_priority(&self) -> u64 {
+        self.priority
+    }
+
+    fn box_clone(&self) -> Box<dyn PriorityRange> {
+        Box::new(Self {
+            priority: self.priority,
+        })
+    }
+}
+
+/// Determining the priority of a list request is tricky.  We want
+/// the priority to be the top-level row.  So if we have a
+/// list<list<int>> and each outer list has 10 rows and each inner
+/// list has 5 rows then the priority of the 100th item is 1 because
+/// it is the 5th item in the 10th item of the *second* row.
+///
+/// This structure allows us to keep track of this complicated priority
+/// relationship.
+///
+/// There's a fair amount of bookkeeping involved here.
+///
+/// A better approach (using repetition levels) is coming in the future.
+pub struct ListPriorityRange {
+    base: Box<dyn PriorityRange>,
+    offsets: Arc<[u64]>,
+    cur_index_into_offsets: usize,
+    cur_position: u64,
+}
+
+impl ListPriorityRange {
+    pub(crate) fn new(base: Box<dyn PriorityRange>, offsets: Arc<[u64]>) -> Self {
+        Self {
+            base,
+            offsets,
+            cur_index_into_offsets: 0,
+            cur_position: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for ListPriorityRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListPriorityRange")
+            .field("base", &self.base)
+            .field("offsets.len()", &self.offsets.len())
+            .field("cur_index_into_offsets", &self.cur_index_into_offsets)
+            .field("cur_position", &self.cur_position)
+            .finish()
+    }
+}
+
+impl PriorityRange for ListPriorityRange {
+    fn advance(&mut self, num_rows: u64) {
+        // We've scheduled X items.  Now walk through the offsets to
+        // determine how many rows we've scheduled.
+        self.cur_position += num_rows;
+        let mut idx_into_offsets = self.cur_index_into_offsets;
+        while idx_into_offsets + 1 < self.offsets.len()
+            && self.offsets[idx_into_offsets + 1] <= self.cur_position
+        {
+            idx_into_offsets += 1;
+        }
+        let base_rows_advanced = idx_into_offsets - self.cur_index_into_offsets;
+        self.cur_index_into_offsets = idx_into_offsets;
+        self.base.advance(base_rows_advanced as u64);
+    }
+
+    fn current_priority(&self) -> u64 {
+        self.base.current_priority()
+    }
+
+    fn box_clone(&self) -> Box<dyn PriorityRange> {
+        Box::new(Self {
+            base: self.base.box_clone(),
+            offsets: self.offsets.clone(),
+            cur_index_into_offsets: self.cur_index_into_offsets,
+            cur_position: self.cur_position,
+        })
+    }
+}
+
 /// Contains the context for a scheduler
 pub struct SchedulerContext {
     recv: Option<mpsc::UnboundedReceiver<DecoderMessage>>,
@@ -1427,7 +1537,7 @@ pub trait SchedulingJob: std::fmt::Debug {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine>;
 
     fn num_rows(&self) -> u64;
@@ -1569,7 +1679,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
         })
     }
     /// Waits until at least `num_rows` have been loaded
-    fn wait_for_loaded(&mut self, num_rows: u64) -> BoxFuture<Result<()>>;
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>>;
     /// The number of rows loaded so far
     fn rows_loaded(&self) -> u64;
     /// The number of rows that still need loading
