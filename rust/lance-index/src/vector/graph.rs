@@ -358,7 +358,7 @@ pub fn greedy_search(
         let mut next = None;
 
         let process_neighbor = |neighbor: u32| {
-            let dist = dist_calc.distance(neighbor).into();
+            let dist = dist_calc.distance(neighbor);
             if dist < closest_dist {
                 closest_dist = dist;
                 next = Some(neighbor);
