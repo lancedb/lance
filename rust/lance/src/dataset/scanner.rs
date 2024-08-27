@@ -65,7 +65,7 @@ use crate::{Error, Result};
 use snafu::{location, Location};
 
 #[cfg(feature = "substrait")]
-use lance_datafusion::expr::parse_substrait;
+use lance_datafusion::substrait::parse_substrait;
 
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
