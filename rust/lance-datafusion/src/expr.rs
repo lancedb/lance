@@ -521,7 +521,7 @@ fn remove_extension_types(
 
 #[cfg(feature = "substrait")]
 fn remove_type_extensions(
-    declarations: &Vec<SimpleExtensionDeclaration>,
+    declarations: &[SimpleExtensionDeclaration],
 ) -> Vec<SimpleExtensionDeclaration> {
     declarations
         .iter()
