@@ -26,6 +26,7 @@ from ..sampler import (
     ShardedFragmentSampler,
     maybe_sample,
 )
+from .dist import get_global_rank, get_global_world_size
 
 __all__ = ["LanceDataset"]
 
@@ -254,13 +255,8 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 rank = self.rank
                 world_size = self.world_size
             else:
-                worker_info = torch.utils.data.get_worker_info()
-                if worker_info is not None:
-                    rank = worker_info.id
-                    world_size = worker_info.num_workers
-                else:
-                    rank = None
-                    world_size = None
+                rank = get_global_rank()
+                world_size = get_global_world_size()
             if self.shard_granularity is None:
                 if rank is not None and world_size is not None:
                     sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
