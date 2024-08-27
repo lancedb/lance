@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
-use arrow_buffer::bit_util;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
@@ -158,17 +157,14 @@ impl LanceStream {
         let project_schema = projection.clone();
         let io_parallelism = dataset.object_store.io_parallelism();
         let frag_parallelism = fragment_parallelism
-            .unwrap_or_else(|| {
-                // This is somewhat aggressive.  It assumes a single page per column.  If there are many pages per
-                // column then we probably don't need to read that many files.  It's a little tricky to get the right
-                // answer though and so we err on the side of speed over memory.  Users can tone down fragment_parallelism
-                // by hand if needed.
-                if projection.fields.is_empty() {
-                    io_parallelism
-                } else {
-                    bit_util::ceil(io_parallelism, projection.fields.len())
-                }
-            })
+            // Opening a fragment is pretty cheap so we can open a lot of them at once
+            // Scheduling a fragment is also pretty cheap
+            // The scheduler backpressure will control fragment priority and total data
+            //
+            // As a result, we don't really need to worry too much about fragment readahead.  We also want this
+            // to be pretty high.  While we are reading one set of fragments we should be scheduling the next set
+            // this should help ensure that we don't have breaks in I/O
+            .unwrap_or(io_parallelism * 2)
             // fragment_readhead=0 doesn't make sense so we just bump it to 1
             .max(1);
         debug!(
