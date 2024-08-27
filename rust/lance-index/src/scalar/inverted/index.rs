@@ -539,7 +539,7 @@ impl PostingListBuilder {
         Self {
             row_ids: Vec::new(),
             frequencies: Vec::new(),
-            positions: with_positions.then(|| Vec::new()),
+            positions: with_positions.then(Vec::new),
         }
     }
 
