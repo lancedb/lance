@@ -280,7 +280,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         let code = self
             .code
             .as_ref()

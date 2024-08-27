@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -48,6 +49,10 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
     fn index_vectors(storage: &impl VectorStore, params: Self::BuildParams) -> Result<Self>
+    where
+        Self: Sized;
+
+    fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self>
     where
         Self: Sized;
 
