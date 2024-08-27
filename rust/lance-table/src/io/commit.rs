@@ -57,8 +57,37 @@ use {
 
 use crate::format::{Index, Manifest};
 
-const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
+
+#[derive(Clone, Copy, Debug)]
+pub enum ManifestNamingScheme {
+    /// `_versions/{version}.manifest`
+    V1,
+    /// `_manifests/{99999999999999999999 - version}.manifest`
+    ///
+    /// Zero-padded and reversed for O(1) lookup of latest version on object stores.
+    V2,
+}
+
+impl ManifestNamingScheme {
+    pub fn manifests_dir(&self, base: &Path) -> Path {
+        match self {
+            Self::V1 => base.child("_versions"),
+            Self::V2 => base.child("_manifests"),
+        }
+    }
+
+    pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
+        let directory = self.manifests_dir(base);
+        match self {
+            Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
+            Self::V2 => {
+                let inverted_version = 99999_99999_99999_99999 - version;
+                directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
+            }
+        }
+    }
+}
 
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
@@ -67,12 +96,6 @@ pub type ManifestWriter = for<'a> fn(
     indices: Option<Vec<Index>>,
     path: &'a Path,
 ) -> BoxFuture<'a, Result<()>>;
-
-/// Get the manifest file path for a version.
-pub fn manifest_path(base: &Path, version: u64) -> Path {
-    base.child(VERSIONS_DIR)
-        .child(format!("{version}.{MANIFEST_EXTENSION}"))
-}
 
 #[derive(Debug)]
 pub struct ManifestLocation {
@@ -88,17 +111,21 @@ pub struct ManifestLocation {
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
+    scheme: ManifestNamingScheme,
 ) -> Result<ManifestLocation> {
     if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base) {
+        if let Ok(Some(location)) = current_manifest_local(base, scheme) {
             return Ok(location);
         }
     }
 
+    // TODO: Move to method of ManifestNamingScheme and dispatch to optimized
+    // method for V2.
+
     // We use `list_with_delimiter` to avoid listing the contents of child directories.
     let manifest_files = object_store
         .inner
-        .list_with_delimiter(Some(&base.child(VERSIONS_DIR)))
+        .list_with_delimiter(Some(&scheme.manifests_dir(base)))
         .await?;
 
     let current = manifest_files
@@ -131,7 +158,7 @@ async fn current_manifest_path(
         })
     } else {
         Err(Error::NotFound {
-            uri: manifest_path(base, 1).to_string(),
+            uri: scheme.manifest_path(base, 1).to_string(),
             location: location!(),
         })
     }
@@ -140,8 +167,11 @@ async fn current_manifest_path(
 // This is an optimized function that searches for the latest manifest. In
 // object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
-fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
-    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
+fn current_manifest_local(
+    base: &Path,
+    scheme: ManifestNamingScheme,
+) -> std::io::Result<Option<ManifestLocation>> {
+    let path = lance_io::local::to_local_path(&scheme.manifests_dir(base));
     let entries = std::fs::read_dir(path)?;
 
     let mut latest_entry: Option<(u64, DirEntry)> = None;
@@ -155,6 +185,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             // .tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d
             continue;
         }
+        // TODO: make parse_version a method on the file naming scheme.
         let Some(version) = filename
             .split_once('.')
             .and_then(|(version_str, _)| version_str.parse::<u64>().ok())
@@ -187,10 +218,10 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
 async fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
+    scheme: ManifestNamingScheme,
 ) -> Result<BoxStream<'a, Result<Path>>> {
-    let base_path = base_path.clone();
     Ok(object_store
-        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
+        .read_dir_all(&scheme.manifests_dir(base_path), None)
         .await?
         .try_filter_map(|obj_meta| {
             if obj_meta.location.extension() == Some(MANIFEST_EXTENSION) {
@@ -238,8 +269,9 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
-        Ok(current_manifest_path(object_store, base_path).await?)
+        Ok(current_manifest_path(object_store, base_path, scheme).await?)
     }
 
     /// Get the path to the latest version manifest of a dataset at the base_path
@@ -247,9 +279,12 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
         // TODO: we need to pade 0's to the version number on the manifest file path
-        Ok(current_manifest_path(object_store, base_path).await?.path)
+        Ok(current_manifest_path(object_store, base_path, scheme)
+            .await?
+            .path)
     }
 
     // for default implementation, parse the version from the path
@@ -257,8 +292,9 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> Result<u64> {
-        Ok(current_manifest_path(object_store, base_path)
+        Ok(current_manifest_path(object_store, base_path, scheme)
             .await?
             .version)
     }
@@ -269,8 +305,9 @@ pub trait CommitHandler: Debug + Send + Sync {
         base_path: &Path,
         version: u64,
         _object_store: &dyn OSObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
-        Ok(manifest_path(base_path, version))
+        Ok(scheme.manifest_path(base_path, version))
     }
 
     /// List manifests that are available for a dataset at the base_path
@@ -278,8 +315,9 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &'a dyn OSObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> Result<BoxStream<'a, Result<Path>>> {
-        list_manifests(base_path, object_store).await
+        list_manifests(base_path, object_store, scheme).await
     }
 
     /// Commit a manifest.
