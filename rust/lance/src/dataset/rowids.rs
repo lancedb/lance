@@ -413,6 +413,7 @@ mod test {
         let write_params = WriteParams {
             enable_stable_row_ids: true,
             max_rows_per_file: 2_500,
+            max_rows_per_group: 500,
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, "memory://", Some(write_params))
