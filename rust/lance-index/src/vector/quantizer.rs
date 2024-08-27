@@ -3,6 +3,7 @@
 
 use core::fmt;
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, FixedSizeListArray};
@@ -50,16 +51,16 @@ pub enum QuantizationType {
     Scalar,
 }
 
-impl TryFrom<&str> for QuantizationType {
-    type Error = Error;
+impl FromStr for QuantizationType {
+    type Err = Error;
 
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
             "FLAT" => Ok(Self::Flat),
             "PQ" => Ok(Self::Product),
             "SQ" => Ok(Self::Scalar),
             _ => Err(Error::Index {
-                message: format!("Unknown quantization type: {}", value),
+                message: format!("Unknown quantization type: {}", s),
                 location: location!(),
             }),
         }

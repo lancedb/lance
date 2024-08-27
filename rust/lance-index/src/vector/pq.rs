@@ -350,7 +350,7 @@ impl Quantization for ProductQuantizer {
     }
 
     fn use_residual(distance_type: DistanceType) -> bool {
-        <PQBuildParams as QuantizerBuildParams>::use_residual(distance_type)
+        PQBuildParams::use_residual(distance_type)
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {

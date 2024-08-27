@@ -551,10 +551,14 @@ impl PQDistCalculator {
         query: &[T],
         distance_type: DistanceType,
     ) -> Self {
-        let distance_table = if matches!(distance_type, DistanceType::Cosine | DistanceType::L2) {
-            build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
-        } else {
-            build_distance_table_dot(codebook, num_bits, num_sub_vectors, query)
+        let distance_table = match distance_type {
+            DistanceType::L2 | DistanceType::Cosine => {
+                build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
+            }
+            DistanceType::Dot => {
+                build_distance_table_dot(codebook, num_bits, num_sub_vectors, query)
+            }
+            _ => unimplemented!("DistanceType is not supported: {:?}", distance_type),
         };
         Self {
             distance_table,
