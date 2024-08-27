@@ -17,14 +17,12 @@ use lance_linalg::{
 use tracing::instrument;
 
 use crate::vector::ivf::transform::PartitionTransformer;
-use crate::vector::{
-    pq::{transform::PQTransformer, ProductQuantizer},
-    residual::ResidualTransform,
-    transform::Transformer,
-};
+use crate::vector::{pq::ProductQuantizer, residual::ResidualTransform, transform::Transformer};
 
+use super::pq::transform::PQTransformer;
+use super::quantizer::Quantization;
 use super::{quantizer::Quantizer, residual::compute_residual};
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -68,6 +66,7 @@ pub fn new_ivf_transformer_with_quantizer(
             vector_column,
             pq,
             range,
+            false,
         )),
         Quantizer::Scalar(_) => Ok(IvfTransformer::with_sq(
             centroids,
@@ -153,6 +152,7 @@ impl IvfTransformer {
         vector_column: &str,
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
+        with_pq_code: bool, // Pass true for v1 index format, otherwise false.
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
@@ -179,24 +179,20 @@ impl IvfTransformer {
             )));
         }
 
-        if pq.use_residual() {
+        if ProductQuantizer::use_residual(distance_type) {
             transforms.push(Arc::new(ResidualTransform::new(
                 centroids.clone(),
                 PART_ID_COLUMN,
                 vector_column,
             )));
-            transforms.push(Arc::new(PQTransformer::new(
-                pq.clone(),
-                RESIDUAL_COLUMN,
-                PQ_CODE_COLUMN,
-            )));
-        } else {
+        }
+        if with_pq_code {
             transforms.push(Arc::new(PQTransformer::new(
                 pq.clone(),
                 vector_column,
                 PQ_CODE_COLUMN,
             )));
-        };
+        }
         Self {
             centroids,
             distance_type,

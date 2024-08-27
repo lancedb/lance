@@ -29,7 +29,9 @@ pub(crate) mod utils;
 
 use self::distance::{build_distance_table_l2, compute_l2_distance};
 pub use self::utils::num_centroids;
-use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};
+use super::quantizer::{
+    Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
+};
 use super::{pb, PQ_CODE_COLUMN};
 pub use builder::PQBuildParams;
 use utils::get_sub_vector_centroids;
@@ -89,10 +91,6 @@ impl ProductQuantizer {
             codebook,
             distance_type,
         })
-    }
-
-    pub fn use_residual(&self) -> bool {
-        matches!(self.distance_type, DistanceType::L2 | DistanceType::Cosine)
     }
 
     #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
@@ -316,8 +314,31 @@ impl Quantization for ProductQuantizer {
     type Metadata = ProductQuantizationMetadata;
     type Storage = ProductQuantizationStorage;
 
-    fn build(_: &dyn Array, _: DistanceType, _: &Self::BuildParams) -> Result<Self> {
-        unimplemented!("ProductQuantizer cannot be built with new index builder")
+    fn build(
+        data: &dyn Array,
+        distance_type: DistanceType,
+        params: &Self::BuildParams,
+    ) -> Result<Self> {
+        assert_eq!(data.null_count(), 0);
+        let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
+            message: format!(
+                "PQ builder: input is not a FixedSizeList: {}",
+                data.data_type()
+            ),
+            location: location!(),
+        })?;
+
+        if let Some(codebook) = params.codebook.as_ref() {
+            return Ok(Self::new(
+                params.num_sub_vectors,
+                params.num_bits as u32,
+                fsl.value_length() as usize,
+                FixedSizeListArray::try_new_from_values(codebook.clone(), fsl.value_length())?,
+                distance_type,
+            ));
+        }
+
+        params.build(data, distance_type)
     }
 
     fn code_dim(&self) -> usize {
@@ -326,6 +347,10 @@ impl Quantization for ProductQuantizer {
 
     fn column(&self) -> &'static str {
         PQ_CODE_COLUMN
+    }
+
+    fn use_residual(distance_type: DistanceType) -> bool {
+        PQBuildParams::use_residual(distance_type)
     }
 
     fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
@@ -377,11 +402,18 @@ impl Quantization for ProductQuantizer {
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        let codebook = match metadata.codebook.as_ref() {
+            Some(fsl) => fsl.clone(),
+            None => {
+                let tensor = pb::Tensor::decode(metadata.codebook_tensor.as_ref())?;
+                FixedSizeListArray::try_from(&tensor)?
+            }
+        };
         Ok(Quantizer::Product(Self::new(
             metadata.num_sub_vectors,
             metadata.num_bits,
             metadata.dimension,
-            metadata.codebook.as_ref().unwrap().clone(),
+            codebook,
             distance_type,
         )))
     }
@@ -399,6 +431,19 @@ impl TryFrom<&ProductQuantizer> for pb::Pq {
             codebook: vec![],
             codebook_tensor: Some(tensor),
         })
+    }
+}
+
+impl TryFrom<Quantizer> for ProductQuantizer {
+    type Error = Error;
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::Product(pq) => Ok(pq),
+            _ => Err(Error::Index {
+                message: "Expect to be a ProductQuantizer".to_string(),
+                location: location!(),
+            }),
+        }
     }
 }
 

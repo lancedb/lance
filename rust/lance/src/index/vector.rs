@@ -219,17 +219,17 @@ pub(crate) async fn build_vector_index(
         });
     };
 
+    let StageParams::Ivf(ivf_params) = &stages[0] else {
+        return Err(Error::Index {
+            message: format!("Build Vector Index: invalid stages: {:?}", stages),
+            location: location!(),
+        });
+    };
+
     let temp_dir = tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+    let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
-        let StageParams::Ivf(ivf_params) = &stages[0] else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
-
-        let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
         IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
             dataset.clone(),
             column.to_owned(),
@@ -245,12 +245,6 @@ pub(crate) async fn build_vector_index(
     } else if is_ivf_pq(stages) {
         // This is a IVF PQ index.
         let len = stages.len();
-        let StageParams::Ivf(ivf_params) = &stages[len - 2] else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
@@ -267,15 +261,9 @@ pub(crate) async fn build_vector_index(
             ivf_params,
             pq_params,
         )
-        .await?
+        .await?;
     } else if is_ivf_hnsw(stages) {
         let len = stages.len();
-        let StageParams::Ivf(ivf_params) = &stages[0] else {
-            return Err(Error::Index {
-                message: format!("Build Vector Index: invalid stages: {:?}", stages),
-                location: location!(),
-            });
-        };
         let StageParams::Hnsw(hnsw_params) = &stages[1] else {
             return Err(Error::Index {
                 message: format!("Build Vector Index: invalid stages: {:?}", stages),
@@ -283,22 +271,22 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
         // with quantization
         if len > 2 {
             match stages.last().unwrap() {
                 StageParams::PQ(pq_params) => {
-                    build_ivf_hnsw_pq_index(
-                        dataset,
-                        column,
-                        name,
-                        uuid,
+                    IvfIndexBuilder::<HNSW, ProductQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
                         params.metric_type,
-                        ivf_params,
-                        hnsw_params,
-                        pq_params,
-                    )
-                    .await?
+                        Box::new(shuffler),
+                        Some(ivf_params.clone()),
+                        Some(pq_params.clone()),
+                        hnsw_params.clone(),
+                    )?
+                    .build()
+                    .await?;
                 }
                 StageParams::SQ(sq_params) => {
                     IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(

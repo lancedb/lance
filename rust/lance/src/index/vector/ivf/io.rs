@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(ds.get_fragments().len(), 2);
 
         let idx = ds
-            .open_vector_index(&indices[0].name, &indices[0].uuid.to_string())
+            .open_vector_index("vector", &indices[0].uuid.to_string())
             .await
             .unwrap();
         let _ivf_idx = idx
