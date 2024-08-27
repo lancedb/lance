@@ -19,7 +19,7 @@ use lance_index::scalar::expression::{
     IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ScalarIndex;
+use lance_index::scalar::{InvertedIndexParams, ScalarIndex};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
@@ -41,6 +41,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
+use scalar::build_inverted_index;
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -239,6 +240,18 @@ impl DatasetIndexExt for Dataset {
                         location: location!(),
                     })?;
                 build_scalar_index(self, column, &index_id.to_string(), params).await?;
+            }
+            (IndexType::Inverted, _) => {
+                // Inverted index params.
+                let inverted_params = params
+                    .as_any()
+                    .downcast_ref::<InvertedIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
+                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.

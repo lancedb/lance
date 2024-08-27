@@ -163,11 +163,11 @@ impl InvertedIndex {
         let tokens = self.tokens.clone();
         let invert_list = InvertedList::load(self.inverted_list.reader.clone()).await?;
         let docs = self.docs.clone();
-        Ok(InvertedIndexBuilder {
+        Ok(InvertedIndexBuilder::from_existing_index(
             tokens,
             invert_list,
             docs,
-        })
+        ))
     }
 }
 
@@ -352,6 +352,7 @@ impl std::fmt::Debug for InvertedListReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InvertedListReader")
             .field("offsets", &self.offsets)
+            .field("max_scores", &self.max_scores)
             .finish()
     }
 }
@@ -525,22 +526,20 @@ pub struct PostingListBuilder {
     pub positions: Option<Vec<Vec<i32>>>,
 }
 
-impl Default for PostingListBuilder {
-    fn default() -> Self {
-        Self {
-            row_ids: Vec::new(),
-            frequencies: Vec::new(),
-            positions: Some(Vec::new()),
-        }
-    }
-}
-
 impl PostingListBuilder {
     pub fn new(row_ids: Vec<u64>, frequencies: Vec<f32>, positions: Option<Vec<Vec<i32>>>) -> Self {
         Self {
             row_ids,
             frequencies,
             positions,
+        }
+    }
+
+    pub fn empty(with_positions: bool) -> Self {
+        Self {
+            row_ids: Vec::new(),
+            frequencies: Vec::new(),
+            positions: with_positions.then(|| Vec::new()),
         }
     }
 

@@ -41,6 +41,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::datatypes::Schema;
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
@@ -1067,27 +1068,33 @@ impl Dataset {
         };
 
         log::info!("Creating index: type={}", index_type);
-        let params: Box<dyn IndexParams> = if index_type == "BTREE" {
-            Box::<ScalarIndexParams>::default()
-        } else if index_type == "BITMAP" {
-            Box::new(ScalarIndexParams {
+        let params: Box<dyn IndexParams> = match index_type.as_str() {
+            "BTREE" => Box::<ScalarIndexParams>::default(),
+            "BITMAP" => Box::new(ScalarIndexParams {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
-            })
-        } else if index_type == "LABEL_LIST" {
-            Box::new(ScalarIndexParams {
+            }),
+            "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
-            })
-        } else if index_type == "INVERTED" {
-            Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::Inverted),
-            })
-        } else {
-            let column_type = match self.ds.schema().field(columns[0]) {
-                Some(f) => f.data_type().clone(),
-                None => return Err(PyValueError::new_err("Column not found in dataset schema.")),
-            };
-            prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
+            }),
+            "INVERTED" => {
+                let mut params = InvertedIndexParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(with_positions) = kwargs.get_item("with_positions")? {
+                        params.with_positions = with_positions.extract()?;
+                    }
+                }
+                Box::new(params)
+            }
+            _ => {
+                let column_type = match self.ds.schema().field(columns[0]) {
+                    Some(f) => f.data_type().clone(),
+                    None => {
+                        return Err(PyValueError::new_err("Column not found in dataset schema."))
+                    }
+                };
+                prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
+            }
         };
 
         let replace = replace.unwrap_or(true);

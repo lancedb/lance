@@ -1208,6 +1208,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        **kwargs,
     ):
         """Create a scalar index on a column.
 
@@ -1279,6 +1280,15 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+
+        Optional Parameters
+        -------------------
+        with_positions: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will store the
+            positions of the words in the document, so that you can conduct phrase
+            query. This will significantly increase the index size.
+            It won't impact the performance of non-phrase queries even if it is set to
+            True.
 
         Examples
         --------
@@ -1364,7 +1374,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} cannot currently be a duration"
             )
 
-        self._ds.create_index([column], index_type, name, replace)
+        self._ds.create_index([column], index_type, name, replace, None, kwargs)
 
     def create_index(
         self,

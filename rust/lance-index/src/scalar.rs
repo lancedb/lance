@@ -91,6 +91,36 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct InvertedIndexParams {
+    // Set it to true if you need to perform phrase query,
+    // this could significantly increase the index size,
+    // non-phrase query performance won't be impacted
+    // even the index was built with positions.
+    pub with_positions: bool,
+}
+
+impl InvertedIndexParams {
+    pub fn with_positions(mut self, with_positions: bool) -> Self {
+        self.with_positions = with_positions;
+        self
+    }
+}
+
+impl IndexParams for InvertedIndexParams {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Inverted
+    }
+
+    fn index_name(&self) -> &str {
+        "INVERTED"
+    }
+}
+
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
 pub trait IndexWriter: Send {
