@@ -741,7 +741,7 @@ pub(crate) mod tests {
                 DataType::Int32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-10, -20),
+                        Uniform::new(-5, -1),
                     ),
                 ),
             ),
