@@ -380,14 +380,14 @@ impl DataBlock {
     ///
     /// This is a zero-copy operation but requires a mutable reference to self and, afterwards,
     /// all buffers will be in Borrowed mode.
-    pub fn borrow_and_clone(&mut self) -> DataBlock {
+    pub fn borrow_and_clone(&mut self) -> Self {
         match self {
-            Self::AllNull(inner) => DataBlock::AllNull(inner.borrow_and_clone()),
-            Self::Nullable(inner) => DataBlock::Nullable(inner.borrow_and_clone()),
-            Self::FixedWidth(inner) => DataBlock::FixedWidth(inner.borrow_and_clone()),
-            Self::VariableWidth(inner) => DataBlock::VariableWidth(inner.borrow_and_clone()),
-            Self::Struct(inner) => DataBlock::Struct(inner.borrow_and_clone()),
-            Self::Dictionary(inner) => DataBlock::Dictionary(inner.borrow_and_clone()),
+            Self::AllNull(inner) => Self::AllNull(inner.borrow_and_clone()),
+            Self::Nullable(inner) => Self::Nullable(inner.borrow_and_clone()),
+            Self::FixedWidth(inner) => Self::FixedWidth(inner.borrow_and_clone()),
+            Self::VariableWidth(inner) => Self::VariableWidth(inner.borrow_and_clone()),
+            Self::Struct(inner) => Self::Struct(inner.borrow_and_clone()),
+            Self::Dictionary(inner) => Self::Dictionary(inner.borrow_and_clone()),
         }
     }
 
@@ -395,14 +395,14 @@ impl DataBlock {
     ///
     /// This will fail if any buffers are in owned mode.  You can call borrow_and_clone() to
     /// ensure that all buffers are in borrowed mode before calling this method.
-    pub fn try_clone(&self) -> Result<DataBlock> {
+    pub fn try_clone(&self) -> Result<Self> {
         match self {
-            Self::AllNull(inner) => Ok(DataBlock::AllNull(inner.try_clone()?)),
-            Self::Nullable(inner) => Ok(DataBlock::Nullable(inner.try_clone()?)),
-            Self::FixedWidth(inner) => Ok(DataBlock::FixedWidth(inner.try_clone()?)),
-            Self::VariableWidth(inner) => Ok(DataBlock::VariableWidth(inner.try_clone()?)),
-            Self::Struct(inner) => Ok(DataBlock::Struct(inner.try_clone()?)),
-            Self::Dictionary(inner) => Ok(DataBlock::Dictionary(inner.try_clone()?)),
+            Self::AllNull(inner) => Ok(Self::AllNull(inner.try_clone()?)),
+            Self::Nullable(inner) => Ok(Self::Nullable(inner.try_clone()?)),
+            Self::FixedWidth(inner) => Ok(Self::FixedWidth(inner.try_clone()?)),
+            Self::VariableWidth(inner) => Ok(Self::VariableWidth(inner.try_clone()?)),
+            Self::Struct(inner) => Ok(Self::Struct(inner.try_clone()?)),
+            Self::Dictionary(inner) => Ok(Self::Dictionary(inner.try_clone()?)),
         }
     }
 
@@ -691,8 +691,7 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
         // Need to make a copy here since indices isn't mutable, could be avoided in theory
         let mut indices_bytes = indices.to_data().buffers()[0].to_vec();
         for invalid_idx in (!validity.inner()).set_indices() {
-            indices_bytes[invalid_idx as usize * bytes_per_index
-                ..(invalid_idx + 1) as usize * bytes_per_index]
+            indices_bytes[invalid_idx * bytes_per_index..(invalid_idx + 1) * bytes_per_index]
                 .copy_from_slice(null_index_bytes.as_slice());
         }
         FixedWidthDataBlock {
@@ -716,15 +715,15 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
 }
 
 enum Nullability {
-    NoNulls,
-    AllNulls,
-    SomeNulls(NullBuffer),
+    None,
+    All,
+    Some(NullBuffer),
 }
 
 impl Nullability {
     fn to_option(&self) -> Option<NullBuffer> {
         match self {
-            Nullability::SomeNulls(nulls) => Some(nulls.clone()),
+            Self::Some(nulls) => Some(nulls.clone()),
             _ => None,
         }
     }
@@ -741,7 +740,7 @@ fn extract_nulls(arrays: &[ArrayRef], num_values: u64) -> Nullability {
         })
         .collect::<Vec<_>>();
     if !has_nulls {
-        return Nullability::NoNulls;
+        return Nullability::None;
     }
     let mut builder = BooleanBufferBuilder::new(num_values as usize);
     let mut num_nulls = 0;
@@ -754,9 +753,9 @@ fn extract_nulls(arrays: &[ArrayRef], num_values: u64) -> Nullability {
         }
     }
     if num_nulls == num_values as usize {
-        Nullability::AllNulls
+        Nullability::All
     } else {
-        Nullability::SomeNulls(NullBuffer::new(builder.finish()))
+        Nullability::Some(NullBuffer::new(builder.finish()))
     }
 }
 
@@ -769,7 +768,7 @@ impl DataBlock {
         let data_type = arrays[0].data_type();
         let nulls = extract_nulls(arrays, num_values);
 
-        if let Nullability::AllNulls = nulls {
+        if let Nullability::All = nulls {
             return Self::AllNull(AllNullDataBlock { num_values });
         }
 
@@ -862,8 +861,8 @@ impl DataBlock {
         };
         if !matches!(data_type, DataType::Dictionary(_, _)) {
             match nulls {
-                Nullability::NoNulls => encoded,
-                Nullability::SomeNulls(nulls) => DataBlock::Nullable(NullableDataBlock {
+                Nullability::None => encoded,
+                Nullability::Some(nulls) => Self::Nullable(NullableDataBlock {
                     data: Box::new(encoded),
                     nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
                 }),
@@ -914,7 +913,7 @@ mod tests {
             .map(|arr| Arc::new(arr.clone()) as ArrayRef)
             .collect::<Vec<_>>();
 
-        let block = DataBlock::from_arrays(&arrays, 7);
+        let block = DataBlock::from_arrays(arrays, 7);
 
         assert_eq!(block.num_values(), 7);
         let block = block.as_nullable().unwrap();
@@ -938,7 +937,7 @@ mod tests {
             .map(|arr| Arc::new(arr.clone()) as ArrayRef)
             .collect::<Vec<_>>();
 
-        let block = DataBlock::from_arrays(&arrays, 3);
+        let block = DataBlock::from_arrays(arrays, 3);
 
         assert_eq!(block.num_values(), 3);
         // Should be no nullable wrapper
