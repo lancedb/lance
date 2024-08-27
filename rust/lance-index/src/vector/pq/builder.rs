@@ -11,6 +11,7 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};

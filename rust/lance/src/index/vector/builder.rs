@@ -8,6 +8,7 @@ use arrow_array::{RecordBatch, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
@@ -250,7 +251,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         let stream = self
             .dataset
             .scan()
-            .batch_readahead(num_cpus::get() * 2)
+            .batch_readahead(get_num_compute_intensive_cpus())
             .project(&[self.column.as_str()])?
             .with_row_id()
             .try_into_stream()
@@ -294,7 +295,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 let ivf_transformer = transformer.clone();
                 tokio::spawn(async move { ivf_transformer.transform(&batch?) })
             })
-            .buffered(num_cpus::get())
+            .buffered(get_num_compute_intensive_cpus())
             .map(|x| x.unwrap())
             .peekable(),
         );

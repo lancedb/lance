@@ -338,6 +338,8 @@ systems and cloud object stores, with the notable except of AWS S3. For ones
 that lack this functionality, an external locking mechanism can be configured
 by the user.
 
+.. _conflict_resolution:
+
 Conflict resolution
 ~~~~~~~~~~~~~~~~~~~
 

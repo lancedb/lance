@@ -13,7 +13,7 @@ use object_store::{path::Path, ObjectStore};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
-use crate::traits::Reader;
+use crate::{object_store::DEFAULT_CLOUD_IO_PARALLELISM, traits::Reader};
 
 /// Object Reader
 ///
@@ -83,6 +83,10 @@ impl Reader for CloudObjectReader {
 
     fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    fn io_parallelism(&self) -> usize {
+        DEFAULT_CLOUD_IO_PARALLELISM
     }
 
     /// Object/File Size.

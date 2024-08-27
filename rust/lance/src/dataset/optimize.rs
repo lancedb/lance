@@ -85,8 +85,10 @@ use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::DatasetIndexExt;
 use lance_table::io::deletion::read_deletion_file;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -137,8 +139,10 @@ pub struct CompactionOptions {
     /// lower) will materialize deletions for all fragments with deletions.
     /// Setting above 1.0 will never materialize deletions.
     pub materialize_deletions_threshold: f32,
-    /// The number of threads to use. Defaults to the number of cores.
-    pub num_threads: usize,
+    /// The number of threads to use (how many compaction tasks to run in parallel).
+    /// Defaults to the number of compute-intensive CPUs.  Not used when running
+    /// tasks manually using [`plan_compaction`]
+    pub num_threads: Option<usize>,
     /// The batch size to use when scanning the input fragments.  If not
     /// specified then the default (see
     /// [`crate::dataset::Scanner::batch_size`]) will be used.
@@ -153,7 +157,7 @@ impl Default for CompactionOptions {
             max_rows_per_group: 1024,
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
-            num_threads: num_cpus::get(),
+            num_threads: None,
             max_bytes_per_file: None,
             batch_size: None,
         }
@@ -220,7 +224,11 @@ pub async fn compact_files(
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
-        .buffer_unordered(options.num_threads);
+        .buffer_unordered(
+            options
+                .num_threads
+                .unwrap_or_else(get_num_compute_intensive_cpus),
+        );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
@@ -467,7 +475,7 @@ pub async fn plan_compaction(
                 Err(e) => Err(e),
             }
         })
-        .buffered(num_cpus::get() * 2);
+        .buffered(dataset.object_store().io_parallelism());
 
     let index_fragmaps = load_index_fragmaps(dataset).await?;
     let indices_containing_frag = |frag_id: u32| {
@@ -640,12 +648,24 @@ async fn rewrite_files(
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
     let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
+    let num_rows = fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap() as u64)
+        .sum::<u64>();
     // If we aren't using move-stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
     let mut scanner = dataset.scan();
     if let Some(batch_size) = options.batch_size {
         scanner.batch_size(batch_size);
     }
+    // Generate an ID for logging purposes
+    let task_id = uuid::Uuid::new_v4();
+    log::info!(
+        "Compaction task {}: Begin compacting {} rows across {} fragments",
+        task_id,
+        num_rows,
+        fragments.len()
+    );
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
@@ -659,6 +679,19 @@ async fn rewrite_files(
         let data = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
         (None, data)
     };
+
+    let mut rows_read = 0;
+    let schema = reader.schema().clone();
+    let reader = reader.inspect_ok(move |batch| {
+        rows_read += batch.num_rows();
+        log::info!(
+            "Compaction task {}: Read progress {}/{}",
+            task_id,
+            rows_read,
+            num_rows,
+        );
+    });
+    let reader = Box::pin(RecordBatchStreamAdapter::new(schema, reader));
 
     let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
@@ -679,16 +712,23 @@ async fn rewrite_files(
     )
     .await?;
 
+    log::info!("Compaction task {}: file written", task_id);
+
     let row_id_map = if let Some(row_ids) = row_ids {
         let row_ids = Arc::try_unwrap(row_ids)
             .expect("Row ids lock still owned")
             .into_inner()
             .expect("Row ids mutex still locked");
 
+        log::info!(
+            "Compaction task {}: reserving fragment ids and transposing row ids",
+            task_id
+        );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         remapping::transpose_row_ids(row_ids, &fragments, &new_fragments)
     } else {
+        log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
 
         HashMap::new()
@@ -705,6 +745,8 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.files.len() + f.deletion_file.is_some() as usize)
         .sum();
+
+    log::info!("Compaction task {}: completed", task_id);
 
     Ok(RewriteResult {
         metrics,

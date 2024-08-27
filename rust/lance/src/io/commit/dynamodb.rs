@@ -46,7 +46,7 @@ mod test {
     use lance_table::io::commit::{
         dynamodb::DynamoDBExternalManifestStore,
         external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-        latest_manifest_path, manifest_path, CommitHandler,
+        manifest_path, CommitHandler,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
@@ -308,10 +308,6 @@ mod test {
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
         localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
-        localfs
-            .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
-            .await
-            .unwrap();
 
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs

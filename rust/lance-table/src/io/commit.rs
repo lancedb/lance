@@ -57,7 +57,6 @@ use {
 
 use crate::format::{Index, Manifest};
 
-const LATEST_MANIFEST_NAME: &str = "_latest.manifest";
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 
@@ -73,10 +72,6 @@ pub type ManifestWriter = for<'a> fn(
 pub fn manifest_path(base: &Path, version: u64) -> Path {
     base.child(VERSIONS_DIR)
         .child(format!("{version}.{MANIFEST_EXTENSION}"))
-}
-
-pub fn latest_manifest_path(base: &Path) -> Path {
-    base.child(LATEST_MANIFEST_NAME)
 }
 
 #[derive(Debug)]
@@ -224,21 +219,6 @@ fn make_staging_manifest_path(base: &Path) -> Result<Path> {
         source: Box::new(e),
         location: location!(),
     })
-}
-
-async fn write_latest_manifest(
-    from_path: &Path,
-    base_path: &Path,
-    object_store: &dyn OSObjectStore,
-) -> Result<()> {
-    let latest_path = latest_manifest_path(base_path);
-    let staging_path = make_staging_manifest_path(from_path)?;
-    object_store
-        .copy(from_path, &staging_path)
-        .await
-        .map_err(|err| CommitError::OtherError(err.into()))?;
-    object_store.rename(&staging_path, &latest_path).await?;
-    Ok(())
 }
 
 #[cfg(feature = "dynamodb")]
@@ -538,8 +518,6 @@ impl CommitHandler for UnsafeCommitHandler {
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
 
-        write_latest_manifest(&version_path, base_path, &object_store.inner).await?;
-
         Ok(())
     }
 }
@@ -613,8 +591,6 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         }
         let res = manifest_writer(object_store, manifest, indices, &path).await;
 
-        write_latest_manifest(&path, base_path, &object_store.inner).await?;
-
         // Release the lock
         lease.release(res.is_ok()).await?;
 
@@ -675,7 +651,7 @@ impl CommitHandler for RenameCommitHandler {
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
 
-        let res = match object_store
+        match object_store
             .inner
             .rename_if_not_exists(&tmp_path, &path)
             .await
@@ -692,11 +668,7 @@ impl CommitHandler for RenameCommitHandler {
                 // Something else went wrong
                 return Err(CommitError::OtherError(e.into()));
             }
-        };
-
-        write_latest_manifest(&path, base_path, &object_store.inner).await?;
-
-        res
+        }
     }
 }
 

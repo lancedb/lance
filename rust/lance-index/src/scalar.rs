@@ -133,6 +133,9 @@ pub trait IndexReader: Send + Sync {
 pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
 
+    /// Suggested I/O parallelism for the store
+    fn io_parallelism(&self) -> usize;
+
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
         -> Result<Box<dyn IndexWriter>>;

@@ -13,7 +13,7 @@ mod test {
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
     };
-    use lance_table::io::commit::{latest_manifest_path, manifest_path, CommitHandler};
+    use lance_table::io::commit::{manifest_path, CommitHandler};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use snafu::{location, Location};
@@ -272,10 +272,7 @@ mod test {
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
         localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
-        localfs
-            .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
-            .await
-            .unwrap();
+
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
             .list(Some(&ds.base))

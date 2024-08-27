@@ -121,7 +121,6 @@ mockall = { version = "0.12.1" }
 mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.11", features = ["future"] }
 num-traits = "0.2"
-num_cpus = "1.0"
 # Set min to prevent use of versions with CVE-2024-41178
 object_store = { version = "0.10.2" }
 parquet = "52.0"

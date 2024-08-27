@@ -152,7 +152,7 @@ impl<'a> CleanupTask<'a> {
             .commit_handler
             .list_manifests(&self.dataset.base, &self.dataset.object_store.inner)
             .await?
-            .try_for_each_concurrent(num_cpus::get(), |path| {
+            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |path| {
                 self.process_manifest_file(path, &inspection, tagged_versions)
             })
             .await?;
@@ -275,7 +275,7 @@ impl<'a> CleanupTask<'a> {
             .collect::<Vec<_>>()
             .await;
         let manifest_bytes_removed = stream::iter(manifest_bytes_removed)
-            .buffer_unordered(num_cpus::get())
+            .buffer_unordered(self.dataset.object_store.io_parallelism())
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;
 
@@ -783,8 +783,6 @@ mod tests {
         );
         assert_lt!(after_count.num_tx_files, before_count.num_tx_files);
 
-        // The latest manifest should still be there, even if it is older than
-        // the given time.
         assert_gt!(after_count.num_manifest_files, 0);
         assert_gt!(after_count.num_data_files, 0);
         // We should keep referenced tx files
@@ -805,9 +803,9 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
 
-        // 3 versions (plus one extra latest.manifest)
+        // 3 versions
         assert_eq!(before_count.num_data_files, 3);
-        assert_eq!(before_count.num_manifest_files, 4);
+        assert_eq!(before_count.num_manifest_files, 3);
 
         let before = utc_now() - TimeDelta::try_days(7).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
@@ -824,7 +822,7 @@ mod tests {
         // the latest version
         assert_eq!(after_count.num_data_files, 3);
         // Only the oldest manifest file should be removed
-        assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(after_count.num_manifest_files, 2);
         assert_eq!(after_count.num_tx_files, 2);
     }
 
@@ -942,7 +940,7 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count.num_data_files, 2);
-        assert_eq!(before_count.num_manifest_files, 3);
+        assert_eq!(before_count.num_manifest_files, 2);
 
         // Not much time has passed but we can still delete the old manifest
         // and the related data files
@@ -957,7 +955,7 @@ mod tests {
         );
 
         assert_eq!(after_count.num_data_files, 1);
-        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_manifest_files, 1);
     }
 
     #[tokio::test]
@@ -986,7 +984,7 @@ mod tests {
 
             let before_count = fixture.count_files().await.unwrap();
             assert_eq!(before_count.num_data_files, 2);
-            assert_eq!(before_count.num_manifest_files, 2);
+            assert_eq!(before_count.num_manifest_files, 1);
 
             let before = utc_now();
             let removed = fixture
@@ -1026,8 +1024,8 @@ mod tests {
         assert_eq!(before_count.num_index_files, 1);
         // Two user data files
         assert_eq!(before_count.num_data_files, 2);
-        // Creating an index creates a new manifest so there are 4 total
-        assert_eq!(before_count.num_manifest_files, 4);
+        // Creating an index creates a new manifest so there are 3 total
+        assert_eq!(before_count.num_manifest_files, 3);
 
         let before = utc_now() - TimeDelta::try_days(8).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
@@ -1041,7 +1039,7 @@ mod tests {
 
         assert_eq!(after_count.num_index_files, 0);
         assert_eq!(after_count.num_data_files, 1);
-        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_manifest_files, 1);
         assert_eq!(after_count.num_tx_files, 1);
     }
 
@@ -1067,7 +1065,7 @@ mod tests {
         let before_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count.num_data_files, 3);
         assert_eq!(before_count.num_delete_files, 2);
-        assert_eq!(before_count.num_manifest_files, 6);
+        assert_eq!(before_count.num_manifest_files, 5);
 
         let before = utc_now() - TimeDelta::try_days(8).unwrap();
         let removed = fixture.run_cleanup(before).await.unwrap();
@@ -1081,7 +1079,7 @@ mod tests {
 
         assert_eq!(after_count.num_data_files, 1);
         assert_eq!(after_count.num_delete_files, 1);
-        assert_eq!(after_count.num_manifest_files, 3);
+        assert_eq!(after_count.num_manifest_files, 2);
         assert_eq!(after_count.num_tx_files, 2);
 
         // Ensure we can still read the dataset
@@ -1129,7 +1127,7 @@ mod tests {
         // This append will fail since the commit is blocked but it should have
         // deposited a data file
         assert_eq!(before_count.num_data_files, 2);
-        assert_eq!(before_count.num_manifest_files, 2);
+        assert_eq!(before_count.num_manifest_files, 1);
         assert_eq!(before_count.num_tx_files, 2);
 
         // All of our manifests are newer than the threshold but temp files
@@ -1147,7 +1145,7 @@ mod tests {
         );
 
         assert_eq!(after_count.num_data_files, 1);
-        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_manifest_files, 1);
         assert_eq!(after_count.num_tx_files, 1);
     }
 
@@ -1199,7 +1197,7 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
         assert_eq!(before_count.num_data_files, 2);
-        assert_eq!(before_count.num_manifest_files, 3);
+        assert_eq!(before_count.num_manifest_files, 2);
 
         assert!(fixture
             .run_cleanup(utc_now() - TimeDelta::try_days(7).unwrap())
@@ -1213,7 +1211,7 @@ mod tests {
         // has to finish the buffered tasks even if they are ignored.
         let mid_count = fixture.count_files().await.unwrap();
         assert_eq!(mid_count.num_data_files, 1);
-        assert_eq!(mid_count.num_manifest_files, 3);
+        assert_eq!(mid_count.num_manifest_files, 2);
 
         fixture.unblock_delete_manifest();
 
@@ -1230,6 +1228,6 @@ mod tests {
         );
 
         assert_eq!(after_count.num_data_files, 1);
-        assert_eq!(after_count.num_manifest_files, 2);
+        assert_eq!(after_count.num_manifest_files, 1);
     }
 }
