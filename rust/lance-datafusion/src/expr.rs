@@ -516,7 +516,7 @@ fn remove_extension_types(
             types: kept_substrait_fields,
         }),
     };
-    Ok((new_substrait_schema, new_arrow_schema, dbg!(index_mapping)))
+    Ok((new_substrait_schema, new_arrow_schema, index_mapping))
 }
 
 #[cfg(feature = "substrait")]
