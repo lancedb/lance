@@ -21,16 +21,22 @@ use {
         Column, DataFusionError, TableReference,
     },
     datafusion_substrait::substrait::proto::{
+        expression::field_reference::{ReferenceType, RootType},
+        expression::reference_segment,
+        expression::RexType,
         expression_reference::ExprType,
         extensions::{simple_extension_declaration::MappingType, SimpleExtensionDeclaration},
+        function_argument::ArgType,
         plan_rel::RelType,
         r#type::{Kind, Struct},
         read_rel::{NamedTable, ReadType},
-        rel, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel, RelRoot,
+        rel, Expression, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel,
+        RelRoot,
     },
     lance_core::{Error, Result},
     prost::Message,
     snafu::{location, Location},
+    std::collections::HashMap,
 };
 
 const MS_PER_DAY: i64 = 86400000;
@@ -473,7 +479,7 @@ pub fn encode_substrait(expr: Expr, schema: Arc<Schema>) -> Result<Vec<u8>> {
 fn remove_extension_types(
     substrait_schema: &NamedStruct,
     arrow_schema: Arc<Schema>,
-) -> Result<(NamedStruct, Arc<Schema>)> {
+) -> Result<(NamedStruct, Arc<Schema>, HashMap<usize, usize>)> {
     let fields = substrait_schema.r#struct.as_ref().unwrap();
     if fields.types.len() != arrow_schema.fields.len() {
         return Err(Error::InvalidInput {
@@ -483,13 +489,22 @@ fn remove_extension_types(
     }
     let mut kept_substrait_fields = Vec::with_capacity(fields.types.len());
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
-    for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields.iter()) {
+    let mut index_mapping = HashMap::with_capacity(arrow_schema.fields.len());
+    let mut field_counter = 0;
+    for (field_index, (substrait_field, arrow_field)) in fields
+        .types
+        .iter()
+        .zip(arrow_schema.fields.iter())
+        .enumerate()
+    {
         if !matches!(
             substrait_field.kind.as_ref().unwrap(),
             Kind::UserDefined(_) | Kind::UserDefinedTypeReference(_)
         ) {
             kept_substrait_fields.push(substrait_field.clone());
             kept_arrow_fields.push(arrow_field.clone());
+            index_mapping.insert(field_index, field_counter);
+            field_counter += 1;
         }
     }
     let new_arrow_schema = Arc::new(Schema::new(kept_arrow_fields));
@@ -501,7 +516,7 @@ fn remove_extension_types(
             types: kept_substrait_fields,
         }),
     };
-    Ok((new_substrait_schema, new_arrow_schema))
+    Ok((new_substrait_schema, new_arrow_schema, dbg!(index_mapping)))
 }
 
 #[cfg(feature = "substrait")]
@@ -513,6 +528,111 @@ fn remove_type_extensions(
         .filter(|d| matches!(d.mapping_type, Some(MappingType::ExtensionFunction(_))))
         .cloned()
         .collect()
+}
+
+#[cfg(feature = "substrait")]
+fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>) -> Result<()> {
+    match expr.rex_type.as_mut().unwrap() {
+        // Simple, no field references possible
+        RexType::Literal(_) | RexType::Nested(_) | RexType::Enum(_) => Ok(()),
+        // Complex operators not supported in filters
+        RexType::WindowFunction(_) | RexType::Subquery(_) => Err(Error::invalid_input(
+            "Window functions or subqueries not allowed in filter expression",
+            location!(),
+        )),
+        // Pass through operators, nested children may have field references
+        RexType::ScalarFunction(ref mut func) => {
+            #[allow(deprecated)]
+            for arg in &mut func.args {
+                remap_expr_references(arg, mapping)?;
+            }
+            for arg in &mut func.arguments {
+                match arg.arg_type.as_mut().unwrap() {
+                    ArgType::Value(expr) => remap_expr_references(expr, mapping)?,
+                    ArgType::Enum(_) | ArgType::Type(_) => {}
+                }
+            }
+            Ok(())
+        }
+        RexType::IfThen(ref mut ifthen) => {
+            for clause in ifthen.ifs.iter_mut() {
+                remap_expr_references(clause.r#if.as_mut().unwrap(), mapping)?;
+                remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
+            }
+            remap_expr_references(ifthen.r#else.as_mut().unwrap(), mapping)?;
+            Ok(())
+        }
+        RexType::SwitchExpression(ref mut switch) => {
+            for clause in switch.ifs.iter_mut() {
+                remap_expr_references(clause.then.as_mut().unwrap(), mapping)?;
+            }
+            remap_expr_references(switch.r#else.as_mut().unwrap(), mapping)?;
+            Ok(())
+        }
+        RexType::SingularOrList(ref mut orlist) => {
+            for opt in orlist.options.iter_mut() {
+                remap_expr_references(opt, mapping)?;
+            }
+            remap_expr_references(orlist.value.as_mut().unwrap(), mapping)?;
+            Ok(())
+        }
+        RexType::MultiOrList(ref mut orlist) => {
+            for opt in orlist.options.iter_mut() {
+                for field in opt.fields.iter_mut() {
+                    remap_expr_references(field, mapping)?;
+                }
+            }
+            for val in orlist.value.iter_mut() {
+                remap_expr_references(val, mapping)?;
+            }
+            Ok(())
+        }
+        RexType::Cast(ref mut cast) => {
+            remap_expr_references(cast.input.as_mut().unwrap(), mapping)?;
+            Ok(())
+        }
+        RexType::Selection(ref mut sel) => {
+            // Finally, the selection, which might actually have field references
+            let root_type = sel.root_type.as_mut().unwrap();
+            // These types of references do not reference input fields so no remap needed
+            if matches!(
+                root_type,
+                RootType::Expression(_) | RootType::OuterReference(_)
+            ) {
+                return Ok(());
+            }
+            match sel.reference_type.as_mut().unwrap() {
+                ReferenceType::DirectReference(direct) => {
+                    match direct.reference_type.as_mut().unwrap() {
+                        reference_segment::ReferenceType::ListElement(_)
+                        | reference_segment::ReferenceType::MapKey(_) => Err(Error::invalid_input(
+                            "map/list nested references not supported in pushdown filters",
+                            location!(),
+                        )),
+                        reference_segment::ReferenceType::StructField(field) => {
+                            if field.child.is_some() {
+                                Err(Error::invalid_input(
+                                    "nested references in pushdown filters not yet supported",
+                                    location!(),
+                                ))
+                            } else {
+                                if let Some(new_index) = mapping.get(&(field.field as usize)) {
+                                    field.field = *new_index as i32;
+                                } else {
+                                    return Err(Error::invalid_input("pushdown filter referenced a field that is not yet supported by Substrait conversion", location!()));
+                                }
+                                Ok(())
+                            }
+                        }
+                    }
+                }
+                ReferenceType::MaskedReference(_) => Err(Error::invalid_input(
+                    "masked references not yet supported in filter expressions",
+                    location!(),
+                )),
+            }
+        }
+    }
 }
 
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
@@ -537,7 +657,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
             location: location!(),
         });
     }
-    let expr = match &envelope.referred_expr[0].expr_type {
+    let mut expr = match &envelope.referred_expr[0].expr_type {
         None => Err(Error::InvalidInput {
             source: "the provided substrait had an expression but was missing an expr_type".into(),
             location: location!(),
@@ -549,8 +669,22 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
         }),
     }?;
 
-    let (substrait_schema, input_schema) =
+    let (substrait_schema, input_schema, index_mapping) =
         remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
+
+    if substrait_schema.r#struct.as_ref().unwrap().types.len()
+        != envelope
+            .base_schema
+            .as_ref()
+            .unwrap()
+            .r#struct
+            .as_ref()
+            .unwrap()
+            .types
+            .len()
+    {
+        remap_expr_references(&mut expr, &index_mapping)?;
+    }
 
     // Datafusion's substrait consumer only supports Plan (not ExtendedExpression) and so
     // we need to create a dummy plan with a single project node
