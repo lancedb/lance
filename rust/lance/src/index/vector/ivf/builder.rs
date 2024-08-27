@@ -15,6 +15,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::PART_ID_COLUMN;
 use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
@@ -30,7 +31,6 @@ use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};
 use lance_index::vector::{
     hnsw::{builder::HnswBuildParams, HnswMetadata},
     ivf::shuffler::shuffle_dataset,
-    pq::ProductQuantizer,
 };
 use lance_io::{stream::RecordBatchStream, traits::Writer};
 use lance_linalg::distance::{DistanceType, MetricType};
@@ -79,6 +79,7 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
+        true,
     );
 
     let stream = shuffle_dataset(
@@ -210,6 +211,7 @@ pub async fn write_vector_storage(
         column,
         pq,
         None,
+        true,
     ));
 
     let data = if let Some(partitions_ds_uri) = precomputed_partitions_ds_uri {

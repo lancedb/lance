@@ -10,13 +10,12 @@ use arrow_array::types::{Float16Type, Float64Type};
 use arrow_array::{cast::AsArray, types::Float32Type, Array, ArrayRef};
 use arrow_array::{ArrowNumericType, FixedSizeListArray, PrimitiveArray};
 use arrow_schema::DataType;
-use futures::{stream, StreamExt, TryStreamExt};
 use lance_arrow::FixedSizeListArrayExt;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
 use rand::SeedableRng;
+use rayon::prelude::*;
 use snafu::{location, Location};
 
 use super::utils::divide_to_subvectors;
@@ -63,6 +62,10 @@ impl QuantizerBuildParams for PQBuildParams {
     fn sample_size(&self) -> usize {
         self.sample_rate * 2_usize.pow(self.num_bits as u32)
     }
+
+    fn use_residual(distance_type: DistanceType) -> bool {
+        matches!(distance_type, DistanceType::L2 | DistanceType::Cosine)
+    }
 }
 
 impl PQBuildParams {
@@ -83,7 +86,7 @@ impl PQBuildParams {
         }
     }
 
-    async fn build_from_fsl<T: ArrowNumericType>(
+    fn build_from_fsl<T: ArrowNumericType>(
         &self,
         data: &FixedSizeListArray,
         distance_type: DistanceType,
@@ -103,8 +106,9 @@ impl PQBuildParams {
         let dimension = data.value_length() as usize;
         let sub_vector_dimension = dimension / self.num_sub_vectors;
 
-        let d = stream::iter(sub_vectors.into_iter())
-            .map(|sub_vec| async move {
+        let d = sub_vectors
+            .into_par_iter()
+            .map(|sub_vec| {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
                     &sub_vec,
@@ -116,11 +120,8 @@ impl PQBuildParams {
                     distance_type,
                     self.sample_rate,
                 )
-                .await
             })
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
+            .collect::<Result<Vec<_>>>()?;
         let mut codebook_builder = PrimitiveBuilder::<T>::with_capacity(num_centroids * dimension);
         for centroid in d.iter() {
             let c = centroid
@@ -144,11 +145,7 @@ impl PQBuildParams {
     /// Build a [ProductQuantizer] from the given data.
     ///
     /// If the [MetricType] is [MetricType::Cosine], the input data will be normalized.
-    pub async fn build(
-        &self,
-        data: &dyn Array,
-        distance_type: DistanceType,
-    ) -> Result<ProductQuantizer> {
+    pub fn build(&self, data: &dyn Array, distance_type: DistanceType) -> Result<ProductQuantizer> {
         assert_eq!(data.null_count(), 0);
         let fsl = data.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
@@ -159,9 +156,9 @@ impl PQBuildParams {
         })?;
         // TODO: support bf16 later.
         match fsl.value_type() {
-            DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type).await,
-            DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type).await,
-            DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type).await,
+            DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),
+            DataType::Float32 => self.build_from_fsl::<Float32Type>(fsl, distance_type),
+            DataType::Float64 => self.build_from_fsl::<Float64Type>(fsl, distance_type),
             _ => Err(Error::Index {
                 message: format!("PQ builder: unsupported data type: {}", fsl.value_type()),
                 location: location!(),

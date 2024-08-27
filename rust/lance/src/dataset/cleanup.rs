@@ -1020,6 +1020,7 @@ mod tests {
         fixture.overwrite_some_data().await.unwrap();
 
         let before_count = fixture.count_files().await.unwrap();
+        // we store 2 files (index and quantized storage) for each index
         assert_eq!(before_count.num_index_files, 1);
         // Two user data files
         assert_eq!(before_count.num_data_files, 2);

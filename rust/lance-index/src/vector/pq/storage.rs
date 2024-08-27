@@ -17,7 +17,7 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -25,13 +25,14 @@ use lance_io::{
     traits::{WriteExt, Writer},
     utils::read_message,
 };
-use lance_linalg::distance::{DistanceType, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
+use super::distance::build_distance_table_dot;
 use super::ProductQuantizer;
 use super::{distance::build_distance_table_l2, num_centroids};
 use crate::vector::storage::STORAGE_METADATA_KEY;
@@ -454,14 +455,7 @@ impl VectorStore for ProductQuantizationStorage {
 
         let metadata_json = serde_json::to_string(&metadata)?;
         let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
-
-        let schema = self
-            .batch
-            .schema_ref()
-            .as_ref()
-            .clone()
-            .with_metadata(metadata);
-        Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
+        Ok([self.batch.with_metadata(metadata)?].into_iter())
     }
 
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
@@ -549,7 +543,7 @@ pub struct PQDistCalculator {
 }
 
 impl PQDistCalculator {
-    fn new<T: L2>(
+    fn new<T: L2 + Dot>(
         codebook: &[T],
         num_bits: u32,
         num_sub_vectors: usize,
@@ -557,10 +551,14 @@ impl PQDistCalculator {
         query: &[T],
         distance_type: DistanceType,
     ) -> Self {
-        let distance_table = if matches!(distance_type, DistanceType::Cosine | DistanceType::L2) {
-            build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
-        } else {
-            unimplemented!("DistanceType is not supported: {:?}", distance_type);
+        let distance_table = match distance_type {
+            DistanceType::L2 | DistanceType::Cosine => {
+                build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
+            }
+            DistanceType::Dot => {
+                build_distance_table_dot(codebook, num_bits, num_sub_vectors, query)
+            }
+            _ => unimplemented!("DistanceType is not supported: {:?}", distance_type),
         };
         Self {
             distance_table,
