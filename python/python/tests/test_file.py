@@ -285,3 +285,37 @@ def test_dictionary(tmp_path):
         round_tripped = round_trip(dict_arr)
         assert round_tripped == dict_arr
         assert round_tripped.type == dict_arr.type
+
+def test_write_read_global_buffer(tmp_path):
+    table = pa.table({"a": [1, 2, 3]})
+    path = tmp_path / "foo.lance"
+    global_buffer_text = "hello"
+    global_buffer_bytes = bytes(global_buffer_text, "utf-8")
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+        global_buffer_pos = writer.add_global_buffer(global_buffer_bytes)
+    reader = LanceFileReader(str(path))
+    assert reader.read_all().to_table() == table
+    assert reader.metadata().global_buffers[global_buffer_pos].size == len(
+        global_buffer_bytes
+    )
+    assert (
+            bytes(reader.read_global_buffer(global_buffer_pos)).decode()
+            == global_buffer_text
+    )
+
+
+def test_write_read_additional_schema_metadata(tmp_path):
+    table = pa.table({"a": [1, 2, 3]})
+    path = tmp_path / "foo.lance"
+    schema_metadata_key = "foo"
+    schema_metadata_value = "bar"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+        writer.add_schema_metadata(schema_metadata_key, schema_metadata_value)
+    reader = LanceFileReader(str(path))
+    assert reader.read_all().to_table() == table
+    assert (
+            reader.metadata().schema.metadata.get(schema_metadata_key.encode()).decode()
+            == schema_metadata_value
+    )
