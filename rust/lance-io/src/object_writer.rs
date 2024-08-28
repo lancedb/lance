@@ -23,7 +23,7 @@ use crate::traits::Writer;
 use snafu::{location, Location};
 
 /// Start at 5MB.
-const INITIAL_UPLOAD_SIZE: usize = 1024 * 1024 * 5;
+const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;
 
 fn max_upload_parallelism() -> usize {
     static MAX_UPLOAD_PARALLELISM: OnceLock<usize> = OnceLock::new();
@@ -42,6 +42,25 @@ fn max_conn_reset_retries() -> u16 {
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(20)
+    })
+}
+
+fn initial_upload_size() -> usize {
+    static LANCE_INITIAL_UPLOAD_SIZE: OnceLock<usize> = OnceLock::new();
+    *LANCE_INITIAL_UPLOAD_SIZE.get_or_init(|| {
+        std::env::var("LANCE_INITIAL_UPLOAD_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .inspect(|size| {
+                if *size < INITIAL_UPLOAD_STEP {
+                    // Minimum part size in GCS and S3
+                    panic!("LANCE_INITIAL_UPLOAD_SIZE must be at least 5MB");
+                } else if *size > 1024 * 1024 * 1024 * 5 {
+                    // Maximum part size in GCS and S3
+                    panic!("LANCE_INITIAL_UPLOAD_SIZE must be at most 5GB");
+                }
+            })
+            .unwrap_or(INITIAL_UPLOAD_STEP)
     })
 }
 
@@ -128,7 +147,7 @@ impl ObjectWriter {
             cursor: 0,
             path: Arc::new(path.clone()),
             connection_resets: 0,
-            buffer: Vec::with_capacity(INITIAL_UPLOAD_SIZE),
+            buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
     }
@@ -138,10 +157,10 @@ impl ObjectWriter {
     fn next_part_buffer(buffer: &mut Vec<u8>, part_idx: u16, constant_upload_size: bool) -> Bytes {
         let new_capacity = if constant_upload_size {
             // The store does not support variable part sizes, so use the initial size.
-            INITIAL_UPLOAD_SIZE
+            initial_upload_size()
         } else {
             // Increase the upload size every 100 parts. This gives maximum part size of 2.5TB.
-            ((part_idx / 100) as usize + 1) * INITIAL_UPLOAD_SIZE
+            initial_upload_size().max(((part_idx / 100) as usize + 1) * INITIAL_UPLOAD_STEP)
         };
         let new_buffer = Vec::with_capacity(new_capacity);
         let part = std::mem::replace(buffer, new_buffer);
@@ -154,6 +173,10 @@ impl ObjectWriter {
         part_idx: u16,
         sleep: Option<std::time::Duration>,
     ) -> BoxFuture<'static, std::result::Result<(), UploadPutError>> {
+        log::debug!(
+            "MultipartUpload submitting part with {} bytes",
+            buffer.len()
+        );
         let fut = upload.put_part(buffer.clone().into());
         Box::pin(async move {
             if let Some(sleep) = sleep {
