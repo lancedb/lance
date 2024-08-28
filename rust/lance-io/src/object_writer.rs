@@ -173,6 +173,10 @@ impl ObjectWriter {
         part_idx: u16,
         sleep: Option<std::time::Duration>,
     ) -> BoxFuture<'static, std::result::Result<(), UploadPutError>> {
+        log::debug!(
+            "MultipartUpload submitting part with {} bytes",
+            buffer.len()
+        );
         let fut = upload.put_part(buffer.clone().into());
         Box::pin(async move {
             if let Some(sleep) = sleep {
