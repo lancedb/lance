@@ -1080,8 +1080,8 @@ impl Dataset {
             "INVERTED" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
-                    if let Some(with_positions) = kwargs.get_item("with_positions")? {
-                        params.with_positions = with_positions.extract()?;
+                    if let Some(with_position) = kwargs.get_item("with_position")? {
+                        params.with_position = with_position.extract()?;
                     }
                 }
                 Box::new(params)

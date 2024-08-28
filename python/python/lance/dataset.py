@@ -1283,7 +1283,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         Optional Parameters
         -------------------
-        with_positions: bool, default False
+        with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
             query. This will significantly increase the index size.

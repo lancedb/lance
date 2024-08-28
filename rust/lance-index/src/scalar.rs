@@ -91,18 +91,26 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct InvertedIndexParams {
-    // Set it to true if you need to perform phrase query,
-    // this could significantly increase the index size,
-    // non-phrase query performance won't be impacted
-    // even the index was built with positions.
-    pub with_positions: bool,
+    /// If true, store the position of the term in the document
+    /// This can significantly increase the size of the index
+    /// If false, only store the frequency of the term in the document
+    /// Default is true
+    pub with_position: bool,
+}
+
+impl Default for InvertedIndexParams {
+    fn default() -> Self {
+        Self {
+            with_position: true,
+        }
+    }
 }
 
 impl InvertedIndexParams {
-    pub fn with_positions(mut self, with_positions: bool) -> Self {
-        self.with_positions = with_positions;
+    pub fn with_position(mut self, with_position: bool) -> Self {
+        self.with_position = with_position;
         self
     }
 }

@@ -42,7 +42,7 @@ impl InvertedIndexBuilder {
     }
 
     pub fn from_existing_index(tokens: TokenSet, invert_list: InvertedList, docs: DocSet) -> Self {
-        let params = InvertedIndexParams::default().with_positions(invert_list.with_positions);
+        let params = InvertedIndexParams::default().with_position(invert_list.with_position);
         Self {
             params,
             tokens,
@@ -151,7 +151,7 @@ impl InvertedIndexBuilder {
 pub struct InvertedList {
     // the index is the token id
     inverted_list: Vec<PostingListBuilder>,
-    pub(crate) with_positions: bool,
+    pub(crate) with_position: bool,
 }
 
 impl InvertedList {
@@ -225,7 +225,7 @@ impl InvertedList {
         Ok(Self {
             inverted_list,
             // the index could be empty so we need to check by the schema
-            with_positions: reader.schema().field(POSITION_COL).is_some(),
+            with_position: reader.schema().field(POSITION_COL).is_some(),
         })
     }
 
@@ -271,7 +271,7 @@ impl InvertedList {
             let token_id = token_id as usize;
             if token_id >= self.inverted_list.len() {
                 self.inverted_list.resize_with(token_id + 1, || {
-                    PostingListBuilder::empty(params.with_positions)
+                    PostingListBuilder::empty(params.with_position)
                 });
             }
             let list = &mut self.inverted_list[token_id];
@@ -323,15 +323,14 @@ mod tests {
     use object_store::path::Path;
 
     use crate::scalar::lance_format::LanceIndexStore;
-    use crate::scalar::{FullTextSearchQuery, InvertedIndexParams, SargableQuery, ScalarIndex};
+    use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
 
     async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = LanceIndexStore::new(ObjectStore::local(), index_dir, None);
 
-        let mut invert_index =
-            super::InvertedIndexBuilder::new(InvertedIndexParams::default().with_positions(true));
+        let mut invert_index = super::InvertedIndexBuilder::default();
         let doc_col = GenericStringArray::<Offset>::from(vec![
             "lance database search",
             "lance database",

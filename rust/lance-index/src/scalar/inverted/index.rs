@@ -535,11 +535,11 @@ impl PostingListBuilder {
         }
     }
 
-    pub fn empty(with_positions: bool) -> Self {
+    pub fn empty(with_position: bool) -> Self {
         Self {
             row_ids: Vec::new(),
             frequencies: Vec::new(),
-            positions: with_positions.then(Vec::new),
+            positions: with_position.then(Vec::new),
         }
     }
 

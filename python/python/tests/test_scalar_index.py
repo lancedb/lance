@@ -211,10 +211,10 @@ def test_lance_mem_pool_env_var(tmp_path):
         del os.environ["LANCE_BYPASS_SPILLING"]
 
 
-@pytest.mark.parametrize("with_positions", [True, False])
-def test_full_text_search(dataset, with_positions):
+@pytest.mark.parametrize("with_position", [True, False])
+def test_full_text_search(dataset, with_position):
     dataset.create_scalar_index(
-        "doc", index_type="INVERTED", with_positions=with_positions
+        "doc", index_type="INVERTED", with_position=with_position
     )
     row = dataset.take(indices=[0], columns=["doc"])
     query = row.column(0)[0].as_py()
