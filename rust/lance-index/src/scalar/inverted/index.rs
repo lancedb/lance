@@ -4,12 +4,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{AsArray, Int32Builder, ListBuilder};
+use arrow::array::{AsArray, Float32Builder, Int32Builder, ListBuilder, UInt64Builder};
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StringArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
@@ -268,8 +268,8 @@ impl ScalarIndex for InvertedIndex {
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct TokenSet {
     // token -> (token_id, frequency)
-    tokens: HashMap<String, u32>,
-    next_id: u32,
+    pub(crate) tokens: HashMap<String, u32>,
+    pub(crate) next_id: u32,
 }
 
 impl TokenSet {
@@ -277,12 +277,12 @@ impl TokenSet {
         let mut tokens = Vec::with_capacity(self.tokens.len());
         let mut token_ids = Vec::with_capacity(self.tokens.len());
         self.tokens.iter().for_each(|(token, token_id)| {
-            tokens.push(token.clone());
+            tokens.push(token.as_str());
             token_ids.push(*token_id);
         });
         let mut indices = (0..self.tokens.len()).collect_vec();
-        indices.sort_unstable_by_key(|&i| tokens[i].as_str());
-        let token_col = StringArray::from_iter_values(indices.iter().map(|&i| tokens[i].as_str()));
+        indices.sort_unstable_by_key(|&i| tokens[i]);
+        let token_col = StringArray::from_iter_values(indices.iter().map(|&i| tokens[i]));
         let token_id_col = UInt32Array::from_iter_values(indices.iter().map(|&i| token_ids[i]));
 
         let schema = arrow_schema::Schema::new(vec![
@@ -335,6 +335,18 @@ impl TokenSet {
 
     pub fn next_id(&self) -> u32 {
         self.next_id
+    }
+}
+
+impl FromIterator<(String, u32)> for TokenSet {
+    fn from_iter<T: IntoIterator<Item = (String, u32)>>(iter: T) -> Self {
+        let mut tokens = HashMap::new();
+        let mut next_id = 0;
+        for (token, token_id) in iter {
+            tokens.insert(token, token_id);
+            next_id = next_id.max(token_id + 1);
+        }
+        Self { tokens, next_id }
     }
 }
 
@@ -523,7 +535,7 @@ impl PostingList {
 pub struct PostingListBuilder {
     pub row_ids: Vec<u64>,
     pub frequencies: Vec<f32>,
-    pub positions: Option<Vec<Vec<i32>>>,
+    pub positions: Option<PositionBuilder>,
 }
 
 impl PostingListBuilder {
@@ -531,7 +543,7 @@ impl PostingListBuilder {
         Self {
             row_ids,
             frequencies,
-            positions,
+            positions: positions.map(PositionBuilder::from),
         }
     }
 
@@ -539,7 +551,15 @@ impl PostingListBuilder {
         Self {
             row_ids: Vec::new(),
             frequencies: Vec::new(),
-            positions: with_position.then(Vec::new),
+            positions: with_position.then(PositionBuilder::new),
+        }
+    }
+
+    pub fn add(&mut self, row_id: u64, term_positions: Vec<i32>) {
+        self.row_ids.push(row_id);
+        self.frequencies.push(term_positions.len() as f32);
+        if let Some(positions) = self.positions.as_mut() {
+            positions.push(term_positions);
         }
     }
 
@@ -551,39 +571,50 @@ impl PostingListBuilder {
         self.len() == 0
     }
 
+    pub fn clear(&mut self) {
+        self.row_ids = Vec::new();
+        self.frequencies = Vec::new();
+        self.positions = self.positions.take().map(|_| PositionBuilder::new());
+    }
+
     pub fn calculate_max_score(&self, docs: &DocSet) -> f32 {
-        // score(q, D) = IDF(q) * (f(q, D) * (k1 + 1)) / (f(q, D) + k1 * (1 - b + b * |D| / avgdl))
         let num_docs = docs.len();
         let avgdl = docs.average_length();
         let mut max_score = 0.0;
-        for (&row_id, &freq) in self.row_ids.iter().zip(self.frequencies.iter()) {
-            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
-            let score = idf(self.len(), num_docs) * (K1 + 1.0) * freq / (freq + doc_norm);
-            if score > max_score {
-                max_score = score;
-            }
-        }
-        max_score
+        self.row_ids
+            .iter()
+            .zip(self.frequencies.iter())
+            .for_each(|(&row_id, &freq)| {
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
+                let score = freq / (freq + doc_norm);
+                if score > max_score {
+                    max_score = score;
+                }
+            });
+        max_score * idf(self.len(), num_docs) * (K1 + 1.0)
     }
 
-    pub fn to_batch(&self) -> Result<RecordBatch> {
-        let indices = (0..self.row_ids.len())
-            .sorted_unstable_by_key(|&i| self.row_ids[i])
-            .collect_vec();
-        let row_id_col = UInt64Array::from_iter_values(indices.iter().map(|&i| self.row_ids[i]));
-        let frequency_col =
-            Float32Array::from_iter_values(indices.iter().map(|&i| self.frequencies[i]));
-        let position_col = self.positions.as_ref().map(|positions| {
-            let mut position_col_builder =
-                ListBuilder::with_capacity(Int32Builder::new(), self.len());
-            for i in indices {
-                let term_positions = &positions[i];
-                let position_builder = position_col_builder.values();
-                position_builder.append_slice(term_positions);
-                position_col_builder.append(true);
+    pub fn to_batch(&mut self) -> Result<RecordBatch> {
+        let length = self.len();
+        let mut row_id_builder = UInt64Builder::with_capacity(length);
+        let mut freq_builder = Float32Builder::with_capacity(length);
+        let mut position_builder = self
+            .positions
+            .as_mut()
+            .map(|_| ListBuilder::with_capacity(Int32Builder::new(), length));
+        for index in (0..length).sorted_unstable_by_key(|&i| self.row_ids[i]) {
+            row_id_builder.append_value(self.row_ids[index]);
+            freq_builder.append_value(self.frequencies[index]);
+            if let Some(position_builder) = position_builder.as_mut() {
+                let inner_builder = position_builder.values();
+                inner_builder.append_slice(self.positions.as_ref().unwrap().get(index));
+                position_builder.append(true);
             }
-            position_col_builder.finish()
-        });
+        }
+        self.clear();
+
+        let row_id_col = row_id_builder.finish();
+        let freq_col = freq_builder.finish();
 
         let mut fields = vec![
             arrow_schema::Field::new(ROW_ID, DataType::UInt64, false),
@@ -591,9 +622,10 @@ impl PostingListBuilder {
         ];
         let mut columns = vec![
             Arc::new(row_id_col) as ArrayRef,
-            Arc::new(frequency_col) as ArrayRef,
+            Arc::new(freq_col) as ArrayRef,
         ];
-        if let Some(position_col) = position_col {
+        if let Some(mut position_builder) = position_builder {
+            let position_col = position_builder.finish();
             fields.push(arrow_schema::Field::new(
                 POSITION_COL,
                 DataType::List(Field::new("item", DataType::Int32, true).into()),
@@ -604,6 +636,43 @@ impl PostingListBuilder {
         let schema = arrow_schema::Schema::new(fields);
         let batch = RecordBatch::try_new(Arc::new(schema), columns)?;
         Ok(batch)
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct PositionBuilder {
+    positions: Vec<i32>,
+    offsets: Vec<usize>,
+}
+
+impl PositionBuilder {
+    pub fn new() -> Self {
+        Self {
+            positions: Vec::new(),
+            offsets: vec![0],
+        }
+    }
+
+    pub fn push(&mut self, positions: Vec<i32>) {
+        self.positions.extend(positions);
+        self.offsets.push(self.positions.len());
+    }
+
+    pub fn get(&self, i: usize) -> &[i32] {
+        let start = self.offsets[i];
+        let end = self.offsets[i + 1];
+        &self.positions[start..end]
+    }
+}
+
+impl From<Vec<Vec<i32>>> for PositionBuilder {
+    fn from(positions: Vec<Vec<i32>>) -> Self {
+        let mut builder = Self::new();
+        builder.offsets.reserve(positions.len());
+        for pos in positions {
+            builder.push(pos);
+        }
+        builder
     }
 }
 
@@ -660,7 +729,7 @@ impl DocSet {
 
     #[inline]
     pub fn average_length(&self) -> f32 {
-        self.total_tokens as f32 / self.token_count.len() as f32
+        self.total_tokens as f32 / self.len() as f32
     }
 
     pub fn to_batch(&self) -> Result<RecordBatch> {
