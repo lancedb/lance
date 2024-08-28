@@ -392,7 +392,7 @@ struct BitpackedPageDecoder {
 }
 
 impl PrimitivePageDecoder for BitpackedPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let num_bytes = self.uncompressed_bits_per_value / 8 * num_rows;
         let mut dest = vec![0; num_bytes as usize];
 
@@ -521,7 +521,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
             }
         }
 
-        Ok(Box::new(FixedWidthDataBlock {
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             data: LanceBuffer::from(dest),
             bits_per_value: self.uncompressed_bits_per_value,
             num_values: num_rows,

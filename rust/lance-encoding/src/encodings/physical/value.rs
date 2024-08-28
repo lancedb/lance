@@ -221,7 +221,7 @@ impl ValuePageDecoder {
 }
 
 impl PrimitivePageDecoder for ValuePageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let bytes_to_skip = rows_to_skip * self.bytes_per_value;
         let bytes_to_take = num_rows * self.bytes_per_value;
 
@@ -232,7 +232,7 @@ impl PrimitivePageDecoder for ValuePageDecoder {
         } else {
             self.decode_buffers(&self.data, bytes_to_skip, bytes_to_take)
         };
-        Ok(Box::new(FixedWidthDataBlock {
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.bytes_per_value * 8,
             data: data_buffer,
             num_values: num_rows,

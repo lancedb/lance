@@ -1321,7 +1321,7 @@ pub trait PrimitivePageDecoder: Send + Sync {
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>>;
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock>;
 }
 
 /// A scheduler for single-column encodings of primitive data

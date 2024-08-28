@@ -9,7 +9,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    data::{DataBlock, DataBlockExt, FixedWidthDataBlock},
+    data::DataBlock,
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
@@ -74,14 +74,14 @@ pub struct FixedListDecoder {
 }
 
 impl PrimitivePageDecoder for FixedListDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_child_rows = num_rows * self.dimension;
         let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
-        let mut child_data = child_data.try_into_layout::<FixedWidthDataBlock>()?;
+        let mut child_data = child_data.as_fixed_width()?;
         child_data.num_values = num_rows;
         child_data.bits_per_value *= self.dimension;
-        Ok(child_data)
+        Ok(DataBlock::FixedWidth(child_data))
     }
 }
 
