@@ -2,6 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Data layouts to represent encoded data in a sub-Arrow format
+//!
+//! These [`DataBlock`] structures represent physical layouts.  They fill a gap somewhere
+//! between [`arrow_data::data::ArrayData`] (which, as a collection of buffers, is too
+//! generic because it doesn't give us enough information about what those buffers represent)
+//! and [`arrow_array::array::Array`] (which is too specific, because it cares about the
+//! logical data type).
+//!
+//! In addition, the layouts represented here are slightly stricter than Arrow's layout rules.
+//! For example, offset buffers MUST start with 0.  These additional restrictions impose a
+//! slight penalty on encode (to normalize arrow data) but make the development of encoders
+//! and decoders easier (since they can rely on a normalized representation)
 
 use std::{ops::Range, sync::Arc};
 
@@ -17,6 +28,10 @@ use lance_core::{Error, Result};
 use crate::buffer::LanceBuffer;
 
 /// A data block with no buffers where everything is null
+///
+/// Note: this data block should not be used for future work.  It will be deprecated
+/// in the 2.1 version of the format where nullability will be handled by the structural
+/// encoders.
 #[derive(Debug)]
 pub struct AllNullDataBlock {
     /// The number of values represented by this block
@@ -46,6 +61,10 @@ impl AllNullDataBlock {
 }
 
 /// Wraps a data block and adds nullability information to it
+///
+/// Note: this data block should not be used for future work.  It will be deprecated
+/// in the 2.1 version of the format where nullability will be handled by the structural
+/// encoders.
 #[derive(Debug)]
 pub struct NullableDataBlock {
     /// The underlying data
@@ -162,6 +181,8 @@ pub struct VariableWidthBlock {
     /// The data buffer
     pub data: LanceBuffer,
     /// The offsets buffer (contains num_values + 1 offsets)
+    ///
+    /// Offsets MUST start at 0
     pub offsets: LanceBuffer,
     /// The number of bits per offset
     pub bits_per_offset: u8,
@@ -338,7 +359,10 @@ impl DictionaryDataBlock {
 ///
 /// A DataBlock can be converted into an Arrow ArrayData (and then Array) for a given array type.
 /// For example, a FixedWidthDataBlock can be converted into any primitive type or a fixed size
-/// list of a primitive type.
+/// list of a primitive type.  This is a zero-copy operation.
+///
+/// In addition, a DataBlock can be created from an Arrow array or arrays.  This is not a zero-copy
+/// operation as some normalization may be required.
 #[derive(Debug)]
 pub enum DataBlock {
     AllNull(AllNullDataBlock),
@@ -482,16 +506,28 @@ fn stitch_offsets<T: ArrowNativeType + std::ops::Add<Output = T> + std::ops::Sub
     let mut dest = Vec::with_capacity(len);
     let mut byte_ranges = Vec::with_capacity(offsets.len());
 
+    // We insert one leading 0 before processing any of the inputs
     dest.push(T::from_usize(0).unwrap());
+
     for mut o in offsets.into_iter() {
         if !o.is_empty() {
             let last_offset = *dest.last().unwrap();
             let o = o.borrow_to_typed_slice::<T>();
             let start = *o.as_ref().first().unwrap();
-            dest.extend(
-                // Skip the leading zero, add last_offset, subtract start
-                o.as_ref()[1..].iter().map(|&x| x + last_offset - start),
-            );
+            // First, we skip the first offset
+            // Then, we subtract that first offset from each remaining offset
+            //
+            // This gives us a 0-based offset array (minus the leading 0)
+            //
+            // Then we add the last offset from the previous array to each offset
+            // which shifts our offset array to the correct position
+            //
+            // For example, let's assume the last offset from the previous array
+            // was 10 and we are given [13, 17, 22].  This means we have two values with
+            // length 4 (17 - 13) and 5 (22 - 17).  The output from this step will be
+            // [14, 19].  Combined with our last offset of 10, this gives us [10, 14, 19]
+            // which is our same two values of length 4 and 5.
+            dest.extend(o.as_ref()[1..].iter().map(|&x| x + last_offset - start));
         }
         byte_ranges.push(get_byte_range::<T>(&mut o));
     }
@@ -632,9 +668,11 @@ fn max_index_val(index_type: &DataType) -> u64 {
 // Second chunk ["bar", "world"], [0, 1, 0, 1, 1]
 //
 // If we simply encode as ["hello", "foo", "bar", "world"], [0, 0, 1, 1, 1, 0, 1, 0, 1, 1]
-// then we will get the wrong answer.
+// then we will get the wrong answer because the dictionaries were not merged and the indices
+// were not remapped.
 //
-// A simple way to do this today is to just concatenate all the arrays.
+// A simple way to do this today is to just concatenate all the arrays.  This is because
+// arrow's dictionary concatenation function already has the logic to merge dictionaries.
 //
 // TODO: We could be more efficient here by checking if the dictionaries are the same
 //       Also, if they aren't, we can possibly do something cheaper than concatenating
