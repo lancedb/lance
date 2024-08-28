@@ -36,10 +36,12 @@ pub struct DictionaryPageScheduler {
     // If true, decode the dictionary items.  If false, leave them dictionary encoded (e.g. the
     // output type is probably a dictionary type)
     should_decode_dict: bool,
+    data_type: DataType,
 }
 
 impl DictionaryPageScheduler {
     pub fn new(
+        data_type: DataType,
         indices_scheduler: Arc<dyn PageScheduler>,
         items_scheduler: Arc<dyn PageScheduler>,
         num_dictionary_items: u32,
@@ -50,6 +52,7 @@ impl DictionaryPageScheduler {
             items_scheduler,
             num_dictionary_items,
             should_decode_dict,
+            data_type,
         }
     }
 }
@@ -111,6 +114,7 @@ impl PageScheduler for DictionaryPageScheduler {
             .boxed()
         } else {
             let num_dictionary_items = self.num_dictionary_items;
+            let data_type = self.data_type.clone();
             tokio::spawn(async move {
                 let items_decoder: Arc<dyn PrimitivePageDecoder> =
                     Arc::from(items_page_decoder.await?);
@@ -124,6 +128,7 @@ impl PageScheduler for DictionaryPageScheduler {
                 Ok(Box::new(DirectDictionaryPageDecoder {
                     decoded_dict,
                     indices_decoder,
+                    data_type,
                 }) as Box<dyn PrimitivePageDecoder>)
             })
             .map(|join_handle| join_handle.unwrap())
@@ -133,18 +138,48 @@ impl PageScheduler for DictionaryPageScheduler {
 }
 
 struct DirectDictionaryPageDecoder {
-    decoded_dict: Box<dyn DataBlock>,
+    data_type: DataType,
+    decoded_dict: DataBlock,
     indices_decoder: Box<dyn PrimitivePageDecoder>,
 }
 
 impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let indices = self.indices_decoder.decode(rows_to_skip, num_rows)?;
         let dict = self.decoded_dict.try_clone()?;
-        Ok(Box::new(DictionaryDataBlock {
-            indices,
-            dictionary: dict,
-        }))
+        match indices {
+            DataBlock::AllNull(num_rows) => Ok(DataBlock::AllNull(num_rows)),
+            DataBlock::FixedWidth(indices) => Ok(DataBlock::Dictionary(DictionaryDataBlock {
+                indices,
+                dictionary: Box::new(dict),
+            })),
+            DataBlock::Nullable(indices) => {
+                // Writers should normalize nulls into the dictionary so this path doesn't need
+                // to be encountered on read.
+                let (key_type, value_type) = match &self.data_type {
+                    DataType::Dictionary(key_type, value_type) => {
+                        (key_type.as_ref().clone(), value_type.as_ref().clone())
+                    }
+                    _ => panic!(
+                        "Unexpected data block type for dictionary: {:?}",
+                        self.data_type
+                    ),
+                };
+                let dict_arrow = dict.into_arrow(value_type, false)?;
+                let indices_arrow = DataBlock::Nullable(indices).into_arrow(key_type, false)?;
+                let dict_data = indices_arrow
+                    .into_builder()
+                    .add_child_data(dict_arrow)
+                    .data_type(self.data_type.clone())
+                    .build()?;
+                let dict_array = make_array(dict_data);
+                Ok(DataBlock::from_array(dict_array))
+            }
+            _ => panic!(
+                "Unexpected data block type for dictionary indices: {:?}",
+                indices
+            ),
+        }
     }
 }
 
@@ -154,7 +189,7 @@ struct DictionaryPageDecoder {
 }
 
 impl PrimitivePageDecoder for DictionaryPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         // Decode the indices
         let indices_data = self.indices_decoder.decode(rows_to_skip, num_rows)?;
 
@@ -182,15 +217,15 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
         let offsets_buffer = string_array.offsets().inner().inner().clone();
         let bytes_buffer = string_array.values().clone();
 
-        let string_data = Box::new(VariableWidthBlock {
+        let string_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: 32,
             data: LanceBuffer::from(bytes_buffer),
             offsets: LanceBuffer::from(offsets_buffer),
             num_values: num_rows,
         });
         if let Some(nulls) = null_buffer {
-            Ok(Box::new(NullableDataBlock {
-                data: string_data,
+            Ok(DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(string_data),
                 nulls: LanceBuffer::from(nulls),
             }))
         } else {

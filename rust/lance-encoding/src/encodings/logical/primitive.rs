@@ -3,6 +3,7 @@
 
 use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
+use arrow::array::AsArray;
 use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::bit_util;
 use arrow_schema::DataType;
@@ -268,9 +269,30 @@ impl DecodeArrayTask for PrimitiveFieldDecodeTask {
             .physical_decoder
             .decode(self.rows_to_skip, self.rows_to_take)?;
 
-        Ok(make_array(
-            block.into_arrow(self.data_type, self.should_validate)?,
-        ))
+        let array = make_array(block.into_arrow(self.data_type.clone(), self.should_validate)?);
+
+        // This is a bit of a hack to work around https://github.com/apache/arrow-rs/issues/6302
+        //
+        // We change from nulls-in-dictionary (storage format) to nulls-in-indices (arrow-rs preferred
+        // format)
+        //
+        // The calculation of logical_nulls is not free and would be good to avoid in the future
+        if let DataType::Dictionary(_, _) = self.data_type {
+            let dict = array.as_any_dictionary();
+            if let Some(nulls) = array.logical_nulls() {
+                let new_indices = dict.keys().to_data();
+                let new_array = make_array(
+                    new_indices
+                        .into_builder()
+                        .nulls(Some(nulls))
+                        .add_child_data(dict.values().to_data())
+                        .data_type(dict.data_type().clone())
+                        .build()?,
+                );
+                return Ok(new_array);
+            }
+        }
+        Ok(array)
     }
 }
 

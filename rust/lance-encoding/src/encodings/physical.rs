@@ -74,7 +74,10 @@ fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn Pag
         1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),
         bits_per_value => {
             if bits_per_value % 8 != 0 {
-                todo!("bits_per_value that are not multiples of 8");
+                todo!(
+                    "bits_per_value ({}) that is not a multiple of 8",
+                    bits_per_value
+                );
             }
             Box::new(ValuePageScheduler::new(
                 bits_per_value / 8,
@@ -191,6 +194,7 @@ pub fn decoder_from_array_encoding(
             let should_decode_dict = !data_type.is_dictionary();
 
             Box::new(DictionaryPageScheduler::new(
+                data_type.clone(),
                 indices_scheduler.into(),
                 items_scheduler.into(),
                 num_dictionary_items,
