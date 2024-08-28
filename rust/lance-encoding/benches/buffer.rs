@@ -65,4 +65,12 @@ criterion_group!(
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
     targets = bench_zip);
+
+// Non-linux version does not support pprof.
+#[cfg(not(target_os = "linux"))]
+criterion_group!(
+    name=benches;
+    config = Criterion::default().significance_level(0.1).sample_size(10);
+    targets = bench_zip);
+
 criterion_main!(benches);

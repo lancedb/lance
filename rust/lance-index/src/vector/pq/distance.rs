@@ -3,7 +3,7 @@
 
 use std::cmp::min;
 
-use lance_linalg::distance::{l2_distance_batch, L2};
+use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 
@@ -25,6 +25,27 @@ pub(super) fn build_distance_table_l2<T: L2>(
             let subvec_centroids =
                 get_sub_vector_centroids(codebook, dimension, num_bits, num_sub_vectors, i);
             l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
+        })
+        .collect()
+}
+
+/// Build a Distance Table from the query to each PQ centroid
+/// using Dot distance.
+pub(super) fn build_distance_table_dot<T: Dot>(
+    codebook: &[T],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    query: &[T],
+) -> Vec<f32> {
+    let dimension = query.len();
+    let sub_vector_length = dimension / num_sub_vectors;
+    query
+        .chunks_exact(sub_vector_length)
+        .enumerate()
+        .flat_map(|(i, sub_vec)| {
+            let subvec_centroids =
+                get_sub_vector_centroids(codebook, dimension, num_bits, num_sub_vectors, i);
+            dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
         })
         .collect()
 }
