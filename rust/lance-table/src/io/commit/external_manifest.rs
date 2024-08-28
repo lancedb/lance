@@ -15,7 +15,7 @@ use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjec
 use snafu::{location, Location};
 
 use super::{
-    current_manifest_path, make_staging_manifest_path, manifest_path, ManifestLocation,
+    current_manifest_path, make_staging_manifest_path, ManifestLocation, ManifestNamingScheme,
     MANIFEST_EXTENSION,
 };
 use crate::format::{Index, Manifest};
@@ -77,7 +77,7 @@ pub struct ExternalManifestCommitHandler {
 }
 
 impl ExternalManifestCommitHandler {
-    /// The manifest is considered committed once the staging manifest is writen
+    /// The manifest is considered committed once the staging manifest is written
     /// to object store and that path is committed to the external store.
     ///
     /// However, to fully complete this, the staging manifest should be materialized
@@ -92,9 +92,10 @@ impl ExternalManifestCommitHandler {
         staging_manifest_path: &Path,
         version: u64,
         store: &dyn OSObjectStore,
+        naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
         // step 1: copy the manifest to the final location
-        let final_manifest_path = manifest_path(base_path, version);
+        let final_manifest_path = naming_scheme.manifest_path(base_path, version);
         match store
             .copy(staging_manifest_path, &final_manifest_path)
             .await
@@ -126,11 +127,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<ManifestLocation, Error> {
-        let path = self.resolve_latest_version(base_path, object_store).await?;
+        let path = self
+            .resolve_latest_version(base_path, object_store, scheme)
+            .await?;
         Ok(ManifestLocation {
             version: self
-                .resolve_latest_version_id(base_path, object_store)
+                .resolve_latest_version_id(base_path, object_store, scheme)
                 .await?,
             path,
             size: None,
@@ -142,6 +146,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
         let version = self
             .external_manifest_store
@@ -156,12 +161,20 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 }
 
                 let staged_path = Path::parse(&path)?;
-                self.finalize_manifest(base_path, &staged_path, version, &object_store.inner)
-                    .await
+                self.finalize_manifest(
+                    base_path,
+                    &staged_path,
+                    version,
+                    &object_store.inner,
+                    scheme,
+                )
+                .await
             }
             // Dataset not found in the external store, this could be because the dataset did not
             // use external store for commit before. In this case, we search for the latest manifest
-            None => Ok(current_manifest_path(object_store, base_path).await?.path),
+            None => Ok(current_manifest_path(object_store, base_path, scheme)
+                .await?
+                .path),
         }
     }
 
@@ -169,6 +182,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<u64, Error> {
         let version = self
             .external_manifest_store
@@ -177,7 +191,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
 
         match version {
             Some((version, _)) => Ok(version),
-            None => Ok(current_manifest_path(object_store, base_path)
+            None => Ok(current_manifest_path(object_store, base_path, scheme)
                 .await?
                 .version),
         }
@@ -188,6 +202,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         version: u64,
         object_store: &dyn OSObjectStore,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
         let path_res = self
             .external_manifest_store
@@ -198,7 +213,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             Ok(p) => p,
             // not board external manifest yet, direct to object store
             Err(Error::NotFound { .. }) => {
-                let path = manifest_path(base_path, version);
+                let path = scheme.manifest_path(base_path, version);
                 // if exist update external manifest store
                 if object_store.exists(&path).await? {
                     // best effort put, if it fails, it's okay
@@ -218,7 +233,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         location: location!(),
                     });
                 }
-                return Ok(manifest_path(base_path, version));
+                return Ok(scheme.manifest_path(base_path, version));
             }
             Err(e) => return Err(e),
         };
@@ -228,8 +243,14 @@ impl CommitHandler for ExternalManifestCommitHandler {
             return Ok(Path::parse(path)?);
         }
 
-        self.finalize_manifest(base_path, &Path::parse(&path)?, version, object_store)
-            .await
+        self.finalize_manifest(
+            base_path,
+            &Path::parse(&path)?,
+            version,
+            object_store,
+            scheme,
+        )
+        .await
     }
 
     async fn commit(
@@ -239,12 +260,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         // path we get here is the path to the manifest we want to write
         // use object_store.base_path.as_ref() for getting the root of the dataset
 
         // step 1: Write the manifest we want to commit to object store with a temporary name
-        let path = manifest_path(base_path, manifest.version);
+        let path = scheme.manifest_path(base_path, manifest.version);
         let staging_path = make_staging_manifest_path(&path)?;
         manifest_writer(object_store, manifest, indices, &staging_path).await?;
 
@@ -270,6 +292,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
             &staging_path,
             manifest.version,
             &object_store.inner,
+            scheme,
         )
         .await?;
 

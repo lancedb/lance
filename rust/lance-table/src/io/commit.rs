@@ -63,9 +63,11 @@ const MANIFEST_EXTENSION: &str = "manifest";
 pub enum ManifestNamingScheme {
     /// `_versions/{version}.manifest`
     V1,
-    /// `_manifests/{99999999999999999999 - version}.manifest`
+    /// `_manifests/{u64::MAX - version}.manifest`
     ///
     /// Zero-padded and reversed for O(1) lookup of latest version on object stores.
+    /// Lexicographically, the first file in the directory should always be the
+    /// latest manifest..
     V2,
 }
 
@@ -82,9 +84,19 @@ impl ManifestNamingScheme {
         match self {
             Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
             Self::V2 => {
-                let inverted_version = 99999_99999_99999_99999 - version;
+                let inverted_version = std::u64::MAX - version;
                 directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
             }
+        }
+    }
+
+    pub fn parse_version(&self, filename: &str) -> Option<u64> {
+        let file_number = filename
+            .split_once('.')
+            .and_then(|(version_str, _)| version_str.parse::<u64>().ok());
+        match self {
+            Self::V1 => file_number,
+            Self::V2 => file_number.map(|v| std::u64::MAX - v),
         }
     }
 }
@@ -185,11 +197,8 @@ fn current_manifest_local(
             // .tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d
             continue;
         }
-        // TODO: make parse_version a method on the file naming scheme.
-        let Some(version) = filename
-            .split_once('.')
-            .and_then(|(version_str, _)| version_str.parse::<u64>().ok())
-        else {
+
+        let Some(version) = scheme.parse_version(&filename) else {
             continue;
         };
 
@@ -331,6 +340,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError>;
 }
 
@@ -540,6 +550,7 @@ impl CommitHandler for UnsafeCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -551,7 +562,7 @@ impl CommitHandler for UnsafeCommitHandler {
         }
 
         let version_path = self
-            .resolve_version(base_path, manifest.version, &object_store.inner)
+            .resolve_version(base_path, manifest.version, &object_store.inner, scheme)
             .await?;
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
@@ -601,9 +612,10 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         let path = self
-            .resolve_version(base_path, manifest.version, &object_store.inner)
+            .resolve_version(base_path, manifest.version, &object_store.inner, scheme)
             .await?;
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
@@ -645,9 +657,17 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         self.as_ref()
-            .commit(manifest, indices, base_path, object_store, manifest_writer)
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                scheme,
+            )
             .await
     }
 }
@@ -666,12 +686,13 @@ impl CommitHandler for RenameCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
         let path = self
-            .resolve_version(base_path, manifest.version, &object_store.inner)
+            .resolve_version(base_path, manifest.version, &object_store.inner, scheme)
             .await?;
 
         // Add .tmp_ prefix to the path

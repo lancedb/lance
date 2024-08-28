@@ -17,6 +17,7 @@ use prost_types::Timestamp;
 use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::format::pb;
+use crate::io::commit::ManifestNamingScheme;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
@@ -278,6 +279,15 @@ impl Manifest {
 
     pub fn should_use_legacy_format(&self) -> bool {
         self.data_storage_format.version == LEGACY_FORMAT_VERSION
+    }
+
+    pub fn manifest_naming_scheme(&self) -> ManifestNamingScheme {
+        // TODO: Make this user configurable
+        if std::env::var("LANCE_USE_V2_VERSION_NAMES").is_ok() {
+            ManifestNamingScheme::V2
+        } else {
+            ManifestNamingScheme::V1
+        }
     }
 }
 

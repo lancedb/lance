@@ -261,6 +261,8 @@ impl DatasetBuilder {
         let cloned_ref = self.version.clone();
         let table_uri = self.table_uri.clone();
 
+        // How do we detect which version scheme is in use?
+
         let manifest = self.manifest.take();
 
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
