@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::scalar::{IndexReader, IndexStore};
+use crate::scalar::{IndexReader, IndexStore, InvertedIndexParams};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::AsArray;
 use arrow::compute::concat_batches;
@@ -24,26 +24,72 @@ use super::index::*;
 
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct InvertedIndexBuilder {
+    params: InvertedIndexParams,
+
     pub(crate) tokens: TokenSet,
     pub(crate) invert_list: InvertedList,
     pub(crate) docs: DocSet,
 }
 
 impl InvertedIndexBuilder {
+    pub fn new(params: InvertedIndexParams) -> Self {
+        Self {
+            params,
+            tokens: TokenSet::default(),
+            invert_list: InvertedList::default(),
+            docs: DocSet::default(),
+        }
+    }
+
+    pub fn from_existing_index(tokens: TokenSet, invert_list: InvertedList, docs: DocSet) -> Self {
+        let params = InvertedIndexParams::default().with_position(invert_list.with_position);
+        Self {
+            params,
+            tokens,
+            invert_list,
+            docs,
+        }
+    }
+
     pub async fn update(
         &mut self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        update_index(
-            new_data,
-            &mut self.tokens,
-            &mut self.invert_list,
-            &mut self.docs,
-        )
-        .await?;
-
+        self.update_index(new_data).await?;
         self.save(dest_store).await?;
+        Ok(())
+    }
+
+    async fn update_index(&mut self, new_data: SendableRecordBatchStream) -> Result<()> {
+        let mut tokenizer = TOKENIZER.clone();
+        let mut stream = new_data;
+        while let Some(batch) = stream.try_next().await? {
+            let doc_iter = iter_str_array(batch.column(0));
+            let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+
+            for (doc, row_id) in doc_iter.zip(row_id_col.values().iter()) {
+                let Some(doc) = doc else { continue };
+                let row_id = *row_id;
+                let mut token_stream = tokenizer.token_stream(doc);
+                let mut token_occurrences = HashMap::new();
+                let mut token_cnt = 0;
+                while let Some(token) = token_stream.next() {
+                    let token_id = self.tokens.add(token.text.to_owned());
+                    token_occurrences
+                        .entry(token_id)
+                        .and_modify(|positions: &mut Vec<i32>| {
+                            positions.push(token.position as i32)
+                        })
+                        .or_insert_with(|| vec![token.position as i32]);
+                    token_cnt += 1;
+                }
+                self.invert_list
+                    .add(token_occurrences, row_id, &self.params);
+                self.docs.add(row_id, token_cnt);
+            }
+        }
+
         Ok(())
     }
 
@@ -99,46 +145,13 @@ impl InvertedIndexBuilder {
     }
 }
 
-pub async fn update_index(
-    new_data: SendableRecordBatchStream,
-    token_set: &mut TokenSet,
-    invert_list: &mut InvertedList,
-    docs: &mut DocSet,
-) -> Result<()> {
-    let mut tokenizer = TOKENIZER.clone();
-    let mut stream = new_data;
-    while let Some(batch) = stream.try_next().await? {
-        let doc_iter = iter_str_array(batch.column(0));
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-
-        for (doc, row_id) in doc_iter.zip(row_id_col.values().iter()) {
-            let Some(doc) = doc else { continue };
-            let row_id = *row_id;
-            let mut token_stream = tokenizer.token_stream(doc);
-            let mut token_occurrences = HashMap::new();
-            let mut token_cnt = 0;
-            while let Some(token) = token_stream.next() {
-                let token_id = token_set.add(token.text.to_owned());
-                token_occurrences
-                    .entry(token_id)
-                    .and_modify(|positions: &mut Vec<i32>| positions.push(token.position as i32))
-                    .or_insert_with(|| vec![token.position as i32]);
-                token_cnt += 1;
-            }
-            invert_list.add(token_occurrences, row_id);
-            docs.add(row_id, token_cnt);
-        }
-    }
-
-    Ok(())
-}
-
 // InvertedList is a mapping from token ids to row ids
 // it's used to retrieve the documents that contain a token
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct InvertedList {
     // the index is the token id
     inverted_list: Vec<PostingListBuilder>,
+    pub(crate) with_position: bool,
 }
 
 impl InvertedList {
@@ -209,7 +222,11 @@ impl InvertedList {
             ));
         }
 
-        Ok(Self { inverted_list })
+        Ok(Self {
+            inverted_list,
+            // the index could be empty so we need to check by the schema
+            with_position: reader.schema().field(POSITION_COL).is_some(),
+        })
     }
 
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
@@ -244,12 +261,18 @@ impl InvertedList {
 
     // for efficiency, we don't check if the row_id exists
     // we assume that the row_id is unique and doesn't exist in the list
-    pub fn add(&mut self, token_occurrences: HashMap<u32, Vec<i32>>, row_id: u64) {
+    pub fn add(
+        &mut self,
+        token_occurrences: HashMap<u32, Vec<i32>>,
+        row_id: u64,
+        params: &InvertedIndexParams,
+    ) {
         for (token_id, term_positions) in token_occurrences {
             let token_id = token_id as usize;
             if token_id >= self.inverted_list.len() {
-                self.inverted_list
-                    .resize_with(token_id + 1, PostingListBuilder::default);
+                self.inverted_list.resize_with(token_id + 1, || {
+                    PostingListBuilder::empty(params.with_position)
+                });
             }
             let list = &mut self.inverted_list[token_id];
             list.row_ids.push(row_id);
