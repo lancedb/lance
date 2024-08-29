@@ -587,7 +587,7 @@ impl ExecutionPlan for MaterializeIndexExec {
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream,
         ));
-        let stream = break_stream(stream, 50 * 1024);
+        let stream = break_stream(stream, 64 * 1024);
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream.map_err(|err| err.into()),
