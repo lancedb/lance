@@ -17,7 +17,7 @@ use deepsize::DeepSizeOf;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu, CPU_RUNTIME};
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
 use lance_core::{Error, Result, ROW_ID};
 use lazy_static::lazy_static;
 use rayon::prelude::*;
