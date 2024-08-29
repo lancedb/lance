@@ -4,6 +4,7 @@
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
 use arrow_array::RecordBatch;
@@ -87,6 +88,12 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
+
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        Self::finish_with_metadata(self, &metadata)
+            .await
+            .map(|_| ())
+    }
 }
 
 #[async_trait]
@@ -98,6 +105,13 @@ impl IndexWriter for v2::writer::FileWriter {
     }
 
     async fn finish(&mut self) -> Result<()> {
+        Self::finish(self).await.map(|_| ())
+    }
+
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        metadata.into_iter().for_each(|(k, v)| {
+            self.add_schema_metadata(k, v);
+        });
         Self::finish(self).await.map(|_| ())
     }
 }

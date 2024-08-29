@@ -138,6 +138,7 @@ pub trait IndexWriter: Send {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
     /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()>;
 }
 
 /// Trait for reading an index (or parts of an index) from storage
