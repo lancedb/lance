@@ -481,7 +481,7 @@ impl FileFragment {
         let deletion_vec_load =
             self.load_deletion_vector(&self.dataset.object_store, &self.metadata);
 
-        let row_id_load = if self.dataset.manifest.uses_move_stable_row_ids() {
+        let row_id_load = if self.dataset.manifest.uses_stable_row_ids() {
             futures::future::Either::Left(
                 load_row_id_sequence(&self.dataset, &self.metadata).map_ok(Some),
             )
@@ -1274,7 +1274,7 @@ pub struct FragmentReader {
 
     /// The row id sequence
     ///
-    /// Only populated if the move-stable row id feature is enabled.
+    /// Only populated if the stable row id feature is enabled.
     row_id_sequence: Option<Arc<RowIdSequence>>,
 
     /// ID of the fragment

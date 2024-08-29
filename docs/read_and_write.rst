@@ -652,7 +652,7 @@ When files are rewritten, the original row addresses are invalidated. This means
 affected files are no longer part of any ANN index if they were before. Because
 of this, it's recommended to rewrite files before re-building indices.
 
-.. TODO: remove this last comment once move-stable row ids are default.
+.. TODO: remove this last comment once stable row ids are default.
 
 Object Store Configuration
 --------------------------

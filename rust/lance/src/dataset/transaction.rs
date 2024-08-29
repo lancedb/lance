@@ -382,7 +382,7 @@ impl Transaction {
     ) -> Result<(Manifest, Vec<Index>)> {
         if config.use_move_stable_row_ids
             && current_manifest
-                .map(|m| !m.uses_move_stable_row_ids())
+                .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
         {
             return Err(Error::NotSupported {
@@ -777,6 +777,10 @@ impl Transaction {
 
     fn assign_row_ids(next_row_id: &mut u64, fragments: &mut [Fragment]) -> Result<()> {
         for fragment in fragments {
+            if fragment.row_id_meta.is_some() {
+                // Operation must have already assigned ids.
+                continue;
+            }
             let physical_rows = fragment.physical_rows.ok_or_else(|| Error::Internal {
                 message: "Fragment does not have physical rows".into(),
                 location: location!(),

@@ -105,11 +105,11 @@ pub struct WriteParams {
     /// If not specified then the latest stable version will be used.
     pub data_storage_version: Option<LanceFileVersion>,
 
-    /// Experimental: if set to true, the writer will use move-stable row ids.
+    /// Experimental: if set to true, the writer will use stable row ids.
     /// These row ids are stable after compaction operations, but not after updates.
     /// This makes compaction more efficient, since with stable row ids no
     /// secondary indices need to be updated to point to new row ids.
-    pub enable_move_stable_row_ids: bool,
+    pub enable_stable_row_ids: bool,
 
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
@@ -127,7 +127,7 @@ impl Default for WriteParams {
             progress: Arc::new(NoopFragmentWriteProgress::new()),
             commit_handler: None,
             data_storage_version: None,
-            enable_move_stable_row_ids: false,
+            enable_stable_row_ids: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::super::utils::make_rowid_capture_stream;
 use super::write_fragments_internal;
@@ -20,10 +20,12 @@ use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, RowIdMeta};
+use lance_table::rowids::rechunk_sequences;
 use roaring::RoaringTreemap;
 use snafu::{location, Location, ResultExt};
 
+use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Dataset};
@@ -196,6 +198,7 @@ impl UpdateJob {
     pub async fn execute(self) -> Result<Arc<Dataset>> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
+        // TODO: handle indexed and unindexed data separately.
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -204,9 +207,9 @@ impl UpdateJob {
         let stream = scanner.try_into_stream().await?.into();
 
         // We keep track of seen row ids so we can delete them from the existing
-        // fragments.
-        let removed_row_ids = Arc::new(RwLock::new(RoaringTreemap::new()));
-        let stream = make_rowid_capture_stream(removed_row_ids.clone(), stream)?;
+        // fragments and then set the row id segments in the new fragments.
+        let (stream, row_id_rx) =
+            make_rowid_capture_stream(stream, self.dataset.manifest().uses_stable_row_ids())?;
 
         let schema = stream.schema();
 
@@ -232,7 +235,7 @@ impl UpdateJob {
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
-        let new_fragments = write_fragments_internal(
+        let mut new_fragments = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
@@ -242,12 +245,35 @@ impl UpdateJob {
         )
         .await?;
 
+        let removed_row_ids = row_id_rx.try_recv().map_err(|err| Error::Internal {
+            message: format!("Failed to receive row ids: {}", err),
+            location: location!(),
+        })?;
+
+        if let Some(row_id_sequence) = removed_row_ids.row_id_sequence() {
+            let fragment_sizes = new_fragments
+                .iter()
+                .map(|f| f.physical_rows.unwrap() as u64);
+            let sequences =
+                rechunk_sequences([row_id_sequence.clone()], fragment_sizes).map_err(|e| {
+                    Error::Internal {
+                        message: format!(
+                            "Captured row ids not equal to number of rows written: {}",
+                            e
+                        ),
+                        location: location!(),
+                    }
+                })?;
+            for (fragment, sequence) in new_fragments.iter_mut().zip(sequences) {
+                let serialized = lance_table::rowids::write_row_ids(&sequence);
+                fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+            }
+        }
+
         // Apply deletions
-        let removed_row_ids = Arc::into_inner(removed_row_ids)
-            .unwrap()
-            .into_inner()
-            .unwrap();
-        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
+        let row_id_index = get_row_id_index(&self.dataset).await?;
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let (old_fragments, removed_fragment_ids) = self.apply_deletions(&row_addrs).await?;
 
         // Commit updated and new fragments
         self.commit(removed_fragment_ids, old_fragments, new_fragments)

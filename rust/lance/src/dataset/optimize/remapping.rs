@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Utilities for remapping row ids. Necessary before move-stable row ids.
+//! Utilities for remapping row ids. Necessary before stable row ids.
 //!
 
 use async_trait::async_trait;

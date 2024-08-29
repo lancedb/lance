@@ -1832,7 +1832,7 @@ pub mod test_dataset {
                 max_rows_per_group: 10,
                 max_rows_per_file: 200,
                 data_storage_version: Some(data_storage_version),
-                enable_move_stable_row_ids: stable_row_ids,
+                enable_stable_row_ids: stable_row_ids,
                 ..Default::default()
             };
             let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -2834,7 +2834,7 @@ mod test {
         let write_params = WriteParams {
             data_storage_version: Some(data_storage_version),
             max_rows_per_file: 300, // At least two files to make sure stable row ids make a difference
-            enable_move_stable_row_ids: stable_row_ids,
+            enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
@@ -3126,7 +3126,7 @@ mod test {
                 test_uri,
                 Some(WriteParams {
                     data_storage_version: Some(data_storage_version),
-                    enable_move_stable_row_ids: stable_row_ids,
+                    enable_stable_row_ids: stable_row_ids,
                     ..Default::default()
                 }),
             )
@@ -3479,7 +3479,7 @@ mod test {
                 Some(WriteParams {
                     max_rows_per_file: 500,
                     data_storage_version: Some(data_storage_version),
-                    enable_move_stable_row_ids: use_stable_row_ids,
+                    enable_stable_row_ids: use_stable_row_ids,
                     ..Default::default()
                 }),
             )
