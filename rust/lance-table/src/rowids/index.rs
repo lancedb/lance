@@ -6,11 +6,14 @@ use std::sync::Arc;
 use std::u64;
 
 use deepsize::DeepSizeOf;
-use lance_core::utils::address::RowAddress;
+use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_core::Result;
 use rangemap::RangeInclusiveMap;
 
 use super::{RowIdSequence, U64Segment};
+
+// TODO: we can't have something separate for tombstones. otherwise we will
+// have duplicate entries for moved rows.
 
 /// An index of row ids
 ///
@@ -27,12 +30,18 @@ use super::{RowIdSequence, U64Segment};
 #[derive(Debug)]
 pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
+pub struct FragmentRowIdIndex {
+    pub fragment_id: u32,
+    pub row_id_sequence: Arc<RowIdSequence>,
+    pub deletion_vector: Arc<DeletionVector>,
+}
+
 impl RowIdIndex {
     /// Create a new index from a list of fragment ids and their corresponding row id sequences.
-    pub fn new(fragment_indices: &[(u32, Arc<RowIdSequence>)]) -> Result<Self> {
+    pub fn new(fragment_indices: &[FragmentRowIdIndex]) -> Result<Self> {
         let chunks = fragment_indices
             .iter()
-            .flat_map(|(fragment_id, sequence)| decompose_sequence(*fragment_id, sequence))
+            .flat_map(|frag_index| decompose_sequence)
             .collect::<Vec<_>>();
 
         let mut final_chunks = Vec::new();
@@ -88,11 +97,13 @@ impl DeepSizeOf for RowIdIndex {
 }
 
 fn decompose_sequence(
-    fragment_id: u32,
-    sequence: &RowIdSequence,
+    frag_index: &FragmentRowIdIndex,
+    // fragment_id: u32,
+    // sequence: &RowIdSequence,
 ) -> Vec<(RangeInclusive<u64>, (U64Segment, U64Segment))> {
-    let mut start_address: u64 = RowAddress::first_row(fragment_id).into();
-    sequence
+    let mut start_address: u64 = RowAddress::first_row(frag_index.fragment_id).into();
+
+    frag_index.row_id_sequence
         .0
         .iter()
         .filter_map(|segment| {
@@ -103,6 +114,13 @@ fn decompose_sequence(
             let coverage = segment.range()?;
 
             Some((coverage, (segment.clone(), address_segment)))
+        })
+        .map(|(range, (row_id_segment, address_segment))| {
+            let row_id_segment = 
+            (
+                range,
+                (row_id_segment.clone(), address_segment.clone()),
+            )
         })
         .collect()
 }
