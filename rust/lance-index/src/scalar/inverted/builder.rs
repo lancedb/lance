@@ -204,7 +204,6 @@ impl InvertedIndexBuilder {
             log::info!("save_tokens done: {:?}", start.elapsed());
         }
 
-        // calculate the max BM25 score for each posting list
         {
             let start = std::time::Instant::now();
             let batches = std::mem::take(&mut self.invert_list).to_batches(&self.docs)?;
@@ -244,26 +243,29 @@ impl InvertedList {
     // the schema of the inverted list is | row_id | frequency |
     // and store the offset of
     pub fn to_batches(self, docs: &DocSet) -> Result<Vec<RecordBatch>> {
-        let (max_scores, batches): (Vec<_>, Vec<_>) = self
+        let results = self
             .inverted_list
             .into_par_iter()
-            .map(|mut list| (list.calculate_max_score(docs), list.to_batch()))
-            .unzip();
+            .map(|list| list.to_batch(docs))
+            .collect::<Result<Vec<_>>>()?;
 
-        let mut batches = batches.into_iter().collect::<Result<Vec<_>>>()?;
-        let offsets = batches
-            .iter()
-            .scan(0, |offset, batch| {
-                *offset += batch.num_rows();
-                Some(*offset - batch.num_rows())
-            })
-            .collect_vec();
+        let mut batches = Vec::with_capacity(results.len());
+        let mut offsets = Vec::with_capacity(results.len() + 1);
+        let mut max_scores = Vec::with_capacity(results.len());
+        let mut num_rows = 0;
+        offsets.push(0);
+        for (batch, max_score) in results {
+            num_rows += batch.num_rows();
+            max_scores.push(max_score);
+            offsets.push(num_rows);
+            batches.push(batch);
+        }
         let metadata = HashMap::from_iter(vec![
             ("offsets".to_owned(), serde_json::to_string(&offsets)?),
             ("max_scores".to_owned(), serde_json::to_string(&max_scores)?),
         ]);
 
-        // this is hack, we don't want to duplicate the metadata
+        // this is tricky, we don't want to duplicate the metadata
         batches[0] = batches[0].with_metadata(metadata)?;
         Ok(batches)
     }

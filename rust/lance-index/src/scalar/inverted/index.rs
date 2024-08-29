@@ -588,8 +588,12 @@ impl PostingListBuilder {
         max_score * idf(self.len(), num_docs) * (K1 + 1.0)
     }
 
-    pub fn to_batch(&mut self) -> Result<RecordBatch> {
+    pub fn to_batch(mut self, docs: &DocSet) -> Result<(RecordBatch, f32)> {
         let length = self.len();
+        let num_docs = docs.len();
+        let avgdl = docs.average_length();
+        let mut max_score = 0.0;
+
         let mut row_id_builder = UInt64Builder::with_capacity(length);
         let mut freq_builder = Float32Builder::with_capacity(length);
         let mut position_builder = self
@@ -597,14 +601,23 @@ impl PostingListBuilder {
             .as_mut()
             .map(|_| ListBuilder::with_capacity(Int32Builder::new(), length));
         for index in (0..length).sorted_unstable_by_key(|&i| self.row_ids[i]) {
-            row_id_builder.append_value(self.row_ids[index]);
-            freq_builder.append_value(self.frequencies[index]);
+            let (row_id, freq) = (self.row_ids[index], self.frequencies[index]);
+            // reorder the posting list by row id
+            row_id_builder.append_value(row_id);
+            freq_builder.append_value(freq);
             if let Some(position_builder) = position_builder.as_mut() {
                 let inner_builder = position_builder.values();
                 inner_builder.append_slice(self.positions.as_ref().unwrap().get(index));
                 position_builder.append(true);
             }
+            // calculate the max score
+            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
+            let score = freq / (freq + doc_norm);
+            if score > max_score {
+                max_score = score;
+            }
         }
+        max_score *= idf(self.len(), num_docs) * (K1 + 1.0);
 
         let row_id_col = row_id_builder.finish();
         let freq_col = freq_builder.finish();
@@ -628,7 +641,7 @@ impl PostingListBuilder {
         }
         let schema = arrow_schema::Schema::new(fields);
         let batch = RecordBatch::try_new(Arc::new(schema), columns)?;
-        Ok(batch)
+        Ok((batch, max_score))
     }
 }
 
