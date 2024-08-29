@@ -286,6 +286,7 @@ def test_dictionary(tmp_path):
         assert round_tripped == dict_arr
         assert round_tripped.type == dict_arr.type
 
+
 def test_write_read_global_buffer(tmp_path):
     table = pa.table({"a": [1, 2, 3]})
     path = tmp_path / "foo.lance"
@@ -300,8 +301,8 @@ def test_write_read_global_buffer(tmp_path):
         global_buffer_bytes
     )
     assert (
-            bytes(reader.read_global_buffer(global_buffer_pos)).decode()
-            == global_buffer_text
+        bytes(reader.read_global_buffer(global_buffer_pos)).decode()
+        == global_buffer_text
     )
 
 
@@ -316,6 +317,6 @@ def test_write_read_additional_schema_metadata(tmp_path):
     reader = LanceFileReader(str(path))
     assert reader.read_all().to_table() == table
     assert (
-            reader.metadata().schema.metadata.get(schema_metadata_key.encode()).decode()
-            == schema_metadata_value
+        reader.metadata().schema.metadata.get(schema_metadata_key.encode()).decode()
+        == schema_metadata_value
     )
