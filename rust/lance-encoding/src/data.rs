@@ -107,7 +107,7 @@ impl NullableDataBlock {
 }
 
 /// A data block for a single buffer of data where each element has a fixed number of bits
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct FixedWidthDataBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -136,16 +136,16 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
 
-    fn into_buffers(self) -> Vec<LanceBuffer> {
+    pub fn into_buffers(self) -> Vec<LanceBuffer> {
         vec![self.data]
     }
 
-    fn borrow_and_clone(&mut self) -> Self {
+    pub fn borrow_and_clone(&mut self) -> Self {
         Self {
             data: self.data.borrow_and_clone(),
             bits_per_value: self.bits_per_value,
@@ -153,7 +153,7 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn try_clone(&self) -> Result<Self> {
+    pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
