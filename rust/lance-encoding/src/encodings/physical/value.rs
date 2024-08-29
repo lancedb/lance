@@ -403,6 +403,12 @@ pub(crate) mod tests {
                 3,
             ),
             (
+                // check it will not pack with signed bit if all values of signed type are negative
+                DataType::Int8,
+                Arc::new(Int8Array::from_iter_values(vec![-2, -3, -4, -5])),
+                3,
+            ),
+            (
                 DataType::Int16,
                 Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, -4, 5 << 8])),
                 12,
