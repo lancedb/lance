@@ -11,7 +11,8 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_index::vector::flat::storage::FlatStorage;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -500,8 +501,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 let reader = FileReader::try_open(
                     scheduler.open_file(&storage_part_path).await?,
                     None,
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
                     &FileMetadataCache::no_cache(),
+                    FileReaderOptions::default(),
                 )
                 .await?;
                 let batches = reader
@@ -533,8 +535,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 let reader = FileReader::try_open(
                     scheduler.open_file(&index_part_path).await?,
                     None,
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
                     &FileMetadataCache::no_cache(),
+                    FileReaderOptions::default(),
                 )
                 .await?;
                 let batches = reader

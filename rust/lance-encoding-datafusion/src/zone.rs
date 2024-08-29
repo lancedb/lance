@@ -26,7 +26,7 @@ use lance_datafusion::planner::Planner;
 use lance_encoding::{
     buffer::LanceBuffer,
     decoder::{
-        decode_batch, ColumnInfoIter, DecoderMiddlewareChain, FieldScheduler, FilterExpression,
+        decode_batch, ColumnInfoIter, DecoderPlugins, FieldScheduler, FilterExpression,
         PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
@@ -34,6 +34,7 @@ use lance_encoding::{
         FieldEncoder, OutOfLineBuffers,
     },
     format::pb,
+    repdef::RepDefBuilder,
     EncodingsIo,
 };
 
@@ -127,6 +128,7 @@ fn path_to_expr(path: &VecDeque<u32>) -> Expr {
 }
 
 /// If a column has zone info in the encoding description then extract it
+#[allow(unused)]
 pub(crate) fn extract_zone_info(
     column_info: &mut ColumnInfoIter,
     data_type: &DataType,
@@ -385,7 +387,8 @@ impl ZoneMapsFieldScheduler {
         let zone_maps_batch = decode_batch(
             &zone_maps_batch,
             &FilterExpression::no_filter(),
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
+            /*should_validate= */ false,
         )
         .await?;
 
@@ -599,6 +602,8 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
     ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
         // TODO: If we do the zone map calculation as part of the encoding task then we can
         // parallelize statistics gathering.  Could be faster too since the encoding task is
@@ -606,7 +611,8 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         // probably too big for the CPU cache anyways).  We can worry about this if we need
         // to improve write speed.
         self.update(&array)?;
-        self.items_encoder.maybe_encode(array, external_buffers)
+        self.items_encoder
+            .maybe_encode(array, external_buffers, repdef, row_number)
     }
 
     fn flush(
@@ -674,17 +680,13 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_expr::{col, BinaryExpr, Expr, Operator};
     use lance_datagen::{BatchCount, RowCount};
-    use lance_encoding::decoder::{
-        CoreFieldDecoderStrategy, DecoderMiddlewareChain, FilterExpression,
-    };
+    use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
     use lance_file::v2::{
         testing::{count_lance_file, write_lance_file, FsFixture},
         writer::FileWriterOptions,
     };
 
-    use crate::{
-        substrait::FilterExpressionExt, LanceDfFieldDecoderStrategy, LanceDfFieldEncodingStrategy,
-    };
+    use crate::{substrait::FilterExpressionExt, LanceDfFieldEncodingStrategy};
 
     #[test_log::test(tokio::test)]
     async fn test_basic_stats() {
@@ -701,13 +703,7 @@ mod tests {
 
         let written_file = write_lance_file(data, &fs, options).await;
 
-        let decoder_middleware = Arc::new(
-            DecoderMiddlewareChain::new()
-                .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(
-                    written_file.schema.clone(),
-                )))
-                .add_strategy(Arc::new(CoreFieldDecoderStrategy::default())),
-        );
+        let decoder_middleware: Arc<DecoderPlugins> = Arc::default();
 
         let num_rows = written_file
             .data

@@ -7,13 +7,17 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
 use crate::buffer::LanceBuffer;
-use crate::data::DataBlock;
+use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
+use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::{BlobFieldEncoder, DESC_FIELD};
+use crate::encodings::logical::primitive::RepDefPrimitiveFieldEncoder;
+use crate::encodings::logical::r#struct::RepDefStructFieldEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
@@ -21,6 +25,7 @@ use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
+use crate::repdef::RepDefBuilder;
 use crate::version::LanceFileVersion;
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -75,10 +80,17 @@ impl EncodedArray {
 /// For example, FixedSizeList<Int32> will have two EncodedArray instances and one EncodedPage
 #[derive(Debug)]
 pub struct EncodedPage {
-    // The encoded array data
-    pub array: EncodedArray,
+    // The encoded page buffers
+    pub data: Vec<LanceBuffer>,
+    // A description of the encoding used to encode the page
+    pub description: PageEncoding,
     /// The number of rows in the encoded page
     pub num_rows: u64,
+    /// The top-level row number of the first row in the page
+    ///
+    /// Generally the number of "top-level" rows and the number of rows are the same.  However,
+    /// in list/fixed-size-list data this is not.
+    pub row_number: u64,
     /// The index of the column
     pub column_idx: u32,
 }
@@ -115,6 +127,125 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
         data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray>;
+}
+
+pub const SECTOR_SIZE: u64 = 128;
+pub const MIN_MINIBLOCK_SIZE: u64 = 3 * 1024;
+pub const MAX_MINIBLOCK_SIZE: u64 = MIN_MINIBLOCK_SIZE + (15 * SECTOR_SIZE);
+
+pub struct MiniBlockCompressed {
+    pub data: LanceBuffer,
+    pub chunks: Vec<MiniBlockChunk>,
+    pub num_values: u64,
+}
+
+impl MiniBlockCompressed {
+    pub fn serialize_meta(&self) -> LanceBuffer {
+        let mut buf = Vec::with_capacity(self.chunks.len());
+        for (chunk_idx, chunk) in self.chunks.iter().enumerate() {
+            if chunk_idx < self.chunks.len() - 1 {
+                debug_assert!(chunk.num_sectors > 0);
+                debug_assert!(chunk.log_num_values > 0);
+            }
+            debug_assert!(chunk.num_sectors < 16);
+            debug_assert!(chunk.log_num_values < 16);
+            println!(
+                "Serializing chunk: num_sectors={} log_num_values={}",
+                chunk.num_sectors, chunk.log_num_values
+            );
+            buf.push(chunk.num_sectors << 4 | chunk.log_num_values);
+            println!("Serialized chunk: {}", buf[buf.len() - 1]);
+        }
+        LanceBuffer::Owned(buf)
+    }
+}
+
+pub const MINIBLOCK_SECTOR_SIZE: u64 = 128;
+
+pub struct MiniBlockChunk {
+    // The number of 128 byte sectors that make up the chunk.
+    // Every chunk is assumed to be at least 3KiB and so a value of 0 would mean 3KiB
+    // and a value of 15 would mean 6016 bytes.
+    //
+    // This value must be < 16 (only 4 bits are used to store it)
+    pub num_sectors: u8,
+    // The log (base 2) of the number of values in the chunk.  If this is the final chunk
+    // then this should be 0 (the number of values will be calculated by subtracting the
+    // size of all other chunks from the total size of the page)
+    //
+    // For example, 1 would mean there are 2 values in the chunk and 15 would mean there
+    // are 32Ki values in the chunk.
+    pub log_num_values: u8,
+}
+
+impl MiniBlockChunk {
+    pub fn num_values(&self) -> u64 {
+        1 << self.log_num_values
+    }
+
+    pub fn num_bytes(&self) -> u64 {
+        MIN_MINIBLOCK_SIZE + (self.num_sectors as u64) * MINIBLOCK_SECTOR_SIZE
+    }
+}
+
+/// Trait for compression algorithms that are suitable for use in the miniblock structural encoding
+///
+/// These compression algorithms should be capable of encoding the data into small chunks (between 3KiB and ~6KiB)
+/// where each chunk (except the last) has 2^N values (N can vary between chunks)
+pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress `chunk`, starting at `value_offset`, until either `target_bytes` is reached or the chunk is fully compressed.
+    ///
+    /// Each value will also need `extra_bits_per_value` bits to be stored (typically repetition and definition info) and so
+    /// this must be taken into account when deciding how many values to compress.
+    ///
+    /// The chunk created by this method must be as close as possible to `target_bytes` but never larger
+    fn compress(&self, chunk: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)>;
+}
+
+/// Trait for compression algorithms that are suitable for use in the zipped structural encoding
+///
+/// Unlike [`FixedPerValueCompressor`] the number of bytes per block can vary between values (and can
+/// even be 0 bytes for empty/null values).  This is useful for encoding data where the values are
+/// too large for mini-block encoding.  However, unlike [`BlockCompressor`] the data is still encoded
+/// in a way that supports random access.
+pub trait VariablePerValueCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress the data into a single buffer where each value can be decoded in isolation
+    ///
+    /// Also returns a description of the compression that can be used to decompress when reading the data back
+    fn compress(&self, data: DataBlock) -> Result<(VariableWidthBlock, pb::ArrayEncoding)>;
+}
+
+/// Trait for compression algorithms that are suitable for use in the zipped structural encoding
+///
+/// Compared to [`FixedPerValueCompressor`], these compressors are capable of compressing the data
+/// so that every value has the exact same number of bits per value.  For example, this is useful
+/// for encoding vector embeddings where every value has a fixed size but the values themselves are
+/// too large to use mini-block.
+///
+/// The advantage of a fixed-bytes-per-value is that we can do random access in 1 IOP instead of 2
+/// and do not need a repetition index.
+pub trait FixedPerValueCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress the data into a single buffer where each value is encoded with the same number of bits
+    ///
+    /// Also returns a description of the compression that can be used to decompress when reading the data back
+    fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, pb::ArrayEncoding)>;
+}
+
+/// Trait for compression algorithms that are suitable for use in the megablock structural encoding
+///
+/// This is the most general type of compression.  There are no constraints on the method of compression it is
+/// assumed that the entire block of data will be present at decompression.
+///
+/// That being said, this is the least appropriate for random access because we must load the entire
+/// mega block to access any single value.  This should only be used for cases where random access is never
+/// required (e.g. when encoding metadata buffers like a dictionary)
+///
+/// All other compressors can act as a BlockCompressor as well
+pub trait BlockCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress the data into a single buffer
+    ///
+    /// Also returns a description of the compression that can be used to decompress when reading the data back
+    fn compress(&self, data: DataBlock) -> Result<(LanceBuffer, pb::ArrayEncoding)>;
 }
 
 pub fn values_column_encoding() -> pb::ColumnEncoding {
@@ -212,6 +343,8 @@ pub trait FieldEncoder: Send {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
     ) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
     ///
@@ -247,6 +380,12 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
         arrays: &[ArrayRef],
         field: &Field,
     ) -> Result<Box<dyn ArrayEncoder>>;
+
+    fn create_block_compressor(&self, field: &Field) -> Result<Box<dyn BlockCompressor>>;
+
+    fn create_fixed_per_value(&self, field: &Field) -> Result<Box<dyn FixedPerValueCompressor>>;
+
+    fn create_miniblock_compressor(&self, field: &Field) -> Result<Box<dyn MiniBlockCompressor>>;
 }
 
 /// The core array encoding strategy is a set of basic encodings that
@@ -574,10 +713,26 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             Some(&field.metadata),
         )
     }
+
+    fn create_miniblock_compressor(&self, field: &Field) -> Result<Box<dyn MiniBlockCompressor>> {
+        assert!(field.data_type().byte_width() > 0);
+        Ok(Box::new(ValueEncoder::default()))
+    }
+
+    fn create_fixed_per_value(&self, field: &Field) -> Result<Box<dyn FixedPerValueCompressor>> {
+        // Right now we only need block compressors for rep/def which is u16.  Will need to expand
+        // this if we need block compression of other types.
+        assert!(field.data_type().byte_width() > 0);
+        Ok(Box::new(ValueEncoder::default()))
+    }
+
+    fn create_block_compressor(&self, _field: &Field) -> Result<Box<dyn BlockCompressor>> {
+        todo!()
+    }
 }
 /// Keeps track of the current column index and makes a mapping
 /// from field id to column index
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ColumnIndexSequence {
     current_index: u32,
     mapping: Vec<(u32, u32)>,
@@ -636,6 +791,14 @@ pub trait FieldEncodingStrategy: Send + Sync + std::fmt::Debug {
         column_index: &mut ColumnIndexSequence,
         options: &EncodingOptions,
     ) -> Result<Box<dyn FieldEncoder>>;
+}
+
+pub fn default_encoding_strategy(version: LanceFileVersion) -> Box<dyn FieldEncodingStrategy> {
+    match version.resolve() {
+        LanceFileVersion::Legacy => panic!(),
+        LanceFileVersion::V2_0 => Box::new(CoreFieldEncodingStrategy::default()),
+        _ => Box::new(RepDefFieldEncodingStrategy::default()),
+    }
 }
 
 /// The core field encoding strategy is a set of basic encodings that
@@ -802,6 +965,146 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
     }
 }
 
+#[derive(Debug)]
+pub struct RepDefFieldEncodingStrategy {
+    pub array_encoding_strategy: Arc<dyn ArrayEncodingStrategy>,
+    pub version: LanceFileVersion,
+}
+
+impl Default for RepDefFieldEncodingStrategy {
+    fn default() -> Self {
+        Self {
+            array_encoding_strategy: Arc::<CoreArrayEncodingStrategy>::default(),
+            version: LanceFileVersion::default(),
+        }
+    }
+}
+
+impl RepDefFieldEncodingStrategy {
+    fn is_primitive_type(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Decimal128(_, _)
+                | DataType::Decimal256(_, _)
+                | DataType::Duration(_)
+                | DataType::Float16
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Int8
+                | DataType::Interval(_)
+                | DataType::Null
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(_, _)
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::UInt8
+                | DataType::FixedSizeBinary(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::Utf8
+                | DataType::LargeUtf8,
+        )
+    }
+}
+
+impl FieldEncodingStrategy for RepDefFieldEncodingStrategy {
+    fn create_field_encoder(
+        &self,
+        encoding_strategy_root: &dyn FieldEncodingStrategy,
+        field: &Field,
+        column_index: &mut ColumnIndexSequence,
+        options: &EncodingOptions,
+    ) -> Result<Box<dyn FieldEncoder>> {
+        let data_type = field.data_type();
+        if Self::is_primitive_type(&data_type) {
+            Ok(Box::new(RepDefPrimitiveFieldEncoder::try_new(
+                options,
+                self.array_encoding_strategy.clone(),
+                column_index.next_column_index(field.id as u32),
+                field.clone(),
+            )?))
+        } else {
+            match data_type {
+                DataType::List(_child) => {
+                    let list_idx = column_index.next_column_index(field.id as u32);
+                    let inner_encoding = encoding_strategy_root.create_field_encoder(
+                        encoding_strategy_root,
+                        &field.children[0],
+                        column_index,
+                        options,
+                    )?;
+                    let offsets_encoder =
+                        Arc::new(BasicEncoder::new(Box::new(ValueEncoder::default())));
+                    Ok(Box::new(ListFieldEncoder::new(
+                        inner_encoding,
+                        offsets_encoder,
+                        options.cache_bytes_per_column,
+                        options.keep_original_array,
+                        list_idx,
+                    )))
+                }
+                DataType::Struct(_) => {
+                    let field_metadata = &field.metadata;
+                    if field_metadata
+                        .get("packed")
+                        .map(|v| v == "true")
+                        .unwrap_or(false)
+                    {
+                        Ok(Box::new(RepDefPrimitiveFieldEncoder::try_new(
+                            options,
+                            self.array_encoding_strategy.clone(),
+                            column_index.next_column_index(field.id as u32),
+                            field.clone(),
+                        )?))
+                    } else {
+                        let children_encoders = field
+                            .children
+                            .iter()
+                            .map(|field| {
+                                self.create_field_encoder(
+                                    encoding_strategy_root,
+                                    field,
+                                    column_index,
+                                    options,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(Box::new(RepDefStructFieldEncoder::new(children_encoders)))
+                    }
+                }
+                DataType::Dictionary(_, value_type) => {
+                    // A dictionary of primitive is, itself, primitive
+                    if Self::is_primitive_type(&value_type) {
+                        Ok(Box::new(RepDefPrimitiveFieldEncoder::try_new(
+                            options,
+                            self.array_encoding_strategy.clone(),
+                            column_index.next_column_index(field.id as u32),
+                            field.clone(),
+                        )?))
+                    } else {
+                        // A dictionary of logical is, itself, logical and we don't support that today
+                        // It could be possible (e.g. store indices in one column and values in remaining columns)
+                        // but would be a significant amount of work
+                        //
+                        // An easier fallback implementation would be to decode-on-write and encode-on-read
+                        Err(Error::NotSupported { source: format!("cannot encode a dictionary column whose value type is a logical type ({})", value_type).into(), location: location!() })
+                    }
+                }
+                _ => todo!("Implement encoding for field {}", field),
+            }
+        }
+    }
+}
+
 /// A batch encoder that encodes RecordBatch objects by delegating
 /// to field encoders for each top-level field in the batch.
 pub struct BatchEncoder {
@@ -858,7 +1161,7 @@ pub struct EncodedBatch {
 }
 
 fn write_page_to_data_buffer(page: EncodedPage, data_buffer: &mut BytesMut) -> PageInfo {
-    let (buffers, encoding) = page.array.into_buffers();
+    let buffers = page.data;
     let mut buffer_offsets_and_sizes = Vec::with_capacity(buffers.len());
     for buffer in buffers {
         let buffer_offset = data_buffer.len() as u64;
@@ -866,10 +1169,12 @@ fn write_page_to_data_buffer(page: EncodedPage, data_buffer: &mut BytesMut) -> P
         let size = data_buffer.len() as u64 - buffer_offset;
         buffer_offsets_and_sizes.push((buffer_offset, size));
     }
+
     PageInfo {
         buffer_offsets_and_sizes: Arc::from(buffer_offsets_and_sizes),
-        encoding,
+        encoding: page.description,
         num_rows: page.num_rows,
+        priority: page.row_number,
     }
 }
 
@@ -894,7 +1199,9 @@ pub async fn encode_batch(
     let mut col_idx_offset = 0;
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
         let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
-        let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers)?;
+        let repdef = RepDefBuilder::default();
+        let encoder = encoder.as_mut();
+        let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);
