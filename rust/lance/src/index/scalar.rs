@@ -111,6 +111,14 @@ pub(super) async fn build_scalar_index(
         Some(ScalarIndexType::LabelList) => {
             train_label_list_index(training_request, &index_store).await
         }
+        Some(ScalarIndexType::Inverted) => {
+            train_inverted_index(
+                training_request,
+                &index_store,
+                InvertedIndexParams::default(),
+            )
+            .await
+        }
         _ => {
             // The BTree index implementation leverages the legacy format's batch offset,
             // which has been removed from new format, so keep using the legacy format for now.
