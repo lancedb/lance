@@ -571,12 +571,6 @@ impl PostingListBuilder {
         self.len() == 0
     }
 
-    pub fn clear(&mut self) {
-        self.row_ids = Vec::new();
-        self.frequencies = Vec::new();
-        self.positions = self.positions.take().map(|_| PositionBuilder::new());
-    }
-
     pub fn calculate_max_score(&self, docs: &DocSet) -> f32 {
         let num_docs = docs.len();
         let avgdl = docs.average_length();
@@ -611,7 +605,6 @@ impl PostingListBuilder {
                 position_builder.append(true);
             }
         }
-        self.clear();
 
         let row_id_col = row_id_builder.finish();
         let freq_col = freq_builder.finish();
@@ -643,6 +636,12 @@ impl PostingListBuilder {
 pub struct PositionBuilder {
     positions: Vec<i32>,
     offsets: Vec<usize>,
+}
+
+impl Default for PositionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PositionBuilder {

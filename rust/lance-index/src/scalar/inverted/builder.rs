@@ -156,7 +156,7 @@ impl InvertedIndexBuilder {
                                 positions.sort_unstable();
                             });
                         }
-                        (num_tokens, token_occurrences.drain().collect(), row_id)
+                        (num_tokens, std::mem::take(token_occurrences), row_id)
                     },
                 )
                 .collect::<Vec<_>>();
@@ -207,7 +207,7 @@ impl InvertedIndexBuilder {
         // calculate the max BM25 score for each posting list
         {
             let start = std::time::Instant::now();
-            let batches = self.invert_list.to_batches(&self.docs)?;
+            let batches = std::mem::take(&mut self.invert_list).to_batches(&self.docs)?;
             log::info!("convert to batches: {:?}", start.elapsed());
             let start = std::time::Instant::now();
             let mut invert_list_writer = dest_store
@@ -243,11 +243,11 @@ pub struct InvertedList {
 impl InvertedList {
     // the schema of the inverted list is | row_id | frequency |
     // and store the offset of
-    pub fn to_batches(&mut self, docs: &DocSet) -> Result<Vec<RecordBatch>> {
+    pub fn to_batches(self, docs: &DocSet) -> Result<Vec<RecordBatch>> {
         let (max_scores, batches): (Vec<_>, Vec<_>) = self
             .inverted_list
-            .par_iter_mut()
-            .map(|list| (list.calculate_max_score(docs), list.to_batch()))
+            .into_par_iter()
+            .map(|mut list| (list.calculate_max_score(docs), list.to_batch()))
             .unzip();
 
         let mut batches = batches.into_iter().collect::<Result<Vec<_>>>()?;
