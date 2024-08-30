@@ -113,9 +113,17 @@ impl TestDatasetGenerator {
         let operation = Operation::Overwrite { fragments, schema };
 
         let registry = Arc::new(ObjectStoreRegistry::default());
-        Dataset::commit(uri, operation, None, Default::default(), None, registry)
-            .await
-            .unwrap()
+        Dataset::commit(
+            uri,
+            operation,
+            None,
+            Default::default(),
+            None,
+            registry,
+            false,
+        )
+        .await
+        .unwrap()
     }
 
     fn make_schema(&self, rng: &mut impl Rng) -> Schema {

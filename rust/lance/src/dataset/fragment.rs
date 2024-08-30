@@ -2246,7 +2246,7 @@ mod tests {
         };
 
         let registry = Arc::new(ObjectStoreRegistry::default());
-        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry)
+        let new_dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
             .await
             .unwrap();
 
@@ -2346,7 +2346,7 @@ mod tests {
             };
 
             let registry = Arc::new(ObjectStoreRegistry::default());
-            let dataset = Dataset::commit(test_uri, op, None, None, None, registry)
+            let dataset = Dataset::commit(test_uri, op, None, None, None, registry, false)
                 .await
                 .unwrap();
 
@@ -2572,6 +2572,7 @@ mod tests {
             None,
             None,
             registry,
+            false,
         )
         .await?;
 

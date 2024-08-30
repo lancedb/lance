@@ -1751,6 +1751,7 @@ class LanceDataset(pa.dataset.Dataset):
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        enable_v2_manifest_paths: Optional[bool] = None,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -1831,6 +1832,7 @@ class LanceDataset(pa.dataset.Dataset):
             read_version,
             commit_lock,
             storage_options=storage_options,
+            enable_v2_manifest_paths=enable_v2_manifest_paths,
         )
         return LanceDataset(base_uri, storage_options=storage_options)
 
@@ -2818,6 +2820,7 @@ def write_dataset(
     storage_options: Optional[Dict[str, str]] = None,
     data_storage_version: str = "legacy",
     use_legacy_format: Optional[bool] = None,
+    enable_v2_manifest_paths: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -2897,6 +2900,7 @@ def write_dataset(
         "progress": progress,
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
+        "enable_v2_manifest_paths": enable_v2_manifest_paths,
     }
 
     if commit_lock:

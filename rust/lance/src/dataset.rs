@@ -101,6 +101,7 @@ pub struct Dataset {
     pub(crate) manifest: Arc<Manifest>,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
+    pub manifest_naming_scheme: ManifestNamingScheme,
 }
 
 /// Dataset Version
@@ -345,6 +346,7 @@ impl Dataset {
             manifest,
             self.session.clone(),
             self.commit_handler.clone(),
+            manifest_location.naming_scheme,
         )
         .await
     }
@@ -427,6 +429,7 @@ impl Dataset {
         manifest: Manifest,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
+        manifest_naming_scheme: ManifestNamingScheme,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -441,6 +444,7 @@ impl Dataset {
             commit_handler,
             session,
             tags,
+            manifest_naming_scheme,
         })
     }
 
@@ -528,6 +532,14 @@ impl Dataset {
             }
         }
 
+        let manifest_naming_scheme = if let Some(d) = dataset.as_ref() {
+            d.manifest_naming_scheme
+        } else if params.enable_v2_manifest_paths {
+            ManifestNamingScheme::V2
+        } else {
+            ManifestNamingScheme::V1
+        };
+
         let params = params; // discard mut
 
         if let Some(d) = dataset.as_ref() {
@@ -579,6 +591,7 @@ impl Dataset {
                 &transaction,
                 &manifest_config,
                 &Default::default(),
+                manifest_naming_scheme,
             )
             .await?
         } else {
@@ -588,6 +601,7 @@ impl Dataset {
                 &base,
                 &transaction,
                 &manifest_config,
+                manifest_naming_scheme,
             )
             .await?
         };
@@ -602,6 +616,7 @@ impl Dataset {
             session: Arc::new(Session::default()),
             commit_handler,
             tags,
+            manifest_naming_scheme,
         })
     }
 
@@ -672,6 +687,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -758,6 +774,7 @@ impl Dataset {
                 &transaction,
                 &Default::default(),
                 &Default::default(),
+                self.manifest_naming_scheme,
             )
             .await?,
         );
@@ -836,6 +853,7 @@ impl Dataset {
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
         object_store_registry: Arc<ObjectStoreRegistry>,
+        enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
             || match operation {
@@ -889,6 +907,14 @@ impl Dataset {
             None
         };
 
+        let manifest_naming_scheme = if let Some(ds) = &dataset {
+            ds.manifest_naming_scheme
+        } else if enable_v2_manifest_paths {
+            ManifestNamingScheme::V2
+        } else {
+            ManifestNamingScheme::V1
+        };
+
         let transaction = Transaction::new(read_version, operation, None);
 
         let manifest = if let Some(dataset) = &dataset {
@@ -899,6 +925,7 @@ impl Dataset {
                 &transaction,
                 &Default::default(),
                 &Default::default(),
+                manifest_naming_scheme,
             )
             .await?
         } else {
@@ -908,6 +935,7 @@ impl Dataset {
                 &base,
                 &transaction,
                 &Default::default(),
+                manifest_naming_scheme,
             )
             .await?
         };
@@ -923,6 +951,7 @@ impl Dataset {
             session: Arc::new(Session::default()),
             commit_handler,
             tags,
+            manifest_naming_scheme,
         })
     }
 
@@ -1082,6 +1111,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -1381,6 +1411,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -1424,12 +1455,11 @@ impl DatasetTakeRows for Dataset {
 
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,                 // default true
-    timestamp: Option<SystemTime>,                // default None
-    use_move_stable_row_ids: bool,                // default false
-    use_legacy_format: Option<bool>,              // default None
-    storage_format: Option<DataStorageFormat>,    // default None
-    manifest_naming_scheme: ManifestNamingScheme, // default V1.
+    auto_set_feature_flags: bool,              // default true
+    timestamp: Option<SystemTime>,             // default None
+    use_move_stable_row_ids: bool,             // default false
+    use_legacy_format: Option<bool>,           // default None
+    storage_format: Option<DataStorageFormat>, // default None
 }
 
 impl Default for ManifestWriteConfig {
@@ -1440,7 +1470,6 @@ impl Default for ManifestWriteConfig {
             use_move_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
-            manifest_naming_scheme: ManifestNamingScheme::V1,
         }
     }
 }
@@ -1453,6 +1482,7 @@ pub(crate) async fn write_manifest_file(
     manifest: &mut Manifest,
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
+    naming_scheme: ManifestNamingScheme,
 ) -> std::result::Result<(), CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
@@ -1469,7 +1499,7 @@ pub(crate) async fn write_manifest_file(
             base_path,
             object_store,
             write_manifest_file_to_path,
-            config.manifest_naming_scheme,
+            naming_scheme,
         )
         .await?;
 
@@ -1961,8 +1991,8 @@ mod tests {
                 use_move_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
-                manifest_naming_scheme: ManifestNamingScheme::V1,
             },
+            dataset.manifest_naming_scheme,
         )
         .await
         .unwrap();
@@ -2627,6 +2657,73 @@ mod tests {
     async fn test_open_dataset_not_found() {
         let result = Dataset::open(".").await;
         assert!(matches!(result.unwrap_err(), Error::DatasetNotFound { .. }));
+    }
+
+    fn assert_all_manifests_use_scheme(test_dir: &TempDir, scheme: ManifestNamingScheme) {
+        let entries_names = test_dir
+            .path()
+            .join("_versions")
+            .read_dir()
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            entries_names
+                .iter()
+                .all(|name| ManifestNamingScheme::detect_scheme(name) == Some(scheme)),
+            "Entries: {:?}",
+            entries_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_manifest_path_create() {
+        // Can create a dataset, using V2 paths
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(10))
+            .unwrap();
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema().clone()),
+            test_uri,
+            Some(WriteParams {
+                enable_v2_manifest_paths: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+
+        // Appending to it will continue to use those paths
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema().clone()),
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+
+        UpdateBuilder::new(Arc::new(dataset))
+            .update_where("key = 5")
+            .unwrap()
+            .set("key", "200")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
     }
 
     #[rstest]

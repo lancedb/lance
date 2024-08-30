@@ -111,6 +111,10 @@ pub struct WriteParams {
     /// secondary indices need to be updated to point to new row ids.
     pub enable_move_stable_row_ids: bool,
 
+    /// If set to true, the writer will use v2 manifest paths. These allow
+    /// O(1) lookups for the latest manifest on object storage.
+    pub enable_v2_manifest_paths: bool,
+
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
@@ -128,6 +132,7 @@ impl Default for WriteParams {
             commit_handler: None,
             data_storage_version: None,
             enable_move_stable_row_ids: false,
+            enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }

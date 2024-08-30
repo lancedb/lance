@@ -335,6 +335,7 @@ impl UpdateJob {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.dataset.manifest_naming_scheme,
         )
         .await?;
 

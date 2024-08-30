@@ -281,16 +281,15 @@ impl DatasetBuilder {
             }
         }
 
-        let manifest = if manifest.is_some() {
-            let mut manifest = manifest.unwrap();
+        let (manifest, manifest_naming_scheme) = if let Some(mut manifest) = manifest {
+            let location = commit_handler
+                .resolve_version_location(&base_path, manifest.version, &object_store.inner)
+                .await?;
             if manifest.schema.has_dictionary_types() {
-                let path = commit_handler
-                    .resolve_version(&base_path, manifest.version, &object_store.inner)
-                    .await?;
-                let reader = object_store.open(&path).await?;
+                let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
-            manifest
+            (manifest, location.naming_scheme)
         } else {
             let manifest_location = match version {
                 Some(version) => {
@@ -308,7 +307,8 @@ impl DatasetBuilder {
                     })?,
             };
 
-            Dataset::load_manifest(&object_store, &manifest_location).await?
+            let manifest = Dataset::load_manifest(&object_store, &manifest_location).await?;
+            (manifest, manifest_location.naming_scheme)
         };
 
         Dataset::checkout_manifest(
@@ -318,6 +318,7 @@ impl DatasetBuilder {
             manifest,
             session,
             commit_handler,
+            manifest_naming_scheme,
         )
         .await
     }

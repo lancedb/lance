@@ -991,6 +991,7 @@ impl MergeInsertJob {
             &transaction,
             &Default::default(),
             &Default::default(),
+            dataset.manifest_naming_scheme,
         )
         .await?;
 

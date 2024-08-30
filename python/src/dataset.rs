@@ -1218,6 +1218,7 @@ impl Dataset {
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1255,6 +1256,7 @@ impl Dataset {
                     object_store_params,
                     commit_handler,
                     object_store_registry,
+                    enable_v2_manifest_paths.unwrap_or(false),
                 )
                 .await
             })?
@@ -1462,6 +1464,12 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
                 storage_options: Some(storage_options),
                 ..Default::default()
             });
+        }
+
+        if let Some(enable_v2_manifest_paths) =
+            get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
+        {
+            p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
         p.commit_handler = get_commit_handler(options);
