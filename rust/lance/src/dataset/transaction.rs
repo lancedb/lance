@@ -35,7 +35,10 @@
 //! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
@@ -79,7 +82,9 @@ pub struct Transaction {
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
-    Append { fragments: Vec<Fragment> },
+    Append {
+        fragments: Vec<Fragment>,
+    },
     /// Updated fragments contain those that have been modified with new deletion
     /// files. The deleted fragment IDs are those that should be removed from
     /// the manifest.
@@ -120,12 +125,16 @@ pub enum Operation {
         schema: Schema,
     },
     /// Restore an old version of the database
-    Restore { version: u64 },
+    Restore {
+        version: u64,
+    },
     /// Reserves fragment ids for future use
     /// This can be used when row ids need to be known before a transaction
     /// has been committed.  It is used during a rewrite operation to allow
     /// indices to be remapped to the new row ids as part of the operation.
-    ReserveFragments { num_fragments: u32 },
+    ReserveFragments {
+        num_fragments: u32,
+    },
 
     /// Update values in the dataset.
     Update {
@@ -138,7 +147,17 @@ pub enum Operation {
     },
 
     /// Project to a new schema. This only changes the schema, not the data.
-    Project { schema: Schema },
+    Project {
+        schema: Schema,
+    },
+
+    /// Change the table metadata. Conflict if same key referenced by concurrent transactions.
+    SetMetadata {
+        table_metadata: HashMap<String, String>,
+    },
+    DeleteMetadata {
+        table_metadata_keys: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +184,8 @@ impl Operation {
             | Self::CreateIndex { .. }
             | Self::ReserveFragments { .. }
             | Self::Project { .. }
+            | Self::SetMetadata { .. }
+            | Self::DeleteMetadata { .. }
             | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
                 updated_fragments,
@@ -195,11 +216,32 @@ impl Operation {
         }
     }
 
+    /// Returns the metadata keys that have been modified by this operation.
+    fn metadata_keys(&self) -> Vec<String> {
+        match self {
+            Self::SetMetadata { table_metadata } => {
+                let vec: Vec<String> = table_metadata.keys().cloned().collect();
+                vec
+            }
+            Self::DeleteMetadata {
+                table_metadata_keys,
+            } => table_metadata_keys.clone(),
+            _ => Vec::<String>::new(),
+        }
+    }
+
     /// Check whether another operation modifies the same fragment IDs as this one.
     fn modifies_same_ids(&self, other: &Self) -> bool {
         let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
         let mut other_ids = other.modified_fragment_ids();
         other_ids.any(|id| self_ids.contains(&id))
+    }
+
+    /// Check whether another operation modifies the same table metadata as this one.
+    fn modifies_same_metadata(&self, other: &Self) -> bool {
+        let self_keys = self.metadata_keys();
+        let other_keys = other.metadata_keys();
+        self_keys.iter().any(|x| other_keys.contains(x))
     }
 
     pub fn name(&self) -> &str {
@@ -214,6 +256,8 @@ impl Operation {
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
+            Self::SetMetadata { .. } => "SetMetadata",
+            Self::DeleteMetadata { .. } => "DeleteMetadata",
         }
     }
 }
@@ -298,6 +342,14 @@ impl Transaction {
                 Operation::Append { .. } => false,
                 _ => true,
             },
+            Operation::SetMetadata { .. } | Operation::DeleteMetadata { .. } => {
+                match &other.operation {
+                    Operation::SetMetadata { .. } | Operation::DeleteMetadata { .. } => {
+                        self.operation.modifies_same_metadata(&other.operation)
+                    }
+                    _ => false,
+                }
+            }
             // Merge changes the schema, but preserves row ids, so the only operations
             // it's compatible with is CreateIndex and ReserveFragments.
             Operation::Merge { .. } => !matches!(
@@ -586,6 +638,7 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
+            Operation::SetMetadata { .. } | Operation::DeleteMetadata { .. } => {}
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -625,6 +678,16 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
+
+        match &self.operation {
+            Operation::SetMetadata { table_metadata } => {
+                manifest.set_metadata(table_metadata.clone())
+            }
+            Operation::DeleteMetadata {
+                table_metadata_keys,
+            } => manifest.delete_metadata(table_metadata_keys.clone()),
+            _ => {}
+        }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
             manifest.max_fragment_id += num_fragments;
@@ -914,6 +977,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     schema: Schema::from(&Fields(schema.clone())),
                 }
             }
+            Some(pb::transaction::Operation::SetMetadata(pb::transaction::SetMetadata {
+                metadata,
+            })) => Operation::SetMetadata {
+                table_metadata: metadata,
+            },
+            Some(pb::transaction::Operation::DeleteMetadata(pb::transaction::DeleteMetadata {
+                metadata_keys,
+            })) => Operation::DeleteMetadata {
+                table_metadata_keys: metadata_keys,
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -1062,6 +1135,16 @@ impl From<&Transaction> for pb::Transaction {
                     schema: Fields::from(schema).0,
                 })
             }
+            Operation::SetMetadata { table_metadata } => {
+                pb::transaction::Operation::SetMetadata(pb::transaction::SetMetadata {
+                    metadata: table_metadata.clone(),
+                })
+            }
+            Operation::DeleteMetadata {
+                table_metadata_keys,
+            } => pb::transaction::Operation::DeleteMetadata(pb::transaction::DeleteMetadata {
+                metadata_keys: table_metadata_keys.clone(),
+            }),
         };
 
         Self {
