@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -77,6 +78,9 @@ pub struct Manifest {
 
     /// The storage format of the data files.
     pub data_storage_format: DataStorageFormat,
+
+    /// Table metadata.
+    pub table_metadata: HashMap<String, String>,
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -99,6 +103,7 @@ impl Manifest {
         data_storage_format: DataStorageFormat,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+
         Self {
             schema,
             version: 1,
@@ -115,6 +120,7 @@ impl Manifest {
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
+            table_metadata: HashMap::new(),
         }
     }
 
@@ -141,6 +147,7 @@ impl Manifest {
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
+            table_metadata: previous.table_metadata.clone(),
         }
     }
 
@@ -158,6 +165,18 @@ impl Manifest {
     /// Set the `timestamp_nanos` value from a Utc DateTime
     pub fn set_timestamp(&mut self, nanos: u128) {
         self.timestamp_nanos = nanos;
+    }
+
+    /// Set the `table_metadata` from a metadata HashMap
+    pub fn set_metadata(&mut self, metadata: HashMap<String, String>) {
+        self.table_metadata.extend(metadata);
+    }
+
+    /// Delete `table_metadata` keys using a Vec of metadata keys
+    pub fn delete_metadata(&mut self, metadata_keys: Vec<String>) {
+        for key in metadata_keys {
+            self.table_metadata.remove(&key);
+        }
     }
 
     /// Check the current fragment list and update the high water mark
@@ -471,6 +490,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
+            table_metadata: p.table_metadata,
         })
     }
 }
@@ -513,6 +533,7 @@ impl From<&Manifest> for pb::Manifest {
                 file_format: m.data_storage_format.file_format.clone(),
                 version: m.data_storage_format.version.clone(),
             }),
+            table_metadata: m.table_metadata.clone(),
         }
     }
 }
@@ -691,5 +712,32 @@ mod tests {
         let manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
         assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn test_table_metadata() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragments = vec![
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
+        ];
+        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+
+        let mut metadata = HashMap::new();
+        metadata.insert("lance:test".to_string(), "value".to_string());
+        metadata.insert("other-key".to_string(), "other-value".to_string());
+
+        manifest.set_metadata(metadata.clone());
+        assert_eq!(manifest.table_metadata, metadata.clone());
+
+        metadata.remove("other-key");
+        manifest.delete_metadata(vec!["other-key".to_string()]);
+        assert_eq!(manifest.table_metadata, metadata);
     }
 }

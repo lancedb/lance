@@ -16,8 +16,10 @@ pub const FLAG_DELETION_FILES: u64 = 1;
 pub const FLAG_MOVE_STABLE_ROW_IDS: u64 = 2;
 /// Files are written with the new v2 format (this flag is no longer used)
 pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
+/// Table metadata is present
+pub const FLAG_TABLE_METADATA: u64 = 8;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 8;
+pub const FLAG_UNKNOWN: u64 = 16;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
@@ -55,6 +57,12 @@ pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) 
         manifest.writer_feature_flags |= FLAG_MOVE_STABLE_ROW_IDS;
     }
 
+    // Test whether any table metadata has been set
+    if !manifest.table_metadata.is_empty() {
+        manifest.reader_feature_flags |= FLAG_TABLE_METADATA;
+        manifest.writer_feature_flags |= FLAG_TABLE_METADATA;
+    }
+
     Ok(())
 }
 
@@ -80,8 +88,12 @@ mod tests {
         assert!(can_read_dataset(super::FLAG_DELETION_FILES));
         assert!(can_read_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
         assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
+        assert!(can_read_dataset(super::FLAG_TABLE_METADATA));
         assert!(can_read_dataset(
-            super::FLAG_DELETION_FILES | super::FLAG_MOVE_STABLE_ROW_IDS
+            super::FLAG_DELETION_FILES
+                | super::FLAG_MOVE_STABLE_ROW_IDS
+                | super::FLAG_USE_V2_FORMAT_DEPRECATED
+                | super::FLAG_TABLE_METADATA
         ));
         assert!(!can_read_dataset(super::FLAG_UNKNOWN));
     }
@@ -91,11 +103,13 @@ mod tests {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
         assert!(can_write_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
-        assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
+        assert!(can_write_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
+        assert!(can_write_dataset(super::FLAG_TABLE_METADATA));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_MOVE_STABLE_ROW_IDS
                 | super::FLAG_USE_V2_FORMAT_DEPRECATED
+                | super::FLAG_TABLE_METADATA
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }

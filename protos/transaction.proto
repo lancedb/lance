@@ -156,6 +156,17 @@ message Transaction {
     // The new fragments where updated rows have been moved to.
     repeated DataFragment new_fragments = 3;
   }
+  
+  // An operation that sets table metadata.
+  message SetMetadata {
+    map<string, string> metadata = 1;
+  }
+  
+  // An operation that deletes table metadata.
+  message DeleteMetadata {
+    repeated string metadata_keys = 1;
+  }
+
 
   // The operation of this transaction.
   oneof operation {
@@ -169,5 +180,7 @@ message Transaction {
     ReserveFragments reserve_fragments = 107;
     Update update = 108;
     Project project = 109;
+    SetMetadata set_metadata = 110;
+    DeleteMetadata delete_metadata = 111;
   }
 }

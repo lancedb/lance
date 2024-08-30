@@ -85,6 +85,7 @@ message Manifest {
   // * 1: deletion files are present
   // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
   //       (such as compaction), but not updates.
+  // * 8: table metadata are present
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -137,6 +138,9 @@ message Manifest {
   //
   // This specifies what format is used to store the data files.
   DataStorageFormat data_format = 15;
+  
+  // Table metadata.
+  map<string, string> table_metadata = 16;
 } // Manifest
 
 // Auxiliary Data attached to a version.
