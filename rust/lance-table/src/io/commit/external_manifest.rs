@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lance_core::{Error, Result};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, ObjectStoreExt};
 use log::warn;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::{location, Location};
@@ -177,13 +177,10 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 }
 
                 // Detect naming scheme based on presence of zero padding.
-                let naming_scheme = if path.chars().nth(20) == Some('.') {
-                    ManifestNamingScheme::V2
-                } else {
-                    ManifestNamingScheme::V1
-                };
-
                 let staged_path = Path::parse(&path)?;
+                let naming_scheme =
+                    ManifestNamingScheme::detect_scheme_staging(staged_path.filename().unwrap());
+
                 self.finalize_manifest(
                     base_path,
                     &staged_path,
@@ -239,40 +236,47 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         location: location!(),
                     })?
                     .path;
-
-                // best effort put, if it fails, it's okay
-                match self
-                    .external_manifest_store
-                    .put_if_not_exists(base_path.as_ref(), version, path.as_ref())
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
+                if object_store.exists(&path).await? {
+                    // best effort put, if it fails, it's okay
+                    match self
+                        .external_manifest_store
+                        .put_if_not_exists(base_path.as_ref(), version, path.as_ref())
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
                             "could up update external manifest store during load, with error: {}",
                             e
                         );
+                        }
                     }
+                    return Ok(path);
+                } else {
+                    return Err(Error::NotFound {
+                        uri: path.to_string(),
+                        location: location!(),
+                    });
                 }
-                return Ok(path);
             }
             Err(e) => return Err(e),
         };
 
         // finalized path, just return
-        let manifest_path = Path::parse(path)?;
-        if manifest_path.extension() == Some(MANIFEST_EXTENSION) {
-            return Ok(manifest_path);
+        let current_path = Path::parse(path)?;
+        if current_path.extension() == Some(MANIFEST_EXTENSION) {
+            return Ok(current_path);
         }
 
-        let scheme = detect_naming_scheme_from_path(&manifest_path)?;
+        let naming_scheme =
+            ManifestNamingScheme::detect_scheme_staging(current_path.filename().unwrap());
 
         self.finalize_manifest(
             base_path,
-            &Path::parse(&manifest_path)?,
+            &Path::parse(&current_path)?,
             version,
             object_store,
-            scheme,
+            naming_scheme,
         )
         .await
     }

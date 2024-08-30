@@ -68,7 +68,7 @@ pub enum ManifestNamingScheme {
     ///
     /// Zero-padded and reversed for O(1) lookup of latest version on object stores.
     /// Lexicographically, the first file in the directory should always be the
-    /// latest manifest..
+    /// latest manifest.
     V2,
 }
 
@@ -104,6 +104,14 @@ impl ManifestNamingScheme {
             }
         } else {
             None
+        }
+    }
+
+    pub fn detect_scheme_staging(filename: &str) -> Self {
+        if filename.chars().nth(20) == Some('.') {
+            Self::V2
+        } else {
+            Self::V1
         }
     }
 }
