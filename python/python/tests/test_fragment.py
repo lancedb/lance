@@ -3,6 +3,7 @@
 
 import json
 import multiprocessing
+import uuid
 from pathlib import Path
 
 import lance
@@ -18,6 +19,7 @@ from lance import (
     write_dataset,
 )
 from lance.debug import format_fragment
+from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -296,3 +298,21 @@ def test_mixed_fragment_versions(tmp_path):
     operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
     with pytest.raises(OSError, match="All data files must have the same version"):
         lance.LanceDataset.commit(ds.uri, operation)
+
+
+def test_create_from_file(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=data.schema, data_storage_version="stable"
+    )
+
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 2)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+
+    assert dataset.count_rows() == 800

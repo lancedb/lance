@@ -304,6 +304,9 @@ impl Fragment {
     }
 
     // Helper method to infer the Lance version from a set of fragments
+    //
+    // Returns None if there are no data files
+    // Returns an error if the data files have different versions
     pub fn try_infer_version(fragments: &[Self]) -> Result<Option<LanceFileVersion>> {
         // Otherwise we need to check the actual file versions
         // Determine version from first file
