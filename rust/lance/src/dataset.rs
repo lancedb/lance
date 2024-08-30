@@ -3125,6 +3125,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first_ver.version().version, 1);
+
+        // test update tag
+        let bad_tag_update = dataset.tags.update("tag3", 1).await;
+        assert_eq!(
+            bad_tag_update.err().unwrap().to_string(),
+            "Ref not found error: tag tag3 does not exist"
+        );
+
+        let another_bad_tag_update = dataset.tags.update("tag1", 3).await;
+        assert_eq!(
+            another_bad_tag_update.err().unwrap().to_string(),
+            "Version not found error: version 3 does not exist"
+        );
+
+        dataset.tags.update("tag1", 2).await.unwrap();
+        dataset = dataset.checkout_version("tag1").await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+
+        dataset.tags.update("tag1", 1).await.unwrap();
+        dataset = dataset.checkout_version("tag1").await.unwrap();
+        assert_eq!(dataset.manifest.version, 1);
     }
 
     #[rstest]
