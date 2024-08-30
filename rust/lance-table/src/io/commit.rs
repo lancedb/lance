@@ -116,6 +116,39 @@ impl ManifestNamingScheme {
     }
 }
 
+/// Migrate all V1 manifests to V2 naming scheme.
+///
+/// This function will rename all V1 manifests to V2 naming scheme.
+///
+/// This function is idempotent, and can be run multiple times without
+/// changing the state of the object store.
+///
+/// However, it should not be run while other concurrent operations are happening.
+/// And it should also run until completion before resuming other operations.
+pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Path) -> Result<()> {
+    object_store
+        .inner
+        .list(Some(&dataset_base.child(VERSIONS_DIR)))
+        .try_filter(|res| {
+            let res = if let Some(filename) = res.location.filename() {
+                ManifestNamingScheme::detect_scheme(filename) == Some(ManifestNamingScheme::V1)
+            } else {
+                false
+            };
+            future::ready(res)
+        })
+        .try_for_each_concurrent(object_store.io_parallelism(), |meta| async move {
+            let filename = meta.location.filename().unwrap();
+            let version = ManifestNamingScheme::V1.parse_version(filename).unwrap();
+            let path = ManifestNamingScheme::V2.manifest_path(dataset_base, version);
+            object_store.inner.rename(&meta.location, &path).await?;
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
+}
+
 /// Function that writes the manifest to the object store.
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
@@ -812,5 +845,88 @@ pub struct CommitConfig {
 impl Default for CommitConfig {
     fn default() -> Self {
         Self { num_retries: 20 }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_naming_scheme() {
+        let v1 = ManifestNamingScheme::V1;
+        let v2 = ManifestNamingScheme::V2;
+
+        assert_eq!(
+            v1.manifest_path(&Path::from("base"), 0),
+            Path::from("base/_versions/0.manifest")
+        );
+        assert_eq!(
+            v1.manifest_path(&Path::from("base"), 42),
+            Path::from("base/_versions/42.manifest")
+        );
+
+        assert_eq!(
+            v2.manifest_path(&Path::from("base"), 0),
+            Path::from("base/_versions/18446744073709551615.manifest")
+        );
+        assert_eq!(
+            v2.manifest_path(&Path::from("base"), 42),
+            Path::from("base/_versions/18446744073709551573.manifest")
+        );
+
+        assert_eq!(v1.parse_version("0.manifest"), Some(0));
+        assert_eq!(v1.parse_version("42.manifest"), Some(42));
+        assert_eq!(
+            v1.parse_version("42.manifest-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc"),
+            Some(42)
+        );
+
+        assert_eq!(v2.parse_version("18446744073709551615.manifest"), Some(0));
+        assert_eq!(v2.parse_version("18446744073709551573.manifest"), Some(42));
+        assert_eq!(
+            v2.parse_version("18446744073709551573.manifest-cee4fbbb-eb19-4ea3-8ca7-54f5ec33dedc"),
+            Some(42)
+        );
+
+        assert_eq!(ManifestNamingScheme::detect_scheme("0.manifest"), Some(v1));
+        assert_eq!(
+            ManifestNamingScheme::detect_scheme("18446744073709551615.manifest"),
+            Some(v2)
+        );
+        assert_eq!(ManifestNamingScheme::detect_scheme("something else"), None);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_naming_migration() {
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+        let versions_dir = base.child(VERSIONS_DIR);
+
+        // Write two v1 files and one v1
+        let original_files = vec![
+            versions_dir.child("irrelevant"),
+            ManifestNamingScheme::V1.manifest_path(&base, 0),
+            ManifestNamingScheme::V2.manifest_path(&base, 1),
+        ];
+        for path in original_files {
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        migrate_scheme_to_v2(&object_store, &base).await.unwrap();
+
+        let expected_files = vec![
+            ManifestNamingScheme::V2.manifest_path(&base, 1),
+            ManifestNamingScheme::V2.manifest_path(&base, 0),
+            versions_dir.child("irrelevant"),
+        ];
+        let actual_files = object_store
+            .inner
+            .list(Some(&versions_dir))
+            .map_ok(|res| res.location)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(actual_files, expected_files);
     }
 }

@@ -1845,6 +1845,14 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.validate()
 
+    def migrate_manifest_paths_v2(self):
+        """
+        Migrate the manifest paths to the new format.
+
+        This will update the manifest to use the new v2 format for paths.
+        """
+        self._ds.migrate_manifest_paths_v2()
+
     @property
     def optimize(self) -> "DatasetOptimizer":
         return DatasetOptimizer(self)

@@ -25,8 +25,8 @@ use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
-    commit_handler_from_url, CommitError, CommitHandler, CommitLock, ManifestLocation,
-    ManifestNamingScheme,
+    commit_handler_from_url, migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock,
+    ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
@@ -1276,6 +1276,14 @@ impl Dataset {
             .try_collect::<Vec<()>>()
             .await?;
 
+        Ok(())
+    }
+
+    pub async fn migrate_manifest_paths_v2(&mut self) -> Result<()> {
+        migrate_scheme_to_v2(self.object_store(), &self.base).await?;
+        // We need to re-open.
+        let latest_version = self.latest_version_id().await?;
+        *self = self.checkout_version(latest_version).await?;
         Ok(())
     }
 }
@@ -2724,6 +2732,18 @@ mod tests {
             .unwrap();
 
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+    }
+
+    #[tokio::test]
+    async fn test_v2_manifest_path_migration() {
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+        let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+        assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V1);
+
+        dataset.migrate_manifest_paths_v2().await.unwrap();
+        assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V2);
     }
 
     #[rstest]

@@ -1272,6 +1272,14 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    fn migrate_manifest_paths_v2(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.migrate_manifest_paths_v2())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         RT.block_on(None, new_self.drop_columns(&columns))?
