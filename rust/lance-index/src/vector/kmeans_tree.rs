@@ -234,3 +234,7 @@ impl KMeansTree {
         Ok(tree)
     }
 }
+
+// TODO add unit tests
+// TODO add IvfSubIndex impl, incl reading/writing
+// TODO add VectorIndex impl
