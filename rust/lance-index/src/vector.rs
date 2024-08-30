@@ -23,6 +23,7 @@ pub mod graph;
 pub mod hnsw;
 pub mod ivf;
 pub mod kmeans;
+pub mod kmeans_tree;
 pub mod pq;
 pub mod quantizer;
 pub mod residual;
