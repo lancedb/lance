@@ -846,6 +846,11 @@ impl Dataset {
     /// * `operation` - A description of the change to commit
     /// * `read_version` - The version of the dataset that this change is based on
     /// * `store_params` Parameters controlling object store access to the manifest
+    /// * `enable_v2_manifest_paths`: If set to true, and this is a new dataset, uses the new v2 manifest
+    ///   paths. These allow constant-time lookups for the latest manifest on object storage.
+    ///   This parameter has no effect on existing datasets. To migrate an existing
+    ///   dataset, use the [`Self::migrate_manifest_paths_v2`] method.
+    ///   Default is False.
     pub async fn commit(
         base_uri: &str,
         operation: Operation,
@@ -1279,6 +1284,35 @@ impl Dataset {
         Ok(())
     }
 
+    /// Migrate the dataset to use the new manifest path scheme.
+    ///
+    /// This function will rename all V1 manifests to [ManifestNamingScheme::V2].
+    /// These paths provide more efficient opening of datasets with many versions
+    /// on object stores.
+    ///
+    /// This function is idempotent, and can be run multiple times without
+    /// changing the state of the object store.
+    ///
+    /// However, it should not be run while other concurrent operations are happening.
+    /// And it should also run until completion before resuming other operations.
+    ///
+    /// ```rust
+    /// # use lance::dataset::Dataset;
+    /// # use lance_table::io::commit::ManifestNamingScheme;
+    /// # use lance_datagen::{array, RowCount, BatchCount};
+    /// # use arrow_array::types::Int32Type;
+    /// # let data = lance_datagen::gen()
+    /// #  .col("key", array::step::<Int32Type>())
+    /// #  .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+    /// # let fut = async {
+    /// let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V1);
+    ///
+    /// dataset.migrate_manifest_paths_v2().await.unwrap();
+    /// assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V2);
+    /// # };
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(fut);
+    /// ```
     pub async fn migrate_manifest_paths_v2(&mut self) -> Result<()> {
         migrate_scheme_to_v2(self.object_store(), &self.base).await?;
         // We need to re-open.
@@ -2732,18 +2766,6 @@ mod tests {
             .unwrap();
 
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
-    }
-
-    #[tokio::test]
-    async fn test_v2_manifest_path_migration() {
-        let data = lance_datagen::gen()
-            .col("key", array::step::<Int32Type>())
-            .into_reader_rows(RowCount::from(10), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
-        assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V1);
-
-        dataset.migrate_manifest_paths_v2().await.unwrap();
-        assert_eq!(dataset.manifest_naming_scheme, ManifestNamingScheme::V2);
     }
 
     #[rstest]

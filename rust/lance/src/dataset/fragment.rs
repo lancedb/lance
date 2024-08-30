@@ -2700,6 +2700,7 @@ mod tests {
             None,
             None,
             object_store_registry,
+            false,
         )
         .await
         .unwrap();

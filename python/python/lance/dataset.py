@@ -1789,6 +1789,12 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        enable_v2_manifest_paths : bool, optional
+            If True, and this is a new dataset, uses the new V2 manifest paths.
+            These paths provide more efficient opening of datasets with many
+            versions on object stores. This parameter has no effect if the dataset
+            already exists. To migrate an existing dataset, instead use the
+            :meth:`migrate_manifest_paths_v2` method. Default is False.
 
         Returns
         -------
@@ -1850,6 +1856,12 @@ class LanceDataset(pa.dataset.Dataset):
         Migrate the manifest paths to the new format.
 
         This will update the manifest to use the new v2 format for paths.
+
+        This function is idempotent, and can be run multiple times without
+        changing the state of the object store.
+
+        However, it should not be run while other concurrent operations are happening.
+        And it should also run until completion before resuming other operations.
         """
         self._ds.migrate_manifest_paths_v2()
 
@@ -2876,6 +2888,12 @@ def write_dataset(
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
+    enable_v2_manifest_paths : bool, optional
+        If True, and this is a new dataset, uses the new V2 manifest paths.
+        These paths provide more efficient opening of datasets with many
+        versions on object stores. This parameter has no effect if the dataset
+        already exists. To migrate an existing dataset, instead use the
+        :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
     """
     if use_legacy_format is not None:
         warnings.warn(

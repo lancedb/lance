@@ -60,6 +60,7 @@ use crate::format::{Index, Manifest};
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 
+/// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestNamingScheme {
     /// `_versions/{version}.manifest`
@@ -67,8 +68,6 @@ pub enum ManifestNamingScheme {
     /// `_manifests/{u64::MAX - version}.manifest`
     ///
     /// Zero-padded and reversed for O(1) lookup of latest version on object stores.
-    /// Lexicographically, the first file in the directory should always be the
-    /// latest manifest.
     V2,
 }
 
