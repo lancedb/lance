@@ -47,7 +47,7 @@ mod test {
     use lance_table::io::commit::{
         dynamodb::DynamoDBExternalManifestStore,
         external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
-        manifest_path, CommitHandler,
+        CommitHandler, ManifestNamingScheme,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
