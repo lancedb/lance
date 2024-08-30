@@ -306,7 +306,9 @@ mod tests {
             "ref@{ref",
             "ref[",
             "ref^",
-            "~/ref"
+            "~/ref",
+            "ref.",
+            "ref..ref"
         )]
         r: &str,
     ) {

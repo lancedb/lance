@@ -293,10 +293,10 @@ def test_tag(tmp_path: Path):
     # test tag update
     with pytest.raises(ValueError):
         ds.tags.update("tag1", 3)
-    
+
     with pytest.raises(ValueError):
         ds.tags.update("tag3", 1)
-    
+
     ds.tags.update("tag1", 2)
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 2
