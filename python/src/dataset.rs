@@ -28,7 +28,9 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::transaction::validate_operation;
+use lance::dataset::transaction::{
+    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex,
+};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
@@ -66,6 +68,7 @@ use pyo3::{
     PyObject, PyResult,
 };
 use snafu::{location, Location};
+use uuid::Uuid;
 
 use crate::error::PythonErrorExt;
 use crate::fragment::{FileFragment, FragmentMetadata};
@@ -216,6 +219,41 @@ impl MergeInsertBuilder {
     }
 }
 
+#[pyclass(name = "_RewriteGroup", module = "_lib")]
+#[derive(Clone)]
+pub struct RewriteGroup(LanceRewriteGroup);
+
+#[pymethods]
+impl RewriteGroup {
+    #[new]
+    pub fn new(old_fragments: Vec<FragmentMetadata>, new_fragments: Vec<FragmentMetadata>) -> Self {
+        let old_fragments = into_fragments(old_fragments);
+        let new_fragments = into_fragments(new_fragments);
+        Self(LanceRewriteGroup {
+            old_fragments,
+            new_fragments,
+        })
+    }
+}
+
+#[pyclass(name = "_RewrittenIndex", module = "_lib")]
+#[derive(Clone)]
+pub struct RewrittenIndex(LanceRewrittenIndex);
+
+#[pymethods]
+impl RewrittenIndex {
+    #[new]
+    pub fn new(old_index: String, new_index: String) -> PyResult<Self> {
+        let old_id: Uuid = old_index
+            .parse()
+            .map_err(|e: uuid::Error| PyValueError::new_err(e.to_string()))?;
+        let new_id: Uuid = new_index
+            .parse()
+            .map_err(|e: uuid::Error| PyValueError::new_err(e.to_string()))?;
+        Ok(Self(LanceRewrittenIndex { old_id, new_id }))
+    }
+}
+
 #[pymethods]
 impl Operation {
     fn __repr__(&self) -> String {
@@ -266,6 +304,20 @@ impl Operation {
     #[staticmethod]
     fn restore(version: u64) -> PyResult<Self> {
         let op = LanceOperation::Restore { version };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn rewrite(
+        groups: Vec<RewriteGroup>,
+        rewritten_indices: Vec<RewrittenIndex>,
+    ) -> PyResult<Self> {
+        let groups = groups.into_iter().map(|g| g.0).collect();
+        let rewritten_indices = rewritten_indices.into_iter().map(|r| r.0).collect();
+        let op = LanceOperation::Rewrite {
+            groups,
+            rewritten_indices,
+        };
         Ok(Self(op))
     }
 }
