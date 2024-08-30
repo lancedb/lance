@@ -46,6 +46,8 @@ from .lance import (
     _Dataset,
     _MergeInsertBuilder,
     _Operation,
+    _RewriteGroup,
+    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
@@ -2143,6 +2145,52 @@ class LanceOperation:
 
         def _to_inner(self):
             return _Operation.restore(self.version)
+
+    @dataclass
+    class RewriteGroup:
+        """
+        Collection of rewritten files
+        """
+
+        old_fragments: Iterable[FragmentMetadata]
+        new_fragments: Iterable[FragmentMetadata]
+
+        def _to_inner(self):
+            old_fragments = [f._metadata for f in self.old_fragments]
+            new_fragments = [f._metadata for f in self.new_fragments]
+            return _RewriteGroup(old_fragments, new_fragments)
+
+    @dataclass
+    class RewrittenIndex:
+        """
+        An index that has been rewritten
+        """
+
+        old_id: str
+        new_id: str
+
+        def _to_inner(self):
+            return _RewrittenIndex(self.old_id, self.new_id)
+
+    @dataclass
+    class Rewrite(BaseOperation):
+        """
+        Operation that rewrites one or more files and indices into one
+        or more files and indices.
+        """
+
+        groups: Iterable[LanceOperation.RewriteGroup]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+
+        def __post_init__(self):
+            all_frags = [old for group in self.groups for old in group.old_fragments]
+            all_frags += [new for group in self.groups for new in group.new_fragments]
+            LanceOperation._validate_fragments(all_frags)
+
+        def _to_inner(self):
+            groups = [group._to_inner() for group in self.groups]
+            rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
+            return _Operation.rewrite(groups, rewritten_indices)
 
 
 class ScannerBuilder:

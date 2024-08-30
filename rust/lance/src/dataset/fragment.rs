@@ -472,6 +472,9 @@ impl FileFragment {
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
             let projection = v2::reader::FileReader::default_projection(dataset.schema());
+            let physical_rows = reader.metadata().num_rows as usize;
+            frag.physical_rows = Some(physical_rows);
+            frag.id = fragment_id as u64;
 
             let column_indices = projection
                 .column_indices

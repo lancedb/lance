@@ -306,13 +306,48 @@ def test_create_from_file(tmp_path):
         [], tmp_path, schema=data.schema, data_storage_version="stable"
     )
 
+    # Append first file
     fragment_name = f"{uuid.uuid4()}.lance"
     with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
         writer.write_batch(data)
 
-    frag = LanceFragment.create_from_file(fragment_name, dataset, 2)
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
     op = LanceOperation.Append([frag])
 
     dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    frag = dataset.get_fragments()[0]
+    assert frag.fragment_id == 0
 
     assert dataset.count_rows() == 800
+
+    # Append second file (fragment id shouldn't be 0 even though we pass in 0)
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    frag = dataset.get_fragments()[1]
+    assert frag.fragment_id == 1
+
+    assert dataset.count_rows() == 1600
+
+    # Simulate compaction
+    compacted_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / compacted_name)) as writer:
+        for batch in dataset.to_batches():
+            writer.write_batch(batch)
+
+    frag = LanceFragment.create_from_file(compacted_name, dataset, 0)
+    group = LanceOperation.RewriteGroup(
+        old_fragments=[frag.metadata for frag in dataset.get_fragments()],
+        new_fragments=[frag],
+    )
+    op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+
+    assert dataset.count_rows() == 1600
+    assert len(dataset.get_fragments()) == 1
+    assert dataset.get_fragments()[0].fragment_id == 2

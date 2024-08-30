@@ -194,7 +194,7 @@ async fn migrate_manifest(
     Ok(())
 }
 
-fn fix_data_storage_version(manifest: &mut Manifest) -> Result<()> {
+fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
     let data_storage_version = manifest.data_storage_format.lance_file_version()?;
     if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
         // Due to bugs in 0.16 it is possible the dataset's data storage version does not
@@ -217,6 +217,21 @@ fn fix_data_storage_version(manifest: &mut Manifest) -> Result<()> {
                     manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
                 }
             }
+    } else {
+        // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
+        // match the data storage version.  This is a sanity assertion to prevent data corruption.
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
+            if actual_file_version != data_storage_version {
+                return Err(Error::Internal {
+                    message: format!(
+                        "The operation added files with version {}.  However, the data storage version is {}.",
+                        actual_file_version,
+                        data_storage_version
+                    ),
+                    location: location!(),
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -473,7 +488,7 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
-        fix_data_storage_version(&mut manifest)?;
+        check_storage_version(&mut manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
 

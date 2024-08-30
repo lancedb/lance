@@ -46,6 +46,7 @@ impl LanceFileVersion {
         match (major, minor) {
             (0, 0) => Ok(Self::Legacy),
             (0, 1) => Ok(Self::Legacy),
+            (0, 2) => Ok(Self::Legacy),
             (0, 3) => Ok(Self::V2_0),
             (2, 0) => Ok(Self::V2_0),
             (2, 1) => Ok(Self::V2_1),

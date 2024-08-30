@@ -614,19 +614,6 @@ impl Transaction {
             Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
         };
 
-        if let Some(frag_version) = Fragment::try_infer_version(&manifest.fragments)? {
-            if frag_version != manifest.data_storage_format.lance_file_version()? {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Data storage format version ({}) does not match version in fragments ({})",
-                        manifest.data_storage_format.lance_file_version()?,
-                        frag_version,
-                    ),
-                    location!(),
-                ));
-            }
-        }
-
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
