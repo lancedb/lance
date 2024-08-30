@@ -273,7 +273,44 @@ impl KMeansTree {
     }
 }
 
-// TODO add unit tests
-// -- first layer should contain =1 node
 // TODO add IvfSubIndex impl, incl reading/writing
 // TODO add VectorIndex impl
+
+// TODO add unit tests
+// -- first layer should contain =1 node
+#[cfg(test)]
+mod tests {
+    use crate::vector::kmeans_tree::{KMeansTree, KMeansTreeParams};
+    use arrow_array::{types::Float32Type, FixedSizeListArray};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_linalg::distance::DistanceType;
+    use lance_testing::datagen::generate_random_array_with_seed;
+    #[tokio::test]
+    async fn test_build() {
+        let params = KMeansTreeParams {
+            k: 10,
+            num_layers: 2,
+            spill_count: 0,
+            max_iters: 5,
+            distance_type: DistanceType::Cosine,
+        };
+        // const DIMENSION: usize = 512;
+        // const TOTAL: usize = 10 * 1024;
+        // const SEED: [u8; 32] = [42; 32];
+        const DIMENSION: usize = 32;
+        const TOTAL: usize = 2000;
+        const SEED: [u8; 32] = [42; 32];
+        let data = generate_random_array_with_seed::<Float32Type>(TOTAL * DIMENSION, SEED);
+        let fsl = FixedSizeListArray::try_new_from_values(data, DIMENSION as i32).unwrap();
+        let tree = KMeansTree::new(&fsl, params).unwrap();
+
+        // These values should be deterministic
+        assert_eq!(tree.clusterings_per_layer.len(), 2);
+        assert_eq!(tree.clusterings_per_layer[0].len(), 1);
+        assert_eq!(tree.clusterings_per_layer[1].len(), 10);
+        // TODO compute average bottom-level cluster size
+        // TODO compute max bottom-level cluster size
+    }
+    // TODO test spill
+    // TODO test queries
+}
