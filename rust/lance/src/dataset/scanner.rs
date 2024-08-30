@@ -69,8 +69,11 @@ use lance_datafusion::substrait::parse_substrait;
 
 pub const DEFAULT_BATCH_SIZE: usize = 8192;
 
-// Same as pyarrow Dataset::scanner()
-pub const DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
+lazy_static::lazy_static! {
+    pub static ref DEFAULT_FRAGMENT_READAHEAD: Option<usize> = std::env::var("LANCE_DEFAULT_FRAGMENT_READAHEAD")
+        .map(|val| Some(val.parse().unwrap())).unwrap_or(None);
+}
 
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
@@ -1540,7 +1543,7 @@ impl Scanner {
             batch_readahead: self.batch_readahead,
             fragment_readahead: self
                 .fragment_readahead
-                .unwrap_or(DEFAULT_FRAGMENT_READAHEAD),
+                .unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD),
             with_row_id: self.with_row_id,
             with_row_address: self.with_row_address,
             make_deletions_null,
