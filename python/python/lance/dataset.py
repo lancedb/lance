@@ -2177,6 +2177,17 @@ class LanceOperation:
         """
         Operation that rewrites one or more files and indices into one
         or more files and indices.
+
+        Attributes
+        ----------
+        groups: list[RewriteGroup]
+            Groups of files that have been rewritten.
+        rewritten_indices: list[RewrittenIndex]
+            Indices that have been rewritten.
+
+        Warning
+        -------
+        This is an advanced API not intended for general use.
         """
 
         groups: Iterable[LanceOperation.RewriteGroup]
