@@ -26,6 +26,7 @@ use lance_table::format::{
 };
 use lance_table::io::commit::{
     commit_handler_from_url, CommitError, CommitHandler, CommitLock, ManifestLocation,
+    ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use log::warn;
@@ -332,15 +333,10 @@ impl Dataset {
 
     async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
-        let manifest_file = self
+        let manifest_location = self
             .commit_handler
-            .resolve_version(&base_path, version, &self.object_store.inner)
+            .resolve_version_location(&base_path, version, &self.object_store.inner)
             .await?;
-        let manifest_location = ManifestLocation {
-            version,
-            path: manifest_file,
-            size: None,
-        };
         let manifest = Self::load_manifest(self.object_store.as_ref(), &manifest_location).await?;
         Self::checkout_manifest(
             self.object_store.clone(),
@@ -1428,11 +1424,12 @@ impl DatasetTakeRows for Dataset {
 
 #[derive(Debug)]
 pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,              // default true
-    timestamp: Option<SystemTime>,             // default None
-    use_move_stable_row_ids: bool,             // default false
-    use_legacy_format: Option<bool>,           // default None
-    storage_format: Option<DataStorageFormat>, // default None
+    auto_set_feature_flags: bool,                 // default true
+    timestamp: Option<SystemTime>,                // default None
+    use_move_stable_row_ids: bool,                // default false
+    use_legacy_format: Option<bool>,              // default None
+    storage_format: Option<DataStorageFormat>,    // default None
+    manifest_naming_scheme: ManifestNamingScheme, // default V1.
 }
 
 impl Default for ManifestWriteConfig {
@@ -1443,6 +1440,7 @@ impl Default for ManifestWriteConfig {
             use_move_stable_row_ids: false,
             use_legacy_format: None,
             storage_format: None,
+            manifest_naming_scheme: ManifestNamingScheme::V1,
         }
     }
 }
@@ -1471,6 +1469,7 @@ pub(crate) async fn write_manifest_file(
             base_path,
             object_store,
             write_manifest_file_to_path,
+            config.manifest_naming_scheme,
         )
         .await?;
 
@@ -1962,6 +1961,7 @@ mod tests {
                 use_move_stable_row_ids: false,
                 use_legacy_format: None,
                 storage_format: None,
+                manifest_naming_scheme: ManifestNamingScheme::V1,
             },
         )
         .await

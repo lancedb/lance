@@ -313,7 +313,10 @@ mod test {
         let version_six_staging_location =
             base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
-            .rename(&manifest_path(&ds.base, 6), &version_six_staging_location)
+            .rename(
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &version_six_staging_location,
+            )
             .await
             .unwrap();
         store

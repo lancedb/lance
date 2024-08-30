@@ -8,7 +8,7 @@ use lance_io::object_store::{
 };
 use lance_table::{
     format::Manifest,
-    io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation},
+    io::commit::{commit_handler_from_url, CommitHandler},
 };
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
@@ -294,14 +294,9 @@ impl DatasetBuilder {
         } else {
             let manifest_location = match version {
                 Some(version) => {
-                    let path = commit_handler
-                        .resolve_version(&base_path, version, &object_store.inner)
-                        .await?;
-                    ManifestLocation {
-                        version,
-                        path,
-                        size: None,
-                    }
+                    commit_handler
+                        .resolve_version_location(&base_path, version, &object_store.inner)
+                        .await?
                 }
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)

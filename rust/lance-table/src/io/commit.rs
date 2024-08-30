@@ -57,9 +57,10 @@ use {
 
 use crate::format::{Index, Manifest};
 
+const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManifestNamingScheme {
     /// `_versions/{version}.manifest`
     V1,
@@ -72,19 +73,12 @@ pub enum ManifestNamingScheme {
 }
 
 impl ManifestNamingScheme {
-    pub fn manifests_dir(&self, base: &Path) -> Path {
-        match self {
-            Self::V1 => base.child("_versions"),
-            Self::V2 => base.child("_manifests"),
-        }
-    }
-
     pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
-        let directory = self.manifests_dir(base);
+        let directory = base.child(VERSIONS_DIR);
         match self {
             Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
             Self::V2 => {
-                let inverted_version = std::u64::MAX - version;
+                let inverted_version = u64::MAX - version;
                 directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
             }
         }
@@ -96,7 +90,20 @@ impl ManifestNamingScheme {
             .and_then(|(version_str, _)| version_str.parse::<u64>().ok());
         match self {
             Self::V1 => file_number,
-            Self::V2 => file_number.map(|v| std::u64::MAX - v),
+            Self::V2 => file_number.map(|v| u64::MAX - v),
+        }
+    }
+
+    pub fn detect_scheme(filename: &str) -> Option<Self> {
+        if filename.ends_with(MANIFEST_EXTENSION) {
+            const V2_LEN: usize = 20 + 1 + MANIFEST_EXTENSION.len();
+            if filename.len() == V2_LEN {
+                Some(Self::V2)
+            } else {
+                Some(Self::V1)
+            }
+        } else {
+            None
         }
     }
 }
@@ -117,88 +124,122 @@ pub struct ManifestLocation {
     pub path: Path,
     /// Size, in bytes, of the manifest file. If it is not known, this field should be `None`.
     pub size: Option<u64>,
+    /// Naming scheme of the manifest file.
+    pub naming_scheme: ManifestNamingScheme,
 }
 
 /// Get the latest manifest path
 async fn current_manifest_path(
     object_store: &ObjectStore,
     base: &Path,
-    scheme: ManifestNamingScheme,
 ) -> Result<ManifestLocation> {
     if object_store.is_local() {
-        if let Ok(Some(location)) = current_manifest_local(base, scheme) {
+        if let Ok(Some(location)) = current_manifest_local(base) {
             return Ok(location);
         }
     }
 
-    // TODO: Move to method of ManifestNamingScheme and dispatch to optimized
-    // method for V2.
+    let manifest_files = object_store.inner.list(Some(&base.child(VERSIONS_DIR)));
 
-    // We use `list_with_delimiter` to avoid listing the contents of child directories.
-    let manifest_files = object_store
-        .inner
-        .list_with_delimiter(Some(&scheme.manifests_dir(base)))
-        .await?;
+    let mut valid_manifests = manifest_files.try_filter_map(|res| {
+        if let Some(scheme) = ManifestNamingScheme::detect_scheme(res.location.filename().unwrap())
+        {
+            future::ready(Ok(Some((scheme, res))))
+        } else {
+            future::ready(Ok(None))
+        }
+    });
 
-    let current = manifest_files
-        .objects
-        .into_iter()
-        .filter(|meta| {
-            meta.location.filename().is_some()
-                && meta
-                    .location
-                    .filename()
-                    .unwrap()
-                    .ends_with(MANIFEST_EXTENSION)
-        })
-        .filter_map(|meta| {
-            let version = meta
-                .location
-                .filename()
-                .unwrap()
-                .split_once('.')
-                .and_then(|(version_str, _)| version_str.parse::<u64>().ok())?;
-            Some((version, meta))
-        })
-        .max_by_key(|(version, _)| *version);
+    let first = valid_manifests.next().await.transpose()?;
+    match first {
+        // If the first valid manifest we see is V2, we can assume that we are using
+        // V2 naming scheme for all manifests.
+        Some((scheme @ ManifestNamingScheme::V2, meta)) => {
+            let version = scheme
+                .parse_version(meta.location.filename().unwrap())
+                .unwrap();
+            Ok(ManifestLocation {
+                version,
+                path: meta.location,
+                size: Some(meta.size as u64),
+                naming_scheme: scheme,
+            })
+        }
+        // If the first valid manifest we see if V1, assume for now that we are
+        // using V1 naming scheme for all manifests. Since we are listing the
+        // directory anyways, we will assert there aren't any V2 manifests.
+        Some((scheme @ ManifestNamingScheme::V1, meta)) => {
+            let mut current_version = scheme
+                .parse_version(meta.location.filename().unwrap())
+                .unwrap();
+            let mut current_meta = meta;
 
-    if let Some((version, meta)) = current {
-        Ok(ManifestLocation {
-            version,
-            path: meta.location,
-            size: Some(meta.size as u64),
-        })
-    } else {
-        Err(Error::NotFound {
-            uri: scheme.manifest_path(base, 1).to_string(),
+            while let Some((scheme, meta)) = valid_manifests.next().await.transpose()? {
+                if matches!(scheme, ManifestNamingScheme::V2) {
+                    return Err(Error::Internal {
+                        message: "Found V2 manifest in a V1 manifest directory".to_string(),
+                        location: location!(),
+                    });
+                }
+                let version = scheme
+                    .parse_version(meta.location.filename().unwrap())
+                    .unwrap();
+                if version > current_version {
+                    current_version = version;
+                    current_meta = meta;
+                }
+            }
+            Ok(ManifestLocation {
+                version: current_version,
+                path: current_meta.location,
+                size: Some(current_meta.size as u64),
+                naming_scheme: scheme,
+            })
+        }
+        None => Err(Error::NotFound {
+            uri: base.child(VERSIONS_DIR).to_string(),
             location: location!(),
-        })
+        }),
     }
 }
 
 // This is an optimized function that searches for the latest manifest. In
 // object_store, list operations lookup metadata for each file listed. This
 // method only gets the metadata for the found latest manifest.
-fn current_manifest_local(
-    base: &Path,
-    scheme: ManifestNamingScheme,
-) -> std::io::Result<Option<ManifestLocation>> {
-    let path = lance_io::local::to_local_path(&scheme.manifests_dir(base));
+fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocation>> {
+    let path = lance_io::local::to_local_path(&base.child(VERSIONS_DIR));
     let entries = std::fs::read_dir(path)?;
 
     let mut latest_entry: Option<(u64, DirEntry)> = None;
+
+    let mut scheme: Option<ManifestNamingScheme> = None;
 
     for entry in entries {
         let entry = entry?;
         let filename_raw = entry.file_name();
         let filename = filename_raw.to_string_lossy();
-        if !filename.ends_with(MANIFEST_EXTENSION) {
+
+        let Some(entry_scheme) = ManifestNamingScheme::detect_scheme(&filename) else {
             // Need to ignore temporary files, such as
             // .tmp_7.manifest_9c100374-3298-4537-afc6-f5ee7913666d
             continue;
+        };
+
+        if let Some(scheme) = scheme {
+            if scheme != entry_scheme {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Found multiple manifest naming schemes in the same directory: {:?} and {:?}",
+                        scheme, entry_scheme
+                    ),
+                ));
+            }
+        } else {
+            scheme = Some(entry_scheme);
         }
 
-        let Some(version) = scheme.parse_version(&filename) else {
+        let Some(version) = entry_scheme.parse_version(&filename) else {
             continue;
         };
 
@@ -218,6 +259,7 @@ fn current_manifest_local(
             version,
             path,
             size: Some(entry.metadata()?.len()),
+            naming_scheme: scheme.unwrap(),
         }))
     } else {
         Ok(None)
@@ -227,10 +269,9 @@ fn current_manifest_local(
 async fn list_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
-    scheme: ManifestNamingScheme,
 ) -> Result<BoxStream<'a, Result<Path>>> {
     Ok(object_store
-        .read_dir_all(&scheme.manifests_dir(base_path), None)
+        .read_dir_all(&base_path.child(VERSIONS_DIR), None)
         .await?
         .try_filter_map(|obj_meta| {
             if obj_meta.location.extension() == Some(MANIFEST_EXTENSION) {
@@ -278,9 +319,8 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
-        scheme: ManifestNamingScheme,
     ) -> Result<ManifestLocation> {
-        Ok(current_manifest_path(object_store, base_path, scheme).await?)
+        Ok(current_manifest_path(object_store, base_path).await?)
     }
 
     /// Get the path to the latest version manifest of a dataset at the base_path
@@ -288,12 +328,9 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
-        scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, Error> {
         // TODO: we need to pade 0's to the version number on the manifest file path
-        Ok(current_manifest_path(object_store, base_path, scheme)
-            .await?
-            .path)
+        Ok(current_manifest_path(object_store, base_path).await?.path)
     }
 
     // for default implementation, parse the version from the path
@@ -301,22 +338,33 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &ObjectStore,
-        scheme: ManifestNamingScheme,
     ) -> Result<u64> {
-        Ok(current_manifest_path(object_store, base_path, scheme)
+        Ok(current_manifest_path(object_store, base_path)
             .await?
             .version)
     }
 
     /// Get the path to a specific versioned manifest of a dataset at the base_path
+    ///
+    /// The version must already exist.
     async fn resolve_version(
         &self,
         base_path: &Path,
         version: u64,
-        _object_store: &dyn OSObjectStore,
-        scheme: ManifestNamingScheme,
+        object_store: &dyn OSObjectStore,
     ) -> std::result::Result<Path, Error> {
-        Ok(scheme.manifest_path(base_path, version))
+        Ok(default_resolve_version(base_path, version, object_store)
+            .await?
+            .path)
+    }
+
+    async fn resolve_version_location(
+        &self,
+        base_path: &Path,
+        version: u64,
+        object_store: &dyn OSObjectStore,
+    ) -> Result<ManifestLocation> {
+        default_resolve_version(base_path, version, object_store).await
     }
 
     /// List manifests that are available for a dataset at the base_path
@@ -324,9 +372,8 @@ pub trait CommitHandler: Debug + Send + Sync {
         &self,
         base_path: &Path,
         object_store: &'a dyn OSObjectStore,
-        scheme: ManifestNamingScheme,
     ) -> Result<BoxStream<'a, Result<Path>>> {
-        list_manifests(base_path, object_store, scheme).await
+        list_manifests(base_path, object_store).await
     }
 
     /// Commit a manifest.
@@ -340,10 +387,38 @@ pub trait CommitHandler: Debug + Send + Sync {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-        scheme: ManifestNamingScheme,
+        naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError>;
 }
 
+async fn default_resolve_version(
+    base_path: &Path,
+    version: u64,
+    object_store: &dyn OSObjectStore,
+) -> Result<ManifestLocation> {
+    // try V2, fallback to V1.
+    let scheme = ManifestNamingScheme::V2;
+    let path = scheme.manifest_path(base_path, version);
+    match object_store.head(&path).await {
+        Ok(meta) => Ok(ManifestLocation {
+            version,
+            path,
+            size: Some(meta.size as u64),
+            naming_scheme: scheme,
+        }),
+        Err(ObjectStoreError::NotFound { .. }) => {
+            // fallback to V1
+            let scheme = ManifestNamingScheme::V1;
+            Ok(ManifestLocation {
+                version,
+                path: scheme.manifest_path(base_path, version),
+                size: None,
+                naming_scheme: scheme,
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
+}
 /// Adapt an object_store credentials into AWS SDK creds
 #[cfg(feature = "dynamodb")]
 #[derive(Debug)]
@@ -550,7 +625,7 @@ impl CommitHandler for UnsafeCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-        scheme: ManifestNamingScheme,
+        naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -561,9 +636,7 @@ impl CommitHandler for UnsafeCommitHandler {
             );
         }
 
-        let version_path = self
-            .resolve_version(base_path, manifest.version, &object_store.inner, scheme)
-            .await?;
+        let version_path = naming_scheme.manifest_path(base_path, manifest.version);
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
 
@@ -612,11 +685,9 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-        scheme: ManifestNamingScheme,
+        naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
-        let path = self
-            .resolve_version(base_path, manifest.version, &object_store.inner, scheme)
-            .await?;
+        let path = naming_scheme.manifest_path(base_path, manifest.version);
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
         let lease = self.lock(manifest.version).await?;
@@ -657,7 +728,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-        scheme: ManifestNamingScheme,
+        naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         self.as_ref()
             .commit(
@@ -666,7 +737,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
                 base_path,
                 object_store,
                 manifest_writer,
-                scheme,
+                naming_scheme,
             )
             .await
     }
@@ -686,26 +757,13 @@ impl CommitHandler for RenameCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
-        scheme: ManifestNamingScheme,
+        naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
-        let path = self
-            .resolve_version(base_path, manifest.version, &object_store.inner, scheme)
-            .await?;
-
-        // Add .tmp_ prefix to the path
-        let mut parts: Vec<_> = path.parts().collect();
-        // Add a UUID to the end of the filename to avoid conflicts
-        let uuid = uuid::Uuid::new_v4();
-        let new_name = format!(
-            ".tmp_{}_{}",
-            parts.last().unwrap().as_ref(),
-            uuid.as_hyphenated()
-        );
-        let _ = std::mem::replace(parts.last_mut().unwrap(), new_name.into());
-        let tmp_path: Path = parts.into_iter().collect();
+        let path = naming_scheme.manifest_path(base_path, manifest.version);
+        let tmp_path = make_staging_manifest_path(&path)?;
 
         // Write the manifest to the temporary path
         manifest_writer(object_store, manifest, indices, &tmp_path).await?;
