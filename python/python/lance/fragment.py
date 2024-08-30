@@ -114,9 +114,9 @@ class LanceFragment(pa.dataset.Fragment):
     @staticmethod
     def create_from_file(
         filename: Union[str, Path],
-        schema: pa.Schema,
+        dataset: LanceDataset,
         fragment_id: int,
-    ) -> LanceFragment:
+    ) -> FragmentMetadata:
         """Create a fragment from the given datafile uri.
 
         This can be used if the datafile is loss from dataset.
@@ -129,12 +129,13 @@ class LanceFragment(pa.dataset.Fragment):
         ----------
         filename: str
             The filename of the datafile.
-        scheme: pa.Schema
-            The schema for the new datafile.
+        dataset: LanceDataset
+            The dataset that the fragment belongs to.
         fragment_id: int
             The ID of the fragment.
         """
-        return _Fragment.create_from_file(filename, schema, fragment_id)
+        fragment = _Fragment.create_from_file(filename, dataset._ds, fragment_id)
+        return FragmentMetadata(fragment.json())
 
     @staticmethod
     def create(

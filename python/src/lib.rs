@@ -72,7 +72,7 @@ pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
-pub use dataset::{Dataset, Operation};
+pub use dataset::{Dataset, Operation, RewriteGroup, RewrittenIndex};
 pub use fragment::FragmentMetadata;
 use fragment::{DataFile, FileFragment};
 pub use indices::register_indices;
@@ -111,6 +111,8 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<Operation>()?;
+    m.add_class::<RewriteGroup>()?;
+    m.add_class::<RewrittenIndex>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<MergeInsertBuilder>()?;
