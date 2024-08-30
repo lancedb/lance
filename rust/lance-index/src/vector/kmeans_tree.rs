@@ -5,11 +5,16 @@
 //!
 //! Support ``cosine`` distances only for now
 
+use crate::vector::flat::storage::FlatStorage;
+use crate::vector::graph::OrderedFloat;
+use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::VECTOR_RESULT_SCHEMA;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch};
 use core::cmp::min;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use {
     lance_linalg::distance::DistanceType,
@@ -87,8 +92,41 @@ fn chunk_to_fixed_size_list_array(
 }
 
 impl KMeansTree {
-    fn search_to_layer(&self, _query: ArrayRef, _k: usize, _layer: usize) -> Result<RecordBatch> {
-        // TODO stub, need to complete
+    fn search_to_layer(&self, query: ArrayRef, k: usize, max_layer: usize) -> Result<RecordBatch> {
+        // let dist_calc = storage.dist_calculator(query);
+        let mut best_candidates = vec![(OrderedFloat(0.0), 0)]; // the first layer only ever contains one tree node, whether it's a leaf or not
+        for layer in 0..min(max_layer + 1, self.clusterings_per_layer.len()) {
+            best_candidates = best_candidates
+                .iter()
+                // TODO: later, check if putting par_flat_map here nets any perf gains over
+                // basic query-wise parallelism
+                .flat_map(|&(_centroid_distance, index)| {
+                    let clustering = &self.clusterings_per_layer[layer][index];
+                    // TODO this could avoid copying with better structs
+                    let flat_storage =
+                        FlatStorage::new(clustering.centroids.clone(), self.params.distance_type);
+                    let dist_calc = flat_storage.dist_calculator(query.clone());
+                    (0..clustering.centroids.len())
+                        .map(|local_index| {
+                            (
+                                OrderedFloat(dist_calc.distance(local_index as u32)),
+                                clustering.children[local_index],
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map(Reverse)
+                .collect::<BinaryHeap<_>>()
+                .into_sorted_vec()
+                .into_iter()
+                .take(k) // TODO maybe this should be a different query-time parameter, similar to nprobes
+                .map(|Reverse(candidate)| candidate)
+                .collect();
+        }
+        if max_layer == self.clusterings_per_layer.len() {
+            // TODO update best_candidates with leaves
+        }
+        // TODO below is a stub, need to format output and complete
         let schema = VECTOR_RESULT_SCHEMA.clone();
         return Ok(RecordBatch::new_empty(schema));
     }
@@ -236,5 +274,6 @@ impl KMeansTree {
 }
 
 // TODO add unit tests
+// -- first layer should contain =1 node
 // TODO add IvfSubIndex impl, incl reading/writing
 // TODO add VectorIndex impl
