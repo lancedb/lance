@@ -2840,7 +2840,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: str = "legacy",
+    data_storage_version: str = "stable",
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
 ) -> LanceDataset:

@@ -16,8 +16,8 @@ pub enum LanceFileVersion {
     // Note that Stable must come AFTER the stable version and Next must come AFTER the next version
     // this way comparisons like x >= V2_0 will work the same if x is Stable or V2_0
     /// The legacy (0.1) format
-    #[default]
     Legacy,
+    #[default]
     V2_0,
     /// The latest stable release
     Stable,
@@ -34,12 +34,6 @@ impl LanceFileVersion {
             Self::Next => Self::V2_1,
             _ => *self,
         }
-    }
-
-    /// Returns the default version if Legacy is not an option
-    pub fn default_v2() -> Self {
-        // This will go away soon, but there are a few spots where the Legacy default doesn't make sense
-        Self::V2_0
     }
 
     pub fn try_from_major_minor(major: u32, minor: u32) -> Result<Self> {

@@ -82,7 +82,8 @@ def test_roundtrip_types(tmp_path: Path):
         }
     )
 
-    dataset = lance.write_dataset(table, tmp_path)
+    # TODO: V2 does not currently handle large_dict
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="legacy")
     assert dataset.schema == table.schema
     assert dataset.to_table() == table
 
@@ -2273,3 +2274,27 @@ def test_late_materialization_batch_size(tmp_path: Path):
         columns=["values"], filter="filter % 2 == 0", batch_size=32
     ):
         assert batch.num_rows == 32
+
+
+EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
+EXPECTED_MAJOR_VERSION = 0
+EXPECTED_MINOR_VERSION = 3
+
+
+def test_default_storage_version(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+    assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
+
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+    from lance.fragment import write_fragments
+
+    frags = write_fragments(table, dataset.uri)
+    frag = frags[0]
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION

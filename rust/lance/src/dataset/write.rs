@@ -231,25 +231,39 @@ pub async fn write_fragments_internal(
     // Make sure the max rows per group is not larger than the max rows per file
     params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
 
-    let mut storage_version = params.storage_version_or_default();
-
-    let schema = if let Some(dataset) = dataset {
-        if matches!(params.mode, WriteMode::Append) {
-            // Append mode, so we need to check compatibility
-            schema.check_compatible(dataset.schema(), &Default::default())?;
-            // If appending use storage version from dataset
-            storage_version = dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_version()?;
-            // Use the schema from the dataset, because it has the correct
-            // field ids.
-            dataset.schema()
-        } else {
-            schema
+    let (schema, storage_version) = if let Some(dataset) = dataset {
+        match params.mode {
+            WriteMode::Append | WriteMode::Create => {
+                // Append mode, so we need to check compatibility
+                schema.check_compatible(dataset.schema(), &Default::default())?;
+                // Use the schema from the dataset, because it has the correct
+                // field ids.  Use the storage version from the dataset, ignoring
+                // any version from the user.
+                (
+                    dataset.schema(),
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                )
+            }
+            WriteMode::Overwrite => {
+                // Overwrite, use the schema from the data.  If the user specified
+                // a storage version use that.  Otherwise use the version from the
+                // dataset.
+                let data_storage_version = params.data_storage_version.unwrap_or(
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                );
+                (schema, data_storage_version)
+            }
         }
     } else {
-        schema
+        // Brand new dataset, use the schema from the data and the storage version
+        // from the user or the default.
+        (schema, params.storage_version_or_default())
     };
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
@@ -463,6 +477,7 @@ mod tests {
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;
+    use lance_datagen::{array, gen, BatchCount, RowCount};
     use lance_file::reader::FileReader;
     use lance_io::traits::Reader;
 
@@ -549,47 +564,52 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_size() {
-        let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
-            "a",
-            DataType::Int32,
-            false,
-        )]));
+        let reader_to_frags = |data_reader: Box<dyn RecordBatchReader + Send>| {
+            let schema = data_reader.schema();
+            let data_reader =
+                data_reader.map(|rb| rb.map_err(datafusion::error::DataFusionError::from));
 
-        // Write 1024 rows and show they are split into two files
-        // 512 * 4 bytes = 2KB
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter(0..1024))],
-        )
-        .unwrap();
+            let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(data_reader),
+            ));
 
-        let write_params = WriteParams {
-            max_rows_per_file: 1024 * 10, // Won't be limited by this
-            max_rows_per_group: 512,
-            max_bytes_per_file: 2 * 1024,
-            mode: WriteMode::Create,
-            ..Default::default()
+            let write_params = WriteParams {
+                max_rows_per_file: 1024 * 1024, // Won't be limited by this
+                max_bytes_per_file: 2 * 1024,
+                mode: WriteMode::Create,
+                ..Default::default()
+            };
+
+            async move {
+                let schema = Schema::try_from(schema.as_ref()).unwrap();
+
+                let object_store = Arc::new(ObjectStore::memory());
+                write_fragments_internal(
+                    None,
+                    object_store,
+                    &Path::from("test"),
+                    &schema,
+                    data_stream,
+                    write_params,
+                )
+                .await
+            }
         };
 
-        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(std::iter::once(Ok(batch))),
-        ));
+        // The writer will not generate a new file until at enough data is *written* (not
+        // just accumulated) to justify a new file.  Since the default page size is 8MiB
+        // we actually need to generate quite a bit of data to trigger this.
+        //
+        // To avoid generating and writing millions of rows (which is a bit slow for a unit
+        // test) we can use a large data type (1KiB binary)
+        let data_reader = Box::new(
+            gen()
+                .anon_col(array::rand_fsb(1024))
+                .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
+        );
 
-        let schema = Schema::try_from(schema.as_ref()).unwrap();
-
-        let object_store = Arc::new(ObjectStore::memory());
-        let fragments = write_fragments_internal(
-            None,
-            object_store,
-            &Path::from("test"),
-            &schema,
-            data_stream,
-            write_params,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fragments.len(), 2);
+        assert_eq!(reader_to_frags(data_reader).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

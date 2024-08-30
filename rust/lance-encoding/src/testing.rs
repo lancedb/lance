@@ -172,7 +172,7 @@ pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<St
     check_round_trip_encoding_generated(
         field,
         Box::new(array_generator_provider),
-        LanceFileVersion::default_v2(),
+        LanceFileVersion::default(),
     )
     .await;
 }

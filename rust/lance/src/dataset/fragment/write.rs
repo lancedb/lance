@@ -111,6 +111,10 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         fragment.physical_rows = Some(writer.finish().await? as usize);
 
+        if matches!(fragment.physical_rows, Some(0)) {
+            return Err(Error::invalid_input("Input data was empty.", location!()));
+        }
+
         let field_ids = writer
             .field_id_to_column_indices()
             .iter()
@@ -353,6 +357,7 @@ mod tests {
         assert_eq!(fragment.id, 42);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![1, 3]);
+        assert_eq!(fragment.files[0].fields, vec![3, 1]);
+        assert_eq!(fragment.files[0].column_indices, vec![0, 1]);
     }
 }

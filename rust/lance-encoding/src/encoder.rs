@@ -261,17 +261,9 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
 
 /// The core array encoding strategy is a set of basic encodings that
 /// are generally applicable in most scenarios.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CoreArrayEncodingStrategy {
     pub version: LanceFileVersion,
-}
-
-impl Default for CoreArrayEncodingStrategy {
-    fn default() -> Self {
-        Self {
-            version: LanceFileVersion::default_v2(),
-        }
-    }
 }
 
 fn get_compression_scheme(field_meta: Option<&HashMap<String, String>>) -> CompressionScheme {
@@ -703,11 +695,14 @@ pub struct CoreFieldEncodingStrategy {
     pub version: LanceFileVersion,
 }
 
+// For some reason clippy has a false negative and thinks this can be derived but
+// it can't because ArrayEncodingStrategy has no default implementation
+#[allow(clippy::derivable_impls)]
 impl Default for CoreFieldEncodingStrategy {
     fn default() -> Self {
         Self {
             array_encoding_strategy: Arc::<CoreArrayEncodingStrategy>::default(),
-            version: LanceFileVersion::default_v2(),
+            version: LanceFileVersion::default(),
         }
     }
 }
@@ -766,7 +761,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             )?))
         } else {
             match data_type {
-                DataType::List(_child) => {
+                DataType::List(_child) | DataType::LargeList(_child) => {
                     let list_idx = column_index.next_column_index(field.id);
                     let inner_encoding = encoding_strategy_root.create_field_encoder(
                         encoding_strategy_root,

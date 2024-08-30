@@ -2454,6 +2454,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_size() {
+        // V1 ONLY
+        //
+        // This test is only for the legacy version of the file format.
+        // It ensures that the `max_rows_per_group` property is respected
+        // and this property does not exist in V2.
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2484,6 +2489,7 @@ mod tests {
             batch_iter,
             Some(WriteParams {
                 max_rows_per_group: 100,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -2590,13 +2596,15 @@ mod tests {
         let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
 
-        let actual_data = reader.legacy_read_range_as_batch(0..3).await?;
-        assert_eq!(expected_data.slice(0, 3), actual_data);
-
         let actual_data = reader
-            .legacy_read_batch_projected(0, .., &dataset.schema().project(&["s", "i"]).unwrap())
-            .await?;
-        assert_eq!(expected_data, actual_data);
+            .read_range(0..3, 3)
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(expected_data.slice(0, 3), actual_data);
 
         // Also check case of row_id.
         let expected_data = expected_data.try_with_column(

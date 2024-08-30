@@ -229,10 +229,7 @@ impl FileWriter {
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
         let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
-            let version = self
-                .options
-                .format_version
-                .unwrap_or(LanceFileVersion::default_v2());
+            let version = self.options.format_version.unwrap_or_default();
             Arc::new(CoreFieldEncodingStrategy {
                 array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
                 version,
@@ -449,10 +446,7 @@ impl FileWriter {
     /// Converts self.version (which is a mix of "software version" and
     /// "format version" into a format version)
     fn version_to_numbers(&self) -> (u16, u16) {
-        let version = self
-            .options
-            .format_version
-            .unwrap_or(LanceFileVersion::default_v2());
+        let version = self.options.format_version.unwrap_or_default();
         match version.resolve() {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
