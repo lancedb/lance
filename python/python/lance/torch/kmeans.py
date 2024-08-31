@@ -59,9 +59,12 @@ class KMeans:
         centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
+        use_cuvs: bool = True,
     ):
         self.k = k
         self.max_iters = max_iters
+        self.use_cuvs = use_cuvs
+
 
         metric = metric.lower()
         self.metric = metric
@@ -75,12 +78,24 @@ class KMeans:
                 f"Only l2/cosine/dot is supported as metric type, got: {metric}"
             )
 
+        if self.use_cuvs and self.metric == "dot":
+            logging.warning(
+                "Kmeans::__init__: metric == \"dot\" is incompatible with use_cuvs == True, disabling cuvs..."
+            )
+            self.use_cuvs = False
+
         self.total_distance = 0
         self.centroids: Optional[torch.Tensor] = centroids
         self.init = init
         self.device = preferred_device(device)
         self.tolerance = tolerance
         self.seed = seed
+
+        if self.device.type != "cuda" and self.use_cuvs:
+            logging.warning(
+                "Kmeans::__init__: cuda is not enabled/available, disabling cuvs..."
+            )
+            self.use_cuvs = False
 
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
@@ -136,7 +151,6 @@ class KMeans:
         data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
             2-D vectors to train kmeans.
         """
-        print("Inside fit function")
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
@@ -165,7 +179,6 @@ class KMeans:
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
-        print("Exiting fit function")
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -270,16 +283,17 @@ class KMeans:
         return total_dist
 
     def rebuild_index(self):
-        cagra_metric = "sqeuclidean"
-        # TODO 128 and 64 should be replaced with something dependent on the dimension
-        index_params = cagra.IndexParams(
-            metric=cagra_metric,
-            intermediate_graph_degree=128,
-            graph_degree=64,
-            build_algo="nn_descent",
-            compression=None,
-        )
-        self.index = cagra.build(index_params, self.centroids)
+        if self.use_cuvs:
+            cagra_metric = "sqeuclidean"
+            dim = self.centroids.shape[1]
+            index_params = cagra.IndexParams(
+                metric=cagra_metric,
+                intermediate_graph_degree=dim*2,
+                graph_degree=max(dim // 4, 16),
+                build_algo="nn_descent",
+                compression=None,
+            )
+            self.index = cagra.build(index_params, self.centroids)
 
     def _transform(
         self,
@@ -289,19 +303,20 @@ class KMeans:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
 
-        out_idx = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.uint32))
-        out_dist = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.float32))
-        search_params = cagra.SearchParams()
-        cagra.search(
-            search_params,
-            self.index,
-            data,
-            1,
-            neighbors=out_idx,
-            distances=out_dist,
-        )
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        return torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
+        if self.use_cuvs:
+            device = torch.device("cuda")
+            out_idx = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.uint32))
+            out_dist = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.float32))
+            search_params = cagra.SearchParams()
+            cagra.search(
+                search_params,
+                self.index,
+                data,
+                1,
+                neighbors=out_idx,
+                distances=out_dist,
+            )
+            return torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
 
         if self.metric in ["l2", "cosine"]:
             return self.dist_func(data, self.centroids, y2=y2)
