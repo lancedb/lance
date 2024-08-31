@@ -17,6 +17,9 @@ from lance.dependencies import (
 )
 from lance.dependencies import numpy as np
 
+from cuvs.neighbors import cagra
+from pylibraft.common import device_ndarray
+
 from . import preferred_device
 from .data import TensorDataset
 from .distance import dot_distance, l2_distance
@@ -309,14 +312,14 @@ class KMeans:
             dim = self.centroids.shape[1]
             graph_degree = max(dim // 4, 32)
             nn_descent_degree = graph_degree * 2
-            index_params = cuvs.neighbors.cagra.IndexParams(
+            index_params = cagra.IndexParams(
                 metric=cagra_metric,
                 intermediate_graph_degree=nn_descent_degree,
                 graph_degree=graph_degree,
                 build_algo="nn_descent",
                 compression=None,
             )
-            self.index = cuvs.neighbors.cagra.build(index_params, self.centroids)
+            self.index = cagra.build(index_params, self.centroids)
             rebuild_time_end = time.time()
             self.time_rebuild += rebuild_time_end - rebuild_time_start
 
@@ -331,16 +334,10 @@ class KMeans:
         if self.use_cuvs:
             search_time_start = time.time()
             device = torch.device("cuda")
-            out_idx = pylibraft.common.device_ndarray.empty(
-                (data.shape[0], 1), dtype="uint32"
-            )
-            out_dist = pylibraft.common.device_ndarray.empty(
-                (data.shape[0], 1), dtype="float32"
-            )
-            search_params = cuvs.neighbors.cagra.SearchParams(
-                itopk_size=self.itopk_size
-            )
-            cuvs.neighbors.cagra.search(
+            out_idx = device_ndarray.empty((data.shape[0], 1), dtype="uint32")
+            out_dist = device_ndarray.empty((data.shape[0], 1), dtype="float32")
+            search_params = cagra.SearchParams(itopk_size=self.itopk_size)
+            cagra.search(
                 search_params,
                 self.index,
                 data,
