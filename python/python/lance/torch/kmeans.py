@@ -65,7 +65,6 @@ class KMeans:
         self.max_iters = max_iters
         self.use_cuvs = use_cuvs
 
-        self.time_init = 0.0
         self.time_rebuild = 0.0
         self.time_search = 0.0
 
@@ -154,7 +153,6 @@ class KMeans:
         data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
             2-D vectors to train kmeans.
         """
-        self.time_init = 0.0
         self.time_rebuild = 0.0
         self.time_search = 0.0
         start = time.time()
@@ -190,7 +188,6 @@ class KMeans:
         if self.use_cuvs:
             logging.info(f"Total search time: {self.time_search}")
             logging.info(f"Total rebuild time: {self.time_rebuild}")
-            logging.info(f"Total init time: {self.time_init}")
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -324,11 +321,10 @@ class KMeans:
             data = torch.nn.functional.normalize(data)
 
         if self.use_cuvs:
-            start_time_init = time.time()
+            search_time_start = time.time()
             device = torch.device("cuda")
             out_idx = device_ndarray.empty((data.shape[0], 1), dtype='uint32')
             out_dist = device_ndarray.empty((data.shape[0], 1), dtype='float32')
-            end_time_init = time.time()
             search_params = cagra.SearchParams(
                 itopk_size = 8
             )
@@ -342,8 +338,7 @@ class KMeans:
             )
             ret = torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
             search_time_end = time.time()
-            self.time_init += end_time_init - start_time_init
-            self.time_search += search_time_end - end_time_init
+            self.time_search += search_time_end - search_time_start
             return ret
 
         if self.metric in ["l2", "cosine"]:
