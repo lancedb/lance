@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from lance.dependencies import _check_for_numpy, _check_for_torch, torch
 from lance.dependencies import numpy as np
+
 from lance.dependencies import cuvs
 from lance.dependencies import pylibraft
 
