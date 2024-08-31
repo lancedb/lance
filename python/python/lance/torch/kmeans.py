@@ -11,8 +11,8 @@ from tqdm import tqdm
 from lance.dependencies import (
     _check_for_numpy,
     _check_for_torch,
-    cuvs,
-    pylibraft,
+    # cuvs,
+    # pylibraft,
     torch,
 )
 from lance.dependencies import numpy as np

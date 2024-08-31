@@ -1,6 +1,6 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=12", "numpy>=1.22,<2"]
+dependencies = ["pyarrow>=12", "numpy>=1.22,<2", "cuvs-cu12", "pylibraft-cu12"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
