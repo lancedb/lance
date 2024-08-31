@@ -6,6 +6,8 @@ import time
 from typing import List, Literal, Optional, Tuple, Union
 
 import pyarrow as pa
+from cuvs.neighbors import cagra
+from pylibraft.common import device_ndarray
 from tqdm import tqdm
 
 from lance.dependencies import (
@@ -16,9 +18,6 @@ from lance.dependencies import (
     torch,
 )
 from lance.dependencies import numpy as np
-
-from cuvs.neighbors import cagra
-from pylibraft.common import device_ndarray
 
 from . import preferred_device
 from .data import TensorDataset
