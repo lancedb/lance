@@ -164,9 +164,7 @@ class KMeans:
             _check_for_numpy(data) and isinstance(data, np.ndarray)
         ):
             self._random_init(data)
-            # data = TensorDataset(data, batch_size=10240)
-            # data = TensorDataset(data, batch_size=1024*256*8)
-            data = TensorDataset(data, batch_size=1024 * 256)
+            data = TensorDataset(data, batch_size=10240)
 
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
