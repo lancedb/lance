@@ -46,6 +46,8 @@ class KMeans:
     device: str, optional
         The device to run the PyTorch algorithms. Default we will pick
         the most performant device on the host. See `lance.torch.preferred_device()`
+    use_cuvs: bool
+        Whether to use cuVS to accelerate computation (useful for many centroids).
     """
 
     def __init__(
@@ -64,6 +66,7 @@ class KMeans:
         self.k = k
         self.max_iters = max_iters
         self.use_cuvs = use_cuvs
+        self.itopk_size = 4
 
         self.time_rebuild = 0.0
         self.time_search = 0.0
@@ -272,6 +275,9 @@ class KMeans:
             del ids
             del dists
             del chunk
+        if self.use_cuvs:
+            self.itopk_size += 1
+            self.itopk_size = min(self.itopk_size, 16)
 
         # this happens when there are too many NaNs or the data is just the same
         # vectors repeated over and over. Performance may be bad but we don't
@@ -323,7 +329,7 @@ class KMeans:
             device = torch.device("cuda")
             out_idx = device_ndarray.empty((data.shape[0], 1), dtype="uint32")
             out_dist = device_ndarray.empty((data.shape[0], 1), dtype="float32")
-            search_params = cagra.SearchParams(itopk_size=8)
+            search_params = cagra.SearchParams(itopk_size=self.itopk_size)
             cagra.search(
                 search_params,
                 self.index,
