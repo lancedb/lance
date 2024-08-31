@@ -187,8 +187,8 @@ class KMeans:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
         if self.use_cuvs:
-            logging.info(f"Total search time: {self.time_search}")
-            logging.info(f"Total rebuild time: {self.time_rebuild}")
+            logging.info("Total search time: %s", self.time_search)
+            logging.info("Total rebuild time: %s", self.time_rebuild)
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
