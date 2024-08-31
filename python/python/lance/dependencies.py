@@ -163,15 +163,15 @@ def _lazy_import(module_name: str) -> tuple[ModuleType, bool]:
 
 
 if TYPE_CHECKING:
+    import cuvs
     import datasets
     import numpy
     import pandas
     import polars
+    import pylibraft
     import ray
     import tensorflow
     import torch
-    import cuvs
-    import pylibraft
 else:
     # heavy/optional third party libs
     numpy, _NUMPY_AVAILABLE = _lazy_import("numpy")

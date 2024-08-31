@@ -3,7 +3,7 @@
 
 import logging
 import time
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Optional, List, Literal, Tuple, Union
 
 import pyarrow as pa
 from tqdm import tqdm
