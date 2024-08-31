@@ -85,7 +85,8 @@ class KMeans:
 
         if self.use_cuvs and self.metric == "dot":
             logging.warning(
-                'Kmeans::__init__: metric == "dot" is incompatible with use_cuvs == True, disabling cuvs...'
+                'Kmeans::__init__: metric == "dot" is incompatible" \
+                " with use_cuvs == True, disabling cuvs...'
             )
             self.use_cuvs = False
 
