@@ -5,14 +5,16 @@ import logging
 import time
 from typing import List, Literal, Optional, Tuple, Union
 
-from cuvs.neighbors import cagra
-from pylibraft.common import device_ndarray
-
 import pyarrow as pa
 from tqdm import tqdm
 
 from lance.dependencies import _check_for_numpy, _check_for_torch, torch
 from lance.dependencies import numpy as np
+from lance.dependencies import cuvs
+from lance.dependencies import pylibraft
+
+from cuvs.neighbors.cagra import cagra
+from pylibraft.common.device_ndarray import device_ndarray
 
 from . import preferred_device
 from .data import TensorDataset
