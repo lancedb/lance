@@ -5,6 +5,9 @@ import logging
 import time
 from typing import List, Literal, Optional, Tuple, Union
 
+from cuvs.neighbors import cagra
+from pylibraft.common import device_ndarray
+
 import pyarrow as pa
 from tqdm import tqdm
 
@@ -133,6 +136,7 @@ class KMeans:
         data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
             2-D vectors to train kmeans.
         """
+        print("Inside fit function")
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
@@ -161,6 +165,7 @@ class KMeans:
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
+        print("Exiting fit function")
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -221,6 +226,7 @@ class KMeans:
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
         y2 = (self.centroids * self.centroids).sum(dim=1)
+        self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
@@ -229,10 +235,10 @@ class KMeans:
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk, y2=y2)
 
-            valid_mask = ids >= 0
-            if torch.any(~valid_mask):
-                chunk = chunk[valid_mask]
-                ids = ids[valid_mask]
+            #valid_mask = ids >= 0
+            #if torch.any(~valid_mask):
+                #chunk = chunk[valid_mask]
+                #ids = ids[valid_mask]
 
             total_dist += dists.nansum().item()
             if ones.shape[0] < ids.shape[0]:
@@ -263,6 +269,18 @@ class KMeans:
         )
         return total_dist
 
+    def rebuild_index(self):
+        cagra_metric = "sqeuclidean"
+        # TODO 128 and 64 should be replaced with something dependent on the dimension
+        index_params = cagra.IndexParams(
+            metric=cagra_metric,
+            intermediate_graph_degree=128,
+            graph_degree=64,
+            build_algo="nn_descent",
+            compression=None,
+        )
+        self.index = cagra.build(index_params, self.centroids)
+
     def _transform(
         self,
         data: torch.Tensor,
@@ -270,6 +288,20 @@ class KMeans:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
+
+        out_idx = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.uint32))
+        out_dist = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.float32))
+        search_params = cagra.SearchParams()
+        cagra.search(
+            search_params,
+            self.index,
+            data,
+            1,
+            neighbors=out_idx,
+            distances=out_dist,
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
 
         if self.metric in ["l2", "cosine"]:
             return self.dist_func(data, self.centroids, y2=y2)

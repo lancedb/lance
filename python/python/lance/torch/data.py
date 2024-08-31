@@ -54,10 +54,14 @@ def _to_tensor(
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
-            np_tensor = arr.values.to_numpy(zero_copy_only=True).reshape(
-                -1, arr.type.list_size
-            )
-            tensor = torch.from_numpy(np_tensor)
+            #np_tensor = arr.values.to_numpy(zero_copy_only=True).reshape(
+            #    -1, arr.type.list_size
+            #)
+            #tensor = torch.from_numpy(np_tensor)
+            np_arrs = arr.to_numpy(zero_copy_only=False)
+            np_tensor = np.stack(np_arrs)
+            del np_arrs
+            tensor = torch.tensor(np_tensor)
             del np_tensor
         elif (
             pa.types.is_integer(arr.type)
