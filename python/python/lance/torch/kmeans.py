@@ -59,7 +59,7 @@ class KMeans:
         centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
-        use_cuvs: bool = True,
+        use_cuvs: bool = False,
     ):
         self.k = k
         self.max_iters = max_iters
@@ -187,9 +187,10 @@ class KMeans:
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
-        print(f"Total search time: {self.time_search}")
-        print(f"Total rebuild time: {self.time_rebuild}")
-        print(f"Total init time: {self.time_init}")
+        if self.use_cuvs:
+            logging.info(f"Total search time: {self.time_search}")
+            logging.info(f"Total rebuild time: {self.time_rebuild}")
+            logging.info(f"Total init time: {self.time_init}")
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
