@@ -65,6 +65,9 @@ class KMeans:
         self.max_iters = max_iters
         self.use_cuvs = use_cuvs
 
+        self.time_init = 0.0
+        self.time_rebuild = 0.0
+        self.time_search = 0.0
 
         metric = metric.lower()
         self.metric = metric
@@ -151,6 +154,9 @@ class KMeans:
         data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
             2-D vectors to train kmeans.
         """
+        self.time_init = 0.0
+        self.time_rebuild = 0.0
+        self.time_search = 0.0
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
@@ -160,7 +166,9 @@ class KMeans:
             _check_for_numpy(data) and isinstance(data, np.ndarray)
         ):
             self._random_init(data)
-            data = TensorDataset(data, batch_size=10240)
+            #data = TensorDataset(data, batch_size=10240)
+            #data = TensorDataset(data, batch_size=1024*256*8)
+            data = TensorDataset(data, batch_size=1024*256)
 
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
@@ -179,6 +187,9 @@ class KMeans:
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
+        print(f"Total search time: {self.time_search}")
+        print(f"Total rebuild time: {self.time_rebuild}")
+        print(f"Total init time: {self.time_init}")
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -238,7 +249,10 @@ class KMeans:
         )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
-        y2 = (self.centroids * self.centroids).sum(dim=1)
+        if (not self.use_cuvs) and self.metric in ["l2", "cosine"]:
+            y2 = (self.centroids * self.centroids).sum(dim=1)
+        else:
+            y2 = None
         self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
@@ -284,16 +298,21 @@ class KMeans:
 
     def rebuild_index(self):
         if self.use_cuvs:
+            rebuild_time_start = time.time()
             cagra_metric = "sqeuclidean"
             dim = self.centroids.shape[1]
+            graph_degree = max(dim // 4, 32)
+            nn_descent_degree = graph_degree * 2
             index_params = cagra.IndexParams(
                 metric=cagra_metric,
-                intermediate_graph_degree=dim*2,
-                graph_degree=max(dim // 4, 16),
+                intermediate_graph_degree=nn_descent_degree,
+                graph_degree=graph_degree,
                 build_algo="nn_descent",
                 compression=None,
             )
             self.index = cagra.build(index_params, self.centroids)
+            rebuild_time_end = time.time()
+            self.time_rebuild += rebuild_time_end - rebuild_time_start
 
     def _transform(
         self,
@@ -304,10 +323,14 @@ class KMeans:
             data = torch.nn.functional.normalize(data)
 
         if self.use_cuvs:
+            start_time_init = time.time()
             device = torch.device("cuda")
-            out_idx = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.uint32))
-            out_dist = device_ndarray(np.zeros((data.shape[0], 1), dtype=np.float32))
-            search_params = cagra.SearchParams()
+            out_idx = device_ndarray.empty((data.shape[0], 1), dtype='uint32')
+            out_dist = device_ndarray.empty((data.shape[0], 1), dtype='float32')
+            end_time_init = time.time()
+            search_params = cagra.SearchParams(
+                itopk_size = 8
+            )
             cagra.search(
                 search_params,
                 self.index,
@@ -316,7 +339,11 @@ class KMeans:
                 neighbors=out_idx,
                 distances=out_dist,
             )
-            return torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
+            ret = torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
+            search_time_end = time.time()
+            self.time_init += end_time_init - start_time_init
+            self.time_search += search_time_end - end_time_init
+            return ret
 
         if self.metric in ["l2", "cosine"]:
             return self.dist_func(data, self.centroids, y2=y2)
