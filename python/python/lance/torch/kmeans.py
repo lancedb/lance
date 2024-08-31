@@ -326,9 +326,15 @@ class KMeans:
         if self.use_cuvs:
             search_time_start = time.time()
             device = torch.device("cuda")
-            out_idx = pylibraft.common.device_ndarray.empty((data.shape[0], 1), dtype="uint32")
-            out_dist = pylibraft.common.device_ndarray.empty((data.shape[0], 1), dtype="float32")
-            search_params = cuvs.neighbors.cagra.SearchParams(itopk_size=self.itopk_size)
+            out_idx = pylibraft.common.device_ndarray.empty(
+                (data.shape[0], 1), dtype="uint32"
+            )
+            out_dist = pylibraft.common.device_ndarray.empty(
+                (data.shape[0], 1), dtype="float32"
+            )
+            search_params = cuvs.neighbors.cagra.SearchParams(
+                itopk_size=self.itopk_size
+            )
             cuvs.neighbors.cagra.search(
                 search_params,
                 self.index,
