@@ -77,8 +77,21 @@ impl InvertedIndexBuilder {
     async fn update_index(&mut self, mut stream: SendableRecordBatchStream) -> Result<()> {
         const NUM_SHARDS: usize = 32;
         let token_maps = (0..NUM_SHARDS)
-            .map(|_| RwLock::new(std::mem::take(&mut self.tokens.tokens)))
+            .map(|_| RwLock::new(HashMap::new()))
             .collect_vec();
+        // init the token maps
+        {
+            let mut token_maps = token_maps
+                .iter()
+                .map(|map| map.write().unwrap())
+                .collect_vec();
+            for (token, token_id) in std::mem::take(&mut self.tokens.tokens) {
+                let mut hasher = DefaultHasher::new();
+                hasher.write(token.as_bytes());
+                let shard = hasher.finish() as usize % NUM_SHARDS;
+                token_maps[shard].insert(token, token_id);
+            }
+        }
         let next_id = AtomicU32::new(self.tokens.next_id);
 
         let start = std::time::Instant::now();
@@ -229,7 +242,7 @@ impl InvertedIndexBuilder {
             .new_index_file(INVERT_LIST_FILE, self.invert_list.schema().clone())
             .await?;
         std::mem::take(&mut self.invert_list)
-            .to_batches(docs.clone(), invert_list_writer)
+            .into_batches(docs.clone(), invert_list_writer)
             .await?;
         log::info!("write inverted lists done: {:?}", start.elapsed());
 
@@ -264,7 +277,7 @@ impl Default for InvertedList {
 
 impl DeepSizeOf for InvertedList {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.inverted_list.deep_size_of_children(context) + std::mem::size_of::<bool>()
+        self.inverted_list.deep_size_of_children(context)
     }
 }
 
@@ -298,8 +311,7 @@ impl InvertedList {
     }
 
     // the schema of the inverted list is | row_id | frequency | positions (optional)
-    #[allow(clippy::wrong_self_convention)]
-    pub async fn to_batches(
+    pub async fn into_batches(
         self,
         docs: Arc<DocSet>,
         mut writer: Box<dyn IndexWriter>,
