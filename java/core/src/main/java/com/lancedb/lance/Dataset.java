@@ -133,11 +133,11 @@ public class Dataset implements Closeable {
   /**
    * Open a dataset from the specified path.
    *
-   * @param allocator Arrow buffer allocator.
    * @param path      file path
+   * @param allocator Arrow buffer allocator
    * @return Dataset
    */
-  public static Dataset open(BufferAllocator allocator, String path) {
+  public static Dataset open(String path, BufferAllocator allocator) {
     return open(allocator, path, new ReadOptions());
   }
 
@@ -258,14 +258,24 @@ public class Dataset implements Closeable {
 
   private native long nativeLatestVersion();
 
-  public void createIndex(List<String> columns, IndexType indexType, Optional<String> name, IndexParams params, boolean replace) {
+  /**
+   * Creates a new index on the dataset.
+   *
+   * @param columns the columns to index from
+   * @param indexType the index type
+   * @param name the name of the created index
+   * @param params index params
+   * @param replace whether to replace the existing index
+   */
+  public void createIndex(List<String> columns, IndexType indexType, Optional<String> name,
+      IndexParams params, boolean replace) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
     }
   }
 
-  private native void nativeCreateIndex(List<String> columns, int indexTypeCode, 
+  private native void nativeCreateIndex(List<String> columns, int indexTypeCode,
     Optional<String> name, IndexParams params, boolean replace);
 
   /**
@@ -319,6 +329,9 @@ public class Dataset implements Closeable {
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
+  /**
+   * @return all the created indexes names
+   */
   public List<String> listIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");

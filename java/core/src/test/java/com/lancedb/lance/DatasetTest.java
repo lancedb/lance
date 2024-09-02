@@ -76,7 +76,7 @@ public class DatasetTest {
     assertThrows(
         RuntimeException.class,
         () -> {
-          dataset = Dataset.open(new RootAllocator(Long.MAX_VALUE), validPath);
+          dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
         });
   }
 
@@ -120,7 +120,7 @@ public class DatasetTest {
             }
   
             // Open dataset with latest version (3)
-            try (Dataset datasetLatest = Dataset.open(allocator, datasetPath)) {
+            try (Dataset datasetLatest = Dataset.open(datasetPath, allocator)) {
               assertEquals(3, datasetLatest.version());
               assertEquals(3, datasetLatest.latestVersion());
             }
@@ -135,7 +135,7 @@ public class DatasetTest {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       assertThrows(IllegalArgumentException.class, () -> {
-        Dataset.open(allocator, datasetPath);
+        Dataset.open(datasetPath, allocator);
       });
     }
   }

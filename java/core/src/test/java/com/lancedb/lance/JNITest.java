@@ -99,8 +99,8 @@ public class JNITest {
         .setNumPartitions(15)
         .build();
     HnswBuildParams hnsw = new HnswBuildParams.Builder()
-        .maxLevel((short) 10)
-        .m(30)
+        .setMaxLevel((short) 10)
+        .setM(30)
         .setEfConstruction(200)
         .setPrefetchDistance(3)
         .build();
@@ -121,8 +121,8 @@ public class JNITest {
         .setNumPartitions(25)
         .build();
     HnswBuildParams hnsw = new HnswBuildParams.Builder()
-        .maxLevel((short) 8)
-        .m(25)
+        .setMaxLevel((short) 8)
+        .setM(25)
         .setEfConstruction(175)
         .build();
     SQBuildParams sq = new SQBuildParams.Builder()

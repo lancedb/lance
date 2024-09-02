@@ -24,12 +24,12 @@ public class HnswBuildParams {
     public Builder() {
     }
 
-    public Builder maxLevel(short maxLevel) {
+    public Builder setMaxLevel(short maxLevel) {
       this.maxLevel = maxLevel;
       return this;
     }
 
-    public Builder m(int m) {
+    public Builder setM(int m) {
       this.m = m;
       return this;
     }
