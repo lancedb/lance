@@ -85,12 +85,14 @@ pub async fn merge_indices<'a>(
                 .await?;
 
             let mut scanner = dataset.scan();
+            let orodering = match index.index_type() {
+                IndexType::Inverted => None,
+                _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
+            };
             scanner
                 .with_fragments(unindexed)
                 .with_row_id()
-                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                    column.name.clone(),
-                )]))?
+                .order_by(orodering)?
                 .project(&[&column.name])?;
             let new_data_stream = scanner.try_into_stream().await?;
 
