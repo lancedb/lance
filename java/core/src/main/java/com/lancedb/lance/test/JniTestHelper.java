@@ -15,6 +15,7 @@
 package com.lancedb.lance.test;
 
 import com.lancedb.lance.JniLoader;
+import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.ipc.Query;
 
 import java.util.List;
@@ -50,4 +51,6 @@ public class JniTestHelper {
    * @param query the optional query
    */
   public static native void parseQuery(Optional<Query> query);
+
+  public static native void parseIndexParams(IndexParams indexParams);
 }

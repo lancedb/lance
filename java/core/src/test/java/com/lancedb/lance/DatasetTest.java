@@ -76,7 +76,7 @@ public class DatasetTest {
     assertThrows(
         RuntimeException.class,
         () -> {
-          dataset = Dataset.open(validPath, new RootAllocator());
+          dataset = Dataset.open(new RootAllocator(Long.MAX_VALUE), validPath);
         });
   }
 
@@ -97,8 +97,8 @@ public class DatasetTest {
           assertEquals(2, dataset2.latestVersion());
   
           // Open dataset with version 1
-          DatasetOpenOptions options1 = new DatasetOpenOptions().version(1);
-          try (Dataset datasetV1 = Dataset.open(datasetPath, allocator, options1)) {
+          ReadOptions options1 = new ReadOptions().version(1);
+          try (Dataset datasetV1 = Dataset.open(allocator, datasetPath, options1)) {
             assertEquals(1, datasetV1.version());
             assertEquals(2, datasetV1.latestVersion());
           }
@@ -113,14 +113,14 @@ public class DatasetTest {
             assertEquals(3, dataset3.latestVersion());
   
             // Open dataset with version 2
-            DatasetOpenOptions options2 = new DatasetOpenOptions().version(2);
-            try (Dataset datasetV2 = Dataset.open(datasetPath, allocator, options2)) {
+            ReadOptions options2 = new ReadOptions().version(2);
+            try (Dataset datasetV2 = Dataset.open(allocator, datasetPath, options2)) {
               assertEquals(2, datasetV2.version());
               assertEquals(3, datasetV2.latestVersion());
             }
   
             // Open dataset with latest version (3)
-            try (Dataset datasetLatest = Dataset.open(datasetPath, allocator)) {
+            try (Dataset datasetLatest = Dataset.open(allocator, datasetPath)) {
               assertEquals(3, datasetLatest.version());
               assertEquals(3, datasetLatest.latestVersion());
             }
@@ -135,7 +135,7 @@ public class DatasetTest {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       assertThrows(IllegalArgumentException.class, () -> {
-        Dataset.open(datasetPath, allocator);
+        Dataset.open(allocator, datasetPath);
       });
     }
   }

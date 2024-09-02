@@ -16,11 +16,10 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::utils::get_query;
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::objects::{JFloatArray, JObject, JString};
+use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
@@ -101,6 +100,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
@@ -178,7 +178,7 @@ fn inner_create_scanner<'local>(
         let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
         let key = Float32Array::from(key_array);
         let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
-        scanner.nearest(&column, &key, k);
+        let _ = scanner.nearest(&column, &key, k);
 
         let nprobes = env.get_int_as_usize_from_method(&java_obj, "getNprobes")?;
         scanner.nprobs(nprobes);
@@ -194,7 +194,7 @@ fn inner_create_scanner<'local>(
         }
 
         let distance_type: JString = env
-            .call_method(&java_obj, "getMetricType", "()Ljava/lang/String;", &[])?
+            .call_method(&java_obj, "getDistanceType", "()Ljava/lang/String;", &[])?
             .l()?
             .into();
         let distance_type: String = env.get_string(&distance_type)?.into();

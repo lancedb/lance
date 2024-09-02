@@ -16,35 +16,38 @@ package com.lancedb.lance;
 
 import java.util.Optional;
 
-public class DatasetOpenOptions {
+/**
+ * Read options for reading from a dataset.
+ */
+public class ReadOptions {
   private Optional<Integer> version;
   private Optional<Integer> blockSize;
   private int indexCacheSize;
   private int metadataCacheSize;
 
-  public DatasetOpenOptions() {
+  public ReadOptions() {
     this.version = Optional.empty();
     this.blockSize = Optional.empty();
     this.indexCacheSize = 256;
     this.metadataCacheSize = 256;
   }
 
-  public DatasetOpenOptions version(int version) {
+  public ReadOptions version(int version) {
     this.version = Optional.of(version);
     return this;
   }
 
-  public DatasetOpenOptions blockSize(int blockSize) {
+  public ReadOptions blockSize(int blockSize) {
     this.blockSize = Optional.of(blockSize);
     return this;
   }
 
-  public DatasetOpenOptions indexCacheSize(int indexCacheSize) {
+  public ReadOptions indexCacheSize(int indexCacheSize) {
     this.indexCacheSize = indexCacheSize;
     return this;
   }
 
-  public DatasetOpenOptions metadataCacheSize(int metadataCacheSize) {
+  public ReadOptions metadataCacheSize(int metadataCacheSize) {
     this.metadataCacheSize = metadataCacheSize;
     return this;
   }

@@ -14,6 +14,8 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.index.IndexParams;
+import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import java.io.Closeable;
@@ -24,6 +26,7 @@ import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.types.pojo.Schema;
 
@@ -44,6 +47,7 @@ public class Dataset implements Closeable {
   private long nativeDatasetHandle;
 
   BufferAllocator allocator;
+  boolean selfManagedAllocator = false;
 
   private final LockManager lockManager = new LockManager();
 
@@ -109,22 +113,55 @@ public class Dataset implements Closeable {
    * Open a dataset from the specified path.
    *
    * @param path      file path
-   * @param allocator Arrow buffer allocator.
    * @return Dataset
    */
-  public static Dataset open(String path, BufferAllocator allocator) {
-    return open(path, allocator, new DatasetOpenOptions());
+  public static Dataset open(String path) {
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions());
+  }
+
+  /**
+   * Open a dataset from the specified path.
+   *
+   * @param path      file path
+   * @param options   the open options
+   * @return Dataset
+   */
+  public static Dataset open(String path, ReadOptions options) {
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, options);
+  }
+
+  /**
+   * Open a dataset from the specified path.
+   *
+   * @param allocator Arrow buffer allocator.
+   * @param path      file path
+   * @return Dataset
+   */
+  public static Dataset open(BufferAllocator allocator, String path) {
+    return open(allocator, path, new ReadOptions());
+  }
+
+  /**
+   * Open a dataset from the specified path with additional options.
+   *
+   * @param allocator Arrow buffer allocator
+   * @param path      file path
+   * @param options   the open options
+   * @return Dataset
+   */
+  public static Dataset open(BufferAllocator allocator, String path, ReadOptions options) {
+    return open(allocator, false, path, options);
   }
 
   /**
    * Open a dataset from the specified path with additional options.
    *
    * @param path      file path
-   * @param allocator Arrow buffer allocator.
    * @param options   the open options
    * @return Dataset
    */
-  public static Dataset open(String path, BufferAllocator allocator, DatasetOpenOptions options) {
+  private static Dataset open(BufferAllocator allocator, boolean selfManagedAllocator,
+      String path, ReadOptions options) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
@@ -132,6 +169,7 @@ public class Dataset implements Closeable {
       options.getBlockSize(), options.getIndexCacheSize(),
       options.getMetadataCacheSize());
     dataset.allocator = allocator;
+    dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
   }
 
@@ -220,6 +258,16 @@ public class Dataset implements Closeable {
 
   private native long nativeLatestVersion();
 
+  public void createIndex(List<String> columns, IndexType indexType, Optional<String> name, IndexParams params, boolean replace) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
+    }
+  }
+
+  private native void nativeCreateIndex(List<String> columns, int indexTypeCode, 
+    Optional<String> name, IndexParams params, boolean replace);
+
   /**
    * Count the number of rows in the dataset.
    *
@@ -271,6 +319,15 @@ public class Dataset implements Closeable {
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
+  public List<String> listIndexes() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeListIndexes();
+    }
+  }
+
+  private native List<String> nativeListIndexes();
+
   /**
    * Closes this dataset and releases any system resources associated with it. If
    * the dataset is
@@ -282,6 +339,9 @@ public class Dataset implements Closeable {
       if (nativeDatasetHandle != 0) {
         releaseNativeDataset(nativeDatasetHandle);
         nativeDatasetHandle = 0;
+      }
+      if (selfManagedAllocator) {
+        allocator.close();
       }
     }
   }

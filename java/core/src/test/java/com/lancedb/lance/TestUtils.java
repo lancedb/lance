@@ -180,7 +180,7 @@ public class TestUtils {
     }
 
     public void openDatasetAndValidate() throws IOException {
-      try (Dataset dataset = Dataset.open(datasetPath, allocator)) {
+      try (Dataset dataset = Dataset.open(allocator, datasetPath)) {
         assertEquals(1, dataset.version());
         assertEquals(1, dataset.latestVersion());
         assertEquals(ROW_COUNT, dataset.countRows());

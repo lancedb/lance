@@ -13,18 +13,13 @@
 // limitations under the License.
 
 use core::slice;
-use std::sync::Arc;
 
 use crate::error::Result;
-use crate::utils::get_query;
+use crate::utils::{get_index_params, get_query};
 use crate::Error;
-use arrow::array::{ArrayRef, Float32Array};
 use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{objects::JObject, JNIEnv};
-use lance::error::Error as LanceError;
-use lance_index::vector::Query;
-use lance_linalg::distance::DistanceType;
 
 /// Extend JNIEnv with helper functions.
 pub trait JNIEnvExt {
@@ -104,6 +99,15 @@ pub trait JNIEnvExt {
     where
         T: TryFrom<i32>,
         <T as TryFrom<i32>>::Error: std::fmt::Debug;
+
+    fn get_optional_from_method<T, F>(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+        f: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce(&mut JNIEnv, JObject) -> Result<T>;
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
     where
@@ -272,18 +276,16 @@ impl JNIEnvExt for JNIEnv<'_> {
         T: TryFrom<i32>,
         <T as TryFrom<i32>>::Error: std::fmt::Debug,
     {
-        let java_object: JObject = self
+        let java_object = self
             .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
-            .l()?
-            .into();
+            .l()?;
         let rust_obj = if self
             .call_method(&java_object, "isPresent", "()Z", &[])?
             .z()?
         {
-            let inner_jobj: JObject = self
+            let inner_jobj = self
                 .call_method(&java_object, "get", "()Ljava/lang/Object;", &[])?
-                .l()?
-                .into();
+                .l()?;
             let inner_value = self.call_method(&inner_jobj, "intValue", "()I", &[])?.i()?;
             Some(T::try_from(inner_value).map_err(|e| {
                 Error::io_error(format!("Failed to convert from i32 to rust type: {:?}", e))
@@ -292,6 +294,32 @@ impl JNIEnvExt for JNIEnv<'_> {
             None
         };
         Ok(rust_obj)
+    }
+
+    fn get_optional_from_method<T, F>(
+        &mut self,
+        obj: &JObject,
+        method_name: &str,
+        f: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce(&mut JNIEnv, JObject) -> Result<T>,
+    {
+        let optional_obj = self
+            .call_method(obj, method_name, "()Ljava/util/Optional;", &[])?
+            .l()?;
+
+        if self
+            .call_method(&optional_obj, "isPresent", "()Z", &[])?
+            .z()?
+        {
+            let inner_obj = self
+                .call_method(&optional_obj, "get", "()Ljava/lang/Object;", &[])?
+                .l()?;
+            f(self, inner_obj).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn get_optional<T, F>(&mut self, obj: &JObject, f: F) -> Result<Option<T>>
@@ -336,4 +364,13 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseQuery(
     query_opt: JObject, // Optional<TmpQuery>
 ) {
     ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseIndexParams(
+    mut env: JNIEnv,
+    _obj: JObject,
+    index_params_obj: JObject, // IndexParams
+) {
+    ok_or_throw_without_return!(env, get_index_params(&mut env, index_params_obj));
 }

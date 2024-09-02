@@ -22,8 +22,6 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import com.lancedb.lance.ipc.LanceScanner;
-import com.lancedb.lance.ipc.Query;
-import com.lancedb.lance.ipc.Query.DistanceType;
 import com.lancedb.lance.ipc.ScanOptions;
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;

@@ -19,9 +19,7 @@ import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 
-import java.io.Serializable;
-
-public class LanceInputPartition implements InputPartition, Serializable {
+public class LanceInputPartition implements InputPartition {
   private static final long serialVersionUID = 4723894723984723984L;
 
   private final StructType schema;

@@ -16,15 +16,11 @@ package com.lancedb.lance.ipc;
 
 import org.apache.arrow.util.Preconditions;
 
+import com.lancedb.lance.index.DistanceType;
+
 import java.util.Optional;
 
 public class Query {
-  public enum DistanceType {
-    L2,
-    Cosine,
-    Dot,
-    Hamming;
-  }
 
   private final String column;
   private final float[] key;
@@ -32,11 +28,11 @@ public class Query {
   private final int nprobes;
   private final Optional<Integer> ef;
   private final Optional<Integer> refineFactor;
-  private final DistanceType metricType;
+  private final DistanceType distanceType;
   private final boolean useIndex;
 
   private Query(Builder builder) {
-    this.column = Preconditions.checkNotNull(builder.column, "Column must be set");
+    this.column = Preconditions.checkNotNull(builder.column, "Columns must be set");
     Preconditions.checkArgument(!builder.column.isEmpty(), "Column must not be empty");
     this.key = Preconditions.checkNotNull(builder.key, "Key must be set");
     Preconditions.checkArgument(builder.k > 0, "K must be greater than 0");
@@ -45,7 +41,7 @@ public class Query {
     this.nprobes = builder.nprobes;
     this.ef = builder.ef;
     this.refineFactor = builder.refineFactor;
-    this.metricType = Preconditions.checkNotNull(builder.metricType, "Metric type must be set");
+    this.distanceType = Preconditions.checkNotNull(builder.distanceType, "Metric type must be set");
     this.useIndex = builder.useIndex;
   }
 
@@ -73,8 +69,8 @@ public class Query {
     return refineFactor;
   }
 
-  public String getMetricType() {
-    return metricType.toString();
+  public String getDistanceType() {
+    return distanceType.toString();
   }
 
   public boolean isUseIndex() {
@@ -84,11 +80,11 @@ public class Query {
   public static class Builder {
     private String column;
     private float[] key;
-    private int k;
-    private int nprobes;
+    private int k = 10;
+    private int nprobes = 1;
     private Optional<Integer> ef = Optional.empty();
     private Optional<Integer> refineFactor = Optional.empty();
-    private DistanceType metricType;
+    private DistanceType distanceType = DistanceType.L2;
     private boolean useIndex = true;
 
     /**
@@ -161,11 +157,11 @@ public class Query {
     /**
      * Sets the distance metric type.
      *
-     * @param metricType The DistanceType to use for the query.
+     * @param distanceType The DistanceType to use for the query.
      * @return The Builder instance for method chaining.
      */
-    public Builder setMetricType(DistanceType metricType) {
-      this.metricType = metricType;
+    public Builder setDistanceType(DistanceType distanceType) {
+      this.distanceType = distanceType;
       return this;
     }
 

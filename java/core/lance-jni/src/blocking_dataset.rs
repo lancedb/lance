@@ -15,7 +15,7 @@
 use crate::error::Result;
 use crate::ffi::JNIEnvExt;
 use crate::traits::FromJString;
-use crate::utils::extract_write_params;
+use crate::utils::{extract_write_params, get_index_params};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -23,15 +23,18 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
-use jni::objects::JString;
-use jni::sys::jint;
+use jni::objects::{JString, JValue};
 use jni::sys::jlong;
+use jni::sys::{jboolean, jint};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, ReadParams, WriteParams};
 use lance::io::ObjectStoreParams;
 use lance::table::format::Fragment;
+use lance::table::format::Index;
+use lance_index::DatasetIndexExt;
+use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use std::iter::empty;
 use std::sync::Arc;
@@ -93,6 +96,21 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
+    pub fn create_index(
+        &mut self,
+        columns: &[&str],
+        index_type: IndexType,
+        name: Option<String>,
+        params: &dyn IndexParams,
+        replace: bool,
+    ) -> Result<()> {
+        RT.block_on(
+            self.inner
+                .create_index(columns, index_type, name, params, replace),
+        )?;
+        Ok(())
+    }
+
     pub fn latest_version(&self) -> Result<u64> {
         let version = RT.block_on(self.inner.latest_version_id())?;
         Ok(version)
@@ -101,6 +119,11 @@ impl BlockingDataset {
     pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         let rows = RT.block_on(self.inner.count_rows(filter))?;
         Ok(rows)
+    }
+
+    pub fn list_indexes(&self) -> Result<Arc<Vec<Index>>> {
+        let indexes = RT.block_on(self.inner.load_indices())?;
+        Ok(indexes)
     }
 
     pub fn close(&self) {}
@@ -304,6 +327,52 @@ fn inner_release_native_dataset(env: &mut JNIEnv, obj: JObject) -> Result<()> {
     dataset.close();
     Ok(())
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCreateIndex(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    columns_jobj: JObject, // List<String>
+    index_type_code_jobj: jint,
+    name_jobj: JObject,   // Optional<String>
+    params_jobj: JObject, // IndexParams
+    replace_jobj: jboolean,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_create_index(
+            &mut env,
+            java_dataset,
+            columns_jobj,
+            index_type_code_jobj,
+            name_jobj,
+            params_jobj,
+            replace_jobj
+        )
+    );
+}
+
+fn inner_create_index(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    columns_jobj: JObject, // List<String>
+    index_type_code_jobj: jint,
+    name_jobj: JObject,   // Optional<String>
+    params_jobj: JObject, // IndexParams
+    replace_jobj: jboolean,
+) -> Result<()> {
+    let columns = env.get_strings(&columns_jobj)?;
+    let index_type = IndexType::try_from(index_type_code_jobj)?;
+    let name = env.get_string_opt(&name_jobj)?;
+    let params = get_index_params(env, params_jobj)?;
+    let replace = replace_jobj != 0;
+    let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    dataset_guard.create_index(&columns_slice, index_type, name, params.as_ref(), replace)?;
+    Ok(())
+}
+
 //////////////////
 // Read Methods //
 //////////////////
@@ -314,8 +383,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     path: JString,
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
-    index_cache_size_object: jint,
-    metadata_cache_size_object: jint,
+    index_cache_size: jint,
+    metadata_cache_size: jint,
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -324,8 +393,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             path,
             version_obj,
             block_size_obj,
-            index_cache_size_object,
-            metadata_cache_size_object
+            index_cache_size,
+            metadata_cache_size
         )
     )
 }
@@ -335,14 +404,12 @@ fn inner_open_native<'local>(
     path: JString,
     version_obj: JObject,    // Optional<Integer>
     block_size_obj: JObject, // Optional<Integer>
-    index_cache_size_object: jint,
-    metadata_cache_size_object: jint,
+    index_cache_size: jint,
+    metadata_cache_size: jint,
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
-    let index_cache_size = index_cache_size_object as i32;
-    let metadata_cache_size = metadata_cache_size_object as i32;
     let dataset = BlockingDataset::open(
         &path_str,
         version,
@@ -456,4 +523,41 @@ fn inner_count_rows(env: &mut JNIEnv, java_dataset: JObject) -> Result<usize> {
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.count_rows(None)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListIndexes<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_list_indexes(&mut env, java_dataset))
+}
+
+fn inner_list_indexes<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let index_names = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let indexes = dataset_guard.list_indexes()?;
+        indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<Vec<String>>()
+    };
+
+    let array_list = env.new_object("java/util/ArrayList", "()V", &[])?;
+
+    for name in index_names {
+        let java_string = env.new_string(&name)?;
+        env.call_method(
+            &array_list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[JValue::Object(&java_string)],
+        )?;
+    }
+
+    Ok(array_list)
 }
