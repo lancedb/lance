@@ -14,6 +14,8 @@
 
 package com.lancedb.lance.index.vector;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
+
 public class IvfBuildParams {
   private final int numPartitions;
   private final int maxIters;
@@ -99,5 +101,17 @@ public class IvfBuildParams {
 
   public boolean useResidual() {
     return useResidual;
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+      .append("numPartitions", numPartitions)
+      .append("maxIters", maxIters)
+      .append("sampleRate", sampleRate)
+      .append("shufflePartitionBatches", shufflePartitionBatches)
+      .append("shufflePartitionConcurrency", shufflePartitionConcurrency)
+      .append("useResidual", useResidual)
+      .toString();
   }
 }

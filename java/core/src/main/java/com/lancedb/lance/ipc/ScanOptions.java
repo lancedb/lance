@@ -14,11 +14,12 @@
 
 package com.lancedb.lance.ipc;
 
+import org.apache.arrow.util.Preconditions;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
-
-import org.apache.arrow.util.Preconditions;
 
 /**
  * Lance scan options.
@@ -38,18 +39,22 @@ public class ScanOptions {
   /**
    * Constructor for LanceScanOptions.
    *
-   * @param fragmentIds the id of the fragments to scan
-   * @param batchSize Maximum row number of each returned ArrowRecordBatch.
-   *                  Optional, use Optional.empty() if unspecified.
-   * @param columns   (Optional) Projected columns. Optional.empty() for scanning all columns.
-   *                  Otherwise, only columns present in the List will be scanned.
-   * @param filter    (Optional) Filter expression. Optional.empty() for no filter.
+   * @param fragmentIds     the id of the fragments to scan
+   * @param batchSize       Maximum row number of each returned ArrowRecordBatch.
+   *                        Optional, use Optional.empty() if unspecified.
+   * @param columns         (Optional) Projected columns. Optional.empty() for
+   *                        scanning all columns.
+   *                        Otherwise, only columns present in the List will be
+   *                        scanned.
+   * @param filter          (Optional) Filter expression. Optional.empty() for no
+   *                        filter.
    * @param substraitFilter (Optional) Substrait filter expression.
-   * @param limit     (Optional) Maximum number of rows to return.
-   * @param offset    (Optional) Number of rows to skip before returning results.
-   * @param withRowId Whether to include the row ID in the results.
-   * @param nearest   (Optional) Nearest neighbor query.
-   * @param batchReadahead Number of batches to read ahead.
+   * @param limit           (Optional) Maximum number of rows to return.
+   * @param offset          (Optional) Number of rows to skip before returning
+   *                        results.
+   * @param withRowId       Whether to include the row ID in the results.
+   * @param nearest         (Optional) Nearest neighbor query.
+   * @param batchReadahead  Number of batches to read ahead.
    */
   public ScanOptions(Optional<List<Integer>> fragmentIds, Optional<Long> batchSize,
       Optional<List<String>> columns, Optional<String> filter,
@@ -108,7 +113,8 @@ public class ScanOptions {
   /**
    * Get the substrait filter.
    *
-   * @return Optional containing the substrait filter if specified, otherwise empty.
+   * @return Optional containing the substrait filter if specified, otherwise
+   *         empty.
    */
   public Optional<ByteBuffer> getSubstraitFilter() {
     return substraitFilter;
@@ -135,7 +141,8 @@ public class ScanOptions {
   /**
    * Get the nearest neighbor query.
    *
-   * @return Optional containing the nearest neighbor query if specified, otherwise empty.
+   * @return Optional containing the nearest neighbor query if specified,
+   *         otherwise empty.
    */
   public Optional<Query> getNearest() {
     return nearest;
@@ -159,6 +166,23 @@ public class ScanOptions {
     return batchReadahead;
   }
 
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+        .append("fragmentIds", fragmentIds.orElse(null))
+        .append("batchSize", batchSize.orElse(null))
+        .append("columns", columns.orElse(null))
+        .append("filter", filter.orElse(null))
+        .append("substraitFilter", substraitFilter
+            .map(buf -> "ByteBuffer[" + buf.remaining() + " bytes]").orElse(null))
+        .append("limit", limit.orElse(null))
+        .append("offset", offset.orElse(null))
+        .append("nearest", nearest.orElse(null))
+        .append("withRowId", withRowId)
+        .append("batchReadahead", batchReadahead)
+        .toString();
+  }
+
   /**
    * Builder for constructing LanceScanOptions.
    */
@@ -174,7 +198,8 @@ public class ScanOptions {
     private boolean withRowId = false;
     private int batchReadahead = 16;
 
-    public Builder() {}
+    public Builder() {
+    }
 
     /**
      * Create a builder from another scan options.

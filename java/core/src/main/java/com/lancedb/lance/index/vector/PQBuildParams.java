@@ -14,6 +14,8 @@
 
 package com.lancedb.lance.index.vector;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
+
 public class PQBuildParams {
   private final int numSubVectors;
   private final int numBits;
@@ -88,5 +90,16 @@ public class PQBuildParams {
 
   public int getSampleRate() {
     return sampleRate;
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+      .append("numSubVectors", numSubVectors)
+      .append("numBits", numBits)
+      .append("maxIters", maxIters)
+      .append("kmeansRedos", kmeansRedos)
+      .append("sampleRate", sampleRate)
+      .toString();
   }
 }

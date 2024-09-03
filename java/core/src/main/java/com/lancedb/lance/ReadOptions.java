@@ -14,6 +14,8 @@
 
 package com.lancedb.lance;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
+
 import java.util.Optional;
 
 /**
@@ -66,5 +68,15 @@ public class ReadOptions {
 
   public int getMetadataCacheSize() {
     return metadataCacheSize;
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+        .append("version", version.orElse(null))
+        .append("blockSize", blockSize.orElse(null))
+        .append("indexCacheSize", indexCacheSize)
+        .append("metadataCacheSize", metadataCacheSize)
+        .toString();
   }
 }

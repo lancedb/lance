@@ -14,6 +14,8 @@
 
 package com.lancedb.lance.index.vector;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
+
 public class SQBuildParams {
   private final short numBits;
   private final int sampleRate;
@@ -27,7 +29,8 @@ public class SQBuildParams {
     private short numBits = 8;
     private int sampleRate = 256;
 
-    public Builder() {}
+    public Builder() {
+    }
 
     public Builder setNumBits(short numBits) {
       this.numBits = numBits;
@@ -51,5 +54,13 @@ public class SQBuildParams {
 
   public int getSampleRate() {
     return sampleRate;
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+      .append("numBits", numBits)
+      .append("sampleRate", sampleRate)
+      .toString();
   }
 }

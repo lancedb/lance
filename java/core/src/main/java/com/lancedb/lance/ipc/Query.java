@@ -15,9 +15,8 @@
 package com.lancedb.lance.ipc;
 
 import org.apache.arrow.util.Preconditions;
-
+import org.apache.commons.lang3.builder.ToStringBuilder;
 import com.lancedb.lance.index.DistanceType;
-
 import java.util.Optional;
 
 public class Query {
@@ -75,6 +74,20 @@ public class Query {
 
   public boolean isUseIndex() {
     return useIndex;
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+        .append("column", column)
+        .append("key", key)
+        .append("k", k)
+        .append("nprobes", nprobes)
+        .append("ef", ef.orElse(null))
+        .append("refineFactor", refineFactor.orElse(null))
+        .append("distanceType", distanceType)
+        .append("useIndex", useIndex)
+        .toString();
   }
 
   public static class Builder {
@@ -180,7 +193,8 @@ public class Query {
      * Builds the Query object.
      *
      * @return A new immutable Query instance.
-     * @throws IllegalStateException if any required fields are not set or have invalid values.
+     * @throws IllegalStateException if any required fields are not set or have
+     *                               invalid values.
      */
     public Query build() {
       return new Query(this);
