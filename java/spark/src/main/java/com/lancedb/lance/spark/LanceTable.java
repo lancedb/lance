@@ -18,7 +18,6 @@ import com.google.common.collect.ImmutableSet;
 import com.lancedb.lance.spark.internal.LanceConfig;
 import java.util.Set;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
-import org.apache.spark.sql.connector.catalog.Table;
 import org.apache.spark.sql.connector.catalog.TableCapability;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.types.StructType;
@@ -27,7 +26,7 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 /**
  * Lance Spark Table.
  */
-public class LanceTable implements Table, SupportsRead {
+public class LanceTable implements SupportsRead {
   private static final Set<TableCapability> CAPABILITIES =
     ImmutableSet.of(
         TableCapability.BATCH_READ);

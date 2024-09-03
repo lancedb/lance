@@ -19,7 +19,6 @@ import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.Test;
 
-import javax.xml.validation.Schema;
 import java.io.IOException;
 import java.util.Iterator;
 import java.util.List;
