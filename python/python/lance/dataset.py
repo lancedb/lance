@@ -2753,6 +2753,19 @@ class Tags:
         """
         self._ds.delete_tag(tag)
 
+    def update(self, tag: str, version: int) -> None:
+        """
+        Update tag to a new version.
+
+        Parameters
+        ----------
+        tag: str,
+            The name of the tag to update.
+        version: int,
+            The new dataset version to tag.
+        """
+        self._ds.update_tag(tag, version)
+
 
 class DatasetStats(TypedDict):
     num_deleted_rows: int

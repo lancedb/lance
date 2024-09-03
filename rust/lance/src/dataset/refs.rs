@@ -153,6 +153,41 @@ impl Tags {
         self.object_store().delete(&tag_file).await
     }
 
+    pub async fn update(&mut self, tag: &str, version: u64) -> Result<()> {
+        check_valid_ref(tag)?;
+
+        let tag_file = tag_path(&self.base, tag);
+
+        if !self.object_store().exists(&tag_file).await? {
+            return Err(Error::RefNotFound {
+                message: format!("tag {} does not exist", tag),
+            });
+        }
+
+        let manifest_file = self
+            .commit_handler
+            .resolve_version(&self.base, version, &self.object_store.inner)
+            .await?;
+
+        if !self.object_store().exists(&manifest_file).await? {
+            return Err(Error::VersionNotFound {
+                message: format!("version {} does not exist", version),
+            });
+        }
+
+        let tag_contents = TagContents {
+            version,
+            manifest_size: self.object_store().size(&manifest_file).await?,
+        };
+
+        self.object_store()
+            .put(
+                &tag_file,
+                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
+            )
+            .await
+    }
+
     pub(crate) fn object_store(&self) -> &ObjectStore {
         &self.object_store
     }
@@ -271,7 +306,9 @@ mod tests {
             "ref@{ref",
             "ref[",
             "ref^",
-            "~/ref"
+            "~/ref",
+            "ref.",
+            "ref..ref"
         )]
         r: &str,
     ) {

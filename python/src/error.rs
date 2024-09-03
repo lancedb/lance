@@ -40,6 +40,10 @@ impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
                 LanceError::InvalidInput { .. } => self.value_error(),
                 LanceError::NotSupported { .. } => self.not_implemented(),
                 LanceError::IO { .. } => self.io_error(),
+                LanceError::NotFound { .. } => self.value_error(),
+                LanceError::RefNotFound { .. } => self.value_error(),
+                LanceError::VersionNotFound { .. } => self.value_error(),
+
                 _ => self.runtime_error(),
             },
         }

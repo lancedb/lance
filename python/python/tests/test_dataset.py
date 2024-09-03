@@ -290,6 +290,25 @@ def test_tag(tmp_path: Path):
     with pytest.raises(ValueError):
         lance.dataset(base_dir, "missing-tag")
 
+    # test tag update
+    with pytest.raises(
+        ValueError, match="Version not found error: version 3 does not exist"
+    ):
+        ds.tags.update("tag1", 3)
+
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag3 does not exist"
+    ):
+        ds.tags.update("tag3", 1)
+
+    ds.tags.update("tag1", 2)
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 2
+
+    ds.tags.update("tag1", 1)
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+
 
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
