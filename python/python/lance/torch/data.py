@@ -44,9 +44,7 @@ def _to_tensor(
         arr: pa.Array = batch[col]
 
         tensor: torch.Tensor = None
-        if (
-            pa.types.is_fixed_size_list(arr.type)
-        ) and (
+        if (pa.types.is_fixed_size_list(arr.type)) and (
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
@@ -55,9 +53,7 @@ def _to_tensor(
             )
             tensor = torch.from_numpy(np_tensor)
             del np_tensor
-        elif (
-            isinstance(arr.type, pa.FixedShapeTensorType)
-        ) and (
+        elif (isinstance(arr.type, pa.FixedShapeTensorType)) and (
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
