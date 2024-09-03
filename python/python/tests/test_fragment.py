@@ -3,6 +3,7 @@
 
 import json
 import multiprocessing
+import uuid
 from pathlib import Path
 
 import lance
@@ -18,6 +19,7 @@ from lance import (
     write_dataset,
 )
 from lance.debug import format_fragment
+from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -296,3 +298,56 @@ def test_mixed_fragment_versions(tmp_path):
     operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
     with pytest.raises(OSError, match="All data files must have the same version"):
         lance.LanceDataset.commit(ds.uri, operation)
+
+
+def test_create_from_file(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=data.schema, data_storage_version="stable"
+    )
+
+    # Append first file
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    frag = dataset.get_fragments()[0]
+    assert frag.fragment_id == 0
+
+    assert dataset.count_rows() == 800
+
+    # Append second file (fragment id shouldn't be 0 even though we pass in 0)
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    frag = dataset.get_fragments()[1]
+    assert frag.fragment_id == 1
+
+    assert dataset.count_rows() == 1600
+
+    # Simulate compaction
+    compacted_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / compacted_name)) as writer:
+        for batch in dataset.to_batches():
+            writer.write_batch(batch)
+
+    frag = LanceFragment.create_from_file(compacted_name, dataset, 0)
+    group = LanceOperation.RewriteGroup(
+        old_fragments=[frag.metadata for frag in dataset.get_fragments()],
+        new_fragments=[frag],
+    )
+    op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+
+    assert dataset.count_rows() == 1600
+    assert len(dataset.get_fragments()) == 1
+    assert dataset.get_fragments()[0].fragment_id == 2

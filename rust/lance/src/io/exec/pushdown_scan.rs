@@ -34,7 +34,7 @@ use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
 use snafu::{location, Location};
 
-use crate::dataset::scanner::DEFAULT_FRAGMENT_READAHEAD;
+use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
 use crate::Error;
 use crate::{
     dataset::{
@@ -73,7 +73,7 @@ impl Default for ScanConfig {
     fn default() -> Self {
         Self {
             batch_readahead: get_num_compute_intensive_cpus(),
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            fragment_readahead: LEGACY_DEFAULT_FRAGMENT_READAHEAD,
             with_row_id: false,
             with_row_address: false,
             make_deletions_null: false,

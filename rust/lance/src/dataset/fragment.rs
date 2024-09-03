@@ -18,14 +18,16 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
-use lance_file::v2;
 use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
+use lance_file::version::LanceFileVersion;
+use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::ReadBatchParams;
@@ -423,13 +425,66 @@ impl FileFragment {
 
     pub async fn create_from_file(
         filename: &str,
-        schema: &Schema,
+        dataset: &Dataset,
         fragment_id: usize,
         physical_rows: Option<usize>,
     ) -> Result<Fragment> {
-        let fragment =
-            Fragment::with_file_legacy(fragment_id as u64, filename, schema, physical_rows);
-        Ok(fragment)
+        let filepath = dataset.data_dir().child(filename);
+        let file_version =
+            determine_file_version(dataset.object_store.as_ref(), &filepath, None).await?;
+
+        if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
+            return Err(Error::io(
+                format!(
+                    "File version mismatch. Dataset verison: {:?} Fragment version: {:?}",
+                    dataset.manifest.data_storage_format.lance_file_version()?,
+                    file_version
+                ),
+                location!(),
+            ));
+        }
+
+        if file_version == LanceFileVersion::Legacy {
+            let fragment = Fragment::with_file_legacy(
+                fragment_id as u64,
+                filename,
+                dataset.schema(),
+                physical_rows,
+            );
+            Ok(fragment)
+        } else {
+            // Load the file metadata, confirm the schema is compatible, and
+            // determine the column offsets
+            let mut frag = Fragment::new(fragment_id as u64);
+            let scheduler = ScanScheduler::new(
+                dataset.object_store.clone(),
+                SchedulerConfig::max_bandwidth(&dataset.object_store),
+            );
+            let file_scheduler = scheduler.open_file(&filepath).await?;
+            let reader = v2::reader::FileReader::try_open(
+                file_scheduler,
+                None,
+                DecoderMiddlewareChain::default(),
+            )
+            .await?;
+            // If the schemas are not compatible we can't calculate field id offsets
+            reader
+                .schema()
+                .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
+            let projection = v2::reader::FileReader::default_projection(dataset.schema());
+            let physical_rows = reader.metadata().num_rows as usize;
+            frag.physical_rows = Some(physical_rows);
+            frag.id = fragment_id as u64;
+
+            let column_indices = projection
+                .column_indices
+                .into_iter()
+                .map(|c| c as i32)
+                .collect();
+
+            frag.add_file(filename, dataset.schema().field_ids(), column_indices);
+            Ok(frag)
+        }
     }
 
     pub fn dataset(&self) -> &Dataset {
@@ -1756,14 +1811,16 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_core::ROW_ID;
+    use lance_datagen::{array, gen, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_io::object_store::ObjectStoreRegistry;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use tempfile::tempdir;
+    use v2::writer::FileWriterOptions;
 
     use super::*;
-    use crate::dataset::transaction::Operation;
+    use crate::{dataset::transaction::Operation, utils::test::TestDatasetGenerator};
 
     async fn create_dataset(test_uri: &str, data_storage_version: LanceFileVersion) -> Dataset {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -2177,7 +2234,7 @@ mod tests {
 
         let mut fragments: Vec<Fragment> = Vec::new();
         for (idx, path) in paths.iter().enumerate() {
-            let f = FileFragment::create_from_file(path, schema, idx, None)
+            let f = FileFragment::create_from_file(path, &dataset, idx, None)
                 .await
                 .unwrap();
             fragments.push(f)
@@ -2593,5 +2650,65 @@ mod tests {
         assert!(matches!(res, Err(Error::IO { .. })));
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_from_file_v2() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let make_gen = || {
+            gen()
+                .col("str", array::rand_type(&DataType::Utf8))
+                .col("int", array::rand_type(&DataType::Int32))
+        };
+
+        let batch = make_gen().into_batch_rows(RowCount::from(128)).unwrap();
+        let dataset = TestDatasetGenerator::new(vec![batch], LanceFileVersion::Stable)
+            .make_hostile(test_uri)
+            .await;
+
+        let new_data = make_gen().into_batch_rows(RowCount::from(128)).unwrap();
+        let store = ObjectStore::local();
+        let file_path = dataset.data_dir().child("some_file.lance");
+        let object_writer = store.create(&file_path).await.unwrap();
+        let mut file_writer =
+            v2::writer::FileWriter::new_lazy(object_writer, FileWriterOptions::default());
+        file_writer.write_batch(&new_data).await.unwrap();
+        file_writer.finish().await.unwrap();
+
+        let frag = FileFragment::create_from_file("some_file.lance", &dataset, 0, Some(128))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Fragment::try_infer_version(&[frag.clone()])
+                .unwrap()
+                .unwrap(),
+            LanceFileVersion::Stable.resolve()
+        );
+
+        let op = Operation::Append {
+            fragments: vec![frag],
+        };
+        let object_store_registry = Arc::new(ObjectStoreRegistry::default());
+        let dataset = Dataset::commit(
+            &dataset.uri,
+            op,
+            Some(dataset.version().version),
+            None,
+            None,
+            object_store_registry,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset
+                .count_rows(Some("int IS NOT NULL".to_string()))
+                .await
+                .unwrap(),
+            256
+        );
     }
 }

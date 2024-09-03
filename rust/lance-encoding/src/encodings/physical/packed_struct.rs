@@ -108,7 +108,7 @@ struct PackedStructPageDecoder {
 }
 
 impl PrimitivePageDecoder for PackedStructPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         // Decoding workflow:
         // rows 0-2: {x: [1, 2, 3], y: [4, 5, 6], z: [7, 8, 9]}
         // rows 3-5: {x: [10, 11, 12], y: [13, 14, 15], z: [16, 17, 18]}
@@ -142,13 +142,13 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             }
 
             start_index += bytes_per_field;
-            children.push(Box::new(FixedWidthDataBlock {
+            children.push(DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: LanceBuffer::from(field_bytes),
                 bits_per_value: bytes_per_field as u64 * 8,
                 num_values: num_rows,
-            }) as Box<dyn DataBlock>);
+            }));
         }
-        Ok(Box::new(StructDataBlock { children }))
+        Ok(DataBlock::Struct(StructDataBlock { children }))
     }
 }
 

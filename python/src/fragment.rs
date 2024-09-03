@@ -16,12 +16,11 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::datatypes::Schema;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use pyo3::prelude::*;
@@ -29,7 +28,7 @@ use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
-use crate::{Scanner, RT};
+use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -71,21 +70,14 @@ impl FileFragment {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (filename, schema, fragment_id))]
+    #[pyo3(signature = (filename, dataset, fragment_id))]
     fn create_from_file(
         filename: &str,
-        schema: PyArrowType<ArrowSchema>,
+        dataset: &Dataset,
         fragment_id: usize,
     ) -> PyResult<FragmentMetadata> {
-        let arrow_schema = schema.0;
-        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to convert Arrow schema to Lance schema: {}",
-                e
-            ))
-        })?;
         let metadata = RT.block_on(None, async {
-            LanceFragment::create_from_file(filename, &schema, fragment_id, None)
+            LanceFragment::create_from_file(filename, dataset.ds.as_ref(), fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })??;

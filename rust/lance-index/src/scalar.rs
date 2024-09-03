@@ -91,6 +91,44 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct InvertedIndexParams {
+    /// If true, store the position of the term in the document
+    /// This can significantly increase the size of the index
+    /// If false, only store the frequency of the term in the document
+    /// Default is true
+    pub with_position: bool,
+}
+
+impl Default for InvertedIndexParams {
+    fn default() -> Self {
+        Self {
+            with_position: true,
+        }
+    }
+}
+
+impl InvertedIndexParams {
+    pub fn with_position(mut self, with_position: bool) -> Self {
+        self.with_position = with_position;
+        self
+    }
+}
+
+impl IndexParams for InvertedIndexParams {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Inverted
+    }
+
+    fn index_name(&self) -> &str {
+        "INVERTED"
+    }
+}
+
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
 pub trait IndexWriter: Send {
@@ -100,6 +138,8 @@ pub trait IndexWriter: Send {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
     /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
+    /// Finishes writing the file and closes the file with additional metadata
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()>;
 }
 
 /// Trait for reading an index (or parts of an index) from storage

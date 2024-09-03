@@ -16,19 +16,20 @@ use itertools::Itertools;
 use lance::Dataset;
 use lance_core::ROW_ID;
 use lance_index::scalar::inverted::flat_full_text_search;
-use lance_index::scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType};
+use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
 
 #[tokio::main]
 async fn main() {
-    const TOTAL: usize = 100_000;
+    env_logger::init();
+    const TOTAL: usize = 10_000_000;
     let tempdir = tempfile::tempdir().unwrap();
     let dataset_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
     let tokens = (0..10_000)
         .map(|_| random_word::gen(random_word::Lang::En))
         .collect_vec();
-    let create_index = false;
+    let create_index = true;
     if create_index {
         let row_id_col = Arc::new(UInt64Array::from(
             (0..TOTAL).map(|i| i as u64).collect_vec(),
@@ -57,19 +58,21 @@ async fn main() {
         let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
             .await
             .unwrap();
-        let scalar_index_params = ScalarIndexParams {
-            force_index_type: Some(ScalarIndexType::Inverted),
+        let params = InvertedIndexParams {
+            with_position: true,
         };
+        let start = std::time::Instant::now();
         dataset
             .create_index(
                 &["doc"],
-                lance_index::IndexType::Scalar,
+                lance_index::IndexType::Inverted,
                 None,
-                &scalar_index_params,
+                &params,
                 true,
             )
             .await
             .unwrap();
+        println!("create_index: {:?}", start.elapsed());
     }
 
     let dataset = Dataset::open(dataset_dir.as_ref()).await.unwrap();

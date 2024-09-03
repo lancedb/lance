@@ -3,47 +3,211 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::hash::{DefaultHasher, Hasher};
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, RwLock};
 
-use crate::scalar::{IndexReader, IndexStore};
+use crate::scalar::{IndexReader, IndexStore, IndexWriter, InvertedIndexParams};
 use crate::vector::graph::OrderedFloat;
 use arrow::array::AsArray;
-use arrow::compute::concat_batches;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
-use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
-use futures::TryStreamExt;
+use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_arrow::{iter_str_array, RecordBatchExt};
+use lance_arrow::iter_str_array;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
 use lance_core::{Error, Result, ROW_ID};
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use lazy_static::lazy_static;
+use rayon::prelude::*;
 use snafu::{location, Location};
+use tracing::instrument;
 
 use super::index::*;
 
+lazy_static! {
+    static ref DOC_CHUNK_SIZE: usize = std::env::var("DOC_CHUNK_SIZE")
+        .unwrap_or_else(|_| "2048".to_string())
+        .parse()
+        .expect("failed to parse DOC_CHUNK_SIZE");
+}
+
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct InvertedIndexBuilder {
+    params: InvertedIndexParams,
+
     pub(crate) tokens: TokenSet,
     pub(crate) invert_list: InvertedList,
     pub(crate) docs: DocSet,
 }
 
 impl InvertedIndexBuilder {
+    pub fn new(params: InvertedIndexParams) -> Self {
+        let with_position = params.with_position;
+        Self {
+            params,
+            tokens: TokenSet::default(),
+            invert_list: InvertedList::new(with_position),
+            docs: DocSet::default(),
+        }
+    }
+
+    pub fn from_existing_index(tokens: TokenSet, invert_list: InvertedList, docs: DocSet) -> Self {
+        let params = InvertedIndexParams::default().with_position(invert_list.with_position);
+        Self {
+            params,
+            tokens,
+            invert_list,
+            docs,
+        }
+    }
+
     pub async fn update(
         &mut self,
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        update_index(
-            new_data,
-            &mut self.tokens,
-            &mut self.invert_list,
-            &mut self.docs,
-        )
-        .await?;
-
+        self.update_index(new_data).await?;
         self.save(dest_store).await?;
+        Ok(())
+    }
+
+    #[instrument(level = "debug", skip_all)]
+    async fn update_index(&mut self, mut stream: SendableRecordBatchStream) -> Result<()> {
+        const NUM_SHARDS: usize = 32;
+        let token_maps = (0..NUM_SHARDS)
+            .map(|_| RwLock::new(HashMap::new()))
+            .collect_vec();
+        // init the token maps
+        {
+            let mut token_maps = token_maps
+                .iter()
+                .map(|map| map.write().unwrap())
+                .collect_vec();
+            for (token, token_id) in std::mem::take(&mut self.tokens.tokens) {
+                let mut hasher = DefaultHasher::new();
+                hasher.write(token.as_bytes());
+                let shard = hasher.finish() as usize % NUM_SHARDS;
+                token_maps[shard].insert(token, token_id);
+            }
+        }
+        let next_id = AtomicU32::new(self.tokens.next_id);
+
+        let start = std::time::Instant::now();
+        while let Some(batch) = stream.try_next().await? {
+            let doc_iter = iter_str_array(batch.column(0));
+            let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+            let docs = doc_iter
+                .zip(row_id_col.values().iter())
+                .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)))
+                .collect_vec(); // we have to collect so that we can call `into_par_iter()`
+
+            let docs = docs
+                .into_par_iter()
+                .map_init(
+                    || {
+                        (
+                            TOKENIZER.clone(),
+                            vec![Vec::new(); NUM_SHARDS],
+                            Vec::with_capacity(*DOC_CHUNK_SIZE),
+                            Vec::with_capacity(*DOC_CHUNK_SIZE),
+                            HashMap::new(),
+                        )
+                    }, // reuse the memory
+                    |(tokenizer, token_buffer, tokens, unknown_tokens, token_occurrences),
+                     (doc, row_id)| {
+                        // tokenize the document
+                        let mut token_stream = tokenizer.token_stream(doc);
+                        while token_stream.advance() {
+                            let token = token_stream.token_mut();
+                            let mut hasher = DefaultHasher::new();
+                            hasher.write(token.text.as_bytes());
+                            let shard = hasher.finish() as usize % NUM_SHARDS;
+                            token_buffer[shard]
+                                .push((std::mem::take(&mut token.text), token.position as i32));
+                        }
+
+                        // map the tokens to token ids
+                        tokens.clear();
+                        token_buffer
+                            .iter_mut()
+                            .enumerate()
+                            .for_each(|(shard, buffer)| {
+                                for chunk in buffer.iter_mut().chunks(*DOC_CHUNK_SIZE).into_iter() {
+                                    // when the document is very long, it almost always contains new tokens,
+                                    // if we don't chunk the tokens, we will have to always acquire write lock of the token_map for a long time
+                                    {
+                                        let token_map = token_maps[shard].read().unwrap();
+                                        for (text, position) in chunk {
+                                            if let Some(token_id) = token_map.get(text) {
+                                                tokens.push((*token_id, *position));
+                                            } else {
+                                                unknown_tokens
+                                                    .push((std::mem::take(text), *position));
+                                            }
+                                        }
+                                    }
+
+                                    if unknown_tokens.is_empty() {
+                                        continue;
+                                    }
+                                    {
+                                        let mut token_map = token_maps[shard].write().unwrap();
+                                        for (text, position) in unknown_tokens.iter_mut() {
+                                            let token_id = *token_map
+                                                .entry(std::mem::take(text))
+                                                .or_insert_with(|| {
+                                                    next_id.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    )
+                                                });
+                                            tokens.push((token_id, *position));
+                                        }
+                                    }
+                                    unknown_tokens.clear()
+                                }
+                                buffer.clear();
+                            });
+
+                        // collect the token occurrences
+                        let num_tokens = tokens.len() as u32;
+                        for (token_id, position) in tokens {
+                            let position = *position;
+                            token_occurrences
+                                .entry(*token_id)
+                                .and_modify(|positions: &mut Vec<i32>| positions.push(position))
+                                .or_insert_with(|| vec![position]);
+                        }
+
+                        // phrase query requires the positions to be sorted
+                        if self.invert_list.with_position {
+                            token_occurrences.iter_mut().for_each(|(_, positions)| {
+                                positions.sort_unstable();
+                            });
+                        }
+                        (num_tokens, std::mem::take(token_occurrences), row_id)
+                    },
+                )
+                .collect::<Vec<_>>();
+
+            self.invert_list
+                .resize(next_id.load(std::sync::atomic::Ordering::Relaxed) as usize);
+            for (num_tokens, token_occurrences, row_id) in docs {
+                self.invert_list.add(token_occurrences, row_id);
+                self.docs.add(row_id, num_tokens);
+            }
+        }
+
+        token_maps.into_iter().for_each(|token_map| {
+            self.tokens
+                .tokens
+                .extend(token_map.write().unwrap().drain());
+        });
+        self.tokens.next_id = next_id.load(std::sync::atomic::Ordering::Relaxed);
+        log::info!("tokenize documents elapsed {:?}", start.elapsed());
+
         Ok(())
     }
 
@@ -61,115 +225,128 @@ impl InvertedIndexBuilder {
         Ok(())
     }
 
-    async fn save(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        let token_set_batch = self.tokens.to_batch()?;
+    #[instrument(level = "debug", skip_all)]
+    async fn save(&mut self, dest_store: &dyn IndexStore) -> Result<()> {
+        let start = std::time::Instant::now();
+        let token_set_batch = std::mem::take(&mut self.tokens).to_batch()?;
         let mut token_set_writer = dest_store
             .new_index_file(TOKENS_FILE, token_set_batch.schema())
             .await?;
         token_set_writer.write_record_batch(token_set_batch).await?;
         token_set_writer.finish().await?;
+        log::info!("write tokens: {:?}", start.elapsed());
 
-        // calculate the max BM25 score for each posting list
-        let max_scores = self
-            .invert_list
-            .inverted_list
-            .par_iter()
-            .map(|list| list.calculate_max_score(&self.docs))
-            .collect::<Vec<_>>();
-        let max_scores = serde_json::to_string(&max_scores)?;
-        let invert_list_batch = self.invert_list.to_batch()?;
-        let invert_list_batch =
-            invert_list_batch.add_metadata("max_scores".to_owned(), max_scores)?;
-        let mut invert_list_writer = dest_store
-            .new_index_file(INVERT_LIST_FILE, invert_list_batch.schema())
+        let docs = Arc::new(std::mem::take(&mut self.docs));
+        let start = std::time::Instant::now();
+        let invert_list_writer = dest_store
+            .new_index_file(INVERT_LIST_FILE, self.invert_list.schema().clone())
             .await?;
-        invert_list_writer
-            .write_record_batch(invert_list_batch)
+        std::mem::take(&mut self.invert_list)
+            .into_batches(docs.clone(), invert_list_writer)
             .await?;
-        invert_list_writer.finish().await?;
+        log::info!("write inverted lists done: {:?}", start.elapsed());
 
-        let docs_batch = self.docs.to_batch()?;
+        let start = std::time::Instant::now();
+        let docs_batch = docs.to_batch()?;
         let mut docs_writer = dest_store
             .new_index_file(DOCS_FILE, docs_batch.schema())
             .await?;
         docs_writer.write_record_batch(docs_batch).await?;
         docs_writer.finish().await?;
+        log::info!("write docs done: {:?}", start.elapsed());
 
         Ok(())
     }
 }
 
-pub async fn update_index(
-    new_data: SendableRecordBatchStream,
-    token_set: &mut TokenSet,
-    invert_list: &mut InvertedList,
-    docs: &mut DocSet,
-) -> Result<()> {
-    let mut tokenizer = TOKENIZER.clone();
-    let mut stream = new_data;
-    while let Some(batch) = stream.try_next().await? {
-        let doc_iter = iter_str_array(batch.column(0));
-        let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-
-        for (doc, row_id) in doc_iter.zip(row_id_col.values().iter()) {
-            let Some(doc) = doc else { continue };
-            let row_id = *row_id;
-            let mut token_stream = tokenizer.token_stream(doc);
-            let mut token_occurrences = HashMap::new();
-            let mut token_cnt = 0;
-            while let Some(token) = token_stream.next() {
-                let token_id = token_set.add(token.text.to_owned());
-                token_occurrences
-                    .entry(token_id)
-                    .and_modify(|positions: &mut Vec<i32>| positions.push(token.position as i32))
-                    .or_insert_with(|| vec![token.position as i32]);
-                token_cnt += 1;
-            }
-            invert_list.add(token_occurrences, row_id);
-            docs.add(row_id, token_cnt);
-        }
-    }
-
-    Ok(())
-}
-
 // InvertedList is a mapping from token ids to row ids
 // it's used to retrieve the documents that contain a token
-#[derive(Debug, Clone, Default, DeepSizeOf)]
+#[derive(Debug, Clone)]
 pub struct InvertedList {
     // the index is the token id
     inverted_list: Vec<PostingListBuilder>,
+    pub(crate) with_position: bool,
+    schema: SchemaRef,
+}
+
+impl Default for InvertedList {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl DeepSizeOf for InvertedList {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.inverted_list.deep_size_of_children(context)
+    }
 }
 
 impl InvertedList {
-    // the schema of the inverted list is | row_id | frequency |
-    // and store the offset of
-    pub fn to_batch(&self) -> Result<RecordBatch> {
-        let batches = self
-            .inverted_list
-            .iter()
-            .map(|list| list.to_batch())
-            .collect::<Result<Vec<_>>>()?;
+    pub fn new(with_position: bool) -> Self {
+        let mut fields = vec![
+            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(FREQUENCY_COL, arrow_schema::DataType::Float32, false),
+        ];
+        if with_position {
+            fields.push(arrow_schema::Field::new(
+                POSITION_COL,
+                arrow_schema::DataType::List(Arc::new(arrow_schema::Field::new(
+                    "item",
+                    arrow_schema::DataType::Int32,
+                    true,
+                ))),
+                false,
+            ));
+        }
+        let schema = Arc::new(arrow_schema::Schema::new(fields));
+        Self {
+            inverted_list: Vec::new(),
+            with_position,
+            schema,
+        }
+    }
 
-        let offsets = batches
-            .iter()
-            .scan(0, |offset, batch| {
-                *offset += batch.num_rows();
-                Some(*offset - batch.num_rows())
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    // the schema of the inverted list is | row_id | frequency | positions (optional)
+    pub async fn into_batches(
+        self,
+        docs: Arc<DocSet>,
+        mut writer: Box<dyn IndexWriter>,
+    ) -> Result<()> {
+        let num_lists = self.inverted_list.len();
+        let schema = self.schema().clone();
+        let mut results = stream::iter(self.inverted_list)
+            .map(|list| {
+                let schema = schema.clone();
+                let docs = docs.clone();
+                CPU_RUNTIME.spawn_blocking(move || list.to_batch(schema, docs))
             })
-            .collect_vec();
-        let metadata = HashMap::from_iter(vec![(
-            "offsets".to_owned(),
-            serde_json::to_string(&offsets)?,
-        )]);
+            .buffered(get_num_compute_intensive_cpus());
 
-        let batch =
-            concat_batches(batches[0].schema_ref(), batches.iter())?.with_metadata(metadata)?;
-        Ok(batch)
+        let mut offsets = Vec::with_capacity(num_lists);
+        let mut max_scores = Vec::with_capacity(num_lists);
+        let mut num_rows = 0;
+        while let Some(result) = results.try_next().await? {
+            let (batch, max_score) = result?;
+            offsets.push(num_rows);
+            max_scores.push(max_score);
+            num_rows += batch.num_rows();
+            writer.write_record_batch(batch).await?;
+        }
+        let metadata = HashMap::from_iter(vec![
+            ("offsets".to_owned(), serde_json::to_string(&offsets)?),
+            ("max_scores".to_owned(), serde_json::to_string(&max_scores)?),
+        ]);
+
+        writer.finish_with_metadata(metadata).await?;
+        Ok(())
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>) -> Result<Self> {
-        let mut inverted_list = Vec::with_capacity(reader.num_rows());
+        let mut inverted_lists = Vec::with_capacity(reader.num_rows());
         let offsets = reader
             .schema()
             .metadata
@@ -202,14 +379,16 @@ impl InvertedList {
                     })
                     .collect_vec()
             });
-            inverted_list.push(PostingListBuilder::new(
+            inverted_lists.push(PostingListBuilder::new(
                 row_ids_col.to_vec(),
                 frequencies_col.to_vec(),
                 positions_col,
             ));
         }
 
-        Ok(Self { inverted_list })
+        let mut inverted_list = Self::new(reader.schema().field(POSITION_COL).is_some());
+        inverted_list.inverted_list = inverted_lists;
+        Ok(inverted_list)
     }
 
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
@@ -224,7 +403,7 @@ impl InvertedList {
                 let positions = list
                     .positions
                     .as_ref()
-                    .map(|positions| positions[i].clone());
+                    .map(|positions| positions.get(i).to_vec());
 
                 match mapping.get(&row_id) {
                     Some(Some(new_row_id)) => {
@@ -242,22 +421,22 @@ impl InvertedList {
         }
     }
 
+    pub fn resize(&mut self, len: usize) {
+        if len > self.inverted_list.len() {
+            self.inverted_list
+                .resize_with(len, || PostingListBuilder::empty(self.with_position));
+        }
+    }
+
     // for efficiency, we don't check if the row_id exists
     // we assume that the row_id is unique and doesn't exist in the list
     pub fn add(&mut self, token_occurrences: HashMap<u32, Vec<i32>>, row_id: u64) {
-        for (token_id, term_positions) in token_occurrences {
-            let token_id = token_id as usize;
-            if token_id >= self.inverted_list.len() {
-                self.inverted_list
-                    .resize_with(token_id + 1, PostingListBuilder::default);
-            }
-            let list = &mut self.inverted_list[token_id];
-            list.row_ids.push(row_id);
-            list.frequencies.push(term_positions.len() as f32);
-            if let Some(positions) = list.positions.as_mut() {
-                positions.push(term_positions);
-            }
-        }
+        token_occurrences
+            .into_iter()
+            .for_each(|(token_id, term_positions)| {
+                let list = &mut self.inverted_list[token_id as usize];
+                list.add(row_id, term_positions);
+            });
     }
 }
 
@@ -309,7 +488,7 @@ mod tests {
 
         let mut invert_index = super::InvertedIndexBuilder::default();
         let doc_col = GenericStringArray::<Offset>::from(vec![
-            "lance database search",
+            "lance database the search",
             "lance database",
             "lance search",
             "database search",

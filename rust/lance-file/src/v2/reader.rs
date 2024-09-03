@@ -505,7 +505,7 @@ impl FileReader {
 
     /// Loads a default projection for all columns in the file, using the data type that
     /// was provided when the file was written.
-    fn default_projection(lance_schema: &Schema) -> ReaderProjection {
+    pub fn default_projection(lance_schema: &Schema) -> ReaderProjection {
         let schema = Arc::new(lance_schema.clone());
         let mut column_indices = Vec::with_capacity(lance_schema.fields.len());
         let mut column_index = 0;

@@ -46,6 +46,8 @@ from .lance import (
     _Dataset,
     _MergeInsertBuilder,
     _Operation,
+    _RewriteGroup,
+    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
@@ -1208,6 +1210,7 @@ class LanceDataset(pa.dataset.Dataset):
         name: Optional[str] = None,
         *,
         replace: bool = True,
+        **kwargs,
     ):
         """Create a scalar index on a column.
 
@@ -1279,6 +1282,15 @@ class LanceDataset(pa.dataset.Dataset):
             column name.
         replace : bool, default True
             Replace the existing index if it exists.
+
+        Optional Parameters
+        -------------------
+        with_position: bool, default True
+            This is for the ``INVERTED`` index. If True, the index will store the
+            positions of the words in the document, so that you can conduct phrase
+            query. This will significantly increase the index size.
+            It won't impact the performance of non-phrase queries even if it is set to
+            True.
 
         Examples
         --------
@@ -1364,7 +1376,7 @@ class LanceDataset(pa.dataset.Dataset):
                 f"Scalar index column {column} cannot currently be a duration"
             )
 
-        self._ds.create_index([column], index_type, name, replace)
+        self._ds.create_index([column], index_type, name, replace, None, kwargs)
 
     def create_index(
         self,
@@ -2133,6 +2145,63 @@ class LanceOperation:
 
         def _to_inner(self):
             return _Operation.restore(self.version)
+
+    @dataclass
+    class RewriteGroup:
+        """
+        Collection of rewritten files
+        """
+
+        old_fragments: Iterable[FragmentMetadata]
+        new_fragments: Iterable[FragmentMetadata]
+
+        def _to_inner(self):
+            old_fragments = [f._metadata for f in self.old_fragments]
+            new_fragments = [f._metadata for f in self.new_fragments]
+            return _RewriteGroup(old_fragments, new_fragments)
+
+    @dataclass
+    class RewrittenIndex:
+        """
+        An index that has been rewritten
+        """
+
+        old_id: str
+        new_id: str
+
+        def _to_inner(self):
+            return _RewrittenIndex(self.old_id, self.new_id)
+
+    @dataclass
+    class Rewrite(BaseOperation):
+        """
+        Operation that rewrites one or more files and indices into one
+        or more files and indices.
+
+        Attributes
+        ----------
+        groups: list[RewriteGroup]
+            Groups of files that have been rewritten.
+        rewritten_indices: list[RewrittenIndex]
+            Indices that have been rewritten.
+
+        Warning
+        -------
+        This is an advanced API not intended for general use.
+        """
+
+        groups: Iterable[LanceOperation.RewriteGroup]
+        rewritten_indices: Iterable[LanceOperation.RewrittenIndex]
+
+        def __post_init__(self):
+            all_frags = [old for group in self.groups for old in group.old_fragments]
+            all_frags += [new for group in self.groups for new in group.new_fragments]
+            LanceOperation._validate_fragments(all_frags)
+
+        def _to_inner(self):
+            groups = [group._to_inner() for group in self.groups]
+            rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
+            return _Operation.rewrite(groups, rewritten_indices)
 
 
 class ScannerBuilder:

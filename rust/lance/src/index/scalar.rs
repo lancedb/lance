@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
+use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
     btree::{train_btree_index, BTreeIndex, TrainingSource},
@@ -111,7 +112,12 @@ pub(super) async fn build_scalar_index(
             train_label_list_index(training_request, &index_store).await
         }
         Some(ScalarIndexType::Inverted) => {
-            train_inverted_index(training_request, &index_store).await
+            train_inverted_index(
+                training_request,
+                &index_store,
+                InvertedIndexParams::default(),
+            )
+            .await
         }
         _ => {
             // The BTree index implementation leverages the legacy format's batch offset,
@@ -121,6 +127,22 @@ pub(super) async fn build_scalar_index(
             train_btree_index(training_request, &flat_index_trainer, &index_store).await
         }
     }
+}
+
+/// Build a Scalar Index
+#[instrument(level = "debug", skip_all)]
+pub(super) async fn build_inverted_index(
+    dataset: &Dataset,
+    column: &str,
+    uuid: &str,
+    params: &InvertedIndexParams,
+) -> Result<()> {
+    let training_request = Box::new(TrainingRequest {
+        dataset: Arc::new(dataset.clone()),
+        column: column.to_string(),
+    });
+    let index_store = LanceIndexStore::from_dataset(dataset, uuid);
+    train_inverted_index(training_request, &index_store, params.clone()).await
 }
 
 pub async fn open_scalar_index(

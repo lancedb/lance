@@ -550,27 +550,7 @@ impl FieldEncoder for StructFieldEncoder {
             .iter_mut()
             .map(|encoder| encoder.flush())
             .collect::<Result<Vec<_>>>()?;
-        let mut child_tasks = child_tasks.into_iter().flatten().collect::<Vec<_>>();
-        let num_rows_seen = self.num_rows_seen;
-        let column_index = self.column_index;
-        // In this "simple struct / no nulls" case we emit a single header page at
-        // the very end which covers the entire struct.
-        child_tasks.push(
-            std::future::ready(Ok(EncodedPage {
-                array: EncodedArray {
-                    buffers: vec![],
-                    encoding: pb::ArrayEncoding {
-                        array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
-                            pb::SimpleStruct {},
-                        )),
-                    },
-                },
-                num_rows: num_rows_seen,
-                column_idx: column_index,
-            }))
-            .boxed(),
-        );
-        Ok(child_tasks)
+        Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
     }
 
     fn num_columns(&self) -> u32 {
@@ -585,7 +565,21 @@ impl FieldEncoder for StructFieldEncoder {
         async move {
             let mut columns = Vec::new();
             // Add a column for the struct header
-            columns.push(EncodedColumn::default());
+            let mut header = EncodedColumn::default();
+            header.final_pages.push(EncodedPage {
+                array: EncodedArray {
+                    buffers: vec![],
+                    encoding: pb::ArrayEncoding {
+                        array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
+                            pb::SimpleStruct {},
+                        )),
+                    },
+                },
+                num_rows: self.num_rows_seen,
+                column_idx: self.column_index,
+            });
+            columns.push(header);
+            // Now run finish on the children
             for child in self.children.iter_mut() {
                 columns.extend(child.finish().await?);
             }

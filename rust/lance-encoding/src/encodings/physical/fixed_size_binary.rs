@@ -10,7 +10,7 @@ use lance_core::Result;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, DataBlockExt, FixedWidthDataBlock, VariableWidthBlock},
+    data::{DataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
@@ -79,11 +79,11 @@ pub struct FixedSizeBinaryDecoder {
 }
 
 impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let rows_to_skip = rows_to_skip * self.byte_width;
         let num_bytes = num_rows * self.byte_width;
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
-        let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
+        let bytes = bytes.as_fixed_width()?;
         debug_assert_eq!(bytes.bits_per_value, 8);
 
         let offsets_buffer = match self.bytes_per_offset {
@@ -104,7 +104,7 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
             _ => panic!("Unsupported offsets type"),
         };
 
-        let string_data = Box::new(VariableWidthBlock {
+        let string_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: (self.bytes_per_offset * 8) as u8,
             data: bytes.data,
             num_values: num_rows,

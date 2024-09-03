@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
+use arrow::array::make_comparator;
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
@@ -114,7 +115,29 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
-            assert_eq!(&expected, actual);
+            if &expected != actual {
+                if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
+                {
+                    // We can't just assert_eq! because the error message is not very helpful.  This gives us a bit
+                    // more information about where the mismatch is.
+                    for i in 0..expected.len() {
+                        if !matches!(comparator(i, i), Ordering::Equal) {
+                            panic!(
+                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            i,
+                            expected,
+                            actual,
+                            expected.slice(i, 1),
+                            actual.slice(i, 1)
+                        );
+                        }
+                    }
+                } else {
+                    // Some arrays (like the null type) don't have a comparator so we just re-run the normal comparison
+                    // and let it assert
+                    assert_eq!(&expected, actual);
+                }
+            }
         }
         offset += batch_size as usize;
     }

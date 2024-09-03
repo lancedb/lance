@@ -125,8 +125,10 @@ class LanceFileReader:
         """
         for i in range(len(indices) - 1):
             if indices[i] > indices[i + 1]:
-                raise ValueError(f"Indices must be sorted in ascending order for \
-                                 file API, got {indices[i]} > {indices[i+1]}")
+                raise ValueError(
+                    f"Indices must be sorted in ascending order for \
+                                 file API, got {indices[i]} > {indices[i+1]}"
+                )
 
         return ReaderResults(
             self._reader.take_rows(indices, batch_size, batch_readahead)
@@ -137,6 +139,22 @@ class LanceFileReader:
         Return metadata describing the file contents
         """
         return self._reader.metadata()
+
+    def read_global_buffer(self, index: int) -> bytes:
+        """
+        Read a global buffer from the file at a given index
+
+        Parameters
+        ----------
+        index: int
+            The index of the global buffer to read
+
+        Returns
+        -------
+        bytes
+            The contents of the global buffer
+        """
+        return self._reader.read_global_buffer(index)
 
 
 class LanceFileWriter:
@@ -207,6 +225,38 @@ class LanceFileWriter:
             return
         self.closed = True
         return self._writer.finish()
+
+    def add_schema_metadata(self, key: str, value: str) -> None:
+        """
+        Add a metadata (key/value pair) entry to the schema. This method allows you to
+        alter the schema metadata. It must be called before `close` is called.
+
+        Parameters
+        ----------
+        key: str
+            The key to add.
+        value: str
+            The value to add.
+        """
+        self._writer.add_schema_metadata(key, value)
+
+    def add_global_buffer(self, data: bytes) -> int:
+        """
+        Add a global buffer to the file. The global buffer can contain any
+        arbitrary bytes.
+
+        Parameters
+        ----------
+        data: bytes
+            The data to write to the file.
+
+        Returns
+        -------
+        int
+            The index of the global buffer. This will always start at 1
+            and increment by 1 each time this method is called.
+        """
+        return self._writer.add_global_buffer(data)
 
     def __enter__(self) -> "LanceFileWriter":
         return self

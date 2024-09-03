@@ -13,7 +13,7 @@ use lance_core::Result;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, DataBlockExt, NullableDataBlock, VariableWidthBlock},
+    data::{DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::pb,
@@ -64,18 +64,15 @@ struct FsstPageDecoder {
 }
 
 impl PrimitivePageDecoder for FsstPageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let compressed_data = self.inner_decoder.decode(rows_to_skip, num_rows)?;
-        let compressed_data = compressed_data.as_any_box();
-        let (string_data, nulls) = match compressed_data.downcast::<NullableDataBlock>() {
-            Ok(nullable) => {
-                let data = nullable.data.try_into_layout::<VariableWidthBlock>()?;
+        let (string_data, nulls) = match compressed_data {
+            DataBlock::Nullable(nullable) => {
+                let data = nullable.data.as_variable_width()?;
                 Result::Ok((data, Some(nullable.nulls)))
             }
-            Err(data) => {
-                let data = data.downcast::<VariableWidthBlock>().unwrap();
-                Ok((data, None))
-            }
+            DataBlock::VariableWidth(variable) => Ok((variable, None)),
+            _ => panic!("Received non-variable width data from inner decoder"),
         }?;
 
         let offsets = ScalarBuffer::<i32>::from(string_data.offsets.into_buffer());
@@ -105,7 +102,7 @@ impl PrimitivePageDecoder for FsstPageDecoder {
         let mut bytes_as_bytes_mut = Vec::with_capacity(decompressed_bytes.len());
         bytes_as_bytes_mut.extend_from_slice(&decompressed_bytes);
 
-        let new_string_data = Box::new(VariableWidthBlock {
+        let new_string_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: 32,
             data: LanceBuffer::from(bytes_as_bytes_mut),
             num_values: num_rows,
@@ -113,8 +110,8 @@ impl PrimitivePageDecoder for FsstPageDecoder {
         });
 
         if let Some(nulls) = nulls {
-            Ok(Box::new(NullableDataBlock {
-                data: new_string_data,
+            Ok(DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(new_string_data),
                 nulls,
             }))
         } else {

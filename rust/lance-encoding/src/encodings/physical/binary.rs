@@ -15,9 +15,7 @@ use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use crate::buffer::LanceBuffer;
-use crate::data::{
-    DataBlock, DataBlockExt, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock,
-};
+use crate::data::{DataBlock, NullableDataBlock, VariableWidthBlock};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
@@ -260,13 +258,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
     // We only need [8, 13] to decode in this case.
     // These need to be normalized in order to build the string later
     // So return [0, 5]
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
-        // Buffers[0] == validity buffer
-        // Buffers[1] == offsets buffer
-        // Buffers[2] == null buffer // TODO: Micro-optimization, can we get rid of this?  Doesn't hurt much though
-        //                              This buffer is always empty since bytes are not allowed to contain nulls
-        // Buffers[3] == bytes buffer
-
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         // STEP 1: validity buffer
         let target_validity = self
             .validity
@@ -322,18 +314,18 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             - bytes_to_skip;
 
         let bytes = self.bytes_decoder.decode(bytes_to_skip, num_bytes)?;
-        let bytes = bytes.try_into_layout::<FixedWidthDataBlock>()?;
+        let bytes = bytes.as_fixed_width()?;
         debug_assert_eq!(bytes.bits_per_value, 8);
 
-        let string_data = Box::new(VariableWidthBlock {
+        let string_data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: bytes_per_offset * 8,
             data: bytes.data,
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_buffer),
         });
         if let Some(validity) = validity_buffer {
-            Ok(Box::new(NullableDataBlock {
-                data: string_data,
+            Ok(DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(string_data),
                 nulls: LanceBuffer::from(validity),
             }))
         } else {

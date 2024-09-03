@@ -17,6 +17,7 @@ use std::{pin::Pin, sync::Arc};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
+use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
@@ -234,6 +235,16 @@ impl LanceFileWriter {
     pub fn finish(&mut self) -> PyResult<u64> {
         RT.runtime.block_on(self.inner.finish()).infer_error()
     }
+
+    pub fn add_global_buffer(&mut self, bytes: Vec<u8>) -> PyResult<u32> {
+        RT.runtime
+            .block_on(self.inner.add_global_buffer(Bytes::from(bytes)))
+            .infer_error()
+    }
+
+    pub fn add_schema_metadata(&mut self, key: String, value: String) {
+        self.inner.add_schema_metadata(key, value)
+    }
 }
 
 fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
@@ -394,5 +405,13 @@ impl LanceFileReader {
     pub fn metadata(&mut self, py: Python) -> LanceFileMetadata {
         let inner_meta = self.inner.metadata();
         LanceFileMetadata::new(inner_meta, py)
+    }
+
+    pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {
+        let buffer_bytes = RT
+            .runtime
+            .block_on(self.inner.read_global_buffer(index))
+            .infer_error()?;
+        Ok(buffer_bytes.to_vec())
     }
 }

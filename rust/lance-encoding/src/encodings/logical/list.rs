@@ -1217,7 +1217,7 @@ mod tests {
     use arrow::array::StringBuilder;
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
-        ArrayRef, BooleanArray, ListArray,
+        Array, ArrayRef, BooleanArray, ListArray, StructArray, UInt64Array,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
@@ -1258,6 +1258,27 @@ mod tests {
 
         let field = Field::new("", make_list_type(struct_type), true);
         check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_struct_empty() {
+        let fields = Fields::from(vec![Field::new("inner", DataType::UInt64, true)]);
+        let items = UInt64Array::from(Vec::<u64>::new());
+        let structs = StructArray::new(fields, vec![Arc::new(items)], None);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0; 2 * 1024 * 1024 + 1]));
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", structs.data_type().clone(), true)),
+            offsets,
+            Arc::new(structs),
+            None,
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(lists)],
+            &TestCases::default(),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
