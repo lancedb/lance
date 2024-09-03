@@ -112,18 +112,18 @@ public class Dataset implements Closeable {
   /**
    * Open a dataset from the specified path.
    *
-   * @param path      file path
+   * @param path file path
    * @return Dataset
    */
   public static Dataset open(String path) {
-    return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions());
+    return open(new RootAllocator(Long.MAX_VALUE), true, path, new ReadOptions.Builder().build());
   }
 
   /**
    * Open a dataset from the specified path.
    *
-   * @param path      file path
-   * @param options   the open options
+   * @param path    file path
+   * @param options the open options
    * @return Dataset
    */
   public static Dataset open(String path, ReadOptions options) {
@@ -138,7 +138,7 @@ public class Dataset implements Closeable {
    * @return Dataset
    */
   public static Dataset open(String path, BufferAllocator allocator) {
-    return open(allocator, path, new ReadOptions());
+    return open(allocator, path, new ReadOptions.Builder().build());
   }
 
   /**
@@ -156,8 +156,8 @@ public class Dataset implements Closeable {
   /**
    * Open a dataset from the specified path with additional options.
    *
-   * @param path      file path
-   * @param options   the open options
+   * @param path    file path
+   * @param options the open options
    * @return Dataset
    */
   private static Dataset open(BufferAllocator allocator, boolean selfManagedAllocator,
@@ -166,8 +166,8 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
     Dataset dataset = openNative(path, options.getVersion(),
-      options.getBlockSize(), options.getIndexCacheSize(),
-      options.getMetadataCacheSize());
+        options.getBlockSize(), options.getIndexCacheSize(),
+        options.getMetadataCacheSize());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
@@ -213,7 +213,8 @@ public class Dataset implements Closeable {
   /**
    * Create a new Dataset Scanner.
    *
-   * @param batchSize the scan options with batch size, columns filter, and substrait
+   * @param batchSize the scan options with batch size, columns filter, and
+   *                  substrait
    * @return a dataset scanner
    */
   public LanceScanner newScan(long batchSize) {
@@ -260,12 +261,13 @@ public class Dataset implements Closeable {
 
   /**
    * Creates a new index on the dataset.
+   * Only vector indexes are supported.
    *
-   * @param columns the columns to index from
+   * @param columns   the columns to index from
    * @param indexType the index type
-   * @param name the name of the created index
-   * @param params index params
-   * @param replace whether to replace the existing index
+   * @param name      the name of the created index
+   * @param params    index params
+   * @param replace   whether to replace the existing index
    */
   public void createIndex(List<String> columns, IndexType indexType, Optional<String> name,
       IndexParams params, boolean replace) {
@@ -276,7 +278,7 @@ public class Dataset implements Closeable {
   }
 
   private native void nativeCreateIndex(List<String> columns, int indexTypeCode,
-    Optional<String> name, IndexParams params, boolean replace);
+      Optional<String> name, IndexParams params, boolean replace);
 
   /**
    * Count the number of rows in the dataset.

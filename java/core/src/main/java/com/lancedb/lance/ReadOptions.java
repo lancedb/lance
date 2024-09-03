@@ -15,43 +15,23 @@
 package com.lancedb.lance;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
-
 import java.util.Optional;
 
 /**
  * Read options for reading from a dataset.
  */
 public class ReadOptions {
+
   private Optional<Integer> version;
   private Optional<Integer> blockSize;
   private int indexCacheSize;
   private int metadataCacheSize;
 
-  public ReadOptions() {
-    this.version = Optional.empty();
-    this.blockSize = Optional.empty();
-    this.indexCacheSize = 256;
-    this.metadataCacheSize = 256;
-  }
-
-  public ReadOptions version(int version) {
-    this.version = Optional.of(version);
-    return this;
-  }
-
-  public ReadOptions blockSize(int blockSize) {
-    this.blockSize = Optional.of(blockSize);
-    return this;
-  }
-
-  public ReadOptions indexCacheSize(int indexCacheSize) {
-    this.indexCacheSize = indexCacheSize;
-    return this;
-  }
-
-  public ReadOptions metadataCacheSize(int metadataCacheSize) {
-    this.metadataCacheSize = metadataCacheSize;
-    return this;
+  private ReadOptions(Builder builder) {
+    this.version = Optional.ofNullable(builder.version);
+    this.blockSize = Optional.ofNullable(builder.blockSize);
+    this.indexCacheSize = builder.indexCacheSize;
+    this.metadataCacheSize = builder.metadataCacheSize;
   }
 
   public Optional<Integer> getVersion() {
@@ -78,5 +58,37 @@ public class ReadOptions {
         .append("indexCacheSize", indexCacheSize)
         .append("metadataCacheSize", metadataCacheSize)
         .toString();
+  }
+
+  public static class Builder {
+
+    private Integer version;
+    private Integer blockSize;
+    private int indexCacheSize = 256;
+    private int metadataCacheSize = 256;
+
+    public Builder setVersion(int version) {
+      this.version = version;
+      return this;
+    }
+
+    public Builder setBlockSize(int blockSize) {
+      this.blockSize = blockSize;
+      return this;
+    }
+
+    public Builder setIndexCacheSize(int indexCacheSize) {
+      this.indexCacheSize = indexCacheSize;
+      return this;
+    }
+
+    public Builder setMetadataCacheSize(int metadataCacheSize) {
+      this.metadataCacheSize = metadataCacheSize;
+      return this;
+    }
+
+    public ReadOptions build() {
+      return new ReadOptions(this);
+    }
   }
 }

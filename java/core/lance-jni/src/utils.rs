@@ -163,10 +163,7 @@ pub fn get_index_params(
             shuffle_partition_batches,
             shuffle_partition_concurrency,
             use_residual,
-            storage_options: None,
-            centroids: None,
-            precomputed_partitons_file: None,
-            precomputed_shuffle_buffers: None,
+            ..Default::default()
         };
         stages.push(StageParams::Ivf(ivf_params));
 
@@ -213,7 +210,7 @@ pub fn get_index_params(
                     max_iters,
                     kmeans_redos,
                     sample_rate,
-                    codebook: None,
+                    ..Default::default()
                 })
             },
         )?;

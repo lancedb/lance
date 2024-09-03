@@ -97,7 +97,7 @@ public class DatasetTest {
           assertEquals(2, dataset2.latestVersion());
   
           // Open dataset with version 1
-          ReadOptions options1 = new ReadOptions().version(1);
+          ReadOptions options1 = new ReadOptions.Builder().setVersion(1).build();
           try (Dataset datasetV1 = Dataset.open(allocator, datasetPath, options1)) {
             assertEquals(1, datasetV1.version());
             assertEquals(2, datasetV1.latestVersion());
@@ -113,7 +113,7 @@ public class DatasetTest {
             assertEquals(3, dataset3.latestVersion());
   
             // Open dataset with version 2
-            ReadOptions options2 = new ReadOptions().version(2);
+            ReadOptions options2 = new ReadOptions.Builder().setVersion(2).build();
             try (Dataset datasetV2 = Dataset.open(allocator, datasetPath, options2)) {
               assertEquals(2, datasetV2.version());
               assertEquals(3, datasetV2.latestVersion());
