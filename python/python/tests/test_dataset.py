@@ -291,10 +291,12 @@ def test_tag(tmp_path: Path):
         lance.dataset(base_dir, "missing-tag")
 
     # test tag update
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError,
+                       match = "Version not found error: version 3 does not exist"):
         ds.tags.update("tag1", 3)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError,
+                       match = "Ref not found error: tag tag3 does not exist"):
         ds.tags.update("tag3", 1)
 
     ds.tags.update("tag1", 2)
