@@ -121,7 +121,10 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfPq as i32 => Ok(Self::IvfPq),
             v if v == Self::IvfHnswSq as i32 => Ok(Self::IvfHnswSq),
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
-            _ => Err(Error::InvalidInput { source: format!("the input value {} is not a valid IndexType", value).into(), location: location!() }),
+            _ => Err(Error::InvalidInput {
+                source: format!("the input value {} is not a valid IndexType", value).into(),
+                location: location!(),
+            }),
         }
     }
 }
