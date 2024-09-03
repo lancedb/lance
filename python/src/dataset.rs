@@ -1025,7 +1025,8 @@ impl Dataset {
 
     fn update_tag(&mut self, tag: String, version: u64) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
-        RT.block_on(None, new_self.tags.update(tag.as_str(), version))?.infer_error()?;
+        RT.block_on(None, new_self.tags.update(tag.as_str(), version))?
+            .infer_error()?;
         self.ds = Arc::new(new_self);
         Ok(())
     }
