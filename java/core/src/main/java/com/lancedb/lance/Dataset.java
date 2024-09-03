@@ -271,7 +271,7 @@ public class Dataset implements Closeable {
    */
   public void createIndex(List<String> columns, IndexType indexType, Optional<String> name,
       IndexParams params, boolean replace) {
-    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
     }

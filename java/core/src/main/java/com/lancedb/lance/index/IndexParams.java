@@ -18,6 +18,9 @@ import com.lancedb.lance.index.vector.VectorIndexParams;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import java.util.Optional;
 
+/**
+ * Parameters for creating an index.
+ */
 public class IndexParams {
   private final DistanceType distanceType;
   private final Optional<VectorIndexParams> vectorIndexParams;
@@ -28,16 +31,23 @@ public class IndexParams {
   }
 
   public static class Builder {
-    private DistanceType distanceType = DistanceType.L2; // Default to L2
+    private DistanceType distanceType = DistanceType.L2;
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
 
     public Builder() {}
 
+    /**
+     * Set the distance type for calculating the distance between vectors.
+     * Default to L2.
+     */
     public Builder setDistanceType(DistanceType distanceType) {
       this.distanceType = distanceType;
       return this;
     }
 
+    /**
+     * Vector index parameters for creating a vector index.
+     */
     public Builder setVectorIndexParams(VectorIndexParams vectorIndexParams) {
       this.vectorIndexParams = Optional.of(vectorIndexParams);
       return this;

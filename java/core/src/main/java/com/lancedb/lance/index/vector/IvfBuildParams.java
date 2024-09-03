@@ -16,6 +16,15 @@ package com.lancedb.lance.index.vector;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
+/**
+ * Parameters for building an IVF index.
+ * Train IVF centroids for the given vector column.
+ * This will run k-means clustering on the given vector column to train the IVF centroids.
+ * This is the first step in several vector indices.
+ * The centroids will be used to partition the vectors into different clusters.
+ * IVF centroids are trained from a sample of the data (determined by the sample_rate).
+ * While this sample is not huge it might still be quite large.
+ */
 public class IvfBuildParams {
   private final int numPartitions;
   private final int maxIters;
@@ -41,33 +50,84 @@ public class IvfBuildParams {
     private int shufflePartitionConcurrency = 2;
     private boolean useResidual = true;
 
+    /**
+     * Parameters for building an IVF index.
+     * Train IVF centroids for the given vector column.
+     * This will run k-means clustering on the given vector column to train the IVF centroids.
+     * This is the first step in several vector indices.
+     * The centroids will be used to partition the vectors into different clusters.
+     * IVF centroids are trained from a sample of the data (determined by the sample_rate).
+     * While this sample is not huge it might still be quite large.
+     */
     public Builder() {}
 
+    /**
+     * @param numPartitions set the number of partitions of IVF (Inverted File Index)
+     *                      Default to 32
+     * @return Builder
+     */
     public Builder setNumPartitions(int numPartitions) {
       this.numPartitions = numPartitions;
       return this;
     }
 
+    /**
+     * @param maxIters set the maximum number of iterations for k-means clustering. Default to 50.
+     * @return Builder
+     */
     public Builder setMaxIters(int maxIters) {
       this.maxIters = maxIters;
       return this;
     }
 
+    /**
+     * Set the sample rate for training IVF centroids
+     * IVF centroids are trained from a sample of the data (determined by the sample_rate).
+     * While this sample is not huge it might still be quite large.
+     * Default to 256.
+     *
+     * @param sampleRate set the sample rate for training IVF centroids
+     * @return Builder
+     */
     public Builder setSampleRate(int sampleRate) {
       this.sampleRate = sampleRate;
       return this;
     }
 
+    /**
+     * Sets the number of batches, using the row group size of the dataset,
+     * to include in each shuffle partition. Default value is 10240.
+     * Assuming the row group size is 1024,
+     * each shuffle partition will hold 10240 * 1024 = 10,485,760 rows.
+     * By making this value smaller, this shuffle will consume less memory
+     * but will take longer to complete, and vice versa.
+     *
+     * @param shufflePartitionBatches the number of batches to include in shuffle
+     * @return Builder
+     */
     public Builder setShufflePartitionBatches(int shufflePartitionBatches) {
       this.shufflePartitionBatches = shufflePartitionBatches;
       return this;
     }
 
+    /**
+     * Set the number of shuffle partitions to process concurrently. Default value is 2.
+     * By making this value smaller, this shuffle will consume less memory
+     * but will take longer to complete, and vice versa.
+     *
+     * @param shufflePartitionConcurrency
+     * @return Builder
+     */
     public Builder setShufflePartitionConcurrency(int shufflePartitionConcurrency) {
       this.shufflePartitionConcurrency = shufflePartitionConcurrency;
       return this;
     }
 
+    /**
+     * Set whether to use residual for k-means clustering. Default value is true.
+     * @param useResidual
+     * @return Builder
+     */
     public Builder setUseResidual(boolean useResidual) {
       this.useResidual = useResidual;
       return this;
@@ -78,7 +138,6 @@ public class IvfBuildParams {
     }
   }
 
-  // Getter methods
   public int getNumPartitions() {
     return numPartitions;
   }

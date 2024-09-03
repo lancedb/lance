@@ -22,14 +22,14 @@ import java.util.Optional;
  */
 public class ReadOptions {
 
-  private Optional<Integer> version;
-  private Optional<Integer> blockSize;
-  private int indexCacheSize;
-  private int metadataCacheSize;
+  private final Optional<Integer> version;
+  private final Optional<Integer> blockSize;
+  private final int indexCacheSize;
+  private final int metadataCacheSize;
 
   private ReadOptions(Builder builder) {
-    this.version = Optional.ofNullable(builder.version);
-    this.blockSize = Optional.ofNullable(builder.blockSize);
+    this.version = builder.version;
+    this.blockSize = builder.blockSize;
     this.indexCacheSize = builder.indexCacheSize;
     this.metadataCacheSize = builder.metadataCacheSize;
   }
@@ -62,26 +62,52 @@ public class ReadOptions {
 
   public static class Builder {
 
-    private Integer version;
-    private Integer blockSize;
+    private Optional<Integer> version = Optional.empty();
+    private Optional<Integer> blockSize = Optional.empty();
     private int indexCacheSize = 256;
     private int metadataCacheSize = 256;
 
+    /**
+     * Set the version of the dataset to read.
+     * If not set, read from latest version.
+     */
     public Builder setVersion(int version) {
-      this.version = version;
+      this.version = Optional.of(version);
       return this;
     }
 
+    /**
+     * Block size in bytes.
+     * Provide a hint for the size of the minimal I/O request.
+     * Recommended to be set to value bigger than 4KB.
+     */
     public Builder setBlockSize(int blockSize) {
-      this.blockSize = blockSize;
+      this.blockSize = Optional.of(blockSize);
       return this;
     }
 
+    /**
+     * Index cache size. Index cache is a LRU cache with TTL.
+     * This number specifies the number of index pages,
+     * for example, IVF partitions, to be cached in the host memory.
+     * Roughly, for an IVF_PQ partition with n rows,
+     * the size of each index page equals the combination of the pq code
+     * (nd.array([n,pq], dtype=uint8))
+     * and the row ids (nd.array([n], dtype=uint64)). Approximately, n = Total Rows
+     * / number of IVF partitions.
+     * pq = number of PQ sub-vectors.
+     * Default is 256.
+     */
     public Builder setIndexCacheSize(int indexCacheSize) {
       this.indexCacheSize = indexCacheSize;
       return this;
     }
 
+    /**
+     * Metadata cache size for the fragment metadata. If it is zero, metadata
+     * cache is disabled.
+     * Default is 256.
+     */
     public Builder setMetadataCacheSize(int metadataCacheSize) {
       this.metadataCacheSize = metadataCacheSize;
       return this;

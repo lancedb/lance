@@ -18,6 +18,9 @@ import com.lancedb.lance.index.DistanceType;
 import java.util.Optional;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
+/**
+ * Parameters for creating a vector index.
+ */
 public class VectorIndexParams {
   private final DistanceType distanceType;
   private final IvfBuildParams ivfParams;
@@ -46,12 +49,30 @@ public class VectorIndexParams {
     }
   }
 
+  /**
+   * Create a new IVF index with flat quantizer.
+   *
+   * @param numPartitions the number of partitions of IVF (Inverted File Index)
+   * @param distanceType the distance type for calculating the distance between vectors
+   */
   public static VectorIndexParams ivfFlat(int numPartitions, DistanceType distanceType) {
     return new Builder(new IvfBuildParams.Builder().setNumPartitions(numPartitions).build())
         .setDistanceType(distanceType)
         .build();
   }
 
+  /**
+   * Create a new IVF index with PQ quantizer.
+   *
+   * @param numPartitions the number of partitions of IVF (Inverted File Index)
+   * @param numBits maps the float vectors to integer vectors, each integer is of num_bits.
+   *                Now only 8 bits are supported
+   * @param numSubVectors the number of sub-vectors for PQ (Product Quantization)
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param maxIterations K-means max iterations. This will run k-means clustering on each subvector
+   *                      to determine the centroids that will be used to quantize the subvectors.
+   * @return the VectorIndexParams
+   */
   public static VectorIndexParams ivfPq(int numPartitions, int numBits, int numSubVectors,
       DistanceType distanceType, int maxIterations) {
     IvfBuildParams ivfParams = new IvfBuildParams.Builder().setNumPartitions(numPartitions).build();
@@ -67,6 +88,14 @@ public class VectorIndexParams {
         .build();
   }
 
+  /**
+   * Create a new IVF index with PQ quantizer.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param IvfBuildParams the IVF build parameters
+   * @param PQBuildParams the PQ build parameters
+   * @return the VectorIndexParams
+   */
   public static VectorIndexParams withIvfPqParams(DistanceType distanceType,
       IvfBuildParams ivf,
       PQBuildParams pq) {
@@ -76,6 +105,16 @@ public class VectorIndexParams {
         .build();
   }
 
+  /**
+   * Create a new IVF HNSW index with PQ quantizer.
+   * The dataset is partitioned into IVF partitions, and each partition builds an HNSW graph.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param IvfBuildParams the IVF build parameters
+   * @param hnswBuildParams the HNSW build parameters
+   * @param PQBuildParams the PQ build parameters
+   * @return the VectorIndexParams
+   */
   public static VectorIndexParams withIvfHnswPqParams(DistanceType distanceType,
       IvfBuildParams ivf,
       HnswBuildParams hnsw,
@@ -87,6 +126,16 @@ public class VectorIndexParams {
         .build();
   }
 
+  /**
+   * Create a new IVF HNSW index with SQ quantizer.
+   * The dataset is partitioned into IVF partitions, and each partition builds an HNSW graph.
+   *
+   * @param distanceType the distance type for calculating the distance between vectors
+   * @param IvfBuildParams the IVF build parameters
+   * @param hnswBuildParams the HNSW build parameters
+   * @param SQBuildParams the SQ build parameters
+   * @return the VectorIndexParams
+   */
   public static VectorIndexParams withIvfHnswSqParams(DistanceType distanceType,
       IvfBuildParams ivf,
       HnswBuildParams hnsw,
@@ -99,31 +148,53 @@ public class VectorIndexParams {
   }
 
   public static class Builder {
-    private DistanceType distanceType = DistanceType.L2; // Default to L2
+    private DistanceType distanceType = DistanceType.L2;
     private final IvfBuildParams ivfParams;
     private Optional<PQBuildParams> pqParams = Optional.empty();
     private Optional<HnswBuildParams> hnswParams = Optional.empty();
     private Optional<SQBuildParams> sqParams = Optional.empty();
 
+    /**
+     * Create a new builder to create a vector index.
+     *
+     * @param ivfParams the IVF build parameters
+     */
     public Builder(IvfBuildParams ivfParams) {
       this.ivfParams = ivfParams;
     }
 
+    /**
+     * @param distanceType the distance type for calculating the distance between vectors
+     * @return Builder
+     */
     public Builder setDistanceType(DistanceType distanceType) {
       this.distanceType = distanceType;
       return this;
     }
 
+    /**
+     * @param sqParams the SQ quantizer build parameters
+     * @return Builder
+     */
     public Builder setPqParams(PQBuildParams pqParams) {
       this.pqParams = Optional.of(pqParams);
       return this;
     }
 
+    /**
+     * @param hnswParams the HNSW build parameters for building the HNSW graph
+     *                   for each IVF partition
+     * @return Builder
+     */
     public Builder setHnswParams(HnswBuildParams hnswParams) {
       this.hnswParams = Optional.of(hnswParams);
       return this;
     }
 
+    /**
+     * @param sqParams the sq build params
+     * @return Builder
+     */
     public Builder setSqParams(SQBuildParams sqParams) {
       this.sqParams = Optional.of(sqParams);
       return this;

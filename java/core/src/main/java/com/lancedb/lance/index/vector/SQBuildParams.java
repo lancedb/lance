@@ -16,6 +16,9 @@ package com.lancedb.lance.index.vector;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
+/**
+ * Parameters for using SQ quantizer.
+ */
 public class SQBuildParams {
   private final short numBits;
   private final int sampleRate;
@@ -32,11 +35,19 @@ public class SQBuildParams {
     public Builder() {
     }
 
+    /**
+     * @param numBits number of bits of scaling range.
+     * @return Builder
+     */
     public Builder setNumBits(short numBits) {
       this.numBits = numBits;
       return this;
     }
 
+    /**
+     * @param sampleRate sample rate for training
+     * @return
+     */
     public Builder setSampleRate(int sampleRate) {
       this.sampleRate = sampleRate;
       return this;
