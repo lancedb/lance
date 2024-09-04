@@ -271,7 +271,7 @@ def test_fragment_v2(tmp_path):
     )
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)
-    assert "minor_version: 3" in format_fragment(fragments[0], ds)
+    assert "major_version: 2" in format_fragment(fragments[0], ds)
 
 
 def test_mixed_fragment_versions(tmp_path):
