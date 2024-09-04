@@ -141,7 +141,7 @@ impl FileWriter {
     pub fn version(&self) -> LanceFileVersion {
         self.options
             .format_version
-            .unwrap_or(LanceFileVersion::default())
+            .unwrap_or(LanceFileVersion::Stable)
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
