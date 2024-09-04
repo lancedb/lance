@@ -35,9 +35,10 @@ mod test {
         },
         Client,
     };
-    use futures::{future::join_all, TryStreamExt};
+    use futures::future::join_all;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
@@ -307,20 +308,14 @@ mod test {
 
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
-        localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
-
-        // set the store back to dataset path with -{uuid} suffix
-        let mut version_six = localfs
-            .list(Some(&ds.base))
-            .try_filter(|p| {
-                let p = p.clone();
-                async move { p.location.filename().unwrap().starts_with("6.manifest-") }
-            })
-            .try_collect::<Vec<_>>()
+        // Move version 6 to a temporary location, put that in the store.
+        let base_path = Path::parse(ds_uri).unwrap();
+        let version_six_staging_location =
+            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
+        localfs
+            .rename(&manifest_path(&ds.base, 6), &version_six_staging_location)
             .await
             .unwrap();
-        assert_eq!(version_six.len(), 1);
-        let version_six_staging_location = version_six.pop().unwrap().location;
         store
             .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref())
             .await
