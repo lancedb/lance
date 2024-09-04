@@ -2769,6 +2769,37 @@ mod tests {
         assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
     }
 
+    #[tokio::test]
+    async fn test_v2_manifest_path_commit() {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "x",
+            DataType::Int32,
+            false,
+        )]))
+        .unwrap();
+        let operation = Operation::Overwrite {
+            fragments: vec![],
+            schema,
+        };
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = Dataset::commit(
+            test_uri,
+            operation,
+            None,
+            None,
+            None,
+            Arc::new(ObjectStoreRegistry::default()),
+            true, // enable_v2_manifest_paths
+        )
+        .await
+        .unwrap();
+
+        assert!(dataset.manifest_naming_scheme == ManifestNamingScheme::V2);
+
+        assert_all_manifests_use_scheme(&test_dir, ManifestNamingScheme::V2);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_merge(
