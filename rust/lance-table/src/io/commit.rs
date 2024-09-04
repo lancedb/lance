@@ -32,6 +32,7 @@ use futures::{
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
+use log::warn;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::{location, Location};
 use url::Url;
@@ -191,13 +192,38 @@ async fn current_manifest_path(
     });
 
     let first = valid_manifests.next().await.transpose()?;
-    match first {
+    match (first, object_store.list_is_lexically_ordered) {
         // If the first valid manifest we see is V2, we can assume that we are using
         // V2 naming scheme for all manifests.
-        Some((scheme @ ManifestNamingScheme::V2, meta)) => {
+        (Some((scheme @ ManifestNamingScheme::V2, meta)), true) => {
             let version = scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
+
+            // Sanity check: verify at least for the first 1k files that they are all V2
+            // and that the version numbers are decreasing. We use the first 1k because
+            // this is the typical size of an object store list endpoint response page.
+            for (scheme, meta) in valid_manifests.take(999).try_collect::<Vec<_>>().await? {
+                if scheme != ManifestNamingScheme::V2 {
+                    warn!(
+                        "Found V1 Manifest in a V2 directory. Use `migrate_manifest_paths_v2` \
+                         to migrate the directory."
+                    );
+                    break;
+                }
+                let next_version = scheme
+                    .parse_version(meta.location.filename().unwrap())
+                    .unwrap();
+                if next_version >= version {
+                    warn!(
+                        "List operation was expected to be lexically ordered, but was not. This \
+                         could mean a corrupt read. Please make a bug report on the lancedb/lance \
+                         GitHub repository."
+                    );
+                    break;
+                }
+            }
+
             Ok(ManifestLocation {
                 version,
                 path: meta.location,
@@ -208,7 +234,7 @@ async fn current_manifest_path(
         // If the first valid manifest we see if V1, assume for now that we are
         // using V1 naming scheme for all manifests. Since we are listing the
         // directory anyways, we will assert there aren't any V2 manifests.
-        Some((scheme @ ManifestNamingScheme::V1, meta)) => {
+        (Some((scheme, meta)), _) => {
             let mut current_version = scheme
                 .parse_version(meta.location.filename().unwrap())
                 .unwrap();
@@ -236,7 +262,7 @@ async fn current_manifest_path(
                 naming_scheme: scheme,
             })
         }
-        None => Err(Error::NotFound {
+        (None, _) => Err(Error::NotFound {
             uri: base.child(VERSIONS_DIR).to_string(),
             location: location!(),
         }),

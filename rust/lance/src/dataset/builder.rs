@@ -228,6 +228,7 @@ impl DatasetBuilder {
                     self.options.block_size,
                     self.options.object_store_wrapper,
                     self.options.use_constant_size_upload_parts,
+                    store.1.scheme() != "file",
                     // If user supplied an object store then we just assume it's probably
                     // cloud-like
                     DEFAULT_CLOUD_IO_PARALLELISM,
