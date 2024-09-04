@@ -56,6 +56,16 @@ impl LanceFileVersion {
             }),
         }
     }
+
+    pub fn to_numbers(&self) -> (u32, u32) {
+        match self {
+            Self::Legacy => (0, 2),
+            Self::V2_0 => (2, 0),
+            Self::V2_1 => (2, 1),
+            Self::Stable => self.resolve().to_numbers(),
+            Self::Next => self.resolve().to_numbers(),
+        }
+    }
 }
 
 impl std::fmt::Display for LanceFileVersion {

@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::Error;
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
+use lance_file::format::{MAJOR_VERSION, MINOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::version::LanceFileVersion;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,13 @@ impl DataFile {
     pub fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
-        Self::new(path, field_ids, vec![], 0, 0)
+        Self::new(
+            path,
+            field_ids,
+            vec![],
+            MAJOR_VERSION as u32,
+            MINOR_VERSION as u32,
+        )
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {

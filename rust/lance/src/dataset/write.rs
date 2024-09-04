@@ -9,7 +9,6 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
@@ -347,12 +346,13 @@ impl GenericWriter for V2WriterAdapter {
             .iter()
             .map(|(_, column_index)| *column_index)
             .collect::<Vec<_>>();
+        let (major, minor) = self.writer.version().to_numbers();
         let data_file = DataFile::new(
             std::mem::take(&mut self.path),
             field_ids,
             column_indices,
-            MAJOR_VERSION as u32,
-            MINOR_VERSION_NEXT as u32,
+            major,
+            minor,
         );
         let num_rows = self.writer.finish().await? as u32;
         Ok((num_rows, data_file))
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_write_v2() {
+    async fn test_file_write_version() {
         let schema = Arc::new(ArrowSchema::new(vec![arrow::datatypes::Field::new(
             "a",
             DataType::Int32,
@@ -590,36 +590,55 @@ mod tests {
         )
         .unwrap();
 
-        let write_params = WriteParams {
-            data_storage_version: Some(LanceFileVersion::Stable),
-            // This parameter should be ignored
-            max_rows_per_group: 1,
-            ..Default::default()
-        };
+        let versions = vec![
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::Stable,
+            LanceFileVersion::Next,
+        ];
+        for version in versions {
+            let (major, minor) = version.to_numbers();
+            let write_params = WriteParams {
+                data_storage_version: Some(version),
+                // This parameter should be ignored
+                max_rows_per_group: 1,
+                ..Default::default()
+            };
 
-        let data_stream = Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(std::iter::once(Ok(batch))),
-        ));
+            let data_stream = Box::pin(RecordBatchStreamAdapter::new(
+                schema.clone(),
+                futures::stream::iter(std::iter::once(Ok(batch.clone()))),
+            ));
 
-        let schema = Schema::try_from(schema.as_ref()).unwrap();
+            let schema = Schema::try_from(schema.as_ref()).unwrap();
 
-        let object_store = Arc::new(ObjectStore::memory());
-        let fragments = write_fragments_internal(
-            None,
-            object_store,
-            &Path::from("test"),
-            &schema,
-            data_stream,
-            write_params,
-        )
-        .await
-        .unwrap();
-        assert_eq!(fragments.len(), 1);
-        let fragment = &fragments[0];
-        assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.physical_rows, Some(1024));
-        assert_eq!(fragment.files[0].file_minor_version, 3);
+            let object_store = Arc::new(ObjectStore::memory());
+            let fragments = write_fragments_internal(
+                None,
+                object_store,
+                &Path::from("test"),
+                &schema,
+                data_stream,
+                write_params,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fragments.len(), 1);
+            let fragment = &fragments[0];
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(fragment.physical_rows, Some(1024));
+            assert_eq!(
+                fragment.files[0].file_major_version, major,
+                "version: {}",
+                version
+            );
+            assert_eq!(
+                fragment.files[0].file_minor_version, minor,
+                "version: {}",
+                version
+            );
+        }
     }
 
     #[tokio::test]
