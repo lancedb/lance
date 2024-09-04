@@ -15,7 +15,19 @@ torch = pytest.importorskip("torch")
 from lance.torch.data import LanceDataset  # noqa: E402
 
 
-def test_iter_over_dataset(tmp_path):
+def test_iter_over_dataset_fixed_shape_tensor(tmp_path):
+    data = np.random.random((10240, 32)).astype("f")
+
+    tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(data)
+    ids = pa.array(range(0, 10240), type=pa.int32())
+    tbl = pa.Table.from_arrays([ids, tensor_array], ["ids", "vec"])
+
+    lance.write_dataset(tbl, tmp_path / "data.lance")
+
+    iter_over_dataset(tmp_path)
+
+
+def test_iter_over_dataset_fixed_size_lists(tmp_path):
     # 10240 of 32-d vectors.
     data = np.random.random(10240 * 32).astype("f")
 
@@ -23,7 +35,13 @@ def test_iter_over_dataset(tmp_path):
     ids = pa.array(range(0, 10240), type=pa.int32())
     tbl = pa.Table.from_arrays([ids, fsl], ["ids", "vec"])
 
-    ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+    lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+
+    iter_over_dataset(tmp_path)
+
+
+def iter_over_dataset(tmp_path):
+    ds = lance.dataset(tmp_path / "data.lance")
 
     # test when sample size is smaller than max_takes
     torch_ds_small = LanceDataset(

@@ -44,10 +44,13 @@ def _to_tensor(
         arr: pa.Array = batch[col]
 
         tensor: torch.Tensor = None
-        if (
-            pa.types.is_fixed_size_list(arr.type)
-            or isinstance(arr.type, pa.FixedShapeTensorType)
-        ) and (
+        if (isinstance(arr.type, pa.FixedShapeTensorType)) and (
+            pa.types.is_floating(arr.type.value_type)
+            or pa.types.is_integer(arr.type.value_type)
+        ):
+            arr = arr.storage
+
+        if (pa.types.is_fixed_size_list(arr.type)) and (
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
