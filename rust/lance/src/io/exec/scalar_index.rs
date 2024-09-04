@@ -410,7 +410,6 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
-        // TODO: multiple batches, stream without materializing all row ids in memory
         let mask = expr.evaluate(dataset.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
