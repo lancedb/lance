@@ -82,7 +82,7 @@ class KMeans:
 
         if self.use_cuvs and self.metric == "dot":
             logging.warning(
-                "Kmeans::__init__: metric == \"dot\" is incompatible with use_cuvs == True, disabling cuvs..."
+                'Kmeans::__init__: metric == "dot" is incompatible with use_cuvs == True, disabling cuvs...'
             )
             self.use_cuvs = False
 
@@ -164,9 +164,9 @@ class KMeans:
             _check_for_numpy(data) and isinstance(data, np.ndarray)
         ):
             self._random_init(data)
-            #data = TensorDataset(data, batch_size=10240)
-            #data = TensorDataset(data, batch_size=1024*256*8)
-            data = TensorDataset(data, batch_size=1024*256)
+            # data = TensorDataset(data, batch_size=10240)
+            # data = TensorDataset(data, batch_size=1024*256*8)
+            data = TensorDataset(data, batch_size=1024 * 256)
 
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
@@ -260,10 +260,10 @@ class KMeans:
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk, y2=y2)
 
-            #valid_mask = ids >= 0
-            #if torch.any(~valid_mask):
-                #chunk = chunk[valid_mask]
-                #ids = ids[valid_mask]
+            # valid_mask = ids >= 0
+            # if torch.any(~valid_mask):
+            # chunk = chunk[valid_mask]
+            # ids = ids[valid_mask]
 
             total_dist += dists.nansum().item()
             if ones.shape[0] < ids.shape[0]:
@@ -323,11 +323,9 @@ class KMeans:
         if self.use_cuvs:
             search_time_start = time.time()
             device = torch.device("cuda")
-            out_idx = device_ndarray.empty((data.shape[0], 1), dtype='uint32')
-            out_dist = device_ndarray.empty((data.shape[0], 1), dtype='float32')
-            search_params = cagra.SearchParams(
-                itopk_size = 8
-            )
+            out_idx = device_ndarray.empty((data.shape[0], 1), dtype="uint32")
+            out_dist = device_ndarray.empty((data.shape[0], 1), dtype="float32")
+            search_params = cagra.SearchParams(itopk_size=8)
             cagra.search(
                 search_params,
                 self.index,
@@ -336,7 +334,12 @@ class KMeans:
                 neighbors=out_idx,
                 distances=out_dist,
             )
-            ret = torch.as_tensor(out_idx, device=device).squeeze(dim=1).view(torch.int32), torch.as_tensor(out_dist, device=device)
+            ret = (
+                torch.as_tensor(out_idx, device=device)
+                .squeeze(dim=1)
+                .view(torch.int32),
+                torch.as_tensor(out_dist, device=device),
+            )
             search_time_end = time.time()
             self.time_search += search_time_end - search_time_start
             return ret
