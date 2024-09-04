@@ -78,7 +78,10 @@ lazy_static::lazy_static! {
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
 // Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
 // So we want to support 256 * 8MiB ~= 2GiB of queued reads
-pub const DEFAULT_IO_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+lazy_static::lazy_static! {
+    pub static ref DEFAULT_IO_BUFFER_SIZE: u64 = std::env::var("LANCE_DEFAULT_IO_BUFFER_SIZE")
+        .map(|val| val.parse().unwrap()).unwrap_or(2 * 1024 * 1024 * 1024);
+}
 
 /// Defines an ordering for a single column
 ///
@@ -1470,7 +1473,7 @@ impl Scanner {
     }
 
     fn get_io_buffer_size(&self) -> u64 {
-        self.io_buffer_size.unwrap_or(DEFAULT_IO_BUFFER_SIZE)
+        self.io_buffer_size.unwrap_or(*DEFAULT_IO_BUFFER_SIZE)
     }
 
     /// Create an Execution plan with a scan node
