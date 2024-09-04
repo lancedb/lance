@@ -23,6 +23,7 @@ use lance_core::{
     },
     Error, Result, ROW_ID_FIELD,
 };
+use lance_datafusion::chunker::break_stream;
 use lance_index::{
     scalar::{
         expression::{ScalarIndexExpr, ScalarIndexLoader},
@@ -409,7 +410,6 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
-        // TODO: multiple batches, stream without materializing all row ids in memory
         let mask = expr.evaluate(dataset.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
@@ -582,9 +582,14 @@ impl ExecutionPlan for MaterializeIndexExec {
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream,
+        ));
+        let stream = break_stream(stream, 64 * 1024);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            MATERIALIZE_INDEX_SCHEMA.clone(),
+            stream.map_err(|err| err.into()),
         )))
     }
 
