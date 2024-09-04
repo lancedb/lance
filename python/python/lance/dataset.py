@@ -1794,7 +1794,9 @@ class LanceDataset(pa.dataset.Dataset):
             These paths provide more efficient opening of datasets with many
             versions on object stores. This parameter has no effect if the dataset
             already exists. To migrate an existing dataset, instead use the
-            :meth:`migrate_manifest_paths_v2` method. Default is False.
+            :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
+            turning this on will make the dataset unreadable for older versions
+            of Lance (prior to 0.17.0).
 
         Returns
         -------
@@ -1860,7 +1862,7 @@ class LanceDataset(pa.dataset.Dataset):
         This function is idempotent, and can be run multiple times without
         changing the state of the object store.
 
-        However, it should not be run while other concurrent operations are happening.
+        DANGER: this should not be run while other concurrent operations are happening.
         And it should also run until completion before resuming other operations.
         """
         self._ds.migrate_manifest_paths_v2()

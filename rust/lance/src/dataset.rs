@@ -849,8 +849,9 @@ impl Dataset {
     /// * `enable_v2_manifest_paths`: If set to true, and this is a new dataset, uses the new v2 manifest
     ///   paths. These allow constant-time lookups for the latest manifest on object storage.
     ///   This parameter has no effect on existing datasets. To migrate an existing
-    ///   dataset, use the [`Self::migrate_manifest_paths_v2`] method.
-    ///   Default is False.
+    ///   dataset, use the [`Self::migrate_manifest_paths_v2`] method. WARNING: turning
+    ///   this on will make the dataset unreadable for older versions of Lance
+    ///   (prior to 0.17.0). Default is False.
     pub async fn commit(
         base_uri: &str,
         operation: Operation,

@@ -246,7 +246,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                         Ok(_) => {}
                         Err(e) => {
                             warn!(
-                            "could up update external manifest store during load, with error: {}",
+                            "could not update external manifest store during load, with error: {}",
                             e
                         );
                         }
