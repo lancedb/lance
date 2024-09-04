@@ -54,7 +54,13 @@ impl DataFile {
     }
 
     pub fn new_legacy_from_fields(path: impl Into<String>, fields: Vec<i32>) -> Self {
-        Self::new(path, fields, vec![], 0, 0)
+        Self::new(
+            path,
+            fields,
+            vec![],
+            MAJOR_VERSION as u32,
+            MINOR_VERSION as u32,
+        )
     }
 
     pub fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
@@ -486,7 +492,7 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": 0, "file_minor_version": 0}],
+                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
                 "physical_rows": None::<usize>}),
