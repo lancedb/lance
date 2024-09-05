@@ -603,6 +603,7 @@ async fn reserve_fragment_ids(
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
@@ -896,6 +897,7 @@ pub async fn commit_compaction(
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
