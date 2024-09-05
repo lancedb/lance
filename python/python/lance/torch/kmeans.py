@@ -6,15 +6,11 @@ import time
 from typing import List, Literal, Optional, Tuple, Union
 
 import pyarrow as pa
-from cuvs.neighbors import cagra
-from pylibraft.common import device_ndarray
 from tqdm import tqdm
 
 from lance.dependencies import (
     _check_for_numpy,
     _check_for_torch,
-    # cuvs,
-    # pylibraft,
     torch,
 )
 from lance.dependencies import numpy as np
@@ -51,8 +47,6 @@ class KMeans:
     device: str, optional
         The device to run the PyTorch algorithms. Default we will pick
         the most performant device on the host. See `lance.torch.preferred_device()`
-    use_cuvs: bool
-        Whether to use cuVS to accelerate computation (useful for many centroids).
     """
 
     def __init__(
@@ -66,15 +60,9 @@ class KMeans:
         centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
-        use_cuvs: bool = False,
     ):
         self.k = k
         self.max_iters = max_iters
-        self.use_cuvs = use_cuvs
-        self.itopk_size = 4
-
-        self.time_rebuild = 0.0
-        self.time_search = 0.0
 
         metric = metric.lower()
         self.metric = metric
@@ -88,12 +76,6 @@ class KMeans:
                 f"Only l2/cosine/dot is supported as metric type, got: {metric}"
             )
 
-        if self.use_cuvs and self.metric == "dot":
-            raise ValueError(
-                'Kmeans::__init__: metric == "dot" is incompatible'
-                " with use_cuvs == True, disabling cuvs..."
-            )
-
         self.total_distance = 0
         self.centroids: Optional[torch.Tensor] = centroids
         self.init = init
@@ -101,8 +83,7 @@ class KMeans:
         self.tolerance = tolerance
         self.seed = seed
 
-        if self.device.type != "cuda" and self.use_cuvs:
-            raise ValueError("Kmeans::__init__: cuda is not enabled/available")
+        self.y2 = None
 
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
@@ -158,8 +139,6 @@ class KMeans:
         data : pa.FixedSizeListArray, np.ndarray, or torch.Tensor
             2-D vectors to train kmeans.
         """
-        self.time_rebuild = 0.0
-        self.time_search = 0.0
         start = time.time()
         if isinstance(data, pa.FixedSizeListArray):
             data = np.stack(data.to_numpy(zero_copy_only=False))
@@ -188,9 +167,6 @@ class KMeans:
             if i % 10 == 0:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
-        if self.use_cuvs:
-            logging.info("Total search time: %s", self.time_search)
-            logging.info("Total rebuild time: %s", self.time_rebuild)
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -250,10 +226,6 @@ class KMeans:
         )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
-        if (not self.use_cuvs) and self.metric in ["l2", "cosine"]:
-            y2 = (self.centroids * self.centroids).sum(dim=1)
-        else:
-            y2 = None
         self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
@@ -261,7 +233,7 @@ class KMeans:
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
-            ids, dists = self._transform(chunk, y2=y2)
+            ids, dists = self._transform(chunk, y2=self.y2)
 
             valid_mask = ids >= 0
             if torch.any(~valid_mask):
@@ -277,9 +249,6 @@ class KMeans:
             del ids
             del dists
             del chunk
-        if self.use_cuvs:
-            self.itopk_size += 1
-            self.itopk_size = min(self.itopk_size, 16)
 
         # this happens when there are too many NaNs or the data is just the same
         # vectors repeated over and over. Performance may be bad but we don't
@@ -301,22 +270,7 @@ class KMeans:
         return total_dist
 
     def rebuild_index(self):
-        if self.use_cuvs:
-            rebuild_time_start = time.time()
-            cagra_metric = "sqeuclidean"
-            dim = self.centroids.shape[1]
-            graph_degree = max(dim // 4, 32)
-            nn_descent_degree = graph_degree * 2
-            index_params = cagra.IndexParams(
-                metric=cagra_metric,
-                intermediate_graph_degree=nn_descent_degree,
-                graph_degree=graph_degree,
-                build_algo="nn_descent",
-                compression=None,
-            )
-            self.index = cagra.build(index_params, self.centroids)
-            rebuild_time_end = time.time()
-            self.time_rebuild += rebuild_time_end - rebuild_time_start
+        self.y2 = (self.centroids * self.centroids).sum(dim=1)
 
     def _transform(
         self,
@@ -325,30 +279,6 @@ class KMeans:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
-
-        if self.use_cuvs:
-            search_time_start = time.time()
-            device = torch.device("cuda")
-            out_idx = device_ndarray.empty((data.shape[0], 1), dtype="uint32")
-            out_dist = device_ndarray.empty((data.shape[0], 1), dtype="float32")
-            search_params = cagra.SearchParams(itopk_size=self.itopk_size)
-            cagra.search(
-                search_params,
-                self.index,
-                data,
-                1,
-                neighbors=out_idx,
-                distances=out_dist,
-            )
-            ret = (
-                torch.as_tensor(out_idx, device=device)
-                .squeeze(dim=1)
-                .view(torch.int32),
-                torch.as_tensor(out_dist, device=device),
-            )
-            search_time_end = time.time()
-            self.time_search += search_time_end - search_time_start
-            return ret
 
         if self.metric in ["l2", "cosine"]:
             return self.dist_func(data, self.centroids, y2=y2)
