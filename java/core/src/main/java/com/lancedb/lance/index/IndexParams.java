@@ -1,15 +1,13 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
  */
 
 package com.lancedb.lance.index;
@@ -24,21 +22,26 @@ import java.util.Optional;
 public class IndexParams {
   private final DistanceType distanceType;
   private final Optional<VectorIndexParams> vectorIndexParams;
+  private final Optional<ScalarIndexParams> scalarIndexParams;
+  private final Optional<InvertedIndexParams> invertedIndexParams;
 
   private IndexParams(Builder builder) {
     this.distanceType = builder.distanceType;
     this.vectorIndexParams = builder.vectorIndexParams;
+    this.scalarIndexParams = builder.scalarIndexParams;
+    this.invertedIndexParams = builder.invertedIndexParams;
   }
 
   public static class Builder {
     private DistanceType distanceType = DistanceType.L2;
     private Optional<VectorIndexParams> vectorIndexParams = Optional.empty();
+    private Optional<ScalarIndexParams> scalarIndexParams = Optional.empty();
+    private Optional<InvertedIndexParams> invertedIndexParams = Optional.empty();
 
     public Builder() {}
 
     /**
-     * Set the distance type for calculating the distance between vectors.
-     * Default to L2.
+     * Set the distance type for calculating the distance between vectors. Default to L2.
      */
     public Builder setDistanceType(DistanceType distanceType) {
       this.distanceType = distanceType;
@@ -50,6 +53,24 @@ public class IndexParams {
      */
     public Builder setVectorIndexParams(VectorIndexParams vectorIndexParams) {
       this.vectorIndexParams = Optional.of(vectorIndexParams);
+      return this;
+    }
+
+    /**
+     * @param scalarIndexParams parameters for creating a scalar index.
+     * @return Builder
+     */
+    public Builder setScalarIndexParams(ScalarIndexParams scalarIndexParams) {
+      this.scalarIndexParams = Optional.of(scalarIndexParams);
+      return this;
+    }
+
+    /**
+     * @param invertedIndexParams parameters for creating an inverted index.
+     * @return Builder
+     */
+    public Builder setInvertedIndexParams(InvertedIndexParams invertedIndexParams) {
+      this.invertedIndexParams = Optional.of(invertedIndexParams);
       return this;
     }
 
@@ -66,11 +87,19 @@ public class IndexParams {
     return vectorIndexParams;
   }
 
+  public Optional<ScalarIndexParams> getScalarIndexParams() {
+    return scalarIndexParams;
+  }
+
+  public Optional<InvertedIndexParams> getInvertedIndexParams() {
+    return invertedIndexParams;
+  }
+
   @Override
   public String toString() {
-    return new ToStringBuilder(this)
-      .append("distanceType", distanceType)
-      .append("vectorIndexParams", vectorIndexParams.orElse(null))
-      .toString();
+    return new ToStringBuilder(this).append("distanceType", distanceType)
+        .append("vectorIndexParams", vectorIndexParams.orElse(null))
+        .append("scalarIndexParams", scalarIndexParams.orElse(null))
+        .append("invertedIndexParams", invertedIndexParams.orElse(null)).toString();
   }
 }

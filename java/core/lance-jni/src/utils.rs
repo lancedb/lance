@@ -19,6 +19,7 @@ use jni::objects::{JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{StageParams, VectorIndexParams};
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams, ScalarIndexType};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
@@ -114,7 +115,7 @@ pub fn get_index_params(
 
     let vector_index_params_option_object = env
         .call_method(
-            index_params_obj,
+            &index_params_obj,
             "getVectorIndexParams",
             "()Ljava/util/Optional;",
             &[],
@@ -246,10 +247,101 @@ pub fn get_index_params(
         None
     };
 
-    match vector_index_params_option {
-        Some(params) => Ok(Box::new(params) as Box<dyn IndexParams>),
-        None => Err(Error::input_error(
-            "VectorIndexParams not present".to_string(),
-        )),
+    if vector_index_params_option.is_some() {
+        return Ok(Box::new(vector_index_params_option.unwrap()) as Box<dyn IndexParams>);
     }
+
+    let scalar_index_params_option_object = env
+        .call_method(
+            &index_params_obj,
+            "getScalarIndexParams",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+
+    let scalar_index_params_option = if env
+        .call_method(&scalar_index_params_option_object, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let scalar_index_params_obj = env
+            .call_method(
+                &scalar_index_params_option_object,
+                "get",
+                "()Ljava/lang/Object;",
+                &[],
+            )?
+            .l()?;
+
+        let force_index_type: Option<ScalarIndexType> = env.get_optional_from_method(
+            &scalar_index_params_obj,
+            "getForceIndexType",
+            |env, force_index_type_obj| {
+                let enum_name = env
+                    .call_method(&force_index_type_obj, "name", "()Ljava/lang/String;", &[])?
+                    .l()?;
+                let enum_str: String = env.get_string(&JString::from(enum_name))?.into();
+
+                match enum_str.as_str() {
+                    "BTREE" => Ok(ScalarIndexType::BTree),
+                    "BITMAP" => Ok(ScalarIndexType::Bitmap),
+                    "LABEL_LIST" => Ok(ScalarIndexType::LabelList),
+                    "INVERTED" => Ok(ScalarIndexType::Inverted),
+                    _ => Err(Error::input_error(format!(
+                        "Unknown ScalarIndexType: {}",
+                        enum_str
+                    ))),
+                }
+            },
+        )?;
+        Some(ScalarIndexParams { force_index_type })
+    } else {
+        None
+    };
+
+    if scalar_index_params_option.is_some() {
+        return Ok(Box::new(scalar_index_params_option.unwrap()) as Box<dyn IndexParams>);
+    }
+
+    let inverted_index_params_option_object = env
+        .call_method(
+            &index_params_obj,
+            "getInvertedIndexParams",
+            "()Ljava/util/Optional;",
+            &[],
+        )?
+        .l()?;
+
+    let inverted_index_params_option = if env
+        .call_method(
+            &inverted_index_params_option_object,
+            "isPresent",
+            "()Z",
+            &[],
+        )?
+        .z()?
+    {
+        let inverted_index_params_obj = env
+            .call_method(
+                &inverted_index_params_option_object,
+                "get",
+                "()Ljava/lang/Object;",
+                &[],
+            )?
+            .l()?;
+
+        let with_position =
+            env.get_boolean_from_method(&inverted_index_params_obj, "isWithPosition")?;
+        Some(InvertedIndexParams { with_position })
+    } else {
+        None
+    };
+
+    if inverted_index_params_option.is_some() {
+        return Ok(Box::new(inverted_index_params_option.unwrap()) as Box<dyn IndexParams>);
+    }
+
+    Err(Error::input_error(
+        "No valid index params presented".to_string(),
+    ))?
 }
