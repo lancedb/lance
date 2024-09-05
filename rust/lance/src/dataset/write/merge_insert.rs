@@ -86,7 +86,7 @@ use crate::{
     Dataset,
 };
 
-use super::write_fragments_internal;
+use super::{write_fragments_internal, WriteParams};
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -890,13 +890,18 @@ impl MergeInsertJob {
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
+            let version = self
+                .dataset
+                .manifest()
+                .data_storage_format
+                .lance_file_version()?;
             let new_fragments = write_fragments_internal(
                 None,
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema(),
                 Box::pin(stream),
-                Default::default(),
+                WriteParams::with_storage_version(version),
             )
             .await?;
             // Apply deletions
@@ -1362,8 +1367,16 @@ mod tests {
         assert_eq!(merge_stats.num_deleted_rows, stats[2]);
     }
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn test_basic_merge() {
+    async fn test_basic_merge(
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1
+        )]
+        version: LanceFileVersion,
+    ) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),
             Field::new("value", DataType::UInt32, false),
@@ -1384,7 +1397,15 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
-        let ds = Arc::new(Dataset::write(batches, test_uri, None).await.unwrap());
+        let ds = Arc::new(
+            Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams::with_storage_version(version)),
+            )
+            .await
+            .unwrap(),
+        );
 
         let new_batch = RecordBatch::try_new(
             schema.clone(),
