@@ -133,6 +133,15 @@ impl Default for WriteParams {
 }
 
 impl WriteParams {
+    /// Create a new WriteParams with the given storage version.
+    /// The other fields are set to their default values.
+    pub fn with_storage_version(version: LanceFileVersion) -> Self {
+        Self {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }
+    }
+
     pub fn storage_version_or_default(&self) -> LanceFileVersion {
         self.data_storage_version.unwrap_or_default()
     }
