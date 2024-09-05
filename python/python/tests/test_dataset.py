@@ -2132,7 +2132,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
     assert dataset.data_storage_version == "2.0"
 
     # Append will write v2 if dataset was originally created with v2
@@ -2141,7 +2141,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert len(dataset.get_fragments()) == 2
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     dataset = lance.write_dataset(
         table, tmp_path, data_storage_version="legacy", mode="overwrite"
@@ -2149,7 +2149,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert dataset.data_storage_version == "0.1"
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Append will write v1 if dataset was originally created with v1
     dataset = lance.write_dataset(
@@ -2157,7 +2157,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v2 will put dataset in "v2 mode"
     dataset = lance.write_dataset(
@@ -2175,7 +2175,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v1 will put dataset in "v1 mode"
     dataset = lance.write_dataset(
@@ -2193,7 +2193,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
 
 def test_late_materialization_batch_size(tmp_path: Path):
