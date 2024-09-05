@@ -326,9 +326,9 @@ def test_writer_maintains_order(tmp_path):
     # 100Ki strings, each string is a couple of KiBs
     big_strings = [f"{i}" * 1024 for i in range(100 * 1024)]
     table = pa.table({"big_strings": big_strings})
-    path = tmp_path / "foo.lance"
 
     for i in range(4):
+        path = tmp_path / f"foo-{i}.lance"
         with LanceFileWriter(str(path)) as writer:
             writer.write_batch(table)
 
