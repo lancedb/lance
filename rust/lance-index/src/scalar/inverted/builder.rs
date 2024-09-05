@@ -430,7 +430,7 @@ impl InvertedList {
                 *list = PostingListBuilder::new(
                     std::mem::take(new_row_ids),
                     std::mem::take(new_freqs),
-                    new_positions.map(|posotions| std::mem::take(posotions)),
+                    new_positions.map(std::mem::take),
                 );
             },
         );
