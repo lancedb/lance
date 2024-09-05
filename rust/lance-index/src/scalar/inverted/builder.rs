@@ -392,33 +392,48 @@ impl InvertedList {
     }
 
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        for list in self.inverted_list.iter_mut() {
-            let mut new_row_ids = Vec::new();
-            let mut new_freqs = Vec::new();
-            let mut new_positions = list.positions.as_ref().map(|_| Vec::new());
+        self.inverted_list.par_iter_mut().for_each_init(
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |(new_row_ids, new_freqs, new_positions), list| {
+                let mut new_positions = list.positions.as_ref().map(|_| new_positions);
 
-            for i in 0..list.len() {
-                let row_id = list.row_ids[i];
-                let freq = list.frequencies[i];
-                let positions = list
-                    .positions
-                    .as_ref()
-                    .map(|positions| positions.get(i).to_vec());
+                for i in 0..list.len() {
+                    let row_id = list.row_ids[i];
+                    let freq = list.frequencies[i];
+                    let positions = list
+                        .positions
+                        .as_ref()
+                        .map(|positions| positions.get(i).to_vec());
 
-                match mapping.get(&row_id) {
-                    Some(Some(new_row_id)) => {
-                        new_row_ids.push(*new_row_id);
-                        new_freqs.push(freq);
-                        if let Some(new_positions) = new_positions.as_mut() {
-                            new_positions.push(positions.unwrap());
+                    match mapping.get(&row_id) {
+                        Some(Some(new_row_id)) => {
+                            new_row_ids.push(*new_row_id);
+                            new_freqs.push(freq);
+                            if let Some(new_positions) = new_positions.as_mut() {
+                                new_positions.push(positions.unwrap());
+                            }
+                        }
+                        Some(None) => {
+                            // remove the row_id
+                            // do nothing
+                        }
+                        None => {
+                            new_row_ids.push(row_id);
+                            new_freqs.push(freq);
+                            if let Some(new_positions) = new_positions.as_mut() {
+                                new_positions.push(positions.unwrap());
+                            }
                         }
                     }
-                    _ => continue,
                 }
-            }
 
-            *list = PostingListBuilder::new(new_row_ids, new_freqs, new_positions);
-        }
+                *list = PostingListBuilder::new(
+                    std::mem::take(new_row_ids),
+                    std::mem::take(new_freqs),
+                    new_positions.map(|posotions| std::mem::take(posotions)),
+                );
+            },
+        );
     }
 
     pub fn resize(&mut self, len: usize) {
