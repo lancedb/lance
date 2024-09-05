@@ -1,15 +1,13 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
  */
 
 package com.lancedb.lance;
@@ -28,6 +26,7 @@ import org.apache.arrow.vector.util.Text;
 import com.lancedb.lance.index.DistanceType;
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.index.ScalarIndexParams;
 import com.lancedb.lance.index.vector.VectorIndexParams;
 
 import java.io.IOException;
@@ -36,7 +35,8 @@ import java.util.*;
 
 public class TestVectorDataset implements AutoCloseable {
   public static final String vectorColumnName = "vec";
-  public static final String indexName = "idx";
+  public static final String vectorIndexName = "vector_index";
+  public static final String scalarIndexName = "scalar_index";
   private final Path datasetPath;
   private Schema schema;
   private BufferAllocator allocator;
@@ -55,21 +55,20 @@ public class TestVectorDataset implements AutoCloseable {
     Map<String, String> metadata = new HashMap<>();
     metadata.put("dataset", "vector");
 
-    List<Field> fields = Arrays.asList(
-        new Field("i", FieldType.nullable(new ArrowType.Int(32, true)), null),
-        new Field("s", FieldType.nullable(new ArrowType.Utf8()), null),
-        new Field(vectorColumnName, FieldType.nullable(new ArrowType.FixedSizeList(32)),
-            Collections.singletonList(new Field("item",
-                FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null))));
+    List<Field> fields =
+        Arrays.asList(new Field("i", FieldType.nullable(new ArrowType.Int(32, true)), null),
+            new Field("s", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field(vectorColumnName, FieldType.nullable(new ArrowType.FixedSizeList(32)),
+                Collections.singletonList(new Field("item",
+                    FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)),
+                    null))));
 
     return new Schema(fields, metadata);
   }
 
   private Dataset createDataset() throws IOException {
-    WriteParams writeParams = new WriteParams.Builder()
-        .withMaxRowsPerGroup(10)
-        .withMaxRowsPerFile(200)
-        .build();
+    WriteParams writeParams =
+        new WriteParams.Builder().withMaxRowsPerGroup(10).withMaxRowsPerFile(200).build();
 
     Dataset.create(allocator, datasetPath.toString(), schema, writeParams).close();
 
@@ -102,7 +101,8 @@ public class TestVectorDataset implements AutoCloseable {
       root.setRowCount(80);
 
       WriteParams fragmentWriteParams = new WriteParams.Builder().build();
-      return Fragment.create(datasetPath.toString(), allocator, root, Optional.of(batchIndex), fragmentWriteParams);
+      return Fragment.create(datasetPath.toString(), allocator, root, Optional.of(batchIndex),
+          fragmentWriteParams);
     }
   }
 
@@ -127,18 +127,26 @@ public class TestVectorDataset implements AutoCloseable {
       root.setRowCount(10);
 
       WriteParams writeParams = new WriteParams.Builder().build();
-      fragmentMetadata = Fragment.create(datasetPath.toString(), allocator, root, Optional.empty(),
-          writeParams);
+      fragmentMetadata =
+          Fragment.create(datasetPath.toString(), allocator, root, Optional.empty(), writeParams);
     }
-    FragmentOperation.Append appendOp = new FragmentOperation.Append(Collections.singletonList(fragmentMetadata));
+    FragmentOperation.Append appendOp =
+        new FragmentOperation.Append(Collections.singletonList(fragmentMetadata));
     return Dataset.commit(allocator, datasetPath.toString(), appendOp, Optional.of(2L));
   }
 
-  public void createIndex(Dataset dataset) {
+  public void createVectorIndex(Dataset dataset) {
     IndexParams params = new IndexParams.Builder()
-        .setVectorIndexParams(VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2))
-        .build();
-    dataset.createIndex(Arrays.asList(vectorColumnName), IndexType.VECTOR, Optional.of(indexName), params, true);
+        .setVectorIndexParams(VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2)).build();
+    dataset.createIndex(Arrays.asList(vectorColumnName), IndexType.VECTOR,
+        Optional.of(vectorIndexName), params, true);
+  }
+
+  public void createScalarIndex(Dataset dataset) {
+    IndexParams params = new IndexParams.Builder()
+        .setScalarIndexParams(new ScalarIndexParams.Builder().build()).build();
+    dataset.createIndex(Arrays.asList("i"), IndexType.SCALAR, Optional.of(scalarIndexName), params,
+        true);
   }
 
   @Override
