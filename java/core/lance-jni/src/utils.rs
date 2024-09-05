@@ -247,8 +247,8 @@ pub fn get_index_params(
         None
     };
 
-    if vector_index_params_option.is_some() {
-        return Ok(Box::new(vector_index_params_option.unwrap()) as Box<dyn IndexParams>);
+    if let Some(params) = vector_index_params_option {
+        return Ok(Box::new(params) as Box<dyn IndexParams>);
     }
 
     let scalar_index_params_option_object = env
@@ -299,8 +299,8 @@ pub fn get_index_params(
         None
     };
 
-    if scalar_index_params_option.is_some() {
-        return Ok(Box::new(scalar_index_params_option.unwrap()) as Box<dyn IndexParams>);
+    if let Some(params) = scalar_index_params_option {
+        return Ok(Box::new(params) as Box<dyn IndexParams>);
     }
 
     let inverted_index_params_option_object = env
@@ -337,8 +337,8 @@ pub fn get_index_params(
         None
     };
 
-    if inverted_index_params_option.is_some() {
-        return Ok(Box::new(inverted_index_params_option.unwrap()) as Box<dyn IndexParams>);
+    if let Some(params) = inverted_index_params_option {
+        return Ok(Box::new(params) as Box<dyn IndexParams>);
     }
 
     Err(Error::input_error(
