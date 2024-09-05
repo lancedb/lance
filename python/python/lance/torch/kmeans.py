@@ -89,11 +89,10 @@ class KMeans:
             )
 
         if self.use_cuvs and self.metric == "dot":
-            logging.warning(
-                'Kmeans::__init__: metric == "dot" is incompatible" \
-                " with use_cuvs == True, disabling cuvs...'
+            raise ValueError(
+                'Kmeans::__init__: metric == "dot" is incompatible'
+                " with use_cuvs == True, disabling cuvs..."
             )
-            self.use_cuvs = False
 
         self.total_distance = 0
         self.centroids: Optional[torch.Tensor] = centroids
@@ -103,10 +102,7 @@ class KMeans:
         self.seed = seed
 
         if self.device.type != "cuda" and self.use_cuvs:
-            logging.warning(
-                "Kmeans::__init__: cuda is not enabled/available, disabling cuvs..."
-            )
-            self.use_cuvs = False
+            raise ValueError("Kmeans::__init__: cuda is not enabled/available")
 
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
