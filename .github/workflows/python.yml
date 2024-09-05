@@ -224,10 +224,6 @@ jobs:
         workspaces: python
         prefix-key: "manylinux2014"  # use this to flush the cache
     - uses: ./.github/workflows/build_linux_wheel
-    - name: Install dependencies
-      run: |
-        pip install ray[data]
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
     - uses: ./.github/workflows/run_integtests
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
