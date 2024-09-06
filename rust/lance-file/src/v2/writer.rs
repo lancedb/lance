@@ -8,7 +8,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::stream::FuturesUnordered;
+use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
@@ -184,10 +184,7 @@ impl FileWriter {
     }
 
     #[instrument(skip_all, level = "debug")]
-    async fn write_pages(
-        &mut self,
-        mut encoding_tasks: FuturesUnordered<EncodeTask>,
-    ) -> Result<()> {
+    async fn write_pages(&mut self, mut encoding_tasks: FuturesOrdered<EncodeTask>) -> Result<()> {
         // As soon as an encoding task is done we write it.  There is no parallelism
         // needed here because "writing" is really just submitting the buffer to the
         // underlying write scheduler (either the OS or object_store's scheduler for
@@ -328,7 +325,7 @@ impl FileWriter {
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
-            .collect::<FuturesUnordered<_>>();
+            .collect::<FuturesOrdered<_>>();
 
         self.write_pages(encoding_tasks).await?;
 
@@ -484,7 +481,7 @@ impl FileWriter {
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
-            .collect::<FuturesUnordered<_>>();
+            .collect::<FuturesOrdered<_>>();
         self.write_pages(encoding_tasks).await?;
 
         self.finish_writers().await?;

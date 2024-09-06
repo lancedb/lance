@@ -228,6 +228,10 @@ pub trait FieldEncoder: Send {
     fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
     ///
+    /// Each encode task produces a single page.  The order of these pages will be maintained
+    /// in the file (we do not worry about order between columns but all pages in the same
+    /// column should maintain order)
+    ///
     /// This may be called intermittently throughout encoding but will always be called
     /// once at the end of encoding just before calling finish
     fn flush(&mut self) -> Result<Vec<EncodeTask>>;

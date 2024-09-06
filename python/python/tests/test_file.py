@@ -320,3 +320,18 @@ def test_write_read_additional_schema_metadata(tmp_path):
         reader.metadata().schema.metadata.get(schema_metadata_key.encode()).decode()
         == schema_metadata_value
     )
+
+
+def test_writer_maintains_order(tmp_path):
+    # 100Ki strings, each string is a couple of KiBs
+    big_strings = [f"{i}" * 1024 for i in range(100 * 1024)]
+    table = pa.table({"big_strings": big_strings})
+
+    for i in range(4):
+        path = tmp_path / f"foo-{i}.lance"
+        with LanceFileWriter(str(path)) as writer:
+            writer.write_batch(table)
+
+        reader = LanceFileReader(str(path))
+        result = reader.read_all().to_table()
+        assert result == table
