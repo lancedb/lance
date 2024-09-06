@@ -356,7 +356,7 @@ impl InvertedList {
                 location: location!(),
             })?;
         let offsets: Vec<usize> = serde_json::from_str(offsets)?;
-
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
         for i in 0..offsets.len() {
             let offset = offsets[i];
             let next_offset = if i + 1 < offsets.len() {
@@ -364,7 +364,7 @@ impl InvertedList {
             } else {
                 reader.num_rows()
             };
-            let batch = reader.read_range(offset..next_offset, None).await?;
+            let batch = batch.slice(offset, next_offset - offset);
             let row_ids_col = batch[ROW_ID].as_primitive::<UInt64Type>().values();
             let frequencies_col = batch[FREQUENCY_COL].as_primitive::<Float32Type>().values();
             let positions_col = batch.column_by_name(POSITION_COL).map(|col| {
