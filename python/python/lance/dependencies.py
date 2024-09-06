@@ -168,7 +168,7 @@ if TYPE_CHECKING:
     import numpy
     import pandas
     import polars
-    import pylibraft.device_ndarray
+    import pylibraft.common.device_ndarray
     import ray
     import tensorflow
     import torch
@@ -179,7 +179,7 @@ else:
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
     cagra, _CAGRA_AVAILABLE = _lazy_import("cuvs.neighbors.cagra")
-    device_ndarray, _DEVICE_NDARRAY_AVAILABLE = _lazy_import("pylibraft.device_ndarray")
+    device_ndarray, _DEVICE_NDARRAY_AVAILABLE = _lazy_import("pylibraft.common.device_ndarray")
     datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
     tensorflow, _TENSORFLOW_AVAILABLE = _lazy_import("tensorflow")
     ray, _RAY_AVAILABLE = _lazy_import("ray")

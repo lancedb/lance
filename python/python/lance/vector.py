@@ -139,7 +139,11 @@ def train_ivf_centroids_on_accelerator(
 ) -> (np.ndarray, str):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
-        not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
+        not (
+            CUDA_REGEX.match(accelerator)
+            or accelerator == "mps"
+            or accelerator == "cuvs"
+        )
     ):
         raise ValueError(
             "Train ivf centroids on accelerator: "
@@ -168,14 +172,27 @@ def train_ivf_centroids_on_accelerator(
         cache=True,
     )
 
-    logging.info("Training IVF partitions using GPU(%s)", accelerator)
-    kmeans = KMeans(
-        k,
-        max_iters=max_iters,
-        metric=metric_type,
-        device=accelerator,
-        centroids=init_centroids,
-    )
+    if accelerator == "cuvs":
+        logging.info("Training IVF partitions using cuVS+GPU")
+        print("Training IVF partitions using cuVS+GPU")
+        from lance.cuvs.kmeans import KMeans as KMeansCuVS
+
+        kmeans = KMeansCuVS(
+            k,
+            max_iters=max_iters,
+            metric=metric_type,
+            device="cuda",
+            centroids=init_centroids,
+        )
+    else:
+        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        kmeans = KMeans(
+            k,
+            max_iters=max_iters,
+            metric=metric_type,
+            device=accelerator,
+            centroids=init_centroids,
+        )
     kmeans.fit(ds)
 
     centroids = kmeans.centroids.cpu().numpy()

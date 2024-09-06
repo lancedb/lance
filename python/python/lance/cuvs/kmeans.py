@@ -6,9 +6,11 @@ import pyarrow as pa
 
 from lance.dependencies import numpy as np
 from lance.dependencies import torch
-from lance.dependencies import cagra
-from lance.dependencies import device_ndarray
+#from lance.dependencies import cagra
+#from lance.dependencies import device_ndarray
 from lance.torch.kmeans import KMeans as KMeansTorch
+from pylibraft.common import device_ndarray
+from cuvs.neighbors import cagra
 
 __all__ = ["KMeans"]
 
@@ -70,7 +72,7 @@ class KMeans(KMeansTorch):
             device=device,
         )
 
-        if self.device.type != "cuda":
+        if self.device.type != "cuda" or not torch.cuda.is_available():
             raise ValueError("KMeans::__init__: cuda is not enabled/available")
 
         self.itopk_size = itopk_size
