@@ -256,6 +256,7 @@ impl GenericFileReader for V1Reader {
 }
 
 mod v2_adapter {
+    use lance_core::datatypes::Field;
     use lance_encoding::decoder::FilterExpression;
 
     use super::*;
@@ -280,23 +281,29 @@ mod v2_adapter {
             }
         }
 
-        pub fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
-            let column_indices = schema
-                .fields
-                .iter()
-                .map(|f| {
-                    *self.field_id_to_column_idx.get(&f.id).unwrap_or_else(|| {
-                        panic!(
-                            "attempt to project field with id {} which did not exist in the data file",
-                            f.id
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            ReaderProjection {
+        fn projection_from_lance_helper<'a>(
+            &self,
+            fields: impl Iterator<Item = &'a Field>,
+            column_indices: &mut Vec<u32>,
+        ) -> Result<()> {
+            for field in fields {
+                let column_idx = *self.field_id_to_column_idx.get(&field.id).ok_or_else(|| Error::InvalidInput {
+                    location: location!(),
+                    source: format!("the schema referenced a field with id {} which was not in the data file's metadata", field.id).into(),
+                })?;
+                column_indices.push(column_idx);
+                self.projection_from_lance_helper(field.children.iter(), column_indices)?;
+            }
+            Ok(())
+        }
+
+        pub fn projection_from_lance(&self, schema: &Schema) -> Result<ReaderProjection> {
+            let mut column_indices = Vec::new();
+            self.projection_from_lance_helper(schema.fields.iter(), &mut column_indices)?;
+            Ok(ReaderProjection {
                 schema: Arc::new(schema.clone()),
                 column_indices,
-            }
+            })
         }
     }
 
@@ -309,7 +316,7 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = self.projection_from_lance(projection.as_ref())?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -330,7 +337,7 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = self.projection_from_lance(projection.as_ref())?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -353,7 +360,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = self.projection_from_lance(projection.as_ref())?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -482,7 +489,12 @@ impl FileFragment {
                 .map(|c| c as i32)
                 .collect();
 
-            frag.add_file(filename, dataset.schema().field_ids(), column_indices);
+            frag.add_file(
+                filename,
+                dataset.schema().field_ids(),
+                column_indices,
+                &file_version,
+            );
             Ok(frag)
         }
     }

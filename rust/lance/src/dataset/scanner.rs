@@ -1002,10 +1002,10 @@ impl Scanner {
                         } else {
                             self.projection_plan.physical_schema.clone()
                         };
-                        if !self.dataset.is_legacy_storage() {
-                            // If this is a v2 dataset then we can pushdown limit/offset (via
-                            // scan_range and we zero out limit/offset so we don't apply it
-                            // twice)
+                        if scan_range.is_some() && !self.dataset.is_legacy_storage() {
+                            // If this is a v2 dataset with no filter then we can pushdown
+                            // limit/offset (via scan_range and we zero out limit/offset
+                            // so we don't apply it twice)
                             use_limit_node = false;
                         }
                         self.scan(

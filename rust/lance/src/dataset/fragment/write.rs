@@ -11,7 +11,6 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
@@ -97,6 +96,11 @@ impl<'a> FragmentCreateBuilder<'a> {
             FileWriterOptions::default(),
         )?;
 
+        let (major, minor) = writer.version().to_numbers();
+
+        let data_file = DataFile::new_unstarted(filename, major, minor);
+        fragment.files.push(data_file);
+
         progress.begin(&fragment).await?;
 
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
@@ -125,15 +129,9 @@ impl<'a> FragmentCreateBuilder<'a> {
             .iter()
             .map(|(_, column_index)| *column_index)
             .collect::<Vec<_>>();
-        let data_file = DataFile::new(
-            filename,
-            field_ids,
-            column_indices,
-            MAJOR_VERSION as u32,
-            MINOR_VERSION_NEXT as u32,
-        );
 
-        fragment.files.push(data_file);
+        fragment.files[0].fields = field_ids;
+        fragment.files[0].column_indices = column_indices;
 
         progress.complete(&fragment).await?;
 

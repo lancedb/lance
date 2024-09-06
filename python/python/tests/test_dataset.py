@@ -539,6 +539,31 @@ def test_pickle(tmp_path: Path):
     assert dataset.to_table() == unpickled.to_table()
 
 
+def test_nested_projection(tmp_path: Path):
+    from lance.debug import format_fragment
+
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "struct": [{"x": counter, "y": counter % 2 == 0} for counter in range(100)],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    print(format_fragment(dataset.get_fragment(0).metadata, dataset))
+    projected = dataset.to_table(columns=["struct.x"])
+    assert projected == pa.Table.from_pydict({"struct.x": range(100)})
+
+    projected = dataset.to_table(columns=["struct.y"])
+    assert projected == pa.Table.from_pydict(
+        {"struct.y": [i % 2 == 0 for i in range(100)]}
+    )
+
+
 def test_polar_scan(tmp_path: Path):
     some_structs = [{"x": counter, "y": counter} for counter in range(100)]
     table = pa.Table.from_pydict(
@@ -2277,8 +2302,8 @@ def test_late_materialization_batch_size(tmp_path: Path):
 
 
 EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
-EXPECTED_MAJOR_VERSION = 0
-EXPECTED_MINOR_VERSION = 3
+EXPECTED_MAJOR_VERSION = 2
+EXPECTED_MINOR_VERSION = 0
 
 
 def test_default_storage_version(tmp_path: Path):

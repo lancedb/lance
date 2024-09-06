@@ -890,18 +890,13 @@ impl MergeInsertJob {
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
-            let version = self
-                .dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_version()?;
             let new_fragments = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema(),
                 Box::pin(stream),
-                WriteParams::with_storage_version(version),
+                WriteParams::default(),
             )
             .await?;
             // Apply deletions

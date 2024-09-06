@@ -31,8 +31,6 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::format::MAGIC;
-use crate::format::MAJOR_VERSION;
-use crate::format::MINOR_VERSION_NEXT;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -139,9 +137,7 @@ impl FileWriter {
 
     /// Returns the format version that will be used when writing the file
     pub fn version(&self) -> LanceFileVersion {
-        self.options
-            .format_version
-            .unwrap_or(LanceFileVersion::default_v2())
+        self.options.format_version.unwrap_or_default()
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
@@ -229,7 +225,7 @@ impl FileWriter {
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
         let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
-            let version = self.options.format_version.unwrap_or_default();
+            let version = self.version();
             Arc::new(CoreFieldEncodingStrategy {
                 array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
                 version,
@@ -615,14 +611,16 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
         data.put_u64_le(gbo_len);
     }
 
+    let (major, minor) = LanceFileVersion::default().to_numbers();
+
     // write the footer
     data.put_u64_le(col_metadata_start);
     data.put_u64_le(cmo_table_start);
     data.put_u64_le(gbo_table_start);
     data.put_u32_le(num_global_buffers);
     data.put_u32_le(batch.page_table.len() as u32);
-    data.put_u16_le(MAJOR_VERSION as u16);
-    data.put_u16_le(MINOR_VERSION_NEXT);
+    data.put_u16_le(major as u16);
+    data.put_u16_le(minor as u16);
     data.put(MAGIC.as_slice());
 
     Ok(data.freeze())

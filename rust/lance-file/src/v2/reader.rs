@@ -116,13 +116,48 @@ impl CachedFileMetadata {
 /// representations of the same semantic type.  An encoding could
 /// theoretically support "casting" (e.g. int to string,  etc.) but
 /// there is little advantage in doing so here.
+///
+/// Note: in order to specify a projection the user will need some way
+/// to figure out the column indices.  In the table format we do this
+/// using field IDs and keeping track of the field id->column index mapping.
+///
+/// If users are not using the table format then they will need to figure
+/// out some way to do this themselves.
 #[derive(Debug, Clone)]
 pub struct ReaderProjection {
     /// The data types (schema) of the selected columns.  The names
     /// of the schema are arbitrary and ignored.
     pub schema: Arc<Schema>,
-    /// The indices of the columns to load.  Note, these are the
-    /// indices of the top level fields only
+    /// The indices of the columns to load.
+    ///
+    /// The mapping should be as follows:
+    ///
+    /// - Primitive: the index of the column in the schema
+    /// - List: the index of the list column in the schema
+    ///         followed by the column indices of the children
+    /// - FixedSizeList (of primitive): the index of the column in the schema
+    ///         (this case is not nested)
+    /// - FixedSizeList (of non-primitive): not yet implemented
+    /// - Dictionary: same as primitive
+    /// - Struct: the index of the struct column in the schema
+    ///          followed by the column indices of the children
+    ///
+    /// In other words, this should be a DFS listing of the desired schema.
+    ///
+    /// For example, if the goal is to load:
+    ///
+    ///   x: int32
+    ///   y: struct<z: int32, w: string>
+    ///   z: list<int32>
+    ///
+    /// and the schema originally used to store the data was:
+    ///
+    ///   a: struct<x: int32>
+    ///   b: int64
+    ///   y: struct<z: int32, c: int64, w: string>
+    ///   z: list<int32>
+    ///
+    /// Then the column_indices should be [1, 3, 4, 6, 7, 8]
     pub column_indices: Vec<u32>,
 }
 
@@ -464,9 +499,6 @@ impl FileReader {
                 location!(),
             ));
         }
-        if projection.schema.fields.len() != projection.column_indices.len() {
-            return Err(Error::invalid_input(format!("The projection schema has {} top level fields but only {} column indices were provided", projection.schema.fields.len(), projection.column_indices.len()), location!()));
-        }
         let mut column_indices_seen = BTreeSet::new();
         for column_index in &projection.column_indices {
             if !column_indices_seen.insert(*column_index) {
@@ -485,34 +517,38 @@ impl FileReader {
         Ok(())
     }
 
-    // Helper function for `default_projection` to determine how many columns are occupied
-    // by a lance field.
-    fn default_column_count(field: &Field) -> u32 {
-        1 + field
-            .children
-            .iter()
-            .map(Self::default_column_count)
-            .sum::<u32>()
+    fn default_projection_helper<'a>(
+        fields: impl Iterator<Item = &'a Field>,
+        column_indices: &mut Vec<u32>,
+        column_index_counter: &mut u32,
+    ) {
+        for field in fields {
+            column_indices.push(*column_index_counter);
+            *column_index_counter += 1;
+
+            Self::default_projection_helper(
+                field.children.iter(),
+                column_indices,
+                column_index_counter,
+            );
+        }
     }
 
-    // This function is one of the few spots in the reader where we rely on Lance table
-    // format and the fact that we wrote a Lance table schema into the global buffers.
+    // If we want to read the entire file, and we know the schema for the file,
+    // then we can use the default projection, and the user doesn't need to supply
+    // field IDs (and the field IDs in the schema do not need to be accurate)
     //
-    // TODO: In the future it would probably be better for the "default type" of a column
-    // to be something that can be provided dynamically via the encodings registry.  We
-    // could pass the pages of the column to some logic that picks a data type based on the
-    // page encodings.
-
-    /// Loads a default projection for all columns in the file, using the data type that
-    /// was provided when the file was written.
+    // If the user doesn't know the schema, then they can fetch it from the file's
+    // global buffers.  So this method can be used in that case too.
     pub fn default_projection(lance_schema: &Schema) -> ReaderProjection {
         let schema = Arc::new(lance_schema.clone());
         let mut column_indices = Vec::with_capacity(lance_schema.fields.len());
         let mut column_index = 0;
-        for field in &lance_schema.fields {
-            column_indices.push(column_index);
-            column_index += Self::default_column_count(field);
-        }
+        Self::default_projection_helper(
+            schema.fields.iter(),
+            &mut column_indices,
+            &mut column_index,
+        );
         ReaderProjection {
             schema,
             column_indices,
