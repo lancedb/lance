@@ -3,14 +3,15 @@ import time
 from typing import Literal, Optional, Tuple, Union
 
 import pyarrow as pa
+from cuvs.neighbors import cagra
+from pylibraft.common import device_ndarray
 
 from lance.dependencies import numpy as np
 from lance.dependencies import torch
-#from lance.dependencies import cagra
-#from lance.dependencies import device_ndarray
+
+# from lance.dependencies import cagra
+# from lance.dependencies import device_ndarray
 from lance.torch.kmeans import KMeans as KMeansTorch
-from pylibraft.common import device_ndarray
-from cuvs.neighbors import cagra
 
 __all__ = ["KMeans"]
 
