@@ -110,6 +110,13 @@ pub struct WriteParams {
     /// secondary indices need to be updated to point to new row ids.
     pub enable_move_stable_row_ids: bool,
 
+    /// If set to true, and this is a new dataset, uses the new v2 manifest paths.
+    /// These allow constant-time lookups for the latest manifest on object storage.
+    /// This parameter has no effect on existing datasets. To migrate an existing
+    /// dataset, use the [`super::Dataset::migrate_manifest_paths_v2`] method.
+    /// Default is False.
+    pub enable_v2_manifest_paths: bool,
+
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
@@ -127,6 +134,7 @@ impl Default for WriteParams {
             commit_handler: None,
             data_storage_version: None,
             enable_move_stable_row_ids: false,
+            enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }

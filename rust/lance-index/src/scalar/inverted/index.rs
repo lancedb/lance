@@ -860,5 +860,5 @@ pub fn collect_tokens(text: &str) -> Vec<String> {
 }
 
 pub fn is_phrase_query(query: &str) -> bool {
-    query.starts_with("\"") && query.ends_with("\"")
+    query.starts_with('\"') && query.ends_with('\"')
 }

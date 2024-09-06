@@ -251,6 +251,30 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_v2_manifest_paths(tmp_path: Path):
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
+def test_v2_manifest_paths_migration(tmp_path: Path):
+    # Create a dataset with v1 manifest paths
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert manifest_path == ["1.manifest"]
+
+    # Migrate to v2 manifest paths
+    lance.dataset(tmp_path).migrate_manifest_paths_v2()
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
 def test_tag(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"

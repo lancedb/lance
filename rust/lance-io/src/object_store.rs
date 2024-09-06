@@ -93,7 +93,12 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    /// Whether to use constant size upload parts for multipart uploads. This
+    /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
+    /// Whether we can assume that the list of files is lexically ordered. This
+    /// is true for object stores, but not for local filesystems.
+    pub list_is_lexically_ordered: bool,
     io_parallelism: usize,
 }
 
@@ -338,6 +343,7 @@ pub struct ObjectStoreParams {
     /// is false, max upload size is 2.5TB. When this is true, the max size is
     /// 50GB.
     pub use_constant_size_upload_parts: bool,
+    pub list_is_lexically_ordered: Option<bool>,
 }
 
 impl Default for ObjectStoreParams {
@@ -350,6 +356,7 @@ impl Default for ObjectStoreParams {
             object_store_wrapper: None,
             storage_options: None,
             use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: None,
         }
     }
 }
@@ -431,6 +438,7 @@ impl ObjectStore {
                 scheme: String::from(scheme),
                 block_size: 4 * 1024, // 4KB block size
                 use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: false,
                 io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
@@ -456,6 +464,7 @@ impl ObjectStore {
             scheme: String::from("file"),
             block_size: 4 * 1024, // 4KB block size
             use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
         }
     }
@@ -467,6 +476,7 @@ impl ObjectStore {
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
         }
     }
@@ -801,6 +811,7 @@ async fn configure_store(
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts,
+                list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
@@ -818,6 +829,7 @@ async fn configure_store(
                 scheme: String::from("gs"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
@@ -831,6 +843,7 @@ async fn configure_store(
                 scheme: String::from("az"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             })
         }
@@ -847,6 +860,7 @@ async fn configure_store(
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
         }),
         unknown_scheme => {
@@ -870,6 +884,7 @@ impl ObjectStore {
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
         use_constant_size_upload_parts: bool,
+        list_is_lexically_ordered: bool,
         io_parallelism: usize,
     ) -> Self {
         let scheme = location.scheme();
@@ -885,6 +900,7 @@ impl ObjectStore {
             scheme: scheme.into(),
             block_size,
             use_constant_size_upload_parts,
+            list_is_lexically_ordered,
             io_parallelism,
         }
     }

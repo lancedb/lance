@@ -338,6 +338,25 @@ systems and cloud object stores, with the notable except of AWS S3. For ones
 that lack this functionality, an external locking mechanism can be configured
 by the user.
 
+Manifest Naming Schemes
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Manifest files must use a consistent naming scheme. The names correspond to the
+versions. That way we can open the right version of the dataset without having
+to read all the manifests. It also makes it clear which file path is the next
+one to be written.
+
+There are two naming schemes that can be used:
+
+1. V1: ``_versions/{version}.manifest``. This is the legacy naming scheme.
+2. V2: ``_versions/{u64::MAX - version:020}.manifest``. This is the new naming
+   scheme. The version is zero-padded (to 20 digits) and subtracted from
+   ``u64::MAX``. This allows the versions to be sorted in descending order,
+   making it possible to find the latest manifest on object storage using a
+   single list call.
+
+It is an error for there to be a mixture of these two naming schemes.
+
 .. _conflict_resolution:
 
 Conflict resolution
