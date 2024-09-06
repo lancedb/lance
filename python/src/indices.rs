@@ -176,7 +176,7 @@ async fn do_transform_vectors(
         .await
         .infer_error()?;
 
-    let (obj_store, path) = object_store_from_uri_or_path(dst_uri).await?;
+    let (obj_store, path) = object_store_from_uri_or_path(dst_uri, None).await?;
     let writer = obj_store.create(&path).await.infer_error()?;
     write_vector_storage(
         &dataset.ds,
@@ -299,7 +299,7 @@ async fn do_load_shuffled_vectors(
     ivf_model: IvfModel,
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
-    let (_, path) = object_store_from_uri_or_path(dir_path).await?;
+    let (_, path) = object_store_from_uri_or_path(dir_path, None).await?;
     let streams = IvfShuffler::load_partitioned_shuffles(&path, filenames)
         .await
         .infer_error()?;

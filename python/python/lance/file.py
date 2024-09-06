@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Optional, Union
+from typing import Optional, Union, Dict
 
 import pyarrow as pa
 
@@ -55,7 +55,7 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str):
+    def __init__(self, path: str, storage_options: Optional[Dict[str, str]] = None):
         """
         Creates a new file reader to read the given file
 
@@ -66,7 +66,7 @@ class LanceFileReader:
             The path to read, can be a pathname for local storage
             or a URI to read from cloud storage.
         """
-        self._reader = _LanceFileReader(path)
+        self._reader = _LanceFileReader(path, storage_options=storage_options)
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
@@ -173,6 +173,7 @@ class LanceFileWriter:
         *,
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         """
@@ -196,7 +197,7 @@ class LanceFileWriter:
             efficient but may not be readable by older versions of the software.
         """
         self._writer = _LanceFileWriter(
-            path, schema, data_cache_bytes=data_cache_bytes, version=version, **kwargs
+            path, schema, data_cache_bytes=data_cache_bytes, version=version, storage_options=storage_options, **kwargs
         )
         self.closed = False
 
