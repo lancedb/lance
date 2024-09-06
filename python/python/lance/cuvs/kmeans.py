@@ -1,25 +1,13 @@
 import logging
 import time
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import pyarrow as pa
-from cuvs.neighbors import cagra
-from pylibraft.common import device_ndarray
-from tqdm import tqdm
 
-from lance.dependencies import (
-    _check_for_numpy,
-    _check_for_torch,
-    # cuvs,
-    # pylibraft,
-    torch,
-)
 from lance.dependencies import numpy as np
-
-from lance.torch import preferred_device
-from lance.torch.data import TensorDataset
-from lance.torch.distance import dot_distance, l2_distance
-
+from lance.dependencies import torch
+from lance.dependencies import cagra
+from lance.dependencies import device_ndarray
 from lance.torch.kmeans import KMeans as KMeansTorch
 
 __all__ = ["KMeans"]
@@ -67,7 +55,7 @@ class KMeans(KMeansTorch):
         device: Optional[str] = None,
         itopk_size: int = 10,
     ):
-        if self.metric == "dot":
+        if metric == "dot":
             raise ValueError(
                 'Kmeans::__init__: metric == "dot" is incompatible' " with cuVS"
             )

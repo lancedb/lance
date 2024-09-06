@@ -24,8 +24,8 @@ _NUMPY_AVAILABLE = True
 _PANDAS_AVAILABLE = True
 _POLARS_AVAILABLE = True
 _TORCH_AVAILABLE = True
-_CUVS_AVAILABLE = True
-_PYLIBRAFT_AVAILABLE = True
+_CAGRA_AVAILABLE = True
+_DEVICE_NDARRAY_AVAILABLE = True
 _HUGGING_FACE_AVAILABLE = True
 _TENSORFLOW_AVAILABLE = True
 _RAY_AVAILABLE = True
@@ -50,8 +50,8 @@ class _LazyModule(ModuleType):
         "pandas": "pd.",
         "polars": "pl.",
         "torch": "torch.",
-        "cuvs": "cuvs.",
-        "pylibraft": "pylibraft.",
+        "cagra": "cagra.",
+        "device_ndarray": "device_ndarray.",
         "tensorflow": "tf.",
         "ray": "ray.",
     }
@@ -163,12 +163,12 @@ def _lazy_import(module_name: str) -> tuple[ModuleType, bool]:
 
 
 if TYPE_CHECKING:
-    import cuvs
+    import cuvs.neighbors.cagra
     import datasets
     import numpy
     import pandas
     import polars
-    import pylibraft
+    import pylibraft.device_ndarray
     import ray
     import tensorflow
     import torch
@@ -178,8 +178,8 @@ else:
     pandas, _PANDAS_AVAILABLE = _lazy_import("pandas")
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
-    cuvs, _CUVS_AVAILABLE = _lazy_import("cuvs")
-    pylibraft, _PYLIBRAFT_AVAILABLE = _lazy_import("pylibraft")
+    cagra, _CAGRA_AVAILABLE = _lazy_import("cuvs.neighbors.cagra")
+    device_ndarray, _DEVICE_NDARRAY_AVAILABLE = _lazy_import("pylibraft.device_ndarray")
     datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
     tensorflow, _TENSORFLOW_AVAILABLE = _lazy_import("tensorflow")
     ray, _RAY_AVAILABLE = _lazy_import("ray")
@@ -246,8 +246,8 @@ __all__ = [
     "ray",
     "tensorflow",
     "torch",
-    "cuvs",
-    "pylibraft",
+    "cagra",
+    "device_ndarray",
     # lazy utilities
     "_check_for_hugging_face",
     "_check_for_numpy",
@@ -262,8 +262,8 @@ __all__ = [
     "_PANDAS_AVAILABLE",
     "_POLARS_AVAILABLE",
     "_TORCH_AVAILABLE",
-    "_CUVS_AVAILABLE",
-    "_PYLIBRAFT_AVAILABLE",
+    "_CAGRA_AVAILABLE",
+    "_DEVICE_NDARRAY_AVAILABLE",
     "_HUGGING_FACE_AVAILABLE",
     "_TENSORFLOW_AVAILABLE",
     "_RAY_AVAILABLE",
