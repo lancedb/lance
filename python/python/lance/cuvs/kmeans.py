@@ -1,32 +1,16 @@
 import importlib.util
 
-if importlib.util.find_spec("cuvs") is None:
-    raise ImportError(
-        "cuvs is not installed. Please install cuvs"
-        + " to use lance.cuvs module (optional dependency name: "
-        + '"cuvs-py39"/"cuvs-py310"/"cuvs-py311")',
-    )
-
-if importlib.util.find_spec("pylibraft") is None:
-    raise ImportError(
-        "pylibraft is not installed. Please install pylibraft"
-        + " to use lance.cuvs module (optional dependency name: "
-        + '"cuvs-py39"/"cuvs-py310"/"cuvs-py311")',
-    )
-
 import logging
 import time
 from typing import Literal, Optional, Tuple, Union
 
 import pyarrow as pa
-from cuvs.neighbors import cagra
-from pylibraft.common import device_ndarray
 
 from lance.dependencies import numpy as np
 from lance.dependencies import torch
 
-# from lance.dependencies import cagra
-# from lance.dependencies import device_ndarray
+from lance.dependencies import cagra
+from lance.dependencies import raft_common
 from lance.torch.kmeans import KMeans as KMeansTorch
 
 __all__ = ["KMeans"]
@@ -140,8 +124,8 @@ class KMeans(KMeansTorch):
 
         search_time_start = time.time()
         device = torch.device("cuda")
-        out_idx = device_ndarray.empty((data.shape[0], 1), dtype="uint32")
-        out_dist = device_ndarray.empty((data.shape[0], 1), dtype="float32")
+        out_idx = raft_common.device_ndarray.empty((data.shape[0], 1), dtype="uint32")
+        out_dist = raft_common.device_ndarray.empty((data.shape[0], 1), dtype="float32")
         search_params = cagra.SearchParams(itopk_size=self.itopk_size)
         cagra.search(
             search_params,

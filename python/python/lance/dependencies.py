@@ -25,7 +25,7 @@ _PANDAS_AVAILABLE = True
 _POLARS_AVAILABLE = True
 _TORCH_AVAILABLE = True
 _CAGRA_AVAILABLE = True
-_DEVICE_NDARRAY_AVAILABLE = True
+_RAFT_COMMON_AVAILABLE = True
 _HUGGING_FACE_AVAILABLE = True
 _TENSORFLOW_AVAILABLE = True
 _RAY_AVAILABLE = True
@@ -51,7 +51,7 @@ class _LazyModule(ModuleType):
         "polars": "pl.",
         "torch": "torch.",
         "cagra": "cagra.",
-        "device_ndarray": "device_ndarray.",
+        "common": "raft_common.",
         "tensorflow": "tf.",
         "ray": "ray.",
     }
@@ -177,9 +177,7 @@ else:
     polars, _POLARS_AVAILABLE = _lazy_import("polars")
     torch, _TORCH_AVAILABLE = _lazy_import("torch")
     cagra, _CAGRA_AVAILABLE = _lazy_import("cuvs.neighbors.cagra")
-    device_ndarray, _DEVICE_NDARRAY_AVAILABLE = _lazy_import(
-        "pylibraft.common.device_ndarray"
-    )
+    raft_common, _RAFT_COMMON_AVAILABLE = _lazy_import("pylibraft.common")
     datasets, _HUGGING_FACE_AVAILABLE = _lazy_import("datasets")
     tensorflow, _TENSORFLOW_AVAILABLE = _lazy_import("tensorflow")
     ray, _RAY_AVAILABLE = _lazy_import("ray")
@@ -247,7 +245,7 @@ __all__ = [
     "tensorflow",
     "torch",
     "cagra",
-    "device_ndarray",
+    "raft_common",
     # lazy utilities
     "_check_for_hugging_face",
     "_check_for_numpy",
@@ -263,7 +261,7 @@ __all__ = [
     "_POLARS_AVAILABLE",
     "_TORCH_AVAILABLE",
     "_CAGRA_AVAILABLE",
-    "_DEVICE_NDARRAY_AVAILABLE",
+    "_RAFT_COMMON_AVAILABLE",
     "_HUGGING_FACE_AVAILABLE",
     "_TENSORFLOW_AVAILABLE",
     "_RAY_AVAILABLE",
