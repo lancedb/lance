@@ -1,16 +1,11 @@
-import importlib.util
-
 import logging
 import time
 from typing import Literal, Optional, Tuple, Union
 
 import pyarrow as pa
 
+from lance.dependencies import cagra, raft_common, torch
 from lance.dependencies import numpy as np
-from lance.dependencies import torch
-
-from lance.dependencies import cagra
-from lance.dependencies import raft_common
 from lance.torch.kmeans import KMeans as KMeansTorch
 
 __all__ = ["KMeans"]
