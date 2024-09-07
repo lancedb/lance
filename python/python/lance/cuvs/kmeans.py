@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
+
 import logging
 import time
 from typing import Literal, Optional, Tuple, Union
