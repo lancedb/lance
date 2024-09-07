@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Optional, Union, Dict
+from typing import Dict, Optional, Union
 
 import pyarrow as pa
 
@@ -65,6 +65,9 @@ class LanceFileReader:
         path: str
             The path to read, can be a pathname for local storage
             or a URI to read from cloud storage.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         """
         self._reader = _LanceFileReader(path, storage_options=storage_options)
 
@@ -195,9 +198,17 @@ class LanceFileWriter:
             The version of the file format to write.  If not specified then
             the latest stable version will be used.  Newer versions are more
             efficient but may not be readable by older versions of the software.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         """
         self._writer = _LanceFileWriter(
-            path, schema, data_cache_bytes=data_cache_bytes, version=version, storage_options=storage_options, **kwargs
+            path,
+            schema,
+            data_cache_bytes=data_cache_bytes,
+            version=version,
+            storage_options=storage_options,
+            **kwargs,
         )
         self.closed = False
 
