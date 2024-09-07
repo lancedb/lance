@@ -1650,10 +1650,15 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows != 12
 
 
+@pytest.mark.slow
 def test_io_buffer_size(tmp_path: Path):
-    # This regresses a deadlock issue that was happening when the
-    # batch size was very large (in bytes) so that batches would be
+    # These cases regress deadlock issues that happen when the
+    # batch size was very large (in bytes) so that batches are
     # bigger than the I/O buffer size
+    #
+    # The test is slow (it needs to generate enough data to cover a variety
+    # of cases) but it is essential to run if any changes are made to the
+    # 2.0 scheduling priority / decoding strategy
     #
     # In this test we create 4 pages of data, 2 for each column.  We
     # then set the I/O buffer size to 5000 bytes so that we only read
@@ -1807,6 +1812,45 @@ def test_io_buffer_size(tmp_path: Path):
     )
 
     dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This reproduces another issue we saw where there are a bunch of empty lists and
+    # lance was calculating the page priority incorrectly.
+
+    fsl_type = pa.list_(pa.uint64(), 32 * 1024 * 1024)
+    list_type = pa.list_(fsl_type)
+
+    def datagen():
+        # Each item is 32
+        values = pa.array(range(32 * 1024 * 1024 * 7), pa.uint64())
+        fsls = pa.FixedSizeListArray.from_arrays(values, 32 * 1024 * 1024)
+        # 3 items, 5 empties, 2 items
+        offsets = pa.array([0, 1, 2, 3, 4, 4, 5, 6, 7], pa.int32())
+        lists = pa.ListArray.from_arrays(offsets, fsls)
+
+        values2 = pa.array(range(32 * 1024 * 1024 * 8), pa.uint64())
+        fsls2 = pa.FixedSizeListArray.from_arrays(values2, 32 * 1024 * 1024)
+        offsets2 = pa.array([0, 1, 2, 3, 4, 5, 6, 7, 8], pa.int32())
+        lists2 = pa.ListArray.from_arrays(offsets2, fsls2)
+
+        yield pa.record_batch(
+            [
+                lists,
+                lists2,
+            ],
+            names=["a", "b"],
+        )
+
+    schema = pa.schema({"a": list_type, "b": list_type})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=10, io_buffer_size=5000).to_table()
 
 
 def test_scan_no_columns(tmp_path: Path):

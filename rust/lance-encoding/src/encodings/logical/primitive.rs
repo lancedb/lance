@@ -31,6 +31,7 @@ use crate::{
 struct PrimitivePage {
     scheduler: Box<dyn PageScheduler>,
     num_rows: u64,
+    page_index: u32,
 }
 
 /// A field scheduler for primitive fields
@@ -61,9 +62,13 @@ impl PrimitiveFieldScheduler {
     ) -> Self {
         let page_schedulers = pages
             .iter()
+            .enumerate()
             // Buggy versions of Lance could sometimes create empty pages
-            .filter(|page| page.num_rows > 0)
-            .map(|page| {
+            .filter(|(page_index, page)| {
+                log::trace!("Skipping empty page with index {}", page_index);
+                page.num_rows > 0
+            })
+            .map(|(page_index, page)| {
                 let page_buffers = PageBuffers {
                     column_buffers: buffers,
                     positions_and_sizes: &page.buffer_offsets_and_sizes,
@@ -73,6 +78,7 @@ impl PrimitiveFieldScheduler {
                 PrimitivePage {
                     scheduler,
                     num_rows: page.num_rows,
+                    page_index: page_index as u32,
                 }
             })
             .collect::<Vec<_>>();
@@ -160,10 +166,13 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
 
         let num_rows_in_next = ranges_in_page.iter().map(|r| r.end - r.start).sum();
         trace!(
-            "Scheduling {} rows across {} ranges from page with {} rows",
+            "Scheduling {} rows across {} ranges from page with {} rows (priority={}, column_index={}, page_index={})",
             num_rows_in_next,
             ranges_in_page.len(),
-            cur_page.num_rows
+            cur_page.num_rows,
+            priority.current_priority(),
+            self.scheduler.column_index,
+            cur_page.page_index,
         );
 
         self.global_row_offset += cur_page.num_rows;
@@ -183,6 +192,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
             rows_drained: 0,
             num_rows: num_rows_in_next,
             should_validate: self.scheduler.should_validate,
+            page_index: cur_page.page_index,
         };
 
         let decoder = Box::new(logical_decoder);
@@ -224,6 +234,7 @@ pub struct PrimitiveFieldDecoder {
     num_rows: u64,
     rows_drained: u64,
     column_index: u32,
+    page_index: u32,
 }
 
 impl PrimitiveFieldDecoder {
@@ -241,6 +252,7 @@ impl PrimitiveFieldDecoder {
             num_rows,
             rows_drained: 0,
             column_index: u32::MAX,
+            page_index: u32::MAX,
         }
     }
 }
@@ -301,9 +313,10 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
     // breaking up large I/O into smaller I/O as a way to accelerate the "time-to-first-decode"
     fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         log::trace!(
-            "primitive wait for more than {} rows on column {} (page has {} rows)",
+            "primitive wait for more than {} rows on column {} and page {} (page has {} rows)",
             loaded_need,
             self.column_index,
+            self.page_index,
             self.num_rows
         );
         async move {
