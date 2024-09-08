@@ -375,7 +375,7 @@ impl Scanner {
         if !query.columns.is_empty() {
             for column in &query.columns {
                 if self.dataset.schema().field(column).is_none() {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!("Column {} not found", column),
                         location!(),
                     ));
@@ -474,14 +474,14 @@ impl Scanner {
     /// skip the first 10 rows and return the rest of the rows in the dataset.
     pub fn limit(&mut self, limit: Option<i64>, offset: Option<i64>) -> Result<&mut Self> {
         if limit.unwrap_or_default() < 0 {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 "Limit must be non-negative".to_string(),
                 location!(),
             ));
         }
         if let Some(off) = offset {
             if off < 0 {
-                return Err(Error::io(
+                return Err(Error::invalid_input(
                     "Offset must be non-negative".to_string(),
                     location!(),
                 ));
@@ -501,25 +501,32 @@ impl Scanner {
         }
 
         if k == 0 {
-            return Err(Error::io("k must be positive".to_string(), location!()));
+            return Err(Error::invalid_input(
+                "k must be positive".to_string(),
+                location!(),
+            ));
         }
         if q.is_empty() {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 "Query vector must have non-zero length".to_string(),
                 location!(),
             ));
         }
         // make sure the field exists
-        let field = self.dataset.schema().field(column).ok_or(Error::io(
-            format!("Column {} not found", column),
-            location!(),
-        ))?;
+        let field = self
+            .dataset
+            .schema()
+            .field(column)
+            .ok_or(Error::invalid_input(
+                format!("Column {} not found", column),
+                location!(),
+            ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type().is_floating() {
                     coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
                 } else {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!(
                             "Column {} is not a vector column (type: {})",
                             column,
@@ -530,7 +537,7 @@ impl Scanner {
                 }
             }
             _ => {
-                return Err(Error::io(
+                return Err(Error::invalid_input(
                     format!(
                         "Column {} is not a vector column (type: {})",
                         column,
@@ -621,7 +628,7 @@ impl Scanner {
                 self.dataset
                     .schema()
                     .field(&column.column_name)
-                    .ok_or(Error::io(
+                    .ok_or(Error::invalid_input(
                         format!("Column {} not found", &column.column_name),
                         location!(),
                     ))?;
@@ -1139,7 +1146,7 @@ impl Scanner {
 
         // Now the full text search supports only one column
         if columns.len() != 1 {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!(
                     "Full text search supports only one column right now, but got {} columns",
                     columns.len()
@@ -1152,7 +1159,7 @@ impl Scanner {
             .dataset
             .load_scalar_index_for_column(column)
             .await?
-            .ok_or(Error::io(
+            .ok_or(Error::invalid_input(
                 format!("Column {} has no inverted index", column),
                 location!(),
             ))?;
@@ -1186,7 +1193,10 @@ impl Scanner {
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {
-            return Err(Error::io("No nearest query".to_string(), location!()));
+            return Err(Error::invalid_input(
+                "No nearest query".to_string(),
+                location!(),
+            ));
         };
 
         // Sanity check
@@ -1195,7 +1205,7 @@ impl Scanner {
             match field.data_type() {
                 DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
                 _ => {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!(
                             "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
                             q.column, field.data_type(),
@@ -1205,7 +1215,7 @@ impl Scanner {
                 }
             }
         } else {
-            return Err(Error::io(
+            return Err(Error::invalid_input(
                 format!("Vector search error: column {} not found", q.column),
                 location!(),
             ));
@@ -1222,7 +1232,7 @@ impl Scanner {
             // There is an index built for the column.
             // We will use the index.
             if matches!(q.refine_factor, Some(0)) {
-                return Err(Error::io(
+                return Err(Error::invalid_input(
                     "Refine factor can not be zero".to_string(),
                     location!(),
                 ));
