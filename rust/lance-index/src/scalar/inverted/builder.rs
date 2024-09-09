@@ -356,7 +356,7 @@ impl InvertedList {
                 location: location!(),
             })?;
         let offsets: Vec<usize> = serde_json::from_str(offsets)?;
-
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
         for i in 0..offsets.len() {
             let offset = offsets[i];
             let next_offset = if i + 1 < offsets.len() {
@@ -364,7 +364,7 @@ impl InvertedList {
             } else {
                 reader.num_rows()
             };
-            let batch = reader.read_range(offset..next_offset, None).await?;
+            let batch = batch.slice(offset, next_offset - offset);
             let row_ids_col = batch[ROW_ID].as_primitive::<UInt64Type>().values();
             let frequencies_col = batch[FREQUENCY_COL].as_primitive::<Float32Type>().values();
             let positions_col = batch.column_by_name(POSITION_COL).map(|col| {
@@ -392,33 +392,48 @@ impl InvertedList {
     }
 
     pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
-        for list in self.inverted_list.iter_mut() {
-            let mut new_row_ids = Vec::new();
-            let mut new_freqs = Vec::new();
-            let mut new_positions = list.positions.as_ref().map(|_| Vec::new());
+        self.inverted_list.par_iter_mut().for_each_init(
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |(new_row_ids, new_freqs, new_positions), list| {
+                let mut new_positions = list.positions.as_ref().map(|_| new_positions);
 
-            for i in 0..list.len() {
-                let row_id = list.row_ids[i];
-                let freq = list.frequencies[i];
-                let positions = list
-                    .positions
-                    .as_ref()
-                    .map(|positions| positions.get(i).to_vec());
+                for i in 0..list.len() {
+                    let row_id = list.row_ids[i];
+                    let freq = list.frequencies[i];
+                    let positions = list
+                        .positions
+                        .as_ref()
+                        .map(|positions| positions.get(i).to_vec());
 
-                match mapping.get(&row_id) {
-                    Some(Some(new_row_id)) => {
-                        new_row_ids.push(*new_row_id);
-                        new_freqs.push(freq);
-                        if let Some(new_positions) = new_positions.as_mut() {
-                            new_positions.push(positions.unwrap());
+                    match mapping.get(&row_id) {
+                        Some(Some(new_row_id)) => {
+                            new_row_ids.push(*new_row_id);
+                            new_freqs.push(freq);
+                            if let Some(new_positions) = new_positions.as_mut() {
+                                new_positions.push(positions.unwrap());
+                            }
+                        }
+                        Some(None) => {
+                            // remove the row_id
+                            // do nothing
+                        }
+                        None => {
+                            new_row_ids.push(row_id);
+                            new_freqs.push(freq);
+                            if let Some(new_positions) = new_positions.as_mut() {
+                                new_positions.push(positions.unwrap());
+                            }
                         }
                     }
-                    _ => continue,
                 }
-            }
 
-            *list = PostingListBuilder::new(new_row_ids, new_freqs, new_positions);
-        }
+                *list = PostingListBuilder::new(
+                    std::mem::take(new_row_ids),
+                    std::mem::take(new_freqs),
+                    new_positions.map(std::mem::take),
+                );
+            },
+        );
     }
 
     pub fn resize(&mut self, len: usize) {
