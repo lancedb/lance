@@ -95,6 +95,25 @@ pub(super) async fn build_scalar_index(
         source: format!("No column with name {}", column).into(),
         location: location!(),
     })?;
+
+    // Check if LabelList index is being created on a non-List or non-LargeList type
+    if matches!(params.force_index_type, Some(ScalarIndexType::LabelList))
+        && !matches!(
+            field.data_type(),
+            DataType::List(_) | DataType::LargeList(_)
+        )
+    {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "LabelList index can only be created on List or LargeList type columns. Column '{}' has type {:?}",
+                column,
+                field.data_type()
+            )
+            .into(),
+            location: location!(),
+        });
+    }
+
     // In theory it should be possible to create a btree/bitmap index on a nested field but
     // performance would be poor and I'm not sure we want to allow that unless there is a need.
     if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList))
