@@ -115,7 +115,7 @@ jobs:
     - name: Run forward compatibility tests
       run: |
         source venv/bin/activate
-        pytest python/tests/forward_compat
+        pytest python/tests/forward_compat --run-forward
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
       run: sudo rm -rf target/wheels
