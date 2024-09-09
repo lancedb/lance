@@ -609,13 +609,19 @@ mod tests {
             ..Default::default()
         };
 
-        let (schema, data) = write_lance_file(data, &fs, options).await;
+        let written_file = write_lance_file(data, &fs, options).await;
 
         let decoder_middleware = DecoderMiddlewareChain::new()
-            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
+            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(
+                written_file.schema.clone(),
+            )))
             .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
-        let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
+        let num_rows = written_file
+            .data
+            .iter()
+            .map(|rb| rb.num_rows())
+            .sum::<usize>();
 
         let result = count_lance_file(
             &fs,
@@ -626,7 +632,9 @@ mod tests {
         assert_eq!(num_rows, result);
 
         let decoder_middleware = DecoderMiddlewareChain::new()
-            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
+            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(
+                written_file.schema.clone(),
+            )))
             .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
@@ -638,7 +646,7 @@ mod tests {
                     op: Operator::Gt,
                     right: Box::new(Expr::Literal(ScalarValue::Int32(Some(50000)))),
                 }),
-                schema.as_ref(),
+                written_file.schema.as_ref(),
             )
             .unwrap(),
         )
@@ -646,7 +654,9 @@ mod tests {
         assert_eq!(0, result);
 
         let decoder_middleware = DecoderMiddlewareChain::new()
-            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
+            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(
+                written_file.schema.clone(),
+            )))
             .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
@@ -658,7 +668,7 @@ mod tests {
                     op: Operator::Gt,
                     right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
                 }),
-                schema.as_ref(),
+                written_file.schema.as_ref(),
             )
             .unwrap(),
         )

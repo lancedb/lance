@@ -629,14 +629,14 @@ impl BufferEncodingStrategy for CoreBufferEncodingStrategy {
 #[derive(Default)]
 pub struct ColumnIndexSequence {
     current_index: u32,
-    mapping: Vec<(i32, i32)>,
+    mapping: Vec<(u32, u32)>,
 }
 
 impl ColumnIndexSequence {
-    pub fn next_column_index(&mut self, field_id: i32) -> u32 {
+    pub fn next_column_index(&mut self, field_id: u32) -> u32 {
         let idx = self.current_index;
         self.current_index += 1;
-        self.mapping.push((field_id, idx as i32));
+        self.mapping.push((field_id, idx));
         idx
     }
 
@@ -756,13 +756,13 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
             Ok(Box::new(PrimitiveFieldEncoder::try_new(
                 options,
                 self.array_encoding_strategy.clone(),
-                column_index.next_column_index(field.id),
+                column_index.next_column_index(field.id as u32),
                 field.clone(),
             )?))
         } else {
             match data_type {
                 DataType::List(_child) | DataType::LargeList(_child) => {
-                    let list_idx = column_index.next_column_index(field.id);
+                    let list_idx = column_index.next_column_index(field.id as u32);
                     let inner_encoding = encoding_strategy_root.create_field_encoder(
                         encoding_strategy_root,
                         &field.children[0],
@@ -794,11 +794,11 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
                             self.array_encoding_strategy.clone(),
-                            column_index.next_column_index(field.id),
+                            column_index.next_column_index(field.id as u32),
                             field.clone(),
                         )?))
                     } else {
-                        let header_idx = column_index.next_column_index(field.id);
+                        let header_idx = column_index.next_column_index(field.id as u32);
                         let children_encoders = field
                             .children
                             .iter()
@@ -823,7 +823,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
                             self.array_encoding_strategy.clone(),
-                            column_index.next_column_index(field.id),
+                            column_index.next_column_index(field.id as u32),
                             field.clone(),
                         )?))
                     } else {
@@ -845,7 +845,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
 /// to field encoders for each top-level field in the batch.
 pub struct BatchEncoder {
     pub field_encoders: Vec<Box<dyn FieldEncoder>>,
-    pub field_id_to_column_index: Vec<(i32, i32)>,
+    pub field_id_to_column_index: Vec<(u32, u32)>,
 }
 
 impl BatchEncoder {
@@ -978,7 +978,7 @@ pub async fn encode_batch(
     let top_level_columns = batch_encoder
         .field_id_to_column_index
         .iter()
-        .map(|(_, idx)| *idx as u32)
+        .map(|(_, idx)| *idx)
         .collect();
     Ok(EncodedBatch {
         data: data_buffer.freeze(),

@@ -122,12 +122,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         let field_ids = writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(field_id, _)| *field_id)
+            .map(|(field_id, _)| *field_id as i32)
             .collect::<Vec<_>>();
         let column_indices = writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(_, column_index)| *column_index)
+            .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
 
         fragment.files[0].fields = field_ids;

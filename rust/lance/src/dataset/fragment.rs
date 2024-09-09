@@ -256,7 +256,6 @@ impl GenericFileReader for V1Reader {
 }
 
 mod v2_adapter {
-    use lance_core::datatypes::Field;
     use lance_encoding::decoder::FilterExpression;
 
     use super::*;
@@ -265,45 +264,20 @@ mod v2_adapter {
     pub struct Reader {
         reader: Arc<v2::reader::FileReader>,
         projection: Arc<Schema>,
-        field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+        field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
     }
 
     impl Reader {
         pub fn new(
             reader: Arc<v2::reader::FileReader>,
             projection: Arc<Schema>,
-            field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+            field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         ) -> Self {
             Self {
                 reader,
                 projection,
                 field_id_to_column_idx,
             }
-        }
-
-        fn projection_from_lance_helper<'a>(
-            &self,
-            fields: impl Iterator<Item = &'a Field>,
-            column_indices: &mut Vec<u32>,
-        ) -> Result<()> {
-            for field in fields {
-                let column_idx = *self.field_id_to_column_idx.get(&field.id).ok_or_else(|| Error::InvalidInput {
-                    location: location!(),
-                    source: format!("the schema referenced a field with id {} which was not in the data file's metadata", field.id).into(),
-                })?;
-                column_indices.push(column_idx);
-                self.projection_from_lance_helper(field.children.iter(), column_indices)?;
-            }
-            Ok(())
-        }
-
-        pub fn projection_from_lance(&self, schema: &Schema) -> Result<ReaderProjection> {
-            let mut column_indices = Vec::new();
-            self.projection_from_lance_helper(schema.fields.iter(), &mut column_indices)?;
-            Ok(ReaderProjection {
-                schema: Arc::new(schema.clone()),
-                column_indices,
-            })
         }
     }
 
@@ -316,7 +290,10 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref())?;
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -337,7 +314,10 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref())?;
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -360,7 +340,10 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
-            let projection = self.projection_from_lance(projection.as_ref())?;
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -478,7 +461,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = v2::reader::FileReader::default_projection(dataset.schema());
+            let projection = v2::reader::ReaderProjection::from_whole_schema(dataset.schema());
             let physical_rows = reader.metadata().num_rows as usize;
             frag.physical_rows = Some(physical_rows);
             frag.id = fragment_id as u64;
@@ -673,7 +656,7 @@ impl FileFragment {
                         if column_index < 0 {
                             None
                         } else {
-                            Some((field_id, column_index as u32))
+                            Some((field_id as u32, column_index as u32))
                         }
                     }),
             ));

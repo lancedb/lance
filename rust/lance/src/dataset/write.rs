@@ -369,13 +369,13 @@ impl GenericWriter for V2WriterAdapter {
             .writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(field_id, _)| *field_id)
+            .map(|(field_id, _)| *field_id as i32)
             .collect::<Vec<_>>();
         let column_indices = self
             .writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(_, column_index)| *column_index)
+            .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
         let (major, minor) = self.writer.version().to_numbers();
         let data_file = DataFile::new(

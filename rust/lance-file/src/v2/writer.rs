@@ -87,7 +87,7 @@ pub struct FileWriter {
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
-    field_id_to_column_indices: Vec<(i32, i32)>,
+    field_id_to_column_indices: Vec<(u32, u32)>,
     num_columns: u32,
     rows_written: u64,
     global_buffers: Vec<(u64, u64)>,
@@ -514,7 +514,7 @@ impl FileWriter {
         Ok(self.writer.tell().await? as u64)
     }
 
-    pub fn field_id_to_column_indices(&self) -> &[(i32, i32)] {
+    pub fn field_id_to_column_indices(&self) -> &[(u32, u32)] {
         &self.field_id_to_column_indices
     }
 }
