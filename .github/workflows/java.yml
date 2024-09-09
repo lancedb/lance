@@ -93,4 +93,4 @@ jobs:
             -Djdk.reflect.useDirectMethodHandle=false \
             -Dio.netty.tryReflectionSetAccessible=true"
           fi
-          mvn clean test
+          mvn clean install

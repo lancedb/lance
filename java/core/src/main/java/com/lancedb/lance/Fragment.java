@@ -29,7 +29,16 @@ public class Fragment {
     JniLoader.ensureLoaded();
   }
 
-  /** Create a fragment from the given data in vector schema root. */
+  /**
+   * Create a fragment from the given data.
+   *
+   * @param datasetUri the dataset uri
+   * @param allocator the buffer allocator
+   * @param root the vector schema root
+   * @param fragmentId the fragment id
+   * @param params the write params
+   * @return the fragment metadata
+   */
   public static FragmentMetadata create(String datasetUri, BufferAllocator allocator,
       VectorSchemaRoot root, Optional<Integer> fragmentId, WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
@@ -46,7 +55,14 @@ public class Fragment {
     }
   }
 
-  /** Create a fragment from the given data. */
+  /**
+   * Create a fragment from the given arrow stream.
+   * @param datasetUri  the dataset uri
+   * @param stream  the arrow stream
+   * @param fragmentId  the fragment id
+   * @param params  the write params
+   * @return  the fragment metadata
+   */
   public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
       Optional<Integer> fragmentId, WriteParams params) {
     Preconditions.checkNotNull(datasetUri);

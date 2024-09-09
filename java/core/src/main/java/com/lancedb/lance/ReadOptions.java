@@ -70,6 +70,9 @@ public class ReadOptions {
     /**
      * Set the version of the dataset to read.
      * If not set, read from latest version.
+     *
+     * @param version the version of the dataset
+     * @return this builder
      */
     public Builder setVersion(int version) {
       this.version = Optional.of(version);
@@ -80,6 +83,9 @@ public class ReadOptions {
      * Block size in bytes.
      * Provide a hint for the size of the minimal I/O request.
      * Recommended to be set to value bigger than 4KB.
+     *
+     * @param blockSize the block size in bytes
+     * @return this builder
      */
     public Builder setBlockSize(int blockSize) {
       this.blockSize = Optional.of(blockSize);
@@ -97,6 +103,9 @@ public class ReadOptions {
      * / number of IVF partitions.
      * pq = number of PQ sub-vectors.
      * Default is 256.
+     *
+     * @param indexCacheSize the index cache size
+     * @return this builder
      */
     public Builder setIndexCacheSize(int indexCacheSize) {
       this.indexCacheSize = indexCacheSize;
@@ -107,6 +116,9 @@ public class ReadOptions {
      * Metadata cache size for the fragment metadata. If it is zero, metadata
      * cache is disabled.
      * Default is 256.
+     *
+     * @param metadataCacheSize the metadata cache size
+     * @return this builder
      */
     public Builder setMetadataCacheSize(int metadataCacheSize) {
       this.metadataCacheSize = metadataCacheSize;

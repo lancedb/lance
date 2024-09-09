@@ -54,6 +54,7 @@ public class VectorIndexParams {
    *
    * @param numPartitions the number of partitions of IVF (Inverted File Index)
    * @param distanceType the distance type for calculating the distance between vectors
+   * @return the VectorIndexParams
    */
   public static VectorIndexParams ivfFlat(int numPartitions, DistanceType distanceType) {
     return new Builder(new IvfBuildParams.Builder().setNumPartitions(numPartitions).build())
@@ -92,8 +93,8 @@ public class VectorIndexParams {
    * Create a new IVF index with PQ quantizer.
    *
    * @param distanceType the distance type for calculating the distance between vectors
-   * @param IvfBuildParams the IVF build parameters
-   * @param PQBuildParams the PQ build parameters
+   * @param ivf the IVF build parameters
+   * @param pq the PQ build parameters
    * @return the VectorIndexParams
    */
   public static VectorIndexParams withIvfPqParams(DistanceType distanceType,
@@ -110,9 +111,9 @@ public class VectorIndexParams {
    * The dataset is partitioned into IVF partitions, and each partition builds an HNSW graph.
    *
    * @param distanceType the distance type for calculating the distance between vectors
-   * @param IvfBuildParams the IVF build parameters
-   * @param hnswBuildParams the HNSW build parameters
-   * @param PQBuildParams the PQ build parameters
+   * @param ivf the IVF build parameters
+   * @param hnsw the HNSW build parameters
+   * @param pq the PQ build parameters
    * @return the VectorIndexParams
    */
   public static VectorIndexParams withIvfHnswPqParams(DistanceType distanceType,
@@ -131,9 +132,9 @@ public class VectorIndexParams {
    * The dataset is partitioned into IVF partitions, and each partition builds an HNSW graph.
    *
    * @param distanceType the distance type for calculating the distance between vectors
-   * @param IvfBuildParams the IVF build parameters
-   * @param hnswBuildParams the HNSW build parameters
-   * @param SQBuildParams the SQ build parameters
+   * @param ivf the IVF build parameters
+   * @param hnsw the HNSW build parameters
+   * @param sq the SQ build parameters
    * @return the VectorIndexParams
    */
   public static VectorIndexParams withIvfHnswSqParams(DistanceType distanceType,
@@ -173,7 +174,7 @@ public class VectorIndexParams {
     }
 
     /**
-     * @param sqParams the SQ quantizer build parameters
+     * @param pqParams the PQ quantizer build parameters
      * @return Builder
      */
     public Builder setPqParams(PQBuildParams pqParams) {

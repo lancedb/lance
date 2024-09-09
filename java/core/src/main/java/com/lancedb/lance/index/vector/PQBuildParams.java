@@ -58,7 +58,7 @@ public class PQBuildParams {
      * The number of subvectors to divide the source vectors into.
      * This must be a divisor of the vector dimension.
      *
-     * @param numSubVectors
+     * @param numSubVectors the number of subvectors
      * @return Builder
      */
     public Builder setNumSubVectors(int numSubVectors) {
@@ -95,7 +95,7 @@ public class PQBuildParams {
 
     /**
      * @param sampleRate sample rate to train PQ codebook
-     * @return
+     * @return Builder
      */
     public Builder setSampleRate(int sampleRate) {
       this.sampleRate = sampleRate;
