@@ -692,11 +692,10 @@ impl LogicalPageDecoder for ListPageDecoder {
                 return Ok(());
             }
 
-            let mut boundary = loaded_need as usize;
+            let boundary = loaded_need as usize;
             debug_assert!(boundary < self.num_rows as usize);
-            while boundary + 2 < self.offsets.len() && self.offsets[boundary] == self.offsets[boundary + 1] {
-                boundary += 1;
-            }
+            // We need more than X lists which means we need at least X+1 lists which means
+            // we need at least offsets[X+1] items which means we need more than offsets[X+1]-1 items.
             let items_needed = self.offsets[boundary + 1].saturating_sub(1);
             trace!(
                 "List decoder is waiting for more than {} rows to be loaded and {}/{} are already loaded.  To satisfy this we need more than {} loaded items",
