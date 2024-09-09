@@ -33,7 +33,10 @@ def test_duckdb_pushdown_extension_types(tmp_path):
     # Not the best error message but hopefully this is short lived until datafusion
     # supports substrait extension types.
     with pytest.raises(
-        duckdb.InvalidInputException,
+        # Older versions of duckdb use duckdb.InvalidInputException and newer versions
+        # use duckdb.duckdb.Error but that part isn't really important so just check for
+        # Exception
+        Exception,
         match="referenced a field that is not yet supported by Substrait conversion",
     ):
         duckdb.query("SELECT * FROM ds WHERE largebin = '456'").fetchall()
