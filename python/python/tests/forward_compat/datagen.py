@@ -54,7 +54,7 @@ def build_basic_types():
 def write_basic_types():
     path = get_path("basic_types.lance")
     with LanceFileWriter(str(path)) as writer:
-        writer.write_table(build_basic_types())
+        writer.write_batch(build_basic_types())
 
 
 def build_large():
@@ -89,7 +89,7 @@ def build_large():
 def write_large():
     path = get_path("large.lance")
     with LanceFileWriter(str(path)) as writer:
-        writer.write_table(build_large())
+        writer.write_batch(build_large())
 
 
 if __name__ == "__main__":
