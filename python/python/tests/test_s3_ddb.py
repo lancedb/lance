@@ -19,6 +19,7 @@ import pyarrow as pa
 import pytest
 from lance.dependencies import _RAY_AVAILABLE, ray
 from lance.fragment import write_fragments
+from lance.file import LanceFileReader, LanceFileWriter
 
 # These are all keys that are accepted by storage_options
 CONFIG = {
@@ -264,3 +265,25 @@ def test_ray_committer(s3_bucket: str, ddb_table: str):
     assert sorted(tbl["id"].to_pylist()) == list(range(10))
     assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
     assert len(ds.get_fragments()) == 1
+
+@pytest.mark.integration
+def test_file_writer_reader(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    del storage_options["dynamodb_endpoint"]
+    table = pa.table({"a": [1, 2, 3]})
+    file_path = uri = f"s3://{s3_bucket}/foo.lance"
+    global_buffer_text = "hello"
+    global_buffer_bytes = bytes(global_buffer_text, "utf-8")
+    with LanceFileWriter(str(file_path), storage_options=storage_options) as writer:
+        writer.write_batch(table)
+        global_buffer_pos = writer.add_global_buffer(global_buffer_bytes)
+    reader = LanceFileReader(str(file_path), storage_options=storage_options)
+    assert reader.read_all().to_table() == table
+    assert reader.metadata().global_buffers[global_buffer_pos].size == len(
+        global_buffer_bytes
+    )
+    assert (
+            bytes(reader.read_global_buffer(global_buffer_pos)).decode()
+            == global_buffer_text
+    )
+
