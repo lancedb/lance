@@ -38,10 +38,12 @@ public class IndexParams {
     private Optional<ScalarIndexParams> scalarIndexParams = Optional.empty();
     private Optional<InvertedIndexParams> invertedIndexParams = Optional.empty();
 
-    public Builder() {}
+    public Builder() {
+    }
 
     /**
-     * Set the distance type for calculating the distance between vectors. Default to L2.
+     * Set the distance type for calculating the distance between vectors. Default
+     * to L2.
      *
      * @param distanceType distance type
      * @return this builder
@@ -53,7 +55,7 @@ public class IndexParams {
 
     /**
      * Vector index parameters for creating a vector index.
-     * 
+     *
      * @param vectorIndexParams vector index parameters
      * @return this builder
      */
