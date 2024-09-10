@@ -589,7 +589,7 @@ mod tests {
 
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
-                FullTextSearchQuery::new("\"lance exists\"".to_owned()).limit(Some(10)),
+                FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();
