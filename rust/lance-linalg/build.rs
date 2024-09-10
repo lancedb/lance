@@ -89,7 +89,7 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
         // Pedantic will complain about _Float16 in some versions of GCC
         // .flag("-Wpedantic")
         // We pass in the suffix to make sure the symbol names are unique
-        .flag(&format!("-DSUFFIX=_{}", suffix));
+        .flag(format!("-DSUFFIX=_{}", suffix));
 
     for flag in flags {
         builder.flag(flag);

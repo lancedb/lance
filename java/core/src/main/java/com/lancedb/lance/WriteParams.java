@@ -57,7 +57,10 @@ public class WriteParams {
     return maxBytesPerFile;
   }
 
-  /** Get Mode with name. */
+  /**
+   * Get Mode with name.
+   * @return mode
+   */
   public Optional<String> getMode() {
     return mode.map(Enum::name);
   }

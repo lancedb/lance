@@ -9,7 +9,7 @@ const NUM_VALUES: &[usize] = &[1024 * 1024, 32 * 1024, 8 * 1024];
 fn bench_zip(c: &mut Criterion) {
     for num_values in NUM_VALUES {
         let num_values = *num_values;
-        let mut group = c.benchmark_group(&format!("zip_{}Ki", num_values / 1024));
+        let mut group = c.benchmark_group(format!("zip_{}Ki", num_values / 1024));
 
         group.throughput(Throughput::Bytes((num_values * 6) as u64));
 

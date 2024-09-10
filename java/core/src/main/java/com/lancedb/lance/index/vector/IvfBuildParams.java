@@ -115,7 +115,7 @@ public class IvfBuildParams {
      * By making this value smaller, this shuffle will consume less memory
      * but will take longer to complete, and vice versa.
      *
-     * @param shufflePartitionConcurrency
+     * @param shufflePartitionConcurrency the number of shuffle partitions to process concurrently
      * @return Builder
      */
     public Builder setShufflePartitionConcurrency(int shufflePartitionConcurrency) {
@@ -125,7 +125,7 @@ public class IvfBuildParams {
 
     /**
      * Set whether to use residual for k-means clustering. Default value is true.
-     * @param useResidual
+     * @param useResidual whether to use residual for k-means clustering
      * @return Builder
      */
     public Builder setUseResidual(boolean useResidual) {

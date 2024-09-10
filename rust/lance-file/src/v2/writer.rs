@@ -223,11 +223,7 @@ impl FileWriter {
             8 * 1024 * 1024
         };
 
-        let max_page_bytes = if let Some(max_page_bytes) = self.options.max_page_bytes {
-            max_page_bytes
-        } else {
-            32 * 1024 * 1024
-        };
+        let max_page_bytes = self.options.max_page_bytes.unwrap_or(32 * 1024 * 1024);
 
         schema.validate()?;
 

@@ -39,6 +39,9 @@ public class IndexParams {
     /**
      * Set the distance type for calculating the distance between vectors.
      * Default to L2.
+     *
+     * @param distanceType distance type
+     * @return this builder
      */
     public Builder setDistanceType(DistanceType distanceType) {
       this.distanceType = distanceType;
@@ -47,6 +50,8 @@ public class IndexParams {
 
     /**
      * Vector index parameters for creating a vector index.
+     * @param vectorIndexParams vector index parameters
+     * @return this builder
      */
     public Builder setVectorIndexParams(VectorIndexParams vectorIndexParams) {
       this.vectorIndexParams = Optional.of(vectorIndexParams);
