@@ -108,7 +108,12 @@ impl InvertedIndex {
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
         } else {
-            token_ids.collect()
+            let token_ids = token_ids.collect::<Vec<_>>();
+            // for phrase query, all tokens must be present
+            if token_ids.len() != tokens.len() {
+                return Ok(Vec::new());
+            }
+            token_ids
         };
         self.bm25_search(token_ids, query, prefilter).await
     }
