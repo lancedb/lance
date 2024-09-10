@@ -264,11 +264,18 @@ message ZoneIndex {
   ColumnEncoding inner = 3;
 }
 
+// Marks a column as blob data.  It will contain a packed struct
+// with fields position and size (u64)
+message Blob {
+  ColumnEncoding inner = 1;
+}
+
 // Encodings that describe a column of values
 message ColumnEncoding {
   oneof column_encoding {
     // No special encoding, just column values
     google.protobuf.Empty values = 1;
     ZoneIndex zone_index = 2;
+    Blob blob = 3;
   }
 }

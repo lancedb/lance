@@ -530,7 +530,7 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test]
@@ -567,19 +567,19 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

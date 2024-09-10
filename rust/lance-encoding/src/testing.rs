@@ -25,8 +25,8 @@ use crate::{
         DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedPage,
-        EncodingOptions, FieldEncoder, FieldEncodingStrategy,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedColumn,
+        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
     version::LanceFileVersion,
@@ -54,13 +54,7 @@ impl EncodingsIo for SimulatedScheduler {
     ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
         let data = ranges
             .into_iter()
-            .map(|range| {
-                if range.is_empty() {
-                    // Some filesystems (e.g. S3 will return an error if an empty request is made and so we need to avoid those)
-                    panic!("Empty request")
-                }
-                self.data.slice(range.start as usize..range.end as usize)
-            })
+            .map(|range| self.data.slice(range.start as usize..range.end as usize))
             .collect();
 
         log::trace!("Scheduled request with priority {}", priority);
@@ -214,8 +208,7 @@ impl ArrayGeneratorProvider for RandomArrayGeneratorProvider {
 }
 
 /// Given a field this will test the round trip encoding and decoding of random data
-pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<String, String>) {
-    let field = field.with_metadata(metadata);
+pub async fn check_round_trip_encoding_random(field: Field) {
     let array_generator_provider = RandomArrayGeneratorProvider {
         field: field.clone(),
     };
@@ -272,6 +265,8 @@ fn supports_nulls(data_type: &DataType) -> bool {
     !matches!(data_type, DataType::Struct(_))
 }
 
+type EncodingVerificationFn = dyn Fn(&[EncodedColumn]);
+
 // The default will just test the full read
 #[derive(Clone)]
 pub struct TestCases {
@@ -281,6 +276,7 @@ pub struct TestCases {
     skip_validation: bool,
     max_page_size: Option<u64>,
     file_version: LanceFileVersion,
+    verify_encoding: Option<Arc<EncodingVerificationFn>>,
 }
 
 impl Default for TestCases {
@@ -292,6 +288,7 @@ impl Default for TestCases {
             skip_validation: false,
             max_page_size: None,
             file_version: LanceFileVersion::default(),
+            verify_encoding: None,
         }
     }
 }
@@ -329,6 +326,17 @@ impl TestCases {
     pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
         self.file_version = version;
         self
+    }
+
+    pub fn with_verify_encoding(mut self, verify_encoding: Arc<EncodingVerificationFn>) -> Self {
+        self.verify_encoding = Some(verify_encoding);
+        self
+    }
+
+    fn verify_encoding(&self, encoding: &[EncodedColumn]) {
+        if let Some(verify_encoding) = self.verify_encoding.as_ref() {
+            verify_encoding(encoding);
+        }
     }
 }
 
@@ -394,6 +402,10 @@ impl SimulatedWriter {
         (offset, size)
     }
 
+    fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
+        self.encoded_data.extend_from_slice(&buffer);
+    }
+
     fn write_page(&mut self, encoded_page: EncodedPage) {
         trace!("Encoded page {:?}", encoded_page);
         let page_buffers = encoded_page.array.data.into_buffers();
@@ -412,6 +424,10 @@ impl SimulatedWriter {
         let col_idx = encoded_page.column_idx as usize;
         self.page_infos[col_idx].push(page_info);
     }
+
+    fn new_external_buffers(&self) -> OutOfLineBuffers {
+        OutOfLineBuffers::new(self.encoded_data.len() as u64)
+    }
 }
 
 /// This is the inner-most check function that actually runs the round trip and tests it
@@ -424,18 +440,33 @@ async fn check_round_trip_encoding_inner(
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
     for arr in &data {
-        for encode_task in encoder.maybe_encode(arr.clone()).unwrap() {
-            let encoded_page = encode_task.await.unwrap();
-            writer.write_page(encoded_page);
+        let mut external_buffers = writer.new_external_buffers();
+        let encode_tasks = encoder
+            .maybe_encode(arr.clone(), &mut external_buffers)
+            .unwrap();
+        for buffer in external_buffers.take_buffers() {
+            writer.write_lance_buffer(buffer);
+        }
+        for task in encode_tasks {
+            writer.write_page(task.await.unwrap());
         }
     }
 
-    for encode_task in encoder.flush().unwrap() {
-        let encoded_page = encode_task.await.unwrap();
-        writer.write_page(encoded_page);
+    let mut external_buffers = writer.new_external_buffers();
+    let encode_tasks = encoder.flush(&mut external_buffers).unwrap();
+    for buffer in external_buffers.take_buffers() {
+        writer.write_lance_buffer(buffer);
+    }
+    for task in encode_tasks {
+        writer.write_page(task.await.unwrap());
     }
 
-    let encoded_columns = encoder.finish().await.unwrap();
+    let mut external_buffers = writer.new_external_buffers();
+    let encoded_columns = encoder.finish(&mut external_buffers).await.unwrap();
+    test_cases.verify_encoding(&encoded_columns);
+    for buffer in external_buffers.take_buffers() {
+        writer.write_lance_buffer(buffer);
+    }
     let mut column_infos = Vec::new();
     for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
         for page in encoded_column.final_pages {

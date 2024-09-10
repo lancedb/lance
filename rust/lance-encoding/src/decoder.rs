@@ -237,11 +237,12 @@ use tracing::instrument;
 use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
+use crate::encodings::logical::blob::{BlobFieldScheduler, DESC_FIELD};
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
-use crate::format::pb;
+use crate::format::pb::{self, column_encoding};
 use crate::{BufferScheduler, EncodingsIo};
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
@@ -754,6 +755,18 @@ impl CoreFieldDecoderStrategy {
             )) as Arc<dyn FieldScheduler>),
         ))
     }
+
+    fn unwrap_blob(column_info: &ColumnInfo) -> Option<ColumnInfo> {
+        if let column_encoding::ColumnEncoding::Blob(blob) =
+            column_info.encoding.column_encoding.as_ref().unwrap()
+        {
+            let mut column_info = column_info.clone();
+            column_info.encoding = blob.inner.as_ref().unwrap().as_ref().clone();
+            Some(column_info)
+        } else {
+            None
+        }
+    }
 }
 
 impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
@@ -767,6 +780,16 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let primitive_col = column_infos.expect_next()?;
+            if let Some(blob_col) = Self::unwrap_blob(primitive_col) {
+                let desc_scheduler = self.create_primitive_scheduler(
+                    DESC_FIELD.data_type(),
+                    chain.current_path(),
+                    &blob_col,
+                    buffers,
+                )?;
+                let blob_scheduler = Arc::new(BlobFieldScheduler::new(desc_scheduler));
+                return Ok((chain, Ok(blob_scheduler)));
+            }
             let scheduler = self.create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),

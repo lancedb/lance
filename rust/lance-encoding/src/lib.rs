@@ -41,6 +41,9 @@ pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     /// This is important in cases where indirect I/O causes high priority requests to be submitted
     /// after low priority requests.  We want to fulfill the indirect I/O more quickly so that we
     /// can decode as quickly as possible.
+    ///
+    /// The implementation should be able to handle empty ranges, and should return an empty
+    /// byte buffer for each empty range.
     fn submit_request(
         &self,
         range: Vec<Range<u64>>,

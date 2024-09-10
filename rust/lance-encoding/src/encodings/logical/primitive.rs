@@ -23,7 +23,7 @@ use crate::{
     },
     encoder::{
         ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
-        FieldEncoder,
+        FieldEncoder, OutOfLineBuffers,
     },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
 };
@@ -548,7 +548,11 @@ impl PrimitiveFieldEncoder {
 
 impl FieldEncoder for PrimitiveFieldEncoder {
     // Buffers data, if there is enough to write a page then we create an encode task
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        _external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.insert(array) {
             Ok(self.do_flush(arrays)?)
         } else {
@@ -557,7 +561,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     }
 
     // If there is any data left in the buffer then create an encode task from it
-    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+    fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
             Ok(self.do_flush(arrays)?)
         } else {
@@ -569,7 +573,10 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         1
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+    fn finish(
+        &mut self,
+        _external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
         std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
     }
 }

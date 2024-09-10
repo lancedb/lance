@@ -14,7 +14,7 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_encoding::encoder::{
     BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
-    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy,
+    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
 };
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_writer::ObjectWriter;
@@ -246,7 +246,11 @@ impl FileWriter {
     }
 
     #[instrument(skip_all, level = "debug")]
-    fn encode_batch(&mut self, batch: &RecordBatch) -> Result<Vec<Vec<EncodeTask>>> {
+    fn encode_batch(
+        &mut self,
+        batch: &RecordBatch,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<Vec<EncodeTask>>> {
         self.schema
             .as_ref()
             .unwrap()
@@ -264,7 +268,7 @@ impl FileWriter {
                         .into(),
                         location: location!(),
                     })?;
-                column_writer.maybe_encode(array.clone())
+                column_writer.maybe_encode(array.clone(), external_buffers)
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -297,7 +301,13 @@ impl FileWriter {
         };
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
-        let encoding_tasks = self.encode_batch(batch)?;
+        let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
+        let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
+        // Next, write external buffers
+        for external_buffer in external_buffers.take_buffers() {
+            self.writer.write_all(&external_buffer).await?;
+        }
+
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
@@ -382,7 +392,11 @@ impl FileWriter {
     async fn finish_writers(&mut self) -> Result<()> {
         let mut col_idx = 0;
         for mut writer in std::mem::take(&mut self.column_writers) {
-            let columns = writer.finish().await?;
+            let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
+            let columns = writer.finish(&mut external_buffers).await?;
+            for buffer in external_buffers.take_buffers() {
+                self.writer.write_all(&buffer).await?;
+            }
             debug_assert_eq!(
                 columns.len(),
                 writer.num_columns() as usize,
@@ -444,11 +458,15 @@ impl FileWriter {
     /// Returns the total number of rows written
     pub async fn finish(&mut self) -> Result<u64> {
         // 1. flush any remaining data and write out those pages
+        let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
         let encoding_tasks = self
             .column_writers
             .iter_mut()
-            .map(|writer| writer.flush())
+            .map(|writer| writer.flush(&mut external_buffers))
             .collect::<Result<Vec<_>>>()?;
+        for external_buffer in external_buffers.take_buffers() {
+            self.writer.write_all(&external_buffer).await?;
+        }
         let encoding_tasks = encoding_tasks
             .into_iter()
             .flatten()
