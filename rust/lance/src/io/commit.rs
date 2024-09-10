@@ -29,7 +29,7 @@ use lance_file::version::LanceFileVersion;
 use lance_table::format::{
     pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, WriterVersion,
 };
-use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
+use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
 use rand::Rng;
 use snafu::{location, Location};
@@ -121,6 +121,7 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -138,6 +139,7 @@ pub(crate) async fn commit_new_dataset(
             Some(indices.clone())
         },
         write_config,
+        manifest_naming_scheme,
     )
     .await?;
 
@@ -415,6 +417,7 @@ pub(crate) async fn commit_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -504,6 +507,7 @@ pub(crate) async fn commit_transaction(
                 Some(indices.clone())
             },
             write_config,
+            manifest_naming_scheme,
         )
         .await;
 

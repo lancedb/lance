@@ -741,6 +741,7 @@ mod tests {
             None,
             None,
             false,
+            false,
             1,
         ));
 
@@ -827,6 +828,7 @@ mod tests {
             Url::parse("mem://").unwrap(),
             None,
             None,
+            false,
             false,
             1,
         ));

@@ -92,6 +92,7 @@ impl BlockingDataset {
             None,
             None,
             object_store_registry,
+            false, // TODO: support enable_v2_manifest_paths
         ))?;
         Ok(Self { inner })
     }

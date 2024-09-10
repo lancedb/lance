@@ -1218,6 +1218,7 @@ impl Dataset {
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1255,6 +1256,7 @@ impl Dataset {
                     object_store_params,
                     commit_handler,
                     object_store_registry,
+                    enable_v2_manifest_paths.unwrap_or(false),
                 )
                 .await
             })?
@@ -1268,6 +1270,14 @@ impl Dataset {
     fn validate(&self) -> PyResult<()> {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    fn migrate_manifest_paths_v2(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.migrate_manifest_paths_v2())?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
@@ -1462,6 +1472,12 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
                 storage_options: Some(storage_options),
                 ..Default::default()
             });
+        }
+
+        if let Some(enable_v2_manifest_paths) =
+            get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
+        {
+            p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
         p.commit_handler = get_commit_handler(options);

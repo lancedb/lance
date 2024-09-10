@@ -46,7 +46,7 @@ public class SQBuildParams {
 
     /**
      * @param sampleRate sample rate for training
-     * @return
+     * @return Builder
      */
     public Builder setSampleRate(int sampleRate) {
       this.sampleRate = sampleRate;

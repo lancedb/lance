@@ -27,7 +27,7 @@ fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
                 location!(),
             ))?))
         }
-        _ => Err(Error::io(
+        _ => Err(Error::invalid_input(
             format!("Expected a literal of type '{data_type:?}' but received: {expr}"),
             location!(),
         )),

@@ -25,14 +25,23 @@ import org.apache.arrow.vector.types.pojo.Schema;
 /** Utility. */
 public class Utils {
 
-  /** Convert Arrow Schema to FFI Arrow Schema. */
+  /**
+   * Convert schema to ArrowSchema for JNI processing.
+   * @param schema schema
+   * @param allocator buffer allocator
+   * @return ArrowSchema
+   */
   public static ArrowSchema toFfi(Schema schema, BufferAllocator allocator) {
     ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
     Data.exportSchema(allocator, schema, null, arrowSchema);
     return arrowSchema;
   }
 
-  /** Convert optional array to optional list for JNI processing. */
+  /**
+   * Convert optional array to optional list for JNI processing.
+   * @param optionalArray  Optional array
+   * @return Optional list
+   */
   public static Optional<List<String>> convert(Optional<String[]> optionalArray) {
     if (optionalArray.isPresent()) {
       return Optional.of(Arrays.asList(optionalArray.get()));

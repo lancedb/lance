@@ -30,11 +30,19 @@ def pytest_addoption(parser):
         default=False,
         help="Run integration tests (requires S3 buckets to be setup with access)",
     )
+    parser.addoption(
+        "--run-slow",
+        action="store_true",
+        default=False,
+        help="Run slow tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
     if not config.getoption("--run-integration"):
         disable_items_with_mark(items, "integration", "--run-integration not specified")
+    if not config.getoption("--run-slow"):
+        disable_items_with_mark(items, "slow", "--run-slow not specified")
     try:
         import torch
 

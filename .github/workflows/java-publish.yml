@@ -1,6 +1,8 @@
 name: Build and publish Java packages
 on:
   release:
+    # Use released instead of published, since we don't publish preview/beta
+    # versions
     types: [released]
   pull_request:
     paths:
@@ -99,7 +101,12 @@ jobs:
         run: |
           git config --global user.email "Lance Github Runner"
           git config --global user.name "dev+gha@lancedb.com"
+      - name: Dry run
+        if: github.event_name == 'pull_request'
+        run: |
+          mvn --batch-mode -DskipTests package
       - name: Publish with Java 8
+        if: github.event_name == 'release'
         run: |
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf

@@ -228,6 +228,8 @@ public class Dataset implements Closeable {
 
   /**
    * Gets the currently checked out version of the dataset.
+   *
+   * @return the version of the dataset
    */
   public long version() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
@@ -239,7 +241,7 @@ public class Dataset implements Closeable {
   private native long nativeVersion();
 
   /**
-   * Gets the latest version of the dataset.
+   * @return the latest version of the dataset.
    */
   public long latestVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {

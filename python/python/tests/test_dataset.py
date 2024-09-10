@@ -251,6 +251,30 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_v2_manifest_paths(tmp_path: Path):
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
+def test_v2_manifest_paths_migration(tmp_path: Path):
+    # Create a dataset with v1 manifest paths
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert manifest_path == ["1.manifest"]
+
+    # Migrate to v2 manifest paths
+    lance.dataset(tmp_path).migrate_manifest_paths_v2()
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
 def test_tag(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"
@@ -1626,10 +1650,15 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows != 12
 
 
+@pytest.mark.slow
 def test_io_buffer_size(tmp_path: Path):
-    # This regresses a deadlock issue that was happening when the
-    # batch size was very large (in bytes) so that batches would be
+    # These cases regress deadlock issues that happen when the
+    # batch size was very large (in bytes) so that batches are
     # bigger than the I/O buffer size
+    #
+    # The test is slow (it needs to generate enough data to cover a variety
+    # of cases) but it is essential to run if any changes are made to the
+    # 2.0 scheduling priority / decoding strategy
     #
     # In this test we create 4 pages of data, 2 for each column.  We
     # then set the I/O buffer size to 5000 bytes so that we only read
@@ -1783,6 +1812,45 @@ def test_io_buffer_size(tmp_path: Path):
     )
 
     dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This reproduces another issue we saw where there are a bunch of empty lists and
+    # lance was calculating the page priority incorrectly.
+
+    fsl_type = pa.list_(pa.uint64(), 32 * 1024 * 1024)
+    list_type = pa.list_(fsl_type)
+
+    def datagen():
+        # Each item is 32
+        values = pa.array(range(32 * 1024 * 1024 * 7), pa.uint64())
+        fsls = pa.FixedSizeListArray.from_arrays(values, 32 * 1024 * 1024)
+        # 3 items, 5 empties, 2 items
+        offsets = pa.array([0, 1, 2, 3, 4, 4, 5, 6, 7], pa.int32())
+        lists = pa.ListArray.from_arrays(offsets, fsls)
+
+        values2 = pa.array(range(32 * 1024 * 1024 * 8), pa.uint64())
+        fsls2 = pa.FixedSizeListArray.from_arrays(values2, 32 * 1024 * 1024)
+        offsets2 = pa.array([0, 1, 2, 3, 4, 5, 6, 7, 8], pa.int32())
+        lists2 = pa.ListArray.from_arrays(offsets2, fsls2)
+
+        yield pa.record_batch(
+            [
+                lists,
+                lists2,
+            ],
+            names=["a", "b"],
+        )
+
+    schema = pa.schema({"a": list_type, "b": list_type})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=10, io_buffer_size=5000).to_table()
 
 
 def test_scan_no_columns(tmp_path: Path):
@@ -2132,7 +2200,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
     assert dataset.data_storage_version == "2.0"
 
     # Append will write v2 if dataset was originally created with v2
@@ -2141,7 +2209,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert len(dataset.get_fragments()) == 2
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     dataset = lance.write_dataset(
         table, tmp_path, data_storage_version="legacy", mode="overwrite"
@@ -2149,7 +2217,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert dataset.data_storage_version == "0.1"
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Append will write v1 if dataset was originally created with v1
     dataset = lance.write_dataset(
@@ -2157,7 +2225,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v2 will put dataset in "v2 mode"
     dataset = lance.write_dataset(
@@ -2175,7 +2243,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v1 will put dataset in "v1 mode"
     dataset = lance.write_dataset(
@@ -2193,7 +2261,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
 
 def test_late_materialization_batch_size(tmp_path: Path):
