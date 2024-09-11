@@ -554,6 +554,14 @@ mod tests {
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
 
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(0));
+
         // test phrase query
         // for non-phrasal query, the order of the tokens doesn't matter
         // so there should be 4 documents that contain "database" or "lance"
@@ -590,6 +598,14 @@ mod tests {
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(0));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
