@@ -188,7 +188,7 @@ impl ArrayEncoder for PackedStructEncoder {
         let (encoded_datas, child_encodings): (Vec<_>, Vec<_>) = encoded_fields
             .into_iter()
             .map(|field| (field.data, field.encoding))
-            .collect();
+            .unzip();
 
         // Zip together encoded data
         let fixed_fields = encoded_datas.into_iter().map(|child| {child.as_fixed_width().map_err(|err| Error::InvalidInput {
