@@ -86,7 +86,7 @@ impl GeneralBufferCompressor {
     }
 }
 
-// An encoder which uses lightweight compression, such as zstd/lz4 to encode buffers
+// An encoder which uses generic compression, such as zstd/lz4 to encode buffers
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
     compressor: Box<dyn BufferCompressor>,

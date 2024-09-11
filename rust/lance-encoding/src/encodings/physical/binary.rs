@@ -381,17 +381,15 @@ fn get_indices_from_string_arrays(
         let offsets = offsets.borrow_to_typed_slice::<i32>();
         indices.extend(offsets.as_ref().windows(2).map(|w| {
             let strlen = (w[1] - w[0]) as u64;
-            let off = strlen + last_offset;
-            last_offset = off;
-            off
+            last_offset += strlen;
+            last_offset
         }));
     } else if bits_per_offset == 64 {
         let offsets = offsets.borrow_to_typed_slice::<i64>();
         indices.extend(offsets.as_ref().windows(2).map(|w| {
             let strlen = (w[1] - w[0]) as u64;
-            let off = strlen + last_offset;
-            last_offset = off;
-            off
+            last_offset += strlen;
+            last_offset
         }));
     }
 

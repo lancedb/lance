@@ -149,7 +149,6 @@ impl ArrayEncoder for FsstArrayEncoder {
         let offsets = data.offsets.borrow_to_typed_slice::<i32>();
         let offsets_slice = offsets.as_ref();
         let bytes_data = data.data.into_buffer();
-        // Currently, fsst encoder expects one buffer, so let us concatenate
 
         let mut dest_offsets = vec![0_i32; offsets_slice.len() * 2];
         let mut dest_values = vec![0_u8; bytes_data.len() * 2];

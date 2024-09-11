@@ -4,7 +4,6 @@ use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_buffer::Buffer;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -36,52 +35,12 @@ use crate::{
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
 
-/// An encoded buffer
-pub struct EncodedBuffer {
-    /// Buffers that make up the encoded buffer
-    ///
-    /// All of these buffers should be written to the file as one contiguous buffer
-    ///
-    /// This is a Vec to allow for zero-copy
-    ///
-    /// For example, if we are asked to write 3 primitive arrays of 1000 rows and we can write them all
-    /// as one page then this will be the value buffers from the 3 primitive arrays
-    pub parts: Vec<Buffer>,
-}
-
-// Custom impl because buffers shouldn't be included in debug output
-impl std::fmt::Debug for EncodedBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncodedBuffer")
-            .field("len", &self.parts.iter().map(|p| p.len()).sum::<usize>())
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-pub struct EncodedArrayBuffer {
-    /// The data making up the buffer
-    pub parts: Vec<Buffer>,
-    /// The index of the buffer in the page
-    pub index: u32,
-}
-
-// Custom impl because buffers shouldn't be included in debug output
-impl std::fmt::Debug for EncodedArrayBuffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncodedBuffer")
-            .field("len", &self.parts.iter().map(|p| p.len()).sum::<usize>())
-            .field("index", &self.index)
-            .finish()
-    }
-}
-
 /// An encoded array
 ///
 /// Maps to a single Arrow array
 ///
-/// This may contain multiple EncodedArrayBuffers.  For example, a nullable int32 array will contain two buffers,
-/// one for the null bitmap and one for the values
+/// This contains the encoded data as well as a description of the encoding that was applied which
+/// can be used to decode the data later.
 #[derive(Debug)]
 pub struct EncodedArray {
     /// The encoded buffers
