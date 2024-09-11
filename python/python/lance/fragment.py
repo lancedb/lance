@@ -147,7 +147,7 @@ class LanceFragment(pa.dataset.Fragment):
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
-        data_storage_version: str = "legacy",
+        data_storage_version: str = "stable",
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
@@ -528,7 +528,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
-    data_storage_version: str = "legacy",
+    data_storage_version: str = "stable",
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:

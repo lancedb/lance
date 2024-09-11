@@ -63,11 +63,11 @@ def test_write_fragment_two_phases(tmp_path: Path):
 def test_write_legacy_fragment(tmp_path: Path):
     tab = pa.table({"a": range(1024)})
     frag = LanceFragment.create(tmp_path, tab, data_storage_version="legacy")
-    assert "file_minor_version: 3" not in str(frag)
+    assert "file_major_version: 2" not in str(frag)
 
     tab = pa.table({"a": range(1024)})
     frag = LanceFragment.create(tmp_path, tab, data_storage_version="stable")
-    assert "file_minor_version: 3" in str(frag)
+    assert "file_major_version: 2" in str(frag)
 
 
 def test_scan_fragment(tmp_path: Path):
@@ -99,15 +99,18 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
 
 
 def test_write_fragments(tmp_path: Path):
-    # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table(
-        {
-            "a": pa.array(range(1024)),
-        }
+    # Should result in two files since each batch is 8MB and max_bytes_per_file is small
+    batches = pa.RecordBatchReader.from_batches(
+        pa.schema([pa.field("a", pa.string())]),
+        [
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+        ],
     )
+
     progress = ProgressForTest()
     fragments = write_fragments(
-        tab,
+        batches,
         tmp_path,
         max_rows_per_group=512,
         max_bytes_per_file=1024,
@@ -200,11 +203,11 @@ def test_dataset_progress(tmp_path: Path):
     assert metadata["id"] == 0
     assert len(metadata["files"]) == 1
     # Fragments aren't exactly equal, because the file was written before
-    # physical_rows was known.
-    assert (
-        fragment.data_files()
-        == FragmentMetadata.from_json(json.dumps(metadata)).data_files()
-    )
+    # physical_rows was known.  However, the paths should be the same.
+    assert len(fragment.data_files()) == 1
+    deserialized = FragmentMetadata.from_json(json.dumps(metadata))
+    assert len(deserialized.data_files()) == 1
+    assert fragment.data_files()[0].path() == deserialized.data_files()[0].path()
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))

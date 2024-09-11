@@ -1002,10 +1002,10 @@ impl Scanner {
                         } else {
                             self.projection_plan.physical_schema.clone()
                         };
-                        if !self.dataset.is_legacy_storage() {
-                            // If this is a v2 dataset then we can pushdown limit/offset (via
-                            // scan_range and we zero out limit/offset so we don't apply it
-                            // twice)
+                        if scan_range.is_some() && !self.dataset.is_legacy_storage() {
+                            // If this is a v2 dataset with no filter then we can pushdown
+                            // limit/offset (via scan_range and we zero out limit/offset
+                            // so we don't apply it twice)
                             use_limit_node = false;
                         }
                         self.scan(
@@ -1990,20 +1990,13 @@ mod test {
             if use_filter {
                 builder.filter("i IS NOT NULL").unwrap();
             }
-            let expected_lens = if use_filter {
-                // If there is a filter then a late materialization pass is added
-                // and that uses coalesce batches which can yield slightly larger
-                // than requested batch sizes.
-                vec![8, 10, 10, 10, 10, 10, 10]
-            } else {
-                vec![8, 2, 8, 2, 8, 2, 8, 2, 8, 2]
-            };
             let mut stream = builder.try_into_stream().await.unwrap();
-            for expected_len in expected_lens {
-                assert_eq!(
-                    stream.next().await.unwrap().unwrap().num_rows(),
-                    expected_len as usize
-                );
+            let mut rows_read = 0;
+            while let Some(next) = stream.next().await {
+                let next = next.unwrap();
+                let expected = 8.min(100 - rows_read);
+                assert_eq!(next.num_rows(), expected);
+                rows_read += next.num_rows();
             }
         }
     }
@@ -2049,11 +2042,12 @@ mod test {
         let mut builder = dataset.scan();
         builder.batch_size(8);
         let mut stream = builder.try_into_stream().await.unwrap();
-        for expected_len in [8, 2, 8, 2, 8, 2, 8, 2, 8, 2] {
-            assert_eq!(
-                stream.next().await.unwrap().unwrap().num_rows(),
-                expected_len as usize
-            );
+        let mut rows_read = 0;
+        while let Some(next) = stream.next().await {
+            let next = next.unwrap();
+            let expected = 8.min(100 - rows_read);
+            assert_eq!(next.num_rows(), expected);
+            rows_read += next.num_rows();
         }
     }
 

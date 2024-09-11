@@ -19,6 +19,7 @@ use jni::objects::{JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{StageParams, VectorIndexParams};
+use lance_encoding::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams, ScalarIndexType};
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -53,6 +54,8 @@ pub fn extract_write_params(
     if let Some(mode_val) = env.get_string_opt(mode)? {
         write_params.mode = WriteMode::try_from(mode_val.as_str())?;
     }
+    // Java code always sets the data storage version to Legacy for now
+    write_params.data_storage_version = Some(LanceFileVersion::Legacy);
     Ok(write_params)
 }
 

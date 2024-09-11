@@ -680,6 +680,7 @@ mod test {
     use arrow_select::concat::concat_batches;
     use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+    use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -710,7 +711,16 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -757,7 +767,16 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -822,7 +841,18 @@ mod test {
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let dataset = Arc::new(Dataset::write(batches, test_uri, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
 
         let fragments = dataset.fragments().clone();
         // [x.b, y.a]
@@ -904,6 +934,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 100,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let dataset = Arc::new(
@@ -1038,6 +1069,7 @@ mod test {
         let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
         let params = WriteParams {
             max_rows_per_group: 3,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, "memory://test", Some(params))
@@ -1243,6 +1275,7 @@ mod test {
 
             let write_params = WriteParams {
                 max_rows_per_group: 3,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             };
             Dataset::write(reader, uri, Some(write_params))
@@ -1366,6 +1399,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1428,6 +1462,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 4,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))

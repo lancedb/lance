@@ -82,7 +82,8 @@ def test_roundtrip_types(tmp_path: Path):
         }
     )
 
-    dataset = lance.write_dataset(table, tmp_path)
+    # TODO: V2 does not currently handle large_dict
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="legacy")
     assert dataset.schema == table.schema
     assert dataset.to_table() == table
 
@@ -536,6 +537,28 @@ def test_pickle(tmp_path: Path):
     pickled = pickle.dumps(dataset)
     unpickled = pickle.loads(pickled)
     assert dataset.to_table() == unpickled.to_table()
+
+
+def test_nested_projection(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "struct": [{"x": counter, "y": counter % 2 == 0} for counter in range(100)],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    projected = dataset.to_table(columns=["struct.x"])
+    assert projected == pa.Table.from_pydict({"struct.x": range(100)})
+
+    projected = dataset.to_table(columns=["struct.y"])
+    assert projected == pa.Table.from_pydict(
+        {"struct.y": [i % 2 == 0 for i in range(100)]}
+    )
 
 
 def test_polar_scan(tmp_path: Path):
@@ -2273,3 +2296,27 @@ def test_late_materialization_batch_size(tmp_path: Path):
         columns=["values"], filter="filter % 2 == 0", batch_size=32
     ):
         assert batch.num_rows == 32
+
+
+EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
+EXPECTED_MAJOR_VERSION = 2
+EXPECTED_MINOR_VERSION = 0
+
+
+def test_default_storage_version(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+    assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
+
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+    from lance.fragment import write_fragments
+
+    frags = write_fragments(table, dataset.uri)
+    frag = frags[0]
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION

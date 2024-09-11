@@ -105,14 +105,15 @@ The following values are supported:
       - Any
       - This is the initial Lance format.
     * - 2.0
-      - 0.15.0
+      - 0.16.0
       - Any
       - Rework of the Lance file format that removed row groups and introduced null
         support for lists, fixed size lists, and primtives
     * - 2.1 (unstable)
       - None
       - Any
-      - Adds FSST string compression and bit packing
+      - Enhances integer and string compression, adds support for nulls in struct fields,
+        and improves random access performance with nested fields.
     * - legacy
       - N/A
       - N/A

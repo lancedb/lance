@@ -11,7 +11,6 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
@@ -97,6 +96,11 @@ impl<'a> FragmentCreateBuilder<'a> {
             FileWriterOptions::default(),
         )?;
 
+        let (major, minor) = writer.version().to_numbers();
+
+        let data_file = DataFile::new_unstarted(filename, major, minor);
+        fragment.files.push(data_file);
+
         progress.begin(&fragment).await?;
 
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
@@ -111,25 +115,23 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         fragment.physical_rows = Some(writer.finish().await? as usize);
 
+        if matches!(fragment.physical_rows, Some(0)) {
+            return Err(Error::invalid_input("Input data was empty.", location!()));
+        }
+
         let field_ids = writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(field_id, _)| *field_id)
+            .map(|(field_id, _)| *field_id as i32)
             .collect::<Vec<_>>();
         let column_indices = writer
             .field_id_to_column_indices()
             .iter()
-            .map(|(_, column_index)| *column_index)
+            .map(|(_, column_index)| *column_index as i32)
             .collect::<Vec<_>>();
-        let data_file = DataFile::new(
-            filename,
-            field_ids,
-            column_indices,
-            MAJOR_VERSION as u32,
-            MINOR_VERSION_NEXT as u32,
-        );
 
-        fragment.files.push(data_file);
+        fragment.files[0].fields = field_ids;
+        fragment.files[0].column_indices = column_indices;
 
         progress.complete(&fragment).await?;
 
@@ -353,6 +355,7 @@ mod tests {
         assert_eq!(fragment.id, 42);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![1, 3]);
+        assert_eq!(fragment.files[0].fields, vec![3, 1]);
+        assert_eq!(fragment.files[0].column_indices, vec![0, 1]);
     }
 }

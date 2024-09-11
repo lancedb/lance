@@ -264,38 +264,19 @@ mod v2_adapter {
     pub struct Reader {
         reader: Arc<v2::reader::FileReader>,
         projection: Arc<Schema>,
-        field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+        field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
     }
 
     impl Reader {
         pub fn new(
             reader: Arc<v2::reader::FileReader>,
             projection: Arc<Schema>,
-            field_id_to_column_idx: Arc<BTreeMap<i32, u32>>,
+            field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
         ) -> Self {
             Self {
                 reader,
                 projection,
                 field_id_to_column_idx,
-            }
-        }
-
-        pub fn projection_from_lance(&self, schema: &Schema) -> ReaderProjection {
-            let column_indices = schema
-                .fields
-                .iter()
-                .map(|f| {
-                    *self.field_id_to_column_idx.get(&f.id).unwrap_or_else(|| {
-                        panic!(
-                            "attempt to project field with id {} which did not exist in the data file",
-                            f.id
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            ReaderProjection {
-                schema: Arc::new(schema.clone()),
-                column_indices,
             }
         }
     }
@@ -309,7 +290,10 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -330,7 +314,10 @@ mod v2_adapter {
             batch_size: u32,
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -353,7 +340,10 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
-            let projection = self.projection_from_lance(projection.as_ref());
+            let projection = ReaderProjection::from_field_ids(
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
             Ok(self
                 .reader
                 .read_tasks(
@@ -471,7 +461,7 @@ impl FileFragment {
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = v2::reader::FileReader::default_projection(dataset.schema());
+            let projection = v2::reader::ReaderProjection::from_whole_schema(dataset.schema());
             let physical_rows = reader.metadata().num_rows as usize;
             frag.physical_rows = Some(physical_rows);
             frag.id = fragment_id as u64;
@@ -482,7 +472,12 @@ impl FileFragment {
                 .map(|c| c as i32)
                 .collect();
 
-            frag.add_file(filename, dataset.schema().field_ids(), column_indices);
+            frag.add_file(
+                filename,
+                dataset.schema().field_ids(),
+                column_indices,
+                &file_version,
+            );
             Ok(frag)
         }
     }
@@ -661,7 +656,7 @@ impl FileFragment {
                         if column_index < 0 {
                             None
                         } else {
-                            Some((field_id, column_index as u32))
+                            Some((field_id as u32, column_index as u32))
                         }
                     }),
             ));
@@ -2454,6 +2449,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_size() {
+        // V1 ONLY
+        //
+        // This test is only for the legacy version of the file format.
+        // It ensures that the `max_rows_per_group` property is respected
+        // and this property does not exist in V2.
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2484,6 +2484,7 @@ mod tests {
             batch_iter,
             Some(WriteParams {
                 max_rows_per_group: 100,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             }),
         )
@@ -2590,13 +2591,15 @@ mod tests {
         let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
 
-        let actual_data = reader.legacy_read_range_as_batch(0..3).await?;
-        assert_eq!(expected_data.slice(0, 3), actual_data);
-
         let actual_data = reader
-            .legacy_read_batch_projected(0, .., &dataset.schema().project(&["s", "i"]).unwrap())
-            .await?;
-        assert_eq!(expected_data, actual_data);
+            .read_range(0..3, 3)
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+        assert_eq!(expected_data.slice(0, 3), actual_data);
 
         // Also check case of row_id.
         let expected_data = expected_data.try_with_column(

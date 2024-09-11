@@ -31,8 +31,6 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::format::MAGIC;
-use crate::format::MAJOR_VERSION;
-use crate::format::MINOR_VERSION_NEXT;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -89,7 +87,7 @@ pub struct FileWriter {
     schema: Option<LanceSchema>,
     column_writers: Vec<Box<dyn FieldEncoder>>,
     column_metadata: Vec<pbfile::ColumnMetadata>,
-    field_id_to_column_indices: Vec<(i32, i32)>,
+    field_id_to_column_indices: Vec<(u32, u32)>,
     num_columns: u32,
     rows_written: u64,
     global_buffers: Vec<(u64, u64)>,
@@ -139,9 +137,7 @@ impl FileWriter {
 
     /// Returns the format version that will be used when writing the file
     pub fn version(&self) -> LanceFileVersion {
-        self.options
-            .format_version
-            .unwrap_or(LanceFileVersion::default_v2())
+        self.options.format_version.unwrap_or_default()
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
@@ -229,10 +225,7 @@ impl FileWriter {
 
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
         let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
-            let version = self
-                .options
-                .format_version
-                .unwrap_or(LanceFileVersion::default_v2());
+            let version = self.version();
             Arc::new(CoreFieldEncodingStrategy {
                 array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
                 version,
@@ -449,10 +442,7 @@ impl FileWriter {
     /// Converts self.version (which is a mix of "software version" and
     /// "format version" into a format version)
     fn version_to_numbers(&self) -> (u16, u16) {
-        let version = self
-            .options
-            .format_version
-            .unwrap_or(LanceFileVersion::default_v2());
+        let version = self.options.format_version.unwrap_or_default();
         match version.resolve() {
             LanceFileVersion::V2_0 => (0, 3),
             LanceFileVersion::V2_1 => (2, 1),
@@ -524,7 +514,7 @@ impl FileWriter {
         Ok(self.writer.tell().await? as u64)
     }
 
-    pub fn field_id_to_column_indices(&self) -> &[(i32, i32)] {
+    pub fn field_id_to_column_indices(&self) -> &[(u32, u32)] {
         &self.field_id_to_column_indices
     }
 }
@@ -621,14 +611,16 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
         data.put_u64_le(gbo_len);
     }
 
+    let (major, minor) = LanceFileVersion::default().to_numbers();
+
     // write the footer
     data.put_u64_le(col_metadata_start);
     data.put_u64_le(cmo_table_start);
     data.put_u64_le(gbo_table_start);
     data.put_u32_le(num_global_buffers);
     data.put_u32_le(batch.page_table.len() as u32);
-    data.put_u16_le(MAJOR_VERSION as u16);
-    data.put_u16_le(MINOR_VERSION_NEXT);
+    data.put_u16_le(major as u16);
+    data.put_u16_le(minor as u16);
     data.put(MAGIC.as_slice());
 
     Ok(data.freeze())

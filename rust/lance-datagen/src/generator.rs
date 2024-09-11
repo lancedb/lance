@@ -6,13 +6,13 @@ use std::{iter, marker::PhantomData, sync::Arc};
 use arrow::{
     array::{ArrayData, AsArray},
     buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
-    datatypes::{ArrowPrimitiveType, Int32Type, IntervalDayTime, IntervalMonthDayNano},
+    datatypes::{ArrowPrimitiveType, Int32Type, Int64Type, IntervalDayTime, IntervalMonthDayNano},
 };
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, FixedSizeBinaryArray, FixedSizeListArray, ListArray, NullArray, PrimitiveArray,
-    RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
+    Array, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray, ListArray, NullArray,
+    PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -913,20 +913,32 @@ struct RandomListGenerator {
     child_field: Arc<Field>,
     items_gen: Box<dyn ArrayGenerator>,
     lengths_gen: Box<dyn ArrayGenerator>,
+    is_large: bool,
 }
 
 impl RandomListGenerator {
     // Creates a list generator that generates random lists with lengths between 0 and 10 (inclusive)
-    fn new(items_gen: Box<dyn ArrayGenerator>) -> Self {
+    fn new(items_gen: Box<dyn ArrayGenerator>, is_large: bool) -> Self {
         let child_field = Arc::new(Field::new("item", items_gen.data_type().clone(), true));
-        let field = Field::new("", DataType::List(child_field.clone()), true);
-        let lengths_dist = Uniform::new_inclusive(0, 10);
-        let lengths_gen = rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist);
+        let list_type = if is_large {
+            DataType::LargeList(child_field.clone())
+        } else {
+            DataType::List(child_field.clone())
+        };
+        let field = Field::new("", list_type, true);
+        let lengths_gen = if is_large {
+            let lengths_dist = Uniform::new_inclusive(0, 10);
+            rand_with_distribution::<Int64Type, Uniform<i64>>(lengths_dist)
+        } else {
+            let lengths_dist = Uniform::new_inclusive(0, 10);
+            rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist)
+        };
         Self {
             field: Arc::new(field),
             child_field,
             items_gen,
             lengths_gen,
+            is_large,
         }
     }
 }
@@ -938,16 +950,29 @@ impl ArrayGenerator for RandomListGenerator {
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn Array>, ArrowError> {
         let lengths = self.lengths_gen.generate(length, rng)?;
-        let lengths = lengths.as_primitive::<Int32Type>();
-        let total_length = lengths.values().iter().sum::<i32>() as u64;
-        let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
-        let items = self.items_gen.generate(RowCount::from(total_length), rng)?;
-        Ok(Arc::new(ListArray::try_new(
-            self.child_field.clone(),
-            offsets,
-            items,
-            None,
-        )?))
+        if self.is_large {
+            let lengths = lengths.as_primitive::<Int64Type>();
+            let total_length = lengths.values().iter().sum::<i64>() as u64;
+            let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+            let items = self.items_gen.generate(RowCount::from(total_length), rng)?;
+            Ok(Arc::new(LargeListArray::try_new(
+                self.child_field.clone(),
+                offsets,
+                items,
+                None,
+            )?))
+        } else {
+            let lengths = lengths.as_primitive::<Int32Type>();
+            let total_length = lengths.values().iter().sum::<i32>() as u64;
+            let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+            let items = self.items_gen.generate(RowCount::from(total_length), rng)?;
+            Ok(Arc::new(ListArray::try_new(
+                self.child_field.clone(),
+                offsets,
+                items,
+                None,
+            )?))
+        }
     }
 
     fn data_type(&self) -> &DataType {
@@ -1688,9 +1713,9 @@ pub mod array {
         Box::<RandomBooleanGenerator>::default()
     }
 
-    pub fn rand_list(item_type: &DataType) -> Box<dyn ArrayGenerator> {
+    pub fn rand_list(item_type: &DataType, is_large: bool) -> Box<dyn ArrayGenerator> {
         let child_gen = rand_type(item_type);
-        Box::new(RandomListGenerator::new(child_gen))
+        Box::new(RandomListGenerator::new(child_gen, is_large))
     }
 
     pub fn rand_struct(fields: Fields) -> Box<dyn ArrayGenerator> {
@@ -1734,7 +1759,8 @@ pub mod array {
                 Dimension::from(*dimension as u32),
             ),
             DataType::FixedSizeBinary(size) => rand_fsb(*size),
-            DataType::List(child) => rand_list(child.data_type()),
+            DataType::List(child) => rand_list(child.data_type(), false),
+            DataType::LargeList(child) => rand_list(child.data_type(), true),
             DataType::Duration(unit) => match unit {
                 TimeUnit::Second => rand::<DurationSecondType>(),
                 TimeUnit::Millisecond => rand::<DurationMillisecondType>(),
@@ -1940,7 +1966,7 @@ mod tests {
     fn test_rng_list() {
         // Note: these tests are heavily dependent on the default seed.
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-        let mut gen = array::rand_list(&DataType::Int32);
+        let mut gen = array::rand_list(&DataType::Int32, false);
         let arr = gen.generate(RowCount::from(100), &mut rng).unwrap();
         // Make sure we can generate empty lists (note, test is dependent on seed)
         let arr = arr.as_list::<i32>();

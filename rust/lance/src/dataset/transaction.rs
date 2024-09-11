@@ -338,9 +338,9 @@ impl Transaction {
             if let Some(user_requested) = user_requested {
                 if user_requested != file_version {
                     return Err(Error::invalid_input(
-                    format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
-                    location!(),
-                ));
+                        format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
+                        location!(),
+                    ));
                 }
             }
             Ok(DataStorageFormat::new(file_version))
@@ -601,11 +601,14 @@ impl Transaction {
         let mut manifest = if let Some(current_manifest) = current_manifest {
             let mut prev_manifest =
                 Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
-            if matches!(self.operation, Operation::Overwrite { .. }) {
-                prev_manifest.data_storage_format = Self::data_storage_format_from_files(
-                    &prev_manifest.fragments,
-                    user_requested_version,
-                )?;
+            if user_requested_version.is_some()
+                && matches!(self.operation, Operation::Overwrite { .. })
+            {
+                // If this is an overwrite operation and the user has requested a specific version
+                // then ovewrite with that version.  Otherwise, if the user didn't request a specific
+                // version, then overwrite with whatever version we had before.
+                prev_manifest.data_storage_format =
+                    DataStorageFormat::new(user_requested_version.unwrap());
             }
             prev_manifest
         } else {
