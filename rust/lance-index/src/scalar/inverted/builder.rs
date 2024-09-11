@@ -496,12 +496,17 @@ mod tests {
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
 
-    async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
+    use super::InvertedIndex;
+
+    async fn create_index<Offset: arrow::array::OffsetSizeTrait>(
+        with_position: bool,
+    ) -> Arc<InvertedIndex> {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let store = LanceIndexStore::new(ObjectStore::local(), index_dir, None);
 
-        let mut invert_index = super::InvertedIndexBuilder::default();
+        let params = super::InvertedIndexParams::default().with_position(with_position);
+        let mut invert_index = super::InvertedIndexBuilder::new(params);
         let doc_col = GenericStringArray::<Offset>::from(vec![
             "lance database the search",
             "lance database",
@@ -531,7 +536,11 @@ mod tests {
             .await
             .expect("failed to update invert index");
 
-        let invert_index = super::InvertedIndex::load(Arc::new(store)).await.unwrap();
+        super::InvertedIndex::load(Arc::new(store)).await.unwrap()
+    }
+
+    async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
+        let invert_index = create_index::<Offset>(false).await;
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
@@ -565,6 +574,23 @@ mod tests {
         // test phrase query
         // for non-phrasal query, the order of the tokens doesn't matter
         // so there should be 4 documents that contain "database" or "lance"
+
+        // we built the index without position, so the phrase query will not work
+        let results = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
+            ))
+            .await;
+        assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
+        let results = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
+            ))
+            .await;
+        assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
+
+        // recreate the index with position
+        let invert_index = create_index::<Offset>(true).await;
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
