@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import pyarrow as pa
 
@@ -40,6 +40,7 @@ class LanceFileWriter:
         schema: Optional[pa.Schema],
         data_cache_bytes: Optional[int],
         version: Optional[str],
+        storage_options: Optional[Dict[str, str]],
         keep_original_array: Optional[bool],
     ): ...
     def write_batch(self, batch: pa.RecordBatch) -> None: ...
@@ -48,7 +49,7 @@ class LanceFileWriter:
     def add_global_buffer(self, data: bytes) -> int: ...
 
 class LanceFileReader:
-    def __init__(self, path: str): ...
+    def __init__(self, path: str, storage_options: Optional[Dict[str, str]]): ...
     def read_all(
         self, batch_size: int, batch_readahead: int
     ) -> pa.RecordBatchReader: ...

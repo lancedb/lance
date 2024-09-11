@@ -54,7 +54,7 @@ def _write_fragment(
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
-    data_storage_version: str = "legacy",
+    data_storage_version: str = "stable",
     storage_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[FragmentMetadata, pa.Schema]:
     from ..dependencies import _PANDAS_AVAILABLE
@@ -188,7 +188,7 @@ class LanceDatasink(_BaseLanceDatasink):
         schema: Optional[pa.Schema] = None,
         mode: Literal["create", "append", "overwrite"] = "create",
         max_rows_per_file: int = 1024 * 1024,
-        data_storage_version: str = "legacy",
+        data_storage_version: str = "stable",
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, Any]] = None,
         *args,
@@ -295,7 +295,7 @@ class LanceFragmentWriter:
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
         max_rows_per_group: Optional[int] = None,  # Only useful for v1 writer.
-        data_storage_version: str = "legacy",
+        data_storage_version: str = "stable",
         use_legacy_format: Optional[bool] = False,
         storage_options: Optional[Dict[str, Any]] = None,
     ):
@@ -387,7 +387,7 @@ def write_lance(
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
     storage_options: Optional[Dict[str, Any]] = None,
-    data_storage_version: str = "legacy",
+    data_storage_version: str = "stable",
 ) -> None:
     """Write Ray dataset at scale.
 

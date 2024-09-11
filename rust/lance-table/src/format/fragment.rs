@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::Error;
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION, MINOR_VERSION_NEXT};
+use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,21 @@ impl DataFile {
             path: path.into(),
             fields,
             column_indices,
+            file_major_version,
+            file_minor_version,
+        }
+    }
+
+    /// Create a new `DataFile` with the expectation that fields and column_indices will be set later
+    pub fn new_unstarted(
+        path: impl Into<String>,
+        file_major_version: u32,
+        file_minor_version: u32,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            fields: vec![],
+            column_indices: vec![],
             file_major_version,
             file_minor_version,
         }
@@ -294,14 +309,11 @@ impl Fragment {
         path: impl Into<String>,
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
+        version: &LanceFileVersion,
     ) {
-        self.files.push(DataFile::new(
-            path,
-            field_ids,
-            column_indices,
-            MAJOR_VERSION as u32,
-            MINOR_VERSION_NEXT as u32,
-        ));
+        let (major, minor) = version.to_numbers();
+        self.files
+            .push(DataFile::new(path, field_ids, column_indices, major, minor));
     }
 
     /// Add a new [`DataFile`] to this fragment.

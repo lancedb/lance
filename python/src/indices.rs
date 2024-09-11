@@ -20,7 +20,9 @@ use pyo3::{
 };
 
 use crate::fragment::FileFragment;
-use crate::{dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path, RT};
+use crate::{
+    dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, RT,
+};
 use lance::index::vector::ivf::write_ivf_pq_file_from_existing_index;
 use lance_index::DatasetIndexExt;
 use uuid::Uuid;
@@ -176,7 +178,7 @@ async fn do_transform_vectors(
         .await
         .infer_error()?;
 
-    let (obj_store, path) = object_store_from_uri_or_path(dst_uri).await?;
+    let (obj_store, path) = object_store_from_uri_or_path_no_options(dst_uri).await?;
     let writer = obj_store.create(&path).await.infer_error()?;
     write_vector_storage(
         &dataset.ds,
@@ -299,7 +301,7 @@ async fn do_load_shuffled_vectors(
     ivf_model: IvfModel,
     pq_model: ProductQuantizer,
 ) -> PyResult<()> {
-    let (_, path) = object_store_from_uri_or_path(dir_path).await?;
+    let (_, path) = object_store_from_uri_or_path_no_options(dir_path).await?;
     let streams = IvfShuffler::load_partitioned_shuffles(&path, filenames)
         .await
         .infer_error()?;

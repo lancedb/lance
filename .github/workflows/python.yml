@@ -105,6 +105,17 @@ jobs:
         prefix-key: "manylinux2014"  # use this to flush the cache
     - uses: ./.github/workflows/build_linux_wheel
     - uses: ./.github/workflows/run_tests
+    - name: Generate forward compatibility files
+      run: python python/tests/forward_compat/datagen.py
+    - name: Install old wheel
+      run: |
+        python -m venv venv
+        source venv/bin/activate
+        pip install pytest pylance==0.16.0
+    - name: Run forward compatibility tests
+      run: |
+        source venv/bin/activate
+        pytest python/tests/forward_compat --run-forward
     # Make sure wheels are not included in the Rust cache
     - name: Delete wheels
       run: sudo rm -rf target/wheels

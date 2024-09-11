@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import pyarrow as pa
 
@@ -55,7 +55,7 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str):
+    def __init__(self, path: str, storage_options: Optional[Dict[str, str]] = None):
         """
         Creates a new file reader to read the given file
 
@@ -65,8 +65,11 @@ class LanceFileReader:
         path: str
             The path to read, can be a pathname for local storage
             or a URI to read from cloud storage.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         """
-        self._reader = _LanceFileReader(path)
+        self._reader = _LanceFileReader(path, storage_options=storage_options)
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
@@ -173,6 +176,7 @@ class LanceFileWriter:
         *,
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         """
@@ -194,9 +198,17 @@ class LanceFileWriter:
             The version of the file format to write.  If not specified then
             the latest stable version will be used.  Newer versions are more
             efficient but may not be readable by older versions of the software.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         """
         self._writer = _LanceFileWriter(
-            path, schema, data_cache_bytes=data_cache_bytes, version=version, **kwargs
+            path,
+            schema,
+            data_cache_bytes=data_cache_bytes,
+            version=version,
+            storage_options=storage_options,
+            **kwargs,
         )
         self.closed = False
 

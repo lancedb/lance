@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{pin::Pin, sync::Arc};
-
+use crate::{error::PythonErrorExt, RT};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
 use arrow_schema::Schema as ArrowSchema;
@@ -28,6 +27,7 @@ use lance_file::{
     },
     version::LanceFileVersion,
 };
+use lance_io::object_store::ObjectStoreParams;
 use lance_io::{
     scheduler::{ScanScheduler, SchedulerConfig},
     ReadBatchParams,
@@ -38,9 +38,9 @@ use pyo3::{
     pyclass, pymethods, IntoPy, PyObject, PyResult, Python,
 };
 use serde::Serialize;
+use std::collections::HashMap;
+use std::{pin::Pin, sync::Arc};
 use url::Url;
-
-use crate::{error::PythonErrorExt, RT};
 
 #[pyclass(get_all)]
 #[derive(Clone, Debug, Serialize)]
@@ -182,9 +182,11 @@ impl LanceFileWriter {
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         version: Option<String>,
+        storage_options: Option<HashMap<String, String>>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
-        let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
+        let (object_store, path) =
+            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
         let object_writer = object_store.create(&path).await.infer_error()?;
         let options = FileWriterOptions {
             data_cache_bytes,
@@ -215,6 +217,7 @@ impl LanceFileWriter {
         schema: Option<PyArrowType<ArrowSchema>>,
         data_cache_bytes: Option<u64>,
         version: Option<String>,
+        storage_options: Option<HashMap<String, String>>,
         keep_original_array: Option<bool>,
     ) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(
@@ -222,6 +225,7 @@ impl LanceFileWriter {
             schema,
             data_cache_bytes,
             version,
+            storage_options,
             keep_original_array,
         ))
     }
@@ -259,12 +263,19 @@ fn path_to_parent(path: &Path) -> PyResult<(Path, String)> {
     Ok((Path::from_iter(parts), filename))
 }
 
+pub async fn object_store_from_uri_or_path_no_options(
+    uri_or_path: impl AsRef<str>,
+) -> PyResult<(ObjectStore, Path)> {
+    object_store_from_uri_or_path(uri_or_path, None).await
+}
+
 // The ObjectStore::from_uri_or_path expects a path to a directory (and it creates it if it does
 // not exist).  We are given a path to a file and so we need to strip the last component
 // before creating the object store.  We then return the object store and the new relative path
 // to the file.
 pub async fn object_store_from_uri_or_path(
     uri_or_path: impl AsRef<str>,
+    storage_options: Option<HashMap<String, String>>,
 ) -> PyResult<(ObjectStore, Path)> {
     if let Ok(mut url) = Url::parse(uri_or_path.as_ref()) {
         if url.scheme().len() > 1 {
@@ -274,8 +285,22 @@ pub async fn object_store_from_uri_or_path(
             let (parent_path, filename) = path_to_parent(&path)?;
             url.set_path(parent_path.as_ref());
 
-            let (object_store, dir_path) =
-                ObjectStore::from_uri(url.as_str()).await.infer_error()?;
+            let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
+            let object_store_params =
+                storage_options
+                    .as_ref()
+                    .map(|storage_options| ObjectStoreParams {
+                        storage_options: Some(storage_options.clone()),
+                        ..Default::default()
+                    });
+
+            let (object_store, dir_path) = ObjectStore::from_uri_and_params(
+                object_store_registry,
+                url.as_str(),
+                &object_store_params.unwrap_or_default(),
+            )
+            .await
+            .infer_error()?;
             let child_path = dir_path.child(filename);
             return Ok((object_store, child_path));
         }
@@ -293,8 +318,12 @@ pub struct LanceFileReader {
 }
 
 impl LanceFileReader {
-    async fn open(uri_or_path: String) -> PyResult<Self> {
-        let (object_store, path) = object_store_from_uri_or_path(uri_or_path).await?;
+    async fn open(
+        uri_or_path: String,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let (object_store, path) =
+            object_store_from_uri_or_path(uri_or_path, storage_options).await?;
         let scheduler = ScanScheduler::new(
             Arc::new(object_store),
             SchedulerConfig {
@@ -354,8 +383,8 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    pub fn new(path: String) -> PyResult<Self> {
-        RT.runtime.block_on(Self::open(path))
+    pub fn new(path: String, storage_options: Option<HashMap<String, String>>) -> PyResult<Self> {
+        RT.runtime.block_on(Self::open(path, storage_options))
     }
 
     pub fn read_all(

@@ -159,18 +159,10 @@ impl IndexReader for v2::reader::FileReader {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
-        let projected_schema = match projection {
-            Some(projection) => Arc::new(self.schema().project(projection)?),
-            None => self.schema().clone(),
-        };
-        let column_indices = projected_schema
-            .fields
-            .iter()
-            .map(|f| f.id as u32)
-            .collect();
-        let projection = v2::reader::ReaderProjection {
-            schema: projected_schema,
-            column_indices,
+        let projection = if let Some(projection) = projection {
+            v2::reader::ReaderProjection::from_column_names(self.schema(), projection)?
+        } else {
+            v2::reader::ReaderProjection::from_whole_schema(self.schema())
         };
         let batches = self
             .read_stream_projected(

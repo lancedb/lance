@@ -586,6 +586,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row_ids.len(), Some(0));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(0));
     }
 
     #[tokio::test]

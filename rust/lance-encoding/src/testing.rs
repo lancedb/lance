@@ -5,7 +5,7 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
 use arrow::array::make_comparator;
 use arrow_array::{Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
 use futures::{future::BoxFuture, FutureExt, StreamExt};
@@ -69,12 +69,49 @@ impl EncodingsIo for SimulatedScheduler {
     }
 }
 
+fn column_indices_from_schema_helper(
+    fields: &[FieldRef],
+    column_indices: &mut Vec<u32>,
+    column_counter: &mut u32,
+) {
+    column_indices.push(*column_counter);
+    *column_counter += 1;
+    for field in fields {
+        match field.data_type() {
+            DataType::Struct(fields) => {
+                column_indices_from_schema_helper(fields.as_ref(), column_indices, column_counter);
+            }
+            DataType::List(inner) => {
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
+            }
+            DataType::LargeList(inner) => {
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
+            }
+            DataType::FixedSizeList(inner, _) => {
+                // FSL(primitive) does not get its own column
+                column_indices.pop();
+                *column_counter -= 1;
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
+            }
+            _ => {
+                column_indices_from_schema_helper(&[], column_indices, column_counter);
+            }
+        }
+    }
+}
+
+fn column_indices_from_schema(schema: &Schema) -> Vec<u32> {
+    let mut column_indices = Vec::new();
+    let mut column_counter = 0;
+    column_indices_from_schema_helper(schema.fields(), &mut column_indices, &mut column_counter);
+    column_indices
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn test_decode(
     num_rows: u64,
     batch_size: u32,
     schema: &Schema,
-    column_indices: &[u32],
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
     io: &Arc<dyn EncodingsIo>,
@@ -88,9 +125,10 @@ async fn test_decode(
         DecoderMiddlewareChain::new().add_strategy(Arc::new(CoreFieldDecoderStrategy {
             validate_data: true,
         }));
+    let column_indices = column_indices_from_schema(schema);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
-        column_indices,
+        &column_indices,
         column_infos,
         &Vec::new(),
         num_rows,
@@ -172,7 +210,7 @@ pub async fn check_round_trip_encoding_random(field: Field, metadata: HashMap<St
     check_round_trip_encoding_generated(
         field,
         Box::new(array_generator_provider),
-        LanceFileVersion::default_v2(),
+        LanceFileVersion::default(),
     )
     .await;
 }
@@ -415,7 +453,6 @@ async fn check_round_trip_encoding_inner(
         num_rows,
         test_cases.batch_size,
         &schema,
-        &[0],
         &column_infos,
         concat_data.clone(),
         &scheduler_copy.clone(),
@@ -451,7 +488,6 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
-            &[0],
             &column_infos,
             expected,
             &scheduler.clone(),
@@ -498,7 +534,6 @@ async fn check_round_trip_encoding_inner(
             num_rows,
             test_cases.batch_size,
             &schema,
-            &[0],
             &column_infos,
             expected,
             &scheduler.clone(),

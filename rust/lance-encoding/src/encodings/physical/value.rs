@@ -513,7 +513,7 @@ pub(crate) mod tests {
             let mut buffed_index = 1;
             let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
                 compression_scheme: CompressionScheme::None,
-                version: LanceFileVersion::default_v2(),
+                version: LanceFileVersion::default(),
             }))
             .unwrap();
             let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
