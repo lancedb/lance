@@ -1213,7 +1213,7 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::StringBuilder;
+    use arrow::array::{LargeListBuilder, StringBuilder};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
         Array, ArrayRef, BooleanArray, ListArray, StructArray, UInt64Array,
@@ -1229,9 +1229,19 @@ mod tests {
         DataType::List(Arc::new(Field::new("item", inner_type, true)))
     }
 
+    fn make_large_list_type(inner_type: DataType) -> DataType {
+        DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_list() {
+        let field = Field::new("", make_large_list_type(DataType::Int32), true);
         check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
@@ -1284,6 +1294,25 @@ mod tests {
     async fn test_simple_list() {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some(1), Some(2), Some(3)]);
+        list_builder.append_value([Some(4), Some(5)]);
+        list_builder.append_null();
+        list_builder.append_value([Some(6), Some(7), Some(8)]);
+        let list_array = list_builder.finish();
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3]);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_large_list() {
+        let items_builder = Int32Builder::new();
+        let mut list_builder = LargeListBuilder::new(items_builder);
         list_builder.append_value([Some(1), Some(2), Some(3)]);
         list_builder.append_value([Some(4), Some(5)]);
         list_builder.append_null();

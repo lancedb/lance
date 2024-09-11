@@ -890,18 +890,13 @@ impl MergeInsertJob {
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
-            let version = self
-                .dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_version()?;
             let new_fragments = write_fragments_internal(
-                None,
+                Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
                 self.dataset.schema(),
                 Box::pin(stream),
-                WriteParams::with_storage_version(version),
+                WriteParams::default(),
             )
             .await?;
             // Apply deletions
@@ -1917,7 +1912,7 @@ mod tests {
                 // Updated columns should be only columns in new data files
                 // -2 field ids are tombstoned.
                 assert_eq!(&data_files[0].fields, &[0, -2, -2]);
-                assert_eq!(&data_files[1].fields, &[1, 2]);
+                assert_eq!(&data_files[1].fields, &[2, 1]);
             };
             has_added_files(&fragments_after[1]);
             has_added_files(&fragments_after[2]);
