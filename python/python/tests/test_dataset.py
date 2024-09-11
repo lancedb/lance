@@ -540,8 +540,6 @@ def test_pickle(tmp_path: Path):
 
 
 def test_nested_projection(tmp_path: Path):
-    from lance.debug import format_fragment
-
     table = pa.Table.from_pydict(
         {
             "a": range(100),
@@ -554,7 +552,6 @@ def test_nested_projection(tmp_path: Path):
 
     dataset = lance.dataset(base_dir)
 
-    print(format_fragment(dataset.get_fragment(0).metadata, dataset))
     projected = dataset.to_table(columns=["struct.x"])
     assert projected == pa.Table.from_pydict({"struct.x": range(100)})
 
