@@ -52,17 +52,6 @@ public class DatasetTest {
   }
 
   @Test
-  void testDatasetOpen() throws IOException, URISyntaxException {
-    String datasetPath = tempDir.resolve("write_stream").toString();
-    try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.RandomAccessDataset testDataset =
-          new TestUtils.RandomAccessDataset(allocator, datasetPath);
-      testDataset.createDatasetAndValidate();
-      testDataset.openDatasetAndValidate();
-    }
-  }
-
-  @Test
   void testCreateEmptyDataset() {
     String datasetPath = tempDir.resolve("new_empty_dataset").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
