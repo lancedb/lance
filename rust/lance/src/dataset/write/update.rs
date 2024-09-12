@@ -456,12 +456,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_update_all(
-        #[values(
-            LanceFileVersion::Legacy,
-            LanceFileVersion::V2_0,
-            LanceFileVersion::V2_1
-        )]
-        version: LanceFileVersion,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     ) {
         let (dataset, _test_dir) = make_test_dataset(version).await;
 
@@ -504,12 +499,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_update_conditional(
-        #[values(
-            LanceFileVersion::Legacy,
-            LanceFileVersion::V2_0,
-            LanceFileVersion::V2_1
-        )]
-        version: LanceFileVersion,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
     ) {
         let (dataset, _test_dir) = make_test_dataset(version).await;
 

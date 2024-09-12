@@ -4,7 +4,7 @@
 use std::{fmt::Debug, ops::Range, sync::Arc, vec};
 
 use arrow::array::AsArray;
-use arrow_array::{make_array, ArrayRef};
+use arrow_array::{make_array, Array, ArrayRef};
 use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
@@ -15,6 +15,7 @@ use snafu::{location, Location};
 use lance_core::{datatypes::Field, Result};
 
 use crate::{
+    data::DataBlock,
     decoder::{
         DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
         PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine,
@@ -481,14 +482,16 @@ impl PrimitiveFieldEncoder {
             .array_encoding_strategy
             .create_array_encoder(&arrays, &self.field)?;
         let column_idx = self.column_index;
+        let data_type = self.field.data_type();
 
         Ok(tokio::task::spawn(async move {
-            let num_rows = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let data = DataBlock::from_arrays(&arrays, num_values);
             let mut buffer_index = 0;
-            let array = encoder.encode(&arrays, &mut buffer_index)?;
+            let array = encoder.encode(data, &data_type, &mut buffer_index)?;
             Ok(EncodedPage {
                 array,
-                num_rows,
+                num_rows: num_values,
                 column_idx,
             })
         })

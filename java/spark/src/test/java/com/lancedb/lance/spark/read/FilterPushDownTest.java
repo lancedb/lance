@@ -12,9 +12,8 @@
  * limitations under the License.
  */
 
-package com.lancedb.lance.spark;
+package com.lancedb.lance.spark.read;
 
-import com.lancedb.lance.spark.query.FilterPushDown;
 import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.sources.*;
 import org.junit.jupiter.api.Test;
@@ -22,7 +21,6 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class FilterPushDownTest {
-
   @Test
   public void testCompileFiltersToSqlWhereClause() {
     // Test case 1: GreaterThan, LessThanOrEqual, IsNotNull

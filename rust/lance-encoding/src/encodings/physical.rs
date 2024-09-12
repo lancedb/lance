@@ -2,14 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
+use block_compress::CompressionScheme;
 use fsst::FsstPageScheduler;
 use lance_arrow::DataTypeExt;
 use packed_struct::PackedStructPageScheduler;
 
-use crate::encodings::physical::value::CompressionScheme;
 use crate::{decoder::PageScheduler, format::pb};
 
-use self::value::parse_compression_scheme;
 use self::{
     basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
     dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
@@ -20,7 +19,7 @@ pub mod basic;
 pub mod binary;
 pub mod bitmap;
 pub mod bitpack;
-pub mod buffers;
+pub mod block_compress;
 pub mod dictionary;
 pub mod fixed_size_binary;
 pub mod fixed_size_list;
@@ -65,10 +64,17 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
 /// Convert a protobuf buffer encoding into a physical page scheduler
 fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn PageScheduler> {
     let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
-    let compression_scheme = if encoding.compression.is_none() {
+    let compression_scheme: CompressionScheme = if encoding.compression.is_none() {
         CompressionScheme::None
     } else {
-        parse_compression_scheme(encoding.compression.as_ref().unwrap().scheme.as_str()).unwrap()
+        encoding
+            .compression
+            .as_ref()
+            .unwrap()
+            .scheme
+            .as_str()
+            .parse()
+            .unwrap()
     };
     match encoding.bits_per_value {
         1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),
@@ -194,7 +200,6 @@ pub fn decoder_from_array_encoding(
             let should_decode_dict = !data_type.is_dictionary();
 
             Box::new(DictionaryPageScheduler::new(
-                data_type.clone(),
                 indices_scheduler.into(),
                 items_scheduler.into(),
                 num_dictionary_items,

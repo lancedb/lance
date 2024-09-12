@@ -8,7 +8,7 @@ use std::{ops::Deref, ptr::NonNull, sync::Arc};
 use arrow_buffer::{ArrowNativeType, Buffer, ScalarBuffer};
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{utils::bit::is_pwr_two, Error, Result};
 
 /// A copy-on-write byte buffer
 ///
@@ -111,8 +111,13 @@ impl LanceBuffer {
     ///
     /// If the buffer is properly aligned this will be zero-copy.  If not, a copy
     /// will be made and an owned buffer returned.
+    ///
+    /// If `bytes_per_value` is not a power of two, then we assume the buffer is
+    /// never going to be reinterpret into another type and we can safely
+    /// ignore the alignment.
     pub fn from_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self {
-        if bytes.as_ptr().align_offset(bytes_per_value as usize) != 0 {
+        if is_pwr_two(bytes_per_value) && bytes.as_ptr().align_offset(bytes_per_value as usize) != 0
+        {
             // The original buffer is not aligned, cannot zero-copy
             let mut buf = Vec::with_capacity(bytes.len());
             buf.extend_from_slice(&bytes);
