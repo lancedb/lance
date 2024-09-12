@@ -186,22 +186,6 @@ impl UpdateBuilder {
 // TODO: support distributed operation.
 
 #[derive(Debug, Clone)]
-pub struct UpdateFragmentStats {
-    pub num_new_fragment_rows: u64,
-    pub num_removed_rows: u64,
-    pub num_old_fragment_rows: u64,
-}
-
-impl UpdateFragmentStats {
-    pub fn sum(&self) -> u64 {
-        let total_updated_rows =
-            self.num_new_fragment_rows + self.num_old_fragment_rows + self.num_removed_rows;
-
-        return total_updated_rows;
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
@@ -209,7 +193,7 @@ pub struct UpdateJob {
 }
 
 impl UpdateJob {
-    pub async fn execute(self) -> Result<(Arc<Dataset>, UpdateFragmentStats)> {
+    pub async fn execute(self) -> Result<(Arc<Dataset>, u64)> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
 
@@ -269,22 +253,15 @@ impl UpdateJob {
             .unwrap();
         let (old_fragments, removed_fragment_ids) = self.apply_deletions(&removed_row_ids).await?;
 
-        let update_fragment_stats = UpdateFragmentStats {
-            num_new_fragment_rows: new_fragments
-                .iter()
-                .map(|f| f.num_rows().unwrap_or_default() as u64)
-                .sum::<u64>(),
-            num_removed_rows: removed_row_ids.len() as u64,
-            num_old_fragment_rows: old_fragments
-                .iter()
-                .map(|f| f.num_rows().unwrap_or_default() as u64)
-                .sum::<u64>(),
-        };
+        let num_updated_rows = new_fragments
+            .iter()
+            .map(|f| f.physical_rows.unwrap_or_default() as u64)
+            .sum::<u64>();
         // Commit updated and new fragments
         Ok((
             self.commit(removed_fragment_ids, old_fragments, new_fragments)
                 .await?,
-            update_fragment_stats,
+            num_updated_rows,
         ))
     }
 
@@ -529,7 +506,7 @@ mod tests {
 
         let original_fragments = dataset.get_fragments();
 
-        let (datase, _) = UpdateBuilder::new(dataset)
+        let (dataset, _) = UpdateBuilder::new(dataset)
             .update_where("id >= 15")
             .unwrap()
             .set("name", "'bar' || cast(id as string)")

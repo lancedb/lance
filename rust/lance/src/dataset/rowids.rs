@@ -410,7 +410,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
-        let dataset = UpdateBuilder::new(Arc::new(dataset))
+        let (dataset, _) = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 3")
             .unwrap()
             .set("id", "100")
