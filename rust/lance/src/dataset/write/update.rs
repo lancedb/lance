@@ -480,7 +480,7 @@ mod tests {
     ) {
         let (dataset, _test_dir) = make_test_dataset(version).await;
 
-        let dataset = UpdateBuilder::new(dataset)
+        let (dataset, _) = UpdateBuilder::new(dataset)
             .set("name", "'bar' || cast(id as string)")
             .unwrap()
             .build()
@@ -529,7 +529,7 @@ mod tests {
 
         let original_fragments = dataset.get_fragments();
 
-        let dataset = UpdateBuilder::new(dataset)
+        let (datase, _) = UpdateBuilder::new(dataset)
             .update_where("id >= 15")
             .unwrap()
             .set("name", "'bar' || cast(id as string)")

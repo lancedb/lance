@@ -941,7 +941,7 @@ impl Dataset {
             .block_on(None, operation.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        self.ds = new_self;
+        (self.ds, _) = new_self;
 
         Ok(())
     }
