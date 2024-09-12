@@ -186,6 +186,12 @@ impl UpdateBuilder {
 // TODO: support distributed operation.
 
 #[derive(Debug, Clone)]
+pub struct UpdateResult {
+    pub new_dataset: Arc<Dataset>,
+    pub rows_updated: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpdateJob {
     dataset: Arc<Dataset>,
     condition: Option<Expr>,
@@ -193,7 +199,7 @@ pub struct UpdateJob {
 }
 
 impl UpdateJob {
-    pub async fn execute(self) -> Result<(Arc<Dataset>, u64)> {
+    pub async fn execute(self) -> Result<UpdateResult> {
         let mut scanner = self.dataset.scan();
         scanner.with_row_id();
 
@@ -255,14 +261,16 @@ impl UpdateJob {
 
         let num_updated_rows = new_fragments
             .iter()
-            .map(|f| f.physical_rows.unwrap_or_default() as u64)
+            .map(|f| f.physical_rows.unwrap() as u64)
             .sum::<u64>();
         // Commit updated and new fragments
-        Ok((
-            self.commit(removed_fragment_ids, old_fragments, new_fragments)
-                .await?,
-            num_updated_rows,
-        ))
+        let new_dataset = self
+            .commit(removed_fragment_ids, old_fragments, new_fragments)
+            .await?;
+        Ok(UpdateResult {
+            new_dataset,
+            rows_updated: num_updated_rows,
+        })
     }
 
     fn apply_updates(
@@ -457,7 +465,7 @@ mod tests {
     ) {
         let (dataset, _test_dir) = make_test_dataset(version).await;
 
-        let (dataset, _) = UpdateBuilder::new(dataset)
+        let update_result = UpdateBuilder::new(dataset)
             .set("name", "'bar' || cast(id as string)")
             .unwrap()
             .build()
@@ -466,6 +474,7 @@ mod tests {
             .await
             .unwrap();
 
+        let dataset = update_result.new_dataset;
         let actual_batches = dataset
             .scan()
             .try_into_stream()
@@ -506,7 +515,7 @@ mod tests {
 
         let original_fragments = dataset.get_fragments();
 
-        let (dataset, _) = UpdateBuilder::new(dataset)
+        let update_result = UpdateBuilder::new(dataset)
             .update_where("id >= 15")
             .unwrap()
             .set("name", "'bar' || cast(id as string)")
@@ -517,6 +526,7 @@ mod tests {
             .await
             .unwrap();
 
+        let dataset = update_result.new_dataset;
         let actual_batches = dataset
             .scan()
             .try_into_stream()

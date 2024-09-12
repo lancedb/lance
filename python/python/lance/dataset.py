@@ -1061,7 +1061,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
-    ):
+    ) -> Dict[str, Any]:
         """
         Update column values for rows matching where.
 
@@ -1087,7 +1087,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        self._ds.update(updates, where)
+        return self._ds.update(updates, where)
 
     def versions(self):
         """
