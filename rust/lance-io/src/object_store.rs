@@ -923,6 +923,7 @@ async fn configure_store(
 }
 
 impl ObjectStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DynObjectStore>,
         location: Url,
