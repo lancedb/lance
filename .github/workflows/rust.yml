@@ -120,6 +120,9 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --check
         shell: bash
+      - name: Start DynamoDB local for tests
+        run: |
+          docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
         run: |
           cargo test --all-features -- --test-threads 1
@@ -155,6 +158,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - name: Select new xcode
+        # Default XCode right now is 15.0.1, which contains a bug that causes
+        # backtraces to not show properly. See: 
+        # https://github.com/rust-lang/rust/issues/113783
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
       - name: Install dependencies
         run: brew install protobuf
       - name: Set up Rust
@@ -162,8 +170,9 @@ jobs:
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
           rustup component add rustfmt
       - name: Run tests
-        run: |
-          cargo build --all-features
+        # Check all benches, even though we aren't going to run them.
+        run: |  
+          cargo build --tests --benches --all-features --workspace
           cargo test --all-features
   windows-build:
     runs-on: windows-latest
@@ -185,6 +194,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
       - name: Run tests
+        # Check all benches, even though we aren't going to run them.
         run: |
-          cargo build
+          cargo build --tests --benches --all-features --workspace
           cargo test

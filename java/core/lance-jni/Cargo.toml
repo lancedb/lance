@@ -14,6 +14,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lance = { workspace = true, features = ["substrait"] }
+lance-encoding = { path = "../../../rust/lance-encoding" }
+lance-linalg = { path = "../../../rust/lance-linalg" }
+lance-index = { path = "../../../rust/lance-index" }
 lance-io.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-schema.workspace = true

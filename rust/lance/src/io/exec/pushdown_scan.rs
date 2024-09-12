@@ -24,15 +24,17 @@ use datafusion::{
     },
     prelude::Expr,
 };
+use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
 use snafu::{location, Location};
 
-use crate::dataset::scanner::{DEFAULT_BATCH_READAHEAD, DEFAULT_FRAGMENT_READAHEAD};
+use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
 use crate::Error;
 use crate::{
     dataset::{
@@ -70,8 +72,8 @@ pub struct ScanConfig {
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
-            batch_readahead: DEFAULT_BATCH_READAHEAD,
-            fragment_readahead: DEFAULT_FRAGMENT_READAHEAD,
+            batch_readahead: get_num_compute_intensive_cpus(),
+            fragment_readahead: LEGACY_DEFAULT_FRAGMENT_READAHEAD,
             with_row_id: false,
             with_row_address: false,
             make_deletions_null: false,
@@ -102,10 +104,9 @@ impl LancePushdownScanExec {
     ) -> Result<Self> {
         // This should be infallible.
         let columns: Vec<_> = predicate
-            .to_columns()
-            .unwrap()
+            .column_refs()
             .into_iter()
-            .map(|col| col.name)
+            .map(|col| col.name.as_str())
             .collect();
         let dataset_schema = dataset.schema();
         let predicate_projection = Arc::new(dataset_schema.project(&columns)
@@ -146,6 +147,10 @@ impl LancePushdownScanExec {
 }
 
 impl ExecutionPlan for LancePushdownScanExec {
+    fn name(&self) -> &str {
+        "LancePushdownScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -154,7 +159,7 @@ impl ExecutionPlan for LancePushdownScanExec {
         self.output_schema.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -268,7 +273,7 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment.open(dataset.schema(), false, false).await?;
+        let mut reader = fragment.open(dataset.schema(), false, false, None).await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -361,10 +366,9 @@ impl FragmentScanner {
                 // 1. Load needed filter columns, which might be a subset of all filter
                 //    columns if statistics obviated the need for some columns.
                 let columns: Vec<_> = predicate
-                    .to_columns()
-                    .unwrap()
+                    .column_refs()
                     .into_iter()
-                    .map(|col| col.name)
+                    .map(|col| col.name.as_str())
                     .collect();
                 let predicate_projection =
                     Arc::new(self.fragment.dataset().schema().project(&columns).unwrap());
@@ -676,10 +680,12 @@ mod test {
     use arrow_select::concat::concat_batches;
     use datafusion::prelude::{lit, Column, SessionContext};
     use lance_arrow::{FixedSizeListArrayExt, SchemaExt};
+    use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    use crate::{datafusion::logical_expr::tests::ExprExt, dataset::WriteParams};
+    use crate::dataset::WriteParams;
+    use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
 
@@ -705,7 +711,16 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -752,7 +767,16 @@ mod test {
         .unwrap()];
         let batches = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
 
-        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(
+            batches,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
         let fragments = dataset.fragments().clone();
         let projection = Arc::new(dataset.schema().clone());
@@ -817,7 +841,18 @@ mod test {
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
-        let dataset = Arc::new(Dataset::write(batches, test_uri, None).await.unwrap());
+        let dataset = Arc::new(
+            Dataset::write(
+                batches,
+                test_uri,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::Legacy),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
 
         let fragments = dataset.fragments().clone();
         // [x.b, y.a]
@@ -899,6 +934,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 100,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let dataset = Arc::new(
@@ -1033,6 +1069,7 @@ mod test {
         let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
         let params = WriteParams {
             max_rows_per_group: 3,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, "memory://test", Some(params))
@@ -1238,6 +1275,7 @@ mod test {
 
             let write_params = WriteParams {
                 max_rows_per_group: 3,
+                data_storage_version: Some(LanceFileVersion::Legacy),
                 ..Default::default()
             };
             Dataset::write(reader, uri, Some(write_params))
@@ -1361,6 +1399,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
@@ -1423,6 +1462,7 @@ mod test {
 
         let write_params = WriteParams {
             max_rows_per_group: 4,
+            data_storage_version: Some(LanceFileVersion::Legacy),
             ..Default::default()
         };
         let mut dataset = Dataset::write(reader, test_uri, Some(write_params))

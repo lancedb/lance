@@ -3,7 +3,10 @@
 
 use bytes::Bytes;
 use lance_core::Result;
-use lance_io::{object_store::ObjectStore, scheduler::ScanScheduler};
+use lance_io::{
+    object_store::ObjectStore,
+    scheduler::{ScanScheduler, SchedulerConfig},
+};
 use object_store::path::Path;
 use rand::{seq::SliceRandom, RngCore};
 use std::{fmt::Display, process::Command, sync::Arc};
@@ -87,8 +90,10 @@ fn bench_full_read(c: &mut Criterion) {
                             .output()
                             .unwrap();
                     }
+                    std::env::set_var("IO_THREADS", io_parallelism.to_string());
                     runtime.block_on(async {
-                        let scheduler = ScanScheduler::new(obj_store, params.io_parallelism);
+                        let scheduler =
+                            ScanScheduler::new(obj_store, SchedulerConfig::default_for_testing());
                         let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
                         let (tx, rx) = mpsc::channel(1024);
@@ -173,8 +178,12 @@ fn bench_random_read(c: &mut Criterion) {
                                 .output()
                                 .unwrap();
                         }
+                        std::env::set_var("IO_THREADS", params.io_parallelism.to_string());
                         runtime.block_on(async {
-                            let scheduler = ScanScheduler::new(obj_store, params.io_parallelism);
+                            let scheduler = ScanScheduler::new(
+                                obj_store,
+                                SchedulerConfig::default_for_testing(),
+                            );
                             let file_scheduler = scheduler.open_file(&tmp_file).await.unwrap();
 
                             let (tx, rx) = mpsc::channel(1024);

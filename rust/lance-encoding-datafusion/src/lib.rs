@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
-use futures::FutureExt;
 use lance_core::{
     datatypes::{Field, Schema},
     Result,
 };
 use lance_encoding::{
-    decoder::{ColumnInfo, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
-    encoder::{ColumnIndexSequence, CoreFieldEncodingStrategy, FieldEncodingStrategy},
+    decoder::{ColumnInfoIter, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
+    encoder::{
+        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodingOptions, FieldEncodingStrategy,
+    },
     encodings::physical::FileBuffers,
 };
 use zone::{extract_zone_info, UnloadedPushdown, ZoneMapsFieldEncoder, ZoneMapsFieldScheduler};
@@ -90,17 +87,17 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<(
         DecoderMiddlewareChainCursor<'a>,
-        BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
+        Result<Arc<dyn FieldScheduler>>,
     )> {
         let is_root = self.initialize();
 
         if let Some((rows_per_map, unloaded_pushdown)) = extract_zone_info(
-            column_infos.front_mut().unwrap(),
+            column_infos.next().unwrap(),
             &field.data_type(),
             chain.current_path(),
         ) {
@@ -119,39 +116,36 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
             None
         };
         let schema = self.schema.clone();
-        let io = chain.io().clone();
+        let _io = chain.io().clone();
 
-        let scheduler_fut = async move {
-            let next = next.await?;
-            if is_root {
-                let state = state.unwrap();
-                let rows_per_map = state.rows_per_map;
-                let zone_map_buffers = state.zone_map_buffers;
-                let num_rows = next.num_rows();
-                if rows_per_map.is_none() {
-                    // No columns had any pushdown info
-                    Ok(next)
-                } else {
-                    let mut scheduler = ZoneMapsFieldScheduler::new(
-                        next,
-                        schema,
-                        zone_map_buffers,
-                        rows_per_map.unwrap(),
-                        num_rows,
-                    );
-                    // Load all the zone maps from disk
-                    // TODO: it would be slightly more efficient to do this
-                    // later when we know what columns are actually used
-                    // for filtering.
-                    scheduler.initialize(io.as_ref()).await?;
-                    Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
-                }
+        let next = next?;
+        if is_root {
+            let state = state.unwrap();
+            let rows_per_map = state.rows_per_map;
+            let zone_map_buffers = state.zone_map_buffers;
+            let num_rows = next.num_rows();
+            if rows_per_map.is_none() {
+                // No columns had any pushdown info
+                Ok((chain, Ok(next)))
             } else {
-                Ok(next)
+                let mut _scheduler = ZoneMapsFieldScheduler::new(
+                    next,
+                    schema,
+                    zone_map_buffers,
+                    rows_per_map.unwrap(),
+                    num_rows,
+                );
+                // Load all the zone maps from disk
+                // TODO: it would be slightly more efficient to do this
+                // later when we know what columns are actually used
+                // for filtering.
+                // scheduler.initialize(io.as_ref()).await?;
+                // Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
+                todo!()
             }
+        } else {
+            Ok((chain, Ok(next)))
         }
-        .boxed();
-        Ok((chain, scheduler_fut))
     }
 }
 
@@ -178,9 +172,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
         encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &lance_core::datatypes::Field,
         column_index: &mut ColumnIndexSequence,
-        cache_bytes_per_column: u64,
-        keep_original_array: bool,
-        config: &std::collections::HashMap<String, String>,
+        options: &EncodingOptions,
     ) -> lance_core::Result<Box<dyn lance_encoding::encoder::FieldEncoder>> {
         let data_type = field.data_type();
         if data_type.is_primitive()
@@ -194,9 +186,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 &self.core,
                 field,
                 column_index,
-                cache_bytes_per_column,
-                keep_original_array,
-                config,
+                options,
             )?;
             Ok(Box::new(ZoneMapsFieldEncoder::try_new(
                 inner_encoder,
@@ -204,14 +194,8 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 self.rows_per_map,
             )?))
         } else {
-            self.core.create_field_encoder(
-                encoding_strategy_root,
-                field,
-                column_index,
-                cache_bytes_per_column,
-                keep_original_array,
-                config,
-            )
+            self.core
+                .create_field_encoder(encoding_strategy_root, field, column_index, options)
         }
     }
 }

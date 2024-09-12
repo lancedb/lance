@@ -47,6 +47,9 @@ pub struct IvfBuildParams {
 
     /// Use residual vectors to build sub-vector.
     pub use_residual: bool,
+
+    /// Storage options used to load precomputed partitions.
+    pub storage_options: Option<HashMap<String, String>>,
 }
 
 impl Default for IvfBuildParams {
@@ -61,6 +64,7 @@ impl Default for IvfBuildParams {
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
             use_residual: true,
+            storage_options: None,
         }
     }
 }

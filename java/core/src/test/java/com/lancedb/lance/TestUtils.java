@@ -43,6 +43,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestUtils {
   public static class SimpleTestDataset {
@@ -113,6 +114,27 @@ public class TestUtils {
           rowcount += currentRowCount;
         }
         assertEquals(totalRows, rowcount);
+      }
+    }
+
+    public void validateScanResults(Dataset dataset, Scanner scanner, int expectedRows, int batchRows, int offset)
+        throws IOException {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        int rowcount = 0;
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          int currentRowCount = root.getRowCount();
+          assertTrue(currentRowCount <= batchRows);
+          rowcount += currentRowCount;
+
+          IntVector idVector = (IntVector) root.getVector("id");
+          for (int i = 0; i < currentRowCount; i++) {
+            int expectedId = offset + rowcount - currentRowCount + i;
+            assertEquals(expectedId, idVector.get(i), "Mismatch at row " + (rowcount - currentRowCount + i));
+          }
+        }
+        assertEquals(expectedRows, rowcount);
       }
     }
   }

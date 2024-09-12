@@ -121,6 +121,22 @@ message Manifest {
   //
   // This is only used if the "move_stable_row_ids" feature flag is set.
   uint64 next_row_id = 14;
+
+  message DataStorageFormat {
+    // The format of the data files (e.g. "lance")
+    string file_format = 1;
+    // The max format version of the data files.
+    //
+    // This is the maximum version of the file format that the dataset will create.
+    // This may be lower than the maximum version that can be written in order to allow
+    // older readers to read the dataset.
+    string version = 2;
+  }
+
+  // The data storage format
+  //
+  // This specifies what format is used to store the data files.
+  DataStorageFormat data_format = 15;
 } // Manifest
 
 // Auxiliary Data attached to a version.
@@ -200,6 +216,11 @@ message DataFile {
   string path = 1;
   // The ids of the fields/columns in this file.
   //
+  // -1 is used for "unassigned" while in memory. It is not meant to be written
+  // to disk. -2 is used for "tombstoned", meaningful a field that is no longer
+  // in use. This is often because the original field id was reassigned to a
+  // different data file.
+  //
   // In Lance v1 IDs are assigned based on position in the file, offset by the max
   // existing field id in the table (if any already). So when a fragment is first
   // created with one file of N columns, the field ids will be 1, 2, ..., N. If a
@@ -235,7 +256,7 @@ message DataFile {
   // - dimension: packed-struct (0):
   //   - x: u32 (1)
   //   - y: u32 (2)
-  // - path: string (3)
+  // - path: list<u32> (3)
   // - embedding: fsl<768> (4)
   //   - fp64
   // - borders: fsl<4> (5)
@@ -249,7 +270,7 @@ message DataFile {
   // This reflects quite a few phenomenon:
   // - The packed struct is encoded into a single column and there is no top-level column
   //   for the x or y fields
-  // - The string is encoded into two columns
+  // - The variable sized list is encoded into two columns
   // - The embedding is encoded into a single column (common for FSL of primitive) and there
   //   is not "FSL column"
   // - The borders field actually does have an "FSL column"

@@ -390,9 +390,60 @@ impl U64Segment {
             })
         };
         let stats = Self::compute_stats(make_new_iter());
-
-        // Then just use Self::From_stats_and_sequence
         Self::from_stats_and_sequence(stats, make_new_iter())
+    }
+
+    pub fn mask(&mut self, positions: &[u32]) {
+        if positions.is_empty() {
+            return;
+        }
+        if positions.len() == self.len() {
+            *self = Self::Range(0..0);
+            return;
+        }
+        let count = (self.len() - positions.len()) as u64;
+        let sorted = match self {
+            Self::Range(_) => true,
+            Self::RangeWithHoles { .. } => true,
+            Self::RangeWithBitmap { .. } => true,
+            Self::SortedArray(_) => true,
+            Self::Array(_) => false,
+        };
+        // To get minimum, need to find the first value that is not masked.
+        let first_unmasked = (0..self.len())
+            .zip(positions.iter().cycle())
+            .find(|(sequential_i, i)| **i != *sequential_i as u32)
+            .map(|(sequential_i, _)| sequential_i)
+            .unwrap();
+        let min = self.get(first_unmasked).unwrap();
+
+        let last_unmasked = (0..self.len())
+            .rev()
+            .zip(positions.iter().rev().cycle())
+            .filter(|(sequential_i, i)| **i != *sequential_i as u32)
+            .map(|(sequential_i, _)| sequential_i)
+            .next()
+            .unwrap();
+        let max = self.get(last_unmasked).unwrap();
+
+        let stats = SegmentStats {
+            min,
+            max,
+            count,
+            sorted,
+        };
+
+        let mut positions = positions.iter().copied().peekable();
+        let sequence = self.iter().enumerate().filter_map(move |(i, val)| {
+            if let Some(next_pos) = positions.peek() {
+                if *next_pos == i as u32 {
+                    positions.next();
+                    return None;
+                }
+            }
+            Some(val)
+        });
+        *self = Self::from_stats_and_sequence(stats, sequence)
     }
 }
 

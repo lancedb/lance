@@ -43,9 +43,10 @@ Preview releases receive the same level of testing as regular releases.
 
    Quickstart <./notebooks/quickstart>
    ./read_and_write
-   File Format <./format>
+   Lance Formats <./format>
    Arrays <./arrays>
    Integrations <./integrations/integrations>
+   Performance Guide <./performance>
    API References <./api/api>
    Contributor Guide <./contributing>
    Examples <./examples/examples>

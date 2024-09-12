@@ -19,7 +19,6 @@ no-default-features = true
 lance-arrow = { workspace = true }
 lance-core = { workspace = true }
 lance-datafusion = { workspace = true }
-lance-datagen = { workspace = true }
 lance-encoding = { workspace = true }
 lance-file = { workspace = true }
 lance-io = { workspace = true }
@@ -56,19 +55,17 @@ rand.workspace = true
 futures.workspace = true
 uuid.workspace = true
 arrow.workspace = true
-num_cpus.workspace = true
 # TODO: use datafusion sub-modules to reduce build size?
 datafusion.workspace = true
 datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
 lapack = { version = "0.19.0", optional = true }
-lru_time_cache = "0.11"
-ordered-float = "3.6.0"
 snafu = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 moka.workspace = true
+tantivy.workspace = true
 tfrecord = { version = "0.15.0", optional = true, features = ["async"] }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 tempfile.workspace = true
@@ -86,6 +83,7 @@ prost-build.workspace = true
 
 [dev-dependencies]
 lance-test-macros = { workspace = true }
+lance-datagen = { workspace = true }
 pretty_assertions = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 criterion = { workspace = true }
@@ -98,6 +96,8 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 env_logger = "0.10.0"
 tracing-chrome = "0.7.1"
 rstest = "0.19.0"
+random_word = { version = "0.4.3", features = ["en"] }
+
 
 [features]
 fp16kernels = ["lance-linalg/fp16kernels"]
@@ -126,4 +126,8 @@ harness = false
 
 [[bench]]
 name = "ivf_pq"
+harness = false
+
+[[bench]]
+name = "take"
 harness = false

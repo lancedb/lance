@@ -3,15 +3,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, ArrayRef};
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    data::DataBlock,
+    decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -36,13 +37,13 @@ impl FixedListScheduler {
 impl PageScheduler for FixedListScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let expanded_ranges = ranges
             .iter()
-            .map(|range| (range.start * self.dimension)..(range.end * self.dimension))
+            .map(|range| (range.start * self.dimension as u64)..(range.end * self.dimension as u64))
             .collect::<Vec<_>>();
         trace!(
             "Expanding {} fsl ranges across {}..{} to item ranges across {}..{}",
@@ -60,47 +61,27 @@ impl PageScheduler for FixedListScheduler {
             let items_decoder = inner_page_decoder.await?;
             Ok(Box::new(FixedListDecoder {
                 items_decoder,
-                dimension,
-            }) as Box<dyn PhysicalPageDecoder>)
+                dimension: dimension as u64,
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
 }
 
 pub struct FixedListDecoder {
-    items_decoder: Box<dyn PhysicalPageDecoder>,
-    dimension: u32,
+    items_decoder: Box<dyn PrimitivePageDecoder>,
+    dimension: u64,
 }
 
-impl PhysicalPageDecoder for FixedListDecoder {
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    ) {
+impl PrimitivePageDecoder for FixedListDecoder {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .update_capacity(rows_to_skip, num_rows, buffers, all_null);
-    }
-
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        let rows_to_skip = rows_to_skip * self.dimension;
-        let num_rows = num_rows * self.dimension;
-        self.items_decoder
-            .decode_into(rows_to_skip, num_rows, dest_buffers)?;
-        Ok(())
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.items_decoder.num_buffers()
+        let num_child_rows = num_rows * self.dimension;
+        let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
+        let mut child_data = child_data.as_fixed_width()?;
+        child_data.num_values = num_rows;
+        child_data.bits_per_value *= self.dimension;
+        Ok(DataBlock::FixedWidth(child_data))
     }
 }
 
@@ -120,29 +101,40 @@ impl FslEncoder {
 }
 
 impl ArrayEncoder for FslEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let inner_arrays = arrays
-            .iter()
-            .map(|arr| arr.as_fixed_size_list().values().clone())
-            .collect::<Vec<_>>();
-        let items_page = self.items_encoder.encode(&inner_arrays, buffer_index)?;
-        Ok(EncodedArray {
-            buffers: items_page.buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeList(Box::new(
-                    pb::FixedSizeList {
-                        dimension: self.dimension,
-                        items: Some(Box::new(items_page.encoding)),
-                    },
-                ))),
-            },
-        })
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let inner_type = match data_type {
+            DataType::FixedSizeList(inner_field, _) => inner_field.data_type().clone(),
+            _ => panic!("Expected fixed size list data type and got {}", data_type),
+        };
+        let mut data = data.as_fixed_width()?;
+        data.bits_per_value /= self.dimension as u64;
+        data.num_values *= self.dimension as u64;
+        let data = DataBlock::FixedWidth(data);
+
+        let encoded_data = self.items_encoder.encode(data, &inner_type, buffer_index)?;
+
+        let data = match encoded_data.data {
+            DataBlock::FixedWidth(mut data) => {
+                data.bits_per_value *= self.dimension as u64;
+                data.num_values /= self.dimension as u64;
+                DataBlock::FixedWidth(data)
+            }
+            _ => panic!("Expected fixed width data block"),
+        };
+
+        let encoding = ProtobufUtils::fixed_size_list(encoded_data.encoding, self.dimension);
+        Ok(EncodedArray { data, encoding })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
     use arrow_schema::{DataType, Field};
 
@@ -156,7 +148,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, HashMap::new()).await;
         }
     }
 }

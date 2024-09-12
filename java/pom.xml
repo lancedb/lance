@@ -6,10 +6,25 @@
 
     <groupId>com.lancedb</groupId>
     <artifactId>lance-parent</artifactId>
-    <version>0.11.0-SNAPSHOT</version>
+    <version>0.0.4</version>
     <packaging>pom</packaging>
 
     <name>Lance Parent</name>
+    <description>Lance Format Java API</description>
+    <url>http://lancedb.com/</url>
+
+    <developers>
+        <developer>
+            <name>Lance DB Dev Group</name>
+            <email>dev@lancedb.com</email>
+        </developer>
+    </developers>
+    <licenses>
+        <license>
+            <name>The Apache Software License, Version 2.0</name>
+            <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+        </license>
+    </licenses>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -21,6 +36,12 @@
         <module>core</module>
         <module>spark</module>
     </modules>
+
+    <scm>
+        <connection>scm:git:https://github.com/lancedb/lance.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/lancedb/lance.git</developerConnection>
+        <url>https://github.com/lancedb/lance</url>
+    </scm>
 
     <dependencyManagement>
         <dependencies>
@@ -57,7 +78,12 @@
             <dependency>
                 <groupId>org.json</groupId>
                 <artifactId>json</artifactId>
-                <version>20210307</version>
+                <version>20231013</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-lang3</artifactId>
+                <version>3.14.0</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -122,6 +148,14 @@
                     </execution>
                 </executions>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-release-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <autoVersionSubmodules>true</autoVersionSubmodules>
+                </configuration>
+            </plugin>
         </plugins>
         <pluginManagement>
             <plugins>
@@ -182,7 +216,8 @@
                         <version>3.2.5</version>
                         <configuration>
                             <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
-                            <forkNode implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
+                            <forkNode
+                                implementation="org.apache.maven.plugin.surefire.extensions.SurefireForkNodeFactory" />
                             <useSystemClassLoader>false</useSystemClassLoader>
                         </configuration>
                     </plugin>
@@ -193,6 +228,16 @@
             <id>deploy-to-ossrh</id>
             <build>
                 <plugins>
+                    <plugin>
+                        <groupId>org.sonatype.central</groupId>
+                        <artifactId>central-publishing-maven-plugin</artifactId>
+                        <version>0.4.0</version>
+                        <extensions>true</extensions>
+                        <configuration>
+                            <publishingServerId>ossrh</publishingServerId>
+                            <tokenAuth>true</tokenAuth>
+                        </configuration>
+                    </plugin>
                     <plugin>
                         <groupId>org.sonatype.plugins</groupId>
                         <artifactId>nexus-staging-maven-plugin</artifactId>

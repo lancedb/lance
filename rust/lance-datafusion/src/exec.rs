@@ -5,25 +5,28 @@
 
 use std::sync::{Arc, Mutex};
 
+use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     dataframe::DataFrame,
     datasource::streaming::StreamingTable,
     execution::{
-        context::{SessionConfig, SessionContext, SessionState},
+        context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
         memory_pool::FairSpillPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
         TaskContext,
     },
     physical_plan::{
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, streaming::PartitionStream, DisplayAs, DisplayFormatType,
+        ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use lazy_static::lazy_static;
 
+use futures::stream;
 use lance_arrow::SchemaExt;
 use lance_core::Result;
 use log::{info, warn};
@@ -56,6 +59,15 @@ impl OneShotExec {
                 datafusion::physical_plan::ExecutionMode::Bounded,
             ),
         }
+    }
+
+    pub fn from_batch(batch: RecordBatch) -> Self {
+        let schema = batch.schema();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch)]),
+        ));
+        Self::new(stream)
     }
 }
 
@@ -97,6 +109,10 @@ impl DisplayAs for OneShotExec {
 }
 
 impl ExecutionPlan for OneShotExec {
+    fn name(&self) -> &str {
+        "OneShotExec"
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -105,7 +121,7 @@ impl ExecutionPlan for OneShotExec {
         self.schema.clone()
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -180,13 +196,7 @@ impl LanceExecutionOptions {
     }
 }
 
-/// Executes a plan using default session & runtime configuration
-///
-/// Only executes a single partition.  Panics if the plan has more than one partition.
-pub fn execute_plan(
-    plan: Arc<dyn ExecutionPlan>,
-    options: LanceExecutionOptions,
-) -> Result<SendableRecordBatchStream> {
+pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
     let session_config = SessionConfig::new();
     let mut runtime_config = RuntimeConfig::new();
     if options.use_spilling() {
@@ -195,12 +205,48 @@ pub fn execute_plan(
             options.mem_pool_size() as usize
         )));
     }
-    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
-    let session_state = SessionState::new_with_config_rt(session_config, runtime_env);
+    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+    SessionContext::new_with_config_rt(session_config, runtime_env)
+}
+
+lazy_static! {
+    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
+        new_session_context(LanceExecutionOptions::default());
+    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
+        new_session_context(LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        })
+    };
+}
+
+pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
+    let session_ctx: SessionContext;
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
+        if options.use_spilling() {
+            session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+        } else {
+            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
+        }
+    } else {
+        session_ctx = new_session_context(options)
+    }
+    session_ctx
+}
+
+/// Executes a plan using default session & runtime configuration
+///
+/// Only executes a single partition.  Panics if the plan has more than one partition.
+pub fn execute_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<SendableRecordBatchStream> {
+    let session_ctx = get_session_context(options);
+
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
-    Ok(plan.execute(0, session_state.task_ctx())?)
+    Ok(plan.execute(0, session_ctx.task_ctx())?)
 }
 
 pub trait SessionContextExt {

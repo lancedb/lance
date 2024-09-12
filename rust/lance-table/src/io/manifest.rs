@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
 use lance_arrow::DataTypeExt;
-use lance_file::writer::ManifestProvider;
+use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
 use snafu::{location, Location};
@@ -22,7 +22,7 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, Index, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
 
 /// Read Manifest on URI.
 ///
@@ -197,7 +197,11 @@ impl ManifestProvider for ManifestDescribing {
         object_writer: &mut ObjectWriter,
         schema: &Schema,
     ) -> Result<Option<usize>> {
-        let mut manifest = Manifest::new(schema.clone(), Arc::new(vec![]));
+        let mut manifest = Manifest::new(
+            schema.clone(),
+            Arc::new(vec![]),
+            DataStorageFormat::new(LanceFileVersion::Legacy),
+        );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
     }
@@ -239,7 +243,7 @@ mod test {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
-        let mut manifest = Manifest::new(schema, Arc::new(vec![]));
+        let mut manifest = Manifest::new(schema, Arc::new(vec![]), DataStorageFormat::default());
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();

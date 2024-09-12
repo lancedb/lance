@@ -6,14 +6,16 @@ use std::borrow::Cow;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Error;
-use lance_datafusion::chunker::chunk_stream;
+use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
+use lance_file::v2::writer::FileWriterOptions;
+use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
-use lance_table::format::Fragment;
+use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
 use uuid::Uuid;
@@ -67,6 +69,75 @@ impl<'a> FragmentCreateBuilder<'a> {
         self.write_impl(stream, schema, id).await
     }
 
+    async fn write_v2_impl(
+        &self,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
+        id: u64,
+    ) -> Result<Fragment> {
+        let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+        let progress = params.progress.as_ref();
+
+        Self::validate_schema(&schema, stream.schema().as_ref())?;
+
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
+            self.dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let mut fragment = Fragment::new(id);
+        let full_path = base_path.child(DATA_DIR).child(filename.clone());
+        let obj_writer = object_store.create(&full_path).await?;
+        let mut writer = lance_file::v2::writer::FileWriter::try_new(
+            obj_writer,
+            schema,
+            FileWriterOptions::default(),
+        )?;
+
+        let (major, minor) = writer.version().to_numbers();
+
+        let data_file = DataFile::new_unstarted(filename, major, minor);
+        fragment.files.push(data_file);
+
+        progress.begin(&fragment).await?;
+
+        let break_limit = (128 * 1024).min(params.max_rows_per_file);
+
+        let mut broken_stream = break_stream(stream, break_limit)
+            .map_ok(|batch| vec![batch])
+            .boxed();
+        while let Some(batched_chunk) = broken_stream.next().await {
+            let batch_chunk = batched_chunk?;
+            writer.write_batches(batch_chunk.iter()).await?;
+        }
+
+        fragment.physical_rows = Some(writer.finish().await? as usize);
+
+        if matches!(fragment.physical_rows, Some(0)) {
+            return Err(Error::invalid_input("Input data was empty.", location!()));
+        }
+
+        let field_ids = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect::<Vec<_>>();
+        let column_indices = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect::<Vec<_>>();
+
+        fragment.files[0].fields = field_ids;
+        fragment.files[0].column_indices = column_indices;
+
+        progress.complete(&fragment).await?;
+
+        Ok(fragment)
+    }
+
     async fn write_impl(
         &self,
         stream: SendableRecordBatchStream,
@@ -76,11 +147,22 @@ impl<'a> FragmentCreateBuilder<'a> {
         let id = id.unwrap_or_default();
 
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+
+        let storage_version = params.storage_version_or_default();
+
+        if storage_version != LanceFileVersion::Legacy {
+            return self.write_v2_impl(stream, schema, id).await;
+        }
         let progress = params.progress.as_ref();
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
-        let (object_store, base_path) = ObjectStore::from_uri(self.dataset_uri).await?;
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
+            self.dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+        .await?;
         let filename = format!("{}.lance", Uuid::new_v4());
         let mut fragment = Fragment::with_file_legacy(id, &filename, &schema, None);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
@@ -92,7 +174,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         )
         .await?;
 
-        progress.begin(&fragment, writer.multipart_id()).await?;
+        progress.begin(&fragment).await?;
 
         let mut buffered_reader = chunk_stream(stream, params.max_rows_per_group);
         while let Some(batched_chunk) = buffered_reader.next().await {
@@ -273,6 +355,7 @@ mod tests {
         assert_eq!(fragment.id, 42);
         assert_eq!(fragment.deletion_file, None);
         assert_eq!(fragment.files.len(), 1);
-        assert_eq!(fragment.files[0].fields, vec![1, 3]);
+        assert_eq!(fragment.files[0].fields, vec![3, 1]);
+        assert_eq!(fragment.files[0].column_indices, vec![0, 1]);
     }
 }

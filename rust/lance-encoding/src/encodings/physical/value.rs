@@ -1,56 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
-use lance_arrow::DataTypeExt;
 use log::trace;
 use snafu::{location, Location};
-use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use crate::buffer::LanceBuffer;
+use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::format::ProtobufUtils;
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
-    encoder::{ArrayEncoder, BufferEncoder, EncodedArray, EncodedArrayBuffer},
-    format::pb,
+    decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 
 use lance_core::{Error, Result};
 
-use super::buffers::{
-    BitmapBufferEncoder, CompressedBufferEncoder, FlatBufferEncoder, GeneralBufferCompressor,
-};
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CompressionScheme {
-    None,
-    Zstd,
-}
-
-impl fmt::Display for CompressionScheme {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let scheme_str = match self {
-            Self::Zstd => "zstd",
-            Self::None => "none",
-        };
-        write!(f, "{}", scheme_str)
-    }
-}
-
-pub fn parse_compression_scheme(scheme: &str) -> Result<CompressionScheme> {
-    match scheme {
-        "none" => Ok(CompressionScheme::None),
-        "zstd" => Ok(CompressionScheme::Zstd),
-        _ => Err(Error::invalid_input(
-            format!("Unknown compression scheme: {}", scheme),
-            location!(),
-        )),
-    }
-}
+use super::block_compress::{CompressionScheme, GeneralBufferCompressor};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -82,17 +52,17 @@ impl ValuePageScheduler {
 impl PageScheduler for ValuePageScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);
         let byte_ranges = if self.compression_scheme == CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
-                    let start = self.buffer_offset + (range.start as u64 * self.bytes_per_value);
-                    let end = self.buffer_offset + (range.end as u64 * self.bytes_per_value);
+                    let start = self.buffer_offset + (range.start * self.bytes_per_value);
+                    let end = self.buffer_offset + (range.end * self.bytes_per_value);
                     min = min.min(start);
                     max = max.max(end);
                     start..end
@@ -122,8 +92,8 @@ impl PageScheduler for ValuePageScheduler {
             ranges
                 .iter()
                 .map(|range| {
-                    let start = (range.start as u64 * bytes_per_value) as usize;
-                    let end = (range.end as u64 * bytes_per_value) as usize;
+                    let start = (range.start * bytes_per_value) as usize;
+                    let end = (range.end * bytes_per_value) as usize;
                     start..end
                 })
                 .collect::<Vec<_>>()
@@ -139,7 +109,7 @@ impl PageScheduler for ValuePageScheduler {
                 data: bytes,
                 uncompressed_data: Arc::new(Mutex::new(None)),
                 uncompressed_range_offsets: range_offsets,
-            }) as Box<dyn PhysicalPageDecoder>)
+            }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -182,149 +152,106 @@ impl ValuePageDecoder {
         !self.uncompressed_range_offsets.is_empty()
     }
 
-    fn decode_buffer(
-        &self,
-        buf: &Bytes,
-        bytes_to_skip: &mut u64,
-        bytes_to_take: &mut u64,
-        dest: &mut bytes::BytesMut,
-    ) {
-        let buf_len = buf.len() as u64;
-        if *bytes_to_skip > buf_len {
-            *bytes_to_skip -= buf_len;
-        } else {
-            let bytes_to_take_here = (buf_len - *bytes_to_skip).min(*bytes_to_take);
-            *bytes_to_take -= bytes_to_take_here;
-            let start = *bytes_to_skip as usize;
-            let end = start + bytes_to_take_here as usize;
-            dest.extend_from_slice(&buf.slice(start..end));
-            *bytes_to_skip = 0;
+    fn decode_buffers<'a>(
+        &'a self,
+        buffers: impl IntoIterator<Item = &'a Bytes>,
+        mut bytes_to_skip: u64,
+        mut bytes_to_take: u64,
+    ) -> LanceBuffer {
+        let mut dest: Option<Vec<u8>> = None;
+
+        for buf in buffers.into_iter() {
+            let buf_len = buf.len() as u64;
+            if bytes_to_skip > buf_len {
+                bytes_to_skip -= buf_len;
+            } else {
+                let bytes_to_take_here = (buf_len - bytes_to_skip).min(bytes_to_take);
+                bytes_to_take -= bytes_to_take_here;
+                let start = bytes_to_skip as usize;
+                let end = start + bytes_to_take_here as usize;
+                let slice = buf.slice(start..end);
+                match (&mut dest, bytes_to_take) {
+                    (None, 0) => {
+                        // The entire request is contained in one buffer so we can maybe zero-copy
+                        // if the slice is aligned properly
+                        return LanceBuffer::from_bytes(slice, dbg!(self.bytes_per_value));
+                    }
+                    (None, _) => {
+                        dest.replace(Vec::with_capacity(bytes_to_take as usize));
+                    }
+                    _ => {}
+                }
+                dest.as_mut().unwrap().extend_from_slice(&slice);
+                bytes_to_skip = 0;
+            }
         }
+        LanceBuffer::from(dest.unwrap_or_default())
     }
 }
 
-impl PhysicalPageDecoder for ValuePageDecoder {
-    fn update_capacity(
-        &self,
-        _rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        _all_null: &mut bool,
-    ) {
-        buffers[0].0 = self.bytes_per_value * num_rows as u64;
-        buffers[0].1 = true;
-    }
+impl PrimitivePageDecoder for ValuePageDecoder {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+        let bytes_to_skip = rows_to_skip * self.bytes_per_value;
+        let bytes_to_take = num_rows * self.bytes_per_value;
 
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        let mut bytes_to_skip = rows_to_skip as u64 * self.bytes_per_value;
-        let mut bytes_to_take = num_rows as u64 * self.bytes_per_value;
-
-        let dest = &mut dest_buffers[0];
-
-        debug_assert!(dest.capacity() as u64 >= bytes_to_take);
-
-        if self.is_compressed() {
+        let data_buffer = if self.is_compressed() {
             let decoding_data = self.get_uncompressed_bytes()?;
-            for buf in decoding_data.lock().unwrap().as_ref().unwrap() {
-                self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
-            }
+            let buffers = decoding_data.lock().unwrap();
+            self.decode_buffers(buffers.as_ref().unwrap(), bytes_to_skip, bytes_to_take)
         } else {
-            for buf in &self.data {
-                self.decode_buffer(buf, &mut bytes_to_skip, &mut bytes_to_take, dest);
-            }
-        }
-        Ok(())
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1
+            self.decode_buffers(&self.data, bytes_to_skip, bytes_to_take)
+        };
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            data: data_buffer,
+            num_values: num_rows,
+        }))
     }
 }
 
-#[derive(Debug)]
-pub struct ValueEncoder {
-    buffer_encoder: Box<dyn BufferEncoder>,
-    compression_scheme: CompressionScheme,
-}
-
-impl ValueEncoder {
-    pub fn try_new(data_type: &DataType, compression_scheme: CompressionScheme) -> Result<Self> {
-        if *data_type == DataType::Boolean {
-            Ok(Self {
-                buffer_encoder: Box::<BitmapBufferEncoder>::default(),
-                compression_scheme,
-            })
-        } else if data_type.is_fixed_stride() {
-            Ok(Self {
-                buffer_encoder: if compression_scheme != CompressionScheme::None {
-                    Box::<CompressedBufferEncoder>::default()
-                } else {
-                    Box::<FlatBufferEncoder>::default()
-                },
-                compression_scheme,
-            })
-        } else {
-            Err(Error::invalid_input(
-                format!("Cannot use ValueEncoder to encode {}", data_type),
-                location!(),
-            ))
-        }
-    }
-}
+#[derive(Debug, Default)]
+pub struct ValueEncoder {}
 
 impl ArrayEncoder for ValueEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+    fn encode(
+        &self,
+        data: DataBlock,
+        _data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
         let index = *buffer_index;
         *buffer_index += 1;
 
-        let encoded_buffer = self.buffer_encoder.encode(arrays)?;
-        let array_bufs = vec![EncodedArrayBuffer {
-            parts: encoded_buffer.parts,
-            index,
-        }];
-
-        let data_type = arrays[0].data_type();
-        let bits_per_value = match data_type {
-            DataType::Boolean => 1,
-            _ => 8 * data_type.byte_width() as u64,
-        };
-        let flat_encoding = pb::ArrayEncoding {
-            array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
-                bits_per_value,
-                buffer: Some(pb::Buffer {
-                    buffer_index: index,
-                    buffer_type: pb::buffer::BufferType::Page as i32,
-                }),
-                compression: if self.compression_scheme != CompressionScheme::None {
-                    Some(pb::Compression {
-                        scheme: self.compression_scheme.to_string(),
-                    })
-                } else {
-                    None
-                },
-            })),
-        };
-
-        Ok(EncodedArray {
-            buffers: array_bufs,
-            encoding: flat_encoding,
-        })
+        let encoding = match &data {
+            DataBlock::FixedWidth(fixed_width) => Ok(ProtobufUtils::flat_encoding(
+                fixed_width.bits_per_value,
+                index,
+                None,
+            )),
+            _ => Err(Error::InvalidInput {
+                source: format!(
+                    "Cannot encode a data block of type {} with ValueEncoder",
+                    data.name()
+                )
+                .into(),
+                location: location!(),
+            }),
+        }?;
+        Ok(EncodedArray { data, encoding })
     }
 }
 
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashMap;
+
     use arrow_schema::{DataType, Field, TimeUnit};
 
     use crate::testing::check_round_trip_encoding_random;
 
     const PRIMITIVE_TYPES: &[DataType] = &[
+        DataType::Null,
         DataType::FixedSizeBinary(2),
         DataType::Date32,
         DataType::Date64,
@@ -353,8 +280,9 @@ pub(crate) mod tests {
     #[test_log::test(tokio::test)]
     async fn test_value_primitive() {
         for data_type in PRIMITIVE_TYPES {
+            log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, HashMap::new()).await;
         }
     }
 }

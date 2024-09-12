@@ -11,8 +11,8 @@ use datafusion_expr::Expr;
 use futures::FutureExt;
 use lance_core::datatypes::Schema;
 use lance_core::Result;
-use lance_datafusion::expr::encode_substrait;
-use lance_datafusion::expr::parse_substrait;
+use lance_datafusion::substrait::encode_substrait;
+use lance_datafusion::substrait::parse_substrait;
 use lance_encoding::decoder::FilterExpression;
 
 /// Helper trait to bridge lance-encoding and substrait

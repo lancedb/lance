@@ -5,6 +5,7 @@ import os
 import random
 import string
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -17,14 +18,16 @@ def create_table(nvec=1000, ndim=128):
     mat = np.random.randn(nvec, ndim)
     price = np.random.rand(nvec) * 100
 
-    def gen_str(n):
-        return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+    def gen_str(n, split="", char_set=string.ascii_letters + string.digits):
+        return "".join(random.choices(char_set, k=n))
 
     meta = np.array([gen_str(100) for _ in range(nvec)])
+    doc = [gen_str(10, " ", string.ascii_letters) for _ in range(nvec)]
     tbl = (
         vec_to_table(data=mat)
         .append_column("price", pa.array(price))
         .append_column("meta", pa.array(meta))
+        .append_column("doc", pa.array(doc, pa.large_string()))
         .append_column("id", pa.array(range(nvec)))
     )
     return tbl
@@ -57,8 +60,8 @@ def data_table(indexed_dataset: lance.LanceDataset):
 
 def test_load_indices(indexed_dataset: lance.LanceDataset):
     indices = indexed_dataset.list_indices()
-    vec_idx = next(idx for idx in indices if idx["type"] == "Vector")
-    scalar_idx = next(idx for idx in indices if idx["type"] == "Scalar")
+    vec_idx = next(idx for idx in indices if idx["type"] == "IVF_PQ")
+    scalar_idx = next(idx for idx in indices if idx["type"] == "BTree")
     assert vec_idx is not None
     assert scalar_idx is not None
 
@@ -206,3 +209,43 @@ def test_lance_mem_pool_env_var(tmp_path):
     finally:
         del os.environ["LANCE_MEM_POOL_SIZE"]
         del os.environ["LANCE_BYPASS_SPILLING"]
+
+
+@pytest.mark.parametrize("with_position", [True, False])
+def test_full_text_search(dataset, with_position):
+    dataset.create_scalar_index(
+        "doc", index_type="INVERTED", with_position=with_position
+    )
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py()
+    query = query.split(" ")[0]
+    results = dataset.scanner(
+        columns=["doc"],
+        full_text_query=query,
+    ).to_table()
+    results = results.column(0)
+    for row in results:
+        assert query in row.as_py()
+
+
+def test_bitmap_index(tmp_path: Path):
+    """Test create bitmap index"""
+    tbl = pa.Table.from_arrays(
+        [pa.array([["a", "b", "c"][i % 3] for i in range(100)])], names=["a"]
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("a", index_type="BITMAP")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "Bitmap"
+
+
+def test_label_list_index(tmp_path: Path):
+    tags = pa.array(["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"])
+    tag_list = pa.ListArray.from_arrays([0, 2, 4], tags)
+    tbl = pa.Table.from_arrays([tag_list], names=["tags"])
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("tags", index_type="LABEL_LIST")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "LabelList"

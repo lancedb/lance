@@ -19,18 +19,15 @@ use tokio::task::JoinHandle;
 use lance_core::{Error, Result};
 
 use crate::{
+    buffer::LanceBuffer,
+    data::{DataBlock, FixedWidthDataBlock},
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression,
-        LogicalPageDecoder, NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
+        LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
     encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
-    encodings::{
-        logical::r#struct::SimpleStructScheduler,
-        physical::{
-            basic::BasicEncoder,
-            value::{CompressionScheme, ValueEncoder},
-        },
-    },
+    encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
     EncodingsIo,
 };
@@ -97,9 +94,9 @@ impl ListRequestsIter {
             let mut range = range.clone();
 
             // Skip any offsets pages that are before the range
-            while offsets_offset + (cur_page_info.offsets_in_page as u64) <= range.start {
+            while offsets_offset + (cur_page_info.offsets_in_page) <= range.start {
                 trace!("Skipping null offset adjustment chunk {:?}", offsets_offset);
-                offsets_offset += cur_page_info.offsets_in_page as u64;
+                offsets_offset += cur_page_info.offsets_in_page;
                 items_offset += cur_page_info.num_items_referenced_by_page;
                 cur_page_info = page_infos_iter.next().unwrap();
             }
@@ -118,7 +115,7 @@ impl ListRequestsIter {
             while !range.is_empty() {
                 // The end of the list request is the min of the end of the range
                 // and the end of the current page
-                let end = offsets_offset + cur_page_info.offsets_in_page as u64;
+                let end = offsets_offset + cur_page_info.offsets_in_page;
                 let last = end >= range.end;
                 let end = end.min(range.end);
                 list_requests.push_back(ListRequest {
@@ -133,7 +130,7 @@ impl ListRequestsIter {
                 // If there is still more data in the range, we need to move to the
                 // next page
                 if !last {
-                    offsets_offset += cur_page_info.offsets_in_page as u64;
+                    offsets_offset += cur_page_info.offsets_in_page;
                     items_offset += cur_page_info.num_items_referenced_by_page;
                     cur_page_info = page_infos_iter.next().unwrap();
                 }
@@ -146,7 +143,7 @@ impl ListRequestsIter {
     }
 
     // Given a page of offset data, grab the corresponding list requests
-    fn next(&mut self, mut num_offsets: u32) -> Vec<ListRequest> {
+    fn next(&mut self, mut num_offsets: u64) -> Vec<ListRequest> {
         let mut list_requests = Vec::new();
         while num_offsets > 0 {
             let req = self.list_requests.front_mut().unwrap();
@@ -155,12 +152,12 @@ impl ListRequestsIter {
                 num_offsets -= 1;
                 debug_assert_ne!(num_offsets, 0);
             }
-            if num_offsets as u64 >= req.num_lists {
-                num_offsets -= req.num_lists as u32;
+            if num_offsets >= req.num_lists {
+                num_offsets -= req.num_lists;
                 list_requests.push(self.list_requests.pop_front().unwrap());
             } else {
                 let sub_req = ListRequest {
-                    num_lists: num_offsets as u64,
+                    num_lists: num_offsets,
                     includes_extra_offset: req.includes_extra_offset,
                     null_offset_adjustment: req.null_offset_adjustment,
                     items_offset: req.items_offset,
@@ -168,7 +165,7 @@ impl ListRequestsIter {
 
                 list_requests.push(sub_req);
                 req.includes_extra_offset = false;
-                req.num_lists -= num_offsets as u64;
+                req.num_lists -= num_offsets;
                 num_offsets = 0;
             }
         }
@@ -324,11 +321,12 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
+    priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
-    let num_offsets = offsets_decoder.unawaited();
+    let num_offsets = offsets_decoder.num_rows();
     // We know the offsets are a primitive array and thus will not need additional
     // pages.  We can use a dummy receiver to match the decoder API
-    offsets_decoder.wait(num_offsets).await?;
+    offsets_decoder.wait_for_loaded(num_offsets - 1).await?;
     let decode_task = offsets_decoder.drain(num_offsets)?;
     let offsets = decode_task.task.decode()?;
 
@@ -336,10 +334,12 @@ async fn indirect_schedule_task(
         decode_offsets(offsets.as_ref(), &list_requests, null_offset_adjustment);
 
     trace!(
-        "Indirectly scheduling items ranges {:?} from list items column with {} rows",
+        "Indirectly scheduling items ranges {:?} from list items column with {} rows (and priority {:?})",
         item_ranges,
-        items_scheduler.num_rows()
+        items_scheduler.num_rows(),
+        priority
     );
+    let offsets: Arc<[u64]> = offsets.into();
 
     // All requested lists are empty
     if item_ranges.is_empty() {
@@ -360,11 +360,14 @@ async fn indirect_schedule_task(
         DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields);
     let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
+    let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
+
     let indirect_messages = indirect_scheduler.schedule_ranges_to_vec(
         &item_ranges,
         // Can't push filters into list items
         &FilterExpression::no_filter(),
         io,
+        Some(priority),
     )?;
 
     for message in indirect_messages {
@@ -414,9 +417,9 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<crate::decoder::ScheduledScanLine> {
-        let next_offsets = self.offsets.schedule_next(context, top_level_row)?;
+        let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
         trace!(
@@ -430,7 +433,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         debug_assert!(list_reqs
             .iter()
             .all(|req| req.null_offset_adjustment == null_offset_adjustment));
-        let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>() as u32;
+        let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
         let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
 
@@ -446,15 +449,17 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             items_scheduler,
             items_type,
             io,
+            priority.box_clone(),
         ));
 
         // Return a decoder
         let decoder = Box::new(ListPageDecoder {
-            offsets: Vec::new(),
+            offsets: Arc::new([]),
             validity: BooleanBuffer::new(Buffer::from_vec(Vec::<u8>::default()), 0, 0),
             item_decoder: None,
             rows_drained: 0,
-            lists_available: 0,
+            rows_loaded: 0,
+            item_field_name: self.scheduler.item_field_name.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
             items_type: self.scheduler.items_type.clone(),
@@ -491,6 +496,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
 pub struct ListFieldScheduler {
     offsets_scheduler: Arc<dyn FieldScheduler>,
     items_scheduler: Arc<dyn FieldScheduler>,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
     list_type: DataType,
@@ -502,7 +508,7 @@ pub struct ListFieldScheduler {
 /// This is needed to construct the scheduler
 #[derive(Debug)]
 pub struct OffsetPageInfo {
-    pub offsets_in_page: u32,
+    pub offsets_in_page: u64,
     pub null_offset_adjustment: u64,
     pub num_items_referenced_by_page: u64,
 }
@@ -512,6 +518,7 @@ impl ListFieldScheduler {
     pub fn new(
         offsets_scheduler: Arc<dyn FieldScheduler>,
         items_scheduler: Arc<dyn FieldScheduler>,
+        item_field_name: String,
         items_type: DataType,
         // Should be int32 or int64
         offset_type: DataType,
@@ -529,6 +536,7 @@ impl ListFieldScheduler {
         Self {
             offsets_scheduler,
             items_scheduler,
+            item_field_name,
             items_type,
             offset_type,
             offset_page_info,
@@ -567,12 +575,13 @@ impl FieldScheduler for ListFieldScheduler {
 struct ListPageDecoder {
     unloaded: Option<JoinHandle<Result<IndirectlyLoaded>>>,
     // offsets and validity will have already been decoded as part of the indirect I/O
-    offsets: Vec<u64>,
+    offsets: Arc<[u64]>,
     validity: BooleanBuffer,
     item_decoder: Option<SimpleStructDecoder>,
-    lists_available: u32,
-    num_rows: u32,
-    rows_drained: u32,
+    num_rows: u64,
+    rows_drained: u64,
+    rows_loaded: u64,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
     data_type: DataType,
@@ -583,6 +592,7 @@ struct ListDecodeTask {
     validity: BooleanBuffer,
     // Will be None if there are no items (all empty / null lists)
     items: Option<Box<dyn DecodeArrayTask>>,
+    item_field_name: String,
     items_type: DataType,
     offset_type: DataType,
 }
@@ -601,7 +611,11 @@ impl DecodeArrayTask for ListDecodeTask {
 
         // TODO: we default to nullable true here, should probably use the nullability given to
         // us from the input schema
-        let item_field = Arc::new(Field::new("item", self.items_type.clone(), true));
+        let item_field = Arc::new(Field::new(
+            self.item_field_name,
+            self.items_type.clone(),
+            true,
+        ));
 
         // The offsets are already decoded but they need to be shifted back to 0 and cast
         // to the appropriate type
@@ -641,8 +655,23 @@ impl DecodeArrayTask for ListDecodeTask {
     }
 }
 
+// Helper method that performs binary search.  However, once the
+// target is found it walks past any duplicates.  E.g. if the
+// input list is [0, 3, 5, 5, 5, 7] then this will only return
+// 0, 1, 4, or 5.
+fn binary_search_to_end(to_search: &[u64], target: u64) -> u64 {
+    let mut result = match to_search.binary_search(&target) {
+        Ok(idx) => idx,
+        Err(idx) => idx - 1,
+    };
+    while result < (to_search.len() - 1) && to_search[result + 1] == target {
+        result += 1;
+    }
+    result as u64
+}
+
 impl LogicalPageDecoder for ListPageDecoder {
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>> {
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>> {
         async move {
             // wait for the indirect I/O to finish, run the scheduler for the indirect
             // I/O and then wait for enough items to arrive
@@ -661,51 +690,39 @@ impl LogicalPageDecoder for ListPageDecoder {
                 self.validity = indirectly_loaded.validity;
                 self.item_decoder = indirectly_loaded.root_decoder;
             }
-            trace!(
-                "List decoder is waiting for {} rows and {} are already available and {} are unawaited",
-                num_rows,
-                self.lists_available,
-                self.num_rows - self.rows_drained
-            );
-            if self.lists_available >= num_rows {
-                self.lists_available -= num_rows;
+            if self.rows_loaded > loaded_need {
                 return Ok(());
             }
-            let num_rows = num_rows - self.lists_available;
-            self.lists_available = 0;
-            let offset_wait_start = self.rows_drained + self.lists_available;
-            let item_start = self.offsets[offset_wait_start as usize];
-            let mut items_needed =
-                self.offsets[offset_wait_start as usize + num_rows as usize] - item_start;
-            if items_needed > 0 {
-                // First discount any already available items
-                let items_already_available = self.item_decoder.as_mut().unwrap().avail_u64();
-                trace!(
-                    "List's items decoder needs {} items and already has {} items available",
-                    items_needed,
-                    items_already_available,
-                );
-                items_needed = items_needed.saturating_sub(items_already_available);
-                if items_needed > 0 {
-                    self.item_decoder.as_mut().unwrap().wait_u64(items_needed).await?;
-                }
-            }
-            // This is technically undercounting a little.  It's possible that we loaded a big items
-            // page with many items and then only needed a few of them for the requested lists.  However,
-            // to find the exact number of lists that are available we would need to walk through the item
-            // lengths and it's faster to just undercount here.
-            self.lists_available += num_rows;
+
+            let boundary = loaded_need as usize;
+            debug_assert!(boundary < self.num_rows as usize);
+            // We need more than X lists which means we need at least X+1 lists which means
+            // we need at least offsets[X+1] items which means we need more than offsets[X+1]-1 items.
+            let items_needed = self.offsets[boundary + 1].saturating_sub(1);
+            trace!(
+                "List decoder is waiting for more than {} rows to be loaded and {}/{} are already loaded.  To satisfy this we need more than {} loaded items",
+                loaded_need,
+                self.rows_loaded,
+                self.num_rows,
+                items_needed,
+            );
+
+            let items_loaded = if let Some(item_decoder) = self.item_decoder.as_mut() {
+                item_decoder.wait_for_loaded(items_needed).await?;
+                item_decoder.rows_loaded()
+            } else {
+                0
+            };
+
+            self.rows_loaded = binary_search_to_end(&self.offsets, items_loaded);
+            trace!("List decoder now has {} loaded rows", self.rows_loaded);
+
             Ok(())
         }
         .boxed()
     }
 
-    fn unawaited(&self) -> u32 {
-        self.num_rows - self.lists_available - self.rows_drained
-    }
-
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask> {
-        self.lists_available -= num_rows;
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
         // We already have the offsets but need to drain the item pages
         let mut actual_num_rows = num_rows;
         let item_start = self.offsets[self.rows_drained as usize];
@@ -745,17 +762,19 @@ impl LogicalPageDecoder for ListPageDecoder {
         } else {
             self.item_decoder
                 .as_mut()
-                .map(|item_decoder| Result::Ok(item_decoder.drain_u64(num_items_to_drain)?.task))
+                .map(|item_decoder| Result::Ok(item_decoder.drain(num_items_to_drain)?.task))
                 .transpose()?
         };
 
         self.rows_drained += num_rows;
+        let has_more = self.rows_left() > 0;
         Ok(NextDecodeTask {
-            has_more: self.avail() > 0 || self.unawaited() > 0,
+            has_more,
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,
                 validity,
+                item_field_name: self.item_field_name.clone(),
                 items: item_decode,
                 items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
@@ -763,8 +782,16 @@ impl LogicalPageDecoder for ListPageDecoder {
         })
     }
 
-    fn avail(&self) -> u32 {
-        self.lists_available
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+
+    fn rows_loaded(&self) -> u64 {
+        self.rows_loaded
+    }
+
+    fn rows_drained(&self) -> u64 {
+        self.rows_drained
     }
 
     fn data_type(&self) -> &DataType {
@@ -773,7 +800,7 @@ impl LogicalPageDecoder for ListPageDecoder {
 }
 
 struct IndirectlyLoaded {
-    offsets: Vec<u64>,
+    offsets: Arc<[u64]>,
     validity: BooleanBuffer,
     root_decoder: Option<SimpleStructDecoder>,
 }
@@ -826,16 +853,19 @@ struct ListOffsetsEncoder {
 }
 
 impl ListOffsetsEncoder {
-    fn new(cache_bytes: u64, keep_original_array: bool, column_index: u32) -> Self {
+    fn new(
+        cache_bytes: u64,
+        keep_original_array: bool,
+        column_index: u32,
+        inner_encoder: Arc<dyn ArrayEncoder>,
+    ) -> Self {
         Self {
             accumulation_queue: AccumulationQueue::new(
                 cache_bytes,
                 column_index,
                 keep_original_array,
             ),
-            inner_encoder: Arc::new(BasicEncoder::new(Box::new(
-                ValueEncoder::try_new(&DataType::Int64, CompressionScheme::None).unwrap(),
-            ))),
+            inner_encoder,
             column_index,
         }
     }
@@ -878,7 +908,7 @@ impl ListOffsetsEncoder {
         tokio::task::spawn(async move {
             let num_rows =
                 offset_arrays.iter().map(|arr| arr.len()).sum::<usize>() - offset_arrays.len();
-            let num_rows = num_rows as u32;
+            let num_rows = num_rows as u64;
             let mut buffer_index = 0;
             let array = Self::do_encode(
                 offset_arrays,
@@ -1012,7 +1042,7 @@ impl ListOffsetsEncoder {
     fn do_encode_u64(
         offset_arrays: Vec<ArrayRef>,
         validity: Vec<Option<&BooleanArray>>,
-        num_offsets: u32,
+        num_offsets: u64,
         null_offset_adjustment: u64,
         buffer_index: &mut u32,
         inner_encoder: Arc<dyn ArrayEncoder>,
@@ -1028,14 +1058,19 @@ impl ListOffsetsEncoder {
                 null_offset_adjustment,
             );
         }
-        inner_encoder.encode(&[Arc::new(UInt64Array::from(offsets))], buffer_index)
+        let offsets_data = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(offsets),
+            num_values: num_offsets,
+        });
+        inner_encoder.encode(offsets_data, &DataType::UInt64, buffer_index)
     }
 
     fn do_encode(
         offset_arrays: Vec<ArrayRef>,
         validity_arrays: Vec<ArrayRef>,
         buffer_index: &mut u32,
-        num_offsets: u32,
+        num_offsets: u64,
         inner_encoder: Arc<dyn ArrayEncoder>,
     ) -> Result<EncodedArray> {
         let validity_arrays = validity_arrays
@@ -1064,7 +1099,7 @@ impl ListOffsetsEncoder {
             inner_encoder,
         )?;
         Ok(EncodedArray {
-            buffers: encoded_offsets.buffers,
+            data: encoded_offsets.data,
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::List(Box::new(
                     pb::List {
@@ -1086,6 +1121,7 @@ pub struct ListFieldEncoder {
 impl ListFieldEncoder {
     pub fn new(
         items_encoder: Box<dyn FieldEncoder>,
+        inner_offsets_encoder: Arc<dyn ArrayEncoder>,
         cache_bytes_per_columns: u64,
         keep_original_array: bool,
         column_index: u32,
@@ -1095,6 +1131,7 @@ impl ListFieldEncoder {
                 cache_bytes_per_columns,
                 keep_original_array,
                 column_index,
+                inner_offsets_encoder,
             ),
             items_encoder,
         }
@@ -1181,11 +1218,12 @@ impl FieldEncoder for ListFieldEncoder {
 #[cfg(test)]
 mod tests {
 
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
+    use arrow::array::{LargeListBuilder, StringBuilder};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
-        ArrayRef, BooleanArray, ListArray,
+        Array, ArrayRef, BooleanArray, ListArray, StructArray, UInt64Array,
     };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
@@ -1198,16 +1236,32 @@ mod tests {
         DataType::List(Arc::new(Field::new("item", inner_type, true)))
     }
 
+    fn make_large_list_type(inner_type: DataType) -> DataType {
+        DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_list() {
+        let field = Field::new("", make_large_list_type(DataType::Int32), true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_strings() {
+        let field = Field::new("", make_list_type(DataType::Utf8), true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
-        let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field).await;
+        let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1219,7 +1273,28 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_list_struct_empty() {
+        let fields = Fields::from(vec![Field::new("inner", DataType::UInt64, true)]);
+        let items = UInt64Array::from(Vec::<u64>::new());
+        let structs = StructArray::new(fields, vec![Arc::new(items)], None);
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0; 2 * 1024 * 1024 + 1]));
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", structs.data_type().clone(), true)),
+            offsets,
+            Arc::new(structs),
+            None,
+        );
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(lists)],
+            &TestCases::default(),
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1237,7 +1312,27 @@ mod tests {
             .with_range(0..3)
             .with_range(1..3)
             .with_indices(vec![1, 3]);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_large_list() {
+        let items_builder = Int32Builder::new();
+        let mut list_builder = LargeListBuilder::new(items_builder);
+        list_builder.append_value([Some(1), Some(2), Some(3)]);
+        list_builder.append_value([Some(4), Some(5)]);
+        list_builder.append_null();
+        list_builder.append_value([Some(6), Some(7), Some(8)]);
+        let list_array = list_builder.finish();
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3]);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1256,10 +1351,16 @@ mod tests {
             let test_cases = TestCases::default()
                 .with_indices(vec![1])
                 .with_indices(vec![0])
-                .with_indices(vec![2]);
-            check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+                .with_indices(vec![2])
+                .with_indices(vec![0, 1]);
+            check_round_trip_encoding_of_data(
+                vec![list_array.clone()],
+                &test_cases,
+                HashMap::new(),
+            )
+            .await;
             let test_cases = test_cases.with_batch_size(1);
-            check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
+            check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
         }
 
         // Scenario 2: All lists are empty
@@ -1274,9 +1375,27 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
 
         let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
-        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
+            .await;
         let test_cases = test_cases.with_batch_size(1);
-        check_round_trip_encoding_of_data(vec![list_array], &test_cases).await;
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+
+        // Scenario 2: All lists are empty (but now with strings)
+
+        // When encoding a list of empty lists there are no items to encode
+        // which is strange and we want to ensure we handle it
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append(true);
+        list_builder.append_null();
+        list_builder.append(true);
+        let list_array = Arc::new(list_builder.finish());
+
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
+        check_round_trip_encoding_of_data(vec![list_array.clone()], &test_cases, HashMap::new())
+            .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1297,6 +1416,6 @@ mod tests {
 
         // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
-        check_round_trip_encoding_of_data(arrs, &test_cases).await;
+        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }

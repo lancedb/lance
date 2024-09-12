@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import NamedTuple, Union
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
@@ -30,11 +31,37 @@ def find_or_clean(dataset_path: Path) -> Union[lance.LanceDataset, None]:
     return None
 
 
+GENRES = [
+    "action",
+    "comedy",
+    "drama",
+    "horror",
+    "romance",
+    "thriller",
+    "western",
+    "sci-fi",
+    "fantasy",
+    "documentary",
+]
+
+
 def create_table(num_rows, offset) -> pa.Table:
     values = pc.random(num_rows * N_DIMS).cast(pa.float32())
     vectors = pa.FixedSizeListArray.from_arrays(values, N_DIMS)
     filterable = pa.array(range(offset, offset + num_rows))
-    return pa.table({"vector": vectors, "filterable": filterable})
+    categories = pa.array(np.random.randint(0, 100, num_rows))
+    genres_values = pa.array(np.random.choice(GENRES, num_rows * 3))
+    genre_offsets = pa.array(np.arange(0, (num_rows + 1) * 3, 3, dtype=np.int32))
+    genres = pa.ListArray.from_arrays(genre_offsets, genres_values)
+    return pa.table(
+        {
+            "vector": vectors,
+            "filterable": filterable,
+            "category": categories,
+            "category_no_index": categories,
+            "genres": genres,
+        }
+    )
 
 
 def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
@@ -51,9 +78,11 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
         rows_remaining -= next_batch_length
         table = create_table(next_batch_length, offset)
         if offset == 0:
-            dataset = lance.write_dataset(table, tmp_path)
+            dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
         else:
-            dataset = lance.write_dataset(table, tmp_path, mode="append")
+            dataset = lance.write_dataset(
+                table, tmp_path, mode="append", use_legacy_format=False
+            )
         offset += next_batch_length
 
     dataset.create_index(
@@ -66,8 +95,10 @@ def create_base_dataset(data_dir: Path) -> lance.LanceDataset:
     )
 
     dataset.create_scalar_index("filterable", "BTREE")
+    dataset.create_scalar_index("category", "BITMAP")
+    dataset.create_scalar_index("genres", "LABEL_LIST")
 
-    return dataset
+    return lance.dataset(tmp_path, index_cache_size=64 * 1024)
 
 
 def create_delete_dataset(data_dir):
@@ -82,7 +113,7 @@ def create_delete_dataset(data_dir):
     dataset = lance.dataset(tmp_path)
     dataset.delete("filterable % 2 != 0")
 
-    return dataset
+    return lance.dataset(tmp_path, index_cache_size=64 * 1024)
 
 
 def create_new_rows_dataset(data_dir):
@@ -98,7 +129,7 @@ def create_new_rows_dataset(data_dir):
     table = create_table(NEW_ROWS, offset=NUM_ROWS)
     dataset = lance.write_dataset(table, tmp_path, mode="append")
 
-    return dataset
+    return lance.dataset(tmp_path, index_cache_size=64 * 1024)
 
 
 class Datasets(NamedTuple):
@@ -129,6 +160,8 @@ def test_knn_search(test_dataset, benchmark):
     q = pc.random(N_DIMS).cast(pa.float32())
     result = benchmark(
         test_dataset.to_table,
+        columns=[],
+        with_row_id=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -141,10 +174,12 @@ def test_knn_search(test_dataset, benchmark):
 
 
 @pytest.mark.benchmark(group="query_ann")
-def test_flat_index_search(test_dataset, benchmark):
+def test_ann_no_refine(test_dataset, benchmark):
     q = pc.random(N_DIMS).cast(pa.float32())
     result = benchmark(
         test_dataset.to_table,
+        columns=[],
+        with_row_id=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -156,10 +191,12 @@ def test_flat_index_search(test_dataset, benchmark):
 
 
 @pytest.mark.benchmark(group="query_ann")
-def test_ivf_pq_index_search(test_dataset, benchmark):
+def test_ann_with_refine(test_dataset, benchmark):
     q = pc.random(N_DIMS).cast(pa.float32())
     result = benchmark(
         test_dataset.to_table,
+        columns=[],
+        with_row_id=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -180,6 +217,8 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
     threshold = int(round(selectivity * NUM_ROWS))
     result = benchmark(
         test_dataset.to_table,
+        columns=[],
+        with_row_id=True,
         nearest=dict(
             column="vector",
             q=q,
@@ -221,11 +260,13 @@ def test_filtered_search(test_dataset, benchmark, selectivity, prefilter, use_in
         "greater_than_not_selective",
     ],
 )
-def test_scalar_index_prefilter(test_dataset, benchmark, filter: str):
+def test_btree_index_prefilter(test_dataset, benchmark, filter: str):
     q = pc.random(N_DIMS).cast(pa.float32())
     if filter is None:
         benchmark(
             test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -236,6 +277,8 @@ def test_scalar_index_prefilter(test_dataset, benchmark, filter: str):
     else:
         benchmark(
             test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
             nearest=dict(
                 column="vector",
                 q=q,
@@ -275,14 +318,190 @@ def test_scalar_index_prefilter(test_dataset, benchmark, filter: str):
         "greater_than_not_selective",
     ],
 )
-def test_scalar_index_search(test_dataset, benchmark, filter: str):
+def test_btree_index_search(test_dataset, benchmark, filter: str):
     if filter is None:
         benchmark(
             test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
         )
     else:
         benchmark(
             test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
             prefilter=True,
             filter=filter,
         )
+
+
+@pytest.mark.benchmark(group="query_ann")
+@pytest.mark.parametrize(
+    "filter",
+    (
+        None,
+        "category = 0",
+        "category != 0",
+        "category IN (0)",
+        "category NOT IN (0)",
+        "category != 0 AND category != 3 AND category != 7",
+        "category NOT IN (0, 3, 7)",
+        "category < 5",
+        "category > 5",
+    ),
+    ids=[
+        "none",
+        "equality",
+        "not_equality",
+        "in_list_one",
+        "not_in_list_one",
+        "not_equality_and_chain",
+        "not_in_list_three",
+        "less_than_selective",
+        "greater_than_not_selective",
+    ],
+)
+def test_bitmap_index_prefilter(test_dataset, benchmark, filter: str):
+    q = pc.random(N_DIMS).cast(pa.float32())
+    if filter is None:
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+        )
+    else:
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+            prefilter=True,
+            filter=filter,
+        )
+
+
+@pytest.mark.benchmark(group="query_no_vec")
+@pytest.mark.parametrize(
+    "filter",
+    (
+        None,
+        "category = 0",
+        "category != 0",
+        "category IN (0)",
+        "category IN (0, 3, 7)",
+        "category NOT IN (0)",
+        "category != 0 AND category != 3 AND category != 7",
+        "category NOT IN (0, 3, 7)",
+        "category < 5",
+        "category > 5",
+    ),
+    ids=[
+        "none",
+        "equality",
+        "not_equality",
+        "in_list_one",
+        "in_list_three",
+        "not_in_list_one",
+        "not_equality_and_chain",
+        "not_in_list_three",
+        "less_than_selective",
+        "greater_than_not_selective",
+    ],
+)
+def test_bitmap_index_search(test_dataset, benchmark, filter: str):
+    if filter is None:
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+        )
+    else:
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            prefilter=True,
+            filter=filter,
+        )
+
+
+@pytest.mark.benchmark(group="query_ann")
+@pytest.mark.parametrize(
+    "filter",
+    (
+        None,
+        "array_has_any(genres, ['comedy'])",
+    ),
+    ids=["none", "one"],
+)
+def test_label_list_index_prefilter(test_dataset, benchmark, filter: str):
+    q = pc.random(N_DIMS).cast(pa.float32())
+    if filter is None:
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+        )
+    else:
+        print(
+            test_dataset.scanner(
+                columns=[],
+                with_row_id=True,
+                nearest=dict(column="vector", q=q, k=100, nprobes=10),
+                prefilter=True,
+                filter=filter,
+            ).explain_plan(True)
+        )
+        benchmark(
+            test_dataset.to_table,
+            columns=[],
+            with_row_id=True,
+            nearest=dict(
+                column="vector",
+                q=q,
+                k=100,
+                nprobes=10,
+            ),
+            prefilter=True,
+            filter=filter,
+        )
+
+
+@pytest.mark.benchmark(group="late_materialization")
+@pytest.mark.parametrize(
+    "use_index",
+    (False, True),
+    ids=["no_index", "with_index"],
+)
+def test_late_materialization(test_dataset, benchmark, use_index):
+    column = "category" if use_index else "category_no_index"
+    print(
+        test_dataset.scanner(
+            columns=["vector"],
+            filter=f"{column} = 0",
+            batch_size=32,
+        ).explain_plan(True)
+    )
+    benchmark(
+        test_dataset.to_table,
+        columns=["vector"],
+        filter=f"{column} = 0",
+        batch_size=32,
+    )

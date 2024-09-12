@@ -60,6 +60,14 @@ impl DeletionVector {
         }
     }
 
+    pub fn iter(&self) -> Box<dyn Iterator<Item = u32> + Send + '_> {
+        match self {
+            Self::NoDeletions => Box::new(std::iter::empty()),
+            Self::Set(set) => Box::new(set.iter().copied()),
+            Self::Bitmap(bitmap) => Box::new(bitmap.iter()),
+        }
+    }
+
     pub fn into_sorted_iter(self) -> Box<dyn Iterator<Item = u32> + Send + 'static> {
         match self {
             Self::NoDeletions => Box::new(std::iter::empty()),
@@ -183,7 +191,13 @@ impl IntoIterator for DeletionVector {
     fn into_iter(self) -> Self::IntoIter {
         match self {
             Self::NoDeletions => Box::new(std::iter::empty()),
-            Self::Set(set) => Box::new(set.into_iter()),
+            Self::Set(set) => {
+                // In many cases, it's much better if this is sorted. It's
+                // guaranteed to be small, so the cost is low.
+                let mut sorted = set.into_iter().collect::<Vec<_>>();
+                sorted.sort();
+                Box::new(sorted.into_iter())
+            }
             Self::Bitmap(bitmap) => Box::new(bitmap.into_iter()),
         }
     }

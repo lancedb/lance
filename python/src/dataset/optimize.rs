@@ -36,6 +36,9 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
             "max_rows_per_group" => {
                 opts.max_rows_per_group = value.extract()?;
             }
+            "max_bytes_per_file" => {
+                opts.max_bytes_per_file = value.extract()?;
+            }
             "materialize_deletions" => {
                 opts.materialize_deletions = value.extract()?;
             }
@@ -43,9 +46,10 @@ fn parse_compaction_options(options: &PyDict) -> PyResult<CompactionOptions> {
                 opts.materialize_deletions_threshold = value.extract()?;
             }
             "num_threads" => {
-                opts.num_threads = value
-                    .extract::<Option<usize>>()?
-                    .unwrap_or_else(num_cpus::get);
+                opts.num_threads = value.extract()?;
+            }
+            "batch_size" => {
+                opts.batch_size = value.extract()?;
             }
             _ => {
                 return Err(PyValueError::new_err(format!(

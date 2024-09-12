@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::Error;
-use lance_file::format::{MAJOR_VERSION, MINOR_VERSION_NEXT};
+use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
+use lance_file::version::LanceFileVersion;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
@@ -52,14 +53,41 @@ impl DataFile {
         }
     }
 
+    /// Create a new `DataFile` with the expectation that fields and column_indices will be set later
+    pub fn new_unstarted(
+        path: impl Into<String>,
+        file_major_version: u32,
+        file_minor_version: u32,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            fields: vec![],
+            column_indices: vec![],
+            file_major_version,
+            file_minor_version,
+        }
+    }
+
     pub fn new_legacy_from_fields(path: impl Into<String>, fields: Vec<i32>) -> Self {
-        Self::new(path, fields, vec![], 0, 0)
+        Self::new(
+            path,
+            fields,
+            vec![],
+            MAJOR_VERSION as u32,
+            MINOR_VERSION as u32,
+        )
     }
 
     pub fn new_legacy(path: impl Into<String>, schema: &Schema) -> Self {
         let mut field_ids = schema.field_ids();
         field_ids.sort();
-        Self::new(path, field_ids, vec![], 0, 0)
+        Self::new(
+            path,
+            field_ids,
+            vec![],
+            MAJOR_VERSION as u32,
+            MINOR_VERSION as u32,
+        )
     }
 
     pub fn schema(&self, full_schema: &Schema) -> Schema {
@@ -281,14 +309,11 @@ impl Fragment {
         path: impl Into<String>,
         field_ids: Vec<i32>,
         column_indices: Vec<i32>,
+        version: &LanceFileVersion,
     ) {
-        self.files.push(DataFile::new(
-            path,
-            field_ids,
-            column_indices,
-            MAJOR_VERSION as u32,
-            MINOR_VERSION_NEXT as u32,
-        ));
+        let (major, minor) = version.to_numbers();
+        self.files
+            .push(DataFile::new(path, field_ids, column_indices, major, minor));
     }
 
     /// Add a new [`DataFile`] to this fragment.
@@ -300,6 +325,45 @@ impl Fragment {
     pub fn has_legacy_files(&self) -> bool {
         // If any file in a fragment is legacy then all files in the fragment must be
         self.files[0].is_legacy_file()
+    }
+
+    // Helper method to infer the Lance version from a set of fragments
+    //
+    // Returns None if there are no data files
+    // Returns an error if the data files have different versions
+    pub fn try_infer_version(fragments: &[Self]) -> Result<Option<LanceFileVersion>> {
+        // Otherwise we need to check the actual file versions
+        // Determine version from first file
+        let Some(sample_file) = fragments
+            .iter()
+            .find(|f| !f.files.is_empty())
+            .map(|f| &f.files[0])
+        else {
+            return Ok(None);
+        };
+        let file_version = LanceFileVersion::try_from_major_minor(
+            sample_file.file_major_version,
+            sample_file.file_minor_version,
+        )?;
+        // Ensure all files match
+        for frag in fragments {
+            for file in &frag.files {
+                let this_file_version = LanceFileVersion::try_from_major_minor(
+                    file.file_major_version,
+                    file.file_minor_version,
+                )?;
+                if file_version != this_file_version {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "All data files must have the same version.  Detected both {} and {}",
+                            file_version, this_file_version
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+        }
+        Ok(Some(file_version))
     }
 }
 
@@ -440,7 +504,7 @@ mod tests {
             json!({
                 "id": 123,
                 "files":[
-                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": 0, "file_minor_version": 0}],
+                    {"path": "foobar.lance", "fields": [0], "column_indices": [], "file_major_version": MAJOR_VERSION, "file_minor_version": MINOR_VERSION}],
                      "deletion_file": {"read_version": 123, "id": 456, "file_type": "array",
                                        "num_deleted_rows": 10},
                 "physical_rows": None::<usize>}),

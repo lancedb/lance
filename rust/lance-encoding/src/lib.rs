@@ -8,12 +8,15 @@ use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 
 use lance_core::Result;
 
+pub mod buffer;
+pub mod data;
 pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod format;
 #[cfg(test)]
 pub mod testing;
+pub mod version;
 
 /// A trait for an I/O service
 ///
@@ -22,7 +25,7 @@ pub mod testing;
 ///
 /// In general, it is assumed that this trait will be implemented by some kind of "file reader"
 /// or "file scheduler".  The encodings here are all limited to accessing a single file.
-pub trait EncodingsIo: Send + Sync {
+pub trait EncodingsIo: std::fmt::Debug + Send + Sync {
     /// Submit an I/O request
     ///
     /// The response must contain a `Bytes` object for each range requested even if the underlying
@@ -59,6 +62,7 @@ pub trait EncodingsIo: Send + Sync {
 }
 
 /// An implementation of EncodingsIo that serves data from an in-memory buffer
+#[derive(Debug)]
 pub struct BufferScheduler {
     data: Bytes,
 }

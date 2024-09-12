@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray};
-use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray};
+use arrow_array::{types::ArrowPrimitiveType, ArrayRef, FixedSizeListArray, PrimitiveArray};
+use lance_arrow::FixedSizeListArrayExt;
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
 use snafu::{location, Location};
@@ -15,8 +15,8 @@ use lance_linalg::{
 
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
-pub async fn train_kmeans<T: ArrowFloatType>(
-    array: &T::ArrayType,
+pub fn train_kmeans<T: ArrowPrimitiveType>(
+    array: &[T::Native],
     dimension: usize,
     k: usize,
     max_iterations: u32,
@@ -27,6 +27,7 @@ pub async fn train_kmeans<T: ArrowFloatType>(
 ) -> Result<ArrayRef>
 where
     T::Native: Dot + L2 + Normalize,
+    PrimitiveArray<T>: From<Vec<T::Native>>,
 {
     let num_rows = array.len() / dimension;
     if num_rows < k {
@@ -48,12 +49,12 @@ where
         let chosen = (0..num_rows).choose_multiple(&mut rng, sample_size);
         let mut builder = Vec::with_capacity(sample_size * dimension);
         for idx in chosen.iter() {
-            let s = &array.as_slice()[idx * dimension..(idx + 1) * dimension];
+            let s = &array[idx * dimension..(idx + 1) * dimension];
             builder.extend_from_slice(s);
         }
-        T::ArrayType::from(builder)
+        PrimitiveArray::<T>::from(builder)
     } else {
-        array.clone()
+        PrimitiveArray::<T>::from(array.to_vec())
     };
 
     let params = KMeansParams {

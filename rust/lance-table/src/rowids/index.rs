@@ -24,6 +24,7 @@ use super::{RowIdSequence, U64Segment};
 // Disjoint ranges of row ids are stored as the keys of the map. The values are
 // a pair of segments. The first segment is the row ids, and the second segment
 // is the addresses.
+#[derive(Debug)]
 pub struct RowIdIndex(RangeInclusiveMap<u64, (U64Segment, U64Segment)>);
 
 impl RowIdIndex {

@@ -65,6 +65,8 @@ pub trait Cosine: Dot + Normalize {
     }
 }
 
+impl Cosine for u8 {}
+
 impl Cosine for bf16 {}
 
 #[cfg(feature = "fp16kernels")]
@@ -76,7 +78,7 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn cosine_f16_neon(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn cosine_f16_avx512(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn cosine_f16_avx2(x: *const f16, x_norm: f32, y: *const f16, dimension: u32) -> f32;
@@ -96,7 +98,7 @@ impl Cosine for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {

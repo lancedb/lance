@@ -25,7 +25,7 @@ mod kernel {
     extern "C" {
         #[cfg(target_arch = "aarch64")]
         pub fn norm_l2_f16_neon(ptr: *const f16, len: u32) -> f32;
-        #[cfg(all(kernel_suppport = "avx512", target_arch = "x86_64"))]
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
         pub fn norm_l2_f16_avx512(ptr: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "x86_64")]
         pub fn norm_l2_f16_avx2(ptr: *const f16, len: u32) -> f32;
@@ -33,6 +33,13 @@ mod kernel {
         pub fn norm_l2_f16_lsx(ptr: *const f16, len: u32) -> f32;
         #[cfg(target_arch = "loongarch64")]
         pub fn norm_l2_f16_lasx(ptr: *const f16, len: u32) -> f32;
+    }
+}
+
+impl Normalize for u8 {
+    #[inline]
+    fn norm_l2(vector: &[Self]) -> f32 {
+        norm_l2_impl::<Self, f32, 16>(vector)
     }
 }
 
@@ -46,7 +53,7 @@ impl Normalize for f16 {
             },
             #[cfg(all(
                 feature = "fp16kernels",
-                kernel_suppport = "avx512",
+                kernel_support = "avx512",
                 target_arch = "x86_64"
             ))]
             SimdSupport::Avx512 => unsafe {

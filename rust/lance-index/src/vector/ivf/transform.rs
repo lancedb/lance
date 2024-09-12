@@ -30,14 +30,14 @@ use super::PART_ID_COLUMN;
 /// this transform is a Noop.
 ///
 #[derive(Debug)]
-pub struct IvfTransformer {
+pub struct PartitionTransformer {
     centroids: FixedSizeListArray,
     distance_type: DistanceType,
     input_column: String,
     output_column: String,
 }
 
-impl IvfTransformer {
+impl PartitionTransformer {
     pub fn new(
         centroids: FixedSizeListArray,
         distance_type: DistanceType,
@@ -53,14 +53,15 @@ impl IvfTransformer {
 
     /// Compute the partition for each row in the input Matrix.
     ///
-    #[instrument(level = "debug", skip(data))]
+    #[instrument(level = "debug", skip_all)]
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
         compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
             .expect("failed to compute partitions")
             .into()
     }
 }
-impl Transformer for IvfTransformer {
+impl Transformer for PartitionTransformer {
+    #[instrument(name = "PartitionTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         if batch.column_by_name(&self.output_column).is_some() {
             // If the partition ID column is already present, we don't need to compute it again.
@@ -125,6 +126,7 @@ impl PartitionFilter {
 }
 
 impl Transformer for PartitionFilter {
+    #[instrument(name = "PartitionFilter::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         // TODO: use datafusion execute?
         let arr = batch

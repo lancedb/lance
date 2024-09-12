@@ -25,7 +25,7 @@ mod serde;
 use deepsize::DeepSizeOf;
 // These are the public API.
 pub use index::RowIdIndex;
-use lance_core::{Error, Result};
+use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
@@ -125,7 +125,7 @@ impl RowIdSequence {
         self.0.extend(other.0);
     }
 
-    /// Mark a set of row ids as deleted. Their value will be replaced with tombstones.
+    /// Remove a set of row ids from the sequence.
     pub fn delete(&mut self, row_ids: impl IntoIterator<Item = u64>) {
         // Order the row ids by position in which they appear in the sequence.
         let (row_ids, offsets) = self.find_ids(row_ids);
@@ -150,6 +150,37 @@ impl RowIdSequence {
 
         // Add the remaining segments.
         self.0.extend_from_slice(remaining_segments);
+    }
+
+    /// Delete row ids by position.
+    pub fn mask(&mut self, positions: impl IntoIterator<Item = u32>) -> Result<()> {
+        let mut local_positions = Vec::new();
+        let mut positions_iter = positions.into_iter();
+        let mut curr_position = positions_iter.next();
+        let mut offset = 0;
+        let mut cutoff = 0;
+
+        for segment in &mut self.0 {
+            // Make vector of local positions
+            cutoff += segment.len() as u32;
+            while let Some(position) = curr_position {
+                if position >= cutoff {
+                    break;
+                }
+                local_positions.push(position - offset);
+                curr_position = positions_iter.next();
+            }
+
+            if !local_positions.is_empty() {
+                segment.mask(&local_positions);
+                local_positions.clear();
+            }
+            offset = cutoff;
+        }
+
+        self.0.retain(|segment| segment.len() != 0);
+
+        Ok(())
     }
 
     /// Find the row ids in the sequence.
@@ -266,6 +297,39 @@ impl RowIdSequence {
             offset += segment_len;
         }
         None
+    }
+}
+
+impl From<&RowIdSequence> for RowIdTreeMap {
+    fn from(row_ids: &RowIdSequence) -> Self {
+        let mut tree_map = Self::new();
+        for segment in &row_ids.0 {
+            match segment {
+                U64Segment::Range(range) => {
+                    tree_map.insert_range(range.clone());
+                }
+                U64Segment::RangeWithBitmap { range, bitmap } => {
+                    tree_map.insert_range(range.clone());
+                    for (i, val) in range.clone().enumerate() {
+                        if !bitmap.get(i) {
+                            tree_map.remove(val);
+                        }
+                    }
+                }
+                U64Segment::RangeWithHoles { range, holes } => {
+                    tree_map.insert_range(range.clone());
+                    for hole in holes.iter() {
+                        tree_map.remove(hole);
+                    }
+                }
+                U64Segment::SortedArray(array) | U64Segment::Array(array) => {
+                    for val in array.iter() {
+                        tree_map.insert(val);
+                    }
+                }
+            }
+        }
+        tree_map
     }
 }
 
@@ -671,5 +735,99 @@ mod test {
             assert!(result.is_err());
             assert!(matches!(result.unwrap_err(), Error::InvalidInput { .. }));
         }
+    }
+
+    #[test]
+    fn test_row_id_sequence_to_treemap() {
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithHoles {
+                range: 50..60,
+                holes: vec![53, 54].into(),
+            },
+            U64Segment::SortedArray(vec![7, 9].into()),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, true, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35, 39].into()),
+            U64Segment::Range(40..50),
+        ]);
+
+        let tree_map = RowIdTreeMap::from(&sequence);
+        let expected = vec![
+            0, 1, 2, 3, 4, 7, 9, 10, 12, 14, 35, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+            51, 52, 55, 56, 57, 58, 59,
+        ]
+        .into_iter()
+        .collect::<RowIdTreeMap>();
+        assert_eq!(tree_map, expected);
+    }
+
+    #[test]
+    fn test_row_id_mask() {
+        // 0, 1, 2, 3, 4
+        // 50, 51, 52, 55, 56, 57, 58, 59
+        // 7, 9
+        // 10, 12, 14
+        // 35, 39
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithHoles {
+                range: 50..60,
+                holes: vec![53, 54].into(),
+            },
+            U64Segment::SortedArray(vec![7, 9].into()),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, true, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35, 39].into()),
+        ]);
+
+        // Masking one in each segment
+        let values_to_remove = [4, 55, 7, 12, 39];
+        let positions_to_remove = sequence
+            .iter()
+            .enumerate()
+            .filter_map(|(i, val)| {
+                if values_to_remove.contains(&val) {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut sequence = sequence;
+        sequence.mask(positions_to_remove).unwrap();
+        let expected = RowIdSequence(vec![
+            U64Segment::Range(0..4),
+            U64Segment::RangeWithBitmap {
+                range: 50..60,
+                bitmap: [
+                    true, true, true, false, false, false, true, true, true, true,
+                ]
+                .as_slice()
+                .into(),
+            },
+            U64Segment::Range(9..10),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, false, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35].into()),
+        ]);
+        assert_eq!(sequence, expected);
+    }
+
+    #[test]
+    fn test_row_id_mask_everything() {
+        let mut sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::SortedArray(vec![7, 9].into()),
+        ]);
+        sequence.mask(0..sequence.len() as u32).unwrap();
+        let expected = RowIdSequence(vec![]);
+        assert_eq!(sequence, expected);
     }
 }

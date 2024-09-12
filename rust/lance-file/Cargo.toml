@@ -29,9 +29,7 @@ bytes.workspace = true
 datafusion-common.workspace = true
 deepsize.workspace = true
 futures.workspace = true
-lance-datagen.workspace = true
 log.workspace = true
-num_cpus.workspace = true
 num-traits.workspace = true
 object_store.workspace = true
 prost.workspace = true
@@ -43,6 +41,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+lance-datagen.workspace = true
+lance-testing.workspace = true
 criterion.workspace = true
 rand.workspace = true
 proptest.workspace = true

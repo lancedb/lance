@@ -25,9 +25,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
-use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
+use lance_file::version::LanceFileVersion;
+use lance_table::format::{
+    pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, WriterVersion,
+};
+use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
+use rand::Rng;
 use snafu::{location, Location};
 
 use futures::future::Either;
@@ -44,7 +48,7 @@ use crate::dataset::{write_manifest_file, ManifestWriteConfig};
 use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
-#[cfg(all(target_feature = "dynamodb", test))]
+#[cfg(all(feature = "dynamodb", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
@@ -117,6 +121,7 @@ pub(crate) async fn commit_new_dataset(
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
@@ -134,6 +139,7 @@ pub(crate) async fn commit_new_dataset(
             Some(indices.clone())
         },
         write_config,
+        manifest_naming_scheme,
     )
     .await?;
 
@@ -190,6 +196,48 @@ async fn migrate_manifest(
     Ok(())
 }
 
+fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
+    let data_storage_version = manifest.data_storage_format.lance_file_version()?;
+    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
+        // Due to bugs in 0.16 it is possible the dataset's data storage version does not
+        // match the file version.  As a result, we need to check and see if they are out
+        // of sync.
+        if let Some(actual_file_version) =
+            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
+                message: format!(
+                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
+                    e
+                ),
+                location: location!(),
+            })? {
+                if actual_file_version > data_storage_version {
+                    log::warn!(
+                        "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
+                        data_storage_version,
+                        actual_file_version
+                    );
+                    manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
+                }
+            }
+    } else {
+        // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
+        // match the data storage version.  This is a sanity assertion to prevent data corruption.
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
+            if actual_file_version != data_storage_version {
+                return Err(Error::Internal {
+                    message: format!(
+                        "The operation added files with version {}.  However, the data storage version is {}.",
+                        actual_file_version,
+                        data_storage_version
+                    ),
+                    location: location!(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fix schema in case of duplicate field ids.
 ///
 /// See test dataset v0.10.5/corrupt_schema
@@ -205,7 +253,7 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     for fragment in manifest.fragments.iter() {
         for file in fragment.files.iter() {
             for field_id in file.fields.iter() {
-                if !seen_fields.insert(*field_id) {
+                if *field_id >= 0 && !seen_fields.insert(*field_id) {
                     fields_with_duplicate_ids.insert(*field_id);
                 }
             }
@@ -330,7 +378,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(num_cpus::get() * 2)
+        .buffered(dataset.object_store.io_parallelism())
         .boxed();
 
     new_fragments.try_collect().await
@@ -369,6 +417,7 @@ pub(crate) async fn commit_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
@@ -407,7 +456,7 @@ pub(crate) async fn commit_transaction(
         check_transaction(transaction, other_version, other_transaction)?;
     }
 
-    for _ in 0..commit_config.num_retries {
+    for attempt_i in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
         let (mut manifest, mut indices) = match transaction.operation {
             Operation::Restore { version } => {
@@ -442,6 +491,8 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
+        check_storage_version(&mut manifest)?;
+
         migrate_indices(&dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -456,6 +507,7 @@ pub(crate) async fn commit_transaction(
                 Some(indices.clone())
             },
             write_config,
+            manifest_naming_scheme,
         )
         .await;
 
@@ -464,17 +516,27 @@ pub(crate) async fn commit_transaction(
                 return Ok(manifest);
             }
             Err(CommitError::CommitConflict) => {
-                // See if we can retry the commit
-                dataset = dataset.checkout_version(target_version).await?;
+                // See if we can retry the commit. Try to account for all
+                // transactions that have been committed since the read_version.
+                // Use small amount of backoff to handle transactions that all
+                // started at exact same time better.
 
-                let other_transaction =
-                    if let Some(txn_file) = dataset.manifest.transaction_file.as_ref() {
+                let backoff_time = backoff_time(attempt_i);
+                tokio::time::sleep(backoff_time).await;
+
+                let latest_version = dataset.latest_version_id().await?;
+                for version in target_version..=latest_version {
+                    dataset = dataset.checkout_version(version).await?;
+                    let other_transaction = if let Some(txn_file) =
+                        dataset.manifest.transaction_file.as_ref()
+                    {
                         Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
                     } else {
                         None
                     };
-                check_transaction(transaction, target_version, &other_transaction)?;
-                target_version += 1;
+                    check_transaction(transaction, version, &other_transaction)?;
+                }
+                target_version = latest_version + 1;
             }
             Err(CommitError::OtherError(err)) => {
                 // If other error, return
@@ -494,6 +556,18 @@ pub(crate) async fn commit_transaction(
     })
 }
 
+fn backoff_time(attempt_i: u32) -> std::time::Duration {
+    // Exponential base:
+    // 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms
+    let backoff = 2_i32.pow(attempt_i) * 100;
+    // With +-100ms jitter
+    let jitter = rand::thread_rng().gen_range(-100..100);
+    let backoff = backoff + jitter;
+    // No more than 5 seconds and less than 10ms.
+    let backoff = backoff.clamp(10, 5_000) as u64;
+    std::time::Duration::from_millis(backoff)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -505,7 +579,7 @@ mod tests {
     use lance_core::datatypes::{Field, Schema};
     use lance_index::IndexType;
     use lance_linalg::distance::MetricType;
-    use lance_table::format::DataFile;
+    use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
         CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
     };
@@ -871,7 +945,7 @@ mod tests {
             },
         ];
 
-        let mut manifest = Manifest::new(schema, Arc::new(fragments));
+        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
         fix_schema(&mut manifest).unwrap();
 

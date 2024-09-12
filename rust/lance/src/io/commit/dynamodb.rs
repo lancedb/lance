@@ -13,53 +13,60 @@
 // Windows FS can't handle concurrent copy
 #[cfg(all(test, target_os = "linux", feature = "dynamodb_tests"))]
 mod test {
+    macro_rules! base_uri {
+        () => {
+            "base_uri"
+        };
+    }
+    macro_rules! version {
+        () => {
+            "version"
+        };
+    }
+
     use std::sync::Arc;
 
     use aws_credential_types::Credentials;
     use aws_sdk_dynamodb::{
         config::Region,
         types::{
-            AttributeDefinition, KeySchemaElement, ProvisionedThroughput, ScalarAttributeType,
+            AttributeDefinition, KeySchemaElement, KeyType, ProvisionedThroughput,
+            ScalarAttributeType,
         },
+        Client,
     };
-    use futures::{future::join_all, StreamExt, TryStreamExt};
+    use futures::future::join_all;
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
 
     use crate::{
-        dataset::{ReadParams, WriteMode, WriteParams},
-        io::{
-            commit::{
-                external_manifest::ExternalManifestCommitHandler, latest_manifest_path,
-                manifest_path, CommitHandler,
-            },
-            object_store::ObjectStoreParams,
-        },
+        dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},
         Dataset,
+    };
+    use lance_table::io::commit::{
+        dynamodb::DynamoDBExternalManifestStore,
+        external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
+        CommitHandler, ManifestNamingScheme,
     };
 
     fn read_params(handler: Arc<dyn CommitHandler>) -> ReadParams {
         ReadParams {
-            store_options: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
 
     fn write_params(handler: Arc<dyn CommitHandler>) -> WriteParams {
         WriteParams {
-            store_params: Some(ObjectStoreParams {
-                commit_handler: Some(handler),
-                ..Default::default()
-            }),
+            commit_handler: Some(handler),
             ..Default::default()
         }
     }
 
     async fn make_dynamodb_store() -> Arc<dyn ExternalManifestStore> {
         let dynamodb_local_config = aws_sdk_dynamodb::config::Builder::new()
+            .behavior_version_latest()
             .endpoint_url(
                 // url for dynamodb-local
                 "http://localhost:8000",
@@ -78,31 +85,36 @@ mod test {
                 KeySchemaElement::builder()
                     .attribute_name(base_uri!())
                     .key_type(KeyType::Hash)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .key_schema(
                 KeySchemaElement::builder()
                     .attribute_name(version!())
                     .key_type(KeyType::Range)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(base_uri!())
                     .attribute_type(ScalarAttributeType::S)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .attribute_definitions(
                 AttributeDefinition::builder()
                     .attribute_name(version!())
                     .attribute_type(ScalarAttributeType::N)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .provisioned_throughput(
                 ProvisionedThroughput::builder()
                     .read_capacity_units(10)
                     .write_capacity_units(10)
-                    .build(),
+                    .build()
+                    .unwrap(),
             )
             .send()
             .await
@@ -185,7 +197,7 @@ mod test {
             external_manifest_store: store,
         };
         let options = read_params(Arc::new(handler));
-        Dataset::open_with_params(ds_uri, &options).await.expect(
+        DatasetBuilder::from_uri(ds_uri).with_read_params(options).load().await.expect(
             "If this fails, it means the external store handler does not correctly handle the case when a dataset exist, but it has never used external store before."
         );
     }
@@ -208,10 +220,12 @@ mod test {
             .unwrap();
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 100);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 100);
     }
 
     #[tokio::test]
@@ -256,10 +270,12 @@ mod test {
         assert!(errors.is_empty(), "{:?}", errors);
 
         // load the data and check the content
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 
     #[tokio::test]
@@ -292,24 +308,17 @@ mod test {
 
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
-        localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
+        // Move version 6 to a temporary location, put that in the store.
+        let base_path = Path::parse(ds_uri).unwrap();
+        let version_six_staging_location =
+            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
-            .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
+            .rename(
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &version_six_staging_location,
+            )
             .await
             .unwrap();
-        // set the store back to dataset path with -{uuid} suffix
-        let mut version_six = localfs
-            .list(Some(&ds.base))
-            .await
-            .unwrap()
-            .try_filter(|p| {
-                let p = p.clone();
-                async move { p.location.filename().unwrap().starts_with("6.manifest-") }
-            })
-            .collect::<Vec<_>>()
-            .await;
-        assert_eq!(version_six.len(), 1);
-        let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
         store
             .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref())
             .await
@@ -317,21 +326,31 @@ mod test {
 
         // Open without external store handler, should not see the out-of-sync commit
         let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(params)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(ds.version().version, 5);
-        assert_eq!(ds.count_rows().await.unwrap(), 50);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 50);
 
         // Open with external store handler, should sync the out-of-sync commit on open
-        let ds = Dataset::open_with_params(ds_uri, &read_params(handler))
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(read_params(handler))
+            .load()
             .await
             .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         // Open without external store handler again, should see the newly sync'd commit
         let params = ReadParams::default();
-        let ds = Dataset::open_with_params(ds_uri, &params).await.unwrap();
+        let ds = DatasetBuilder::from_uri(ds_uri)
+            .with_read_params(params)
+            .load()
+            .await
+            .unwrap();
         assert_eq!(ds.version().version, 6);
-        assert_eq!(ds.count_rows().await.unwrap(), 60);
+        assert_eq!(ds.count_rows(None).await.unwrap(), 60);
     }
 }

@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use chrono::prelude::*;
 use lance_file::datatypes::{populate_schema_dictionary, Fields, FieldsWithMeta};
 use lance_file::reader::FileReader;
+use lance_file::version::{LanceFileVersion, LEGACY_FORMAT_VERSION};
 use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
 
 use super::Fragment;
-use crate::feature_flags::FLAG_MOVE_STABLE_ROW_IDS;
+use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::Schema;
@@ -73,6 +74,9 @@ pub struct Manifest {
 
     /// The max row id used so far.
     pub next_row_id: u64,
+
+    /// The storage format of the data files.
+    pub data_storage_format: DataStorageFormat,
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -89,7 +93,11 @@ fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
 }
 
 impl Manifest {
-    pub fn new(schema: Schema, fragments: Arc<Vec<Fragment>>) -> Self {
+    pub fn new(
+        schema: Schema,
+        fragments: Arc<Vec<Fragment>>,
+        data_storage_format: DataStorageFormat,
+    ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
         Self {
             schema,
@@ -106,6 +114,7 @@ impl Manifest {
             transaction_file: None,
             fragment_offsets,
             next_row_id: 0,
+            data_storage_format,
         }
     }
 
@@ -131,6 +140,7 @@ impl Manifest {
             transaction_file: None,
             fragment_offsets,
             next_row_id: previous.next_row_id,
+            data_storage_format: previous.data_storage_format.clone(),
         }
     }
 
@@ -265,12 +275,52 @@ impl Manifest {
         let pb_manifest: pb::Manifest = self.into();
         pb_manifest.encode_to_vec()
     }
+
+    pub fn should_use_legacy_format(&self) -> bool {
+        self.data_storage_format.version == LEGACY_FORMAT_VERSION
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WriterVersion {
     pub library: String,
     pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataStorageFormat {
+    pub file_format: String,
+    pub version: String,
+}
+
+const LANCE_FORMAT_NAME: &str = "lance";
+
+impl DataStorageFormat {
+    pub fn new(version: LanceFileVersion) -> Self {
+        Self {
+            file_format: LANCE_FORMAT_NAME.to_string(),
+            version: version.resolve().to_string(),
+        }
+    }
+
+    pub fn lance_file_version(&self) -> Result<LanceFileVersion> {
+        self.version.parse::<LanceFileVersion>()
+    }
+}
+
+impl Default for DataStorageFormat {
+    fn default() -> Self {
+        Self::new(LanceFileVersion::default())
+    }
+}
+
+impl From<pb::manifest::DataStorageFormat> for DataStorageFormat {
+    fn from(pb: pb::manifest::DataStorageFormat) -> Self {
+        Self {
+            file_format: pb.file_format,
+            version: pb.version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +434,23 @@ impl TryFrom<pb::Manifest> for Manifest {
             });
         }
 
+        let data_storage_format = match p.data_format {
+            None => {
+                if let Some(inferred_version) = Fragment::try_infer_version(fragments.as_ref())? {
+                    // If there are fragments, they are a better indicator
+                    DataStorageFormat::new(inferred_version)
+                } else {
+                    // No fragments to inspect, best we can do is look at writer flags
+                    if has_deprecated_v2_feature_flag(p.writer_feature_flags) {
+                        DataStorageFormat::new(LanceFileVersion::Stable)
+                    } else {
+                        DataStorageFormat::new(LanceFileVersion::Legacy)
+                    }
+                }
+            }
+            Some(format) => DataStorageFormat::from(format),
+        };
+
         Ok(Self {
             schema: Schema::from(fields_with_meta),
             version: p.version,
@@ -403,6 +470,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             },
             fragment_offsets,
             next_row_id: p.next_row_id,
+            data_storage_format,
         })
     }
 }
@@ -441,6 +509,10 @@ impl From<&Manifest> for pb::Manifest {
             max_fragment_id: m.max_fragment_id,
             transaction_file: m.transaction_file.clone().unwrap_or_default(),
             next_row_id: m.next_row_id,
+            data_format: Some(pb::manifest::DataStorageFormat {
+                file_format: m.data_storage_format.file_format.clone(),
+                version: m.data_storage_format.version.clone(),
+            }),
         }
     }
 }
@@ -554,7 +626,7 @@ mod tests {
             Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
             Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
-        let manifest = Manifest::new(schema, Arc::new(fragments));
+        let manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
         let actual = manifest.fragments_by_offset_range(0..10);
         assert_eq!(actual.len(), 1);
@@ -616,7 +688,7 @@ mod tests {
             },
         ];
 
-        let manifest = Manifest::new(schema, Arc::new(fragments));
+        let manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
         assert_eq!(manifest.max_field_id(), 43);
     }

@@ -1,203 +1,319 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Projection
-//!
+use std::sync::{Arc, OnceLock};
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+use datafusion::error::{DataFusionError, Result};
+use datafusion::logical_expr::ScalarUDF;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::scalar::ScalarValue;
+use datafusion_functions::core::getfield::GetFieldFunc;
+use datafusion_functions::core::named_struct::NamedStructFunc;
+use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 
-use arrow_array::RecordBatch;
-use arrow_schema::{Schema as ArrowSchema, SchemaRef};
-use datafusion::common::Statistics;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
-};
-use datafusion_physical_expr::EquivalenceProperties;
-use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
-use tokio::sync::mpsc::Receiver;
-use tokio::task::JoinHandle;
-
-use crate::arrow::*;
-use crate::datatypes::Schema;
-use crate::Result;
-
-/// Executing Projection on a stream of record batches.
-pub struct ProjectionStream {
-    rx: Receiver<DataFusionResult<RecordBatch>>,
-
-    bg_thread: Option<JoinHandle<()>>,
-
-    projection: Arc<ArrowSchema>,
+fn get_field_func() -> Arc<ScalarUDF> {
+    static GET_FIELD_FUNC: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+    GET_FIELD_FUNC
+        .get_or_init(|| Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::new())))
+        .clone()
+}
+fn get_make_struct_func() -> Arc<ScalarUDF> {
+    static MAKE_STRUCT_FUNC: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
+    MAKE_STRUCT_FUNC
+        .get_or_init(|| Arc::new(ScalarUDF::new_from_impl(NamedStructFunc::new())))
+        .clone()
 }
 
-impl ProjectionStream {
-    fn new(input: SendableRecordBatchStream, projection: &Schema) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(2);
+/// Make a DataFusion projection node from a schema.
+///
+/// The `projection` schema must be a subset of the input schema. This can be
+/// used to select a subset of fields, either at the top-level or within
+/// nested structs.
+pub fn project(input: Arc<dyn ExecutionPlan>, projection: &ArrowSchema) -> Result<ProjectionExec> {
+    // Use input schema and projection schema to create a list of physical expressions.
+    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
+        Vec::with_capacity(projection.fields.len());
 
-        let schema = Arc::new(ArrowSchema::from(projection));
-        let schema_clone = schema.clone();
-        let bg_thread = tokio::spawn(async move {
-            if let Err(e) = input
-                .zip(stream::repeat_with(|| schema_clone.clone()))
-                .then(|(batch, schema)| async move {
-                    let batch = batch?;
-                    batch.project_by_schema(schema.as_ref())
-                })
-                .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
-                .try_for_each(|b| async {
-                    if tx.send(Ok(b)).await.is_err() {
-                        // If channel is closed, make sure we return an error to end the stream.
-                        return Err(DataFusionError::Internal(
-                            "ExecNode(Projection): channel closed".to_string(),
-                        ));
-                    }
-                    Ok(())
-                })
-                .await
-            {
-                if let Err(e) = tx.send(Err(e)).await {
-                    if let Err(e) = e.0 {
-                        // if channel was closed, it was cancelled by the receiver.
-                        // But if there was a different error we should send it
-                        // or log it.
-                        if !e.to_string().contains("channel closed") {
-                            log::error!("channel was closed by receiver, but error occurred in background thread: {:?}", e);
-                        }
-                    }
-                }
+    let input_schema = input.schema();
+
+    let selections = compute_projection(input_schema.fields(), &projection.fields)?;
+
+    let field_names = projection.fields().iter().map(|f| f.name()).cloned();
+
+    for (name, selection) in field_names.zip(selections.into_iter()) {
+        let expr = selection_as_expr(&selection, input_schema.fields(), None);
+        exprs.push((expr, name));
+    }
+
+    ProjectionExec::try_new(exprs, input)
+}
+
+fn selection_as_expr(
+    selection: &Selection,
+    parent_fields: &Fields,
+    parent_expr: Option<Arc<dyn PhysicalExpr>>,
+) -> Arc<dyn PhysicalExpr> {
+    match selection {
+        Selection::FullField(field_name) => {
+            let (field_index, field) = &parent_fields.find(field_name).unwrap();
+            if let Some(expr) = parent_expr {
+                // We are extracting a child field.
+                sub_field(expr, field)
+            } else {
+                // This is a top-level field
+                Arc::new(Column::new(field.name(), *field_index))
             }
-        });
+        }
+        Selection::StructProjection(field_name, sub_selections) => {
+            let (field_index, field) = &parent_fields.find(field_name).unwrap();
+            let parent = if let Some(grandparent) = parent_expr {
+                sub_field(grandparent, field)
+            } else {
+                Arc::new(Column::new(field_name, *field_index))
+            };
+            let DataType::Struct(fields) = field.data_type() else {
+                panic!("Expected struct");
+            };
+            let mut sub_exprs = Vec::with_capacity(2 * sub_selections.len());
+            for sub_selection in sub_selections {
+                sub_exprs.push(Arc::new(Literal::new(ScalarValue::Utf8(Some(
+                    sub_selection.name().to_string(),
+                )))) as Arc<dyn PhysicalExpr>);
+                sub_exprs.push(selection_as_expr(
+                    sub_selection,
+                    fields,
+                    Some(parent.clone()),
+                ));
+            }
 
-        Self {
-            rx,
-            bg_thread: Some(bg_thread),
-            projection: schema,
+            let make_struct = get_make_struct_func();
+            Arc::new(ScalarFunctionExpr::new(
+                make_struct.name(),
+                make_struct.clone(),
+                sub_exprs,
+                project_field(field.data_type(), selection),
+            ))
         }
     }
 }
 
-impl Stream for ProjectionStream {
-    type Item = DataFusionResult<RecordBatch>;
+fn sub_field(parent_expr: Arc<dyn PhysicalExpr>, field: &Field) -> Arc<dyn PhysicalExpr> {
+    let func = get_field_func();
+    Arc::new(ScalarFunctionExpr::new(
+        func.name(),
+        func.clone(),
+        vec![
+            parent_expr,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(field.name().clone())))),
+        ],
+        field.data_type().clone(),
+    ))
+}
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = Pin::into_inner(self);
-        // We need to check the JoinHandle to make sure the thread hasn't panicked.
-        let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
-            match bg_thread.poll_unpin(cx) {
-                Poll::Ready(Ok(())) => true,
-                Poll::Ready(Err(join_error)) => {
-                    return Poll::Ready(Some(Err(DataFusionError::Execution(format!(
-                        "ExecNode(Projection): thread panicked: {}",
-                        join_error
-                    )))));
+fn project_field(field_type: &DataType, selection: &Selection) -> DataType {
+    match selection {
+        Selection::FullField(_) => field_type.clone(),
+        Selection::StructProjection(_, sub_selections) => {
+            if let DataType::Struct(fields) = field_type {
+                let mut projected_fields = Vec::with_capacity(sub_selections.len());
+                for sub_selection in sub_selections {
+                    let field_name = sub_selection.name();
+                    let field = fields.iter().find(|f| f.name() == field_name).unwrap();
+                    let projected_field_type = project_field(field.data_type(), sub_selection);
+                    // If we project, it's always null (for some reason).
+                    projected_fields.push(Field::new(field_name, projected_field_type, true));
                 }
-                Poll::Pending => false,
+                DataType::Struct(projected_fields.into())
+            } else {
+                panic!("Expected struct")
             }
-        } else {
-            false
-        };
-        if bg_thread_completed {
-            // Need to take it, since we aren't allowed to poll if again after.
-            this.bg_thread.take();
         }
-        // this.rx.
-        this.rx.poll_recv(cx)
     }
 }
 
-impl RecordBatchStream for ProjectionStream {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.projection.clone()
-    }
-}
-
+/// Represents selection of fields from a struct / schema.
 #[derive(Debug)]
-pub struct ProjectionExec {
-    input: Arc<dyn ExecutionPlan>,
-    project: Arc<Schema>,
-    properties: PlanProperties,
+pub enum Selection<'a> {
+    /// Selects this fields and all subfields
+    FullField(&'a str),
+    /// For a struct, selections of subfields
+    StructProjection(&'a str, Vec<Selection<'a>>),
 }
 
-impl DisplayAs for ProjectionExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let columns = self
-                    .project
-                    .fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(f, "Projection: fields=[{}]", columns)
-            }
+impl Selection<'_> {
+    /// Returns the name of the field being selected.
+    pub fn name(&self) -> &str {
+        match self {
+            Selection::FullField(name) => name,
+            Selection::StructProjection(name, _) => name,
         }
     }
 }
 
-impl ProjectionExec {
-    pub fn try_new(input: Arc<dyn ExecutionPlan>, project: Arc<Schema>) -> Result<Self> {
-        let arrow_schema = ArrowSchema::from(project.as_ref());
-        // TODO: we reset the EquivalenceProperties here but we could probably just project
-        // them, that way ordering is maintained (or just use DF project?)
-        let properties = input
-            .properties()
-            .clone()
-            .with_eq_properties(EquivalenceProperties::new(Arc::new(arrow_schema)));
-        Ok(Self {
-            input,
-            project,
-            properties,
-        })
+/// Resolves the projection into a list of selections.
+pub fn compute_projection<'a>(
+    schema: &'_ Fields,
+    projection: &'a Fields,
+) -> Result<Vec<Selection<'a>>> {
+    let mut selections = Vec::with_capacity(projection.len());
+    for projected_field in projection {
+        match projected_field.data_type() {
+            DataType::Struct(fields) => {
+                let original_field = schema
+                    .iter()
+                    .find(|f| f.name() == projected_field.name())
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "compute_projection: projected field {} not found in schema {:?}",
+                            projected_field.name(),
+                            schema
+                        ))
+                    })?;
+                let DataType::Struct(input_fields) = original_field.data_type() else {
+                    return Err(DataFusionError::Internal(
+                        "compute_projection: expected struct".to_string(),
+                    ));
+                };
+
+                let sub_selections = compute_projection(input_fields, fields)?;
+                if fields.len() == input_fields.len()
+                    && sub_selections
+                        .iter()
+                        .all(|s| matches!(s, Selection::FullField(_)))
+                {
+                    selections.push(Selection::FullField(projected_field.name()));
+                } else {
+                    selections.push(Selection::StructProjection(
+                        projected_field.name(),
+                        sub_selections,
+                    ));
+                }
+            }
+            _ => {
+                selections.push(Selection::FullField(projected_field.name()));
+            }
+        }
     }
+    Ok(selections)
 }
 
-impl ExecutionPlan for ProjectionExec {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+#[cfg(test)]
+mod tests {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StructArray};
+    use datafusion::{physical_plan::memory::MemoryExec, prelude::SessionContext};
+    use futures::TryStreamExt;
+    use lance_core::datatypes::Schema;
+
+    use super::*;
+
+    fn sample_nested_data() -> RecordBatch {
+        let schema = Arc::new(
+            ArrowSchema::new(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new(
+                    "b",
+                    DataType::Struct(
+                        vec![
+                            Field::new("c", DataType::Int32, true),
+                            Field::new(
+                                "d",
+                                DataType::Struct(
+                                    vec![
+                                        Field::new("e", DataType::Int32, true),
+                                        Field::new("f", DataType::Int32, true),
+                                    ]
+                                    .into(),
+                                ),
+                                true,
+                            ),
+                        ]
+                        .into(),
+                    ),
+                    true,
+                ),
+            ])
+            .with_metadata([("key".into(), "value".into())].into()),
+        );
+
+        // Only needs to be one row
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                Arc::new(StructArray::from(vec![
+                    (
+                        Arc::new(Field::new("c", DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+                    ),
+                    (
+                        Arc::new(Field::new(
+                            "d",
+                            DataType::Struct(
+                                vec![
+                                    Field::new("e", DataType::Int32, true),
+                                    Field::new("f", DataType::Int32, true),
+                                ]
+                                .into(),
+                            ),
+                            true,
+                        )),
+                        Arc::new(StructArray::from(vec![
+                            (
+                                Arc::new(Field::new("e", DataType::Int32, true)),
+                                Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+                            ),
+                            (
+                                Arc::new(Field::new("f", DataType::Int32, true)),
+                                Arc::new(Int32Array::from(vec![4])),
+                            ),
+                        ])),
+                    ),
+                ])),
+            ],
+        )
+        .unwrap()
     }
 
-    fn schema(&self) -> SchemaRef {
-        let arrow_schema = ArrowSchema::from(self.project.as_ref());
-        arrow_schema.into()
+    async fn apply_to_batch(batch: RecordBatch, projection: &ArrowSchema) -> Result<RecordBatch> {
+        let schema = batch.schema();
+        let memory_exec = MemoryExec::try_new(&[vec![batch]], schema, None).unwrap();
+        let exec = project(Arc::new(memory_exec), projection)?;
+        let claimed_schema = exec.schema();
+        let session = SessionContext::new();
+        let task_ctx = session.task_ctx();
+        let stream = exec.execute(0, task_ctx)?;
+        assert_eq!(stream.schema().as_ref(), claimed_schema.as_ref());
+        let batches = stream.try_collect::<Vec<_>>().await?;
+        assert_eq!(batches.len(), 1);
+        Ok(batches.into_iter().next().unwrap())
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
-    }
+    #[tokio::test]
+    async fn test_project_node() {
+        let sample_data = sample_nested_data();
+        let schema = sample_data.schema();
+        // Project that schema with nested fields selected
+        let lance_schema = Schema::try_from(schema.as_ref()).unwrap();
 
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::try_new(
-            children[0].clone(),
-            self.project.clone(),
-        )?))
-    }
+        let projections: [&[i32]; 4] = [
+            &[0, 2, 4, 5], // All leaves
+            &[0, 1],       // Top-level fields
+            &[2],          // Partial first level struct
+            &[4],          // Partial second level struct
+        ];
 
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<datafusion::execution::context::TaskContext>,
-    ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-        Ok(Box::pin(ProjectionStream::new(input_stream, &self.project)))
-    }
+        for projection in projections {
+            let projected_schema = lance_schema.project_by_ids(projection);
+            let projected_arrow_schema = (&projected_schema).into();
 
-    fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
-        let num_rows = self.input.statistics()?.num_rows;
-        Ok(Statistics {
-            num_rows,
-            ..datafusion::physical_plan::Statistics::new_unknown(self.schema().as_ref())
-        })
-    }
+            let result = apply_to_batch(sample_data.clone(), &projected_arrow_schema)
+                .await
+                .unwrap();
 
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
+            assert_eq!(result.schema().as_ref(), &projected_arrow_schema);
+        }
     }
 }

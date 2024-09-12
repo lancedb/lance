@@ -14,14 +14,13 @@ pub const FLAG_DELETION_FILES: u64 = 1;
 /// Row ids are table after moves, but not updates. Fragments contain an index
 /// mapping row ids to row addresses.
 pub const FLAG_MOVE_STABLE_ROW_IDS: u64 = 2;
-/// Files are written with the new v2 format (temporary flag, will be removed
-/// once v2 is the default format)
-pub const FLAG_USE_V2_FORMAT: u64 = 4;
+/// Files are written with the new v2 format (this flag is no longer used)
+pub const FLAG_USE_V2_FORMAT_DEPRECATED: u64 = 4;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 8;
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
-pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
+pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) -> Result<()> {
     // Reset flags
     manifest.reader_feature_flags = 0;
     manifest.writer_feature_flags = 0;
@@ -41,7 +40,7 @@ pub fn apply_feature_flags(manifest: &mut Manifest) -> Result<()> {
         .fragments
         .iter()
         .any(|frag| frag.row_id_meta.is_some());
-    if has_row_ids {
+    if has_row_ids || enable_stable_row_id {
         if !manifest
             .fragments
             .iter()
@@ -67,8 +66,8 @@ pub fn can_write_dataset(writer_flags: u64) -> bool {
     writer_flags < FLAG_UNKNOWN
 }
 
-pub fn should_use_legacy_format(writer_flags: u64) -> bool {
-    writer_flags & FLAG_USE_V2_FORMAT == 0
+pub fn has_deprecated_v2_feature_flag(writer_flags: u64) -> bool {
+    writer_flags & FLAG_USE_V2_FORMAT_DEPRECATED != 0
 }
 
 #[cfg(test)]
@@ -80,7 +79,7 @@ mod tests {
         assert!(can_read_dataset(0));
         assert!(can_read_dataset(super::FLAG_DELETION_FILES));
         assert!(can_read_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
-        assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT));
+        assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_read_dataset(
             super::FLAG_DELETION_FILES | super::FLAG_MOVE_STABLE_ROW_IDS
         ));
@@ -92,11 +91,11 @@ mod tests {
         assert!(can_write_dataset(0));
         assert!(can_write_dataset(super::FLAG_DELETION_FILES));
         assert!(can_write_dataset(super::FLAG_MOVE_STABLE_ROW_IDS));
-        assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT));
+        assert!(can_read_dataset(super::FLAG_USE_V2_FORMAT_DEPRECATED));
         assert!(can_write_dataset(
             super::FLAG_DELETION_FILES
                 | super::FLAG_MOVE_STABLE_ROW_IDS
-                | super::FLAG_USE_V2_FORMAT
+                | super::FLAG_USE_V2_FORMAT_DEPRECATED
         ));
         assert!(!can_write_dataset(super::FLAG_UNKNOWN));
     }

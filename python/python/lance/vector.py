@@ -8,8 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
@@ -19,6 +18,8 @@ from .dependencies import _check_for_numpy, torch
 from .dependencies import numpy as np
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from . import LanceDataset
 
 
@@ -183,15 +184,20 @@ def train_ivf_centroids_on_accelerator(
         np.save(f, centroids)
     logging.info("Saved centroids to %s", f.name)
 
-    return centroids, compute_partitions(dataset, column, kmeans, batch_size=20480)
+    return centroids, kmeans
+
+
+def _collate_fn(batch):
+    return batch[0]
 
 
 def compute_partitions(
     dataset: LanceDataset,
     column: str,
     kmeans: Any,  # KMeans
-    batch_size: int = 10240,
-    spill_dir: Union[str, Path] = None,
+    batch_size: int = 1024 * 10 * 4,
+    dst_dataset_uri: Optional[Union[str, Path]] = None,
+    allow_cuda_tf32: bool = True,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -205,8 +211,11 @@ def compute_partitions(
         KMeans model to use to compute partitions.
     batch_size: int, default 10240
         The batch size used to read the dataset.
-    spill_dir: Path
-        The path to store the partitions.
+    dst_dataset_uri: Union[str, Path], optional
+        The path to store the partitions.  If not specified a random
+        directory is used instead
+    allow_tf32: bool, default True
+        Whether to allow tf32 for matmul on CUDA.
 
     Returns
     -------
@@ -215,11 +224,21 @@ def compute_partitions(
     """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
+    torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
+
+    num_rows = dataset.count_rows()
+
     torch_ds = PytorchLanceDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
+    )
+    loader = torch.utils.data.DataLoader(
+        torch_ds,
+        batch_size=1,
+        pin_memory=True,
+        collate_fn=_collate_fn,
     )
     output_schema = pa.schema(
         [
@@ -228,24 +247,29 @@ def compute_partitions(
         ]
     )
 
+    progress = tqdm(total=num_rows)
+
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
-            for batch in torch_ds:
-                batch: Dict[str, torch.Tensor] = batch
-                vecs = batch[column].reshape(-1, kmeans.centroids.shape[1])
+            for batch in loader:
+                vecs = (
+                    batch[column]
+                    .to(kmeans.device)
+                    .reshape(-1, kmeans.centroids.shape[1])
+                )
 
-                vecs.to(kmeans.device)
-                partitions = kmeans.transform(vecs).cpu().numpy()
-                ids = batch["_rowid"].reshape(-1).cpu().numpy()
-
+                partitions = kmeans.transform(vecs)
+                ids = batch["_rowid"].reshape(-1)
                 # this is expected to be true, so just assert
                 assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                ids = ids[partitions >= 0]
-                partitions = partitions[partitions >= 0]
+                mask = (partitions.isfinite()).cpu()
+                ids = ids[mask]
+                partitions = partitions.cpu()[mask]
+
                 part_batch = pa.RecordBatch.from_arrays(
-                    [ids, partitions],
+                    [ids.numpy(), partitions.cpu().numpy()],
                     schema=output_schema,
                 )
                 if len(part_batch) < len(ids):
@@ -254,27 +278,24 @@ def compute_partitions(
                         len(part_batch) - len(ids),
                     )
 
+                progress.update(part_batch.num_rows)
                 yield part_batch
 
-    rbr = pa.RecordBatchReader.from_batches(
-        output_schema, tqdm(_partition_assignment())
-    )
-
-    if spill_dir is None:
-        spill_dir = tempfile.mkdtemp()
-
-    spill_uri = Path(spill_dir) / "precomputed_partitions.lance"
-
+    rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
+    if dst_dataset_uri is None:
+        dst_dataset_uri = tempfile.mkdtemp()
     ds = write_dataset(
         rbr,
-        spill_uri,
+        dst_dataset_uri,
         schema=output_schema,
         max_rows_per_file=dataset.count_rows(),
+        data_storage_version="stable",
     )
     assert len(ds.get_fragments()) == 1
     files = ds.get_fragments()[0].data_files()
     assert len(files) == 1
 
-    logging.info("Saved recomputed partitions to %s", spill_uri.absolute())
+    progress.close()
 
-    return str(spill_uri)
+    logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
+    return str(dst_dataset_uri)

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 """
-Integration tests with S3 and DynamoDB.
+Integration tests with S3 and DynamoDB. Also used to test storage_options are
+passed correctly.
 
 See DEVELOPMENT.md under heading "Integration Tests" for more information.
 """
@@ -16,6 +17,9 @@ from threading import Barrier
 import lance
 import pyarrow as pa
 import pytest
+from lance.dependencies import _RAY_AVAILABLE, ray
+from lance.file import LanceFileReader, LanceFileWriter
+from lance.fragment import write_fragments
 
 # These are all keys that are accepted by storage_options
 CONFIG = {
@@ -221,3 +225,65 @@ def test_s3_unsafe(s3_bucket: str):
     assert len(ds.versions()) == 1
     assert ds.count_rows() == 3
     assert ds.to_table() == data
+
+
+@pytest.mark.integration
+def test_s3_ddb_distributed_commit(s3_bucket: str, ddb_table: str):
+    table_name = uuid.uuid4().hex
+    table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
+
+    schema = pa.schema([pa.field("a", pa.int64())])
+    fragments = write_fragments(
+        pa.table({"a": pa.array(range(1024))}),
+        f"s3+ddb://{s3_bucket}/distributed_commit?ddbTableName={ddb_table}",
+        storage_options=CONFIG,
+    )
+    operation = lance.LanceOperation.Overwrite(schema, fragments)
+    ds = lance.LanceDataset.commit(table_dir, operation, storage_options=CONFIG)
+    assert ds.count_rows() == 1024
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_ray_committer(s3_bucket: str, ddb_table: str):
+    from lance.ray.sink import write_lance
+
+    table_name = uuid.uuid4().hex
+    table_dir = f"s3+ddb://{s3_bucket}/{table_name}?ddbTableName={ddb_table}"
+
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
+
+    ds = ray.data.range(10).map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
+    write_lance(ds, table_dir, schema=schema, storage_options=CONFIG)
+
+    ds = lance.dataset(table_dir, storage_options=CONFIG)
+    assert ds.count_rows() == 10
+    assert ds.schema == schema
+
+    tbl = ds.to_table()
+    assert sorted(tbl["id"].to_pylist()) == list(range(10))
+    assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
+    assert len(ds.get_fragments()) == 1
+
+
+@pytest.mark.integration
+def test_file_writer_reader(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    del storage_options["dynamodb_endpoint"]
+    table = pa.table({"a": [1, 2, 3]})
+    file_path = f"s3://{s3_bucket}/foo.lance"
+    global_buffer_text = "hello"
+    global_buffer_bytes = bytes(global_buffer_text, "utf-8")
+    with LanceFileWriter(str(file_path), storage_options=storage_options) as writer:
+        writer.write_batch(table)
+        global_buffer_pos = writer.add_global_buffer(global_buffer_bytes)
+    reader = LanceFileReader(str(file_path), storage_options=storage_options)
+    assert reader.read_all().to_table() == table
+    assert reader.metadata().global_buffers[global_buffer_pos].size == len(
+        global_buffer_bytes
+    )
+    assert (
+        bytes(reader.read_global_buffer(global_buffer_pos)).decode()
+        == global_buffer_text
+    )

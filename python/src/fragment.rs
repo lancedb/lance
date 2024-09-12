@@ -16,22 +16,19 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::datatypes::Schema;
-use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
-use object_store::path::Path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
 use crate::dataset::get_write_params;
 use crate::updater::Updater;
-use crate::{Scanner, RT};
+use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
 #[derive(Clone)]
@@ -73,21 +70,14 @@ impl FileFragment {
     }
 
     #[staticmethod]
-    #[pyo3(signature = (filename, schema, fragment_id))]
+    #[pyo3(signature = (filename, dataset, fragment_id))]
     fn create_from_file(
         filename: &str,
-        schema: PyArrowType<ArrowSchema>,
+        dataset: &Dataset,
         fragment_id: usize,
     ) -> PyResult<FragmentMetadata> {
-        let arrow_schema = schema.0;
-        let schema = Schema::try_from(&arrow_schema).map_err(|e| {
-            PyValueError::new_err(format!(
-                "Failed to convert Arrow schema to Lance schema: {}",
-                e
-            ))
-        })?;
         let metadata = RT.block_on(None, async {
-            LanceFragment::create_from_file(filename, &schema, fragment_id, None)
+            LanceFragment::create_from_file(filename, dataset.ds.as_ref(), fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
@@ -99,7 +89,7 @@ impl FileFragment {
     fn create(
         dataset_uri: &str,
         fragment_id: Option<usize>,
-        reader: &PyAny,
+        reader: &Bound<PyAny>,
         kwargs: Option<&PyDict>,
     ) -> PyResult<FragmentMetadata> {
         let params = if let Some(kw_params) = kwargs {
@@ -126,7 +116,7 @@ impl FileFragment {
         self.fragment.id()
     }
 
-    fn metadata(&self) -> FragmentMetadata {
+    pub fn metadata(&self) -> FragmentMetadata {
         FragmentMetadata::new(self.fragment.metadata().clone())
     }
 
@@ -430,40 +420,11 @@ impl FragmentMetadata {
     }
 }
 
-#[pyfunction(name = "_cleanup_partial_writes")]
-pub fn cleanup_partial_writes(base_uri: &str, files: Vec<(String, String)>) -> PyResult<()> {
-    let (store, base_path) = RT
-        .runtime
-        .block_on(ObjectStore::from_uri(base_uri))
-        .map_err(|err| PyIOError::new_err(format!("Failed to create object store: {}", err)))?;
-
-    let files: Vec<(Path, String)> = files
-        .into_iter()
-        .map(|(path, multipart_id)| (Path::from(path.as_str()), multipart_id))
-        .collect();
-
-    #[allow(clippy::map_identity)]
-    async fn inner(
-        store: ObjectStore,
-        base_path: Path,
-        files: Vec<(Path, String)>,
-    ) -> Result<(), ::lance::Error> {
-        let files_iter = files
-            .iter()
-            .map(|(path, multipart_id)| (path, multipart_id));
-        lance::dataset::cleanup::cleanup_partial_writes(&store, &base_path, files_iter).await
-    }
-
-    RT.runtime
-        .block_on(inner(store, base_path, files))
-        .map_err(|err| PyIOError::new_err(format!("Failed to cleanup files: {}", err)))
-}
-
 #[pyfunction(name = "_write_fragments")]
 #[pyo3(signature = (dataset_uri, reader, **kwargs))]
 pub fn write_fragments(
     dataset_uri: &str,
-    reader: &PyAny,
+    reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Vec<FragmentMetadata>> {
     let batches = convert_reader(reader)?;
@@ -485,7 +446,7 @@ pub fn write_fragments(
         .collect()
 }
 
-fn convert_reader(reader: &PyAny) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
+fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let reader = RT.block_on(
@@ -496,6 +457,8 @@ fn convert_reader(reader: &PyAny) -> PyResult<Box<dyn RecordBatchReader + Send +
         )??;
         Ok(Box::new(reader))
     } else {
-        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow(reader)?))
+        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
+            reader,
+        )?))
     }
 }

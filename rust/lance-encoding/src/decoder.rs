@@ -213,26 +213,28 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
+use std::sync::Once;
 use std::{ops::Range, sync::Arc};
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::{BoxStream, FuturesOrdered};
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
+use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, Schema};
-use log::trace;
+use log::{debug, trace, warn};
 use snafu::{location, Location};
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 
 use lance_core::{Error, Result};
 use tracing::instrument;
 
-use crate::encoder::get_str_encoding_type;
+use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
-use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
@@ -240,13 +242,16 @@ use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb;
 use crate::{BufferScheduler, EncodingsIo};
 
+// If users are getting batches over 10MiB large then it's time to reduce the batch size
+const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
+
 /// Metadata describing a page in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
 #[derive(Debug)]
 pub struct PageInfo {
     /// The number of rows in the page
-    pub num_rows: u32,
+    pub num_rows: u64,
     /// The encoding that explains the buffers in the page
     pub encoding: pb::ArrayEncoding,
     /// The offsets and sizes of the buffers in the file
@@ -324,7 +329,7 @@ impl Default for DecoderMiddlewareChain {
         Self {
             chain: Default::default(),
         }
-        .add_strategy(Arc::new(CoreFieldDecoderStrategy))
+        .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()))
     }
 }
 
@@ -369,7 +374,7 @@ pub struct DecoderMiddlewareChainCursor<'a> {
 
 pub type ChosenFieldScheduler<'a> = (
     DecoderMiddlewareChainCursor<'a>,
-    BoxFuture<'static, Result<Arc<dyn FieldScheduler>>>,
+    Result<Arc<dyn FieldScheduler>>,
 );
 
 impl<'a> DecoderMiddlewareChainCursor<'a> {
@@ -392,12 +397,15 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     pub fn next(
         mut self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         if self.cur_idx >= self.chain.chain.len() {
             return Err(Error::invalid_input(
-                "The user requested field {:?} from column {:?} but no decoders were registered to handle it",
+                format!(
+                    "The user requested a field {:?} but no decoders were registered to handle it",
+                    field
+                ),
                 location!(),
             ));
         }
@@ -417,7 +425,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
     pub fn restart_at_current(
         mut self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.cur_idx = 0;
@@ -431,24 +439,85 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         mut self,
         child_idx: u32,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.push_back(child_idx);
         self.cur_idx = 0;
-        self.next(field, column_infos, buffers)
+        match self.next(field, column_infos, buffers) {
+            Ok(mut next) => {
+                next.0.path.pop_back();
+                Ok(next)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Starts the decoding process for a field
     pub(crate) fn start(
         mut self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
     ) -> Result<ChosenFieldScheduler<'a>> {
         self.path.clear();
         self.cur_idx = 0;
         self.next(field, column_infos, buffers)
+    }
+}
+
+pub struct ColumnInfoIter<'a> {
+    column_infos: &'a [ColumnInfo],
+    column_indices: &'a [u32],
+    column_info_pos: usize,
+    column_indices_pos: usize,
+}
+
+impl<'a> ColumnInfoIter<'a> {
+    pub fn new(column_infos: &'a [ColumnInfo], column_indices: &'a [u32]) -> Self {
+        let initial_pos = column_indices[0] as usize;
+        Self {
+            column_infos,
+            column_indices,
+            column_info_pos: initial_pos,
+            column_indices_pos: 0,
+        }
+    }
+
+    pub fn peek(&self) -> &'a ColumnInfo {
+        &self.column_infos[self.column_info_pos]
+    }
+
+    pub fn expect_next(&mut self) -> Result<&'a ColumnInfo> {
+        self.next().ok_or_else(|| {
+            Error::invalid_input(
+                "there were more fields in the schema than provided column indices",
+                location!(),
+            )
+        })
+    }
+
+    pub(crate) fn next_top_level(&mut self) {
+        self.column_indices_pos += 1;
+        if self.column_indices_pos < self.column_indices.len() {
+            self.column_info_pos = self.column_indices[self.column_indices_pos] as usize;
+        } else {
+            self.column_info_pos = self.column_infos.len();
+        }
+    }
+}
+
+impl<'a> Iterator for ColumnInfoIter<'a> {
+    type Item = &'a ColumnInfo;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.column_info_pos < self.column_infos.len() {
+            let info = &self.column_infos[self.column_info_pos];
+            self.column_info_pos += 1;
+            Some(info)
+        } else {
+            None
+        }
     }
 }
 
@@ -512,7 +581,7 @@ pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<ChosenFieldScheduler<'a>>;
@@ -520,7 +589,9 @@ pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
 
 /// The core decoder strategy handles all the various Arrow types
 #[derive(Debug, Default)]
-pub struct CoreFieldDecoderStrategy;
+pub struct CoreFieldDecoderStrategy {
+    pub validate_data: bool,
+}
 
 impl CoreFieldDecoderStrategy {
     /// This is just a sanity check to ensure there is no "wrapped encodings"
@@ -550,26 +621,12 @@ impl CoreFieldDecoderStrategy {
     }
 
     fn is_primitive(data_type: &DataType) -> bool {
-        if data_type.is_primitive() {
+        if data_type.is_primitive() | data_type.is_binary_like() {
             true
-        } else if get_str_encoding_type() {
-            match data_type {
-                // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean
-                | DataType::Null
-                | DataType::FixedSizeBinary(_)
-                | DataType::Utf8 => true,
-                DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
-                _ => false,
-            }
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean
-                | DataType::Null
-                | DataType::FixedSizeBinary(_)
-                // | DataType::Utf8 
-                => true,
+                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -577,6 +634,7 @@ impl CoreFieldDecoderStrategy {
     }
 
     fn create_primitive_scheduler(
+        &self,
         data_type: &DataType,
         path: &VecDeque<u32>,
         column: &ColumnInfo,
@@ -589,16 +647,18 @@ impl CoreFieldDecoderStrategy {
             positions_and_sizes: &column.buffer_offsets_and_sizes,
         };
         Ok(Arc::new(PrimitiveFieldScheduler::new(
+            column.index,
             data_type.clone(),
             column.page_infos.clone(),
             column_buffers,
+            self.validate_data,
         )))
     }
 
     /// Helper method to verify the page encoding of a struct header column
     fn check_simple_struct(column_info: &ColumnInfo, path: &VecDeque<u32>) -> Result<()> {
         Self::ensure_values_encoded(column_info, path)?;
-        if !column_info.page_infos.len() == 1 {
+        if column_info.page_infos.len() != 1 {
             return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
         }
         let encoding = &column_info.page_infos[0].encoding;
@@ -607,61 +667,94 @@ impl CoreFieldDecoderStrategy {
             _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
         }
     }
+
+    fn check_packed_struct(column_info: &ColumnInfo) -> bool {
+        let encoding = &column_info.page_infos[0].encoding;
+        matches!(
+            encoding.array_encoding.as_ref().unwrap(),
+            pb::array_encoding::ArrayEncoding::PackedStruct(_)
+        )
+    }
 }
 
 impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
     fn create_field_scheduler<'a>(
         &self,
         field: &Field,
-        column_infos: &mut VecDeque<ColumnInfo>,
+        column_infos: &mut ColumnInfoIter,
         buffers: FileBuffers,
         chain: DecoderMiddlewareChainCursor<'a>,
     ) -> Result<ChosenFieldScheduler<'a>> {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
-            let primitive_col = column_infos.pop_front().unwrap();
-            let scheduler = Self::create_primitive_scheduler(
+            let primitive_col = column_infos.expect_next()?;
+            let scheduler = self.create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),
-                &primitive_col,
+                primitive_col,
                 buffers,
             )?;
-            return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
+            return Ok((chain, Ok(scheduler)));
         }
         match &data_type {
             DataType::FixedSizeList(inner, _dimension) => {
                 // A fixed size list column could either be a physical or a logical decoder
                 // depending on the child data type.
                 if Self::is_primitive(inner.data_type()) {
-                    let primitive_col = column_infos.pop_front().unwrap();
-                    let scheduler = Self::create_primitive_scheduler(
+                    let primitive_col = column_infos.expect_next()?;
+                    let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
-                        &primitive_col,
+                        primitive_col,
                         buffers,
                     )?;
-                    return Ok((chain, std::future::ready(Ok(scheduler)).boxed()));
+                    Ok((chain, Ok(scheduler)))
                 } else {
                     todo!()
                 }
             }
+            DataType::Dictionary(_key_type, value_type) => {
+                if Self::is_primitive(value_type) {
+                    let primitive_col = column_infos.expect_next()?;
+                    let scheduler = self.create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        primitive_col,
+                        buffers,
+                    )?;
+                    Ok((chain, Ok(scheduler)))
+                } else {
+                    Err(Error::NotSupported {
+                        source: format!(
+                            "No way to decode into a dictionary field of type {}",
+                            value_type
+                        )
+                        .into(),
+                        location: location!(),
+                    })
+                }
+            }
             DataType::List(items_field) | DataType::LargeList(items_field) => {
-                let offsets_column = column_infos.pop_front().unwrap();
-                Self::ensure_values_encoded(&offsets_column, chain.current_path())?;
+                let offsets_column = column_infos.expect_next()?;
+                column_infos.next_top_level();
+                Self::ensure_values_encoded(offsets_column, chain.current_path())?;
                 let offsets_column_buffers = ColumnBuffers {
                     file_buffers: buffers,
                     positions_and_sizes: &offsets_column.buffer_offsets_and_sizes,
                 };
+                let item_field_name = items_field.name().clone();
                 let (chain, items_scheduler) = chain.new_child(
                     /*child_idx=*/ 0,
                     &field.children[0],
                     column_infos,
                     buffers,
                 )?;
+                let items_scheduler = items_scheduler?;
 
                 let (inner_infos, null_offset_adjustments): (Vec<_>, Vec<_>) = offsets_column
                     .page_infos
                     .iter()
+                    .filter(|offsets_page| offsets_page.num_rows > 0)
                     .map(|offsets_page| {
                         if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
                             &offsets_page.encoding.array_encoding
@@ -688,9 +781,11 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     })
                     .unzip();
                 let inner = Arc::new(PrimitiveFieldScheduler::new(
+                    offsets_column.index,
                     DataType::UInt64,
                     Arc::from(inner_infos.into_boxed_slice()),
                     offsets_column_buffers,
+                    self.validate_data,
                 )) as Arc<dyn FieldScheduler>;
                 let offset_type = if matches!(data_type, DataType::List(_)) {
                     DataType::Int32
@@ -698,69 +793,53 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     DataType::Int64
                 };
                 let items_type = items_field.data_type().clone();
-                let list_scheduler_fut = async move {
-                    let items_scheduler = items_scheduler.await?;
-                    Ok(Arc::new(ListFieldScheduler::new(
-                        inner,
-                        items_scheduler,
-                        items_type,
-                        offset_type,
-                        null_offset_adjustments,
-                    )) as Arc<dyn FieldScheduler>)
-                }
-                .boxed();
-                Ok((chain, list_scheduler_fut))
-            }
-            DataType::Utf8 | DataType::Binary | DataType::LargeBinary | DataType::LargeUtf8 => {
-                let list_type = if matches!(data_type, DataType::Utf8 | DataType::Binary) {
-                    DataType::List(Arc::new(ArrowField::new("item", DataType::UInt8, true)))
-                } else {
-                    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::UInt8, true)))
-                };
-                let list_field = ArrowField::new(&field.name, list_type, true);
-                let list_field = Field::try_from(&list_field).unwrap();
-                // We've changed the data type but are still decoding the same "field"
-                let (chain, list_decoder) =
-                    chain.restart_at_current(&list_field, column_infos, buffers)?;
-                let data_type = data_type.clone();
-                let binary_scheduler_fut = async move {
-                    let list_decoder = list_decoder.await?;
-                    Ok(
-                        Arc::new(BinaryFieldScheduler::new(list_decoder, data_type.clone()))
-                            as Arc<dyn FieldScheduler>,
-                    )
-                }
-                .boxed();
-                Ok((chain, binary_scheduler_fut))
+                let list_scheduler = Ok(Arc::new(ListFieldScheduler::new(
+                    inner,
+                    items_scheduler,
+                    item_field_name.clone(),
+                    items_type,
+                    offset_type,
+                    null_offset_adjustments,
+                )) as Arc<dyn FieldScheduler>);
+                Ok((chain, list_scheduler))
             }
             DataType::Struct(fields) => {
-                let column_info = column_infos.pop_front().unwrap();
-                Self::check_simple_struct(&column_info, chain.current_path()).unwrap();
-                let (chain, child_schedulers) = field.children.iter().enumerate().try_fold(
-                    (chain, FuturesOrdered::new()),
-                    |(chain, mut fields), (field_idx, field)| {
-                        let (chain, field) =
-                            chain.new_child(field_idx as u32, field, column_infos, buffers)?;
-                        fields.push_back(field);
-                        Result::Ok((chain, fields))
-                    },
-                )?;
+                let column_info = column_infos.expect_next()?;
 
-                let fields = fields.clone();
-                let struct_fut = async move {
-                    let child_schedulers = child_schedulers.try_collect::<Vec<_>>().await?;
-                    Ok(
-                        Arc::new(SimpleStructScheduler::new(child_schedulers, fields))
-                            as Arc<dyn FieldScheduler>,
-                    )
+                if Self::check_packed_struct(column_info) {
+                    // use packed struct encoding
+                    let scheduler = self.create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        column_info,
+                        buffers,
+                    )?;
+                    Ok((chain, Ok(scheduler)))
+                } else {
+                    // use default struct encoding
+                    Self::check_simple_struct(column_info, chain.current_path()).unwrap();
+                    let mut child_schedulers = Vec::with_capacity(field.children.len());
+                    let mut chain = chain;
+                    for (i, field) in field.children.iter().enumerate() {
+                        column_infos.next_top_level();
+                        let (next_chain, field_scheduler) =
+                            chain.new_child(i as u32, field, column_infos, buffers)?;
+                        child_schedulers.push(field_scheduler?);
+                        chain = next_chain;
+                    }
+
+                    let fields = fields.clone();
+                    let struct_scheduler = Ok(Arc::new(SimpleStructScheduler::new(
+                        child_schedulers,
+                        fields,
+                    )) as Arc<dyn FieldScheduler>);
+
+                    // For now, we don't record nullability for structs.  As a result, there is always
+                    // only one "page" of struct data.  In the future, this will change.  A null-aware
+                    // struct scheduler will need to first calculate how many rows are in the struct page
+                    // and then find the child pages that overlap.  This should be doable.
+                    Ok((chain, struct_scheduler))
                 }
-                .boxed();
-
-                // For now, we don't record nullability for structs.  As a result, there is always
-                // only one "page" of struct data.  In the future, this will change.  A null-aware
-                // struct scheduler will need to first calculate how many rows are in the struct page
-                // and then find the child pages that overlap.  This should be doable.
-                Ok((chain, struct_fut))
             }
             // TODO: Still need support for dictionary / RLE
             _ => chain.next(field, column_infos, buffers),
@@ -775,9 +854,9 @@ fn root_column(num_rows: u64) -> ColumnInfo {
     let root_pages = (0..num_root_pages)
         .map(|i| PageInfo {
             num_rows: if i == num_root_pages - 1 {
-                final_page_num_rows as u32
+                final_page_num_rows
             } else {
-                u32::MAX
+                u64::MAX
             },
             encoding: pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
@@ -798,8 +877,9 @@ fn root_column(num_rows: u64) -> ColumnInfo {
 impl DecodeBatchScheduler {
     /// Creates a new decode scheduler with the expected schema and the column
     /// metadata of the file.
-    pub async fn try_new<'a>(
+    pub fn try_new<'a>(
         schema: &'a Schema,
+        column_indices: &[u32],
         column_infos: &[Arc<ColumnInfo>],
         file_buffer_positions_and_sizes: &'a Vec<(u64, u64)>,
         num_rows: u64,
@@ -811,16 +891,24 @@ impl DecodeBatchScheduler {
         };
         let arrow_schema = ArrowSchema::from(schema);
         let root_fields = arrow_schema.fields().clone();
-        let mut columns = VecDeque::with_capacity(column_infos.len() + 1);
-        columns.push_back(root_column(num_rows));
+        let mut columns = Vec::with_capacity(column_infos.len() + 1);
+        columns.push(root_column(num_rows));
         columns.extend(column_infos.iter().map(|col| col.as_ref().clone()));
+        let adjusted_column_indices = [0_u32]
+            .into_iter()
+            .chain(column_indices.iter().map(|i| *i + 1))
+            .collect::<Vec<_>>();
+        let mut column_iter = ColumnInfoIter::new(&columns, &adjusted_column_indices);
         let root_type = DataType::Struct(root_fields.clone());
-        let root_field = Field::try_from(&ArrowField::new("root", root_type, false))?;
-        let (_, root_scheduler_fut) =
+        let mut root_field = Field::try_from(&ArrowField::new("root", root_type, false))?;
+        root_field
+            .metadata
+            .insert("__lance_decoder_root".to_string(), "true".to_string());
+        let (_, root_scheduler) =
             decoder_strategy
                 .cursor(io)
-                .start(&root_field, &mut columns, buffers)?;
-        let root_scheduler = root_scheduler_fut.await?;
+                .start(&root_field, &mut column_iter, buffers)?;
+        let root_scheduler = root_scheduler?;
         Ok(Self {
             root_scheduler,
             root_fields,
@@ -839,10 +927,24 @@ impl DecodeBatchScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
         io: Arc<dyn EncodingsIo>,
-        mut schedule_action: impl FnMut(Result<DecoderMessage>),
+        mut schedule_action: impl FnMut(Result<DecoderMessage>) -> bool,
+        // If specified, this will be used as the top_level_row for all scheduling
+        // tasks.  This is used by list scheduling to ensure all items scheduling
+        // tasks are scheduled at the same top level row.
+        priority: Option<Box<dyn PriorityRange>>,
     ) {
         let rows_requested = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-        trace!("Scheduling ranges {:?} ({} rows)", ranges, rows_requested);
+        trace!(
+            "Scheduling {} ranges across {}..{} ({} rows){}",
+            ranges.len(),
+            ranges.first().unwrap().start,
+            ranges.last().unwrap().end,
+            rows_requested,
+            priority
+                .as_ref()
+                .map(|p| format!(" (priority={:?})", p))
+                .unwrap_or_default()
+        );
 
         let mut context = SchedulerContext::new(io);
         let maybe_root_job = self.root_scheduler.schedule_ranges(ranges, filter);
@@ -853,25 +955,30 @@ impl DecodeBatchScheduler {
         let mut root_job = maybe_root_job.unwrap();
         let mut num_rows_scheduled = 0;
         let mut rows_to_schedule = root_job.num_rows();
+        let mut priority = priority.unwrap_or(Box::new(SimplePriorityRange::new(0)));
         trace!("Scheduled ranges refined to {} rows", rows_to_schedule);
         while rows_to_schedule > 0 {
-            let maybe_next_scan_line = root_job.schedule_next(&mut context, num_rows_scheduled);
+            let maybe_next_scan_line = root_job.schedule_next(&mut context, priority.as_ref());
             if let Err(schedule_next_err) = maybe_next_scan_line {
                 schedule_action(Err(schedule_next_err));
                 return;
             }
             let next_scan_line = maybe_next_scan_line.unwrap();
-            num_rows_scheduled += next_scan_line.rows_scheduled as u64;
-            rows_to_schedule -= next_scan_line.rows_scheduled as u64;
+            priority.advance(next_scan_line.rows_scheduled);
+            num_rows_scheduled += next_scan_line.rows_scheduled;
+            rows_to_schedule -= next_scan_line.rows_scheduled;
             trace!(
                 "Scheduled scan line of {} rows and {} decoders",
                 next_scan_line.rows_scheduled,
                 next_scan_line.decoders.len()
             );
-            schedule_action(Ok(DecoderMessage {
+            if !schedule_action(Ok(DecoderMessage {
                 scheduled_so_far: num_rows_scheduled,
                 decoders: next_scan_line.decoders,
-            }));
+            })) {
+                // Decoder has disconnected
+                return;
+            }
         }
 
         trace!("Finished scheduling {} ranges", ranges.len());
@@ -884,9 +991,19 @@ impl DecodeBatchScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
         io: Arc<dyn EncodingsIo>,
+        priority: Option<Box<dyn PriorityRange>>,
     ) -> Result<Vec<DecoderMessage>> {
         let mut decode_messages = Vec::new();
-        self.do_schedule_ranges(ranges, filter, io, |msg| decode_messages.push(msg));
+        self.do_schedule_ranges(
+            ranges,
+            filter,
+            io,
+            |msg| {
+                decode_messages.push(msg);
+                true
+            },
+            priority,
+        );
         decode_messages.into_iter().collect::<Result<Vec<_>>>()
     }
 
@@ -907,9 +1024,25 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        self.do_schedule_ranges(ranges, filter, scheduler, |msg| {
-            sink.send(msg).unwrap();
-        })
+        self.do_schedule_ranges(
+            ranges,
+            filter,
+            scheduler,
+            |msg| {
+                match sink.send(msg) {
+                    Ok(_) => true,
+                    Err(SendError { .. }) => {
+                        // The receiver has gone away.  We can't do anything about it
+                        // so just ignore the error.
+                        debug!(
+                        "schedule_ranges aborting early since decoder appears to have been dropped"
+                    );
+                        false
+                    }
+                }
+            },
+            None,
+        )
     }
 
     /// Schedules the load of a range of rows
@@ -944,7 +1077,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        debug_assert!(indices.windows(2).all(|w| w[0] < w[1]));
+        debug_assert!(indices.windows(2).all(|w| w[0] <= w[1]));
         if indices.is_empty() {
             return;
         }
@@ -983,6 +1116,7 @@ pub struct BatchDecodeStream {
     rows_scheduled: u64,
     rows_drained: u64,
     scheduler_exhuasted: bool,
+    emitted_batch_size_warning: Arc<Once>,
 }
 
 impl BatchDecodeStream {
@@ -1010,6 +1144,7 @@ impl BatchDecodeStream {
             rows_scheduled: 0,
             rows_drained: 0,
             scheduler_exhuasted: false,
+            emitted_batch_size_warning: Arc::new(Once::new()),
         }
     }
 
@@ -1060,11 +1195,10 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64) as u32;
-        self.rows_remaining -= to_take as u64;
+        let mut to_take = self.rows_remaining.min(self.rows_per_batch as u64);
+        self.rows_remaining -= to_take;
 
-        let scheduled_need =
-            (self.rows_drained + to_take as u64).saturating_sub(self.rows_scheduled);
+        let scheduled_need = (self.rows_drained + to_take).saturating_sub(self.rows_scheduled);
         trace!("scheduled_need = {} because rows_drained = {} and to_take = {} and rows_scheduled = {}", scheduled_need, self.rows_drained, to_take, self.rows_scheduled);
         if scheduled_need > 0 {
             let desired_scheduled = scheduled_need + self.rows_scheduled;
@@ -1075,7 +1209,7 @@ impl BatchDecodeStream {
             let actually_scheduled = self.wait_for_scheduled(desired_scheduled).await?;
             if actually_scheduled < desired_scheduled {
                 let under_scheduled = desired_scheduled - actually_scheduled;
-                to_take -= under_scheduled as u32;
+                to_take -= under_scheduled;
             }
         }
 
@@ -1083,25 +1217,37 @@ impl BatchDecodeStream {
             return Ok(None);
         }
 
-        let avail = self.root_decoder.avail_u64();
-        trace!("Top level page has {} rows already available", avail);
-        if avail < to_take as u64 {
-            trace!(
-                "Top level page waiting for an additional {} rows",
-                to_take as u64 - avail
-            );
-            self.root_decoder.wait(to_take).await?;
-        }
+        // wait_for_loaded waits for *>* loaded_need (not >=) so we do a -1 here
+        let loaded_need = self.rows_drained + to_take - 1;
+        trace!(
+            "Waiting for I/O (desire at least {} fully loaded rows)",
+            loaded_need
+        );
+        self.root_decoder.wait_for_loaded(loaded_need).await?;
+
         let next_task = self.root_decoder.drain(to_take)?;
-        self.rows_drained += to_take as u64;
+        self.rows_drained += to_take;
         Ok(Some(next_task))
     }
 
     #[instrument(level = "debug", skip_all)]
-    fn task_to_batch(task: NextDecodeTask) -> Result<RecordBatch> {
+    fn task_to_batch(
+        task: NextDecodeTask,
+        emitted_batch_size_warning: Arc<Once>,
+    ) -> Result<RecordBatch> {
         let struct_arr = task.task.decode();
         match struct_arr {
-            Ok(struct_arr) => Ok(RecordBatch::from(struct_arr.as_struct())),
+            Ok(struct_arr) => {
+                let batch = RecordBatch::from(struct_arr.as_struct());
+                let size_bytes = batch.get_array_memory_size() as u64;
+                if size_bytes > BATCH_SIZE_BYTES_WARNING {
+                    emitted_batch_size_warning.call_once(|| {
+                        let size_mb = size_bytes / 1024 / 1024;
+                        debug!("Lance read in a single batch that contained more than {}MiB of data.  You may want to consider reducing the batch size.", size_mb);
+                    });
+                }
+                Ok(batch)
+            }
             Err(e) => {
                 let e = Error::Internal {
                     message: format!("Error decoding batch: {}", e),
@@ -1117,15 +1263,21 @@ impl BatchDecodeStream {
             let next_task = slf.next_batch_task().await;
             let next_task = next_task.transpose().map(|next_task| {
                 let num_rows = next_task.as_ref().map(|t| t.num_rows).unwrap_or(0);
+                let emitted_batch_size_warning = slf.emitted_batch_size_warning.clone();
                 let task = tokio::spawn(async move {
                     let next_task = next_task?;
-                    Self::task_to_batch(next_task)
+                    Self::task_to_batch(next_task, emitted_batch_size_warning)
                 });
                 (task, num_rows)
             });
             next_task.map(|(task, num_rows)| {
                 let task = task.map(|join_wrapper| join_wrapper.unwrap()).boxed();
-                let next_task = ReadBatchTask { task, num_rows };
+                // This should be true since batch size is u32
+                debug_assert!(num_rows <= u32::MAX as u64);
+                let next_task = ReadBatchTask {
+                    task,
+                    num_rows: num_rows as u32,
+                };
                 (next_task, slf)
             })
         });
@@ -1144,51 +1296,39 @@ impl BatchDecodeStream {
 /// the decode task for batch 0 and the decode task for batch 1.
 ///
 /// See [`crate::decoder`] for more information
-pub trait PhysicalPageDecoder: Send + Sync {
-    /// Calculates and updates the capacity required to represent the requested data
+pub trait PrimitivePageDecoder: Send + Sync {
+    /// Decode data into buffers
+    ///
+    /// This may be a simple zero-copy from a disk buffer or could involve complex decoding
+    /// such as decompressing from some compressed representation.
     ///
     /// Capacity is stored as a tuple of (num_bytes: u64, is_needed: bool).  The `is_needed`
     /// portion only needs to be updated if the encoding has some concept of an "optional"
     /// buffer.
     ///
-    /// The decoder should look at `rows_to_skip` and `num_rows` and then calculate how
-    /// many bytes of data are needed.  It should then update the first part of the tuple.
+    /// Encodings can have any number of input or output buffers.  For example, a dictionary
+    /// decoding will convert two buffers (indices + dictionary) into a single buffer
     ///
-    /// Note: Most encodings deal with a single buffer.  They may have multiple input buffers
-    /// but they only have a single output buffer.  The current exception to this rule is the
-    /// `basic` encoding which has an output "validity" buffer and an output "values" buffers.
-    /// We may find there are other such exceptions.
+    /// Binary decodings have two output buffers (one for values, one for offsets)
     ///
+    /// Other decodings could even expand the # of output buffers.  For example, we could decode
+    /// fixed size strings into variable length strings going from one input buffer to multiple output
+    /// buffers.
+    ///
+    /// Each Arrow data type typically has a fixed structure of buffers and the encoding chain will
+    /// generally end at one of these structures.  However, intermediate structures may exist which
+    /// do not correspond to any Arrow type at all.  For example, a bitpacking encoding will deal
+    /// with buffers that have bits-per-value that is not a multiple of 8.
+    ///
+    /// The `primitive_array_from_buffers` method has an expected buffer layout for each arrow
+    /// type (order matters) and encodings that aim to decode into arrow types should respect
+    /// this layout.
     /// # Arguments
     ///
     /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
     /// * `num_rows` - how many rows to decode
-    /// * `buffers` - A mutable slice of "capacities" (as described above), one per buffer
     /// * `all_null` - A mutable bool, set to true if a decoder determines all values are null
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    );
-    /// Decodes the data into the requested buffers.
-    ///
-    /// You can assume that the capacity will have already been configured on the `BytesMut`
-    /// according to the capacity calculated in [`PhysicalPageDecoder::update_capacity`]
-    ///
-    /// # Arguments
-    ///
-    /// * `rows_to_skip` - how many rows to skip (within the page) before decoding
-    /// * `num_rows` - how many rows to decode
-    /// * `dest_buffers` - the output buffers to decode into
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [BytesMut],
-    ) -> Result<()>;
-    fn num_buffers(&self) -> u32;
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock>;
 }
 
 /// A scheduler for single-column encodings of primitive data
@@ -1199,7 +1339,6 @@ pub trait PhysicalPageDecoder: Send + Sync {
 /// be shared in follow-up I/O tasks.
 ///
 /// See [`crate::decoder`] for more information
-
 pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     /// Schedules a batch of I/O to load the data needed for the requested ranges
     ///
@@ -1214,10 +1353,117 @@ pub trait PageScheduler: Send + Sync + std::fmt::Debug {
     ///   scheduled.  This can be used to assign priority to I/O requests
     fn schedule_ranges(
         &self,
-        ranges: &[Range<u32>],
+        ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>>;
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>;
+}
+
+/// A trait to control the priority of I/O
+pub trait PriorityRange: std::fmt::Debug + Send + Sync {
+    fn advance(&mut self, num_rows: u64);
+    fn current_priority(&self) -> u64;
+    fn box_clone(&self) -> Box<dyn PriorityRange>;
+}
+
+/// A simple priority scheme for top-level fields with no parent
+/// repetition
+#[derive(Debug)]
+pub struct SimplePriorityRange {
+    priority: u64,
+}
+
+impl SimplePriorityRange {
+    fn new(priority: u64) -> Self {
+        Self { priority }
+    }
+}
+
+impl PriorityRange for SimplePriorityRange {
+    fn advance(&mut self, num_rows: u64) {
+        self.priority += num_rows;
+    }
+
+    fn current_priority(&self) -> u64 {
+        self.priority
+    }
+
+    fn box_clone(&self) -> Box<dyn PriorityRange> {
+        Box::new(Self {
+            priority: self.priority,
+        })
+    }
+}
+
+/// Determining the priority of a list request is tricky.  We want
+/// the priority to be the top-level row.  So if we have a
+/// list<list<int>> and each outer list has 10 rows and each inner
+/// list has 5 rows then the priority of the 100th item is 1 because
+/// it is the 5th item in the 10th item of the *second* row.
+///
+/// This structure allows us to keep track of this complicated priority
+/// relationship.
+///
+/// There's a fair amount of bookkeeping involved here.
+///
+/// A better approach (using repetition levels) is coming in the future.
+pub struct ListPriorityRange {
+    base: Box<dyn PriorityRange>,
+    offsets: Arc<[u64]>,
+    cur_index_into_offsets: usize,
+    cur_position: u64,
+}
+
+impl ListPriorityRange {
+    pub(crate) fn new(base: Box<dyn PriorityRange>, offsets: Arc<[u64]>) -> Self {
+        Self {
+            base,
+            offsets,
+            cur_index_into_offsets: 0,
+            cur_position: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for ListPriorityRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListPriorityRange")
+            .field("base", &self.base)
+            .field("offsets.len()", &self.offsets.len())
+            .field("cur_index_into_offsets", &self.cur_index_into_offsets)
+            .field("cur_position", &self.cur_position)
+            .finish()
+    }
+}
+
+impl PriorityRange for ListPriorityRange {
+    fn advance(&mut self, num_rows: u64) {
+        // We've scheduled X items.  Now walk through the offsets to
+        // determine how many rows we've scheduled.
+        self.cur_position += num_rows;
+        let mut idx_into_offsets = self.cur_index_into_offsets;
+        while idx_into_offsets + 1 < self.offsets.len()
+            && self.offsets[idx_into_offsets + 1] <= self.cur_position
+        {
+            idx_into_offsets += 1;
+        }
+        let base_rows_advanced = idx_into_offsets - self.cur_index_into_offsets;
+        self.cur_index_into_offsets = idx_into_offsets;
+        self.base.advance(base_rows_advanced as u64);
+    }
+
+    fn current_priority(&self) -> u64 {
+        self.base.current_priority()
+    }
+
+    fn box_clone(&self) -> Box<dyn PriorityRange> {
+        Box::new(Self {
+            base: self.base.box_clone(),
+            offsets: self.offsets.clone(),
+            cur_index_into_offsets: self.cur_index_into_offsets,
+            cur_position: self.cur_position,
+        })
+    }
 }
 
 /// Contains the context for a scheduler
@@ -1290,7 +1536,7 @@ impl SchedulerContext {
 
 #[derive(Debug)]
 pub struct ScheduledScanLine {
-    pub rows_scheduled: u32,
+    pub rows_scheduled: u64,
     pub decoders: Vec<DecoderReady>,
 }
 
@@ -1298,7 +1544,7 @@ pub trait SchedulingJob: std::fmt::Debug {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine>;
 
     fn num_rows(&self) -> u64;
@@ -1372,7 +1618,7 @@ pub struct NextDecodeTask {
     /// The decode task itself
     pub task: Box<dyn DecodeArrayTask>,
     /// The number of rows that will be created
-    pub num_rows: u32,
+    pub num_rows: u64,
     /// Whether or not the decoder that created this still has more rows to decode
     pub has_more: bool,
 }
@@ -1439,14 +1685,24 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
             location: location!(),
         })
     }
-    /// Waits for enough data to be loaded to decode `num_rows` of data
-    fn wait(&mut self, num_rows: u32) -> BoxFuture<Result<()>>;
+    /// Waits until at least `num_rows` have been loaded
+    fn wait_for_loaded(&mut self, loaded_need: u64) -> BoxFuture<Result<()>>;
+    /// The number of rows loaded so far
+    fn rows_loaded(&self) -> u64;
+    /// The number of rows that still need loading
+    fn rows_unloaded(&self) -> u64 {
+        self.num_rows() - self.rows_loaded()
+    }
+    /// The total number of rows in the field
+    fn num_rows(&self) -> u64;
+    /// The number of rows that have been drained so far
+    fn rows_drained(&self) -> u64;
+    /// The number of rows that are still available to drain
+    fn rows_left(&self) -> u64 {
+        self.num_rows() - self.rows_drained()
+    }
     /// Creates a task to decode `num_rows` of data into an array
-    fn drain(&mut self, num_rows: u32) -> Result<NextDecodeTask>;
-    /// The number of rows that are in the page but haven't yet been "waited"
-    fn unawaited(&self) -> u32;
-    /// The number of rows that have been "waited" but not yet decoded
-    fn avail(&self) -> u32;
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
     /// The data type of the decoded data
     fn data_type(&self) -> &DataType;
 }
@@ -1460,13 +1716,13 @@ pub async fn decode_batch(
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
+        &batch.top_level_columns,
         &batch.page_table,
         &vec![],
         batch.num_rows,
         field_decoder_strategy,
         &io_scheduler,
-    )
-    .await?;
+    )?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
     #[allow(clippy::single_range_in_vec_init)]

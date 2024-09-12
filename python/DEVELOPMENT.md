@@ -17,13 +17,13 @@ re-building.
 ## Running tests
 
 ```shell
-pytest python/tests
+make test
 ```
 
 To check the documentation examples, use
 
 ```shell
-pytest --doctest-modules python/lance
+make doctest
 ```
 
 ## Formatting and linting
@@ -47,8 +47,8 @@ make lint
 ### Format and lint on commit
 
 If you would like to run the formatters and linters when you commit your code
-then you can use the pre-commit tool.  The project includes a pre-commit config
-file already.  First, install the pre-commit tool:
+then you can use the pre-commit tool. The project includes a pre-commit config
+file already. First, install the pre-commit tool:
 
 ```shell
 pip install pre-commit
@@ -162,33 +162,33 @@ pytest --benchmark-compare=$COMPARE_ID python/benchmarks -m "not slow"
 ## Tracing
 
 Rust has great integration with tools like criterion and pprof which make it easy
-to profile and debug CPU intensive tasks.  However, these tools are not as effective
+to profile and debug CPU intensive tasks. However, these tools are not as effective
 at profiling I/O intensive work or providing a high level trace of an operation.
 
 To fill this gap the lance code utlizies the Rust tracing crate to provide tracing
-information for lance operations.  User applications can receive these events and
-forward them on for logging purposes.  Developers can also use this information to
+information for lance operations. User applications can receive these events and
+forward them on for logging purposes. Developers can also use this information to
 get a sense of the I/O that happens during an operation.
 
 ### Instrumenting code
 
 When instrumenting code you can use the `#[instrument]` macro from the Rust tracing
-crate.  See the crate docs for more information on the various parameters that can
-be set.  As a general guideline we should aim to instrument the following methods:
+crate. See the crate docs for more information on the various parameters that can
+be set. As a general guideline we should aim to instrument the following methods:
 
-* Top-level methods that will often be called by external libraries and could be slow
-* Compute intensive methods that will perform a significant amount of CPU compute
-* Any point where we are waiting on external resources (e.g. disk)
+- Top-level methods that will often be called by external libraries and could be slow
+- Compute intensive methods that will perform a significant amount of CPU compute
+- Any point where we are waiting on external resources (e.g. disk)
 
 To begin with, instrument methods as close to the user as possible and refine downwards
-as you need.  For example, start by instrumenting the entire dataset write operation
+as you need. For example, start by instrumenting the entire dataset write operation
 and then instrument any individual parts of the operation that you would like to see
 details for.
 
 ### Tracing a unit test
 
 If you would like tracing information for a rust unit test then you will need to
-decorate your test with the lance_test_macros::test attribute.  This will wrap any
+decorate your test with the lance_test_macros::test attribute. This will wrap any
 existing test attributes that you are using:
 
 ```rust
@@ -205,13 +205,13 @@ LANCE_TRACING to the your desired verbosity level (trace, debug, info, warn, err
 LANCE_TESTING=debug cargo test dataset::tests::test_create_dataset
 ```
 
-This will create a .json file (named with a timestamp) in your working directory.  This
+This will create a .json file (named with a timestamp) in your working directory. This
 .json file can be loaded by chrome or by <https://ui.perfetto.dev>
 
 ### Tracing a python script
 
 If you would like to trace a python script (application, benchmark, test) then you can easily
-do so using the lance.tracing module.  Simply call:
+do so using the lance.tracing module. Simply call:
 
 ```python
 from lance.tracing import trace_to_chrome
@@ -223,7 +223,7 @@ trace_to_chrome(level="debug")
 
 A single .json trace file will be generated after python has exited.
 
-You can use the `trace_to_chrome` function within the benchmarks, but for 
+You can use the `trace_to_chrome` function within the benchmarks, but for
 sensible results you'll want to force the benchmark to just run only once.
 To do this, rewrite the benchmark using the pedantic API:
 
@@ -237,13 +237,12 @@ benchmark.pedantic(run, iterations=1, rounds=1)
 ### Trace visualization limitations
 
 The current tracing implementation is slightly flawed when it comes to async
-operations that run in parallel.  The rust tracing-chrome library emits
-trace events into the chrome trace events JSON format.  This format is not
+operations that run in parallel. The rust tracing-chrome library emits
+trace events into the chrome trace events JSON format. This format is not
 sophisticated enough to represent asynchronous parallel work.
 
 As a result, a single instrumented async method may appear as many different
 spans in the UI.
-
 
 ## Running S3 Integration tests
 
@@ -307,3 +306,15 @@ maturin build --release \
     --target x86_64-apple-darwin \
     --out wheels
 ```
+
+## Picking a thread pool
+
+When an operation should run in parallel you typically need to specify how many threads
+to use. For example, as input to `StreamExt::buffered`. There are two numbers you can
+use. You can use `ObjectStore::io_parallelism` or `get_num_compute_intensive_cpus`.
+
+Often, operations will do a little of both compute and I/O, and you will need to make
+a judgement call. If you are unsure, and you are doing any I/O, then picking the
+`io_parallelism` is a good fallback behavior. The worst case is just that we over-parallelize
+and there is more CPU contention then there needs to be. If this becomes a problem we
+can always split the operation into two parts and use the two different thread pools.

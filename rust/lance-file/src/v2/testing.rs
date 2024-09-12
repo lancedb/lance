@@ -8,7 +8,11 @@ use arrow_schema::ArrowError;
 use futures::TryStreamExt;
 use lance_core::datatypes::Schema;
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_io::{object_store::ObjectStore, scheduler::ScanScheduler, ReadBatchParams};
+use lance_io::{
+    object_store::ObjectStore,
+    scheduler::{ScanScheduler, SchedulerConfig},
+    ReadBatchParams,
+};
 use object_store::path::Path;
 use tempfile::TempDir;
 
@@ -30,7 +34,8 @@ impl Default for FsFixture {
         let tmp_path = Path::parse(tmp_path).unwrap();
         let tmp_path = tmp_path.child("some_file.lance");
         let object_store = Arc::new(ObjectStore::local());
-        let scheduler = ScanScheduler::new(object_store.clone(), 8);
+        let scheduler =
+            ScanScheduler::new(object_store.clone(), SchedulerConfig::default_for_testing());
         Self {
             _tmp_dir: tmp_dir,
             object_store,
@@ -40,22 +45,22 @@ impl Default for FsFixture {
     }
 }
 
+pub struct WrittenFile {
+    pub schema: Arc<Schema>,
+    pub data: Vec<RecordBatch>,
+    pub field_id_mapping: Vec<(u32, u32)>,
+}
+
 pub async fn write_lance_file(
     data: impl RecordBatchReader,
     fs: &FsFixture,
     options: FileWriterOptions,
-) -> (Arc<Schema>, Vec<RecordBatch>) {
+) -> WrittenFile {
     let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
 
     let lance_schema = lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap();
 
-    let mut file_writer = FileWriter::try_new(
-        writer,
-        fs.tmp_path.to_string(),
-        lance_schema.clone(),
-        options,
-    )
-    .unwrap();
+    let mut file_writer = FileWriter::try_new(writer, lance_schema.clone(), options).unwrap();
 
     let data = data
         .collect::<std::result::Result<Vec<_>, ArrowError>>()
@@ -64,9 +69,14 @@ pub async fn write_lance_file(
     for batch in &data {
         file_writer.write_batch(batch).await.unwrap();
     }
+    let field_id_mapping = file_writer.field_id_to_column_indices().to_vec();
     file_writer.add_schema_metadata("foo", "bar");
     file_writer.finish().await.unwrap();
-    (Arc::new(lance_schema), data)
+    WrittenFile {
+        schema: Arc::new(lance_schema),
+        data,
+        field_id_mapping,
+    }
 }
 
 pub async fn read_lance_file(

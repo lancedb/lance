@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::any::Any;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -15,15 +16,21 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::stream;
-use futures::stream::Stream;
+use futures::future::BoxFuture;
+use futures::stream::{BoxStream, Stream};
+use futures::{stream, FutureExt, TryFutureExt};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
-use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
+use log::debug;
+use snafu::{location, Location};
 
 use crate::dataset::fragment::{FileFragment, FragmentReader};
+use crate::dataset::scanner::{DEFAULT_FRAGMENT_READAHEAD, LEGACY_DEFAULT_FRAGMENT_READAHEAD};
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
@@ -33,15 +40,26 @@ async fn open_file(
     with_row_id: bool,
     with_row_address: bool,
     with_make_deletions_null: bool,
+    scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
 ) -> Result<FragmentReader> {
     let mut reader = file_fragment
-        .open(projection.as_ref(), with_row_id, with_row_address)
+        .open(
+            projection.as_ref(),
+            with_row_id,
+            with_row_address,
+            scan_scheduler,
+        )
         .await?;
 
     if with_make_deletions_null {
         reader.with_make_deletions_null();
     };
     Ok(reader)
+}
+
+struct FragmentWithRange {
+    fragment: FileFragment,
+    range: Option<Range<u32>>,
 }
 
 /// Dataset Scan Node.
@@ -62,6 +80,8 @@ impl LanceStream {
     /// Parameters
     ///
     ///  - ***dataset***: The source dataset.
+    ///  - ***fragments***: The fragments to scan.
+    ///  - ***offsets***: The range of offsets to scan (scan all rows if None).
     ///  - ***projection***: the projection [Schema].
     ///  - ***filter***: filter [`PhysicalExpr`], optional.
     ///  - ***read_size***: the number of rows to read for each request.
@@ -76,6 +96,220 @@ impl LanceStream {
     pub fn try_new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        offsets: Option<Range<u64>>,
+        projection: Arc<Schema>,
+        read_size: usize,
+        batch_readahead: usize,
+        fragment_readahead: Option<usize>,
+        io_buffer_size: u64,
+        with_row_id: bool,
+        with_row_address: bool,
+        with_make_deletions_null: bool,
+        scan_in_order: bool,
+    ) -> Result<Self> {
+        let is_v2_scan = fragments
+            .iter()
+            .filter_map(|frag| frag.files.first().map(|f| !f.is_legacy_file()))
+            .next()
+            .unwrap_or(false);
+        if is_v2_scan {
+            Self::try_new_v2(
+                dataset,
+                fragments,
+                offsets,
+                projection,
+                read_size,
+                fragment_readahead,
+                with_row_id,
+                with_row_address,
+                with_make_deletions_null,
+                io_buffer_size,
+            )
+        } else {
+            Self::try_new_v1(
+                dataset,
+                fragments,
+                projection,
+                read_size,
+                batch_readahead,
+                fragment_readahead.unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD),
+                with_row_id,
+                with_row_address,
+                with_make_deletions_null,
+                scan_in_order,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_v2(
+        dataset: Arc<Dataset>,
+        fragments: Arc<Vec<Fragment>>,
+        offsets: Option<Range<u64>>,
+        projection: Arc<Schema>,
+        batch_size: usize,
+        fragment_parallelism: Option<usize>,
+        with_row_id: bool,
+        with_row_address: bool,
+        with_make_deletions_null: bool,
+        io_buffer_size: u64,
+    ) -> Result<Self> {
+        let project_schema = projection.clone();
+        let io_parallelism = dataset.object_store.io_parallelism();
+        // First, use the value specified by the user in the call
+        // Second, use the default from the environment variable, if specified
+        // Finally, use a default based on the io_parallelism
+        //
+        // Opening a fragment is pretty cheap so we can open a lot of them at once
+        // Scheduling a fragment is also pretty cheap
+        // The scheduler backpressure will control fragment priority and total data
+        //
+        // As a result, we don't really need to worry too much about fragment readahead.  We also want this
+        // to be pretty high.  While we are reading one set of fragments we should be scheduling the next set
+        // this should help ensure that we don't have breaks in I/O
+        let frag_parallelism = fragment_parallelism
+            .unwrap_or((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
+            // fragment_readhead=0 doesn't make sense so we just bump it to 1
+            .max(1);
+        debug!(
+            "Given io_parallelism={} and num_columns={} we will read {} fragments at once while scanning v2 dataset",
+            io_parallelism,
+            projection.fields.len(),
+            frag_parallelism
+        );
+
+        let mut file_fragments = fragments
+            .iter()
+            .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
+            .map(|fragment| FragmentWithRange {
+                fragment,
+                range: None,
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(offsets) = offsets {
+            let mut rows_to_skip = offsets.start;
+            let mut rows_to_take = offsets.end - offsets.start;
+            let mut filtered_fragments = Vec::with_capacity(file_fragments.len());
+
+            let mut frags_iter = file_fragments.into_iter();
+            while rows_to_take > 0 {
+                if let Some(next_frag) = frags_iter.next() {
+                    let num_rows_in_frag = next_frag
+                        .fragment
+                        .count_rows()
+                        // count_rows should be a fast operation in v2 files
+                        .now_or_never()
+                        .ok_or(Error::Internal {
+                            message: "Encountered fragment without row count metadata in v2 file"
+                                .to_string(),
+                            location: location!(),
+                        })??;
+                    if rows_to_skip >= num_rows_in_frag as u64 {
+                        rows_to_skip -= num_rows_in_frag as u64;
+                    } else {
+                        let rows_to_take_in_frag =
+                            (num_rows_in_frag as u64 - rows_to_skip).min(rows_to_take);
+                        let range =
+                            Some(rows_to_skip as u32..(rows_to_skip + rows_to_take_in_frag) as u32);
+                        filtered_fragments.push(FragmentWithRange {
+                            fragment: next_frag.fragment,
+                            range,
+                        });
+                        rows_to_skip = 0;
+                        rows_to_take -= rows_to_take_in_frag;
+                    }
+                } else {
+                    log::warn!(
+                        "Ran out of fragments before we were done scanning for range: {:?}",
+                        offsets
+                    );
+                    rows_to_take = 0;
+                }
+            }
+            file_fragments = filtered_fragments;
+        }
+
+        let scan_scheduler = ScanScheduler::new(
+            dataset.object_store.clone(),
+            SchedulerConfig {
+                io_buffer_size_bytes: io_buffer_size,
+            },
+        );
+
+        let mut priorities = Vec::with_capacity(file_fragments.len());
+        let mut current_priority = 0;
+        for frag in &file_fragments {
+            priorities.push(current_priority);
+            current_priority += frag.fragment.num_data_files();
+        }
+
+        let batches = stream::iter(file_fragments.into_iter().zip(priorities))
+            .map(move |(file_fragment, priority)| {
+                let project_schema = project_schema.clone();
+                let scan_scheduler = scan_scheduler.clone();
+                #[allow(clippy::type_complexity)]
+                let frag_task: BoxFuture<
+                    Result<BoxStream<Result<BoxFuture<Result<RecordBatch>>>>>,
+                > = tokio::spawn(async move {
+                    let reader = open_file(
+                        file_fragment.fragment,
+                        project_schema,
+                        with_row_id,
+                        with_row_address,
+                        with_make_deletions_null,
+                        Some((scan_scheduler, priority as u64)),
+                    )
+                    .await?;
+                    let batch_stream = if let Some(range) = file_fragment.range {
+                        reader.read_range(range, batch_size as u32)?.boxed()
+                    } else {
+                        reader.read_all(batch_size as u32)?.boxed()
+                    };
+                    let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
+                        batch_stream
+                            .map(|fut| {
+                                Result::Ok(
+                                    fut.map_err(|e| DataFusionError::External(Box::new(e)))
+                                        .boxed(),
+                                )
+                            })
+                            .boxed();
+                    Result::Ok(batch_stream)
+                })
+                .map(|res_res| res_res.unwrap())
+                .boxed();
+                Ok(frag_task)
+            })
+            // We need two levels of try_buffered here.  The first kicks off the tasks to read the fragments.
+            // As soon as we open the fragment we will start scheduling and that will kick off many background
+            // tasks (not tracked by this stream) to read I/O.  The limit here is really to limit how many open
+            // files we have.  It's not going to have much affect on how much RAM we are using.
+            .try_buffered(frag_parallelism)
+            .boxed();
+        let batches = batches
+            .try_flatten()
+            // The second try_buffered controls how many CPU decode tasks we kick off in parallel.
+            //
+            // TODO: Ideally this will eventually get tied into datafusion as a # of partitions.  This will let
+            // us fully fuse decode into the first half of the plan.  Currently there is likely to be a thread
+            // transfer between the two steps.
+            .try_buffered(get_num_compute_intensive_cpus())
+            .stream_in_current_span()
+            .boxed();
+
+        Ok(Self {
+            inner_stream: batches,
+            projection,
+            with_row_id,
+            with_row_address,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_v1(
+        dataset: Arc<Dataset>,
+        fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
@@ -86,6 +320,10 @@ impl LanceStream {
         scan_in_order: bool,
     ) -> Result<Self> {
         let project_schema = projection.clone();
+        debug!(
+            "Scanning v1 dataset with frag_readahead={} and batch_readahead={}",
+            fragment_readahead, batch_readahead
+        );
 
         let file_fragments = fragments
             .iter()
@@ -101,6 +339,7 @@ impl LanceStream {
                         with_row_id,
                         with_row_address,
                         with_make_deletions_null,
+                        None,
                     ))
                 })
                 .try_buffered(fragment_readahead);
@@ -128,6 +367,7 @@ impl LanceStream {
                         with_row_id,
                         with_row_address,
                         with_make_deletions_null,
+                        None,
                     ))
                 })
                 .try_buffered(fragment_readahead);
@@ -198,10 +438,12 @@ impl Stream for LanceStream {
 pub struct LanceScanExec {
     dataset: Arc<Dataset>,
     fragments: Arc<Vec<Fragment>>,
+    range: Option<Range<u64>>,
     projection: Arc<Schema>,
     read_size: usize,
     batch_readahead: usize,
-    fragment_readahead: usize,
+    fragment_readahead: Option<usize>,
+    io_buffer_size: u64,
     with_row_id: bool,
     with_row_address: bool,
     with_make_deletions_null: bool,
@@ -240,10 +482,12 @@ impl LanceScanExec {
     pub fn new(
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
+        range: Option<Range<u64>>,
         projection: Arc<Schema>,
         read_size: usize,
         batch_readahead: usize,
-        fragment_readahead: usize,
+        fragment_readahead: Option<usize>,
+        io_buffer_size: u64,
         with_row_id: bool,
         with_row_address: bool,
         with_make_deletions_null: bool,
@@ -269,10 +513,12 @@ impl LanceScanExec {
         Self {
             dataset,
             fragments,
+            range,
             projection,
             read_size,
             batch_readahead,
             fragment_readahead,
+            io_buffer_size,
             with_row_id,
             with_row_address,
             with_make_deletions_null,
@@ -284,6 +530,10 @@ impl LanceScanExec {
 }
 
 impl ExecutionPlan for LanceScanExec {
+    fn name(&self) -> &str {
+        "LanceScanExec"
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -293,7 +543,7 @@ impl ExecutionPlan for LanceScanExec {
     }
 
     /// Scan is the leaf node, so returns an empty vector.
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
@@ -318,10 +568,12 @@ impl ExecutionPlan for LanceScanExec {
         Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
             self.fragments.clone(),
+            self.range.clone(),
             self.projection.clone(),
             self.read_size,
             self.batch_readahead,
             self.fragment_readahead,
+            self.io_buffer_size,
             self.with_row_id,
             self.with_row_address,
             self.with_make_deletions_null,

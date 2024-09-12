@@ -5,56 +5,123 @@ use core::panic;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::UInt32Type;
-// use arrow::compute::concat;
-use arrow_array::{
-    builder::{ArrayBuilder, Int32Builder, UInt32Builder, UInt8Builder},
-    Array, ArrayRef, Int32Array, UInt32Array,
-};
-use futures::stream::StreamExt;
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt};
-// use rand::seq::index;
-
-use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
-    EncodingsIo,
-};
+use arrow_array::types::UInt64Type;
+use arrow_array::ArrayRef;
+use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
+use futures::TryFutureExt;
+use futures::{future::BoxFuture, FutureExt};
 
 use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
-use arrow_array::PrimitiveArray;
+use crate::buffer::LanceBuffer;
+use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock};
+use crate::format::ProtobufUtils;
+use crate::{
+    decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
+    EncodingsIo,
+};
+
+use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
 use lance_core::Result;
-use std::ops::Deref;
+
+struct IndicesNormalizer {
+    indices: Vec<u64>,
+    validity: BooleanBufferBuilder,
+    null_adjustment: u64,
+}
+
+impl IndicesNormalizer {
+    fn new(num_rows: u64, null_adjustment: u64) -> Self {
+        let mut indices = Vec::with_capacity(num_rows as usize);
+        indices.push(0);
+        Self {
+            indices,
+            validity: BooleanBufferBuilder::new(num_rows as usize),
+            null_adjustment,
+        }
+    }
+
+    fn normalize(&self, val: u64) -> (bool, u64) {
+        if val >= self.null_adjustment {
+            (false, val - self.null_adjustment)
+        } else {
+            (true, val)
+        }
+    }
+
+    fn extend(&mut self, new_indices: &PrimitiveArray<UInt64Type>, is_start: bool) {
+        let mut last = *self.indices.last().unwrap();
+        if is_start {
+            let (is_valid, val) = self.normalize(new_indices.value(0));
+            self.indices.push(val);
+            self.validity.append(is_valid);
+            last += val;
+        }
+        let mut prev = self.normalize(*new_indices.values().first().unwrap()).1;
+        for w in new_indices.values().windows(2) {
+            let (is_valid, val) = self.normalize(w[1]);
+            let next = val - prev + last;
+            self.indices.push(next);
+            self.validity.append(is_valid);
+            prev = val;
+            last = next;
+        }
+    }
+
+    fn into_parts(mut self) -> (Vec<u64>, BooleanBuffer) {
+        (self.indices, self.validity.finish())
+    }
+}
 
 #[derive(Debug)]
 pub struct BinaryPageScheduler {
     indices_scheduler: Arc<dyn PageScheduler>,
     bytes_scheduler: Arc<dyn PageScheduler>,
+    offsets_type: DataType,
+    null_adjustment: u64,
 }
 
 impl BinaryPageScheduler {
     pub fn new(
         indices_scheduler: Arc<dyn PageScheduler>,
         bytes_scheduler: Arc<dyn PageScheduler>,
+        offsets_type: DataType,
+        null_adjustment: u64,
     ) -> Self {
         Self {
             indices_scheduler,
             bytes_scheduler,
+            offsets_type,
+            null_adjustment,
         }
     }
+
+    fn decode_indices(decoder: Arc<dyn PrimitivePageDecoder>, num_rows: u64) -> Result<ArrayRef> {
+        let mut primitive_wrapper =
+            PrimitiveFieldDecoder::new_from_data(decoder, DataType::UInt64, num_rows, false);
+        let drained_task = primitive_wrapper.drain(num_rows)?;
+        let indices_decode_task = drained_task.task;
+        indices_decode_task.decode()
+    }
+}
+
+struct IndirectData {
+    decoded_indices: UInt64Array,
+    offsets_type: DataType,
+    validity: BooleanBuffer,
+    bytes_decoder_fut: BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>>,
 }
 
 impl PageScheduler for BinaryPageScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[std::ops::Range<u32>],
+        ranges: &[std::ops::Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         // ranges corresponds to row ranges that the user wants to fetch.
         // if user wants row range a..b
         // Case 1: if a != 0, we need indices a-1..b to decode
@@ -63,27 +130,29 @@ impl PageScheduler for BinaryPageScheduler {
             .iter()
             .map(|range| {
                 if range.start != 0 {
-                    (range.start - 1)..(range.end)
+                    (range.start - 1)..range.end
                 } else {
-                    0..(range.end)
+                    0..range.end
                 }
             })
-            .collect::<Vec<std::ops::Range<u32>>>();
+            .collect::<Vec<std::ops::Range<u64>>>();
 
-        let mut futures_ordered = FuturesOrdered::new();
-        for range in indices_ranges.iter() {
-            let indices_page_decoder =
-                self.indices_scheduler
-                    .schedule_ranges(&[range.clone()], scheduler, top_level_row);
-            futures_ordered.push_back(indices_page_decoder);
-        }
+        // We schedule all the indices for decoding together
+        // This is more efficient compared to scheduling them one by one (reduces speed significantly for random access)
+        let indices_page_decoder =
+            self.indices_scheduler
+                .schedule_ranges(&indices_ranges, scheduler, top_level_row);
+
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        let indices_num_rows = indices_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
         let ranges = ranges.to_vec();
         let copy_scheduler = scheduler.clone();
         let copy_bytes_scheduler = self.bytes_scheduler.clone();
-        let copy_indices_ranges = indices_ranges.to_vec();
+        let null_adjustment = self.null_adjustment;
+        let offsets_type = self.offsets_type.clone();
 
-        async move {
+        tokio::spawn(async move {
             // For the following data:
             // "abcd", "hello", "abcd", "apple", "hello", "abcd"
             //   4,        9,     13,      18,      23,     27
@@ -95,92 +164,88 @@ impl PageScheduler for BinaryPageScheduler {
             // Cumulative sum: 0, 4 | 8 | 13
             // These are the normalized offsets stored in decoded_indices
             // Rest of the workflow is continued later in BinaryPageDecoder
+            let indices_decoder = Arc::from(indices_page_decoder.await?);
+            let indices = Self::decode_indices(indices_decoder, indices_num_rows)?;
+            let decoded_indices = indices.as_primitive::<UInt64Type>();
 
-            let mut builder = UInt32Builder::new();
+            let mut indices_builder = IndicesNormalizer::new(num_rows, null_adjustment);
             let mut bytes_ranges = Vec::new();
-            let mut curr_range_idx = 0;
-            let mut last = 0;
-            while let Some(indices_page_decoder) = futures_ordered.next().await {
-                let indices: Arc<dyn PhysicalPageDecoder> = Arc::from(indices_page_decoder?);
+            let mut curr_offset_index = 0;
 
-                // Build and run decode task for offsets
-                let curr_indices_range = copy_indices_ranges[curr_range_idx].clone();
-                let curr_row_range = ranges[curr_range_idx].clone();
-                let indices_num_rows = curr_indices_range.end - curr_indices_range.start;
-                let mut primitive_wrapper = PrimitiveFieldDecoder::new_from_data(
-                    indices,
-                    DataType::UInt32,
-                    indices_num_rows,
-                );
-                let drained_task = primitive_wrapper.drain(indices_num_rows)?;
-                let indices_decode_task = drained_task.task;
-                let decoded_part = indices_decode_task.decode()?;
+            for curr_row_range in ranges.iter() {
+                let row_start = curr_row_range.start;
+                let curr_range_len = (curr_row_range.end - row_start) as usize;
 
-                let indices_array = decoded_part.as_primitive::<UInt32Type>();
-                let mut indices_vec = indices_array.values().to_vec();
+                let curr_indices;
 
-                // Pad a zero at the start if the first row is requested
-                // This is because the offsets do not start with 0 by default
-                if curr_row_range.start == 0 {
-                    indices_vec.insert(0, 0);
+                if row_start == 0 {
+                    curr_indices = decoded_indices.slice(0, curr_range_len);
+                    curr_offset_index = curr_range_len;
+                } else {
+                    curr_indices = decoded_indices.slice(curr_offset_index, curr_range_len + 1);
+                    curr_offset_index += curr_range_len + 1;
                 }
 
-                // Normalize the indices as described above
-                let normalized_indices: PrimitiveArray<UInt32Type> = indices_vec
-                    .iter()
-                    .map(|x| x - indices_vec[0] + last)
-                    .collect();
-                last = normalized_indices.value(normalized_indices.len() - 1);
-                let normalized_vec = normalized_indices.values().to_vec();
-
-                // The first vector to be normalized should not have the leading zero removed
-                let truncated_vec = if curr_range_idx == 0 {
-                    normalized_vec.as_slice()
+                let first = if row_start == 0 {
+                    0
                 } else {
-                    &normalized_vec[1..]
+                    indices_builder
+                        .normalize(*curr_indices.values().first().unwrap())
+                        .1
                 };
+                let last = indices_builder
+                    .normalize(*curr_indices.values().last().unwrap())
+                    .1;
+                if first != last {
+                    bytes_ranges.push(first..last);
+                }
 
-                builder.append_slice(truncated_vec);
-
-                // get bytes range from the index range
-                let bytes_range = if curr_row_range.start != 0 {
-                    indices_array.value(0)..indices_array.value(indices_array.len() - 1)
-                } else {
-                    0..indices_array.value(indices_array.len() - 1)
-                };
-
-                bytes_ranges.push(bytes_range);
-                curr_range_idx += 1;
+                indices_builder.extend(&curr_indices, row_start == 0);
             }
 
-            let decoded_indices = Arc::new(builder.finish());
+            let (indices, validity) = indices_builder.into_parts();
+            let decoded_indices = UInt64Array::from(indices);
 
-            let bytes_ranges_slice = bytes_ranges.as_slice();
+            // In the indirect task we schedule the bytes, but we do not await them.  We don't want to
+            // await the bytes until the decoder is ready for them so that we don't release the backpressure
+            // too early
+            let bytes_decoder_fut =
+                copy_bytes_scheduler.schedule_ranges(&bytes_ranges, &copy_scheduler, top_level_row);
 
-            // Schedule the bytes for decoding
-            let bytes_page_decoder = copy_bytes_scheduler.schedule_ranges(
-                bytes_ranges_slice,
-                &copy_scheduler,
-                top_level_row,
-            );
-
-            let bytes_decoder: Box<dyn PhysicalPageDecoder> = bytes_page_decoder.await?;
-
-            Ok(Box::new(BinaryPageDecoder {
+            Ok(IndirectData {
                 decoded_indices,
-                bytes_decoder,
-            }) as Box<dyn PhysicalPageDecoder>)
-        }
+                validity,
+                offsets_type,
+                bytes_decoder_fut,
+            })
+        })
+        // Propagate join panic
+        .map(|join_handle| join_handle.unwrap())
+        .and_then(|indirect_data| {
+            async move {
+                // Later, this will be called once the decoder actually starts polling.  At that point
+                // we await the bytes (releasing the backpressure)
+                let bytes_decoder = indirect_data.bytes_decoder_fut.await?;
+                Ok(Box::new(BinaryPageDecoder {
+                    decoded_indices: indirect_data.decoded_indices,
+                    offsets_type: indirect_data.offsets_type,
+                    validity: indirect_data.validity,
+                    bytes_decoder,
+                }) as Box<dyn PrimitivePageDecoder>)
+            }
+        })
         .boxed()
     }
 }
 
 struct BinaryPageDecoder {
-    decoded_indices: Arc<dyn Array>,
-    bytes_decoder: Box<dyn PhysicalPageDecoder>,
+    decoded_indices: UInt64Array,
+    offsets_type: DataType,
+    validity: BooleanBuffer,
+    bytes_decoder: Box<dyn PrimitivePageDecoder>,
 }
 
-impl PhysicalPageDecoder for BinaryPageDecoder {
+impl PrimitivePageDecoder for BinaryPageDecoder {
     // Continuing the example from BinaryPageScheduler
     // Suppose batch_size = 2. Then first, rows_to_skip=0, num_rows=2
     // Need to scan 2 rows
@@ -188,96 +253,114 @@ impl PhysicalPageDecoder for BinaryPageDecoder {
     // Allocate 8 bytes capacity.
     // Next rows_to_skip=2, num_rows=1
     // Skip 8 bytes. Allocate 5 bytes capacity.
-    fn update_capacity(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        all_null: &mut bool,
-    ) {
-        let offsets = self
-            .decoded_indices
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-
-        // 32 bits or 4 bytes per value.
-        buffers[0].0 = (num_rows as u64) * 4;
-        buffers[0].1 = true;
-
-        let bytes_to_skip = offsets.value(rows_to_skip as usize);
-        let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
-
-        self.bytes_decoder
-            .update_capacity(bytes_to_skip, num_bytes, &mut buffers[1..], all_null);
-    }
-
-    // Continuing from update_capacity:
-    // When rows_to_skip=2, num_rows=1
+    //
     // The normalized offsets are [0, 4, 8, 13]
     // We only need [8, 13] to decode in this case.
     // These need to be normalized in order to build the string later
     // So return [0, 5]
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [bytes::BytesMut],
-    ) -> Result<()> {
-        let offsets = self
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
+        // STEP 1: validity buffer
+        let target_validity = self
+            .validity
+            .slice(rows_to_skip as usize, num_rows as usize);
+        let has_nulls = target_validity.count_set_bits() < target_validity.len();
+
+        let validity_buffer = if has_nulls {
+            let num_validity_bits = arrow_buffer::bit_util::ceil(num_rows as usize, 8);
+            let mut validity_buffer = Vec::with_capacity(num_validity_bits);
+
+            if rows_to_skip == 0 {
+                validity_buffer.extend_from_slice(target_validity.inner().as_slice());
+            } else {
+                // Need to copy the buffer because there may be a bit offset in first byte
+                let target_validity = BooleanBuffer::from_iter(target_validity.iter());
+                validity_buffer.extend_from_slice(target_validity.inner().as_slice());
+            }
+            Some(validity_buffer)
+        } else {
+            None
+        };
+
+        // STEP 2: offsets buffer
+        // Currently we always do a copy here, we need to cast to the appropriate type
+        // and we go ahead and normalize so the starting offset is 0 (though we could skip
+        // this)
+        let bytes_per_offset = match self.offsets_type {
+            DataType::Int32 => 4,
+            DataType::Int64 => 8,
+            _ => panic!("Unsupported offsets type"),
+        };
+
+        let target_offsets = self
             .decoded_indices
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
+            .slice(rows_to_skip as usize, (num_rows + 1) as usize);
 
-        let bytes_to_skip = offsets.value(rows_to_skip as usize);
-        let num_bytes = offsets.value((rows_to_skip + num_rows) as usize) - bytes_to_skip;
-
-        let target_offsets = offsets.slice(
-            rows_to_skip.try_into().unwrap(),
-            (num_rows + 1).try_into().unwrap(),
-        );
-
-        // Normalize offsets
+        // Normalize and cast (TODO: could fuse these into one pass for micro-optimization)
         let target_vec = target_offsets.values();
-        let normalized_array: PrimitiveArray<UInt32Type> =
-            target_vec.iter().map(|x| x - target_vec[0]).collect();
-        let normalized_values = normalized_array.values();
+        let start = target_vec[0];
+        let offsets_buffer =
+            match bytes_per_offset {
+                4 => ScalarBuffer::from_iter(target_vec.iter().map(|x| (x - start) as i32))
+                    .into_inner(),
+                8 => ScalarBuffer::from_iter(target_vec.iter().map(|x| (x - start) as i64))
+                    .into_inner(),
+                _ => panic!("Unsupported offsets type"),
+            };
 
-        let byte_slice = normalized_values.inner().deref();
+        let bytes_to_skip = self.decoded_indices.value(rows_to_skip as usize);
+        let num_bytes = self
+            .decoded_indices
+            .value((rows_to_skip + num_rows) as usize)
+            - bytes_to_skip;
 
-        // copy target_offsets into dest_buffers[0]
-        dest_buffers[0].extend_from_slice(byte_slice);
+        let bytes = self.bytes_decoder.decode(bytes_to_skip, num_bytes)?;
+        let bytes = bytes.as_fixed_width()?;
+        debug_assert_eq!(bytes.bits_per_value, 8);
 
-        // Copy decoded bytes into dest_buffers[1..]
-        // Currently an empty null buffer is the first one
-        // The actual bytes are in the second buffer
-        // Including the indices this results in 3 buffers in total
-        self.bytes_decoder
-            .decode_into(bytes_to_skip, num_bytes, &mut dest_buffers[1..])?;
-
-        Ok(())
-    }
-
-    fn num_buffers(&self) -> u32 {
-        self.bytes_decoder.num_buffers() + 1
+        let string_data = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: bytes_per_offset * 8,
+            data: bytes.data,
+            num_values: num_rows,
+            offsets: LanceBuffer::from(offsets_buffer),
+        });
+        if let Some(validity) = validity_buffer {
+            Ok(DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(string_data),
+                nulls: LanceBuffer::from(validity),
+            }))
+        } else {
+            Ok(string_data)
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct BinaryEncoder {
     indices_encoder: Box<dyn ArrayEncoder>,
-    bytes_encoder: Box<dyn ArrayEncoder>,
 }
 
 impl BinaryEncoder {
-    pub fn new(
-        indices_encoder: Box<dyn ArrayEncoder>,
-        bytes_encoder: Box<dyn ArrayEncoder>,
-    ) -> Self {
-        Self {
-            indices_encoder,
-            bytes_encoder,
+    pub fn new(indices_encoder: Box<dyn ArrayEncoder>) -> Self {
+        Self { indices_encoder }
+    }
+
+    // In 2.1 we will materialize nulls higher up (in the primitive encoder).  Unfortunately,
+    // in 2.0 we actually need to write the offsets.
+    fn all_null_variable_width(data_type: &DataType, num_values: u64) -> VariableWidthBlock {
+        if matches!(data_type, DataType::Binary | DataType::Utf8) {
+            VariableWidthBlock {
+                bits_per_offset: 32,
+                data: LanceBuffer::empty(),
+                num_values,
+                offsets: LanceBuffer::reinterpret_vec(vec![0_u32; num_values as usize + 1]),
+            }
+        } else {
+            VariableWidthBlock {
+                bits_per_offset: 64,
+                data: LanceBuffer::empty(),
+                num_values,
+                offsets: LanceBuffer::reinterpret_vec(vec![0_u64; num_values as usize + 1]),
+            }
         }
     }
 }
@@ -286,149 +369,325 @@ impl BinaryEncoder {
 // Strings are a vector of arrays corresponding to each record batch
 // Zero offset is removed from the start of the offsets array
 // The indices array is computed across all arrays in the vector
-fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
-    let mut indices_builder = Int32Builder::new();
-    let mut last_offset = 0;
-    arrays.iter().for_each(|arr| {
-        let string_arr = arrow_array::cast::as_string_array(arr);
-        let offsets = string_arr.offsets().inner();
-        let mut offsets = offsets.slice(1, offsets.len() - 1).to_vec();
+fn get_indices_from_string_arrays(
+    mut offsets: LanceBuffer,
+    bits_per_offset: u8,
+    nulls: Option<LanceBuffer>,
+    num_rows: usize,
+) -> (DataBlock, u64) {
+    let mut indices = Vec::with_capacity(num_rows);
+    let mut last_offset = 0_u64;
+    if bits_per_offset == 32 {
+        let offsets = offsets.borrow_to_typed_slice::<i32>();
+        indices.extend(offsets.as_ref().windows(2).map(|w| {
+            let strlen = (w[1] - w[0]) as u64;
+            last_offset += strlen;
+            last_offset
+        }));
+    } else if bits_per_offset == 64 {
+        let offsets = offsets.borrow_to_typed_slice::<i64>();
+        indices.extend(offsets.as_ref().windows(2).map(|w| {
+            let strlen = (w[1] - w[0]) as u64;
+            last_offset += strlen;
+            last_offset
+        }));
+    }
 
-        if indices_builder.len() == 0 {
-            last_offset = offsets[offsets.len() - 1];
-        } else {
-            offsets = offsets
-                .iter()
-                .map(|offset| offset + last_offset)
-                .collect::<Vec<i32>>();
-            last_offset = offsets[offsets.len() - 1];
-        }
+    if indices.is_empty() {
+        return (
+            DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: 64,
+                data: LanceBuffer::empty(),
+                num_values: 0,
+            }),
+            0,
+        );
+    }
 
-        let new_int_arr = Int32Array::from(offsets);
-        indices_builder.append_slice(new_int_arr.values());
+    let last_offset = *indices.last().expect("Indices array is empty");
+    // 8 exabytes in a single array seems unlikely but...just in case
+    assert!(
+        last_offset < u64::MAX / 2,
+        "Indices array with strings up to 2^63 is too large for this encoding"
+    );
+    let null_adjustment: u64 = *indices.last().expect("Indices array is empty") + 1;
+
+    if let Some(nulls) = nulls {
+        let nulls = NullBuffer::new(BooleanBuffer::new(nulls.into_buffer(), 0, num_rows));
+        indices
+            .iter_mut()
+            .zip(nulls.iter())
+            .for_each(|(index, is_valid)| {
+                if !is_valid {
+                    *index += null_adjustment;
+                }
+            });
+    }
+    let indices = DataBlock::FixedWidth(FixedWidthDataBlock {
+        bits_per_value: 64,
+        data: LanceBuffer::reinterpret_vec(indices),
+        num_values: num_rows as u64,
     });
-
-    Arc::new(indices_builder.finish()) as ArrayRef
-}
-
-// Bytes computed across all string arrays, similar to indices above
-fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> ArrayRef {
-    let mut bytes_builder = UInt8Builder::new();
-    arrays.iter().for_each(|arr| {
-        let string_arr = arrow_array::cast::as_string_array(arr);
-        let values = string_arr.values();
-        bytes_builder.append_slice(values);
-    });
-
-    Arc::new(bytes_builder.finish()) as ArrayRef
+    (indices, null_adjustment)
 }
 
 impl ArrayEncoder for BinaryEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let (null_count, _row_count) = arrays
-            .iter()
-            .map(|arr| (arr.null_count() as u32, arr.len() as u32))
-            .fold((0, 0), |acc, val| (acc.0 + val.0, acc.1 + val.1));
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let (data, nulls) = match data {
+            DataBlock::Nullable(nullable) => {
+                let data = nullable.data.as_variable_width()?;
+                (data, Some(nullable.nulls))
+            }
+            DataBlock::VariableWidth(variable) => (variable, None),
+            DataBlock::AllNull(all_null) => {
+                let data = Self::all_null_variable_width(data_type, all_null.num_values);
+                let validity =
+                    LanceBuffer::all_unset(bit_util::ceil(all_null.num_values as usize, 8));
+                (data, Some(validity))
+            }
+            _ => panic!("Expected variable width data block but got {}", data.name()),
+        };
 
-        if null_count != 0 {
-            panic!("Data contains null values, not currently supported for binary data.")
-        } else {
-            let index_array = get_indices_from_string_arrays(arrays);
-            let encoded_indices = self.indices_encoder.encode(&[index_array], buffer_index)?;
+        let (indices, null_adjustment) = get_indices_from_string_arrays(
+            data.offsets,
+            data.bits_per_offset,
+            nulls,
+            data.num_values as usize,
+        );
+        let encoded_indices =
+            self.indices_encoder
+                .encode(indices, &DataType::UInt64, buffer_index)?;
 
-            let byte_array = get_bytes_from_string_arrays(arrays);
-            let encoded_bytes = self.bytes_encoder.encode(&[byte_array], buffer_index)?;
+        let encoded_indices_data = encoded_indices.data.as_fixed_width()?;
 
-            let mut encoded_buffers = encoded_indices.buffers;
-            encoded_buffers.extend(encoded_bytes.buffers);
+        assert!(encoded_indices_data.bits_per_value <= 64);
 
-            Ok(EncodedArray {
-                buffers: encoded_buffers,
-                encoding: pb::ArrayEncoding {
-                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Binary(Box::new(
-                        pb::Binary {
-                            indices: Some(Box::new(encoded_indices.encoding)),
-                            bytes: Some(Box::new(encoded_bytes.encoding)),
-                        },
-                    ))),
-                },
-            })
+        let data = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: encoded_indices_data.bits_per_value as u8,
+            offsets: encoded_indices_data.data,
+            data: data.data,
+            num_values: data.num_values,
+        });
+
+        let bytes_buffer_index = *buffer_index;
+        *buffer_index += 1;
+        // TODO: Do we really need a "nested encoding" here?
+        let bytes_encoding =
+            ProtobufUtils::flat_encoding(/*bits_per_value=*/ 8, bytes_buffer_index, None);
+
+        let encoding =
+            ProtobufUtils::binary(encoded_indices.encoding, bytes_encoding, null_adjustment);
+
+        Ok(EncodedArray { data, encoding })
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+
+    use arrow_array::{
+        builder::{LargeStringBuilder, StringBuilder},
+        ArrayRef, StringArray,
+    };
+    use arrow_schema::{DataType, Field};
+    use std::{collections::HashMap, sync::Arc, vec};
+
+    use crate::{
+        buffer::LanceBuffer,
+        data::DataBlock,
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+    };
+
+    use super::get_indices_from_string_arrays;
+
+    #[test_log::test(tokio::test)]
+    async fn test_utf8_binary() {
+        let field = Field::new("", DataType::Utf8, false);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test]
+    fn test_encode_indices_adjusts_nulls() {
+        // Null entries in string arrays should be adjusted
+        let string_array = Arc::new(StringArray::from(vec![
+            None,
+            Some("foo"),
+            Some("foo"),
+            None,
+            None,
+            None,
+        ])) as ArrayRef;
+        let string_data = DataBlock::from(string_array).as_nullable().unwrap();
+        let nulls = string_data.nulls;
+        let string_data = string_data.data.as_variable_width().unwrap();
+
+        let (indices, null_adjustment) = get_indices_from_string_arrays(
+            string_data.offsets,
+            string_data.bits_per_offset,
+            Some(nulls),
+            string_data.num_values as usize,
+        );
+
+        let indices = indices.as_fixed_width().unwrap();
+        assert_eq!(indices.bits_per_value, 64);
+        assert_eq!(
+            indices.data,
+            LanceBuffer::reinterpret_vec(vec![7_u64, 3, 6, 13, 13, 13])
+        );
+        assert_eq!(null_adjustment, 7);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary() {
+        let field = Field::new("", DataType::Binary, false);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_binary() {
+        let field = Field::new("", DataType::LargeBinary, true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_large_utf8() {
+        let field = Field::new("", DataType::LargeUtf8, true);
+        check_round_trip_encoding_random(field, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_utf8_binary() {
+        let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 3, 4]);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sliced_utf8() {
+        let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
+        let string_array = string_array.slice(1, 3);
+
+        let test_cases = TestCases::default()
+            .with_range(0..1)
+            .with_range(0..2)
+            .with_range(1..2);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bigger_than_max_page_size() {
+        // Create an array with one single 32MiB string
+        let big_string = String::from_iter((0..(32 * 1024 * 1024)).map(|_| '0'));
+        let string_array = StringArray::from(vec![
+            Some(big_string),
+            Some("abc".to_string()),
+            None,
+            None,
+            Some("xyz".to_string()),
+        ]);
+
+        // Drop the max page size to 1MiB
+        let test_cases = TestCases::default().with_max_page_size(1024 * 1024);
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+
+        // This is a regression testing the case where a page with X rows is split into Y parts
+        // where the number of parts is not evenly divisible by the number of rows.  In this
+        // case we are splitting 90 rows into 4 parts.
+        let big_string = String::from_iter((0..(1000 * 1000)).map(|_| '0'));
+        let string_array = StringArray::from_iter_values((0..90).map(|_| big_string.clone()));
+
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(string_array)],
+            &TestCases::default(),
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_strings() {
+        // Scenario 1: Some strings are empty
+
+        let values = [Some("abc"), Some(""), None];
+        // Test empty list at beginning, middle, and end
+        for order in [[0, 1, 2], [1, 0, 2], [2, 0, 1]] {
+            let mut string_builder = StringBuilder::new();
+            for idx in order {
+                string_builder.append_option(values[idx]);
+            }
+            let string_array = Arc::new(string_builder.finish());
+            let test_cases = TestCases::default()
+                .with_indices(vec![1])
+                .with_indices(vec![0])
+                .with_indices(vec![2])
+                .with_indices(vec![0, 1]);
+            check_round_trip_encoding_of_data(
+                vec![string_array.clone()],
+                &test_cases,
+                HashMap::new(),
+            )
+            .await;
+            let test_cases = test_cases.with_batch_size(1);
+            check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new())
+                .await;
         }
-        // Currently not handling all null cases in this array encoder.
-        // TODO: Separate behavior for all null rows vs some null rows
-        // else if null_count == row_count {
-        //     let nullability = pb::nullable::Nullability::AllNulls(pb::nullable::AllNull {});
 
-        //     Ok(EncodedArray {
-        //         buffers: vec![],
-        //         encoding: pb::ArrayEncoding {
-        //             array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
-        //                 pb::Nullable {
-        //                     nullability: Some(nullability),
-        //                 },
-        //             ))),
-        //         },
-        //     })
-        // }
+        // Scenario 2: All strings are empty
 
-        // let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
-        // let encoding = pb::nullable::Nullability::NoNulls(Box::new(pb::nullable::NoNull {
-        //     values: Some(Box::new(arr_encoding.encoding)),
-        // }));
-        // (arr_encoding.buffers, encoding)
-        // } else if null_count == row_count {
-        // let encoding = pb::nullable::Nullability::AllNulls(pb::nullable::AllNull {});
-        // (vec![], encoding)
-        // } else {
-        //     let validity_as_arrays = arrays
-        //         .iter()
-        //         .map(|arr| {
-        //             if let Some(nulls) = arr.nulls() {
-        //                 Arc::new(BooleanArray::new(nulls.inner().clone(), None)) as ArrayRef
-        //             } else {
-        //                 let buff = BooleanBuffer::new_set(arr.len());
-        //                 Arc::new(BooleanArray::new(buff, None)) as ArrayRef
-        //             }
-        //         })
-        //         .collect::<Vec<_>>();
+        // When encoding an array of empty strings there are no bytes to encode
+        // which is strange and we want to ensure we handle it
+        let string_array = Arc::new(StringArray::from(vec![Some(""), None, Some("")]));
 
-        //     let validity_buffer_index = *buffer_index;
-        //     *buffer_index += 1;
-        //     let validity = BitmapBufferEncoder::default().encode(&validity_as_arrays)?;
-        //     let validity_encoding = Box::new(pb::ArrayEncoding {
-        //         array_encoding: Some(pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
-        //             bits_per_value: 1,
-        //             buffer: Some(pb::Buffer {
-        //                 buffer_index: validity_buffer_index,
-        //                 buffer_type: pb::buffer::BufferType::Page as i32,
-        //             }),
-        //             compression: None,
-        //         })),
-        //     });
+        let test_cases = TestCases::default().with_range(0..2).with_indices(vec![1]);
+        check_round_trip_encoding_of_data(vec![string_array.clone()], &test_cases, HashMap::new())
+            .await;
+        let test_cases = test_cases.with_batch_size(1);
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
 
-        //     let arr_encoding = self.values_encoder.encode(arrays, buffer_index)?;
-        //     let encoding = pb::nullable::Nullability::SomeNulls(Box::new(pb::nullable::SomeNull {
-        //         validity: Some(validity_encoding),
-        //         values: Some(Box::new(arr_encoding.encoding)),
-        //     }));
+    #[test_log::test(tokio::test)]
+    #[ignore] // This test is quite slow in debug mode
+    async fn test_jumbo_string() {
+        // This is an overflow test.  We have a list of lists where each list
+        // has 1Mi items.  We encode 5000 of these lists and so we have over 4Gi in the
+        // offsets range
+        let mut string_builder = LargeStringBuilder::new();
+        // a 1 MiB string
+        let giant_string = String::from_iter((0..(1024 * 1024)).map(|_| '0'));
+        for _ in 0..5000 {
+            string_builder.append_option(Some(&giant_string));
+        }
+        let giant_array = Arc::new(string_builder.finish()) as ArrayRef;
+        let arrs = vec![giant_array];
 
-        //     let mut buffers = arr_encoding.buffers;
-        //     buffers.push(EncodedArrayBuffer {
-        //         parts: validity.parts,
-        //         index: validity_buffer_index,
-        //     });
-        //     (buffers, encoding)
-        // };
-
-        // Ok(EncodedArray {
-        //     buffers,
-        //     encoding: pb::ArrayEncoding {
-        //         array_encoding: Some(pb::array_encoding::ArrayEncoding::Nullable(Box::new(
-        //             pb::Nullable {
-        //                 nullability: Some(nullability),
-        //             },
-        //         ))),
-        //     },
-        // })
+        // // We can't validate because our validation relies on concatenating all input arrays
+        let test_cases = TestCases::default().without_validation();
+        check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 }

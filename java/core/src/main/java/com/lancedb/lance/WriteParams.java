@@ -14,6 +14,8 @@
 
 package com.lancedb.lance;
 
+import org.apache.commons.lang3.builder.ToStringBuilder;
+
 import java.util.Optional;
 
 /**
@@ -55,9 +57,22 @@ public class WriteParams {
     return maxBytesPerFile;
   }
 
-  /** Get Mode with name. */
+  /**
+   * Get Mode with name.
+   * @return mode
+   */
   public Optional<String> getMode() {
     return mode.map(Enum::name);
+  }
+
+  @Override
+  public String toString() {
+    return new ToStringBuilder(this)
+        .append("maxRowsPerFile", maxRowsPerFile.orElse(null))
+        .append("maxRowsPerGroup", maxRowsPerGroup.orElse(null))
+        .append("maxBytesPerFile", maxBytesPerFile.orElse(null))
+        .append("mode", mode.orElse(null))
+        .toString();
   }
 
   /**

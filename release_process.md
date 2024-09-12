@@ -30,7 +30,7 @@ Once that release is published, it will trigger publish jobs for Python.
 The action will automatically generate release notes. **Please review these
 and make any necessary edits.**
 
-> [!NOTE]  
+> [!NOTE]
 > Preview releases are not published to crates.io, since Rust is a source
 > distribution. Users can simply point to the tag on GitHub in their `Cargo.toml`.
 
@@ -47,7 +47,7 @@ it will increment the patch version in the `Cargo.toml` and `pyproject.toml` fil
 The action will automatically generate release notes. **Please review these
 and make any necessary edits.**
 
-Once that release is published, it will trigger publish jobs for Rust and Python.
+Once that release is published, it will trigger publish jobs for Rust, Python, and Java.
 
 ## Incrementing the minor version.
 
@@ -61,10 +61,10 @@ incremented the minor version in the current release cycle.
 ## Breaking Change policy
 
 We try to avoid breaking changes, but sometimes they are necessary. When there
-are breaking changes, we will increment the minor version. (This is valid 
+are breaking changes, we will increment the minor version. (This is valid
 semantic versioning because we are still in `0.x` versions.)
 
-When a PR makes a breaking change, the PR author should mark the PR using the 
+When a PR makes a breaking change, the PR author should mark the PR using the
 conventional commit markers: either exclamation mark after the type
 (such as `feat!: change signature of func`) or have `BREAKING CHANGE` in the
 body of the PR. A CI job will add a `breaking-change` label to the PR, which is
@@ -72,8 +72,8 @@ what will ultimately be used by CI to determine if the minor version should be
 incremented.
 
 A CI job will validate that if a `breaking-change` label is added, the minor
-version is incremented in the `Cargo.toml` and `pyproject.toml` files. The only
-exception is if it has already been incremented since the last stable release.
+version is incremented in the `Cargo.toml`, `pyproject.toml`, and `pom.xml` files.
+The only exception is if it has already been incremented since the last stable release.
 
 **It is the responsibility of the PR author to increment the minor version when
 appropriate.**

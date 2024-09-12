@@ -3,6 +3,7 @@
 
 import json
 import multiprocessing
+import uuid
 from pathlib import Path
 
 import lance
@@ -18,6 +19,7 @@ from lance import (
     write_dataset,
 )
 from lance.debug import format_fragment
+from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 
@@ -58,6 +60,16 @@ def test_write_fragment_two_phases(tmp_path: Path):
     )
 
 
+def test_write_legacy_fragment(tmp_path: Path):
+    tab = pa.table({"a": range(1024)})
+    frag = LanceFragment.create(tmp_path, tab, data_storage_version="legacy")
+    assert "file_major_version: 2" not in str(frag)
+
+    tab = pa.table({"a": range(1024)})
+    frag = LanceFragment.create(tmp_path, tab, data_storage_version="stable")
+    assert "file_major_version: 2" in str(frag)
+
+
 def test_scan_fragment(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100, 200)})
     ds = write_dataset(tab, tmp_path)
@@ -87,15 +99,18 @@ def test_scan_fragment_with_dynamic_projection(tmp_path: Path):
 
 
 def test_write_fragments(tmp_path: Path):
-    # This will be split across two files if we set the max_bytes_per_file to 1024
-    tab = pa.table(
-        {
-            "a": pa.array(range(1024)),
-        }
+    # Should result in two files since each batch is 8MB and max_bytes_per_file is small
+    batches = pa.RecordBatchReader.from_batches(
+        pa.schema([pa.field("a", pa.string())]),
+        [
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+        ],
     )
+
     progress = ProgressForTest()
     fragments = write_fragments(
-        tab,
+        batches,
         tmp_path,
         max_rows_per_group=512,
         max_bytes_per_file=1024,
@@ -188,11 +203,11 @@ def test_dataset_progress(tmp_path: Path):
     assert metadata["id"] == 0
     assert len(metadata["files"]) == 1
     # Fragments aren't exactly equal, because the file was written before
-    # physical_rows was known.
-    assert (
-        fragment.data_files()
-        == FragmentMetadata.from_json(json.dumps(metadata)).data_files()
-    )
+    # physical_rows was known.  However, the paths should be the same.
+    assert len(fragment.data_files()) == 1
+    deserialized = FragmentMetadata.from_json(json.dumps(metadata))
+    assert len(deserialized.data_files()) == 1
+    assert fragment.data_files()[0].path() == deserialized.data_files()[0].path()
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=failing_write, args=(progress_uri, dataset_uri))
@@ -207,7 +222,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.in_progress") as f:
         progress_data = json.load(f)
     assert progress_data["fragment_id"] == 1
-    assert isinstance(progress_data["multipart_id"], str)
     # progress contains custom metadata
     assert progress_data["metadata"]["test_key"] == "test_value"
 
@@ -215,11 +229,6 @@ def test_dataset_progress(tmp_path: Path):
     with open(progress_uri / "fragment_1.json") as f:
         metadata = json.load(f)
     assert metadata["id"] == 1
-
-    progress.cleanup_partial_writes(str(dataset_uri))
-
-    assert not (progress_uri / "fragment_1.json").exists()
-    assert not (progress_uri / "fragment_1.in_progress").exists()
 
 
 def test_fragment_meta():
@@ -261,8 +270,87 @@ def test_fragment_v2(tmp_path):
     fragments = write_fragments(
         tab,
         tmp_path,
-        use_legacy_format=False,
+        data_storage_version="stable",
     )
     assert len(fragments) == 1
     ds = lance.dataset(dataset_uri)
-    assert "minor_version: 3" in format_fragment(fragments[0], ds)
+    assert "major_version: 2" in format_fragment(fragments[0], ds)
+
+
+def test_mixed_fragment_versions(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+
+    # Create empty v2 dataset
+    ds = lance.write_dataset(
+        data_obj=[],
+        uri=tmp_path / "dataset2",
+        schema=data.schema,
+        data_storage_version="stable",
+    )
+
+    # Add one v1 file and one v2 file
+    fragments = []
+    fragments.append(
+        lance.LanceFragment.create(ds.uri, data, data_storage_version="legacy")
+    )
+    fragments.append(
+        lance.LanceFragment.create(ds.uri, data, data_storage_version="stable")
+    )
+
+    # Attempt to commit
+    operation = lance.LanceOperation.Overwrite(ds.schema, fragments)
+    with pytest.raises(OSError, match="All data files must have the same version"):
+        lance.LanceDataset.commit(ds.uri, operation)
+
+
+def test_create_from_file(tmp_path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    dataset = lance.write_dataset(
+        [], tmp_path, schema=data.schema, data_storage_version="stable"
+    )
+
+    # Append first file
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    frag = dataset.get_fragments()[0]
+    assert frag.fragment_id == 0
+
+    assert dataset.count_rows() == 800
+
+    # Append second file (fragment id shouldn't be 0 even though we pass in 0)
+    fragment_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / fragment_name)) as writer:
+        writer.write_batch(data)
+
+    frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
+    op = LanceOperation.Append([frag])
+
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    frag = dataset.get_fragments()[1]
+    assert frag.fragment_id == 1
+
+    assert dataset.count_rows() == 1600
+
+    # Simulate compaction
+    compacted_name = f"{uuid.uuid4()}.lance"
+    with LanceFileWriter(str(tmp_path / "data" / compacted_name)) as writer:
+        for batch in dataset.to_batches():
+            writer.write_batch(batch)
+
+    frag = LanceFragment.create_from_file(compacted_name, dataset, 0)
+    group = LanceOperation.RewriteGroup(
+        old_fragments=[frag.metadata for frag in dataset.get_fragments()],
+        new_fragments=[frag],
+    )
+    op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
+    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+
+    assert dataset.count_rows() == 1600
+    assert len(dataset.get_fragments()) == 1
+    assert dataset.get_fragments()[0].fragment_id == 2

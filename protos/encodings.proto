@@ -169,7 +169,25 @@ message Flat {
   Buffer buffer = 2;
   // The Compression message can specify the compression scheme (e.g. zstd) and any
   // other information that is needed for decompression.
+  //
+  // If this array is compressed then the bits_per_value refers to the uncompressed
+  // data.
   Compression compression = 3;
+}
+
+// Items are bitpacked in a buffer
+message Bitpacked {
+  // the number of bits used for a value in the buffer
+  uint64 compressed_bits_per_value = 1;
+
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+
+  // The items in the list
+  Buffer buffer = 3;
+
+  // Whether or not a sign bit is included in the bitpacked value
+  bool signed = 4;
 }
 
 // An array encoding for shredded structs that will never be null
@@ -183,6 +201,29 @@ message SimpleStruct {}
 message Binary {
   ArrayEncoding indices = 1;
   ArrayEncoding bytes = 2;
+  uint64 null_adjustment = 3;
+}
+
+message Fsst {
+  ArrayEncoding binary = 1;
+  bytes symbol_table = 2;
+}
+
+// An array encoding for dictionary-encoded fields
+message Dictionary {
+  ArrayEncoding indices = 1;
+  ArrayEncoding items = 2;
+  uint32 num_dictionary_items = 3;
+}
+
+message PackedStruct {
+  repeated ArrayEncoding inner = 1;
+  Buffer buffer = 2;
+}
+
+message FixedSizeBinary {
+  ArrayEncoding bytes = 1;
+  uint32 byte_width = 2;
 }
 
 // Encodings that decode into an Arrow array
@@ -194,6 +235,11 @@ message ArrayEncoding {
         List list = 4;
         SimpleStruct struct = 5;
         Binary binary = 6;
+        Dictionary dictionary = 7;
+        Fsst fsst = 8;
+        PackedStruct packed_struct = 9;
+        Bitpacked bitpacked = 10;
+        FixedSizeBinary fixed_size_binary = 11;
     }
 }
 

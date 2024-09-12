@@ -26,7 +26,7 @@ use super::index::FlatMetadata;
 pub const FLAT_COLUMN: &str = "flat";
 
 /// All data are stored in memory
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FlatStorage {
     batch: RecordBatch,
     distance_type: DistanceType,

@@ -64,22 +64,27 @@ pub fn load_row_id_sequences<'a>(
         .map(|fragment| {
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
-        .buffer_unordered(num_cpus::get())
+        .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
-// TODO: remove allow unused once we start using this in query and take paths.
-#[allow(unused)]
-pub async fn get_row_id_index(dataset: &Dataset) -> Result<Arc<lance_table::rowids::RowIdIndex>> {
-    // The path here isn't real, it's just used to prevent collisions in the cache.
-    let path = dataset
-        .base
-        .child("row_ids")
-        .child(dataset.manifest.version.to_string());
-    dataset
-        .session
-        .file_metadata_cache
-        .get_or_insert(&path, |_path| async { load_row_id_index(dataset).await })
-        .await
+pub async fn get_row_id_index(
+    dataset: &Dataset,
+) -> Result<Option<Arc<lance_table::rowids::RowIdIndex>>> {
+    if dataset.manifest.uses_move_stable_row_ids() {
+        // The path here isn't real, it's just used to prevent collisions in the cache.
+        let path = dataset
+            .base
+            .child("row_ids")
+            .child(dataset.manifest.version.to_string());
+        let index = dataset
+            .session
+            .file_metadata_cache
+            .get_or_insert(&path, |_path| async { load_row_id_index(dataset).await })
+            .await?;
+        Ok(Some(index))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::RowIdIndex> {
@@ -104,6 +109,7 @@ mod test {
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use futures::Future;
     use lance_core::{utils::address::RowAddress, ROW_ADDR, ROW_ID};
+    use lance_index::{scalar::ScalarIndexParams, DatasetIndexExt, IndexType};
 
     fn sequence_batch(values: Range<i32>) -> RecordBatch {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -130,10 +136,44 @@ mod test {
             .await
             .unwrap();
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        assert!(dataset.manifest.uses_move_stable_row_ids());
+
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
 
         assert_eq!(dataset.manifest().next_row_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_must_set_on_creation() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap();
+
+        let batch = sequence_batch(0..10);
+        let reader =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
+        let write_params = WriteParams {
+            enable_move_stable_row_ids: false,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(reader, tmp_path, Some(write_params))
+            .await
+            .unwrap();
+        assert!(!dataset.manifest().uses_move_stable_row_ids());
+
+        // Trying to append without stable row ids should fail.
+        let write_params = WriteParams {
+            enable_move_stable_row_ids: true,
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let reader =
+            RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
+        let result = Dataset::write(reader, tmp_path, Some(write_params)).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(),
+                Error::NotSupported { source, .. }
+                    if source.to_string().contains("Cannot enable stable row ids on existing dataset")));
     }
 
     #[tokio::test]
@@ -150,7 +190,7 @@ mod test {
             .await
             .unwrap();
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
 
         let found_addresses = (0..num_rows)
             .map(|i| index.get(i).unwrap())
@@ -197,7 +237,7 @@ mod test {
         // Overwriting should NOT reset the row id counter.
         assert_eq!(dataset.manifest().next_row_id, 2 * num_rows);
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_none());
         assert!(index.get(num_rows).is_some());
     }
@@ -235,7 +275,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, 60);
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         assert!(index.get(60).is_none());
     }
@@ -305,7 +345,7 @@ mod test {
 
     #[rstest::rstest]
     #[tokio::test]
-    async fn test_delete_with_row_ids() {
+    async fn test_delete_with_row_ids(#[values(true, false)] with_scalar_index: bool) {
         let batch = sequence_batch(0..6);
 
         let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
@@ -318,6 +358,19 @@ mod test {
             .await
             .unwrap();
         assert_eq!(dataset.get_fragments().len(), 3);
+
+        if with_scalar_index {
+            dataset
+                .create_index(
+                    &["id"],
+                    IndexType::Scalar,
+                    None,
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
 
         dataset.delete("id = 3 or id = 4").await.unwrap();
 
@@ -368,7 +421,7 @@ mod test {
             .await
             .unwrap();
 
-        let index = get_row_id_index(&dataset).await.unwrap();
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         // Old address is still there.
         assert_eq!(index.get(3), Some(RowAddress::new_from_parts(0, 3)));

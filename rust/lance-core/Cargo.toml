@@ -27,7 +27,7 @@ futures.workspace = true
 lazy_static.workspace = true
 mock_instant.workspace = true
 moka.workspace = true
-num_cpus.workspace = true
+num_cpus = "1.0"
 object_store = { workspace = true }
 pin-project.workspace = true
 prost.workspace = true
@@ -40,6 +40,7 @@ tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+log.workspace = true
 
 # This is used to detect CPU features at runtime.
 # See src/utils/cpu.rs

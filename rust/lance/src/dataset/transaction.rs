@@ -22,28 +22,28 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge | Project |
-//! |------------------|--------|--------|------------------|--------------|---------|-------|---------|
-//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    | ❌      |
-//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    | ❌      |
-//! | Overwrite/Create | ✅     | ✅     | ✅               | ✅           | ✅      | ✅    | ✅      |
-//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    | ✅      |
-//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    | ❌      |
-//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    | ❌      |
-//! | Project          | ✅     | ✅     | ❌               | ❌           | ✅      | ❌    | ✅      |
+//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project |
+//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|
+//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      |
+//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      |
+//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      |
+//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      |
+//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      |
+//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      |
+//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      |
 //!
-//! (1) Delete and rewrite are compatible with each other and themselves only if
+//! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
 
 use std::{collections::HashSet, sync::Arc};
 
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_file::datatypes::Fields;
+use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_io::object_store::ObjectStore;
 use lance_table::{
     format::{
         pb::{self, IndexMetadata},
-        Fragment, Index, Manifest, RowIdMeta,
+        DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
     },
     io::{
         commit::CommitHandler,
@@ -232,10 +232,10 @@ impl Transaction {
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        // TODO: this assume IsolationLevel is Serializable, but we could also
-        // support Snapshot Isolation, which is more permissive. In particular,
-        // it would allow a Delete transaction to succeed after a concurrent
-        // Append, even if the Append added rows that would be deleted.
+        // This assumes IsolationLevel is Snapshot Isolation, which is more
+        // permissive than Serializable. In particular, it allows a Delete
+        // transaction to succeed after a concurrent Append, even if the Append
+        // added rows that would be deleted.
         match &self.operation {
             Operation::Append { .. } => match &other.operation {
                 // Append is compatible with anything that doesn't change the schema
@@ -295,6 +295,7 @@ impl Transaction {
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 Operation::Project { .. } => false,
+                Operation::Append { .. } => false,
                 _ => true,
             },
             // Merge changes the schema, but preserves row ids, so the only operations
@@ -328,6 +329,29 @@ impl Transaction {
         })
     }
 
+    fn data_storage_format_from_files(
+        fragments: &[Fragment],
+        user_requested: Option<LanceFileVersion>,
+    ) -> Result<DataStorageFormat> {
+        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
+            // Ensure user-requested matches data files
+            if let Some(user_requested) = user_requested {
+                if user_requested != file_version {
+                    return Err(Error::invalid_input(
+                        format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
+                        location!(),
+                    ));
+                }
+            }
+            Ok(DataStorageFormat::new(file_version))
+        } else {
+            // If no files use user-requested or default
+            Ok(user_requested
+                .map(DataStorageFormat::new)
+                .unwrap_or_default())
+        }
+    }
+
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -356,6 +380,17 @@ impl Transaction {
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
     ) -> Result<(Manifest, Vec<Index>)> {
+        if config.use_move_stable_row_ids
+            && current_manifest
+                .map(|m| !m.uses_move_stable_row_ids())
+                .unwrap_or_default()
+        {
+            return Err(Error::NotSupported {
+                source: "Cannot enable stable row ids on existing dataset".into(),
+                location: location!(),
+            });
+        }
+
         // Get the schema and the final fragment list
         let schema = match self.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
@@ -440,6 +475,7 @@ impl Transaction {
                         }
                     }
                 });
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
                 removed_fragment_ids,
@@ -463,6 +499,7 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Overwrite { ref fragments, .. } => {
                 let mut new_fragments =
@@ -486,7 +523,19 @@ impl Transaction {
                     &mut fragment_id,
                     current_version,
                 )?;
-                Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+
+                if next_row_id.is_some() {
+                    // We can re-use indices, but need to rewrite the fragment bitmaps
+                    debug_assert!(rewritten_indices.is_empty());
+                    for index in final_indices.iter_mut() {
+                        if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
+                            *fragment_bitmap =
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                        }
+                    }
+                } else {
+                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                }
             }
             Operation::CreateIndex {
                 new_indices,
@@ -511,7 +560,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -532,7 +581,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Restore { .. } => {
                 unreachable!()
@@ -542,16 +591,36 @@ impl Transaction {
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
+        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
+            (None, Some(true)) => Some(LanceFileVersion::Legacy),
+            (None, Some(false)) => Some(LanceFileVersion::V2_0),
+            (None, None) => None,
+        };
+
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments))
+            let mut prev_manifest =
+                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
+            if user_requested_version.is_some()
+                && matches!(self.operation, Operation::Overwrite { .. })
+            {
+                // If this is an overwrite operation and the user has requested a specific version
+                // then ovewrite with that version.  Otherwise, if the user didn't request a specific
+                // version, then overwrite with whatever version we had before.
+                prev_manifest.data_storage_format =
+                    DataStorageFormat::new(user_requested_version.unwrap());
+            }
+            prev_manifest
         } else {
-            Manifest::new(schema, Arc::new(final_fragments))
+            let data_storage_format =
+                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
+            Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
         };
 
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
-            apply_feature_flags(&mut manifest)?;
+            apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
@@ -570,7 +639,7 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema) {
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -580,6 +649,17 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+        });
+
+        // We might have also removed all fragments that an index was covering, so
+        // we should remove those indices as well.
+        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
+        indices.retain(|existing_index| {
+            existing_index
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
+                .unwrap_or(true)
         });
     }
 
@@ -1163,7 +1243,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, false, true, true, false, false, true],
+                [false, false, false, true, true, false, false, true],
             ),
             (
                 Operation::Delete {
@@ -1172,7 +1252,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [true, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true],
             ),
             (
                 Operation::Overwrite {
@@ -1228,12 +1308,12 @@ mod tests {
             ),
             (
                 Operation::Update {
-                    // Delete that affects same fragments as other transactions
+                    // Update that affects same fragments as other transactions
                     updated_fragments: vec![fragment0.clone()],
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2.clone()],
                 },
-                [true, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true],
             ),
         ];
 

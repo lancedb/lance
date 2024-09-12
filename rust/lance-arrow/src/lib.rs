@@ -5,6 +5,7 @@
 //!
 //! To improve Arrow-RS ergonomic
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -14,7 +15,7 @@ use arrow_array::{
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
-use arrow_select::take::take;
+use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
 pub mod deepcopy;
@@ -284,6 +285,14 @@ pub fn as_fixed_size_binary_array(arr: &dyn Array) -> &FixedSizeBinaryArray {
     arr.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap()
 }
 
+pub fn iter_str_array(arr: &dyn Array) -> Box<dyn Iterator<Item = Option<&str>> + '_> {
+    match arr.data_type() {
+        DataType::Utf8 => Box::new(arr.as_string::<i32>().iter()),
+        DataType::LargeUtf8 => Box::new(arr.as_string::<i64>().iter()),
+        _ => panic!("Expecting Utf8 or LargeUtf8, found {:?}", arr.data_type()),
+    }
+}
+
 /// Extends Arrow's [RecordBatch].
 pub trait RecordBatchExt {
     /// Append a new column to this [`RecordBatch`] and returns a new RecordBatch.
@@ -374,6 +383,19 @@ pub trait RecordBatchExt {
     /// Project the schema over the [RecordBatch].
     fn project_by_schema(&self, schema: &Schema) -> Result<RecordBatch>;
 
+    /// metadata of the schema.
+    fn metadata(&self) -> &HashMap<String, String>;
+
+    /// Add metadata to the schema.
+    fn add_metadata(&self, key: String, value: String) -> Result<RecordBatch> {
+        let mut metadata = self.metadata().clone();
+        metadata.insert(key, value);
+        self.with_metadata(metadata)
+    }
+
+    /// Replace the schema metadata with the provided one.
+    fn with_metadata(&self, metadata: HashMap<String, String>) -> Result<RecordBatch>;
+
     /// Take selected rows from the [RecordBatch].
     fn take(&self, indices: &UInt32Array) -> Result<RecordBatch>;
 }
@@ -458,6 +480,16 @@ impl RecordBatchExt for RecordBatch {
     fn project_by_schema(&self, schema: &Schema) -> Result<Self> {
         let struct_array: StructArray = self.clone().into();
         self.try_new_from_struct_array(project(&struct_array, schema.fields())?)
+    }
+
+    fn metadata(&self) -> &HashMap<String, String> {
+        self.schema_ref().metadata()
+    }
+
+    fn with_metadata(&self, metadata: HashMap<String, String>) -> Result<RecordBatch> {
+        let mut schema = self.schema_ref().as_ref().clone();
+        schema.metadata = metadata;
+        Self::try_new(schema.into(), self.columns().into())
     }
 
     fn take(&self, indices: &UInt32Array) -> Result<Self> {
@@ -582,6 +614,33 @@ fn get_sub_array<'a>(array: &'a ArrayRef, components: &[&str]) -> Option<&'a Arr
     struct_arr
         .column_by_name(components[0])
         .and_then(|arr| get_sub_array(arr, &components[1..]))
+}
+
+/// Interleave multiple RecordBatches into a single RecordBatch.
+///
+/// Behaves like [`arrow::compute::interleave`], but for RecordBatches.
+pub fn interleave_batches(
+    batches: &[RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch> {
+    let first_batch = batches.first().ok_or_else(|| {
+        ArrowError::InvalidArgumentError("Cannot interleave zero RecordBatches".to_string())
+    })?;
+    let schema = first_batch.schema().clone();
+    let num_columns = first_batch.num_columns();
+    let mut columns = Vec::with_capacity(num_columns);
+    let mut chunks = Vec::with_capacity(batches.len());
+
+    for i in 0..num_columns {
+        for batch in batches {
+            chunks.push(batch.column(i).as_ref());
+        }
+        let new_column = interleave(&chunks, indices)?;
+        columns.push(new_column);
+        chunks.clear();
+    }
+
+    RecordBatch::try_new(schema, columns)
 }
 
 #[cfg(test)]

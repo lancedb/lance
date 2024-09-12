@@ -17,33 +17,36 @@ use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::ROW_ADDR;
+use lance_datafusion::projection::ProjectionPlan;
 use snafu::{location, Location};
 
+use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
 
 pub async fn take(
     dataset: &Dataset,
     row_indices: &[u64],
-    projection: &Schema,
+    projection: &ProjectionPlan,
 ) -> Result<RecordBatch> {
     if row_indices.is_empty() {
-        let schema = Arc::new(projection.into());
-        return Ok(RecordBatch::new_empty(schema));
+        return Ok(RecordBatch::new_empty(Arc::new(
+            projection.output_schema()?,
+        )));
     }
 
     let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
     sorted_indices.sort_by_key(|&i| row_indices[i]);
 
-    let fragments = dataset.get_fragments();
+    let fragments = dataset.get_fragments().into_iter().map(Arc::new);
 
     // We will split into sub-requests for each fragment.
-    let mut sub_requests: Vec<(&FileFragment, Range<usize>)> = Vec::new();
+    let mut sub_requests: Vec<(Arc<FileFragment>, Range<usize>)> = Vec::new();
     // We will remap the row indices to the original row indices, using a pair
     // of (request position, position in request)
     let mut remap_index: Vec<(usize, usize)> = vec![(0, 0); row_indices.len()];
     let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(row_indices.len());
 
-    let mut fragments_iter = fragments.iter();
+    let mut fragments_iter = fragments.into_iter();
     let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
         source: "Called take on an empty dataset.".to_string().into(),
         location: location!(),
@@ -113,17 +116,29 @@ pub async fn take(
         sub_requests.push((current_fragment, start..end));
     }
 
+    let local_ids_buffer = Arc::new(local_ids_buffer);
+
     let take_tasks = sub_requests
         .into_iter()
         .map(|(fragment, indices_range)| {
-            let local_ids = &local_ids_buffer[indices_range];
-            fragment.take(local_ids, projection)
+            let local_ids_buffer = local_ids_buffer.clone();
+            let physical_schema = projection.physical_schema.clone();
+            async move {
+                let local_ids = &local_ids_buffer[indices_range];
+                fragment.take(local_ids, &physical_schema).await
+            }
         })
         .collect::<Vec<_>>();
-    let batches = futures::stream::iter(take_tasks)
-        .buffered(num_cpus::get() * 4)
-        .try_collect::<Vec<RecordBatch>>()
-        .await?;
+    let take_stream = futures::stream::iter(take_tasks)
+        .buffered(dataset.object_store.io_parallelism())
+        .map_err(|err| DataFusionError::External(err.into()))
+        .boxed();
+    let take_stream = Box::pin(RecordBatchStreamAdapter::new(
+        projection.arrow_schema_ref(),
+        take_stream,
+    ));
+    let take_stream = projection.project_stream(take_stream)?;
+    let batches = take_stream.try_collect::<Vec<RecordBatch>>().await?;
 
     let struct_arrs: Vec<StructArray> = batches.into_iter().map(StructArray::from).collect();
     let refs: Vec<_> = struct_arrs.iter().map(|x| x as &dyn Array).collect();
@@ -135,25 +150,25 @@ pub async fn take(
 pub async fn take_rows(
     dataset: &Dataset,
     row_ids: &[u64],
-    projection: &Schema,
+    projection: &ProjectionPlan,
 ) -> Result<RecordBatch> {
     if row_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(projection.into())));
+        return Ok(RecordBatch::new_empty(Arc::new(
+            projection.output_schema()?,
+        )));
     }
 
-    let row_addrs = if dataset.manifest.uses_move_stable_row_ids() {
-        // Need to map the row ids to addresses
-        let index = get_row_id_index(dataset).await?;
+    let row_addrs = if let Some(row_id_index) = get_row_id_index(dataset).await? {
         let addresses = row_ids
             .iter()
-            .filter_map(|id| index.get(*id).map(|address| address.into()))
+            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
             .collect::<Vec<_>>();
         Cow::Owned(addresses)
     } else {
         Cow::Borrowed(row_ids)
     };
 
-    let projection = Arc::new(projection.clone());
+    let projection = Arc::new(projection);
     let row_addr_stats = check_row_addrs(&row_addrs);
 
     // This method is mostly to annotate the send bound to avoid the
@@ -173,7 +188,7 @@ pub async fn take_rows(
         }
     }
 
-    if row_addr_stats.contiguous {
+    let batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
         let fragment_id = (start >> 32) as usize;
@@ -188,7 +203,9 @@ pub async fn take_rows(
             )
         })?;
 
-        let reader = fragment.open(projection.as_ref(), false, false).await?;
+        let reader = fragment
+            .open(&projection.physical_schema, false, false, None)
+            .await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
@@ -227,17 +244,22 @@ pub async fn take_rows(
             })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
-            let batch_fut = do_take(fragment, row_offsets, projection.clone(), false);
+            let batch_fut = do_take(
+                fragment,
+                row_offsets,
+                projection.physical_schema.clone(),
+                false,
+            );
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(4 * num_cpus::get())
+            .buffered(dataset.object_store.io_parallelism())
             .try_collect()
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     } else {
         let projection_with_row_addr = Schema::merge(
-            projection.as_ref(),
+            projection.physical_schema.as_ref(),
             &ArrowSchema::new(vec![ArrowField::new(
                 ROW_ADDR,
                 arrow::datatypes::DataType::UInt64,
@@ -268,8 +290,10 @@ pub async fn take_rows(
         });
 
         let mut batches = futures::stream::iter(fragment_and_indices)
-            .map(|(fragment, indices)| do_take(fragment, indices, projection.clone(), true))
-            .buffered(4 * num_cpus::get())
+            .map(|(fragment, indices)| {
+                do_take(fragment, indices, projection.physical_schema.clone(), true)
+            })
+            .buffered(dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -310,7 +334,9 @@ pub async fn take_rows(
         let struct_arr: StructArray = one_batch.into();
         let reordered = arrow_select::take::take(&struct_arr, &remapping_index, None)?;
         Ok(as_struct_array(&reordered).into())
-    }
+    }?;
+
+    projection.project_batch(batch).await
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -332,7 +358,7 @@ pub fn take_scan(
                 let range = res.map_err(|err| DataFusionError::External(Box::new(err)))?;
                 let row_pos: Vec<u64> = (range.start..range.end).collect();
                 dataset
-                    .take(&row_pos, projection.as_ref())
+                    .take(&row_pos, ProjectionRequest::Schema(projection.clone()))
                     .await
                     .map_err(|err| DataFusionError::External(Box::new(err)))
             };
@@ -377,6 +403,7 @@ fn check_row_addrs(row_ids: &[u64]) -> RowAddressStats {
 mod test {
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::DataType;
+    use lance_file::version::LanceFileVersion;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
@@ -409,14 +436,15 @@ mod test {
     #[rstest]
     #[tokio::test]
     async fn test_take(
-        #[values(false, true)] use_legacy_format: bool,
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
         #[values(false, true)] enable_move_stable_row_ids: bool,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids,
             ..Default::default()
         };
@@ -438,7 +466,7 @@ mod test {
                     40,  // 40
                     125, // 125
                 ],
-                &projection,
+                projection,
             )
             .await
             .unwrap();
@@ -463,15 +491,65 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows_out_of_bound(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_take_with_projection(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+        #[values(false, true)] enable_move_stable_row_ids: bool,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            data_storage_version: Some(data_storage_version),
+            enable_move_stable_row_ids,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 400);
+        let projection = ProjectionRequest::from_sql(vec![("foo", "i"), ("bar", "i*2")]);
+        let values = dataset
+            .take(&[10, 50, 100], projection.clone())
+            .await
+            .unwrap();
+
+        let expected_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("foo", DataType::Int32, false),
+            ArrowField::new("bar", DataType::Int32, false),
+        ]));
+        assert_eq!(
+            RecordBatch::try_new(
+                expected_schema,
+                vec![
+                    Arc::new(Int32Array::from_iter_values([10, 50, 100])),
+                    Arc::new(Int32Array::from_iter_values([20, 100, 200])),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        let values2 = dataset.take_rows(&[10, 50, 100], projection).await.unwrap();
+        assert_eq!(values, values2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_take_rows_out_of_bound(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         // a dataset with 1 fragment and 400 rows
-        let test_ds = TestVectorDataset::new(use_legacy_format).await.unwrap();
+        let test_ds = TestVectorDataset::new(data_storage_version, false)
+            .await
+            .unwrap();
         let ds = test_ds.dataset;
 
         // take the last row of first fragment
         // this triggers the contiguous branch
         let indices = &[(1 << 32) - 1];
-        let fut = require_send(ds.take_rows(indices, ds.schema()));
+        let fut = require_send(ds.take_rows(indices, ds.schema().clone()));
         let err = fut.await.unwrap_err();
         assert!(
             err.to_string().contains("Invalid read params"),
@@ -481,7 +559,10 @@ mod test {
 
         // this triggers the sorted branch, but not contiguous
         let indices = &[(1 << 32) - 3, (1 << 32) - 1];
-        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        let err = ds
+            .take_rows(indices, ds.schema().clone())
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("Invalid read params Indices(4294967293,4294967295)"),
@@ -491,7 +572,10 @@ mod test {
 
         // this triggers the catch all branch
         let indices = &[(1 << 32) - 1, (1 << 32) - 3];
-        let err = ds.take_rows(indices, ds.schema()).await.unwrap_err();
+        let err = ds
+            .take_rows(indices, ds.schema().clone())
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("Invalid read params Indices(4294967293,4294967295)"),
@@ -502,12 +586,15 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_take_rows(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -524,7 +611,10 @@ mod test {
             1_u64 << 32,        // 40
             (2_u64 << 32) + 20, // 100
         ];
-        let values = dataset.take_rows(indices, &projection).await.unwrap();
+        let values = dataset
+            .take_rows(indices, projection.clone())
+            .await
+            .unwrap();
         assert_eq!(
             RecordBatch::try_new(
                 data.schema(),
@@ -542,7 +632,10 @@ mod test {
         // Delete some rows from a fragment
         dataset.delete("i in (199, 100)").await.unwrap();
         dataset.validate().await.unwrap();
-        let values = dataset.take_rows(indices, &projection).await.unwrap();
+        let values = dataset
+            .take_rows(indices, projection.clone())
+            .await
+            .unwrap();
         assert_eq!(
             RecordBatch::try_new(
                 data.schema(),
@@ -558,19 +651,22 @@ mod test {
         );
 
         // Take an empty selection.
-        let values = dataset.take_rows(&[], &projection).await.unwrap();
+        let values = dataset.take_rows(&[], projection).await.unwrap();
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
     }
 
     #[rstest]
     #[tokio::test]
-    async fn take_scan_dataset(#[values(false, true)] use_legacy_format: bool) {
+    async fn take_scan_dataset(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         use arrow::datatypes::Int32Type;
 
         let data = test_batch(1..5);
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -607,11 +703,14 @@ mod test {
 
     #[rstest]
     #[tokio::test]
-    async fn test_take_rows_with_row_ids(#[values(false, true)] use_legacy_format: bool) {
+    async fn test_take_rows_with_row_ids(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             max_rows_per_group: 2,
-            use_legacy_format,
+            data_storage_version: Some(data_storage_version),
             enable_move_stable_row_ids: true,
             ..Default::default()
         };
@@ -623,7 +722,10 @@ mod test {
         dataset.delete("i in (1, 2, 3, 7)").await.unwrap();
 
         let indices = &[0, 4, 6, 5];
-        let result = dataset.take_rows(indices, dataset.schema()).await.unwrap();
+        let result = dataset
+            .take_rows(indices, dataset.schema().clone())
+            .await
+            .unwrap();
         assert_eq!(
             RecordBatch::try_new(
                 data.schema(),

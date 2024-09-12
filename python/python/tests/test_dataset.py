@@ -16,6 +16,7 @@ from unittest import mock
 
 import lance
 import lance.fragment
+import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import polars as pl
@@ -81,7 +82,8 @@ def test_roundtrip_types(tmp_path: Path):
         }
     )
 
-    dataset = lance.write_dataset(table, tmp_path)
+    # TODO: V2 does not currently handle large_dict
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="legacy")
     assert dataset.schema == table.schema
     assert dataset.to_table() == table
 
@@ -250,6 +252,89 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_v2_manifest_paths(tmp_path: Path):
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
+def test_v2_manifest_paths_migration(tmp_path: Path):
+    # Create a dataset with v1 manifest paths
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert manifest_path == ["1.manifest"]
+
+    # Migrate to v2 manifest paths
+    lance.dataset(tmp_path).migrate_manifest_paths_v2()
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
+def test_tag(tmp_path: Path):
+    table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
+    base_dir = tmp_path / "test"
+
+    lance.write_dataset(table, base_dir)
+    ds = lance.write_dataset(table, base_dir, mode="append")
+
+    assert len(ds.tags.list()) == 0
+
+    with pytest.raises(ValueError):
+        ds.tags.create("tag1", 3)
+
+    with pytest.raises(ValueError):
+        ds.tags.delete("tag1")
+
+    ds.tags.create("tag1", 1)
+    assert len(ds.tags.list()) == 1
+
+    with pytest.raises(ValueError):
+        ds.tags.create("tag1", 1)
+
+    ds.tags.delete("tag1")
+
+    ds.tags.create("tag1", 1)
+    ds.tags.create("tag2", 1)
+
+    assert len(ds.tags.list()) == 2
+
+    with pytest.raises(OSError):
+        ds.checkout_version("tag3")
+
+    assert ds.checkout_version("tag1").version == 1
+
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+
+    with pytest.raises(ValueError):
+        lance.dataset(base_dir, "missing-tag")
+
+    # test tag update
+    with pytest.raises(
+        ValueError, match="Version not found error: version 3 does not exist"
+    ):
+        ds.tags.update("tag1", 3)
+
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag3 does not exist"
+    ):
+        ds.tags.update("tag3", 1)
+
+    ds.tags.update("tag1", 2)
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 2
+
+    ds.tags.update("tag1", 1)
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
+
+
 def test_sample(tmp_path: Path):
     table1 = pa.Table.from_pydict({"x": [0, 10, 20, 30, 40, 50], "y": range(6)})
     base_dir = tmp_path / "test"
@@ -304,6 +389,20 @@ def test_take_with_columns(tmp_path: Path):
     assert table2 == pa.Table.from_pylist([{"b": 2}])
 
 
+def test_take_with_projection(tmp_path: Path):
+    table1 = pa.Table.from_pylist([{"a": 1, "b": "x"}, {"a": 2, "b": "y"}])
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table1, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    table2 = dataset.take([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+
+    assert table2 == pa.Table.from_pylist([{"a2": 2, "bup": "X"}])
+
+    table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+    assert table3 == table2
+
+
 def test_filter(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -314,10 +413,13 @@ def test_filter(tmp_path: Path):
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
 
 
-def test_limit_offset(tmp_path: Path):
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
+def test_limit_offset(tmp_path: Path, data_storage_version: str):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
+    lance.write_dataset(
+        table, base_dir, data_storage_version=data_storage_version, max_rows_per_file=10
+    )
     dataset = lance.dataset(base_dir)
 
     # test just limit
@@ -328,6 +430,24 @@ def test_limit_offset(tmp_path: Path):
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
+
+    # Slicing in the middle of fragments
+    assert dataset.to_table(offset=5, limit=20) == table.slice(5, 20)
+
+    # Slicing within a single fragment
+    assert dataset.to_table(offset=5, limit=3) == table.slice(5, 3)
+
+    # Skipping entire fragments
+    assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
+
+    # Limit past the end
+    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+
+    # Invalid limit / offset
+    with pytest.raises(ValueError, match="Offset must be non-negative"):
+        assert dataset.to_table(offset=-1, limit=10) == table.slice(50, 50)
+    with pytest.raises(ValueError, match="Limit must be non-negative"):
+        assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
 
 
 def test_relative_paths(tmp_path: Path):
@@ -417,6 +537,28 @@ def test_pickle(tmp_path: Path):
     pickled = pickle.dumps(dataset)
     unpickled = pickle.loads(pickled)
     assert dataset.to_table() == unpickled.to_table()
+
+
+def test_nested_projection(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "struct": [{"x": counter, "y": counter % 2 == 0} for counter in range(100)],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    projected = dataset.to_table(columns=["struct.x"])
+    assert projected == pa.Table.from_pydict({"struct.x": range(100)})
+
+    projected = dataset.to_table(columns=["struct.y"])
+    assert projected == pa.Table.from_pydict(
+        {"struct.y": [i % 2 == 0 for i in range(100)]}
+    )
 
 
 def test_polar_scan(tmp_path: Path):
@@ -554,6 +696,7 @@ def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     lance.write_dataset(table, base_dir)
+    time.sleep(0.1)
     moment = datetime.now()
     lance.write_dataset(table, base_dir, mode="overwrite")
 
@@ -576,6 +719,70 @@ def test_cleanup_old_versions(tmp_path):
 
     # Now this call will actually delete the old version
     stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
+
+
+def test_cleanup_error_when_tagged_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert len(dataset.versions()) == 3
+
+    dataset.tags.delete("old-tag")
+    with pytest.raises(OSError):
+        dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert len(dataset.versions()) == 3
+
+    dataset.tags.delete("another-old-tag")
+    stats = dataset.cleanup_old_versions(older_than=(datetime.now() - moment))
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 2
+    assert len(dataset.versions()) == 1
+
+
+def test_cleanup_around_tagged_old_versions(tmp_path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+    lance.write_dataset(table, base_dir, mode="overwrite")
+    time.sleep(0.1)
+    moment = datetime.now()
+    lance.write_dataset(table, base_dir, mode="overwrite")
+
+    dataset = lance.dataset(base_dir)
+    dataset.tags.create("old-tag", 1)
+    dataset.tags.create("another-old-tag", 2)
+    dataset.tags.create("tag-latest", 3)
+
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
+    assert stats.bytes_removed == 0
+    assert stats.old_versions == 0
+
+    dataset.tags.delete("old-tag")
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
+    assert stats.bytes_removed > 0
+    assert stats.old_versions == 1
+
+    dataset.tags.delete("another-old-tag")
+    stats = dataset.cleanup_old_versions(
+        older_than=(datetime.now() - moment), error_if_tagged_old_versions=False
+    )
     assert stats.bytes_removed > 0
     assert stats.old_versions == 1
 
@@ -1022,6 +1229,52 @@ def test_merge_insert(tmp_path: Path):
         check_merge_stats(merge_dict, (None, None, None))
 
 
+def test_merge_insert_subcols(tmp_path: Path):
+    initial_data = pa.table(
+        {
+            "a": range(10),
+            "b": range(10),
+            "c": range(10, 20),
+        }
+    )
+    # Split across two fragments
+    dataset = lance.write_dataset(
+        initial_data, tmp_path / "dataset", max_rows_per_file=5
+    )
+    original_fragments = dataset.get_fragments()
+
+    new_values = pa.table(
+        {
+            "a": range(3, 5),
+            "b": range(20, 22),
+        }
+    )
+    (dataset.merge_insert("a").when_matched_update_all().execute(new_values))
+
+    expected = pa.table(
+        {
+            "a": range(10),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 9],
+            "c": range(10, 20),
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
+    # First fragment has new file
+    fragments = dataset.get_fragments()
+    assert fragments[0].fragment_id == original_fragments[0].fragment_id
+    assert fragments[1].fragment_id == original_fragments[1].fragment_id
+
+    assert len(fragments[0].data_files()) == 2
+    assert str(fragments[0].data_files()[0]) == str(
+        original_fragments[0].data_files()[0]
+    )
+    assert len(fragments[1].data_files()) == 1
+    assert str(fragments[1].data_files()[0]) == str(
+        original_fragments[1].data_files()[0]
+    )
+
+
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
@@ -1202,7 +1455,10 @@ def test_merge_insert_incompatible_schema(tmp_path: Path):
 
     with pytest.raises(OSError):
         merge_dict = (
-            dataset.merge_insert("a").when_matched_update_all().execute(new_table)
+            dataset.merge_insert("a")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute(new_table)
         )
         check_merge_stats(merge_dict, (None, None, None))
 
@@ -1339,6 +1595,26 @@ def test_update_dataset_all_types(tmp_path: Path):
     assert dataset.to_table() == expected
 
 
+def test_update_with_binary_field(tmp_path: Path):
+    # Create a lance dataset with binary fields
+    table = pa.Table.from_pydict(
+        {
+            "a": [f"str-{i}" for i in range(100)],
+            "b": [b"bin-{i}" for i in range(100)],
+            "c": list(range(100)),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Update binary field
+    dataset.update({"b": "X'616263'"}, where="c < 2")
+
+    ds = lance.dataset(tmp_path)
+    assert ds.scanner(filter="c < 2").to_table().column(
+        "b"
+    ).combine_chunks() == pa.array([b"abc", b"abc"])
+
+
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
     base_dir = tmp_path / "dataset"
 
@@ -1384,6 +1660,220 @@ def test_scan_with_batch_size(tmp_path: Path):
         assert batch.num_rows == 16
         df = batch.to_pandas()
         assert df["a"].iloc[0] == idx * 16
+
+    os.environ["LANCE_DEFAULT_BATCH_SIZE"] = "12"
+    batches = dataset.scanner(scan_in_order=True).to_batches()
+    for batch in batches:
+        # The last batch in each file has 4 rows
+        assert batch.num_rows == 12 or batch.num_rows == 4
+
+    del os.environ["LANCE_DEFAULT_BATCH_SIZE"]
+    batches = dataset.scanner(scan_in_order=True).to_batches()
+    for batch in batches:
+        assert batch.num_rows != 12
+
+
+@pytest.mark.slow
+def test_io_buffer_size(tmp_path: Path):
+    # These cases regress deadlock issues that happen when the
+    # batch size was very large (in bytes) so that batches are
+    # bigger than the I/O buffer size
+    #
+    # The test is slow (it needs to generate enough data to cover a variety
+    # of cases) but it is essential to run if any changes are made to the
+    # 2.0 scheduling priority / decoding strategy
+    #
+    # In this test we create 4 pages of data, 2 for each column.  We
+    # then set the I/O buffer size to 5000 bytes so that we only read
+    # 1 page at a time and set the batch size to 2M rows so that we
+    # read in all 4 pages for a single batch.
+    #
+    # The scheduler will schedule in this order: C0P0, C1P0, C0P1, C1P1
+    #
+    # The deadlock would happen because the decoder was decoding in this
+    # order: C0P0, C0P1, C1P0, C1P1.
+    #
+    # The decoder will wait for C0P1 but the scheduler will only have scheduled
+    # C1P0 and so deadlock would happen.
+    #
+    # The fix was to change the decoder to decode in the same order as the
+    # scheduler.
+    base_dir = tmp_path / "dataset"
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.uint64(), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This test is similar but the first column is a list column.  The I/O to grab
+    # the list items will span multiple requests and it is important that all of
+    # those requests share the priority of the parent list
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array([[0]] * 1024 * 1024, pa.list_(pa.uint64())),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # Another scenario.  Each list item is a page in itself and we have two list
+    # columns
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.list_(pa.uint64())})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Same scenario as above except now it's a list<list<int>>
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.list_(pa.list_(pa.uint64())), "b": pa.list_(pa.list_(pa.uint64()))}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Next we consider the case where the column is a struct column and we want to
+    # make sure we don't decode too deeply into the struct child
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [{"foo": i} for i in range(1024 * 1024)],
+                        pa.struct([pa.field("foo", pa.uint64())]),
+                    ),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.struct([pa.field("foo", pa.uint64())]), "b": pa.uint64()}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This reproduces another issue we saw where there are a bunch of empty lists and
+    # lance was calculating the page priority incorrectly.
+
+    fsl_type = pa.list_(pa.uint64(), 32 * 1024 * 1024)
+    list_type = pa.list_(fsl_type)
+
+    def datagen():
+        # Each item is 32
+        values = pa.array(range(32 * 1024 * 1024 * 7), pa.uint64())
+        fsls = pa.FixedSizeListArray.from_arrays(values, 32 * 1024 * 1024)
+        # 3 items, 5 empties, 2 items
+        offsets = pa.array([0, 1, 2, 3, 4, 4, 5, 6, 7], pa.int32())
+        lists = pa.ListArray.from_arrays(offsets, fsls)
+
+        values2 = pa.array(range(32 * 1024 * 1024 * 8), pa.uint64())
+        fsls2 = pa.FixedSizeListArray.from_arrays(values2, 32 * 1024 * 1024)
+        offsets2 = pa.array([0, 1, 2, 3, 4, 5, 6, 7, 8], pa.int32())
+        lists2 = pa.ListArray.from_arrays(offsets2, fsls2)
+
+        yield pa.record_batch(
+            [
+                lists,
+                lists2,
+            ],
+            names=["a", "b"],
+        )
+
+    schema = pa.schema({"a": list_type, "b": list_type})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=10, io_buffer_size=5000).to_table()
 
 
 def test_scan_no_columns(tmp_path: Path):
@@ -1726,63 +2216,107 @@ def test_migrate_manifest(tmp_path: Path):
     assert not manifest_needs_migration(ds)
 
 
-def test_v2_dataset(tmp_path: Path):
+def test_legacy_dataset(tmp_path: Path):
     table = pa.table({"a": range(100), "b": range(100)})
-    dataset = lance.write_dataset(table, tmp_path, use_legacy_format=False)
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="stable")
     batches = list(dataset.to_batches())
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
+    assert dataset.data_storage_version == "2.0"
 
     # Append will write v2 if dataset was originally created with v2
-    dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=True, mode="append"
-    )
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
 
     assert len(dataset.get_fragments()) == 2
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=True, mode="overwrite"
+        table, tmp_path, data_storage_version="legacy", mode="overwrite"
     )
+    assert dataset.data_storage_version == "0.1"
+
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Append will write v1 if dataset was originally created with v1
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=False, mode="append"
+        table, tmp_path, data_storage_version="stable", mode="append"
     )
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v2 will put dataset in "v2 mode"
     dataset = lance.write_dataset(
-        [], tmp_path, schema=table.schema, use_legacy_format=False, mode="overwrite"
+        [],
+        tmp_path,
+        schema=table.schema,
+        data_storage_version="stable",
+        mode="overwrite",
     )
 
     assert len(dataset.get_fragments()) == 0
 
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=True, mode="append"
+        table, tmp_path, data_storage_version="legacy", mode="append"
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v1 will put dataset in "v1 mode"
     dataset = lance.write_dataset(
-        [], tmp_path, schema=table.schema, use_legacy_format=True, mode="overwrite"
+        [],
+        tmp_path,
+        schema=table.schema,
+        data_storage_version="legacy",
+        mode="overwrite",
     )
 
     assert len(dataset.get_fragments()) == 0
 
     dataset = lance.write_dataset(
-        table, tmp_path, use_legacy_format=False, mode="append"
+        table, tmp_path, data_storage_version="stable", mode="append"
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
+
+
+def test_late_materialization_batch_size(tmp_path: Path):
+    table = pa.table({"filter": np.arange(32 * 32), "values": np.arange(32 * 32)})
+    dataset = lance.write_dataset(
+        table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
+    )
+    for batch in dataset.to_batches(
+        columns=["values"], filter="filter % 2 == 0", batch_size=32
+    ):
+        assert batch.num_rows == 32
+
+
+EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
+EXPECTED_MAJOR_VERSION = 2
+EXPECTED_MINOR_VERSION = 0
+
+
+def test_default_storage_version(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+    assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
+
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+    from lance.fragment import write_fragments
+
+    frags = write_fragments(table, dataset.uri)
+    frag = frags[0]
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION

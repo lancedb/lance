@@ -163,6 +163,10 @@ impl<'a> Visited<'a> {
         let node_id_usize = node_id as usize;
         self.visited[node_id_usize]
     }
+
+    pub fn count_ones(&self) -> usize {
+        self.visited.count_ones()
+    }
 }
 
 impl<'a> Drop for Visited<'a> {
@@ -201,6 +205,32 @@ impl VisitedGenerator {
     }
 }
 
+fn process_neighbors_with_look_ahead<F>(
+    neighbors: &[u32],
+    mut process_neighbor: F,
+    look_ahead: Option<usize>,
+    dist_calc: &impl DistCalculator,
+) where
+    F: FnMut(u32),
+{
+    match look_ahead {
+        Some(look_ahead) => {
+            for i in 0..neighbors.len().saturating_sub(look_ahead) {
+                dist_calc.prefetch(neighbors[i + look_ahead]);
+                process_neighbor(neighbors[i]);
+            }
+            for neighbor in &neighbors[neighbors.len().saturating_sub(look_ahead)..] {
+                process_neighbor(*neighbor);
+            }
+        }
+        None => {
+            for neighbor in neighbors.iter() {
+                process_neighbor(*neighbor);
+            }
+        }
+    }
+}
+
 /// Beam search over a graph
 ///
 /// This is the same as ``search-layer`` in HNSW.
@@ -230,11 +260,10 @@ pub fn beam_search(
     ep: &OrderedNode,
     k: usize,
     dist_calc: &impl DistCalculator,
-    bitset: Option<&roaring::bitmap::RoaringBitmap>,
+    bitset: Option<&Visited>,
     prefetch_distance: Option<usize>,
-    visited_generator: &mut VisitedGenerator,
+    visited: &mut Visited,
 ) -> Vec<OrderedNode> {
-    let mut visited = visited_generator.generate(graph.len());
     //let mut visited: HashSet<_> = HashSet::with_capacity(k);
     let mut candidates = BinaryHeap::with_capacity(k);
     visited.insert(ep.id);
@@ -269,7 +298,7 @@ pub fn beam_search(
             .copied()
             .collect();
 
-        let mut process_neighbor = |neighbor: u32| {
+        let process_neighbor = |neighbor: u32| {
             visited.insert(neighbor);
             let dist = dist_calc.distance(neighbor).into();
             if dist <= furthest || results.len() < k {
@@ -287,25 +316,12 @@ pub fn beam_search(
                 candidates.push(Reverse((dist, neighbor).into()));
             }
         };
-
-        match prefetch_distance {
-            Some(look_ahead) => {
-                for i in 0..unvisited_neighbors.len().saturating_sub(look_ahead) {
-                    dist_calc.prefetch(unvisited_neighbors[i + look_ahead]);
-                    process_neighbor(unvisited_neighbors[i]);
-                }
-                for neighbor in
-                    &unvisited_neighbors[unvisited_neighbors.len().saturating_sub(look_ahead)..]
-                {
-                    process_neighbor(*neighbor);
-                }
-            }
-            None => {
-                for neighbor in unvisited_neighbors {
-                    process_neighbor(neighbor);
-                }
-            }
-        };
+        process_neighbors_with_look_ahead(
+            &unvisited_neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
     }
 
     results.into_sorted_vec()
@@ -333,22 +349,27 @@ pub fn greedy_search(
     graph: &dyn Graph,
     start: OrderedNode,
     dist_calc: &impl DistCalculator,
+    prefetch_distance: Option<usize>,
 ) -> OrderedNode {
     let mut current = start.id;
     let mut closest_dist = start.dist.0;
     loop {
         let neighbors = graph.neighbors(current);
-        let distances = neighbors
-            .iter()
-            .map(|neighbor| dist_calc.distance(*neighbor));
-
         let mut next = None;
-        for (neighbor, dist) in neighbors.iter().zip(distances) {
+
+        let process_neighbor = |neighbor: u32| {
+            let dist = dist_calc.distance(neighbor);
             if dist < closest_dist {
                 closest_dist = dist;
-                next = Some(*neighbor);
+                next = Some(neighbor);
             }
-        }
+        };
+        process_neighbors_with_look_ahead(
+            &neighbors,
+            process_neighbor,
+            prefetch_distance,
+            dist_calc,
+        );
 
         if let Some(next) = next {
             current = next;

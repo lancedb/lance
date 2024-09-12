@@ -14,12 +14,15 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
-use lance_core::Result;
+use lance_core::utils::mask::RowIdTreeMap;
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
+use snafu::{location, Location};
 
 use crate::{Index, IndexType};
 
-use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex, ScalarQuery};
+use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
+use super::{AnyQuery, SargableQuery};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -157,6 +160,13 @@ impl Index for FlatIndex {
         self
     }
 
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::NotSupported {
+            source: "FlatIndex is not vector index".into(),
+            location: location!(),
+        })
+    }
+
     fn index_type(&self) -> IndexType {
         IndexType::Scalar
     }
@@ -182,13 +192,14 @@ impl Index for FlatIndex {
 
 #[async_trait]
 impl ScalarIndex for FlatIndex {
-    async fn search(&self, query: &ScalarQuery) -> Result<UInt64Array> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
         let predicate = match query {
-            ScalarQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
-            ScalarQuery::IsNull() => arrow::compute::is_null(self.values())?,
-            ScalarQuery::IsIn(values) => {
+            SargableQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
+            SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
+            SargableQuery::IsIn(values) => {
                 let choices = values
                     .iter()
                     .map(|val| lit(val.clone()))
@@ -207,7 +218,7 @@ impl ScalarIndex for FlatIndex {
                     .expect("InList evaluation should return boolean array")
                     .clone()
             }
-            ScalarQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
+            SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
                     panic!("Scalar range query received with no upper or lower bound")
                 }
@@ -240,12 +251,17 @@ impl ScalarIndex for FlatIndex {
                     &arrow_ord::cmp::lt(self.values(), &upper.to_scalar()?)?,
                 )?,
             },
+            SargableQuery::FullTextSearch(_) => return Err(Error::invalid_input(
+                "full text search is not supported for flat index, build a inverted index for it",
+                location!(),
+            )),
         };
-        Ok(arrow_select::filter::filter(self.ids(), &predicate)?
+        let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
+        let matching_ids = matching_ids
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type")
-            .clone())
+            .expect("Result of arrow_select::filter::filter did not match input type");
+        Ok(RowIdTreeMap::from_iter(matching_ids.values()))
     }
 
     // Note that there is no write/train method for flat index at the moment and so it isn't
@@ -306,24 +322,24 @@ mod tests {
         }
     }
 
-    async fn check_index(query: &ScalarQuery, expected: &[u64]) {
+    async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
         let actual = index.search(query).await.unwrap();
-        let expected = UInt64Array::from_iter_values(expected.iter().copied());
+        let expected = RowIdTreeMap::from_iter(expected);
         assert_eq!(actual, expected);
     }
 
     #[tokio::test]
     async fn test_equality() {
-        check_index(&ScalarQuery::Equals(ScalarValue::from(100)), &[0]).await;
-        check_index(&ScalarQuery::Equals(ScalarValue::from(10)), &[5]).await;
-        check_index(&ScalarQuery::Equals(ScalarValue::from(5)), &[]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(100)), &[0]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(10)), &[5]).await;
+        check_index(&SargableQuery::Equals(ScalarValue::from(5)), &[]).await;
     }
 
     #[tokio::test]
     async fn test_range() {
         check_index(
-            &ScalarQuery::Range(
+            &SargableQuery::Range(
                 Bound::Included(ScalarValue::from(100)),
                 Bound::Excluded(ScalarValue::from(1234)),
             ),
@@ -331,17 +347,17 @@ mod tests {
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::from(1000))),
+            &SargableQuery::Range(Bound::Unbounded, Bound::Excluded(ScalarValue::from(1000))),
             &[5, 0],
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Included(ScalarValue::from(0)), Bound::Unbounded),
+            &SargableQuery::Range(Bound::Included(ScalarValue::from(0)), Bound::Unbounded),
             &[5, 0, 3, 100],
         )
         .await;
         check_index(
-            &ScalarQuery::Range(Bound::Included(ScalarValue::from(100000)), Bound::Unbounded),
+            &SargableQuery::Range(Bound::Included(ScalarValue::from(100000)), Bound::Unbounded),
             &[],
         )
         .await;
@@ -350,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn test_is_in() {
         check_index(
-            &ScalarQuery::IsIn(vec![
+            &SargableQuery::IsIn(vec![
                 ScalarValue::from(100),
                 ScalarValue::from(1234),
                 ScalarValue::from(3000),

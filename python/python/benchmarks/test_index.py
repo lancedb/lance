@@ -3,9 +3,11 @@
 from pathlib import Path
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.indices import IndicesBuilder, IvfModel, PqModel
 
 N_DIMS = 512
 
@@ -95,3 +97,107 @@ def test_optimize_index(
         lance.write_dataset(small_table, test_large_dataset.uri, mode="append")
 
     benchmark(test_large_dataset.optimize.optimize_indices)
+
+
+@pytest.mark.benchmark(group="optimize_index")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_train_ivf(test_large_dataset, benchmark, num_partitions):
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    benchmark.pedantic(
+        builder.train_ivf,
+        kwargs={"num_partitions": num_partitions},
+        iterations=1,
+        rounds=1,
+    )
+
+
+# Pre-computing partition assigment only makes sense on CUDA and so this benchmark runs
+# only on CUDA.
+@pytest.mark.benchmark(group="assign_partitions")
+@pytest.mark.parametrize("num_partitions", [100, 300])
+def test_partition_assignment(test_large_dataset, benchmark, num_partitions):
+    from lance.dependencies import torch
+
+    try:
+        if not torch.cuda.is_available():
+            return
+    except:  # noqa: E722
+        return
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    ivf = builder.train_ivf(num_partitions=num_partitions)
+    benchmark.pedantic(
+        builder.assign_ivf_partitions, args=[ivf, None, "cuda"], iterations=1, rounds=1
+    )
+
+
+def rand_ivf(rand_dataset):
+    dtype = rand_dataset.schema.field("vector").type.value_type.to_pandas_dtype()
+    centroids = np.random.rand(N_DIMS * 35000).astype(dtype)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, N_DIMS)
+    return IvfModel(centroids, "l2")
+
+
+def rand_pq(rand_dataset, rand_ivf):
+    dtype = rand_dataset.schema.field("vector").type.value_type.to_pandas_dtype()
+    codebook = np.random.rand(N_DIMS * 256).astype(dtype)
+    codebook = pa.FixedSizeListArray.from_arrays(codebook, N_DIMS)
+    pq = PqModel(512 // 16, codebook)
+    return pq
+
+
+def gen_rand_part_ids(dataset, dest_uri):
+    row_ids = dataset.to_table(with_row_address=True, columns=[])
+    part_ids = np.random.randint(0, 35000, size=row_ids.num_rows, dtype=np.uint32)
+    table = pa.table({"row_id": row_ids.column(0), "partition": part_ids})
+    lance.write_dataset(table, dest_uri, max_rows_per_file=row_ids.num_rows)
+
+
+@pytest.mark.benchmark(group="transform_vectors")
+def test_transform_vectors_no_precomputed_parts(test, tmpdir, benchmark):
+    ivf = rand_ivf(test_dataset)
+    pq = rand_pq(test_dataset, ivf)
+    builder = IndicesBuilder(test_dataset, "vector")
+    dst_uri = str(tmpdir / "output.lance")
+
+    benchmark.pedantic(
+        builder.transform_vectors,
+        args=[ivf, pq, dst_uri],
+        iterations=1,
+        rounds=1,
+    )
+
+
+@pytest.mark.benchmark(group="transform_vectors")
+def test_transform_vectors_with_precomputed_parts(
+    test_large_dataset, tmpdir, benchmark
+):
+    ivf = rand_ivf(test_large_dataset)
+    pq = rand_pq(test_large_dataset, ivf)
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    dst_uri = str(tmpdir / "output.lance")
+    part_ids_path = str(tmpdir / "part_ids")
+    gen_rand_part_ids(test_large_dataset, part_ids_path)
+    benchmark.pedantic(
+        builder.transform_vectors,
+        args=[ivf, pq, dst_uri, None, part_ids_path],
+        iterations=1,
+        rounds=1,
+    )
+
+
+@pytest.mark.benchmark(group="shuffle_vectors")
+def test_shuffle_vectors(test_large_dataset, tmpdir, benchmark):
+    ivf = rand_ivf(test_large_dataset)
+    pq = rand_pq(test_large_dataset, ivf)
+    builder = IndicesBuilder(test_large_dataset, "vector")
+    transformed_uri = str(tmpdir / "output.lance")
+    part_ids_path = str(tmpdir / "part_ids")
+    gen_rand_part_ids(test_large_dataset, part_ids_path)
+    builder.transform_vectors(ivf, pq, transformed_uri, None, part_ids_path)
+    shuffle_out = str(tmpdir)
+    benchmark.pedantic(
+        builder.shuffle_transformed_vectors,
+        args=[["output.lance"], shuffle_out, ivf],
+        iterations=1,
+        rounds=1,
+    )

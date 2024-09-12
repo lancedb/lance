@@ -12,6 +12,8 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+
+object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 lance-arrow.workspace = true
 lance-core.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
@@ -32,8 +34,7 @@ chrono.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 lazy_static.workspace = true
-num_cpus.workspace = true
-object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
+log.workspace = true
 pin-project.workspace = true
 prost.workspace = true
 shellexpand.workspace = true
@@ -48,12 +49,15 @@ async-priority-channel = "0.2.0"
 [dev-dependencies]
 criterion.workspace = true
 parquet.workspace = true
-pprof.workspace = true
 tempfile.workspace = true
+test-log.workspace = true
 mockall.workspace = true
 
 [build-dependencies]
 prost-build.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+pprof.workspace = true
 
 [[bench]]
 name = "scheduler"

@@ -11,7 +11,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 
-use lance_index::vector::ivf::Ivf;
+use lance_index::vector::ivf::IvfTransformer;
 use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array_with_seed;
 
@@ -27,14 +27,14 @@ fn bench_partitions(c: &mut Criterion) {
         let fsl = FixedSizeListArray::try_new_from_values(centroids, DIMENSION as i32).unwrap();
 
         for k in &[1, 10, 50] {
-            let ivf = Ivf::new(fsl.clone(), DistanceType::L2, vec![]);
+            let ivf = IvfTransformer::new(fsl.clone(), DistanceType::L2, vec![]);
             c.bench_function(format!("IVF{},k={},L2", num_centroids, k).as_str(), |b| {
                 b.iter(|| {
                     let _ = ivf.find_partitions(&query, *k);
                 })
             });
 
-            let ivf = Ivf::new(fsl.clone(), DistanceType::Cosine, vec![]);
+            let ivf = IvfTransformer::new(fsl.clone(), DistanceType::Cosine, vec![]);
             c.bench_function(
                 format!("IVF{},k={},Cosine", num_centroids, k).as_str(),
                 |b| {
@@ -45,7 +45,7 @@ fn bench_partitions(c: &mut Criterion) {
             );
         }
 
-        let ivf = Ivf::new(fsl.clone(), DistanceType::L2, vec![]);
+        let ivf = IvfTransformer::new(fsl.clone(), DistanceType::L2, vec![]);
         let batch = generate_random_array_with_seed::<Float32Type>(DIMENSION * 4096, SEED);
         let fsl = FixedSizeListArray::try_new_from_values(batch, DIMENSION as i32).unwrap();
         c.bench_function(

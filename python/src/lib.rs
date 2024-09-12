@@ -57,6 +57,7 @@ pub(crate) mod error;
 pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
+pub(crate) mod indices;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
@@ -66,15 +67,15 @@ pub(crate) mod updater;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
-use crate::fragment::{cleanup_partial_writes, write_fragments};
+use crate::fragment::write_fragments;
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
-use crate::utils::build_sq_storage;
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
-pub use dataset::{Dataset, Operation};
+pub use dataset::{Dataset, Operation, RewriteGroup, RewrittenIndex};
 pub use fragment::FragmentMetadata;
 use fragment::{DataFile, FileFragment};
+pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
 
@@ -110,6 +111,8 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<Operation>()?;
+    m.add_class::<RewriteGroup>()?;
+    m.add_class::<RewrittenIndex>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<MergeInsertBuilder>()?;
@@ -139,10 +142,8 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
-    m.add_wrapped(wrap_pyfunction!(cleanup_partial_writes))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
-    m.add_wrapped(wrap_pyfunction!(build_sq_storage))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
@@ -150,6 +151,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
+    register_indices(py, m)?;
     Ok(())
 }
 

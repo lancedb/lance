@@ -11,7 +11,7 @@ import pyarrow as pa
 from .dependencies import _check_for_numpy, _check_for_pandas
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .lance import _build_sq_storage, _Hnsw, _KMeans
+from .lance import _Hnsw, _KMeans
 
 if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
@@ -78,6 +78,7 @@ class KMeans:
         k: int,
         metric_type: Literal["l2", "dot", "cosine"] = "l2",
         max_iters: int = 50,
+        centroids: Optional[pa.FixedSizeListArray] = None,
     ):
         """Create a KMeans model.
 
@@ -90,6 +91,7 @@ class KMeans:
             Supported distance metrics: "l2", "cosine", "dot"
         max_iters: int
             The maximum number of iterations to run the KMeans algorithm. Default: 50.
+        centroids (pyarrow.FixedSizeListArray, optional.) – Provide existing centroids.
         """
         metric_type = metric_type.lower()
         if metric_type not in ["l2", "dot", "cosine"]:
@@ -98,7 +100,9 @@ class KMeans:
             )
         self.k = k
         self._metric_type = metric_type
-        self._kmeans = _KMeans(k, metric_type, max_iters=max_iters)
+        self._kmeans = _KMeans(
+            k, metric_type, max_iters=max_iters, centroids_arr=centroids
+        )
 
     def __repr__(self) -> str:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
@@ -245,9 +249,3 @@ class HNSW:
 
     def vectors(self) -> pa.Array:
         return self._hnsw.vectors()
-
-
-def build_sq_storage(
-    row_ids_array: Iterator[pa.Array], vectors_array: pa.Array, dim, bounds: tuple
-) -> pa.RecordBatch:
-    return _build_sq_storage(row_ids_array, vectors_array, dim, bounds)

@@ -12,17 +12,20 @@ description = "Internal utilities used by other lance modules to simplify workin
 [dependencies]
 arrow.workspace = true
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 arrow-ord.workspace = true
 async-trait.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
-datafusion-substrait = { version = "37.1", optional = true }
+datafusion-substrait = { version = "40.0", optional = true }
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
+lazy_static.workspace = true
 log.workspace = true
 prost.workspace = true
 snafu.workspace = true

@@ -6,13 +6,16 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
+use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lazy_static::lazy_static;
+use quantizer::{QuantizationType, Quantizer};
+use v3::subindex::SubIndexType;
 
 pub mod bq;
 pub mod flat;
@@ -102,6 +105,7 @@ impl From<DistanceType> for pb::VectorMetricType {
 }
 
 /// Vector Index for (Approximate) Nearest Neighbor (ANN) Search.
+/// It's always the IVF index, any other index types without partitioning will be treated as IVF with one partition.
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
 pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
@@ -125,6 +129,15 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///  - Only supports `f32` now. Will add f64/f16 later.
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch>;
 
+    fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
+
+    async fn search_in_partition(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch>;
+
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.
     fn is_loadable(&self) -> bool;
@@ -135,6 +148,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If the index can be remapped return Ok.  Else return an error
     /// explaining why not
     fn check_can_remap(&self) -> Result<()>;
+
+    // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()>;
+    // async fn merge(&self, indices: Vec<Arc<dyn VectorIndex>>) -> Result<()>;
 
     /// Load the index from the reader on-demand.
     async fn load(
@@ -170,4 +186,10 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
+
+    fn ivf_model(&self) -> IvfModel;
+    fn quantizer(&self) -> Quantizer;
+
+    /// the index type of this vector index.
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
 }

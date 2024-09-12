@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
@@ -22,7 +22,9 @@ use snafu::{location, Location};
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;
-use crate::vector::v3::subindex::IvfSubIndex;
+use crate::vector::ivf::storage::IvfModel;
+use crate::vector::quantizer::QuantizationType;
+use crate::vector::v3::subindex::{IvfSubIndex, SubIndexType};
 use crate::{
     vector::{
         graph::NEIGHBORS_FIELD,
@@ -34,8 +36,6 @@ use crate::{
     },
     Index, IndexType,
 };
-
-use super::builder::HNSW_METADATA_KEY;
 
 #[derive(Clone, DeepSizeOf)]
 pub struct HNSWIndexOptions {
@@ -118,6 +118,11 @@ impl<Q: Quantization + Send + Sync + 'static> Index for HNSWIndex<Q> {
         self
     }
 
+    /// Cast to [VectorIndex]
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(self)
+    }
+
     /// Retrieve index statistics as a JSON Value
     fn statistics(&self) -> Result<serde_json::Value> {
         Ok(json!({
@@ -164,6 +169,19 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             storage.as_ref(),
             pre_filter,
         )
+    }
+
+    fn find_partitions(&self, _: &Query) -> Result<UInt32Array> {
+        unimplemented!("only for IVF")
+    }
+
+    async fn search_in_partition(
+        &self,
+        _: usize,
+        _: &Query,
+        _: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        unimplemented!("only for IVF")
     }
 
     fn is_loadable(&self) -> bool {
@@ -230,7 +248,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             .await?;
         let mut schema = batch.schema_ref().as_ref().clone();
         schema.metadata.insert(
-            HNSW_METADATA_KEY.to_string(),
+            HNSW::metadata_key().to_owned(),
             serde_json::to_string(&metadata)?,
         );
         let batch = batch.with_schema(schema.into())?;
@@ -254,6 +272,21 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             message: "Remapping HNSW in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    fn ivf_model(&self) -> IvfModel {
+        unimplemented!("only for IVF")
+    }
+
+    fn quantizer(&self) -> Quantizer {
+        self.partition_storage.quantizer().clone()
+    }
+
+    fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
+        (
+            SubIndexType::Hnsw,
+            self.partition_storage.quantizer().quantization_type(),
+        )
     }
 
     fn metric_type(&self) -> DistanceType {

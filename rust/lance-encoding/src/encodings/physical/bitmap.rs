@@ -4,14 +4,16 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow_buffer::BooleanBufferBuilder;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    decoder::{PageScheduler, PhysicalPageDecoder},
+    buffer::LanceBuffer,
+    data::{DataBlock, FixedWidthDataBlock},
+    decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
 
@@ -33,19 +35,19 @@ impl DenseBitmapScheduler {
 impl PageScheduler for DenseBitmapScheduler {
     fn schedule_ranges(
         &self,
-        ranges: &[Range<u32>],
+        ranges: &[Range<u64>],
         scheduler: &Arc<dyn EncodingsIo>,
         top_level_row: u64,
-    ) -> BoxFuture<'static, Result<Box<dyn PhysicalPageDecoder>>> {
+    ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let mut min = u64::MAX;
         let mut max = 0;
         let chunk_reqs = ranges
             .iter()
             .map(|range| {
                 debug_assert_ne!(range.start, range.end);
-                let start = self.buffer_offset + range.start as u64 / 8;
+                let start = self.buffer_offset + range.start / 8;
                 let bit_offset = range.start % 8;
-                let end = self.buffer_offset + range.end.div_ceil(8) as u64;
+                let end = self.buffer_offset + range.end.div_ceil(8);
                 let byte_range = start..end;
                 min = min.min(start);
                 max = max.max(end);
@@ -76,7 +78,7 @@ impl PageScheduler for DenseBitmapScheduler {
                     length,
                 })
                 .collect::<Vec<_>>();
-            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PhysicalPageDecoder>)
+            Ok(Box::new(BitmapDecoder { chunks }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
     }
@@ -84,34 +86,17 @@ impl PageScheduler for DenseBitmapScheduler {
 
 struct BitmapData {
     data: Bytes,
-    bit_offset: u32,
-    length: u32,
+    bit_offset: u64,
+    length: u64,
 }
 
 struct BitmapDecoder {
     chunks: Vec<BitmapData>,
 }
 
-impl PhysicalPageDecoder for BitmapDecoder {
-    fn update_capacity(
-        &self,
-        _rows_to_skip: u32,
-        num_rows: u32,
-        buffers: &mut [(u64, bool)],
-        _all_null: &mut bool,
-    ) {
-        buffers[0].0 = arrow_buffer::bit_util::ceil(num_rows as usize, 8) as u64;
-        buffers[0].1 = true;
-    }
-
-    fn decode_into(
-        &self,
-        rows_to_skip: u32,
-        num_rows: u32,
-        dest_buffers: &mut [BytesMut],
-    ) -> Result<()> {
+impl PrimitivePageDecoder for BitmapDecoder {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let mut rows_to_skip = rows_to_skip;
-
         let mut dest_builder = BooleanBufferBuilder::new(num_rows as usize);
 
         let mut rows_remaining = num_rows;
@@ -129,37 +114,22 @@ impl PhysicalPageDecoder for BitmapDecoder {
         }
 
         let bool_buffer = dest_builder.finish().into_inner();
-        unsafe { dest_buffers[0].set_len(bool_buffer.len()) }
-        // TODO: This requires an extra copy.  First we copy the data from the read buffer(s)
-        // into dest_builder (one copy is inevitable).  Then we copy the data from dest_builder
-        // into dest_buffers.  This second copy could be avoided (e.g. BooleanBufferBuilder
-        // has a new_from_buffer but that requires MutableBuffer and we can't easily get there
-        // from BytesMut [or can we?])
-        //
-        // Worst case, we vendor our own copy of BooleanBufferBuilder based on BytesMut.  We could
-        // also use MutableBuffer ourselves instead of BytesMut but arrow-rs claims MutableBuffer may
-        // be deprecated in the future (though that discussion seems to have died)
-
-        // TODO: Will this work at the boundaries?  If we have to skip 3 bits for example then the first
-        // bytes of bool_buffer.as_slice will be 000XXXXX and if we copy it on top of YYY00000 then the YYY
-        // will be clobbered.
-        //
-        // It's a moot point at the moment since we don't support page bridging
-        dest_buffers[0].copy_from_slice(bool_buffer.as_slice());
-        Ok(())
-    }
-
-    fn num_buffers(&self) -> u32 {
-        1
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::from(bool_buffer),
+            bits_per_value: 1,
+            num_values: num_rows,
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::{DataType, Field};
-    use bytes::{Bytes, BytesMut};
+    use std::collections::HashMap;
 
-    use crate::decoder::PhysicalPageDecoder;
+    use arrow_schema::{DataType, Field};
+    use bytes::Bytes;
+
+    use crate::decoder::PrimitivePageDecoder;
     use crate::encodings::physical::bitmap::BitmapData;
     use crate::testing::check_round_trip_encoding_random;
 
@@ -168,7 +138,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, HashMap::new()).await;
     }
 
     #[test]
@@ -189,8 +159,8 @@ mod tests {
                 },
             ],
         };
-        let mut dest = vec![BytesMut::with_capacity(1)];
-        let result = decoder.decode_into(5, 1, &mut dest);
+
+        let result = decoder.decode(5, 1);
         assert!(result.is_ok());
     }
 }

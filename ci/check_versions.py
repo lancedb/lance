@@ -37,16 +37,26 @@ def parse_version(version: str) -> tuple[int, int, int]:
 
 if __name__ == "__main__":
     new_version = parse_version(get_versions())
+    print(f"New version: {new_version}")
 
     repo = Github().get_repo(os.environ["GITHUB_REPOSITORY"])
     latest_release = repo.get_latest_release()
     last_version = parse_version(latest_release.tag_name[1:])
+    print(f"Last version: {last_version}")
 
     # Check for a breaking-change label in the PRs between the last release and the current commit.
     commits = repo.compare(latest_release.tag_name, os.environ["GITHUB_SHA"]).commits
     prs = (pr for commit in commits for pr in commit.get_pulls())
-    pr_labels = (label.name for pr in prs for label in pr.labels)
-    has_breaking_changes = any(label == "breaking-change" for label in pr_labels)
+    has_breaking_changes = False
+    for pr in prs:
+        pr_labels = (label.name for label in pr.labels)
+        if any(label == "breaking-change" for label in pr_labels):
+            has_breaking_changes = True
+            print(f"Found breaking change in PR #{pr.number}: {pr.title}")
+            print(f"  {pr.html_url}")
+            break
+    else:
+        print("No breaking changes found.")
 
     if os.environ.get("PR_NUMBER"):
         # If we're running on a PR, we should validate that the version has been

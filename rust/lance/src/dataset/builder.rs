@@ -3,10 +3,12 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams};
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, DEFAULT_CLOUD_IO_PARALLELISM,
+};
 use lance_table::{
     format::Manifest,
-    io::commit::{commit_handler_from_url, CommitHandler, ManifestLocation},
+    io::commit::{commit_handler_from_url, CommitHandler},
 };
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
@@ -14,6 +16,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use url::Url;
 
+use super::refs::{Ref, Tags};
 use super::{ReadParams, WriteParams, DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::{
     error::{Error, Result},
@@ -33,8 +36,9 @@ pub struct DatasetBuilder {
     session: Option<Arc<Session>>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
     options: ObjectStoreParams,
-    version: Option<u64>,
+    version: Option<Ref>,
     table_uri: String,
+    object_store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl DatasetBuilder {
@@ -48,6 +52,7 @@ impl DatasetBuilder {
             session: None,
             version: None,
             manifest: None,
+            object_store_registry: Arc::new(ObjectStoreRegistry::default()),
         }
     }
 }
@@ -76,9 +81,15 @@ impl DatasetBuilder {
         self
     }
 
-    /// Sets `version` to the builder
+    /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
-        self.version = Some(version);
+        self.version = Some(Ref::from(version));
+        self
+    }
+
+    /// Sets `version` for the builder using a tag
+    pub fn with_tag(mut self, tag: &str) -> Self {
+        self.version = Some(Ref::from(tag));
         self
     }
 
@@ -167,6 +178,8 @@ impl DatasetBuilder {
             self.commit_handler = Some(commit_handler);
         }
 
+        self.object_store_registry = read_params.object_store_registry.clone();
+
         self
     }
 
@@ -179,6 +192,9 @@ impl DatasetBuilder {
         if let Some(commit_handler) = write_params.commit_handler {
             self.commit_handler = Some(commit_handler);
         }
+
+        self.object_store_registry = write_params.object_store_registry.clone();
+
         self
     }
 
@@ -189,6 +205,11 @@ impl DatasetBuilder {
     /// If this is set, then `with_index_cache_size` and `with_metadata_cache_size` are ignored.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    pub fn with_object_store_registry(mut self, registry: Arc<ObjectStoreRegistry>) -> Self {
+        self.object_store_registry = registry;
         self
     }
 
@@ -206,13 +227,22 @@ impl DatasetBuilder {
                     store.1.clone(),
                     self.options.block_size,
                     self.options.object_store_wrapper,
+                    self.options.use_constant_size_upload_parts,
+                    store.1.scheme() != "file",
+                    // If user supplied an object store then we just assume it's probably
+                    // cloud-like
+                    DEFAULT_CLOUD_IO_PARALLELISM,
                 ),
                 Path::from(store.1.path()),
                 commit_handler,
             )),
             None => {
-                let (store, path) =
-                    ObjectStore::from_uri_and_params(&self.table_uri, &self.options).await?;
+                let (store, path) = ObjectStore::from_uri_and_params(
+                    self.object_store_registry.clone(),
+                    &self.table_uri,
+                    &self.options,
+                )
+                .await?;
                 Ok((store, path, commit_handler))
             }
         }
@@ -228,34 +258,45 @@ impl DatasetBuilder {
             )),
         };
 
-        let version = self.version;
+        let mut version: Option<u64> = None;
+        let cloned_ref = self.version.clone();
         let table_uri = self.table_uri.clone();
+
+        // How do we detect which version scheme is in use?
 
         let manifest = self.manifest.take();
 
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
-        let manifest = if manifest.is_some() {
-            let mut manifest = manifest.unwrap();
+        if let Some(r) = cloned_ref {
+            version = match r {
+                Ref::Version(v) => Some(v),
+                Ref::Tag(t) => {
+                    let tags = Tags::new(
+                        Arc::new(object_store.clone()),
+                        commit_handler.clone(),
+                        base_path.clone(),
+                    );
+                    Some(tags.get_version(t.as_str()).await?)
+                }
+            }
+        }
+
+        let (manifest, manifest_naming_scheme) = if let Some(mut manifest) = manifest {
+            let location = commit_handler
+                .resolve_version_location(&base_path, manifest.version, &object_store.inner)
+                .await?;
             if manifest.schema.has_dictionary_types() {
-                let path = commit_handler
-                    .resolve_version(&base_path, manifest.version, &object_store.inner)
-                    .await?;
-                let reader = object_store.open(&path).await?;
+                let reader = object_store.open(&location.path).await?;
                 populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
             }
-            manifest
+            (manifest, location.naming_scheme)
         } else {
             let manifest_location = match version {
                 Some(version) => {
-                    let path = commit_handler
-                        .resolve_version(&base_path, version, &object_store.inner)
-                        .await?;
-                    ManifestLocation {
-                        version,
-                        path,
-                        size: None,
-                    }
+                    commit_handler
+                        .resolve_version_location(&base_path, version, &object_store.inner)
+                        .await?
                 }
                 None => commit_handler
                     .resolve_latest_location(&base_path, &object_store)
@@ -267,7 +308,8 @@ impl DatasetBuilder {
                     })?,
             };
 
-            Dataset::load_manifest(&object_store, &manifest_location).await?
+            let manifest = Dataset::load_manifest(&object_store, &manifest_location).await?;
+            (manifest, manifest_location.naming_scheme)
         };
 
         Dataset::checkout_manifest(
@@ -277,6 +319,7 @@ impl DatasetBuilder {
             manifest,
             session,
             commit_handler,
+            manifest_naming_scheme,
         )
         .await
     }
