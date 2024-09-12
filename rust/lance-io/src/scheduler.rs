@@ -660,7 +660,7 @@ mod tests {
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 
-    use crate::testing::MockObjectStore;
+    use crate::{object_store::DEFAULT_DOWNLOAD_RETRY_COUNT, testing::MockObjectStore};
 
     use super::*;
 
@@ -743,6 +743,7 @@ mod tests {
             false,
             false,
             1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
         ));
 
         let config = SchedulerConfig {
@@ -831,6 +832,7 @@ mod tests {
             false,
             false,
             1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
         ));
 
         let config = SchedulerConfig {

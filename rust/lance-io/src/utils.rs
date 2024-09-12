@@ -183,7 +183,7 @@ mod tests {
 
     use crate::{
         object_reader::CloudObjectReader,
-        object_store::ObjectStore,
+        object_store::{ObjectStore, DEFAULT_DOWNLOAD_RETRY_COUNT},
         object_writer::ObjectWriter,
         traits::{ProtoStruct, WriteExt, Writer},
         utils::read_struct,
@@ -226,7 +226,9 @@ mod tests {
         assert_eq!(pos, 0);
         object_writer.shutdown().await.unwrap();
 
-        let object_reader = CloudObjectReader::new(store.inner, path, 1024, None).unwrap();
+        let object_reader =
+            CloudObjectReader::new(store.inner, path, 1024, None, DEFAULT_DOWNLOAD_RETRY_COUNT)
+                .unwrap();
         let actual: BytesWrapper = read_struct(&object_reader, pos).await.unwrap();
         assert_eq!(some_message, actual);
     }
