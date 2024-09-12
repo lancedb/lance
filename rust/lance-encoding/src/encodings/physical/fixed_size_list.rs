@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, ArrayRef};
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
@@ -12,7 +12,7 @@ use crate::{
     data::DataBlock,
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -101,23 +101,34 @@ impl FslEncoder {
 }
 
 impl ArrayEncoder for FslEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let inner_arrays = arrays
-            .iter()
-            .map(|arr| arr.as_fixed_size_list().values().clone())
-            .collect::<Vec<_>>();
-        let items_page = self.items_encoder.encode(&inner_arrays, buffer_index)?;
-        Ok(EncodedArray {
-            buffers: items_page.buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeList(Box::new(
-                    pb::FixedSizeList {
-                        dimension: self.dimension,
-                        items: Some(Box::new(items_page.encoding)),
-                    },
-                ))),
-            },
-        })
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let inner_type = match data_type {
+            DataType::FixedSizeList(inner_field, _) => inner_field.data_type().clone(),
+            _ => panic!("Expected fixed size list data type and got {}", data_type),
+        };
+        let mut data = data.as_fixed_width()?;
+        data.bits_per_value /= self.dimension as u64;
+        data.num_values *= self.dimension as u64;
+        let data = DataBlock::FixedWidth(data);
+
+        let encoded_data = self.items_encoder.encode(data, &inner_type, buffer_index)?;
+
+        let data = match encoded_data.data {
+            DataBlock::FixedWidth(mut data) => {
+                data.bits_per_value *= self.dimension as u64;
+                data.num_values /= self.dimension as u64;
+                DataBlock::FixedWidth(data)
+            }
+            _ => panic!("Expected fixed width data block"),
+        };
+
+        let encoding = ProtobufUtils::fixed_size_list(encoded_data.encoding, self.dimension);
+        Ok(EncodedArray { data, encoding })
     }
 }
 

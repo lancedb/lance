@@ -141,26 +141,13 @@ impl FileWriter {
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let mut buffers = encoded_page.array.buffers;
-        buffers.sort_by_key(|b| b.index);
+        let buffers = encoded_page.array.data.into_buffers();
         let mut buffer_offsets = Vec::with_capacity(buffers.len());
         let mut buffer_sizes = Vec::with_capacity(buffers.len());
         for buffer in buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
-            buffer_sizes.push(
-                buffer
-                    .parts
-                    .iter()
-                    .map(|part| part.len() as u64)
-                    .sum::<u64>(),
-            );
-            // Note: could potentially use write_vectored here but there is no
-            // write_vectored_all and object_store doesn't support it anyways and
-            // buffers won't normally be in *too* many parts so its unlikely to
-            // have much benefit in most cases.
-            for part in &buffer.parts {
-                self.writer.write_all(part).await?;
-            }
+            buffer_sizes.push(buffer.len() as u64);
+            self.writer.write_all(&buffer).await?;
         }
         let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?.encode_to_vec();
         let page = pbfile::column_metadata::Page {
@@ -413,10 +400,8 @@ impl FileWriter {
                 for buffer in column.column_buffers {
                     column_metadata.buffer_offsets.push(buffer_pos);
                     let mut size = 0;
-                    for part in buffer.parts {
-                        self.writer.write_all(&part).await?;
-                        size += part.len() as u64;
-                    }
+                    self.writer.write_all(&buffer).await?;
+                    size += buffer.len() as u64;
                     buffer_pos += size;
                     column_metadata.buffer_sizes.push(size);
                 }

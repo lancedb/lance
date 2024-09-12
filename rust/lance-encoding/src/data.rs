@@ -175,6 +175,39 @@ impl FixedWidthDataBlock {
     }
 }
 
+/// A data block with no regular structure.  There is no available spot to attach
+/// validity / repdef information and it cannot be converted to Arrow without being
+/// decoded
+#[derive(Debug)]
+pub struct OpaqueBlock {
+    pub buffers: Vec<LanceBuffer>,
+    pub num_values: u64,
+}
+
+impl OpaqueBlock {
+    fn borrow_and_clone(&mut self) -> Self {
+        Self {
+            buffers: self
+                .buffers
+                .iter_mut()
+                .map(|b| b.borrow_and_clone())
+                .collect(),
+            num_values: self.num_values,
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            buffers: self
+                .buffers
+                .iter()
+                .map(|b| b.try_clone())
+                .collect::<Result<_>>()?,
+            num_values: self.num_values,
+        })
+    }
+}
+
 /// A data block for variable-width data (e.g. strings, packed rows, etc.)
 #[derive(Debug)]
 pub struct VariableWidthBlock {
@@ -369,6 +402,7 @@ pub enum DataBlock {
     Nullable(NullableDataBlock),
     FixedWidth(FixedWidthDataBlock),
     VariableWidth(VariableWidthBlock),
+    Opaque(OpaqueBlock),
     Struct(StructDataBlock),
     Dictionary(DictionaryDataBlock),
 }
@@ -383,6 +417,10 @@ impl DataBlock {
             Self::VariableWidth(inner) => inner.into_arrow(data_type, validate),
             Self::Struct(inner) => inner.into_arrow(data_type, validate),
             Self::Dictionary(inner) => inner.into_arrow(data_type, validate),
+            Self::Opaque(_) => Err(Error::Internal {
+                message: "Cannot convert OpaqueBlock to Arrow".to_string(),
+                location: location!(),
+            }),
         }
     }
 
@@ -397,6 +435,7 @@ impl DataBlock {
             Self::VariableWidth(inner) => inner.into_buffers(),
             Self::Struct(inner) => inner.into_buffers(),
             Self::Dictionary(inner) => inner.into_buffers(),
+            Self::Opaque(inner) => inner.buffers,
         }
     }
 
@@ -412,6 +451,7 @@ impl DataBlock {
             Self::VariableWidth(inner) => Self::VariableWidth(inner.borrow_and_clone()),
             Self::Struct(inner) => Self::Struct(inner.borrow_and_clone()),
             Self::Dictionary(inner) => Self::Dictionary(inner.borrow_and_clone()),
+            Self::Opaque(inner) => Self::Opaque(inner.borrow_and_clone()),
         }
     }
 
@@ -427,6 +467,7 @@ impl DataBlock {
             Self::VariableWidth(inner) => Ok(Self::VariableWidth(inner.try_clone()?)),
             Self::Struct(inner) => Ok(Self::Struct(inner.try_clone()?)),
             Self::Dictionary(inner) => Ok(Self::Dictionary(inner.try_clone()?)),
+            Self::Opaque(inner) => Ok(Self::Opaque(inner.try_clone()?)),
         }
     }
 
@@ -438,6 +479,7 @@ impl DataBlock {
             Self::VariableWidth(_) => "VariableWidth",
             Self::Struct(_) => "Struct",
             Self::Dictionary(_) => "Dictionary",
+            Self::Opaque(_) => "Opaque",
         }
     }
 
@@ -449,6 +491,7 @@ impl DataBlock {
             Self::VariableWidth(inner) => inner.num_values,
             Self::Struct(inner) => inner.children[0].num_values(),
             Self::Dictionary(inner) => inner.indices.num_values,
+            Self::Opaque(inner) => inner.num_values,
         }
     }
 }
