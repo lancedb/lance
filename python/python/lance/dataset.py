@@ -1071,7 +1071,7 @@ class LanceDataset(pa.dataset.Dataset):
             A mapping of column names to a SQL expression.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
-        
+
         Returns
         -------
         updates : dict
