@@ -223,9 +223,25 @@ def test_full_text_search(dataset, with_position):
         columns=["doc"],
         full_text_query=query,
     ).to_table()
+    assert results.num_rows > 0
     results = results.column(0)
     for row in results:
         assert query in row.as_py()
+
+
+def test_filter_with_fts_index(dataset):
+    dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py()
+    query = query.split(" ")[0]
+    results = dataset.scanner(
+        filter=f"doc = '{query}'",
+        prefilter=True,
+    ).to_table()
+    assert results.num_rows > 0
+    results = results["doc"]
+    for row in results:
+        assert query == row.as_py()
 
 
 def test_bitmap_index(tmp_path: Path):

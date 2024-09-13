@@ -170,9 +170,33 @@ pub async fn open_scalar_index(
     uuid: &str,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, uuid));
-    let index_dir = dataset.indices_dir().child(uuid);
-    // This works at the moment, since we only have a few index types, may need to introduce better
-    // detection method in the future.
+    let index_type = detect_scalar_index_type(dataset, column, uuid).await?;
+    match index_type {
+        ScalarIndexType::Bitmap => {
+            let bitmap_index = BitmapIndex::load(index_store).await?;
+            Ok(bitmap_index as Arc<dyn ScalarIndex>)
+        }
+        ScalarIndexType::LabelList => {
+            let tag_index = LabelListIndex::load(index_store).await?;
+            Ok(tag_index as Arc<dyn ScalarIndex>)
+        }
+        ScalarIndexType::Inverted => {
+            let inverted_index = InvertedIndex::load(index_store).await?;
+            Ok(inverted_index as Arc<dyn ScalarIndex>)
+        }
+        ScalarIndexType::BTree => {
+            let btree_index = BTreeIndex::load(index_store).await?;
+            Ok(btree_index as Arc<dyn ScalarIndex>)
+        }
+    }
+}
+
+pub async fn detect_scalar_index_type(
+    dataset: &Dataset,
+    column: &str,
+    index_uuid: &str,
+) -> Result<ScalarIndexType> {
+    let index_dir = dataset.indices_dir().child(index_uuid);
     let col = dataset.schema().field(column).ok_or(Error::Internal {
         message: format!(
             "Index refers to column {} which does not exist in dataset schema",
@@ -180,19 +204,18 @@ pub async fn open_scalar_index(
         ),
         location: location!(),
     })?;
+
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(INVERT_LIST_FILE);
-    if let DataType::List(_) = col.data_type() {
-        let tag_index = LabelListIndex::load(index_store).await?;
-        Ok(tag_index as Arc<dyn ScalarIndex>)
+    let index_type = if let DataType::List(_) = col.data_type() {
+        ScalarIndexType::LabelList
     } else if dataset.object_store.exists(&bitmap_page_lookup).await? {
-        let bitmap_index = BitmapIndex::load(index_store).await?;
-        Ok(bitmap_index as Arc<dyn ScalarIndex>)
+        ScalarIndexType::Bitmap
     } else if dataset.object_store.exists(&inverted_list_lookup).await? {
-        let inverted_index = InvertedIndex::load(index_store).await?;
-        Ok(inverted_index as Arc<dyn ScalarIndex>)
+        ScalarIndexType::Inverted
     } else {
-        let btree_index = BTreeIndex::load(index_store).await?;
-        Ok(btree_index as Arc<dyn ScalarIndex>)
-    }
+        ScalarIndexType::BTree
+    };
+
+    Ok(index_type)
 }
