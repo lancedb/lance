@@ -294,10 +294,16 @@ const BINARY_DATATYPES: [DataType; 4] = [
 ];
 
 impl CoreArrayEncodingStrategy {
-    fn can_use_fsst(data_type: &DataType, data_size: u64, version: LanceFileVersion) -> bool {
+    fn can_use_fsst(
+        data_type: &DataType,
+        data_size: u64,
+        version: LanceFileVersion,
+        field_meta: Option<&HashMap<String, String>>,
+    ) -> bool {
         version >= LanceFileVersion::V2_1
             && matches!(data_type, DataType::Utf8 | DataType::Binary)
             && data_size > 4 * 1024 * 1024
+            && get_compression_scheme(field_meta) == CompressionScheme::None
     }
 
     fn default_binary_encoder(
@@ -305,14 +311,27 @@ impl CoreArrayEncodingStrategy {
         data_type: &DataType,
         data_size: u64,
         version: LanceFileVersion,
+        field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
-        let bin_indices_encoder =
-            Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
-        let bin_bytes_encoder =
-            Self::choose_array_encoder(arrays, &DataType::UInt8, data_size, false, version, None)?;
+        let bin_indices_encoder = Self::choose_array_encoder(
+            arrays,
+            &DataType::UInt64,
+            data_size,
+            false,
+            version,
+            field_meta,
+        )?;
+        let bin_bytes_encoder = Self::choose_array_encoder(
+            arrays,
+            &DataType::UInt8,
+            data_size,
+            false,
+            version,
+            field_meta,
+        )?;
 
         let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, bin_bytes_encoder));
-        if Self::can_use_fsst(data_type, data_size, version) {
+        if Self::can_use_fsst(data_type, data_size, version, field_meta) {
             Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
         } else {
             Ok(bin_encoder)
@@ -388,17 +407,19 @@ impl CoreArrayEncodingStrategy {
                             data_size,
                             false,
                             version,
-                            None,
+                            field_meta,
                         )?;
 
                         Ok(Box::new(BasicEncoder::new(Box::new(
                             FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
                         ))))
                     } else {
-                        Self::default_binary_encoder(arrays, data_type, data_size, version)
+                        Self::default_binary_encoder(
+                            arrays, data_type, data_size, version, field_meta,
+                        )
                     }
                 } else {
-                    Self::default_binary_encoder(arrays, data_type, data_size, version)
+                    Self::default_binary_encoder(arrays, data_type, data_size, version, field_meta)
                 }
             }
             DataType::Struct(fields) => {
@@ -996,13 +1017,15 @@ pub async fn encode_batch(
 
 #[cfg(test)]
 pub mod tests {
-    use arrow_array::{ArrayRef, StringArray};
-    use std::sync::Arc;
-
-    use crate::version::LanceFileVersion;
-
     use super::check_dict_encoding;
     use super::check_fixed_size_encoding;
+    use super::CoreArrayEncodingStrategy;
+    use crate::encoder::HashMap;
+    use crate::encodings::physical::value::COMPRESSION_META_KEY;
+    use crate::version::LanceFileVersion;
+    use arrow_array::{ArrayRef, StringArray};
+    use arrow_schema::DataType;
+    use std::sync::Arc;
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
         let arr = StringArray::from(arr);
@@ -1122,5 +1145,49 @@ pub mod tests {
             vec![vec![None, None], vec![None, None]],
             LanceFileVersion::V2_1
         ));
+    }
+
+    #[test]
+    fn test_can_use_fsst() {
+        assert!(!CoreArrayEncodingStrategy::can_use_fsst(
+            &DataType::Int32,
+            8 * 1024 * 1024,
+            LanceFileVersion::V2_1,
+            None
+        ));
+
+        assert!(CoreArrayEncodingStrategy::can_use_fsst(
+            &DataType::Utf8,
+            8 * 1024 * 1024,
+            LanceFileVersion::V2_1,
+            None
+        ));
+
+        assert!(!CoreArrayEncodingStrategy::can_use_fsst(
+            &DataType::Utf8,
+            8 * 1024 * 1024,
+            LanceFileVersion::V2_1,
+            Some(&HashMap::from([(
+                COMPRESSION_META_KEY.to_string(),
+                "zstd".to_string()
+            )])),
+        ));
+    }
+
+    #[test]
+    fn test_default_binary_encoder() {
+        let result = CoreArrayEncodingStrategy::default_binary_encoder(
+            &[Arc::new(StringArray::from(vec![Some("a"), Some("b")]))],
+            &DataType::Utf8,
+            2,
+            LanceFileVersion::V2_1,
+            Some(&HashMap::from([(
+                COMPRESSION_META_KEY.to_string(),
+                "zstd".to_string(),
+            )])),
+        );
+        assert!(result.is_ok());
+        let encoder = result.unwrap();
+        assert!(format!("{:?}", encoder).starts_with("BinaryEncoder"));
     }
 }
