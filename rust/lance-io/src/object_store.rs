@@ -46,6 +46,8 @@ pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 // Cloud disks often need many many threads to saturate the network
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
 
+pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
+
 #[async_trait]
 pub trait ObjectStoreExt {
     /// Returns true if the file exists.
@@ -100,6 +102,8 @@ pub struct ObjectStore {
     /// is true for object stores, but not for local filesystems.
     pub list_is_lexically_ordered: bool,
     io_parallelism: usize,
+    /// Number of times to retry a failed download
+    download_retry_count: usize,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -440,6 +444,7 @@ impl ObjectStore {
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: false,
                 io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
@@ -466,6 +471,7 @@ impl ObjectStore {
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
         }
     }
 
@@ -478,6 +484,7 @@ impl ObjectStore {
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
         }
     }
 
@@ -516,6 +523,7 @@ impl ObjectStore {
                 path.clone(),
                 self.block_size,
                 None,
+                self.download_retry_count,
             )?)),
         }
     }
@@ -533,6 +541,7 @@ impl ObjectStore {
                 path.clone(),
                 self.block_size,
                 Some(known_size),
+                self.download_retry_count,
             )?)),
         }
     }
@@ -641,6 +650,28 @@ impl ObjectStore {
         Ok(self.inner.head(path).await?.size)
     }
 }
+
+/// Options that can be set for multiple object stores
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
+pub enum LanceConfigKey {
+    /// Number of times to retry a download that fails
+    DownloadRetryCount,
+}
+
+impl FromStr for LanceConfigKey {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "download_retry_count" => Ok(Self::DownloadRetryCount),
+            _ => Err(Error::InvalidInput {
+                source: format!("Invalid LanceConfigKey: {}", s).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StorageOptions(pub HashMap<String, String>);
 
@@ -709,6 +740,15 @@ impl StorageOptions {
         })
     }
 
+    /// Number of times to retry a download that fails
+    pub fn download_retry_count(&self) -> usize {
+        self.0
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == "download_retry_count")
+            .map(|(_, value)| value.parse::<usize>().unwrap_or(3))
+            .unwrap_or(3)
+    }
+
     /// Subset of options relevant for azure storage
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
         self.0
@@ -755,6 +795,7 @@ async fn configure_store(
     options: ObjectStoreParams,
 ) -> Result<ObjectStore> {
     let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
+    let download_retry_count = storage_options.download_retry_count();
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
@@ -813,6 +854,7 @@ async fn configure_store(
                 use_constant_size_upload_parts,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         "gs" => {
@@ -831,6 +873,7 @@ async fn configure_store(
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         "az" => {
@@ -845,6 +888,7 @@ async fn configure_store(
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         // we have a bypass logic to use `tokio::fs` directly to lower overhead
@@ -862,6 +906,7 @@ async fn configure_store(
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count,
         }),
         unknown_scheme => {
             if let Some(provider) = registry.providers.get(unknown_scheme) {
@@ -878,6 +923,7 @@ async fn configure_store(
 }
 
 impl ObjectStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DynObjectStore>,
         location: Url,
@@ -886,6 +932,7 @@ impl ObjectStore {
         use_constant_size_upload_parts: bool,
         list_is_lexically_ordered: bool,
         io_parallelism: usize,
+        download_retry_count: usize,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
@@ -902,6 +949,7 @@ impl ObjectStore {
             use_constant_size_upload_parts,
             list_is_lexically_ordered,
             io_parallelism,
+            download_retry_count,
         }
     }
 }
