@@ -1071,6 +1071,11 @@ class LanceDataset(pa.dataset.Dataset):
             A mapping of column names to a SQL expression.
         where : str, optional
             A SQL predicate indicating which rows should be updated.
+        
+        Returns
+        -------
+        updates : dict
+            A dictionary containing the number of rows updated.
 
         Examples
         --------
@@ -1078,7 +1083,8 @@ class LanceDataset(pa.dataset.Dataset):
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
-        >>> dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> update_stats = dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> update_stats["num_updated_rows"] = 2
         >>> dataset.to_table().to_pandas()
            a  b
         0  1  a
