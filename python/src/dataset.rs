@@ -29,7 +29,7 @@ use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::transaction::{
-    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex,
+    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex
 };
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -56,6 +56,7 @@ use lance_index::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
+use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -317,6 +318,27 @@ impl Operation {
         let op = LanceOperation::Rewrite {
             groups,
             rewritten_indices,
+        };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn create_index(
+        uuid: String,
+        name: String,
+        fields: Vec<i32>,
+        dataset_version: u64,
+    ) -> PyResult<Self> {
+        let new_indices = vec![Index {
+            uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
+            name,
+            fields,
+            dataset_version,
+            fragment_bitmap: None,
+        }];
+        let op = LanceOperation::CreateIndex {
+            new_indices,
+            removed_indices: vec![],
         };
         Ok(Self(op))
     }
