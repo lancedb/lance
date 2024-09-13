@@ -38,7 +38,6 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
-use lance_index::scalar::expression::IndexInformationProvider;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::FullTextSearchQuery;
@@ -1127,19 +1126,23 @@ impl Scanner {
         query: &FullTextSearchQuery,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let columns = if query.columns.is_empty() {
-            let index_info = self.dataset.scalar_index_info().await?;
-            self.dataset
-                .schema()
-                .fields
-                .iter()
-                .filter_map(|f| {
-                    if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
-                        index_info.get_index(&f.name).map(|_| f.name.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+            let string_columns = self.dataset.schema().fields.iter().filter_map(|f| {
+                if f.data_type() == DataType::Utf8 || f.data_type() == DataType::LargeUtf8 {
+                    Some(&f.name)
+                } else {
+                    None
+                }
+            });
+
+            let mut indexed_columns = Vec::new();
+            for column in string_columns {
+                let index = self.dataset.load_scalar_index_for_column(column).await?;
+                if index.is_some() {
+                    indexed_columns.push(column.clone());
+                }
+            }
+
+            indexed_columns
         } else {
             query.columns.clone()
         };
