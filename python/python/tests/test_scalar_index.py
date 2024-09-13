@@ -228,6 +228,20 @@ def test_full_text_search(dataset, with_position):
         assert query in row.as_py()
 
 
+def test_filter_with_fts_index(dataset):
+    dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py()
+    query = query.split(" ")[0]
+    results = dataset.scanner(
+        columns=["doc"],
+        filter=f"doc = '{query}'",
+    ).to_table()
+    results = results.column(0)
+    for row in results:
+        assert query == row.as_py()
+
+
 def test_bitmap_index(tmp_path: Path):
     """Test create bitmap index"""
     tbl = pa.Table.from_arrays(
