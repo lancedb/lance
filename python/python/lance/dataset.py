@@ -47,7 +47,7 @@ from .lance import (
     _MergeInsertBuilder,
     _Operation,
     _RewriteGroup,
-    _RewrittenIndex,    
+    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
@@ -2245,7 +2245,9 @@ class LanceOperation:
         dataset_version: int
 
         def _to_inner(self):
-            return _Operation.create_index(self.uuid, self.name, self.fields, self.dataset_version)
+            return _Operation.create_index(
+                self.uuid, self.name, self.fields, self.dataset_version
+            )
 
 
 class ScannerBuilder:
