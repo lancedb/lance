@@ -19,7 +19,7 @@ use lance_index::scalar::expression::{
     IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{InvertedIndexParams, ScalarIndex};
+use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
@@ -41,7 +41,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::build_inverted_index;
+use scalar::{build_inverted_index, detect_scalar_index_type};
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -766,22 +766,34 @@ impl DatasetIndexInternalExt for Dataset {
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
-        let indexed_fields = indices
-        .iter()
-        .filter(|idx| idx.fields.len() == 1)
-        .map(|idx| {
-            let field = idx.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
-            field.map(|field| {
-                let query_parser = if let DataType::List(_) = field.data_type() {
+        let mut indexed_fields = Vec::new();
+        for index in indices.iter().filter(|idx| idx.fields.len() == 1) {
+            let field = index.fields[0];
+            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Index referenced a field with id {field} which did not exist in the schema"
+                ),
+                location: location!(),
+            })?;
+
+            let query_parser = match field.data_type() {
+                DataType::List(_) => {
                     Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
-                } else {
+                }
+                DataType::Utf8 | DataType::LargeUtf8 => {
+                    let uuid = index.uuid.to_string();
+                    let index_type = detect_scalar_index_type(self, &field.name, &uuid).await?;
+                    // Inverted index can't be used for filtering
+                    if matches!(index_type, ScalarIndexType::Inverted) {
+                        continue;
+                    }
                     Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
-                };
-                (field.name.clone(), (field.data_type(), query_parser))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+                }
+                _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
+            };
+
+            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+        }
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
