@@ -2243,10 +2243,15 @@ class LanceOperation:
         name: str
         fields: List[int]
         dataset_version: int
+        fragment_ids: List[int]
 
         def _to_inner(self):
             return _Operation.create_index(
-                self.uuid, self.name, self.fields, self.dataset_version
+                self.uuid,
+                self.name,
+                self.fields,
+                self.dataset_version,
+                self.fragment_ids,
             )
 
 

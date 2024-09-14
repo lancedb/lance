@@ -328,13 +328,14 @@ impl Operation {
         name: String,
         fields: Vec<i32>,
         dataset_version: u64,
+        fragment_ids: Vec<u32>,
     ) -> PyResult<Self> {
         let new_indices = vec![Index {
             uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
             dataset_version,
-            fragment_bitmap: None,
+            fragment_bitmap: Some(fragment_ids.into_iter().collect()),
         }];
         let op = LanceOperation::CreateIndex {
             new_indices,

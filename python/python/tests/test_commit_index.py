@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import os
 import random
 import shutil
 import string
-from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import lance
@@ -14,7 +12,9 @@ import pyarrow as pa
 import pytest
 
 
-def create_table(num_rows=1000):
+@pytest.fixture()
+def test_table():
+    num_rows = 1000
     price = np.random.rand(num_rows) * 100
 
     def gen_str(n, split="", char_set=string.ascii_letters + string.digits):
@@ -35,20 +35,18 @@ def create_table(num_rows=1000):
 
 
 @pytest.fixture()
-def dataset_with_index(tmp_path):
-    table = create_table()
-    dataset = lance.write_dataset(table, tmp_path)
+def dataset_with_index(test_table, tmp_path):
+    dataset = lance.write_dataset(test_table, tmp_path)
     dataset.create_scalar_index("meta", index_type="BTREE")
     return dataset
 
 
-def test_commit_index(tmp_path, dataset_with_index):
+def test_commit_index(dataset_with_index, test_table, tmp_path):
     index_id = dataset_with_index.list_indices()[0]["uuid"]
 
     # Create a new dataset without index
-    table = create_table()
     dataset_without_index = lance.write_dataset(
-        table, tmp_path / "dataset_without_index"
+        test_table, tmp_path / "dataset_without_index"
     )
 
     # Copy the index from dataset_with_index to dataset_without_index
@@ -59,7 +57,11 @@ def test_commit_index(tmp_path, dataset_with_index):
     # Commit the index to dataset_without_index
     field_idx = dataset_without_index.schema.get_field_index("meta")
     create_index_op = lance.LanceOperation.CreateIndex(
-        index_id, "meta_idx", [field_idx], dataset_without_index.version
+        index_id,
+        "meta_idx",
+        [field_idx],
+        dataset_without_index.version,
+        [f.fragment_id for f in dataset_without_index.get_fragments()],
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,
@@ -70,6 +72,10 @@ def test_commit_index(tmp_path, dataset_with_index):
     # Verify that both datasets have the index
     assert len(dataset_with_index.list_indices()) == 1
     assert len(dataset_without_index.list_indices()) == 1
+
+    assert (
+        dataset_without_index.list_indices()[0] == dataset_with_index.list_indices()[0]
+    )
 
     # Check if the index is used in scans
     for dataset in [dataset_with_index, dataset_without_index]:
