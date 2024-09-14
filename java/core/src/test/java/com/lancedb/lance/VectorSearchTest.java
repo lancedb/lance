@@ -1,15 +1,13 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
  */
 
 package com.lancedb.lance;
@@ -34,7 +32,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -42,9 +40,9 @@ import static org.junit.jupiter.api.Assertions.*;
 //
 // The dataset has the following columns:
 //
-//  i   - i32      : [0, 1, ..., 399]
-//  s   - &str     : ["s-0", "s-1", ..., "s-399"]
-//  vec - [f32; 32]: [[0, 1, ... 31], [32, ..., 63], ... [..., (80 * 5 * 32) - 1]]
+// i - i32 : [0, 1, ..., 399]
+// s - &str : ["s-0", "s-1", ..., "s-399"]
+// vec - [f32; 32]: [[0, 1, ... 31], [32, ..., 63], ... [..., (80 * 5 * 32) - 1]]
 //
 // An IVF-PQ index with 2 partitions is trained on this data
 public class VectorSearchTest {
@@ -52,13 +50,27 @@ public class VectorSearchTest {
   Path tempDir;
 
   @Test
-  void test_create_index() throws Exception {
-    try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_create_index"))) {
+  void test_create_vector_index() throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_create_vector_index"))) {
       try (Dataset dataset = testVectorDataset.create()) {
-        testVectorDataset.createIndex(dataset);
+        testVectorDataset.createVectorIndex(dataset);
         List<String> indexes = dataset.listIndexes();
         assertEquals(1, indexes.size());
-        assertEquals(TestVectorDataset.indexName, indexes.get(0));
+        assertEquals(TestVectorDataset.vectorIndexName, indexes.get(0));
+      }
+    }
+  }
+
+  @Test
+  void test_create_scalar_index() throws Exception {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_create_scalar_index"))) {
+      try (Dataset dataset = testVectorDataset.create()) {
+        testVectorDataset.createScalarIndex(dataset);
+        List<String> indexes = dataset.listIndexes();
+        assertEquals(1, indexes.size());
+        assertEquals(TestVectorDataset.scalarIndexName, indexes.get(0));
       }
     }
   }
@@ -68,50 +80,50 @@ public class VectorSearchTest {
   // Directly panic instead of throwing an exception
   // @Test
   // void search_invalid_vector() throws Exception {
-  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_create_index"))) {
-  //     try (Dataset dataset = testVectorDataset.create()) {
-  //       float[] key = new float[30];
-  //       for (int i = 0; i < 30; i++) {
-  //         key[i] = (float) (i + 30);
-  //       }
-  //       ScanOptions options = new ScanOptions.Builder()
-  //           .nearest(new Query.Builder()
-  //               .setColumn(TestVectorDataset.vectorColumnName)
-  //               .setKey(key)
-  //               .setK(5)
-  //               .setUseIndex(false)
-  //               .build())
-  //           .build();
-  //       assertThrows(IllegalArgumentException.class, () -> {
-  //         try (Scanner scanner = dataset.newScan(options)) {
-  //           try (ArrowReader reader = scanner.scanBatches()) {
-  //           }
-  //         }
-  //       });
-  //     }
-  //   }
+  // try (TestVectorDataset testVectorDataset = new
+  // TestVectorDataset(tempDir.resolve("test_create_index"))) {
+  // try (Dataset dataset = testVectorDataset.create()) {
+  // float[] key = new float[30];
+  // for (int i = 0; i < 30; i++) {
+  // key[i] = (float) (i + 30);
+  // }
+  // ScanOptions options = new ScanOptions.Builder()
+  // .nearest(new Query.Builder()
+  // .setColumn(TestVectorDataset.vectorColumnName)
+  // .setKey(key)
+  // .setK(5)
+  // .setUseIndex(false)
+  // .build())
+  // .build();
+  // assertThrows(IllegalArgumentException.class, () -> {
+  // try (Scanner scanner = dataset.newScan(options)) {
+  // try (ArrowReader reader = scanner.scanBatches()) {
+  // }
+  // }
+  // });
+  // }
+  // }
   // }
 
   @ParameterizedTest
-  @ValueSource(booleans = { false, true })
-  void test_knn(boolean createVectorIndex) throws Exception {
+  @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+  void test_knn(boolean createVectorIndex, boolean createScalarIndex) throws Exception {
     try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn"))) {
       try (Dataset dataset = testVectorDataset.create()) {
 
         if (createVectorIndex) {
-          testVectorDataset.createIndex(dataset);
+          testVectorDataset.createVectorIndex(dataset);
+        }
+        if (createScalarIndex) {
+          testVectorDataset.createScalarIndex(dataset);
         }
         float[] key = new float[32];
         for (int i = 0; i < 32; i++) {
           key[i] = (float) (i + 32);
         }
         ScanOptions options = new ScanOptions.Builder()
-            .nearest(new Query.Builder()
-                .setColumn(TestVectorDataset.vectorColumnName)
-                .setKey(key)
-                .setK(5)
-                .setUseIndex(false)
-                .build())
+            .nearest(new Query.Builder().setColumn(TestVectorDataset.vectorColumnName).setKey(key)
+                .setK(5).setUseIndex(false).build())
             .build();
         try (Scanner scanner = dataset.newScan(options)) {
           try (ArrowReader reader = scanner.scanBatches()) {
@@ -124,7 +136,8 @@ public class VectorSearchTest {
             assertEquals(4, root.getSchema().getFields().size(), "Expected 4 columns");
             assertEquals("i", root.getSchema().getFields().get(0).getName());
             assertEquals("s", root.getSchema().getFields().get(1).getName());
-            assertEquals(TestVectorDataset.vectorColumnName, root.getSchema().getFields().get(2).getName());
+            assertEquals(TestVectorDataset.vectorColumnName,
+                root.getSchema().getFields().get(2).getName());
             assertEquals("_distance", root.getSchema().getFields().get(3).getName());
 
             IntVector iVector = (IntVector) root.getVector("i");
@@ -152,9 +165,10 @@ public class VectorSearchTest {
 
   @Test
   void test_knn_with_new_data() throws Exception {
-    try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn_with_new_data"))) {
+    try (TestVectorDataset testVectorDataset =
+        new TestVectorDataset(tempDir.resolve("test_knn_with_new_data"))) {
       try (Dataset dataset = testVectorDataset.create()) {
-        testVectorDataset.createIndex(dataset);
+        testVectorDataset.createVectorIndex(dataset);
       }
 
       float[] key = new float[32];
@@ -168,7 +182,7 @@ public class VectorSearchTest {
 
       for (Optional<String> filter : filters) {
         for (Optional<Integer> limit : limits) {
-          for (boolean useIndex : new boolean[] { true, false }) {
+          for (boolean useIndex : new boolean[] {true, false}) {
             cases.add(new TestCase(filter, limit, useIndex));
           }
         }
@@ -178,12 +192,8 @@ public class VectorSearchTest {
       try (Dataset dataset = testVectorDataset.appendNewData()) {
         for (TestCase testCase : cases) {
           ScanOptions.Builder optionsBuilder = new ScanOptions.Builder()
-              .nearest(new Query.Builder()
-                  .setColumn(TestVectorDataset.vectorColumnName)
-                  .setKey(key)
-                  .setK(k)
-                  .setUseIndex(testCase.useIndex)
-                  .build());
+              .nearest(new Query.Builder().setColumn(TestVectorDataset.vectorColumnName).setKey(key)
+                  .setK(k).setUseIndex(testCase.useIndex).build());
 
           testCase.filter.ifPresent(optionsBuilder::filter);
           testCase.limit.ifPresent(optionsBuilder::limit);
@@ -207,7 +217,8 @@ public class VectorSearchTest {
 
               // Top one should be the first value of new data
               IntVector iVector = (IntVector) root.getVector("i");
-              assertEquals(400, iVector.get(0), "First result should be the first value of new data");
+              assertEquals(400, iVector.get(0),
+                  "First result should be the first value of new data");
 
               // Check if distances are in ascending order
               Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
