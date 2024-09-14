@@ -99,7 +99,7 @@ jobs:
           fail_ci_if_error: false
   linux-arm:
     runs-on: warp-ubuntu-latest-arm64-4x
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -160,7 +160,7 @@ jobs:
           workspaces: rust
       - name: Select new xcode
         # Default XCode right now is 15.0.1, which contains a bug that causes
-        # backtraces to not show properly. See: 
+        # backtraces to not show properly. See:
         # https://github.com/rust-lang/rust/issues/113783
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
       - name: Install dependencies
@@ -171,7 +171,7 @@ jobs:
           rustup component add rustfmt
       - name: Run tests
         # Check all benches, even though we aren't going to run them.
-        run: |  
+        run: |
           cargo build --tests --benches --all-features --workspace
           cargo test --all-features
   windows-build:
