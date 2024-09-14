@@ -109,10 +109,10 @@ impl Dot for f16 {
     #[inline]
     fn dot(x: &[Self], y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
-            SimdSupport::Neon => unsafe {
-                kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
+            // #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            // SimdSupport::Neon => unsafe {
+            //     kernel::dot_f16_neon(x.as_ptr(), y.as_ptr(), x.len() as u32)
+            // },
             #[cfg(all(
                 feature = "fp16kernels",
                 kernel_support = "avx512",

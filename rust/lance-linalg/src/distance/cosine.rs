@@ -17,7 +17,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FloatArray};
-#[cfg(feature = "fp16kernels")]
+// #[cfg(feature = "fp16kernels")]
 use lance_core::utils::cpu::SimdSupport;
 use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 
@@ -69,7 +69,6 @@ impl Cosine for u8 {}
 
 impl Cosine for bf16 {}
 
-#[cfg(feature = "fp16kernels")]
 mod kernel {
     use super::*;
 
@@ -92,7 +91,7 @@ mod kernel {
 impl Cosine for f16 {
     fn cosine_fast(x: &[Self], x_norm: f32, y: &[Self]) -> f32 {
         match *FP16_SIMD_SUPPORT {
-            #[cfg(all(feature = "fp16kernels", target_arch = "aarch64"))]
+            #[cfg(target_arch = "aarch64")]
             SimdSupport::Neon => unsafe {
                 kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },

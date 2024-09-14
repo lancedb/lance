@@ -19,7 +19,7 @@ lazy_static! {
     pub static ref FP16_SIMD_SUPPORT: SimdSupport = {
         #[cfg(target_arch = "aarch64")]
         {
-            if aarch64::has_neon_f16_support() {
+            if std::arch::is_aarch64_feature_detected!("fp16") {
                 SimdSupport::Neon
             } else {
                 SimdSupport::None
