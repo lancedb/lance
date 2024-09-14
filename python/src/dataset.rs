@@ -29,7 +29,7 @@ use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::transaction::{
-    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex
+    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex,
 };
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
