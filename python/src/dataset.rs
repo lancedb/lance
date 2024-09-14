@@ -916,7 +916,7 @@ impl Dataset {
         Ok(())
     }
 
-    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<()> {
+    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<PyObject> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
             builder = builder
@@ -941,9 +941,11 @@ impl Dataset {
             .block_on(None, operation.execute())?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        self.ds = new_self;
-
-        Ok(())
+        self.ds = new_self.new_dataset;
+        let update_dict = PyDict::new(updates.py());
+        let num_rows_updated = new_self.rows_updated;
+        update_dict.set_item("num_rows_updated", num_rows_updated)?;
+        Ok(update_dict.into())
     }
 
     fn count_deleted_rows(&self) -> PyResult<usize> {
