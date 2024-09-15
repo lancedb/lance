@@ -61,6 +61,8 @@ message Transaction {
     repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
+    // Table metadata to merge with existing table metadata.
+    map<string, string> table_metadata = 4;
   }
 
   // Add or replace a new secondary index.

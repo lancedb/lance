@@ -267,7 +267,11 @@ impl Operation {
     ) -> PyResult<Self> {
         let schema = convert_schema(&schema.0)?;
         let fragments = into_fragments(fragments);
-        let op = LanceOperation::Overwrite { fragments, schema };
+        let op = LanceOperation::Overwrite {
+            fragments,
+            schema,
+            table_metadata: None,
+        };
         Ok(Self(op))
     }
 

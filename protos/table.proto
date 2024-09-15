@@ -85,6 +85,7 @@ message Manifest {
   // * 1: deletion files are present
   // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
   //       (such as compaction), but not updates.
+  // * 4: use v2 format (deprecated)
   // * 8: table metadata are present
   uint64 reader_feature_flags = 9;
 

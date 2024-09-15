@@ -167,16 +167,15 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
-    /// Set the `table_metadata` from a metadata HashMap
-    pub fn set_metadata(&mut self, metadata: HashMap<String, String>) {
+    /// Set the `table_metadata` from a metadata iterator
+    pub fn set_metadata(&mut self, metadata: impl IntoIterator<Item = (String, String)>) {
         self.table_metadata.extend(metadata);
     }
 
-    /// Delete `table_metadata` keys using a Vec of metadata keys
-    pub fn delete_metadata(&mut self, metadata_keys: Vec<String>) {
-        for key in metadata_keys {
-            self.table_metadata.remove(&key);
-        }
+    /// Delete `table_metadata` keys using a slice of metadata keys
+    pub fn delete_metadata(&mut self, metadata_keys: &[&str]) {
+        self.table_metadata
+            .retain(|key, _| !metadata_keys.contains(&key.as_str()));
     }
 
     /// Check the current fragment list and update the high water mark
@@ -737,7 +736,7 @@ mod tests {
         assert_eq!(manifest.table_metadata, metadata.clone());
 
         metadata.remove("other-key");
-        manifest.delete_metadata(vec!["other-key".to_string()]);
+        manifest.delete_metadata(&["other-key"]);
         assert_eq!(manifest.table_metadata, metadata);
     }
 }
