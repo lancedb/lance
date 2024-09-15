@@ -590,7 +590,11 @@ impl Dataset {
         .await?;
 
         let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                fragments,
+                table_metadata: None,
+            },
             WriteMode::Append => Operation::Append { fragments },
         };
 
@@ -1507,11 +1511,14 @@ impl Dataset {
     }
 
     /// Set key-value pairs in table metadata.
-    pub async fn set_table_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+    pub async fn set_table_metadata(
+        &mut self,
+        metadata: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::SetMetadata {
-                table_metadata: metadata,
+                table_metadata: HashMap::from_iter(metadata),
             },
             None,
         );
@@ -1523,6 +1530,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -1532,11 +1540,11 @@ impl Dataset {
     }
 
     /// Delete keys from the table metadata.
-    pub async fn delete_table_metadata(&mut self, metadata_keys: Vec<String>) -> Result<()> {
+    pub async fn delete_table_metadata(&mut self, metadata_keys: &[&str]) -> Result<()> {
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::DeleteMetadata {
-                table_metadata_keys: metadata_keys,
+                table_metadata_keys: Vec::from_iter(metadata_keys.iter().map(ToString::to_string)),
             },
             None,
         );
@@ -1548,6 +1556,7 @@ impl Dataset {
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
@@ -2852,6 +2861,7 @@ mod tests {
         let operation = Operation::Overwrite {
             fragments: vec![],
             schema,
+            table_metadata: None,
         };
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -3289,10 +3299,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_table_metadata(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
-    ) {
+    async fn test_table_metadata() {
         // Create a table
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "i",
@@ -3308,29 +3315,17 @@ mod tests {
             vec![Arc::new(UInt32Array::from_iter_values(0..100))],
         );
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(
-            reader,
-            test_uri,
-            Some(WriteParams {
-                data_storage_version: Some(data_storage_version),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
 
         let mut metadata = HashMap::new();
         metadata.insert("lance:test".to_string(), "value".to_string());
-        metadata.insert("other-test".to_string(), "other-value".to_string());
+        metadata.insert("other-key".to_string(), "other-value".to_string());
 
         dataset.set_table_metadata(metadata.clone()).await.unwrap();
         assert_eq!(dataset.manifest.table_metadata, metadata);
 
         metadata.remove("other-key");
-        dataset
-            .delete_table_metadata(vec!["other-key".to_string()])
-            .await
-            .unwrap();
+        dataset.delete_table_metadata(&["other-key"]).await.unwrap();
         assert_eq!(dataset.manifest.table_metadata, metadata);
     }
 
