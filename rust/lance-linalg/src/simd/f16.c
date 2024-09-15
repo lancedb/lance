@@ -55,7 +55,12 @@ float FUNC(l2_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
+#if defined(__aarch64__)
+    // on aarch64 with fp16, this is 2x faster.
     FP16 sub = x[i] - y[i];
+#else
+    float sub = x[i] - y[i];
+#endif
     // Use float32 as the accumulator to avoid overflow.
     sum += sub * sub;
   }
