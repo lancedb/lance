@@ -13,8 +13,6 @@ use arrow_array::{cast::AsArray, types::Float32Type, Array, FixedSizeListArray, 
 use arrow_schema::DataType;
 use half::{bf16, f16};
 use lance_arrow::{ArrowFloatType, FloatArray};
-use lance_core::utils::cpu::SimdSupport;
-use lance_core::utils::cpu::FP16_SIMD_SUPPORT;
 use num_traits::{real::Real, AsPrimitive, Num};
 
 use crate::simd::{
@@ -126,17 +124,16 @@ impl Dot for f16 {
             }
         }
 
-        match *FP16_SIMD_SUPPORT {
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lasx => unsafe {
+        #[cfg(target_arch = "loongarch64")]
+        {
+            if loongarch64::has_lasx_support() {
                 kernel::dot_f16_lasx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            #[cfg(all(feature = "fp16kernels", target_arch = "loongarch64"))]
-            SimdSupport::Lsx => unsafe {
+            } else if loongarch64::has_lsx_support() {
                 kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
-            },
-            _ => dot_scalar::<Self, f32, 16>(x, y),
+            }
         }
+
+        dot_scalar::<Self, f32, 16>(x, y)
     }
 }
 

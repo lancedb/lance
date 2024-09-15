@@ -48,33 +48,6 @@ lazy_static! {
     };
 }
 
-// Inspired by https://github.com/RustCrypto/utils/blob/master/cpufeatures/src/aarch64.rs
-// aarch64 doesn't have userspace feature detection built in, so we have to call
-// into OS-specific functions to check for features.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-mod aarch64 {
-    pub fn has_neon_f16_support() -> bool {
-        // Maybe we can assume it's there?
-        true
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-mod aarch64 {
-    pub fn has_neon_f16_support() -> bool {
-        // See: https://github.com/rust-lang/libc/blob/7ce81ca7aeb56aae7ca0237ef9353d58f3d7d2f1/src/unix/linux_like/linux/gnu/b64/aarch64/mod.rs#L533
-        let flags = unsafe { libc::getauxval(libc::AT_HWCAP) };
-        flags & libc::HWCAP_FPHP != 0
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_os = "windows"))]
-mod aarch64 {
-    pub fn has_neon_f16_support() -> bool {
-        // https://github.com/lancedb/lance/issues/2411
-        false
-    }
-}
 
 #[cfg(target_arch = "loongarch64")]
 mod loongarch64 {
