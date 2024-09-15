@@ -60,14 +60,17 @@ float FUNC(dot_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
 }
 
 float FUNC(l2_f16)(const FP16 *x, const FP16 *y, uint32_t dimension) {
-  float sum = 0.0;
+  float x2 = 0.0;
+  float y2 = 0.0;
+  float xy = 0.0;
 
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    float s = (float) x[i] - (float) y[i];
-    sum += s * s;
+    x2 += x[i] * x[i];
+    y2 += y[i] * y[i];
+    xy += x[i] * y[i];
   }
-  return sum;
+  return x2 + y2 - 2 * xy;
 }
 
 float FUNC(cosine_f16)(const FP16 *x, float x_norm, const FP16 *y, uint32_t dimension) {
@@ -78,9 +81,9 @@ float FUNC(cosine_f16)(const FP16 *x, float x_norm, const FP16 *y, uint32_t dime
   // of the fp16 to fp32 conversion.
 #pragma clang loop unroll(enable) interleave(enable) vectorize(enable)
   for (uint32_t i = 0; i < dimension; i++) {
-    float y_i = (float) y[i];
-    dot += (float) x[i] * y_i;
-    l2_y += y_i * y_i;
+    // FP16 y_i = y[i];
+    dot += x[i] * y[i];
+    l2_y += y[i] * y[i];
   }
 
   return 1.0 - dot / (x_norm * sqrtf(l2_y));

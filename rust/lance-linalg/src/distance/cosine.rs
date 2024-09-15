@@ -95,15 +95,11 @@ impl Cosine for f16 {
             SimdSupport::Neon => unsafe {
                 kernel::cosine_f16_neon(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
-            #[cfg(all(
-                feature = "fp16kernels",
-                kernel_support = "avx512",
-                target_arch = "x86_64"
-            ))]
+            #[cfg(target_arch = "x86_64")]
             SimdSupport::Avx512 => unsafe {
                 kernel::cosine_f16_avx512(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
-            #[cfg(all(feature = "fp16kernels", target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             SimdSupport::Avx2 => unsafe {
                 kernel::cosine_f16_avx2(x.as_ptr(), x_norm, y.as_ptr(), y.len() as u32)
             },
