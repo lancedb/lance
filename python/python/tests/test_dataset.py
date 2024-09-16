@@ -452,10 +452,10 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     full_ds_version = dataset.version
     dataset.delete("a % 2 = 0")
     filt_table = table.filter((pa.compute.bit_wise_and(pa.compute.field("a"), 1)) != 0)
-    # assert (
-    #     dataset.to_table(offset=10).combine_chunks()
-    #     == filt_table.slice(10).combine_chunks()
-    # )
+    assert (
+        dataset.to_table(offset=10).combine_chunks()
+        == filt_table.slice(10).combine_chunks()
+    )
 
     dataset = dataset.checkout_version(full_ds_version)
     dataset.restore()
