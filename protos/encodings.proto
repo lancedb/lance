@@ -169,6 +169,9 @@ message Flat {
   Buffer buffer = 2;
   // The Compression message can specify the compression scheme (e.g. zstd) and any
   // other information that is needed for decompression.
+  //
+  // If this array is compressed then the bits_per_value refers to the uncompressed
+  // data.
   Compression compression = 3;
 }
 

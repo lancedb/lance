@@ -7,13 +7,14 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, ArrayRef, StructArray};
+use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
 
 use crate::{
+    data::{AllNullDataBlock, DataBlock},
     decoder::{
         DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
         NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
@@ -568,7 +569,9 @@ impl FieldEncoder for StructFieldEncoder {
             let mut header = EncodedColumn::default();
             header.final_pages.push(EncodedPage {
                 array: EncodedArray {
-                    buffers: vec![],
+                    data: DataBlock::AllNull(AllNullDataBlock {
+                        num_values: self.num_rows_seen,
+                    }),
                     encoding: pb::ArrayEncoding {
                         array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
                             pb::SimpleStruct {},

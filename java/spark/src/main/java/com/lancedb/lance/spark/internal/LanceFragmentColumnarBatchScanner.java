@@ -14,7 +14,7 @@
 
 package com.lancedb.lance.spark.internal;
 
-import com.lancedb.lance.spark.LanceInputPartition;
+import com.lancedb.lance.spark.read.LanceInputPartition;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.vectorized.ArrowColumnVector;
@@ -35,7 +35,7 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
 
   public static LanceFragmentColumnarBatchScanner create(
       int fragmentId, LanceInputPartition inputPartition) {
-    LanceFragmentScanner fragmentScanner = LanceReader
+    LanceFragmentScanner fragmentScanner = LanceDatasetAdapter
         .getFragmentScanner(fragmentId, inputPartition);
     return new LanceFragmentColumnarBatchScanner(fragmentScanner, fragmentScanner.getArrowReader());
   }

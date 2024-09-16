@@ -4,7 +4,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, DEFAULT_CLOUD_IO_PARALLELISM,
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM,
 };
 use lance_table::{
     format::Manifest,
@@ -220,6 +221,14 @@ impl DatasetBuilder {
             None => commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await,
         }?;
 
+        let storage_options = self
+            .options
+            .storage_options
+            .clone()
+            .map(StorageOptions::new)
+            .unwrap_or_default();
+        let download_retry_count = storage_options.download_retry_count();
+
         match &self.options.object_store {
             Some(store) => Ok((
                 ObjectStore::new(
@@ -232,6 +241,7 @@ impl DatasetBuilder {
                     // If user supplied an object store then we just assume it's probably
                     // cloud-like
                     DEFAULT_CLOUD_IO_PARALLELISM,
+                    download_retry_count,
                 ),
                 Path::from(store.1.path()),
                 commit_handler,
