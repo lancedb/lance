@@ -1740,7 +1740,26 @@ impl FragmentReader {
         )
     }
 
-    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+    fn patch_range_for_deletions(&self, range: Range<u32>, dv: &DeletionVector) -> Range<u32> {
+        let mut start = range.start;
+        let mut end = range.end;
+        for val in dv.to_sorted_iter() {
+            if val <= start {
+                start += 1;
+                end += 1;
+            } else if val < end {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        start..end
+    }
+
+    pub fn read_range(&self, mut range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        if let Some(deletion_vector) = self.deletion_vec.as_ref() {
+            range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
+        }
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),
             batch_size,
@@ -2088,6 +2107,66 @@ mod tests {
                 &UInt64Array::from_iter_values(20..30)
             );
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_range_scan_deletions(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri, data_storage_version).await;
+
+        let version = dataset.version().version;
+
+        let check = |cond: &'static str, range: Range<u32>, expected: Vec<i32>| async {
+            let mut dataset = dataset.checkout_version(version).await.unwrap();
+            dataset.restore().await.unwrap();
+            dataset.delete(cond).await.unwrap();
+
+            let fragment = &dataset.get_fragments()[0];
+            let reader = fragment
+                .open(dataset.schema(), true, false, None)
+                .await
+                .unwrap();
+
+            // Using batch_size=20 here.  If we use batch_size=range.len() we get
+            // multiple batches because we might have to read from a larger range
+            // to satisfy the request
+            let mut stream = reader.read_range(range, 20).unwrap();
+            let mut batches = Vec::new();
+            while let Some(next) = stream.next().await {
+                batches.push(next.await.unwrap());
+            }
+            let schema = Arc::new(dataset.schema().into());
+            let batch = arrow_select::concat::concat_batches(&schema, batches.iter()).unwrap();
+
+            assert_eq!(batch.num_rows(), expected.len());
+            assert_eq!(
+                batch.column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from(expected)
+            );
+        };
+        // Deleting from the start
+        check("i < 5", 0..2, vec![5, 6]).await;
+        check("i < 5", 0..15, (5..20).collect()).await;
+        // Deleting from the middle
+        check("i >= 5 and i < 15", 7..9, vec![17, 18]).await;
+        check("i >= 5 and i < 15", 3..5, vec![3, 4]).await;
+        check("i >= 5 and i < 15", 3..6, vec![3, 4, 15]).await;
+        check("i >= 5 and i < 15", 5..6, vec![15]).await;
+        check("i >= 5 and i < 15", 5..10, vec![15, 16, 17, 18, 19]).await;
+        check(
+            "i >= 5 and i < 15",
+            0..10,
+            vec![0, 1, 2, 3, 4, 15, 16, 17, 18, 19],
+        )
+        .await;
+        // Deleting from the end
+        check("i >= 15", 10..15, vec![10, 11, 12, 13, 14]).await;
+        check("i >= 15", 0..15, (0..15).collect()).await;
     }
 
     #[rstest]
