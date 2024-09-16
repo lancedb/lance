@@ -56,6 +56,7 @@ use lance_index::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
+use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -317,6 +318,32 @@ impl Operation {
         let op = LanceOperation::Rewrite {
             groups,
             rewritten_indices,
+        };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
+    fn create_index(
+        uuid: String,
+        name: String,
+        fields: Vec<i32>,
+        dataset_version: u64,
+        fragment_ids: &PySet,
+    ) -> PyResult<Self> {
+        let fragment_ids: Vec<u32> = fragment_ids
+            .iter()
+            .map(|item| item.extract::<u32>())
+            .collect::<PyResult<Vec<u32>>>()?;
+        let new_indices = vec![Index {
+            uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
+            name,
+            fields,
+            dataset_version,
+            fragment_bitmap: Some(fragment_ids.into_iter().collect()),
+        }];
+        let op = LanceOperation::CreateIndex {
+            new_indices,
+            removed_indices: vec![],
         };
         Ok(Self(op))
     }
