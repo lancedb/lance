@@ -24,9 +24,9 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Set,
     TypedDict,
     Union,
-    Set,
 )
 
 import pyarrow as pa
