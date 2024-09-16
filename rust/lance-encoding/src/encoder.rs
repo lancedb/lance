@@ -14,6 +14,8 @@ use snafu::{location, Location};
 use crate::buffer::LanceBuffer;
 use crate::data::DataBlock;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
+use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
+use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
@@ -330,6 +332,13 @@ impl CoreArrayEncodingStrategy {
                 }
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
+            }
+            DataType::UInt8 => {
+                let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                    compressed_bit_width as usize,
+                    data_type.clone(),
+                )))
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::default(),

@@ -203,6 +203,39 @@ impl LanceBuffer {
         Self::Borrowed(Buffer::from_vec(vec))
     }
 
+    pub fn reinterpret_to_rust_native<T>(&mut self) -> Result<&[T]>
+    where
+        T: Copy, // Ensure `T` can be copied (as needed for safely reinterpreting bytes)
+    {
+        // Step 1: Clone or borrow the internal buffer.
+        let buffer = self.borrow_and_clone();
+
+        // Step 2: Convert the borrowed data into a `Buffer` type.
+        let buffer = buffer.into_buffer();
+
+        // Step 3: Get the raw byte slice from the buffer.
+        let byte_slice = buffer.as_slice();
+
+        // Step 4: Safety check - ensure that the byte slice length is a multiple of `T`.
+        if byte_slice.len() % std::mem::size_of::<T>() != 0 {
+            return Err(Error::Internal {
+                message: "Buffer size is not a multiple of the target type size".to_string(),
+                location: location!(),
+            });
+        }
+
+        // Step 5: Reinterpret the byte slice as a slice of `T`.
+        let typed_slice = unsafe {
+            std::slice::from_raw_parts(
+                byte_slice.as_ptr() as *const T,
+                byte_slice.len() / std::mem::size_of::<T>(),
+            )
+        };
+
+        // Step 6: Return the reinterpreted slice.
+        Ok(typed_slice)
+    }
+
     /// Reinterprets a LanceBuffer into a Vec<T>
     ///
     /// Unfortunately, there is no way to do this safely in Rust without a copy, even if

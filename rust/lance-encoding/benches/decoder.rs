@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{RecordBatch, UInt32Array, UInt8Array};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -59,6 +59,47 @@ const ENCODING_OPTIONS: EncodingOptions = EncodingOptions {
     max_page_bytes: 32 * 1024 * 1024,
     keep_original_array: true,
 };
+
+fn bench_decode2(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("decode_uint8");
+    group.measurement_time(std::time::Duration::new(12, 0)); // 11.1 seconds
+    let array = UInt8Array::from(vec![5; 1024 * 1024 * 1024]);
+    let data = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "uint8",
+            DataType::UInt8,
+            false,
+        )])),
+        vec![Arc::new(array)],
+    )
+    .unwrap();
+    let lance_schema =
+        Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
+    let input_bytes = data.get_array_memory_size();
+    group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
+    let encoding_strategy = CoreFieldEncodingStrategy::default();
+    let encoded = rt
+        .block_on(encode_batch(
+            &data,
+            lance_schema,
+            &encoding_strategy,
+            &ENCODING_OPTIONS,
+        ))
+        .unwrap();
+    group.bench_function("uint8", |b| {
+        b.iter(|| {
+            let batch = rt
+                .block_on(lance_encoding::decoder::decode_batch(
+                    &encoded,
+                    &FilterExpression::no_filter(),
+                    &DecoderMiddlewareChain::default(),
+                ))
+                .unwrap();
+            assert_eq!(data.num_rows(), batch.num_rows());
+        })
+    });
+}
 
 fn bench_decode(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -314,7 +355,7 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(pprof::criterion::PProfProfiler::new(100, pprof::criterion::Output::Flamegraph(None)));
-    targets = bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
+    targets = bench_decode2, bench_decode, bench_decode_fsl, bench_decode_str_with_dict_encoding, bench_decode_packed_struct,
                 bench_decode_str_with_fixed_size_binary_encoding);
 
 // Non-linux version does not support pprof.
