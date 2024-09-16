@@ -220,13 +220,13 @@ pub struct BitpackedForNonNegScheduler {
     buffer_offset: u64,
 }
 
-fn locate_chunk_start2(scheduler: &BitpackedForNonNegScheduler, relative_row_num: u64) -> u64 {
+fn locate_chunk_start(scheduler: &BitpackedForNonNegScheduler, relative_row_num: u64) -> u64 {
     let elems_per_chunk = 1024;
     let chunk_size = elems_per_chunk * scheduler.compressed_bit_width / 8;
     relative_row_num / elems_per_chunk * chunk_size
 }
 
-fn locate_chunk_end2(scheduler: &BitpackedForNonNegScheduler, relative_row_num: u64) -> u64 {
+fn locate_chunk_end(scheduler: &BitpackedForNonNegScheduler, relative_row_num: u64) -> u64 {
     let elems_per_chunk: u64 = 1024;
     let chunk_size = elems_per_chunk * scheduler.compressed_bit_width / 8;
     relative_row_num / elems_per_chunk * chunk_size + chunk_size
@@ -260,15 +260,15 @@ impl PageScheduler for BitpackedForNonNegScheduler {
         let mut byte_ranges = vec![];
         let mut bytes_idx_to_range_indices = vec![];
         let first_byte_range = std::ops::Range {
-            start: self.buffer_offset + locate_chunk_start2(self, ranges[0].start),
-            end: self.buffer_offset + locate_chunk_end2(self, ranges[0].end - 1),
+            start: self.buffer_offset + locate_chunk_start(self, ranges[0].start),
+            end: self.buffer_offset + locate_chunk_end(self, ranges[0].end - 1),
         }; // the ranges are half-open
         byte_ranges.push(first_byte_range);
         bytes_idx_to_range_indices.push(vec![ranges[0].clone()]);
         for (i, range) in ranges.iter().enumerate().skip(1) {
-            let this_start = locate_chunk_start2(self, range.start);
-            let this_end = locate_chunk_end2(self, range.end - 1);
-            if this_start == locate_chunk_start2(self, ranges[i - 1].end - 1) {
+            let this_start = locate_chunk_start(self, range.start);
+            let this_end = locate_chunk_end(self, range.end - 1);
+            if this_start == locate_chunk_start(self, ranges[i - 1].end - 1) {
                 byte_ranges.last_mut().unwrap().end = this_end;
                 bytes_idx_to_range_indices
                     .last_mut()
@@ -299,7 +299,7 @@ impl PageScheduler for BitpackedForNonNegScheduler {
 
         let bytes = scheduler.submit_request(byte_ranges.clone(), top_level_row);
 
-        // Clone the necessary data from `self` to move into the async block
+        // copy the necessary data from `self` to move into the async block
         let compressed_bit_width = self.compressed_bit_width;
         let uncompressed_bits_per_value = self.uncompressed_bits_per_value;
         let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
@@ -416,10 +416,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow::util::bit_util::ceil;
 
-    #[test]
-    fn test_encode() {
-        // Prepare input data
-    }
     use crate::decoder::decode_batch;
     use crate::decoder::DecoderMiddlewareChain;
     use crate::decoder::FilterExpression;
