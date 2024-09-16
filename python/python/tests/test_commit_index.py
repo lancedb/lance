@@ -61,7 +61,7 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         "meta_idx",
         [field_idx],
         dataset_without_index.version,
-        [f.fragment_id for f in dataset_without_index.get_fragments()],
+        set([f.fragment_id for f in dataset_without_index.get_fragments()]),
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,
