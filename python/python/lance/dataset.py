@@ -26,6 +26,7 @@ from typing import (
     Optional,
     TypedDict,
     Union,
+    Set,
 )
 
 import pyarrow as pa
@@ -2243,7 +2244,7 @@ class LanceOperation:
         name: str
         fields: List[int]
         dataset_version: int
-        fragment_ids: List[int]
+        fragment_ids: Set[int]
 
         def _to_inner(self):
             return _Operation.create_index(
