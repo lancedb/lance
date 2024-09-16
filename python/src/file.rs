@@ -331,7 +331,7 @@ impl LanceFileReader {
             },
         );
         let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
+        let inner = FileReader::try_open(file, None, Arc::<DecoderMiddlewareChain>::default())
             .await
             .infer_error()?;
         Ok(Self {

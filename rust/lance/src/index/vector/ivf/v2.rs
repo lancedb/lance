@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{cache::DEFAULT_INDEX_CACHE_SIZE, Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
@@ -117,12 +118,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
+        let file_metadata_cache = session
+            .upgrade()
+            .map(|sess| sess.file_metadata_cache.clone())
+            .unwrap_or_else(|| FileMetadataCache::no_cache());
         let index_reader = FileReader::try_open(
             scheduler
                 .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))
                 .await?,
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &file_metadata_cache,
         )
         .await?;
         let index_metadata: IndexMetadata = serde_json::from_str(
@@ -173,7 +179,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 )
                 .await?,
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &file_metadata_cache,
         )
         .await?;
         let storage = IvfQuantizationStorage::try_new(storage_reader).await?;

@@ -12,7 +12,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::TryStreamExt;
 use lance::{io::ObjectStore, Dataset};
-use lance_core::Result;
+use lance_core::{cache::FileMetadataCache, Result};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
@@ -65,14 +65,21 @@ impl BenchmarkFixture {
         let test_path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path, None))
+        Arc::new(LanceIndexStore::new(
+            object_store,
+            test_path,
+            FileMetadataCache::no_cache(),
+        ))
     }
 
     fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path, None).with_legacy_format(true))
+        Arc::new(
+            LanceIndexStore::new(object_store, test_path, FileMetadataCache::no_cache())
+                .with_legacy_format(true),
+        )
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {

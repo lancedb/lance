@@ -27,6 +27,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
+use lance_core::cache::{CapacityMode, FileMetadataCache};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
@@ -511,7 +512,11 @@ impl IvfShuffler {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(object_store.into(), scheduler_config);
                 let file = scheduler.open_file(&path).await?;
-                let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
+                let cache =
+                    FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+
+                let reader =
+                    Lancev2FileReader::try_open(file, None, Default::default(), &cache).await?;
                 let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
                 total_batches.push(num_batches as usize);
             }
@@ -559,7 +564,13 @@ impl IvfShuffler {
                 }
             } else {
                 let file = scheduler.open_file(&path).await?;
-                let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
+                let reader = Lancev2FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &FileMetadataCache::no_cache(),
+                )
+                .await?;
                 let mut stream = reader
                     .read_stream(
                         lance_io::ReadBatchParams::Range(
@@ -624,7 +635,13 @@ impl IvfShuffler {
                 let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
                 let scheduler = ScanScheduler::new(Arc::new(object_store), scheduler_config);
                 let file = scheduler.open_file(&path).await?;
-                let reader = Lancev2FileReader::try_open(file, None, Default::default()).await?;
+                let reader = Lancev2FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &FileMetadataCache::no_cache(),
+                )
+                .await?;
                 reader
                     .read_stream(
                         lance_io::ReadBatchParams::Range(
@@ -795,7 +812,8 @@ impl IvfShuffler {
             let reader = lance_file::v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                DecoderMiddlewareChain::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
+                &FileMetadataCache::no_cache(),
             )
             .await?;
             let stream = reader

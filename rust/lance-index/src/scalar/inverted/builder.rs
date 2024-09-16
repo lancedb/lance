@@ -489,6 +489,7 @@ mod tests {
     use arrow_array::{Array, ArrayRef, GenericStringArray, RecordBatch, UInt64Array};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
+    use lance_core::cache::{CapacityMode, FileMetadataCache};
     use lance_core::ROW_ID_FIELD;
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
@@ -503,7 +504,8 @@ mod tests {
     ) -> Arc<InvertedIndex> {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
-        let store = LanceIndexStore::new(ObjectStore::local(), index_dir, None);
+        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+        let store = LanceIndexStore::new(ObjectStore::local(), index_dir, cache);
 
         let params = super::InvertedIndexParams::default().with_position(with_position);
         let mut invert_index = super::InvertedIndexBuilder::new(params);

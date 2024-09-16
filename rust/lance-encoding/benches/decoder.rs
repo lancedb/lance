@@ -84,13 +84,12 @@ fn bench_decode(c: &mut Criterion) {
         let func_name = format!("{:?}", data_type).to_lowercase();
         group.bench_function(func_name, |b| {
             b.iter(|| {
-                let batch = rt
-                    .block_on(lance_encoding::decoder::decode_batch(
-                        &encoded,
-                        &FilterExpression::no_filter(),
-                        &DecoderMiddlewareChain::default(),
-                    ))
-                    .unwrap();
+                let batch = lance_encoding::decoder::decode_batch(
+                    &encoded,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderMiddlewareChain>::default(),
+                )
+                .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
             })
         });
@@ -123,13 +122,12 @@ fn bench_decode_fsl(c: &mut Criterion) {
         let func_name = format!("{:?}", data_type).to_lowercase();
         group.bench_function(func_name, |b| {
             b.iter(|| {
-                let batch = rt
-                    .block_on(lance_encoding::decoder::decode_batch(
-                        &encoded,
-                        &FilterExpression::no_filter(),
-                        &DecoderMiddlewareChain::default(),
-                    ))
-                    .unwrap();
+                let batch = lance_encoding::decoder::decode_batch(
+                    &encoded,
+                    &FilterExpression::no_filter(),
+                    Arc::<DecoderMiddlewareChain>::default(),
+                )
+                .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
             })
         });
@@ -179,13 +177,12 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
     let func_name = format!("{:?}", data_type).to_lowercase();
     group.bench_function(func_name, |b| {
         b.iter(|| {
-            let batch = rt
-                .block_on(lance_encoding::decoder::decode_batch(
-                    &encoded,
-                    &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
-                ))
-                .unwrap();
+            let batch = lance_encoding::decoder::decode_batch(
+                &encoded,
+                &FilterExpression::no_filter(),
+                Arc::<DecoderMiddlewareChain>::default(),
+            )
+            .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
         })
     });
@@ -249,13 +246,12 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     let func_name = "struct";
     group.bench_function(func_name, |b| {
         b.iter(|| {
-            let batch = rt
-                .block_on(lance_encoding::decoder::decode_batch(
-                    &encoded,
-                    &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
-                ))
-                .unwrap();
+            let batch = lance_encoding::decoder::decode_batch(
+                &encoded,
+                &FilterExpression::no_filter(),
+                Arc::<DecoderMiddlewareChain>::default(),
+            )
+            .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
         })
     });
@@ -297,13 +293,12 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
     let func_name = "fixed-utf8".to_string();
     group.bench_function(func_name, |b| {
         b.iter(|| {
-            let batch = rt
-                .block_on(lance_encoding::decoder::decode_batch(
-                    &encoded,
-                    &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
-                ))
-                .unwrap();
+            let batch = lance_encoding::decoder::decode_batch(
+                &encoded,
+                &FilterExpression::no_filter(),
+                Arc::<DecoderMiddlewareChain>::default(),
+            )
+            .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
         })
     });

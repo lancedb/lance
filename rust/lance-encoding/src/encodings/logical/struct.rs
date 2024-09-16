@@ -199,6 +199,15 @@ impl FieldScheduler for SimpleStructScheduler {
     fn num_rows(&self) -> u64 {
         self.num_rows
     }
+
+    fn initialize<'a>(
+        &'a mut self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        // 2.0 schedulers do not need to initialize
+        std::future::ready(Ok(())).boxed()
+    }
 }
 
 #[derive(Debug)]
