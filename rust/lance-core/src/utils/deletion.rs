@@ -83,6 +83,17 @@ impl DeletionVector {
         }
     }
 
+    /// Create an iterator that iterates over the values in the deletion vector in sorted order.
+    pub fn to_sorted_iter<'a>(&'a self) -> Box<dyn Iterator<Item = u32> + Send + 'a> {
+        match self {
+            Self::NoDeletions => Box::new(std::iter::empty()),
+            // We have to make a clone when we're using a set
+            // but sets should be relatively small.
+            Self::Set(_) => self.clone().into_sorted_iter(),
+            Self::Bitmap(bitmap) => Box::new(bitmap.iter()),
+        }
+    }
+
     // Note: deletion vectors are based on 32-bit offsets.  However, this function works
     // even when given 64-bit row addresses.  That is because `id as u32` returns the lower
     // 32 bits (the row offset) and the upper 32 bits are ignored.
