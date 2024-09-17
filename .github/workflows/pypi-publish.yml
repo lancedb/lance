@@ -14,6 +14,9 @@ jobs:
         python-minor-version: [ "9" ]
         config:
           - platform: x86_64
+            manylinux: "2_17"
+            extra_args: ""
+          - platform: x86_64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
           - platform: aarch64
@@ -34,7 +37,7 @@ jobs:
     - name: Handle tag
       id: handle_tag
       run: |
-        # If the tag ends with -beta.N, we need to call setup_version.py
+        # If the tag ends with -beta.N, we need to call setup_version.py 
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
@@ -81,7 +84,7 @@ jobs:
     - name: Handle tag
       id: handle_tag
       run: |
-        # If the tag ends with -beta.N, we need to call setup_version.py
+        # If the tag ends with -beta.N, we need to call setup_version.py 
         # and export repo as "fury" instead of "pypi"
         if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
           TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
@@ -120,7 +123,7 @@ jobs:
         id: handle_tag
         shell: bash
         run: |
-          # If the tag ends with -beta.N, we need to call setup_version.py
+          # If the tag ends with -beta.N, we need to call setup_version.py 
           # and export repo as "fury" instead of "pypi"
           if [[ ${{ github.ref }} == refs/tags/*-beta.* ]]; then
             TAG=$(echo ${{ github.ref }} | sed 's/refs\/tags\///')
