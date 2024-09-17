@@ -78,7 +78,7 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     builder
         // We use clang #pragma to yields better vectorization
         // See https://github.com/lancedb/lance/pull/2885
-        .compiler("clang")
+        // .compiler("clang")
         .std("c17")
         .file("src/simd/f16.c")
         .flag("-ffast-math")
