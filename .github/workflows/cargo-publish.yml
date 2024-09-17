@@ -37,7 +37,7 @@ jobs:
         with:
           workspaces: rust
       - name: Verify and checkout specified tag
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
         run: |
           git fetch --all --tags
           if git rev-parse ${{ github.event.inputs.tag }} >/dev/null 2>&1; then
