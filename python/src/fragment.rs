@@ -210,10 +210,12 @@ impl FileFragment {
         Ok(Scanner::new(scn))
     }
 
-    fn updater(&self, columns: Option<Vec<String>>) -> PyResult<Updater> {
+    fn updater(&self, columns: Option<Vec<String>>, batch_size: Option<u32>) -> PyResult<Updater> {
         let cols = columns.as_deref();
         let inner = RT
-            .block_on(None, async { self.fragment.updater(cols, None).await })?
+            .block_on(None, async {
+                self.fragment.updater(cols, None, batch_size).await
+            })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(Updater::new(inner))
     }

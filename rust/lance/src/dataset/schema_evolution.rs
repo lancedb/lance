@@ -261,7 +261,7 @@ async fn add_columns_impl(
                 }
 
                 let mut updater = fragment
-                    .updater(read_columns_ref, schemas_ref.clone())
+                    .updater(read_columns_ref, schemas_ref.clone(), None)
                     .await?;
 
                 let mut batch_index = 0;

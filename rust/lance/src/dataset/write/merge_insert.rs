@@ -701,6 +701,7 @@ impl MergeInsertJob {
                         .updater(
                             Some(&read_columns),
                             Some((write_schema, dataset.schema().clone())),
+                            None,
                         )
                         .await?;
 
