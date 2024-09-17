@@ -54,6 +54,7 @@ lance-encoding-datafusion = { version = "=0.18.1", path = "./rust/lance-encoding
 lance-file = { version = "=0.18.1", path = "./rust/lance-file" }
 lance-index = { version = "=0.18.1", path = "./rust/lance-index" }
 lance-io = { version = "=0.18.1", path = "./rust/lance-io" }
+lance-jni = { version = "=0.18.1", path = "./java/core/lance-jni" }
 lance-linalg = { version = "=0.18.1", path = "./rust/lance-linalg" }
 lance-table = { version = "=0.18.1", path = "./rust/lance-table" }
 lance-test-macros = { version = "=0.18.1", path = "./rust/lance-test-macros" }
