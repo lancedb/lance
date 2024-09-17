@@ -10,7 +10,7 @@ use lance_table::utils::stream::ReadBatchFutStream;
 use snafu::{location, Location};
 
 use super::fragment::FragmentReader;
-use super::scanner::DEFAULT_BATCH_SIZE;
+use super::scanner::get_default_batch_size;
 use super::write::{open_writer, GenericWriter};
 use super::Dataset;
 use crate::dataset::FileFragment;
@@ -76,7 +76,7 @@ impl Updater {
             // If this is a v2 dataset, let the user pick the batch size
             (None, Some(legacy_batch_size)) => legacy_batch_size,
             // Otherwise, default to 1024 if the user didn't specify anything
-            (None, None) => DEFAULT_BATCH_SIZE.unwrap_or(1024) as u32,
+            (None, None) => get_default_batch_size().unwrap_or(1024) as u32,
         };
 
         let input_stream = reader.read_all(batch_size)?;
