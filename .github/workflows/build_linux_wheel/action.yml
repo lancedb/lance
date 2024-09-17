@@ -33,6 +33,9 @@ runs:
         working-directory: python
         target: x86_64-unknown-linux-gnu
         manylinux: ${{ inputs.manylinux }}
+        docker-options: |
+          -e CC=clang
+          -e CXX=clang++
         args: ${{ inputs.args }}
         before-script-linux: |
           set -e
@@ -52,11 +55,7 @@ runs:
         before-script-linux: |
           set -e
           apt install -y unzip
-          if [ $(uname -m) = "x86_64" ]; then
-            PROTOC_ARCH="x86_64"
-          else
-            PROTOC_ARCH="aarch_64"
-          fi
+          PROTOC_ARCH="aarch_64"
           curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$PROTOC_ARCH.zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip
