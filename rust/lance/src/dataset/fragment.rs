@@ -1740,12 +1740,7 @@ impl FragmentReader {
         )
     }
 
-    fn patch_range_for_deletions(
-        &self,
-        range: Range<u32>,
-        dv: &DeletionVector,
-        num_physical_rows: u32,
-    ) -> Range<u32> {
+    fn patch_range_for_deletions(&self, range: Range<u32>, dv: &DeletionVector) -> Range<u32> {
         let mut start = range.start;
         let mut end = range.end;
         for val in dv.to_sorted_iter() {
@@ -1758,8 +1753,6 @@ impl FragmentReader {
                 break;
             }
         }
-        let end = end.min(num_physical_rows);
-        let start = start.min(end);
         start..end
     }
 
@@ -1771,11 +1764,7 @@ impl FragmentReader {
     ) -> Result<ReadBatchFutStream> {
         if skip_deleted_rows {
             if let Some(deletion_vector) = self.deletion_vec.as_ref() {
-                range = self.patch_range_for_deletions(
-                    range,
-                    deletion_vector.as_ref(),
-                    self.num_physical_rows as u32,
-                );
+                range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
             }
         }
         self.new_read_impl(
@@ -2041,12 +2030,33 @@ mod tests {
         let fragment = &dataset.get_fragments()[0];
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
 
+        // Test with take_range (all rows addressible)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(fragment.schema(), with_row_id, false, None)
                 .await
                 .unwrap();
             for valid_range in [0..40, 20..40] {
+                reader
+                    .take_range(valid_range, 100)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
+            for invalid_range in [0..41, 41..42] {
+                assert!(reader.take_range(invalid_range, 100).is_err());
+            }
+        }
+
+        // Test with read_range (only non-deleted rows addressible)
+        for with_row_id in [false, true] {
+            let reader = fragment
+                .open(fragment.schema(), with_row_id, false, None)
+                .await
+                .unwrap();
+            for valid_range in [0..20, 0..10, 10..20] {
                 reader
                     .read_range(valid_range, 100)
                     .unwrap()
@@ -2055,7 +2065,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for invalid_range in [0..41, 41..42] {
+            for invalid_range in [0..21, 21..22] {
                 assert!(reader.read_range(invalid_range, 100).is_err());
             }
         }
@@ -2063,7 +2073,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fragment_scan_deletions(
+    async fn test_fragment_take_range_deletions(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
@@ -2111,7 +2121,7 @@ mod tests {
             let to_batches = |range: Range<u32>| {
                 let batch_size = range.len() as u32;
                 reader
-                    .read_range(range, batch_size)
+                    .take_range(range, batch_size)
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
