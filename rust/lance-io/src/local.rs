@@ -4,7 +4,7 @@
 //! Optimized local I/Os
 
 use std::fs::File;
-use std::io::{ErrorKind, SeekFrom};
+use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -160,6 +160,22 @@ impl Reader for LocalObjectReader {
             read_exact_at(file, buf.as_mut(), range.start as u64)?;
 
             Ok(buf.freeze())
+        })
+        .await?
+        .map_err(|err: std::io::Error| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        })
+    }
+
+    /// Reads the entire file.
+    #[instrument(level = "debug", skip(self))]
+    async fn get_all(&self) -> object_store::Result<Bytes> {
+        let mut file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            file.read_to_end(buf.as_mut())?;
+            Ok(Bytes::from(buf))
         })
         .await?
         .map_err(|err: std::io::Error| object_store::Error::Generic {
