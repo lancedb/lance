@@ -5,6 +5,12 @@ on:
     # Use released instead of published, since we don't publish preview/beta
     # versions. Users instead install them from the git repo.
     types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g., v1.0.0)'
+        required: true
+        type: string
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -14,7 +20,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
@@ -27,6 +33,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - name: Checkout specified tag
+        if: github.event_name == 'workflow_dispatch'
+        run: git checkout ${{ github.event.inputs.tag }}
       - name: Install dependencies
         run: |
           sudo apt update
