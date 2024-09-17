@@ -11,9 +11,6 @@ on:
         description: 'Tag to publish (e.g., v1.0.0)'
         required: true
         type: string
-  pull_request:
-    paths:
-      - .github/workflows/cargo-publish.yml
 
 env:
   # This env var is used by Swatinem/rust-cache@v2 for the cache
@@ -37,7 +34,7 @@ jobs:
         with:
           workspaces: rust
       - name: Verify and checkout specified tag
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+        if: github.event_name == 'workflow_dispatch'
         run: |
           git fetch --all --tags
           if git rev-parse ${{ github.event.inputs.tag }} >/dev/null 2>&1; then
@@ -54,7 +51,6 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - uses: albertlockett/publish-crates@v2.2
-        if: github.event_name != 'pull_request'
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           args: '--all-features'
