@@ -1740,7 +1740,12 @@ impl FragmentReader {
         )
     }
 
-    fn patch_range_for_deletions(&self, range: Range<u32>, dv: &DeletionVector) -> Range<u32> {
+    fn patch_range_for_deletions(
+        &self,
+        range: Range<u32>,
+        dv: &DeletionVector,
+        num_physical_rows: u32,
+    ) -> Range<u32> {
         let mut start = range.start;
         let mut end = range.end;
         for val in dv.to_sorted_iter() {
@@ -1753,12 +1758,25 @@ impl FragmentReader {
                 break;
             }
         }
+        let end = end.min(num_physical_rows);
+        let start = start.min(end);
         start..end
     }
 
-    pub fn read_range(&self, mut range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
-        if let Some(deletion_vector) = self.deletion_vec.as_ref() {
-            range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
+    fn do_read_range(
+        &self,
+        mut range: Range<u32>,
+        batch_size: u32,
+        skip_deleted_rows: bool,
+    ) -> Result<ReadBatchFutStream> {
+        if skip_deleted_rows {
+            if let Some(deletion_vector) = self.deletion_vec.as_ref() {
+                range = self.patch_range_for_deletions(
+                    range,
+                    deletion_vector.as_ref(),
+                    self.num_physical_rows as u32,
+                );
+            }
         }
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),
@@ -1773,6 +1791,22 @@ impl FragmentReader {
         )
     }
 
+    /// Reads a range of rows from the fragment
+    ///
+    /// This function interprets the request as the Xth to the Nth row of the fragment (after deletions)
+    /// and will always return range.len().min(self.num_rows()) rows.
+    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, true)
+    }
+
+    /// Takes a range of rows from the fragment
+    ///
+    /// Unlike [`Self::read_range`], this function will NOT skip deleted rows.  If rows are deleted they will
+    /// be filtered or set to null.  This function may return less than range.len() rows as a result.
+    pub fn take_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, false)
+    }
+
     pub fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
         self.new_read_impl(ReadBatchParams::RangeFull, batch_size, move |reader| {
             reader.read_all_tasks(batch_size, reader.projection().clone())
@@ -1785,7 +1819,7 @@ impl FragmentReader {
     // TODO: Move away from this by changing callers to support consuming a stream
     pub async fn legacy_read_range_as_batch(&self, range: Range<usize>) -> Result<RecordBatch> {
         let batches = self
-            .read_range(
+            .take_range(
                 range.start as u32..range.end as u32,
                 DEFAULT_BATCH_READ_SIZE,
             )?
