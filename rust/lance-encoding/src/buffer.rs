@@ -316,11 +316,25 @@ impl From<Buffer> for LanceBuffer {
     }
 }
 
+pub fn transmute_to_bytes_vec<T>(mut from: Vec<T>) -> Vec<u8> 
+where
+    T: Copy,
+{
+    unsafe {
+        let element_size = size_of::<T>();
+        let capacity = from.capacity() * element_size;
+        let len = from.len() * element_size;
+        let ptr = from.as_mut_ptr();
+        std::mem::forget(from);
+        Vec::from_raw_parts(ptr as *mut u8, len, capacity)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_buffer::Buffer;
 
-    use super::LanceBuffer;
+    use super::{transmute_to_bytes_vec, LanceBuffer};
 
     #[test]
     fn test_eq() {
@@ -395,4 +409,14 @@ mod tests {
         let buf = LanceBuffer::Owned(vec![1, 2, 15, 20]);
         assert_eq!("01020F14", buf.as_hex());
     }
+
+    #[test]
+    fn test_transmute_to_bytes_vec_u16() {
+        let vec: Vec<u16> = vec![1, 2, 3];
+        let bytes = transmute_to_bytes_vec(vec);
+        // for this test to pass, the endianness of the machine must be little-endian,
+        // should I include a panic in `transmute_to_bytes_vec` when the endianness is not little-endian?
+        assert_eq!(bytes, vec![1, 0, 2, 0, 3, 0]);
+    }
+
 }
