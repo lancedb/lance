@@ -449,6 +449,22 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     with pytest.raises(ValueError, match="Limit must be non-negative"):
         assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
 
+    full_ds_version = dataset.version
+    dataset.delete("a % 2 = 0")
+    filt_table = table.filter((pa.compute.bit_wise_and(pa.compute.field("a"), 1)) != 0)
+    assert (
+        dataset.to_table(offset=10).combine_chunks()
+        == filt_table.slice(10).combine_chunks()
+    )
+
+    dataset = dataset.checkout_version(full_ds_version)
+    dataset.restore()
+    dataset.delete("a > 2 AND a < 7")
+    print(dataset.to_table(offset=3, limit=1))
+    filt_table = table.slice(7, 1)
+
+    assert dataset.to_table(offset=3, limit=1) == filt_table
+
 
 def test_relative_paths(tmp_path: Path):
     # relative paths get coerced to the full absolute path
