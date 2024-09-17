@@ -912,6 +912,33 @@ def test_merge_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_merge_batch_size(tmp_path: Path):
+    # Create dataset with 10 fragments with 100 rows each
+    table = pa.table({"a": range(1000)})
+    for batch_size in [1, 10, 100, 1000]:
+        ds_path = str(tmp_path / str(batch_size))
+        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
+        fragments = []
+
+        def mutate(batch):
+            assert batch.num_rows <= batch_size
+            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
+
+        for frag in dataset.get_fragments():
+            merged, schema = frag.merge_columns(mutate, batch_size=batch_size)
+            fragments.append(merged)
+
+        merge = lance.LanceOperation.Merge(fragments, schema)
+        dataset = lance.LanceDataset.commit(
+            ds_path, merge, read_version=dataset.version
+        )
+
+        dataset.validate()
+        tbl = dataset.to_table()
+        expected = pa.table({"a": range(1000), "b": range(1000)})
+        assert tbl == expected
+
+
 def test_merge_with_schema_holes(tmp_path: Path):
     # Create table with 3 cols
     table = pa.table({"a": range(10)})

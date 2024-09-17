@@ -66,7 +66,11 @@ use snafu::{location, Location};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-pub const DEFAULT_BATCH_SIZE: usize = 8192;
+const BATCH_SIZE_FALLBACK: usize = 8192;
+lazy_static::lazy_static! {
+    pub static ref DEFAULT_BATCH_SIZE: Option<usize> = std::env::var("LANCE_DEFAULT_BATCH_SIZE")
+        .map(|val| Some(val.parse().unwrap())).unwrap_or(None);
+}
 
 pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 lazy_static::lazy_static! {
@@ -262,23 +266,14 @@ impl Scanner {
         // 64KB, this is 16K rows. For local file systems, the default block size
         // is just 4K, which would mean only 1K rows, which might be a little small.
         // So we use a default minimum of 8K rows.
-        std::env::var("LANCE_DEFAULT_BATCH_SIZE")
-            .map(|bs| {
-                bs.parse().unwrap_or_else(|_| {
-                    panic!(
-                        "The value of LANCE_DEFAULT_BATCH_SIZE ({}) is not a valid batch size",
-                        bs
-                    )
-                })
+        DEFAULT_BATCH_SIZE.unwrap_or_else(|| {
+            self.batch_size.unwrap_or_else(|| {
+                std::cmp::max(
+                    self.dataset.object_store().block_size() / 4,
+                    BATCH_SIZE_FALLBACK,
+                )
             })
-            .unwrap_or_else(|_| {
-                self.batch_size.unwrap_or_else(|| {
-                    std::cmp::max(
-                        self.dataset.object_store().block_size() / 4,
-                        DEFAULT_BATCH_SIZE,
-                    )
-                })
-            })
+        })
     }
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
