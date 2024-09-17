@@ -70,7 +70,6 @@ runs:
         before-script-linux: |
           set -e
           apt install -y unzip
-          PROTOC_ARCH="aarch_64"
           curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-aarch_64.zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip
