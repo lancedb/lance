@@ -113,6 +113,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
             }
         }
         _ => {
+            // in dictionary encoding, they route it to here when array is utf8, don't know what we should do yet.
             res = 8;
         }
     };
@@ -269,13 +270,13 @@ impl PageScheduler for BitpackedForNonNegScheduler {
             let this_start = locate_chunk_start(self, range.start);
             let this_end = locate_chunk_end(self, range.end - 1);
             if this_start == locate_chunk_start(self, ranges[i - 1].end - 1) {
-                byte_ranges.last_mut().unwrap().end = this_end;
+                byte_ranges.last_mut().unwrap().end = self.buffer_offset + this_end;
                 bytes_idx_to_range_indices
                     .last_mut()
                     .unwrap()
                     .push(range.clone());
             } else {
-                byte_ranges.push(this_start..this_end);
+                byte_ranges.push(self.buffer_offset + this_start..self.buffer_offset + this_end);
                 bytes_idx_to_range_indices.push(vec![range.clone()]);
             }
         }
