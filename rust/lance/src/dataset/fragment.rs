@@ -1132,6 +1132,7 @@ impl FileFragment {
         &self,
         columns: Option<&[T]>,
         schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
@@ -1160,11 +1161,11 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas)
+        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None).await?;
+        let mut updater = self.updater(Some(&[join_column]), None, None).await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner.collect(batch[join_column].clone()).await?;
@@ -2433,7 +2434,7 @@ mod tests {
             }
 
             let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None).await.unwrap();
+            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
@@ -2677,7 +2678,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"]), None).await?;
+        let mut updater = fragment.updater(Some(&["i"]), None, None).await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;
