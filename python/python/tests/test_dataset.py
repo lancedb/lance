@@ -2383,13 +2383,65 @@ def test_legacy_dataset(tmp_path: Path):
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
 
+def test_late_materialization_param(tmp_path: Path):
+    table = pa.table(
+        {
+            "filter": np.arange(4),
+            "values": pa.array([b"abcd", b"efgh", b"ijkl", b"mnop"]),
+        }
+    )
+    dataset = lance.write_dataset(
+        table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
+    )
+    filt = "filter % 2 == 0"
+
+    assert "(values)" in dataset.scanner(
+        filter=filt, materialization_style=None
+    ).explain_plan(True)
+    assert ", values" in dataset.scanner(
+        filter=filt, materialization_style=False
+    ).explain_plan(True)
+    assert "(values)" in dataset.scanner(
+        filter=filt, materialization_style=True
+    ).explain_plan(True)
+    assert "(values)" in dataset.scanner(
+        filter=filt, materialization_style=["values"]
+    ).explain_plan(True)
+    assert ", values" in dataset.scanner(
+        filter=filt, materialization_style=["filter"]
+    ).explain_plan(True)
+
+    # These tests just make sure we can pass in the parameter.  There's no great
+    # way to know if late materialization happened or not.  That will have to be
+    # for benchmarks
+    expected = dataset.to_table(filter=filt)
+    assert dataset.to_table(filter=filt, materialization_style=None) == expected
+    assert dataset.to_table(filter=filt, materialization_style=False) == expected
+    assert dataset.to_table(filter=filt, materialization_style=True) == expected
+    assert dataset.to_table(filter=filt, materialization_style=["values"]) == expected
+
+    expected = list(dataset.to_batches(filter=filt))
+    assert list(dataset.to_batches(filter=filt, materialization_style=None)) == expected
+    assert (
+        list(dataset.to_batches(filter=filt, materialization_style=False)) == expected
+    )
+    assert list(dataset.to_batches(filter=filt, materialization_style=True)) == expected
+    assert (
+        list(dataset.to_batches(filter=filt, materialization_style=["values"]))
+        == expected
+    )
+
+
 def test_late_materialization_batch_size(tmp_path: Path):
     table = pa.table({"filter": np.arange(32 * 32), "values": np.arange(32 * 32)})
     dataset = lance.write_dataset(
         table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
     )
     for batch in dataset.to_batches(
-        columns=["values"], filter="filter % 2 == 0", batch_size=32
+        columns=["values"],
+        filter="filter % 2 == 0",
+        batch_size=32,
+        materialization_style=True,
     ):
         assert batch.num_rows == 32
 

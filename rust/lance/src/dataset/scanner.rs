@@ -34,6 +34,8 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
+use lance_arrow::DataTypeExt;
+use lance_core::datatypes::Field;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
@@ -132,6 +134,52 @@ impl ColumnOrdering {
     }
 }
 
+/// Materialization style for the scanner
+///
+/// This only affects columns that are not used in a filter
+///
+/// Early materialization will fetch the entire column and throw
+/// away the rows that are not needed.  This fetches more data but
+/// uses fewer I/O requests.
+///
+/// Late materialization will only fetch the rows that are needed.
+/// This fetches less data but uses more I/O requests.
+///
+/// This parameter only affects scans.  Vector search and full text search
+/// always use late materialization.
+pub enum MaterializationStyle {
+    /// Heuristic-based materialization style
+    ///
+    /// The default approach depends on the type of object storage.  For
+    /// cloud storage (e.g. S3, GCS, etc.) we only use late materialization
+    /// for columns that are more than 1000 bytes in size.
+    ///
+    /// For local storage we use late materialization for columns that are
+    /// more than 10 bytes in size.
+    ///
+    /// These values are based on experimentation and the assumption that a
+    /// filter will be selecting ~0.1% of the rows in a column.
+    Heuristic,
+    /// All columns will be fetched with late materialization where possible
+    AllLate,
+    /// All columns will be fetched with early materialization where possible
+    AllEarly,
+    /// All columns will be fetched with late materialization except for the specified columns
+    AllEarlyExcept(Vec<u32>),
+}
+
+impl MaterializationStyle {
+    pub fn all_early_except(columns: &[impl AsRef<str>], schema: &Schema) -> Result<Self> {
+        let field_ids = schema
+            .project(columns)?
+            .field_ids()
+            .into_iter()
+            .map(|id| id as u32)
+            .collect();
+        Ok(Self::AllEarlyExcept(field_ids))
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -152,6 +200,9 @@ pub struct Scanner {
 
     /// If true then the filter will be applied before an index scan
     prefilter: bool,
+
+    /// Materialization style controls when columns are fetched
+    materialization_style: MaterializationStyle,
 
     /// Optional filter expression.
     pub(crate) filter: Option<Expr>,
@@ -228,6 +279,7 @@ impl Scanner {
             dataset,
             projection_plan,
             prefilter: false,
+            materialization_style: MaterializationStyle::Heuristic,
             filter: None,
             full_text_query: None,
             batch_size: None,
@@ -312,7 +364,7 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let physical_schema = self.physical_schema(true)?;
+        let physical_schema = self.scan_output_schema(true)?;
         let base_schema = self.dataset.schema().merge(physical_schema.as_ref())?;
         self.projection_plan = ProjectionPlan::try_new(&base_schema, columns)?;
         Ok(self)
@@ -328,6 +380,22 @@ impl Scanner {
     /// results do not match the filter.
     pub fn prefilter(&mut self, should_prefilter: bool) -> &mut Self {
         self.prefilter = should_prefilter;
+        self
+    }
+
+    /// Set the materialization style for the scan
+    ///
+    /// This controls when columns are fetched from storage.  The default should work
+    /// well for most cases.
+    ///
+    /// If you know (in advance) a query will return relatively few results (less than
+    /// 0.1% of the rows) then you may want to experiment with applying late materialization
+    /// to more (or all) columns.
+    ///
+    /// If you know a query is going to return many rows then you may want to experiment
+    /// with applying early materialization to more (or all) columns.
+    pub fn materialization_style(&mut self, style: MaterializationStyle) -> &mut Self {
+        self.materialization_style = style;
         self
     }
 
@@ -668,8 +736,11 @@ impl Scanner {
         Ok(plan.schema())
     }
 
-    /// The schema of the Scanner from lance physical takes
-    pub(crate) fn physical_schema(&self, in_projection: bool) -> Result<Arc<Schema>> {
+    /// The output schema from the initial scan stage of a plan
+    ///
+    /// This includes columns that are added by the scan but don't exist in the dataset
+    /// schema (e.g. _distance, _rowid, _rowaddr)
+    pub(crate) fn scan_output_schema(&self, force_row_id: bool) -> Result<Arc<Schema>> {
         let mut extra_columns = vec![];
 
         if self.nearest.as_ref().is_some() {
@@ -680,7 +751,7 @@ impl Scanner {
             extra_columns.push(ArrowField::new(SCORE_COL, DataType::Float32, true));
         }
 
-        if self.with_row_id || in_projection {
+        if self.with_row_id || force_row_id {
             extra_columns.push(ROW_ID_FIELD.clone());
         }
 
@@ -714,7 +785,7 @@ impl Scanner {
         // Append the extra columns
         let mut output_expr = self.projection_plan.to_physical_exprs()?;
 
-        let physical_schema = ArrowSchema::from(self.physical_schema(false)?.as_ref());
+        let physical_schema = ArrowSchema::from(self.scan_output_schema(false)?.as_ref());
 
         // distance goes before the row_id column
         if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
@@ -822,6 +893,68 @@ impl Scanner {
             Ok(None)
         } else {
             Ok(Some(new_schema))
+        }
+    }
+
+    // A "narrow" field is a field that is so small that we are better off reading the
+    // entire column and filtering in memory rather than "take"ing the column.
+    //
+    // The exact threshold depends on a two factors:
+    // 1. The number of rows returned by the filter
+    // 2. The number of rows in the dataset
+    // 3. The IOPS/bandwidth ratio of the storage system
+    // 4. The size of each value in the column
+    //
+    // We don't (today) have a good way of knowing #1 or #4.  #2 is easy to know.  We can
+    // combine 1 & 2 into "percentage of rows returned" but since we don't know #1 it
+    // doesn't really help.  #3 is complex but as a rule of thumb we can use:
+    //
+    //   Local storage: 1 IOP for ever ten thousand bytes
+    //   Cloud storage: 1 IOP for every million bytes
+    //
+    // Our current heuristic today is to assume a filter will return 0.1% of the rows in the dataset.
+    //
+    // This means, for cloud storage, a field is "narrow" if there are 1KB of data per row and
+    // for local disk a field is "narrow" if there are 10 bytes of data per row.
+    fn is_early_field(&self, field: &Field) -> bool {
+        match self.materialization_style {
+            MaterializationStyle::AllEarly => true,
+            MaterializationStyle::AllLate => false,
+            MaterializationStyle::AllEarlyExcept(ref cols) => !cols.contains(&(field.id as u32)),
+            MaterializationStyle::Heuristic => {
+                let byte_width = field.data_type().byte_width_opt();
+                let is_cloud = self.dataset.object_store().is_cloud();
+                if is_cloud {
+                    byte_width.map_or(false, |bw| bw < 1000)
+                } else {
+                    byte_width.map_or(false, |bw| bw < 10)
+                }
+            }
+        }
+    }
+
+    fn calc_eager_columns(&self, filter_plan: &FilterPlan) -> Result<Arc<Schema>> {
+        let columns = filter_plan.refine_columns();
+        let filter_schema = self.dataset.schema().project(&columns)?;
+        let physical_schema = self.projection_plan.physical_schema.clone();
+        let remaining_schema = physical_schema.exclude(&filter_schema)?;
+
+        let narrow_fields = remaining_schema
+            .fields
+            .iter()
+            .filter(|f| self.is_early_field(f))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if narrow_fields.is_empty() {
+            Ok(Arc::new(filter_schema))
+        } else {
+            let mut new_fields = filter_schema.fields;
+            new_fields.extend(narrow_fields);
+            Ok(Arc::new(Schema {
+                fields: new_fields,
+                metadata: HashMap::new(),
+            }))
         }
     }
 
@@ -956,12 +1089,12 @@ impl Scanner {
                 self.fts(&filter_plan, query).await?
             }
             (None, None) => {
-                // Avoid pushdown scan node if using v2 files
                 let fragments = if let Some(fragments) = self.fragments.as_ref() {
                     fragments
                 } else {
                     self.dataset.fragments()
                 };
+                // Avoid pushdown scan node if using v2 files
                 let use_stats = if fragments.iter().any(|f| !f.has_legacy_files()) {
                     false
                 } else {
@@ -977,12 +1110,10 @@ impl Scanner {
                     }
                     // TODO: support combined pushdown and scalar index scan
                     (Some(index_query), Some(_)) => {
-                        // If there is a filter then just load the filter
-                        // columns (we will `take` the remaining columns afterwards)
-                        let columns = filter_plan.refine_columns();
-                        let filter_schema = Arc::new(self.dataset.schema().project(&columns)?);
-                        self.scalar_indexed_scan(&filter_schema, index_query)
-                            .await?
+                        // If there is a filter then just load the eager columns and
+                        // "take" the other columns later.
+                        let eager_schema = self.calc_eager_columns(&filter_plan)?;
+                        self.scalar_indexed_scan(&eager_schema, index_query).await?
                     }
                     (None, Some(_)) if use_stats && self.batch_size.is_none() => {
                         self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
@@ -990,12 +1121,12 @@ impl Scanner {
                     (None, _) => {
                         // The source is a full scan of the table
                         let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                        let schema = if filter_plan.has_refine() {
+                        let eager_schema = if filter_plan.has_refine() {
                             // If there is a filter then only load the filter columns in the
                             // initial scan.  We will `take` the remaining columns later
-                            let columns = filter_plan.refine_columns();
-                            Arc::new(self.dataset.schema().project(&columns)?)
+                            self.calc_eager_columns(&filter_plan)?
                         } else {
+                            // If there is no filter we eagerly load everything
                             self.projection_plan.physical_schema.clone()
                         };
                         if scan_range.is_some() && !self.dataset.is_legacy_storage() {
@@ -1009,7 +1140,7 @@ impl Scanner {
                             self.with_row_address,
                             false,
                             scan_range,
-                            schema,
+                            eager_schema,
                         )
                     }
                 }
@@ -1024,11 +1155,18 @@ impl Scanner {
 
         // Stage 1.5 load columns needed for stages 2 & 3
         let mut additional_schema = None;
+        // We may need to take filter columns if we are going to refine
+        // an indexed scan.  Otherwise, the filter was applied during the scan
+        // and this should be false
         if filter_plan.has_refine() {
-            additional_schema = self.calc_new_fields(
-                &Schema::try_from(plan.schema().as_ref())?,
-                &filter_plan.refine_columns(),
-            )?;
+            let eager_schema = self.calc_eager_columns(&filter_plan)?;
+            let base_schema = Schema::try_from(plan.schema().as_ref())?;
+            let still_to_load = eager_schema.exclude(base_schema)?;
+            if still_to_load.fields.is_empty() {
+                additional_schema = None;
+            } else {
+                additional_schema = Some(still_to_load);
+            }
         }
         if let Some(ordering) = &self.ordering {
             additional_schema = self.calc_new_fields(
@@ -1091,7 +1229,7 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.physical_schema(false)?;
+        let physical_schema = self.scan_output_schema(false)?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
@@ -1816,7 +1954,7 @@ pub mod test_dataset {
                         "vec",
                         DataType::FixedSizeList(
                             Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                            32,
+                            256,
                         ),
                         true,
                     ),
@@ -1826,9 +1964,9 @@ pub mod test_dataset {
 
             let batches: Vec<RecordBatch> = (0..5)
                 .map(|i| {
-                    let vector_values: Float32Array = (0..32 * 80).map(|v| v as f32).collect();
+                    let vector_values: Float32Array = (0..256 * 80).map(|v| v as f32).collect();
                     let vectors =
-                        FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+                        FixedSizeListArray::try_new_from_values(vector_values, 256).unwrap();
                     RecordBatch::try_new(
                         schema.clone(),
                         vec![
@@ -1887,8 +2025,8 @@ pub mod test_dataset {
 
         pub async fn append_new_data(&mut self) -> Result<()> {
             let vector_values: Float32Array =
-                (0..10).flat_map(|i| [i as f32; 32].into_iter()).collect();
-            let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 32).unwrap();
+                (0..10).flat_map(|i| [i as f32; 256].into_iter()).collect();
+            let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 256).unwrap();
             let new_data: Vec<ArrayRef> = vec![
                 Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
                 Arc::new(StringArray::from_iter_values(
@@ -4134,10 +4272,11 @@ mod test {
     ) -> Result<()> {
         // Create a vector dataset
         let mut dataset = TestVectorDataset::new(data_storage_version, stable_row_id).await?;
+        let lance_schema = dataset.dataset.schema();
 
         // Scans
         // ---------------------------------------------------------------------
-        // Experimental writer does not use LancePushdownScan
+        // V2 writer does not use LancePushdownScan
         if data_storage_version == LanceFileVersion::Legacy {
             assert_plan_equals(
                 &dataset.dataset,
@@ -4154,10 +4293,69 @@ mod test {
                     .filter("i > 10 and i < 20")
             },
             "ProjectionExec: expr=[s@2 as s]
-  Take: columns=\"i, _rowid, s\"
+  Take: columns=\"i, _rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@0 > 10 AND i@0 < 20
         LanceScan: uri..., projection=[i], row_id=true, row_addr=false, ordered=true",
+        )
+        .await?;
+
+        // Integer fields will be eagerly materialized while string/vec fields
+        // are not.
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.use_stats(false).filter("s IS NOT NULL"),
+            "ProjectionExec: expr=[i@1 as i, s@0 as s, vec@3 as vec]
+  Take: columns=\"s, i, _rowid, (vec)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: s@0 IS NOT NULL
+        LanceScan: uri..., projection=[s, i], row_id=true, row_addr=false, ordered=true",
+        )
+        .await?;
+
+        // Custom materialization
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.use_stats(false)
+                    .materialization_style(MaterializationStyle::AllEarly)
+                    .filter("s IS NOT NULL")
+            },
+            "ProjectionExec: expr=[i@1 as i, s@0 as s, vec@2 as vec]
+  FilterExec: s@0 IS NOT NULL
+    LanceScan: uri..., projection=[s, i, vec], row_id=true, row_addr=false, ordered=true",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.use_stats(false)
+                    .materialization_style(MaterializationStyle::AllLate)
+                    .filter("s IS NOT NULL")
+            },
+            "ProjectionExec: expr=[i@2 as i, s@0 as s, vec@3 as vec]
+  Take: columns=\"s, _rowid, (i), (vec)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: s@0 IS NOT NULL
+        LanceScan: uri..., projection=[s], row_id=true, row_addr=false, ordered=true",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.use_stats(false)
+                    .materialization_style(
+                        MaterializationStyle::all_early_except(&["i"], lance_schema).unwrap(),
+                    )
+                    .filter("s IS NOT NULL")
+            },
+            "ProjectionExec: expr=[i@3 as i, s@0 as s, vec@1 as vec]
+  Take: columns=\"s, vec, _rowid, (i)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: s@0 IS NOT NULL
+        LanceScan: uri..., projection=[s, vec], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
@@ -4175,7 +4373,7 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, i, s\"
+  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@2 IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
@@ -4191,7 +4389,7 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 42),
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, i, s, vec\"
+  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=42), expr=...
         ANNSubIndex: name=..., k=42, deltas=1
@@ -4203,12 +4401,12 @@ mod test {
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 10)?.refine(4)),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, s\"
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=10), expr=...
           KNNVectorDistance: metric=l2
-            Take: columns=\"_distance, _rowid, vec\"
+            Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=40), expr=...
                   ANNSubIndex: name=..., k=40, deltas=1
@@ -4221,7 +4419,7 @@ mod test {
             &dataset.dataset,
             |scan| Ok(scan.nearest("vec", &q, 13)?.use_index(false)),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
-  Take: columns=\"vec, _rowid, _distance, i, s\"
+  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=13), expr=...
@@ -4241,10 +4439,10 @@ mod test {
                     .with_row_id())
             },
             "ProjectionExec: expr=[s@3 as s, vec@4 as vec, _distance@0 as _distance, _rowid@1 as _rowid]
-  Take: columns=\"_distance, _rowid, i, s, vec\"
+  Take: columns=\"_distance, _rowid, i, (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@2 > 10
-        Take: columns=\"_distance, _rowid, i\"
+        Take: columns=\"_distance, _rowid, (i)\"
           CoalesceBatchesExec: target_batch_size=8192
             SortExec: TopK(fetch=17), expr=...
               ANNSubIndex: name=..., k=17, deltas=1
@@ -4262,7 +4460,7 @@ mod test {
                     .prefilter(true))
             },
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, i, s, vec\"
+  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=17), expr=...
         ANNSubIndex: name=..., k=17, deltas=1
@@ -4279,7 +4477,7 @@ mod test {
             // TODO: we could write an optimizer rule to eliminate the last Projection
             // by doing it as part of the last Take. This would likely have minimal impact though.
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, s\"
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=6), expr=...
@@ -4291,7 +4489,7 @@ mod test {
                     SortExec: TopK(fetch=6), expr=...
                       KNNVectorDistance: metric=l2
                         LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-                Take: columns=\"_distance, _rowid, vec\"
+                Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=6), expr=...
                       ANNSubIndex: name=..., k=6, deltas=1
@@ -4304,10 +4502,10 @@ mod test {
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 15)?.filter("i > 10"),
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, s\"
+  Take: columns=\"_rowid, vec, _distance, i, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@3 > 10
-        Take: columns=\"_rowid, vec, _distance, i\"
+        Take: columns=\"_rowid, vec, _distance, (i)\"
           CoalesceBatchesExec: target_batch_size=8192
             FilterExec: _distance@... IS NOT NULL
               SortExec: TopK(fetch=15), expr=...
@@ -4319,7 +4517,7 @@ mod test {
                           SortExec: TopK(fetch=15), expr=...
                             KNNVectorDistance: metric=l2
                               LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-                      Take: columns=\"_distance, _rowid, vec\"
+                      Take: columns=\"_distance, _rowid, (vec)\"
                         CoalesceBatchesExec: target_batch_size=8192
                           SortExec: TopK(fetch=15), expr=...
                             ANNSubIndex: name=..., k=15, deltas=1
@@ -4339,7 +4537,7 @@ mod test {
             // TODO: i is scanned on both sides but is projected away mid-plan
             // only to be taken again later. We should fix this.
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, s\"
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=5), expr=...
@@ -4352,7 +4550,7 @@ mod test {
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
                           LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-                Take: columns=\"_distance, _rowid, vec\"
+                Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=5), expr=...
                       ANNSubIndex: name=..., k=5, deltas=1
@@ -4377,7 +4575,7 @@ mod test {
                     .prefilter(true))
             },
             "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
-  Take: columns=\"_distance, _rowid, i, s, vec\"
+  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: TopK(fetch=5), expr=...
         ANNSubIndex: name=..., k=5, deltas=1
@@ -4397,7 +4595,7 @@ mod test {
                     .prefilter(true))
             },
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, s\"
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=8), expr=...
@@ -4410,7 +4608,7 @@ mod test {
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
                           LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-                Take: columns=\"_distance, _rowid, vec\"
+                Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=8), expr=...
                       ANNSubIndex: name=..., k=8, deltas=1
@@ -4430,7 +4628,7 @@ mod test {
                     .prefilter(true))
             },
             "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@1 as vec, _distance@2 as _distance]
-  Take: columns=\"_rowid, vec, _distance, i, s\"
+  Take: columns=\"_rowid, vec, _distance, (i), (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: _distance@... IS NOT NULL
         SortExec: TopK(fetch=11), expr=...
@@ -4443,7 +4641,7 @@ mod test {
                       KNNVectorDistance: metric=l2
                         FilterExec: i@1 > 10
                           LanceScan: uri=..., projection=[vec, i], row_id=true, row_addr=false, ordered=false
-                Take: columns=\"_distance, _rowid, vec\"
+                Take: columns=\"_distance, _rowid, (vec)\"
                   CoalesceBatchesExec: target_batch_size=8192
                     SortExec: TopK(fetch=11), expr=...
                       ANNSubIndex: name=..., k=11, deltas=1
@@ -4458,7 +4656,7 @@ mod test {
             &dataset.dataset,
             |scan| scan.project(&["s"])?.filter("i > 10"),
             "ProjectionExec: expr=[s@1 as s]
-  Take: columns=\"_rowid, s\"
+  Take: columns=\"_rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       MaterializeIndex: query=i > 10",
         )
@@ -4486,7 +4684,7 @@ mod test {
             "ProjectionExec: expr=[s@1 as s]
   RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
     UnionExec
-      Take: columns=\"_rowid, s\"
+      Take: columns=\"_rowid, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
           MaterializeIndex: query=i > 10
       ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
@@ -4546,7 +4744,7 @@ mod test {
   ProjectionExec: expr=[s@1 as s]
     RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
       UnionExec
-        Take: columns=\"_rowid, s\"
+        Take: columns=\"_rowid, (s)\"
           CoalesceBatchesExec: target_batch_size=8192
             MaterializeIndex: query=i > 10
         ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
