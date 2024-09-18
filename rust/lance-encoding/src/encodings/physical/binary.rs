@@ -314,7 +314,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             - bytes_to_skip;
 
         let bytes = self.bytes_decoder.decode(bytes_to_skip, num_bytes)?;
-        let bytes = bytes.as_fixed_width()?;
+        let bytes = bytes.as_fixed_width().unwrap();
         debug_assert_eq!(bytes.bits_per_value, 8);
 
         let string_data = DataBlock::VariableWidth(VariableWidthBlock {
@@ -440,7 +440,7 @@ impl ArrayEncoder for BinaryEncoder {
     ) -> Result<EncodedArray> {
         let (data, nulls) = match data {
             DataBlock::Nullable(nullable) => {
-                let data = nullable.data.as_variable_width()?;
+                let data = nullable.data.as_variable_width().unwrap();
                 (data, Some(nullable.nulls))
             }
             DataBlock::VariableWidth(variable) => (variable, None),
@@ -463,7 +463,7 @@ impl ArrayEncoder for BinaryEncoder {
             self.indices_encoder
                 .encode(indices, &DataType::UInt64, buffer_index)?;
 
-        let encoded_indices_data = encoded_indices.data.as_fixed_width()?;
+        let encoded_indices_data = encoded_indices.data.as_fixed_width().unwrap();
 
         assert!(encoded_indices_data.bits_per_value <= 64);
 

@@ -145,7 +145,8 @@ impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
         let indices = self
             .indices_decoder
             .decode(rows_to_skip, num_rows)?
-            .as_fixed_width()?;
+            .as_fixed_width()
+            .unwrap();
         let dict = self.decoded_dict.try_clone()?;
         Ok(DataBlock::Dictionary(DictionaryDataBlock {
             indices,
@@ -270,7 +271,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
 
         let encoded = DataBlock::Dictionary(DictionaryDataBlock {
             dictionary: Box::new(encoded_items.data),
-            indices: encoded_indices.data.as_fixed_width()?,
+            indices: encoded_indices.data.as_fixed_width().unwrap(),
         });
 
         let encoding = ProtobufUtils::dict_encoding(
@@ -384,7 +385,7 @@ impl ArrayEncoder for DictionaryEncoder {
             .encode(items_data, &DataType::Utf8, buffer_index)?;
 
         let encoded_data = DataBlock::Dictionary(DictionaryDataBlock {
-            indices: encoded_indices.data.as_fixed_width()?,
+            indices: encoded_indices.data.as_fixed_width().unwrap(),
             dictionary: Box::new(encoded_items.data),
         });
 

@@ -132,6 +132,12 @@ def test_with_nulls(tmp_path):
             {
                 "some_null_1": pa.array([1, 2, None], pa.int64()),
                 "some_null_2": pa.array([None, None, 3], pa.int64()),
+                "nullable_list": pa.array(
+                    [[1, 2], None, [None, 3]], pa.list_(pa.int64())
+                ),
+                "nullable_fsl": pa.array(
+                    [[1, 2], None, [None, 3]], pa.list_(pa.int64(), 2)
+                ),
                 "all_null": pa.array([None, None, None], pa.int64()),
                 "null_strings": pa.array([None, "foo", None], pa.string()),
             }
