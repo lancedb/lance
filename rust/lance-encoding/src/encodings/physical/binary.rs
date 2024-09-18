@@ -499,7 +499,7 @@ impl ArrayEncoder for BinaryEncoder {
         let bytes_encoding = ProtobufUtils::flat_encoding(
             /*bits_per_value=*/ 8,
             bytes_buffer_index,
-            self.compression_scheme.clone(),
+            self.compression_scheme,
         );
 
         let encoding =
