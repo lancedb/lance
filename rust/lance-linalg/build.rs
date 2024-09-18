@@ -20,12 +20,12 @@ fn main() -> Result<(), String> {
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
 
-    if cfg!(not(feature = "fp16kernels")) {
-        println!(
-            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
-        );
-        return Ok(());
-    }
+    // if cfg!(not(feature = "fp16kernels")) {
+    //     println!(
+    //         "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
+    //     );
+    //     return Ok(());
+    // }
 
     if cfg!(target_os = "windows") {
         println!(
