@@ -63,7 +63,7 @@ const ENCODING_OPTIONS: EncodingOptions = EncodingOptions {
 fn bench_decode2(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_uint8");
-    group.measurement_time(std::time::Duration::new(12, 0)); 
+    group.measurement_time(std::time::Duration::new(12, 0));
     let array = UInt8Array::from(vec![5; 1024 * 1024 * 1024]);
     let data = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(

@@ -1,19 +1,16 @@
-// SPDX-License-Identifier: Apache-2.0
+// spdx-license-identifier: apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
 
 use arrow::datatypes::{
-    ArrowPrimitiveType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
-use arrow::util::bit_util::ceil;
-use arrow_array::{cast::AsArray, Array, PrimitiveArray};
+use arrow_array::{Array, PrimitiveArray};
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
-use num_traits::{AsPrimitive, PrimInt, ToPrimitive};
 use snafu::{location, Location};
 
 use lance_arrow::DataTypeExt;
@@ -25,20 +22,22 @@ use crate::decoder::{PageScheduler, PrimitivePageDecoder};
 use crate::encoder::{ArrayEncoder, EncodedArray};
 use crate::format::ProtobufUtils;
 use arrow::array::ArrayRef;
+use bytemuck::cast_slice;
 use fastlanes::BitPacking;
 
 // Compute the compressed_bit_width for a given array of unsigned integers
 // the vortex approach is better, they compute all stastistics before encoding
+// todo: see how to use rust macro to rewrite this function
 pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
     // is it possible to get here?
-    if arrays.len() == 0 {
+    if arrays.is_empty() {
         return 0;
     }
 
     let res;
 
     match arrays[0].data_type() {
-        DataType::UInt8 | DataType::Int8 => {
+        DataType::UInt8 => {
             let mut global_max: u8 = 0;
             for array in arrays {
                 // at this point we know that the array doesn't contain any negative values
@@ -52,13 +51,32 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
             }
             let num_bits =
                 arrays[0].data_type().byte_width() as u64 * 8 - global_max.leading_zeros() as u64;
+            // we will have constant encoding later
             if num_bits == 0 {
                 res = 1;
             } else {
                 res = num_bits;
             }
         }
-        DataType::UInt16 | DataType::Int16 => {
+
+        DataType::Int8 => {
+            let mut global_max_width: u64 = 0;
+            for array in arrays {
+                let primitive_array = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<Int8Type>>()
+                    .unwrap();
+                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                global_max_width = global_max_width.max(8 - array_max_width.leading_zeros() as u64);
+            }
+            if global_max_width == 0 {
+                res = 1;
+            } else {
+                res = global_max_width;
+            }
+        }
+
+        DataType::UInt16 => {
             let mut global_max: u16 = 0;
             for array in arrays {
                 let primitive_array = array
@@ -76,7 +94,26 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                 res = num_bits;
             }
         }
-        DataType::UInt32 | DataType::Int32 => {
+
+        DataType::Int16 => {
+            let mut global_max_width: u64 = 0;
+            for array in arrays {
+                let primitive_array = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<Int16Type>>()
+                    .unwrap();
+                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                global_max_width =
+                    global_max_width.max(16 - array_max_width.leading_zeros() as u64);
+            }
+            if global_max_width == 0 {
+                res = 1;
+            } else {
+                res = global_max_width;
+            }
+        }
+
+        DataType::UInt32 => {
             let mut global_max: u32 = 0;
             for array in arrays {
                 let primitive_array = array
@@ -94,7 +131,26 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                 res = num_bits;
             }
         }
-        DataType::UInt64 | DataType::Int64 => {
+
+        DataType::Int32 => {
+            let mut global_max_width: u64 = 0;
+            for array in arrays {
+                let primitive_array = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<Int32Type>>()
+                    .unwrap();
+                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                global_max_width =
+                    global_max_width.max(32 - array_max_width.leading_zeros() as u64);
+            }
+            if global_max_width == 0 {
+                res = 1;
+            } else {
+                res = global_max_width;
+            }
+        }
+
+        DataType::UInt64 => {
             let mut global_max: u64 = 0;
             for array in arrays {
                 let primitive_array = array
@@ -110,6 +166,24 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
                 res = 1;
             } else {
                 res = num_bits;
+            }
+        }
+
+        DataType::Int64 => {
+            let mut global_max_width: u64 = 0;
+            for array in arrays {
+                let primitive_array = array
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<Int64Type>>()
+                    .unwrap();
+                let array_max_width = arrow::compute::bit_or(primitive_array).unwrap_or(0);
+                global_max_width =
+                    global_max_width.max(64 - array_max_width.leading_zeros() as u64);
+            }
+            if global_max_width == 0 {
+                res = 1;
+            } else {
+                res = global_max_width;
             }
         }
         _ => {
@@ -153,21 +227,23 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 let num_chunks = (unpacked.num_values + 1023) / 1024;
                 let num_full_chunks = unpacked.num_values / 1024;
                 // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
-                let packed_chunk_size = 1024 * self.compressed_bit_width / 8;
+                // the output type is the same as the input type
+                // 1024 * compressed_bit_width / 8
+                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
 
                 let input = unpacked.data.reinterpret_to_rust_native::<u8>().unwrap();
                 let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
 
                 // Loop over all but the last chunk.
                 (0..num_full_chunks).for_each(|i| {
-                    let start_elem = i as usize * 1024 as usize;
+                    let start_elem = i as usize * 1024_usize;
 
                     let output_len = output.len();
                     unsafe {
                         output.set_len(output_len + packed_chunk_size);
                         BitPacking::unchecked_pack(
                             self.compressed_bit_width,
-                            &input[start_elem as usize..][..1024],
+                            &input[start_elem..][..1024],
                             &mut output[output_len..][..packed_chunk_size],
                         );
                     };
@@ -204,11 +280,199 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                     num_values: unpacked.num_values,
                 });
 
-                return Ok(EncodedArray {
+                Ok(EncodedArray {
                     data: packed,
                     encoding,
-                });
+                })
             }
+
+            DataType::UInt16 | DataType::Int16 => {
+                let num_chunks = (unpacked.num_values + 1023) / 1024;
+                let num_full_chunks = unpacked.num_values / 1024;
+                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
+                // the output type is the same as the input type
+                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
+
+                let input = unpacked.data.reinterpret_to_rust_native::<u16>().unwrap();
+                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
+
+                // Loop over all but the last chunk.
+                (0..num_full_chunks).for_each(|i| {
+                    let start_elem = i as usize * 1024_usize;
+
+                    let output_len = output.len();
+                    unsafe {
+                        output.set_len(output_len + packed_chunk_size);
+                        BitPacking::unchecked_pack(
+                            self.compressed_bit_width,
+                            &input[start_elem..][..1024],
+                            &mut output[output_len..][..packed_chunk_size],
+                        );
+                    };
+                });
+
+                if num_chunks != num_full_chunks {
+                    let last_chunk_elem_num = unpacked.num_values % 1024;
+                    let mut last_chunk = vec![0u16; 1024];
+                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
+                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
+                    );
+
+                    let output_len = output.len();
+                    unsafe {
+                        output.set_len(output.len() + packed_chunk_size);
+                        BitPacking::unchecked_pack(
+                            self.compressed_bit_width,
+                            &last_chunk,
+                            &mut output[output_len..][..packed_chunk_size],
+                        );
+                    }
+                }
+                let bitpacked_for_non_neg_buffer_index = *buffer_index;
+                *buffer_index += 1;
+
+                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
+                    self.compressed_bit_width as u64,
+                    _data_type.byte_width() as u64 * 8,
+                    bitpacked_for_non_neg_buffer_index,
+                );
+                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: self.compressed_bit_width as u64,
+                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    num_values: unpacked.num_values,
+                });
+                Ok(EncodedArray {
+                    data: packed,
+                    encoding,
+                })
+            }
+
+            DataType::UInt32 | DataType::Int32 => {
+                let num_chunks = (unpacked.num_values + 1023) / 1024;
+                let num_full_chunks = unpacked.num_values / 1024;
+                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
+                // the output type is the same as the input type
+                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
+
+                let input_slice = unpacked.data.borrow_to_typed_slice::<u32>();
+                let input = input_slice.as_ref();
+                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
+
+                // Loop over all but the last chunk.
+                (0..num_full_chunks).for_each(|i| {
+                    let start_elem = i as usize * 1024_usize;
+
+                    let output_len = output.len();
+                    unsafe {
+                        output.set_len(output_len + packed_chunk_size);
+                        BitPacking::unchecked_pack(
+                            self.compressed_bit_width,
+                            &input[start_elem..][..1024],
+                            &mut output[output_len..][..packed_chunk_size],
+                        );
+                    };
+                });
+
+                if num_chunks != num_full_chunks {
+                    let last_chunk_elem_num = unpacked.num_values % 1024;
+                    let mut last_chunk = vec![0u32; 1024];
+                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
+                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
+                    );
+
+                    let output_len = output.len();
+                    unsafe {
+                        output.set_len(output.len() + packed_chunk_size);
+                        BitPacking::unchecked_pack(
+                            self.compressed_bit_width,
+                            &last_chunk,
+                            &mut output[output_len..][..packed_chunk_size],
+                        );
+                    }
+                }
+                let bitpacked_for_non_neg_buffer_index = *buffer_index;
+                *buffer_index += 1;
+
+                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
+                    self.compressed_bit_width as u64,
+                    _data_type.byte_width() as u64 * 8,
+                    bitpacked_for_non_neg_buffer_index,
+                );
+                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: self.compressed_bit_width as u64,
+                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    num_values: unpacked.num_values,
+                });
+
+                Ok(EncodedArray {
+                    data: packed,
+                    encoding,
+                })
+            }
+
+            DataType::UInt64 | DataType::Int64 => {
+                let num_chunks = (unpacked.num_values + 1023) / 1024;
+                let num_full_chunks = unpacked.num_values / 1024;
+                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
+                // the output type is the same as the input type
+                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
+
+                let input_slice = unpacked.data.borrow_to_typed_slice::<u64>();
+                let input = input_slice.as_ref();
+                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
+
+                // Loop over all but the last chunk.
+                (0..num_full_chunks).for_each(|i| {
+                    let start_elem = i as usize * 1024_usize;
+
+                    let output_len = output.len();
+                    unsafe {
+                        output.set_len(output_len + packed_chunk_size);
+                        BitPacking::unchecked_pack(
+                            self.compressed_bit_width,
+                            &input[start_elem..][..1024],
+                            &mut output[output_len..][..packed_chunk_size],
+                        );
+                    };
+                });
+
+                if num_chunks != num_full_chunks {
+                    let last_chunk_elem_num = unpacked.num_values % 1024;
+                    let mut last_chunk = vec![0u64; 1024];
+                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
+                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
+                    );
+
+                    let output_len = output.len();
+                    unsafe {
+                        output.set_len(output.len() + packed_chunk_size);
+                        BitPacking::unchecked_pack(
+                            self.compressed_bit_width,
+                            &last_chunk,
+                            &mut output[output_len..][..packed_chunk_size],
+                        );
+                    }
+                }
+                let bitpacked_for_non_neg_buffer_index = *buffer_index;
+                *buffer_index += 1;
+
+                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
+                    self.compressed_bit_width as u64,
+                    _data_type.byte_width() as u64 * 8,
+                    bitpacked_for_non_neg_buffer_index,
+                );
+                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
+                    bits_per_value: self.compressed_bit_width as u64,
+                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    num_values: unpacked.num_values,
+                });
+
+                Ok(EncodedArray {
+                    data: packed,
+                    encoding,
+                })
+            }
+
             _ => todo!(),
         }
     }
@@ -328,7 +592,7 @@ struct BitpackedForNonNegPageDecoder {
     // number of bits in the uncompressed value. E.g. this will be 32 for DataType::UInt32
     uncompressed_bits_per_value: u64,
 
-    decompressed_buf: Vec<u8>,
+    decompressed_buf: LanceBuffer,
 }
 
 impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
@@ -340,14 +604,75 @@ impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
                 output.extend_from_slice(
                     &self.decompressed_buf[rows_to_skip as usize..][..num_rows as usize],
                 );
-                let res = Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
                     data: LanceBuffer::from(output),
                     bits_per_value: self.uncompressed_bits_per_value,
                     num_values: num_rows,
-                }));
-                return res;
+                }))
             }
-            _ => panic!("Unsupported data type"),
+
+            16 => {
+                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
+                let mut output: Vec<u16> = Vec::with_capacity(num_rows as usize);
+                unsafe {
+                    output.set_len(num_rows as usize);
+                    std::ptr::copy_nonoverlapping(
+                        self.decompressed_buf
+                            .as_ptr()
+                            .add(2 * rows_to_skip as usize),
+                        output.as_ptr() as *mut u8,
+                        num_rows as usize * 2,
+                    );
+                }
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    bits_per_value: self.uncompressed_bits_per_value,
+                    num_values: num_rows,
+                }))
+            }
+
+            32 => {
+                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
+                let mut output: Vec<u32> = Vec::with_capacity(num_rows as usize);
+                unsafe {
+                    output.set_len(num_rows as usize);
+                    std::ptr::copy_nonoverlapping(
+                        self.decompressed_buf
+                            .as_ptr()
+                            .add(4 * rows_to_skip as usize),
+                        output.as_ptr() as *mut u8,
+                        num_rows as usize * 4,
+                    );
+                }
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    bits_per_value: self.uncompressed_bits_per_value,
+                    num_values: num_rows,
+                }))
+            }
+
+            64 => {
+                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
+                let mut output: Vec<u64> = Vec::with_capacity(num_rows as usize);
+                unsafe {
+                    output.set_len(num_rows as usize);
+                    std::ptr::copy_nonoverlapping(
+                        self.decompressed_buf
+                            .as_ptr()
+                            .add(8 * rows_to_skip as usize),
+                        output.as_ptr() as *mut u8,
+                        num_rows as usize * 8,
+                    );
+                }
+                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    bits_per_value: self.uncompressed_bits_per_value,
+                    num_values: num_rows,
+                }))
+            }
+            _ => {
+                panic!("Unsupported data type");
+            }
         }
     }
 }
@@ -355,10 +680,10 @@ impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
 fn bitpacked_for_non_neg_decode(
     compressed_bit_width: u64,
     uncompressed_bits_per_value: u64,
-    data: &Vec<Bytes>,
-    bytes_idx_to_range_indices: &Vec<Vec<std::ops::Range<u64>>>,
+    data: &[Bytes],
+    bytes_idx_to_range_indices: &[Vec<std::ops::Range<u64>>],
     num_rows: u64,
-) -> Vec<u8> {
+) -> LanceBuffer {
     match uncompressed_bits_per_value {
         8 => {
             let mut decompressed: Vec<u8> = Vec::with_capacity(num_rows as usize);
@@ -402,7 +727,148 @@ fn bitpacked_for_non_neg_decode(
                     j += 1;
                 }
             }
-            decompressed
+            LanceBuffer::Owned(decompressed)
+        }
+
+        16 => {
+            let mut decompressed: Vec<u16> = Vec::with_capacity(num_rows as usize);
+            let packed_chunk_size_in_byte: usize = 1024 * compressed_bit_width as usize / 8;
+            let mut decompress_chunk_buf = vec![0_u16; 1024];
+            for (i, bytes) in data.iter().enumerate() {
+                let mut j = 0;
+                let mut ranges_idx = 0;
+                let mut curr_range_start = bytes_idx_to_range_indices[i][0].start;
+                while j * packed_chunk_size_in_byte < bytes.len() {
+                    let chunk_in_u8: &[u8] =
+                        &bytes[j * packed_chunk_size_in_byte..][..packed_chunk_size_in_byte];
+                    let chunk = cast_slice(chunk_in_u8);
+                    unsafe {
+                        BitPacking::unchecked_unpack(
+                            compressed_bit_width as usize,
+                            chunk,
+                            &mut decompress_chunk_buf,
+                        );
+                    }
+                    loop {
+                        if curr_range_start + 1024 < bytes_idx_to_range_indices[i][ranges_idx].end {
+                            let this_part_len = 1024 - curr_range_start % 1024;
+                            decompressed.extend_from_slice(
+                                &decompress_chunk_buf[curr_range_start as usize % 1024..],
+                            );
+                            curr_range_start += this_part_len;
+                            break;
+                        } else {
+                            let this_part_len =
+                                bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
+                            decompressed.extend_from_slice(
+                                &decompress_chunk_buf[curr_range_start as usize % 1024..]
+                                    [..this_part_len as usize],
+                            );
+                            ranges_idx += 1;
+                            if ranges_idx == bytes_idx_to_range_indices[i].len() {
+                                break;
+                            }
+                            curr_range_start = bytes_idx_to_range_indices[i][ranges_idx].start;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            LanceBuffer::reinterpret_vec(decompressed).to_owned()
+        }
+
+        32 => {
+            let mut decompressed: Vec<u32> = Vec::with_capacity(num_rows as usize);
+            let packed_chunk_size_in_byte: usize = 1024 * compressed_bit_width as usize / 8;
+            let mut decompress_chunk_buf = vec![0_u32; 1024];
+            for (i, bytes) in data.iter().enumerate() {
+                let mut j = 0;
+                let mut ranges_idx = 0;
+                let mut curr_range_start = bytes_idx_to_range_indices[i][0].start;
+                while j * packed_chunk_size_in_byte < bytes.len() {
+                    let chunk_in_u8: &[u8] =
+                        &bytes[j * packed_chunk_size_in_byte..][..packed_chunk_size_in_byte];
+                    let chunk = cast_slice(chunk_in_u8);
+                    unsafe {
+                        BitPacking::unchecked_unpack(
+                            compressed_bit_width as usize,
+                            chunk,
+                            &mut decompress_chunk_buf,
+                        );
+                    }
+                    loop {
+                        if curr_range_start + 1024 < bytes_idx_to_range_indices[i][ranges_idx].end {
+                            let this_part_len = 1024 - curr_range_start % 1024;
+                            decompressed.extend_from_slice(
+                                &decompress_chunk_buf[curr_range_start as usize % 1024..],
+                            );
+                            curr_range_start += this_part_len;
+                            break;
+                        } else {
+                            let this_part_len =
+                                bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
+                            decompressed.extend_from_slice(
+                                &decompress_chunk_buf[curr_range_start as usize % 1024..]
+                                    [..this_part_len as usize],
+                            );
+                            ranges_idx += 1;
+                            if ranges_idx == bytes_idx_to_range_indices[i].len() {
+                                break;
+                            }
+                            curr_range_start = bytes_idx_to_range_indices[i][ranges_idx].start;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            LanceBuffer::reinterpret_vec(decompressed).to_owned()
+        }
+
+        64 => {
+            let mut decompressed: Vec<u64> = Vec::with_capacity(num_rows as usize);
+            let packed_chunk_size_in_byte: usize = 1024 * compressed_bit_width as usize / 8;
+            let mut decompress_chunk_buf = vec![0_u64; 1024];
+            for (i, bytes) in data.iter().enumerate() {
+                let mut j = 0;
+                let mut ranges_idx = 0;
+                let mut curr_range_start = bytes_idx_to_range_indices[i][0].start;
+                while j * packed_chunk_size_in_byte < bytes.len() {
+                    let chunk_in_u8: &[u8] =
+                        &bytes[j * packed_chunk_size_in_byte..][..packed_chunk_size_in_byte];
+                    let chunk = cast_slice(chunk_in_u8);
+                    unsafe {
+                        BitPacking::unchecked_unpack(
+                            compressed_bit_width as usize,
+                            chunk,
+                            &mut decompress_chunk_buf,
+                        );
+                    }
+                    loop {
+                        if curr_range_start + 1024 < bytes_idx_to_range_indices[i][ranges_idx].end {
+                            let this_part_len = 1024 - curr_range_start % 1024;
+                            decompressed.extend_from_slice(
+                                &decompress_chunk_buf[curr_range_start as usize % 1024..],
+                            );
+                            curr_range_start += this_part_len;
+                            break;
+                        } else {
+                            let this_part_len =
+                                bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
+                            decompressed.extend_from_slice(
+                                &decompress_chunk_buf[curr_range_start as usize % 1024..]
+                                    [..this_part_len as usize],
+                            );
+                            ranges_idx += 1;
+                            if ranges_idx == bytes_idx_to_range_indices[i].len() {
+                                break;
+                            }
+                            curr_range_start = bytes_idx_to_range_indices[i][ranges_idx].start;
+                        }
+                    }
+                    j += 1;
+                }
+            }
+            LanceBuffer::reinterpret_vec(decompressed).to_owned()
         }
         _ => panic!("Unsupported data type"),
     }
@@ -411,33 +877,23 @@ fn bitpacked_for_non_neg_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, PrimitiveArray};
-    use arrow::buffer::Buffer;
+    use arrow::array::{
+        Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
+    };
     use arrow::datatypes::DataType;
-    use arrow::record_batch::RecordBatch;
-    use arrow::util::bit_util::ceil;
-
-    use crate::decoder::decode_batch;
-    use crate::decoder::DecoderMiddlewareChain;
-    use crate::decoder::FilterExpression;
-    use crate::encoder::encode_batch;
-    use crate::encoder::CoreFieldEncodingStrategy;
-    use crate::encoder::EncodingOptions;
-    use arrow::array::UInt8Array;
-    use arrow::datatypes::Field;
-    use arrow::datatypes::Schema;
 
     #[test_log::test(tokio::test)]
     async fn test_compute_compressed_bit_width_for_non_neg() {}
 
     use std::collections::HashMap;
 
-    use lance_datagen::{ByteCount, RowCount};
+    use lance_datagen::RowCount;
 
     use crate::testing::{check_round_trip_encoding_of_data, TestCases};
 
     #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes() {
+    async fn test_bitpack_fastlanes_u8() {
         let values: Vec<u8> = vec![5; 1024];
         let array = UInt8Array::from(values);
         let array: Arc<dyn arrow_array::Array> = Arc::new(array);
@@ -466,8 +922,582 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(50))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_u16() {
+        let values: Vec<u16> = vec![5; 1024];
+        let array = UInt16Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u16> = vec![66; 1000];
+        let array = UInt16Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u16> = vec![77; 2000];
+        let array = UInt16Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u16> = vec![0; 10000];
+        let array = UInt16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u16> = vec![88; 10000];
+        let array = UInt16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u16> = vec![300; 100];
+        let array = UInt16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u16> = vec![800; 100];
+        let array = UInt16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_u32() {
+        let values: Vec<u32> = vec![5; 1024];
+        let array = UInt32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![7; 2000];
+        let array = UInt32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![66; 1000];
+        let array = UInt32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![666; 1000];
+        let array = UInt32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![77; 2000];
+        let array = UInt32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![0; 10000];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![1; 10000];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![88; 10000];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![300; 100];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![3000; 100];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![800; 100];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![8000; 100];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![65536; 100];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u32> = vec![655360; 100];
+        let array = UInt32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(50))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_u64() {
+        let values: Vec<u64> = vec![5; 1024];
+        let array = UInt64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![7; 2000];
+        let array = UInt64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![66; 1000];
+        let array = UInt64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![666; 1000];
+        let array = UInt64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![77; 2000];
+        let array = UInt64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![0; 10000];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![1; 10000];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![88; 10000];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![300; 100];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![3000; 100];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![800; 100];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![8000; 100];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![65536; 100];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<u64> = vec![655360; 100];
+        let array = UInt64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(50))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_i8() {
+        let values: Vec<i8> = vec![-5; 1024];
+        let array = Int8Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i8> = vec![66; 1000];
+        let array = Int8Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i8> = vec![77; 2000];
+        let array = Int8Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i8> = vec![0; 10000];
+        let array = Int8Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i8> = vec![88; 10000];
+        let array = Int8Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i8> = vec![-88; 10000];
+        let array = Int8Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(50))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_i16() {
+        let values: Vec<i16> = vec![-5; 1024];
+        let array = Int16Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        /*
+        let values: Vec<i16> = vec![66; 1000];
+        let array = Int16Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i16> = vec![77; 2000];
+        let array = Int16Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i16> = vec![0; 10000];
+        let array = Int16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i16> = vec![88; 10000];
+        let array = Int16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i16> = vec![300; 100];
+        let array = Int16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i16> = vec![800; 100];
+        let array = Int16Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(1))
             .unwrap()
@@ -476,8 +1506,8 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(20))
             .unwrap()
@@ -486,8 +1516,8 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(50))
             .unwrap()
@@ -496,8 +1526,8 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(100))
             .unwrap()
@@ -506,8 +1536,8 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(1000))
             .unwrap()
@@ -516,8 +1546,8 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(1024))
             .unwrap()
@@ -526,8 +1556,8 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
             .into_batch_rows(RowCount::from(2000))
             .unwrap()
@@ -536,9 +1566,284 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_primitive::<UInt8Type>(
-                arrow::datatypes::UInt8Type::DATA_TYPE,
+            .anon_col(lance_datagen::array::rand_type(
+                &DataType::Int16,
             ))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+        */
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_i32() {
+        let values: Vec<i32> = vec![-5; 1024];
+        let array = Int32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![66; 1000];
+        let array = Int32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![-66; 1000];
+        let array = Int32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![77; 2000];
+        let array = Int32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![-77; 2000];
+        let array = Int32Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![0; 10000];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![88; 10000];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![-88; 10000];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![300; 100];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![-300; 100];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![800; 100];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![-800; 100];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![65536; 100];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i32> = vec![-65536; 100];
+        let array = Int32Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(50))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+            .into_batch_rows(RowCount::from(3000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_bitpack_fastlanes_i64() {
+        let values: Vec<i64> = vec![-5; 1024];
+        let array = Int64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![66; 1000];
+        let array = Int64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![-66; 1000];
+        let array = Int64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![77; 2000];
+        let array = Int64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![-77; 2000];
+        let array = Int64Array::from(values);
+        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![0; 10000];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![88; 10000];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![-88; 10000];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![300; 100];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![-300; 100];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![800; 100];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![-800; 100];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![65536; 100];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let values: Vec<i64> = vec![-65536; 100];
+        let array = Int64Array::from(values);
+        let arr = Arc::new(array) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(1))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(20))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(50))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(100))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(1000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(1024))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+            .into_batch_rows(RowCount::from(2000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
             .into_batch_rows(RowCount::from(3000))
             .unwrap()
             .column(0)
