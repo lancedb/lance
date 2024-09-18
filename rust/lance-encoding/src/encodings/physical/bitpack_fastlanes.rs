@@ -25,8 +25,8 @@ use arrow::array::ArrayRef;
 use bytemuck::cast_slice;
 use fastlanes::BitPacking;
 
-// Compute the compressed_bit_width for a given array of unsigned integers
-// the vortex approach is better, they compute all stastistics before encoding
+// Compute the compressed_bit_width for a given array of integers
+// todo: compute all statistics before encoding 
 // todo: see how to use rust macro to rewrite this function
 pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
     // is it possible to get here?
@@ -40,12 +40,10 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
         DataType::UInt8 => {
             let mut global_max: u8 = 0;
             for array in arrays {
-                // at this point we know that the array doesn't contain any negative values
                 let primitive_array = array
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt8Type>>()
                     .unwrap();
-                //println!("primitive_array: {:?}", primitive_array);
                 let array_max = arrow::compute::bit_or(primitive_array);
                 global_max = global_max.max(array_max.unwrap_or(0));
             }
@@ -231,7 +229,9 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 // 1024 * compressed_bit_width / 8
                 let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
 
-                let input = unpacked.data.reinterpret_to_rust_native::<u8>().unwrap();
+                let input_slice = unpacked.data.borrow_to_typed_slice::<u8>();
+                let input = input_slice.as_ref();
+
                 let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
 
                 // Loop over all but the last chunk.
@@ -293,7 +293,8 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 // the output type is the same as the input type
                 let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
 
-                let input = unpacked.data.reinterpret_to_rust_native::<u16>().unwrap();
+                let input_slice = unpacked.data.borrow_to_typed_slice::<u16>();
+                let input = input_slice.as_ref();
                 let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
 
                 // Loop over all but the last chunk.
@@ -551,16 +552,6 @@ impl PageScheduler for BitpackedForNonNegScheduler {
             byte_ranges[0].start,
             byte_ranges.last().unwrap().end
         );
-        /*
-        println!(
-            "Scheduling I/O for {} ranges spread across byte range {}..{}",
-            byte_ranges.len(),
-            byte_ranges[0].start,
-            byte_ranges[byte_ranges.len() - 1].end
-        );
-        println!("ranges: {:?}", ranges);
-        println!("byte_ranges: {:?}", byte_ranges);
-        */
 
         let bytes = scheduler.submit_request(byte_ranges.clone(), top_level_row);
 
@@ -870,7 +861,7 @@ fn bitpacked_for_non_neg_decode(
             }
             LanceBuffer::reinterpret_vec(decompressed).to_owned()
         }
-        _ => panic!("Unsupported data type"),
+        _ => unreachable!("bitpacked_for_non_neg_decode only supports 8, 16, 32, 64 uncompressed_bits_per_value"),
     }
 }
 
@@ -1462,7 +1453,6 @@ mod tests {
         let array: Arc<dyn arrow_array::Array> = Arc::new(array);
         check_round_trip_encoding_of_data(vec![array], &TestCases::default(), HashMap::new()).await;
 
-        /*
         let values: Vec<i16> = vec![66; 1000];
         let array = Int16Array::from(values);
         let array: Arc<dyn arrow_array::Array> = Arc::new(array);
@@ -1574,7 +1564,6 @@ mod tests {
             .column(0)
             .clone();
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
-        */
     }
 
     #[test_log::test(tokio::test)]
