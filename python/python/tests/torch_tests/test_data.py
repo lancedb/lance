@@ -134,14 +134,16 @@ def test_iter_filter(tmp_path):
         )
     )
 
-    # sampling fails
-    with pytest.raises(ValueError):
-        LanceDataset(
-            ds,
-            batch_size=10,
-            filter="ids >= 300",
-            samples=100,
-            columns=["ids"],
+    # sampling with filter
+    with pytest.raises(NotImplementedError):
+        check(
+            LanceDataset(
+                ds,
+                batch_size=10,
+                filter="ids >= 300",
+                samples=100,
+                columns=["ids"],
+            )
         )
 
 

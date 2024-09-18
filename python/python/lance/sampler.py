@@ -137,7 +137,7 @@ def _filtered_efficient_sample(
         if len(columns) == 1 and filter.lower() == f"{columns[0]} is not null":
             table = pc.drop_null(table)
         elif filter is not None:
-            raise Exception(f"Can't yet run filter <{filter}> in-memory")
+            raise NotImplementedError(f"Can't yet run filter <{filter}> in-memory")
         if table.num_rows > 0:
             tables.append(table)
             remaining_rows -= table.num_rows
