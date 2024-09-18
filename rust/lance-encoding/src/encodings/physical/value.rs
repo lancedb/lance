@@ -174,7 +174,7 @@ impl ValuePageDecoder {
                     (None, 0) => {
                         // The entire request is contained in one buffer so we can maybe zero-copy
                         // if the slice is aligned properly
-                        return LanceBuffer::from_bytes(slice, dbg!(self.bytes_per_value));
+                        return LanceBuffer::from_bytes(slice, self.bytes_per_value);
                     }
                     (None, _) => {
                         dest.replace(Vec::with_capacity(bytes_to_take as usize));

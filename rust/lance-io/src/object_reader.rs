@@ -9,7 +9,7 @@ use bytes::Bytes;
 use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use lance_core::Result;
-use object_store::{path::Path, ObjectStore};
+use object_store::{path::Path, GetOptions, ObjectStore};
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
@@ -28,6 +28,7 @@ pub struct CloudObjectReader {
     size: OnceCell<usize>,
 
     block_size: usize,
+    download_retry_count: usize,
 }
 
 impl DeepSizeOf for CloudObjectReader {
@@ -44,12 +45,14 @@ impl CloudObjectReader {
         path: Path,
         block_size: usize,
         known_size: Option<usize>,
+        download_retry_count: usize,
     ) -> Result<Self> {
         Ok(Self {
             object_store,
             path,
             size: OnceCell::new_with(known_size),
             block_size,
+            download_retry_count,
         })
     }
 
@@ -104,7 +107,40 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes> {
-        self.do_with_retry(|| self.object_store.get_range(&self.path, range.clone()))
-            .await
+        // We have a separate retry loop here.  This is because object_store does not
+        // attempt retries on downloads that fail during streaming of the response body.
+        //
+        // However, this failure is pretty common (e.g. timeout) and we want to retry in these
+        // situations.  In addition, we provide additional logging information in these
+        // failures cases.
+        let mut retries = self.download_retry_count;
+        loop {
+            let get_result = self
+                .do_with_retry(|| {
+                    let options = GetOptions {
+                        range: Some(range.clone().into()),
+                        ..Default::default()
+                    };
+                    self.object_store.get_opts(&self.path, options)
+                })
+                .await?;
+            match get_result.bytes().await {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => {
+                    if retries == 0 {
+                        log::warn!("Failed to download range {:?} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}", range, self.path, self.download_retry_count, err);
+                        return Err(err);
+                    }
+                    log::debug!(
+                        "Retrying range {:?} from {} (remaining retries: {}).  Error details: {:?}",
+                        range,
+                        self.path,
+                        retries,
+                        err
+                    );
+                    retries -= 1;
+                }
+            }
+        }
     }
 }

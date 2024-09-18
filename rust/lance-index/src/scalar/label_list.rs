@@ -180,7 +180,10 @@ fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
         }
         UInt64Array::from(indices)
     } else {
-        unreachable!("Should verify that the first column is a list earlier")
+        unreachable!(
+            "Should verify that the first column is a list earlier. Got array of type: {}",
+            list_arr.data_type()
+        )
     }
 }
 
@@ -189,14 +192,19 @@ fn unnest_schema(schema: &Schema) -> SchemaRef {
     let key_field = fields_iter.next().unwrap();
     let remaining_fields = fields_iter.collect::<Vec<_>>();
 
-    let new_key_field = if let DataType::List(item_field) = key_field.data_type() {
-        Field::new(
+    let new_key_field = match key_field.data_type() {
+        DataType::List(item_field) | DataType::LargeList(item_field) => Field::new(
             key_field.name(),
             item_field.data_type().clone(),
             item_field.is_nullable() || key_field.is_nullable(),
-        )
-    } else {
-        unreachable!("Should verify that the first column is a list earlier")
+        ),
+        other_type => {
+            unreachable!(
+                "The first field in the schema must be a List or LargeList type. \
+                Found: {}. This should have been verified earlier in the code.",
+                other_type
+            )
+        }
     };
 
     let all_fields = vec![Arc::new(new_key_field)]

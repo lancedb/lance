@@ -410,7 +410,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
-        let dataset = UpdateBuilder::new(Arc::new(dataset))
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 3")
             .unwrap()
             .set("id", "100")
@@ -421,6 +421,7 @@ mod test {
             .await
             .unwrap();
 
+        let dataset = update_result.new_dataset;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         // Old address is still there.

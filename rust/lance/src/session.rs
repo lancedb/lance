@@ -31,7 +31,28 @@ pub struct Session {
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Session()")
+        f.debug_struct("Session")
+            .field(
+                "index_cache",
+                &format!(
+                    "IndexCache(items={}, size_bytes={})",
+                    self.index_cache.get_size(),
+                    self.index_cache.deep_size_of()
+                ),
+            )
+            .field(
+                "file_metadata_cache",
+                &format!(
+                    "FileMetadataCache(items={}, size_bytes={})",
+                    self.file_metadata_cache.size(),
+                    self.file_metadata_cache.deep_size_of()
+                ),
+            )
+            .field(
+                "index_extensions",
+                &self.index_extensions.keys().collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 

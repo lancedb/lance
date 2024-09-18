@@ -449,6 +449,22 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     with pytest.raises(ValueError, match="Limit must be non-negative"):
         assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
 
+    full_ds_version = dataset.version
+    dataset.delete("a % 2 = 0")
+    filt_table = table.filter((pa.compute.bit_wise_and(pa.compute.field("a"), 1)) != 0)
+    assert (
+        dataset.to_table(offset=10).combine_chunks()
+        == filt_table.slice(10).combine_chunks()
+    )
+
+    dataset = dataset.checkout_version(full_ds_version)
+    dataset.restore()
+    dataset.delete("a > 2 AND a < 7")
+    print(dataset.to_table(offset=3, limit=1))
+    filt_table = table.slice(7, 1)
+
+    assert dataset.to_table(offset=3, limit=1) == filt_table
+
 
 def test_relative_paths(tmp_path: Path):
     # relative paths get coerced to the full absolute path
@@ -894,6 +910,33 @@ def test_merge_with_commit(tmp_path: Path):
     tbl = dataset.to_table()
 
     assert tbl == expected
+
+
+def test_merge_batch_size(tmp_path: Path):
+    # Create dataset with 10 fragments with 100 rows each
+    table = pa.table({"a": range(1000)})
+    for batch_size in [1, 10, 100, 1000]:
+        ds_path = str(tmp_path / str(batch_size))
+        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
+        fragments = []
+
+        def mutate(batch):
+            assert batch.num_rows <= batch_size
+            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
+
+        for frag in dataset.get_fragments():
+            merged, schema = frag.merge_columns(mutate, batch_size=batch_size)
+            fragments.append(merged)
+
+        merge = lance.LanceOperation.Merge(fragments, schema)
+        dataset = lance.LanceDataset.commit(
+            ds_path, merge, read_version=dataset.version
+        )
+
+        dataset.validate()
+        tbl = dataset.to_table()
+        expected = pa.table({"a": range(1000), "b": range(1000)})
+        assert tbl == expected
 
 
 def test_merge_with_schema_holes(tmp_path: Path):
@@ -1501,6 +1544,10 @@ def test_merge_insert_vector_column(tmp_path: Path):
     check_merge_stats(merge_dict, (1, 1, 0))
 
 
+def check_update_stats(update_dict, expected):
+    assert (update_dict["num_rows_updated"],) == expected
+
+
 def test_update_dataset(tmp_path: Path):
     nrows = 100
     vecs = pa.FixedSizeListArray.from_arrays(
@@ -1511,11 +1558,12 @@ def test_update_dataset(tmp_path: Path):
 
     dataset = lance.dataset(tmp_path / "dataset")
 
-    dataset.update(dict(b="b + 1"))
+    update_dict = dataset.update(dict(b="b + 1"))
     expected = pa.table({"a": range(100), "b": range(1, 101)})
     assert dataset.to_table(columns=["a", "b"]) == expected
+    check_update_stats(update_dict, (100,))
 
-    dataset.update(dict(a="a * 2"), where="a < 50")
+    update_dict = dataset.update(dict(a="a * 2"), where="a < 50")
     expected = pa.table(
         {
             "a": [x * 2 if x < 50 else x for x in range(100)],
@@ -1523,8 +1571,9 @@ def test_update_dataset(tmp_path: Path):
         }
     )
     assert dataset.to_table(columns=["a", "b"]).sort_by("b") == expected
+    check_update_stats(update_dict, (50,))
 
-    dataset.update(dict(vec="[42.0, 43.0]"))
+    update_dict = dataset.update(dict(vec="[42.0, 43.0]"))
     expected = pa.table(
         {
             "b": range(1, 101),
@@ -1534,6 +1583,7 @@ def test_update_dataset(tmp_path: Path):
         }
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
+    check_update_stats(update_dict, (100,))
 
 
 def test_update_dataset_all_types(tmp_path: Path):
@@ -1558,7 +1608,7 @@ def test_update_dataset_all_types(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
 
     # One update with all matching types
-    dataset.update(
+    update_dict = dataset.update(
         dict(
             int32="2",
             int64="2",
@@ -1593,6 +1643,7 @@ def test_update_dataset_all_types(tmp_path: Path):
         }
     )
     assert dataset.to_table() == expected
+    check_update_stats(update_dict, (1,))
 
 
 def test_update_with_binary_field(tmp_path: Path):
@@ -1607,12 +1658,13 @@ def test_update_with_binary_field(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
 
     # Update binary field
-    dataset.update({"b": "X'616263'"}, where="c < 2")
+    update_dict = dataset.update({"b": "X'616263'"}, where="c < 2")
 
     ds = lance.dataset(tmp_path)
     assert ds.scanner(filter="c < 2").to_table().column(
         "b"
     ).combine_chunks() == pa.array([b"abc", b"abc"])
+    check_update_stats(update_dict, (2,))
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):

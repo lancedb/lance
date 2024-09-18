@@ -108,6 +108,9 @@ impl InvertedIndex {
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
         } else {
+            if !self.inverted_list.has_positions() {
+                return Err(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() });
+            }
             let token_ids = token_ids.collect::<Vec<_>>();
             // for phrase query, all tokens must be present
             if token_ids.len() != tokens.len() {
@@ -377,6 +380,8 @@ struct InvertedListReader {
     offsets: Vec<usize>,
     max_scores: Option<Vec<f32>>,
 
+    has_position: bool,
+
     // cache
     posting_cache: Cache<u32, PostingList>,
     position_cache: Cache<u32, ListArray>,
@@ -413,6 +418,8 @@ impl InvertedListReader {
             None => None,
         };
 
+        let has_position = reader.schema().field(POSITION_COL).is_some();
+
         let posting_cache = Cache::builder()
             .max_capacity(*CACHE_SIZE as u64)
             .weigher(|_, posting: &PostingList| posting.deep_size_of() as u32)
@@ -425,9 +432,14 @@ impl InvertedListReader {
             reader,
             offsets,
             max_scores,
+            has_position,
             posting_cache,
             position_cache,
         })
+    }
+
+    pub(crate) fn has_positions(&self) -> bool {
+        self.has_position
     }
 
     pub(crate) fn posting_len(&self, token_id: u32) -> usize {
@@ -489,7 +501,7 @@ impl InvertedListReader {
                 .await?;
             Result::Ok(batch
                 .column_by_name(POSITION_COL)
-                .ok_or(Error::Index { message: "the index was built with old version which doesn't support phrase query, please re-create the index".to_owned(), location: location!() })?
+                .ok_or(Error::Index { message: "position is not found but required for phrase queries, try recreating the index with position".to_owned(), location: location!() })?
                 .as_list::<i32>()
                 .clone())
         }).await.map_err(|e| Error::io(e.to_string(), location!()))

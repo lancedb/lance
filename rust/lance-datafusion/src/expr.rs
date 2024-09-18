@@ -219,6 +219,11 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(val.clone())),
             _ => None,
         },
+        ScalarValue::LargeUtf8(val) => match ty {
+            DataType::Utf8 => Some(ScalarValue::Utf8(val.clone())),
+            DataType::LargeUtf8 => Some(value.clone()),
+            _ => None,
+        },
         ScalarValue::Boolean(_) => match ty {
             DataType::Boolean => Some(value.clone()),
             _ => None,
