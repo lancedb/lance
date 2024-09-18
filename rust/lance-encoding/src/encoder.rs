@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -269,7 +269,11 @@ impl CoreArrayEncodingStrategy {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder = Self::choose_array_encoder(
-                        arrays,
+                        // We need to pass arrays to this method to figure out what kind of compression to
+                        // use but we haven't actually calculated the indices yet.  For now, we just assume
+                        // worst case and use the full range.  In the future maybe we can pass in statistics
+                        // instead of the actual data
+                        &[Arc::new(UInt8Array::from_iter_values(0_u8..255_u8))],
                         &DataType::UInt8,
                         data_size,
                         false,
