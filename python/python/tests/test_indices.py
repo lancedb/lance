@@ -76,6 +76,7 @@ def test_ivf_centroids_cuda(rand_dataset):
     assert len(ivf.centroids) == NUM_PARTITIONS
 
 
+@pytest.mark.cuda
 def test_ivf_centroids_mostly_null_cuda(mostly_null_dataset):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
         sample_rate=16, accelerator="cuda"
