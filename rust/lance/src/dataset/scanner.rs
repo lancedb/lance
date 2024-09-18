@@ -46,7 +46,6 @@ use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, Index};
-use log::debug;
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
@@ -1111,8 +1110,6 @@ impl Scanner {
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
-
-        debug!("Execution plan:\n{:?}", plan);
 
         Ok(plan)
     }
