@@ -283,6 +283,29 @@ impl LanceBuffer {
     pub fn copy_array<const N: usize>(array: [u8; N]) -> Self {
         Self::Owned(Vec::from(array))
     }
+
+    /// Returns a new [LanceBuffer] that is a slice of this buffer starting at `offset`,
+    /// with `length` bytes.
+    /// Doing so allows the same memory region to be shared between lance buffers.
+    /// # Panics
+    /// Panics if `(offset + length)` is larger than the existing length.
+    pub fn slice_with_length(&self, offset: usize, length: usize) -> Self {
+        let original_buffer_len = match self {
+            Self::Borrowed(buffer) => buffer.len(),
+            Self::Owned(buffer) => buffer.len(),
+        };
+        assert!(
+            offset.saturating_add(length) <= original_buffer_len,
+            "the offset of the new Buffer cannot exceed the existing length"
+        );
+        match self {
+            Self::Borrowed(buffer) => Self::Borrowed(buffer.slice_with_length(offset, length)),
+            // A copy happened during `Buffer::from_slice_ref`
+            Self::Owned(buffer) => {
+                Self::Borrowed(Buffer::from_slice_ref(&buffer[offset..offset + length]))
+            }
+        }
+    }
 }
 
 impl AsRef<[u8]> for LanceBuffer {

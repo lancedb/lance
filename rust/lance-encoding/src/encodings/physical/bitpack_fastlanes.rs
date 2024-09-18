@@ -276,7 +276,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 );
                 let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
                     bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::Owned(output),
+                    data: LanceBuffer::reinterpret_vec(output),
                     num_values: unpacked.num_values,
                 });
 
@@ -339,7 +339,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 );
                 let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
                     bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    data: LanceBuffer::reinterpret_vec(output),
                     num_values: unpacked.num_values,
                 });
                 Ok(EncodedArray {
@@ -401,7 +401,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 );
                 let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
                     bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    data: LanceBuffer::reinterpret_vec(output),
                     num_values: unpacked.num_values,
                 });
 
@@ -464,7 +464,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 );
                 let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
                     bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
+                    data: LanceBuffer::reinterpret_vec(output),
                     num_values: unpacked.num_values,
                 });
 
@@ -589,80 +589,39 @@ struct BitpackedForNonNegPageDecoder {
 impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
     fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         match self.uncompressed_bits_per_value {
-            8 => {
-                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
-                let mut output = Vec::with_capacity(num_rows as usize);
-                output.extend_from_slice(
-                    &self.decompressed_buf[rows_to_skip as usize..][..num_rows as usize],
-                );
-                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-                    data: LanceBuffer::from(output),
-                    bits_per_value: self.uncompressed_bits_per_value,
-                    num_values: num_rows,
-                }))
-            }
+            8 => Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: self
+                    .decompressed_buf
+                    .slice_with_length(rows_to_skip as usize, num_rows as usize),
+                bits_per_value: self.uncompressed_bits_per_value,
+                num_values: num_rows,
+            })),
 
-            16 => {
-                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
-                let mut output: Vec<u16> = Vec::with_capacity(num_rows as usize);
-                unsafe {
-                    output.set_len(num_rows as usize);
-                    std::ptr::copy_nonoverlapping(
-                        self.decompressed_buf
-                            .as_ptr()
-                            .add(2 * rows_to_skip as usize),
-                        output.as_ptr() as *mut u8,
-                        num_rows as usize * 2,
-                    );
-                }
-                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
-                    bits_per_value: self.uncompressed_bits_per_value,
-                    num_values: num_rows,
-                }))
-            }
+            16 => Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: self
+                    .decompressed_buf
+                    .slice_with_length((rows_to_skip * 2) as usize, (num_rows * 2) as usize),
+                bits_per_value: self.uncompressed_bits_per_value,
+                num_values: num_rows,
+            })),
 
-            32 => {
-                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
-                let mut output: Vec<u32> = Vec::with_capacity(num_rows as usize);
-                unsafe {
-                    output.set_len(num_rows as usize);
-                    std::ptr::copy_nonoverlapping(
-                        self.decompressed_buf
-                            .as_ptr()
-                            .add(4 * rows_to_skip as usize),
-                        output.as_ptr() as *mut u8,
-                        num_rows as usize * 4,
-                    );
-                }
-                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
-                    bits_per_value: self.uncompressed_bits_per_value,
-                    num_values: num_rows,
-                }))
-            }
+            32 => Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: self
+                    .decompressed_buf
+                    .slice_with_length((rows_to_skip * 4) as usize, (num_rows * 4) as usize),
+                bits_per_value: self.uncompressed_bits_per_value,
+                num_values: num_rows,
+            })),
 
-            64 => {
-                // I did an extra copy here, not sure how to avoid it and whether it's safe to avoid it
-                let mut output: Vec<u64> = Vec::with_capacity(num_rows as usize);
-                unsafe {
-                    output.set_len(num_rows as usize);
-                    std::ptr::copy_nonoverlapping(
-                        self.decompressed_buf
-                            .as_ptr()
-                            .add(8 * rows_to_skip as usize),
-                        output.as_ptr() as *mut u8,
-                        num_rows as usize * 8,
-                    );
-                }
-                Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-                    data: LanceBuffer::reinterpret_vec(output).to_owned(),
-                    bits_per_value: self.uncompressed_bits_per_value,
-                    num_values: num_rows,
-                }))
-            }
+            64 => Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: self
+                    .decompressed_buf
+                    .slice_with_length((rows_to_skip * 8) as usize, (num_rows * 8) as usize),
+                bits_per_value: self.uncompressed_bits_per_value,
+                num_values: num_rows,
+            })),
             _ => {
-                panic!("Unsupported data type");
+                unreachable!("bitpacked_for_non_neg_decode only supports 8, 16, 32, 64 uncompressed_bits_per_value")
             }
         }
     }
