@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::FromJString;
 use crate::utils::{extract_write_params, get_index_params};
@@ -23,7 +23,7 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
-use jni::objects::{JString, JValue};
+use jni::objects::{JMap, JString, JValue};
 use jni::sys::jlong;
 use jni::sys::{jboolean, jint};
 use jni::{objects::JObject, JNIEnv};
@@ -36,6 +36,7 @@ use lance::table::format::Index;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
+use std::collections::HashMap;
 use std::iter::empty;
 use std::sync::Arc;
 
@@ -62,6 +63,7 @@ impl BlockingDataset {
         block_size: Option<i32>,
         index_cache_size: i32,
         metadata_cache_size: i32,
+        storage_options: HashMap<String, String>,
     ) -> Result<Self> {
         let params = ReadParams {
             index_cache_size: index_cache_size as usize,
@@ -78,6 +80,7 @@ impl BlockingDataset {
         if let Some(ver) = version {
             builder = builder.with_version(ver as u64);
         }
+        builder = builder.with_storage_options(storage_options);
 
         let inner = RT.block_on(builder.load())?;
         Ok(Self { inner })
@@ -386,6 +389,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size: jint,
     metadata_cache_size: jint,
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -395,7 +399,8 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_openNative<'local>(
             version_obj,
             block_size_obj,
             index_cache_size,
-            metadata_cache_size
+            metadata_cache_size,
+            storage_options_obj
         )
     )
 }
@@ -407,16 +412,33 @@ fn inner_open_native<'local>(
     block_size_obj: JObject, // Optional<Integer>
     index_cache_size: jint,
     metadata_cache_size: jint,
+    storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let path_str: String = path.extract(env)?;
     let version = env.get_int_opt(&version_obj)?;
     let block_size = env.get_int_opt(&block_size_obj)?;
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+
+        Ok::<_, Error>(map)
+    })?;
     let dataset = BlockingDataset::open(
         &path_str,
         version,
         block_size,
         index_cache_size,
         metadata_cache_size,
+        storage_options,
     )?;
     dataset.into_java(env)
 }
