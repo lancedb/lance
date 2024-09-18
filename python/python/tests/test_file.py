@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -341,3 +343,33 @@ def test_writer_maintains_order(tmp_path):
         reader = LanceFileReader(str(path))
         result = reader.read_all().to_table()
         assert result == table
+
+
+def test_compression(tmp_path):
+    # 10Ki strings, which should be highly compressible, but not eligible for dictionary
+    compressible_strings = [f"compress_me_please-{i}" for i in range(10 * 1024)]
+    table_default = pa.table({"compressible_strings": compressible_strings})
+
+    schema_compress = pa.schema(
+        [
+            pa.field(
+                "compressible_strings",
+                pa.string(),
+                metadata={"lance-encoding:compression": "zstd"},
+            )
+        ]
+    )
+    table_compress = pa.table(
+        {"compressible_strings": compressible_strings}, schema=schema_compress
+    )
+
+    with LanceFileWriter(str(tmp_path / "default.lance")) as writer:
+        writer.write_batch(table_default)
+
+    with LanceFileWriter(str(tmp_path / "compress.lance"), schema_compress) as writer:
+        writer.write_batch(table_compress)
+
+    size_default = os.path.getsize(tmp_path / "default.lance")
+    size_compress = os.path.getsize(tmp_path / "compress.lance")
+
+    assert size_compress < size_default

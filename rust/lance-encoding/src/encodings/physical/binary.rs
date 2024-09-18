@@ -27,6 +27,8 @@ use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
 use lance_core::Result;
 
+use super::block_compress::{BufferCompressor, CompressionScheme, GeneralBufferCompressor};
+
 struct IndicesNormalizer {
     indices: Vec<u64>,
     validity: BooleanBufferBuilder,
@@ -337,11 +339,22 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 #[derive(Debug)]
 pub struct BinaryEncoder {
     indices_encoder: Box<dyn ArrayEncoder>,
+    compression_scheme: Option<CompressionScheme>,
+    buffer_compressor: Option<Box<dyn BufferCompressor>>,
 }
 
 impl BinaryEncoder {
-    pub fn new(indices_encoder: Box<dyn ArrayEncoder>) -> Self {
-        Self { indices_encoder }
+    pub fn new(
+        indices_encoder: Box<dyn ArrayEncoder>,
+        compression_scheme: Option<CompressionScheme>,
+    ) -> Self {
+        let buffer_compressor = compression_scheme
+            .map(|scheme| GeneralBufferCompressor::get_compressor(&scheme.to_string()));
+        Self {
+            indices_encoder,
+            compression_scheme,
+            buffer_compressor,
+        }
     }
 
     // In 2.1 we will materialize nulls higher up (in the primitive encoder).  Unfortunately,
@@ -438,7 +451,7 @@ impl ArrayEncoder for BinaryEncoder {
         data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
-        let (data, nulls) = match data {
+        let (mut data, nulls) = match data {
             DataBlock::Nullable(nullable) => {
                 let data = nullable.data.as_variable_width().unwrap();
                 (data, Some(nullable.nulls))
@@ -467,6 +480,12 @@ impl ArrayEncoder for BinaryEncoder {
 
         assert!(encoded_indices_data.bits_per_value <= 64);
 
+        if let Some(buffer_compressor) = &self.buffer_compressor {
+            let mut compressed_data = Vec::with_capacity(data.data.len());
+            buffer_compressor.compress(&data.data, &mut compressed_data)?;
+            data.data = LanceBuffer::Owned(compressed_data);
+        }
+
         let data = DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: encoded_indices_data.bits_per_value as u8,
             offsets: encoded_indices_data.data,
@@ -476,9 +495,12 @@ impl ArrayEncoder for BinaryEncoder {
 
         let bytes_buffer_index = *buffer_index;
         *buffer_index += 1;
-        // TODO: Do we really need a "nested encoding" here?
-        let bytes_encoding =
-            ProtobufUtils::flat_encoding(/*bits_per_value=*/ 8, bytes_buffer_index, None);
+
+        let bytes_encoding = ProtobufUtils::flat_encoding(
+            /*bits_per_value=*/ 8,
+            bytes_buffer_index,
+            self.compression_scheme,
+        );
 
         let encoding =
             ProtobufUtils::binary(encoded_indices.encoding, bytes_encoding, null_adjustment);
