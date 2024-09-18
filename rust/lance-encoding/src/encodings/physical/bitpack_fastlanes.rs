@@ -1,4 +1,4 @@
-// spdx-license-identifier: apache-2.0
+// SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use bytemuck::cast_slice;
 use fastlanes::BitPacking;
 
 // Compute the compressed_bit_width for a given array of integers
-// todo: compute all statistics before encoding 
+// todo: compute all statistics before encoding
 // todo: see how to use rust macro to rewrite this function
 pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
     // is it possible to get here?
@@ -861,7 +861,9 @@ fn bitpacked_for_non_neg_decode(
             }
             LanceBuffer::reinterpret_vec(decompressed).to_owned()
         }
-        _ => unreachable!("bitpacked_for_non_neg_decode only supports 8, 16, 32, 64 uncompressed_bits_per_value"),
+        _ => unreachable!(
+            "bitpacked_for_non_neg_decode only supports 8, 16, 32, 64 uncompressed_bits_per_value"
+        ),
     }
 }
 
@@ -1486,9 +1488,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(1))
             .unwrap()
             .column(0)
@@ -1496,9 +1496,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(20))
             .unwrap()
             .column(0)
@@ -1506,9 +1504,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(50))
             .unwrap()
             .column(0)
@@ -1516,9 +1512,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(100))
             .unwrap()
             .column(0)
@@ -1526,9 +1520,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(1000))
             .unwrap()
             .column(0)
@@ -1536,9 +1528,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(1024))
             .unwrap()
             .column(0)
@@ -1546,9 +1536,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(2000))
             .unwrap()
             .column(0)
@@ -1556,9 +1544,7 @@ mod tests {
         check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
 
         let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(
-                &DataType::Int16,
-            ))
+            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
             .into_batch_rows(RowCount::from(3000))
             .unwrap()
             .column(0)
