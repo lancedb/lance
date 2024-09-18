@@ -67,6 +67,10 @@ impl FileMetadataCache {
         }
     }
 
+    pub fn size(&self) -> usize {
+        self.cache.entry_count() as usize
+    }
+
     pub fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
         self.cache
             .get(&(path.to_owned(), TypeId::of::<T>()))

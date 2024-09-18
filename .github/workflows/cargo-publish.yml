@@ -33,9 +33,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: Checkout specified tag
+      - name: Verify and checkout specified tag
         if: github.event_name == 'workflow_dispatch'
-        run: git checkout ${{ github.event.inputs.tag }}
+        run: |
+          git fetch --all --tags
+          if git rev-parse ${{ github.event.inputs.tag }} >/dev/null 2>&1; then
+            git checkout ${{ github.event.inputs.tag }}
+            echo "Successfully checked out tag ${{ github.event.inputs.tag }}"
+          else
+            echo "Error: Tag ${{ github.event.inputs.tag }} does not exist"
+            echo "Available tags:"
+            git tag -l
+            exit 1
+          fi
       - name: Install dependencies
         run: |
           sudo apt update
