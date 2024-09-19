@@ -733,6 +733,7 @@ impl FileReader {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn do_take_rows(
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,

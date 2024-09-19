@@ -124,9 +124,7 @@ impl FileMetadataCache {
     }
 
     pub fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
-        let Some(cache) = self.cache.as_ref() else {
-            return None;
-        };
+        let cache = self.cache.as_ref()?;
         let temp: Path;
         let path = if let Some(base_path) = &self.base_path {
             temp = base_path.child_path(path);

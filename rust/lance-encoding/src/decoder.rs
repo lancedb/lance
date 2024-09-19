@@ -349,10 +349,7 @@ impl DecoderMiddlewareChain {
 
     /// Obtain a cursor into the chain that can be used to create
     /// field schedulers
-    pub(crate) fn cursor<'a>(
-        &'a self,
-        io: Arc<dyn EncodingsIo>,
-    ) -> DecoderMiddlewareChainCursor<'a> {
+    pub(crate) fn cursor(&self, io: Arc<dyn EncodingsIo>) -> DecoderMiddlewareChainCursor<'_> {
         DecoderMiddlewareChainCursor {
             chain: self,
             io,
@@ -881,6 +878,7 @@ fn root_column(num_rows: u64) -> ColumnInfo {
 impl DecodeBatchScheduler {
     /// Creates a new decode scheduler with the expected schema and the column
     /// metadata of the file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn try_new<'a>(
         schema: &'a Schema,
         column_indices: &[u32],
@@ -898,7 +896,7 @@ impl DecodeBatchScheduler {
         let root_fields = arrow_schema.fields().clone();
         let mut columns = Vec::with_capacity(column_infos.len() + 1);
         columns.push(Arc::new(root_column(num_rows)));
-        columns.extend(column_infos.iter().map(|col| col.clone()));
+        columns.extend(column_infos.iter().cloned());
         let adjusted_column_indices = [0_u32]
             .into_iter()
             .chain(column_indices.iter().map(|i| *i + 1))
@@ -1305,8 +1303,8 @@ pub enum RequestedRows {
 impl RequestedRows {
     pub fn num_rows(&self) -> u64 {
         match self {
-            RequestedRows::Ranges(ranges) => ranges.iter().map(|r| r.end - r.start).sum(),
-            RequestedRows::Indices(indices) => indices.len() as u64,
+            Self::Ranges(ranges) => ranges.iter().map(|r| r.end - r.start).sum(),
+            Self::Indices(indices) => indices.len() as u64,
         }
     }
 }

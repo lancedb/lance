@@ -121,7 +121,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let file_metadata_cache = session
             .upgrade()
             .map(|sess| sess.file_metadata_cache.clone())
-            .unwrap_or_else(|| FileMetadataCache::no_cache());
+            .unwrap_or_else(FileMetadataCache::no_cache);
         let index_reader = FileReader::try_open(
             scheduler
                 .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))

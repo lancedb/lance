@@ -314,6 +314,7 @@ fn decode_offsets(
 ///
 /// This task does not wait for the items data.  That happens on the main decode loop (unless
 /// we have list of list of ... in which case it happens in the outer indirect decode loop)
+#[allow(clippy::too_many_arguments)]
 async fn indirect_schedule_task(
     mut offsets_decoder: Box<dyn LogicalPageDecoder>,
     list_requests: Vec<ListRequest>,
