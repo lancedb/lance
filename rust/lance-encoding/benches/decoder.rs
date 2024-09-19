@@ -60,56 +60,13 @@ const ENCODING_OPTIONS: EncodingOptions = EncodingOptions {
     keep_original_array: true,
 };
 
-/* 
-fn bench_decode2(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut group = c.benchmark_group("decode_uint8");
-    group.measurement_time(std::time::Duration::new(12, 0));
-    let array = UInt8Array::from(vec![5; 1024 * 1024 * 1024]);
-    let data = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "uint8",
-            DataType::UInt8,
-            false,
-        )])),
-        vec![Arc::new(array)],
-    )
-    .unwrap();
-    let lance_schema =
-        Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
-    let input_bytes = data.get_array_memory_size();
-    group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
-    let encoding_strategy = CoreFieldEncodingStrategy::default();
-    let encoded = rt
-        .block_on(encode_batch(
-            &data,
-            lance_schema,
-            &encoding_strategy,
-            &ENCODING_OPTIONS,
-        ))
-        .unwrap();
-    group.bench_function("uint8", |b| {
-        b.iter(|| {
-            let batch = rt
-                .block_on(lance_encoding::decoder::decode_batch(
-                    &encoded,
-                    &FilterExpression::no_filter(),
-                    &DecoderMiddlewareChain::default(),
-                ))
-                .unwrap();
-            assert_eq!(data.num_rows(), batch.num_rows());
-        })
-    });
-}
-*/
-
 fn bench_decode(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
     for data_type in PRIMITIVE_TYPES {
         let data = lance_datagen::gen()
             .anon_col(lance_datagen::array::rand_type(data_type))
-            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024 * 1024))
+            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
             .unwrap();
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());

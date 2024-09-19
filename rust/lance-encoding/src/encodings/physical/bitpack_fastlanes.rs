@@ -194,6 +194,74 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
     res
 }
 
+macro_rules! encode_fixed_width {
+    ($self:expr, $unpacked:expr, $data_type:ty, $buffer_index:expr) => {{
+        let num_chunks = ($unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
+        let num_full_chunks = $unpacked.num_values / ELEMS_PER_CHUNK;
+        let uncompressed_bit_width = std::mem::size_of::<$data_type>() as u64 * 8;
+        
+        // the output vector type is the same as the input type, for example, when input is u16, output is Vec<u16>
+        let packed_chunk_size = 1024 * $self.compressed_bit_width as usize / uncompressed_bit_width as usize;
+
+        let input_slice = $unpacked.data.borrow_to_typed_slice::<$data_type>();
+        let input = input_slice.as_ref();
+
+        let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
+
+        // Loop over all but the last chunk.
+        (0..num_full_chunks).for_each(|i| {
+            let start_elem = (i * ELEMS_PER_CHUNK) as usize;
+
+            let output_len = output.len();
+            unsafe {
+                output.set_len(output_len + packed_chunk_size);
+                BitPacking::unchecked_pack(
+                    $self.compressed_bit_width,
+                    &input[start_elem..][..ELEMS_PER_CHUNK as usize],
+                    &mut output[output_len..][..packed_chunk_size],
+                );
+            }
+        });
+
+        if num_chunks != num_full_chunks {
+            let last_chunk_elem_num = $unpacked.num_values % ELEMS_PER_CHUNK;
+            let mut last_chunk = vec![0 as $data_type; ELEMS_PER_CHUNK as usize];
+            last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
+                &input[$unpacked.num_values as usize - last_chunk_elem_num as usize..],
+            );
+
+            let output_len = output.len();
+            unsafe {
+                output.set_len(output_len + packed_chunk_size);
+                BitPacking::unchecked_pack(
+                    $self.compressed_bit_width,
+                    &last_chunk,
+                    &mut output[output_len..][..packed_chunk_size],
+                );
+            }
+        }
+
+        let bitpacked_for_non_neg_buffer_index = *$buffer_index;
+        *$buffer_index += 1;
+
+        let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
+            $self.compressed_bit_width as u64,
+            uncompressed_bit_width,
+            bitpacked_for_non_neg_buffer_index,
+        );
+        let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: $self.compressed_bit_width as u64,
+            data: LanceBuffer::reinterpret_vec(output),
+            num_values: $unpacked.num_values,
+        });
+
+        Ok(EncodedArray {
+            data: packed,
+            encoding,
+        })
+    }};
+}
+
 #[derive(Debug)]
 pub struct BitpackedForNonNegArrayEncoder {
     pub compressed_bit_width: usize,
@@ -222,268 +290,13 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 location: location!(),
             });
         };
+    
         match _data_type {
-            DataType::UInt8 | DataType::Int8 => {
-                let num_chunks = (unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
-                let num_full_chunks = unpacked.num_values / ELEMS_PER_CHUNK;
-                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
-                // the output type is the same as the input type
-                // 1024 * compressed_bit_width / 8
-                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
-
-                let input_slice = unpacked.data.borrow_to_typed_slice::<u8>();
-                let input = input_slice.as_ref();
-
-                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
-
-                // Loop over all but the last chunk.
-                (0..num_full_chunks).for_each(|i| {
-                    let start_elem = (i * ELEMS_PER_CHUNK) as usize;
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output_len + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &input[start_elem..][..ELEMS_PER_CHUNK as usize],
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    };
-                });
-
-                if num_chunks != num_full_chunks {
-                    let last_chunk_elem_num = unpacked.num_values % ELEMS_PER_CHUNK;
-                    let mut last_chunk = vec![0u8; ELEMS_PER_CHUNK as usize];
-                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
-                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
-                    );
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output.len() + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &last_chunk,
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    }
-                }
-                let bitpacked_for_non_neg_buffer_index = *buffer_index;
-                *buffer_index += 1;
-
-                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
-                    self.compressed_bit_width as u64,
-                    _data_type.byte_width() as u64 * 8,
-                    bitpacked_for_non_neg_buffer_index,
-                );
-                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
-                    bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output),
-                    num_values: unpacked.num_values,
-                });
-
-                Ok(EncodedArray {
-                    data: packed,
-                    encoding,
-                })
-            }
-
-            DataType::UInt16 | DataType::Int16 => {
-                let num_chunks = (unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
-                let num_full_chunks = unpacked.num_values / ELEMS_PER_CHUNK;
-                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
-                // the output type is the same as the input type
-                // 1024 * compressed_bit_width / 8
-                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
-
-                let input_slice = unpacked.data.borrow_to_typed_slice::<u16>();
-                let input = input_slice.as_ref();
-
-                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
-
-                // Loop over all but the last chunk.
-                (0..num_full_chunks).for_each(|i| {
-                    let start_elem = (i * ELEMS_PER_CHUNK) as usize;
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output_len + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &input[start_elem..][..ELEMS_PER_CHUNK as usize],
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    };
-                });
-
-                if num_chunks != num_full_chunks {
-                    let last_chunk_elem_num = unpacked.num_values % ELEMS_PER_CHUNK;
-                    let mut last_chunk = vec![0u16; ELEMS_PER_CHUNK as usize];
-                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
-                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
-                    );
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output.len() + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &last_chunk,
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    }
-                }
-                let bitpacked_for_non_neg_buffer_index = *buffer_index;
-                *buffer_index += 1;
-
-                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
-                    self.compressed_bit_width as u64,
-                    _data_type.byte_width() as u64 * 8,
-                    bitpacked_for_non_neg_buffer_index,
-                );
-                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
-                    bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output),
-                    num_values: unpacked.num_values,
-                });
-
-                Ok(EncodedArray {
-                    data: packed,
-                    encoding,
-                })
-            }
-
-            DataType::UInt32 | DataType::Int32 => {
-                let num_chunks = (unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
-                let num_full_chunks = unpacked.num_values / ELEMS_PER_CHUNK;
-                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
-                // the output type is the same as the input type
-                // 1024 * compressed_bit_width / 8
-                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
-
-                let input_slice = unpacked.data.borrow_to_typed_slice::<u32>();
-                let input = input_slice.as_ref();
-
-                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
-
-                // Loop over all but the last chunk.
-                (0..num_full_chunks).for_each(|i| {
-                    let start_elem = (i * ELEMS_PER_CHUNK) as usize;
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output_len + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &input[start_elem..][..ELEMS_PER_CHUNK as usize],
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    };
-                });
-
-                if num_chunks != num_full_chunks {
-                    let last_chunk_elem_num = unpacked.num_values % ELEMS_PER_CHUNK;
-                    let mut last_chunk = vec![0u32; ELEMS_PER_CHUNK as usize];
-                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
-                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
-                    );
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output.len() + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &last_chunk,
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    }
-                }
-                let bitpacked_for_non_neg_buffer_index = *buffer_index;
-                *buffer_index += 1;
-
-                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
-                    self.compressed_bit_width as u64,
-                    _data_type.byte_width() as u64 * 8,
-                    bitpacked_for_non_neg_buffer_index,
-                );
-                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
-                    bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output),
-                    num_values: unpacked.num_values,
-                });
-
-                Ok(EncodedArray {
-                    data: packed,
-                    encoding,
-                })
-            }
-
-            DataType::UInt64 | DataType::Int64 => {
-                let num_chunks = (unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
-                let num_full_chunks = unpacked.num_values / ELEMS_PER_CHUNK;
-                // there is no ceiling needed to calculate the size of the packed chunk because 1024 has divisor 8
-                // the output type is the same as the input type
-                // 1024 * compressed_bit_width / 8
-                let packed_chunk_size = 128 * self.compressed_bit_width / _data_type.byte_width();
-
-                let input_slice = unpacked.data.borrow_to_typed_slice::<u64>();
-                let input = input_slice.as_ref();
-
-                let mut output = Vec::with_capacity(num_chunks as usize * packed_chunk_size);
-
-                // Loop over all but the last chunk.
-                (0..num_full_chunks).for_each(|i| {
-                    let start_elem = (i * ELEMS_PER_CHUNK) as usize;
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output_len + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &input[start_elem..][..ELEMS_PER_CHUNK as usize],
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    };
-                });
-
-                if num_chunks != num_full_chunks {
-                    let last_chunk_elem_num = unpacked.num_values % ELEMS_PER_CHUNK;
-                    let mut last_chunk = vec![0u64; ELEMS_PER_CHUNK as usize];
-                    last_chunk[..last_chunk_elem_num as usize].clone_from_slice(
-                        &input[unpacked.num_values as usize - last_chunk_elem_num as usize..],
-                    );
-
-                    let output_len = output.len();
-                    unsafe {
-                        output.set_len(output.len() + packed_chunk_size);
-                        BitPacking::unchecked_pack(
-                            self.compressed_bit_width,
-                            &last_chunk,
-                            &mut output[output_len..][..packed_chunk_size],
-                        );
-                    }
-                }
-                let bitpacked_for_non_neg_buffer_index = *buffer_index;
-                *buffer_index += 1;
-
-                let encoding = ProtobufUtils::bitpacked_for_non_neg_encoding(
-                    self.compressed_bit_width as u64,
-                    _data_type.byte_width() as u64 * 8,
-                    bitpacked_for_non_neg_buffer_index,
-                );
-                let packed = DataBlock::FixedWidth(FixedWidthDataBlock {
-                    bits_per_value: self.compressed_bit_width as u64,
-                    data: LanceBuffer::reinterpret_vec(output),
-                    num_values: unpacked.num_values,
-                });
-
-                Ok(EncodedArray {
-                    data: packed,
-                    encoding,
-                })
-            }
-
-            _ => todo!(),
+            DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
+            DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
+            DataType::UInt32 | DataType::Int32 => encode_fixed_width!(self, unpacked, u32, buffer_index),
+            DataType::UInt64 | DataType::Int64 => encode_fixed_width!(self, unpacked, u64, buffer_index),
+            _ => unreachable!("BitpackedForNonNegArrayEncoder only supports data types of UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64"),
         }
     }
 }
