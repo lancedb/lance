@@ -143,6 +143,10 @@ jobs:
         with:
           workspaces: python
           prefix-key: "manylinux2014" # use this to flush the cache
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y pkg-config python3-h5py
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
