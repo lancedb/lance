@@ -188,6 +188,9 @@ message Bitpacked {
 
   // Whether or not a sign bit is included in the bitpacked value
   bool signed = 4;
+
+  // Whether or not all value is negative
+  bool all_negative = 5;
 }
 
 // An array encoding for shredded structs that will never be null

@@ -106,6 +106,7 @@ fn get_bitpacked_buffer_decoder(
         encoding.uncompressed_bits_per_value,
         buffer_offset,
         encoding.signed,
+        encoding.all_negative,
     ))
 }
 
