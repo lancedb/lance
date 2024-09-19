@@ -121,7 +121,8 @@ jobs:
         run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
-    runs-on: ubuntu-2404-4x-arm64
+    #runs-on: warp-ubuntu-latest-arm64-4x
+    runs-on: buildjet-4vcpu-ubuntu-2204-arm
     name: Python Linux 3.${{ matrix.python-minor-version }} ARM
     strategy:
       matrix:
@@ -136,17 +137,17 @@ jobs:
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: 3.${{ matrix.python-minor-version }}
+        run: |
+          sudo apt update
+          sudo apt install -y -qq wget software-properties-common
+          sudo add-apt-repository ppa:deadsnakes/ppa
+          sudo apt install -y python3.${{ matrix.python-minor-version }}
+          sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
+          sudo apt install -y python3-pip python3.${{ matrix.python-minor-version }}-distutils
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
           prefix-key: "manylinux2014" # use this to flush the cache
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y pkg-config python3-h5py
       - uses: ./.github/workflows/build_linux_wheel
         with:
           arm-build: "true"
