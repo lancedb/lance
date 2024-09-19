@@ -29,7 +29,7 @@ env:
 
 jobs:
   linux-build:
-    runs-on: ubuntu-2404-4x-x64
+    runs-on: "ubuntu-24.04"
     timeout-minutes: 45
     strategy:
       matrix:
