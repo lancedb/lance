@@ -46,7 +46,6 @@ use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, Index};
-use log::debug;
 use roaring::RoaringBitmap;
 use tracing::{info_span, instrument, Span};
 
@@ -66,7 +65,14 @@ use snafu::{location, Location};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-pub const DEFAULT_BATCH_SIZE: usize = 8192;
+const BATCH_SIZE_FALLBACK: usize = 8192;
+// For backwards compatibility / historical reasons we re-calculate the default batch size
+// on each call
+pub fn get_default_batch_size() -> Option<usize> {
+    std::env::var("LANCE_DEFAULT_BATCH_SIZE")
+        .map(|val| Some(val.parse().unwrap()))
+        .unwrap_or(None)
+}
 
 pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 lazy_static::lazy_static! {
@@ -262,23 +268,14 @@ impl Scanner {
         // 64KB, this is 16K rows. For local file systems, the default block size
         // is just 4K, which would mean only 1K rows, which might be a little small.
         // So we use a default minimum of 8K rows.
-        std::env::var("LANCE_DEFAULT_BATCH_SIZE")
-            .map(|bs| {
-                bs.parse().unwrap_or_else(|_| {
-                    panic!(
-                        "The value of LANCE_DEFAULT_BATCH_SIZE ({}) is not a valid batch size",
-                        bs
-                    )
-                })
+        get_default_batch_size().unwrap_or_else(|| {
+            self.batch_size.unwrap_or_else(|| {
+                std::cmp::max(
+                    self.dataset.object_store().block_size() / 4,
+                    BATCH_SIZE_FALLBACK,
+                )
             })
-            .unwrap_or_else(|_| {
-                self.batch_size.unwrap_or_else(|| {
-                    std::cmp::max(
-                        self.dataset.object_store().block_size() / 4,
-                        DEFAULT_BATCH_SIZE,
-                    )
-                })
-            })
+        })
     }
 
     fn ensure_not_fragment_scan(&self) -> Result<()> {
@@ -1113,8 +1110,6 @@ impl Scanner {
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
-
-        debug!("Execution plan:\n{:?}", plan);
 
         Ok(plan)
     }

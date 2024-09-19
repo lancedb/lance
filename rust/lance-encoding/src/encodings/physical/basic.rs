@@ -160,7 +160,7 @@ impl PrimitivePageDecoder for BasicPageDecoder {
         match &self.mode {
             DataNullStatus::Some(decoders) => {
                 let validity = decoders.validity.decode(rows_to_skip, num_rows)?;
-                let validity = validity.as_fixed_width()?;
+                let validity = validity.as_fixed_width().unwrap();
                 let values = decoders.values.decode(rows_to_skip, num_rows)?;
                 Ok(DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(values),

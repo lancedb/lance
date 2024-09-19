@@ -449,6 +449,22 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     with pytest.raises(ValueError, match="Limit must be non-negative"):
         assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
 
+    full_ds_version = dataset.version
+    dataset.delete("a % 2 = 0")
+    filt_table = table.filter((pa.compute.bit_wise_and(pa.compute.field("a"), 1)) != 0)
+    assert (
+        dataset.to_table(offset=10).combine_chunks()
+        == filt_table.slice(10).combine_chunks()
+    )
+
+    dataset = dataset.checkout_version(full_ds_version)
+    dataset.restore()
+    dataset.delete("a > 2 AND a < 7")
+    print(dataset.to_table(offset=3, limit=1))
+    filt_table = table.slice(7, 1)
+
+    assert dataset.to_table(offset=3, limit=1) == filt_table
+
 
 def test_relative_paths(tmp_path: Path):
     # relative paths get coerced to the full absolute path
@@ -894,6 +910,33 @@ def test_merge_with_commit(tmp_path: Path):
     tbl = dataset.to_table()
 
     assert tbl == expected
+
+
+def test_merge_batch_size(tmp_path: Path):
+    # Create dataset with 10 fragments with 100 rows each
+    table = pa.table({"a": range(1000)})
+    for batch_size in [1, 10, 100, 1000]:
+        ds_path = str(tmp_path / str(batch_size))
+        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
+        fragments = []
+
+        def mutate(batch):
+            assert batch.num_rows <= batch_size
+            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
+
+        for frag in dataset.get_fragments():
+            merged, schema = frag.merge_columns(mutate, batch_size=batch_size)
+            fragments.append(merged)
+
+        merge = lance.LanceOperation.Merge(fragments, schema)
+        dataset = lance.LanceDataset.commit(
+            ds_path, merge, read_version=dataset.version
+        )
+
+        dataset.validate()
+        tbl = dataset.to_table()
+        expected = pa.table({"a": range(1000), "b": range(1000)})
+        assert tbl == expected
 
 
 def test_merge_with_schema_holes(tmp_path: Path):

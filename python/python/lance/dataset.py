@@ -24,6 +24,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Set,
     TypedDict,
     Union,
 )
@@ -2232,6 +2233,27 @@ class LanceOperation:
             groups = [group._to_inner() for group in self.groups]
             rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
             return _Operation.rewrite(groups, rewritten_indices)
+
+    @dataclass
+    class CreateIndex(BaseOperation):
+        """
+        Operation that creates an index on the dataset.
+        """
+
+        uuid: str
+        name: str
+        fields: List[int]
+        dataset_version: int
+        fragment_ids: Set[int]
+
+        def _to_inner(self):
+            return _Operation.create_index(
+                self.uuid,
+                self.name,
+                self.fields,
+                self.dataset_version,
+                self.fragment_ids,
+            )
 
 
 class ScannerBuilder:

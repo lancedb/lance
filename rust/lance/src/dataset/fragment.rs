@@ -1132,6 +1132,7 @@ impl FileFragment {
         &self,
         columns: Option<&[T]>,
         schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
@@ -1160,11 +1161,11 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas)
+        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None).await?;
+        let mut updater = self.updater(Some(&[join_column]), None, None).await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner.collect(batch[join_column].clone()).await?;
@@ -1740,7 +1741,33 @@ impl FragmentReader {
         )
     }
 
-    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+    fn patch_range_for_deletions(&self, range: Range<u32>, dv: &DeletionVector) -> Range<u32> {
+        let mut start = range.start;
+        let mut end = range.end;
+        for val in dv.to_sorted_iter() {
+            if val <= start {
+                start += 1;
+                end += 1;
+            } else if val < end {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        start..end
+    }
+
+    fn do_read_range(
+        &self,
+        mut range: Range<u32>,
+        batch_size: u32,
+        skip_deleted_rows: bool,
+    ) -> Result<ReadBatchFutStream> {
+        if skip_deleted_rows {
+            if let Some(deletion_vector) = self.deletion_vec.as_ref() {
+                range = self.patch_range_for_deletions(range, deletion_vector.as_ref());
+            }
+        }
         self.new_read_impl(
             ReadBatchParams::Range(range.start as usize..range.end as usize),
             batch_size,
@@ -1752,6 +1779,22 @@ impl FragmentReader {
                 )
             },
         )
+    }
+
+    /// Reads a range of rows from the fragment
+    ///
+    /// This function interprets the request as the Xth to the Nth row of the fragment (after deletions)
+    /// and will always return range.len().min(self.num_rows()) rows.
+    pub fn read_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, true)
+    }
+
+    /// Takes a range of rows from the fragment
+    ///
+    /// Unlike [`Self::read_range`], this function will NOT skip deleted rows.  If rows are deleted they will
+    /// be filtered or set to null.  This function may return less than range.len() rows as a result.
+    pub fn take_range(&self, range: Range<u32>, batch_size: u32) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, false)
     }
 
     pub fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
@@ -1766,7 +1809,7 @@ impl FragmentReader {
     // TODO: Move away from this by changing callers to support consuming a stream
     pub async fn legacy_read_range_as_batch(&self, range: Range<usize>) -> Result<RecordBatch> {
         let batches = self
-            .read_range(
+            .take_range(
                 range.start as u32..range.end as u32,
                 DEFAULT_BATCH_READ_SIZE,
             )?
@@ -1988,12 +2031,33 @@ mod tests {
         let fragment = &dataset.get_fragments()[0];
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
 
+        // Test with take_range (all rows addressible)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(fragment.schema(), with_row_id, false, None)
                 .await
                 .unwrap();
             for valid_range in [0..40, 20..40] {
+                reader
+                    .take_range(valid_range, 100)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
+            for invalid_range in [0..41, 41..42] {
+                assert!(reader.take_range(invalid_range, 100).is_err());
+            }
+        }
+
+        // Test with read_range (only non-deleted rows addressible)
+        for with_row_id in [false, true] {
+            let reader = fragment
+                .open(fragment.schema(), with_row_id, false, None)
+                .await
+                .unwrap();
+            for valid_range in [0..20, 0..10, 10..20] {
                 reader
                     .read_range(valid_range, 100)
                     .unwrap()
@@ -2002,7 +2066,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for invalid_range in [0..41, 41..42] {
+            for invalid_range in [0..21, 21..22] {
                 assert!(reader.read_range(invalid_range, 100).is_err());
             }
         }
@@ -2010,7 +2074,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn test_fragment_scan_deletions(
+    async fn test_fragment_take_range_deletions(
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
@@ -2058,7 +2122,7 @@ mod tests {
             let to_batches = |range: Range<u32>| {
                 let batch_size = range.len() as u32;
                 reader
-                    .read_range(range, batch_size)
+                    .take_range(range, batch_size)
                     .unwrap()
                     .buffered(1)
                     .try_collect::<Vec<_>>()
@@ -2088,6 +2152,66 @@ mod tests {
                 &UInt64Array::from_iter_values(20..30)
             );
         }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_range_scan_deletions(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+    ) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let dataset = create_dataset(test_uri, data_storage_version).await;
+
+        let version = dataset.version().version;
+
+        let check = |cond: &'static str, range: Range<u32>, expected: Vec<i32>| async {
+            let mut dataset = dataset.checkout_version(version).await.unwrap();
+            dataset.restore().await.unwrap();
+            dataset.delete(cond).await.unwrap();
+
+            let fragment = &dataset.get_fragments()[0];
+            let reader = fragment
+                .open(dataset.schema(), true, false, None)
+                .await
+                .unwrap();
+
+            // Using batch_size=20 here.  If we use batch_size=range.len() we get
+            // multiple batches because we might have to read from a larger range
+            // to satisfy the request
+            let mut stream = reader.read_range(range, 20).unwrap();
+            let mut batches = Vec::new();
+            while let Some(next) = stream.next().await {
+                batches.push(next.await.unwrap());
+            }
+            let schema = Arc::new(dataset.schema().into());
+            let batch = arrow_select::concat::concat_batches(&schema, batches.iter()).unwrap();
+
+            assert_eq!(batch.num_rows(), expected.len());
+            assert_eq!(
+                batch.column_by_name("i").unwrap().as_ref(),
+                &Int32Array::from(expected)
+            );
+        };
+        // Deleting from the start
+        check("i < 5", 0..2, vec![5, 6]).await;
+        check("i < 5", 0..15, (5..20).collect()).await;
+        // Deleting from the middle
+        check("i >= 5 and i < 15", 7..9, vec![17, 18]).await;
+        check("i >= 5 and i < 15", 3..5, vec![3, 4]).await;
+        check("i >= 5 and i < 15", 3..6, vec![3, 4, 15]).await;
+        check("i >= 5 and i < 15", 5..6, vec![15]).await;
+        check("i >= 5 and i < 15", 5..10, vec![15, 16, 17, 18, 19]).await;
+        check(
+            "i >= 5 and i < 15",
+            0..10,
+            vec![0, 1, 2, 3, 4, 15, 16, 17, 18, 19],
+        )
+        .await;
+        // Deleting from the end
+        check("i >= 15", 10..15, vec![10, 11, 12, 13, 14]).await;
+        check("i >= 15", 0..15, (0..15).collect()).await;
     }
 
     #[rstest]
@@ -2310,7 +2434,7 @@ mod tests {
             }
 
             let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None).await.unwrap();
+            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
@@ -2554,7 +2678,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"]), None).await?;
+        let mut updater = fragment.updater(Some(&["i"]), None, None).await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;

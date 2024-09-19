@@ -364,6 +364,7 @@ class LanceFragment(pa.dataset.Fragment):
         self,
         value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
@@ -390,7 +391,7 @@ class LanceFragment(pa.dataset.Fragment):
         Tuple[FragmentMetadata, LanceSchema]
             A new fragment with the added column(s) and the final schema.
         """
-        updater = self._fragment.updater(columns)
+        updater = self._fragment.updater(columns, batch_size)
 
         while True:
             batch = updater.next()

@@ -11,6 +11,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
+use crate::data::FixedSizeListBlock;
 use crate::format::ProtobufUtils;
 use crate::{
     buffer::LanceBuffer,
@@ -140,11 +141,13 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             }
 
             start_index += bytes_per_field;
-            children.push(DataBlock::FixedWidth(FixedWidthDataBlock {
+            let child_block = FixedWidthDataBlock {
                 data: LanceBuffer::from(field_bytes),
                 bits_per_value: bytes_per_field as u64 * 8,
                 num_values: num_rows,
-            }));
+            };
+            let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
+            children.push(child_block);
         }
         Ok(DataBlock::Struct(StructDataBlock { children }))
     }
@@ -168,7 +171,7 @@ impl ArrayEncoder for PackedStructEncoder {
         data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
-        let struct_data = data.as_struct()?;
+        let struct_data = data.as_struct().unwrap();
 
         let DataType::Struct(child_types) = data_type else {
             panic!("Struct datatype expected");
@@ -191,10 +194,29 @@ impl ArrayEncoder for PackedStructEncoder {
             .unzip();
 
         // Zip together encoded data
-        let fixed_fields = encoded_datas.into_iter().map(|child| {child.as_fixed_width().map_err(|err| Error::InvalidInput {
-                source: format!("Packed struct encoder currently only implemented for fixed-width data blocks: {}", err).into(),
-                location: location!(),
-            })}).collect::<Result<Vec<_>>>()?;
+        //
+        // We can currently encode both FixedWidth and FixedSizeList.  In order
+        // to encode the latter we "flatten" it converting a FixedSizeList into
+        // a FixedWidth with very wide items.
+        let fixed_fields = encoded_datas
+            .into_iter()
+            .map(|child| match child {
+                DataBlock::FixedWidth(fixed) => Ok(fixed),
+                DataBlock::FixedSizeList(fixed_size_list) => {
+                    let flattened = fixed_size_list.try_into_flat().ok_or_else(|| {
+                        Error::invalid_input(
+                            "Packed struct encoder cannot pack nullable fixed-width data blocks",
+                            location!(),
+                        )
+                    })?;
+                    Ok(flattened)
+                }
+                _ => Err(Error::invalid_input(
+                    "Packed struct encoder currently only implemented for fixed-width data blocks",
+                    location!(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let total_bits_per_value = fixed_fields.iter().map(|f| f.bits_per_value).sum::<u64>();
 
         let num_values = fixed_fields[0].num_values;
