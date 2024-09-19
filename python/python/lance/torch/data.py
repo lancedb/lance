@@ -233,9 +233,6 @@ class LanceDataset(torch.utils.data.IterableDataset):
             warnings.warn("rank and world_size are deprecated", DeprecationWarning)
         self.sampler: Optional[Sampler] = sampler
 
-        if filter is not None and self.samples > 0 or self.samples is None:
-            raise ValueError("`filter` is not supported with `samples`")
-
         # Dataset with huggingface metadata
         if (
             dataset.schema.metadata is not None
@@ -284,6 +281,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     n=self.samples,
                     columns=self.columns,
                     batch_size=self.batch_size,
+                    filt=self.filter,
                 )
             else:
                 raw_stream = sampler(
