@@ -281,7 +281,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
     fn encode(
         &self,
         data: DataBlock,
-        _data_type: &DataType,
+        data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
         let DataBlock::FixedWidth(mut unpacked) = data else {
@@ -291,7 +291,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
             });
         };
     
-        match _data_type {
+        match data_type {
             DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
             DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
             DataType::UInt32 | DataType::Int32 => encode_fixed_width!(self, unpacked, u32, buffer_index),
@@ -542,12 +542,12 @@ fn bitpacked_for_non_neg_decode(
             let packed_chunk_size_in_byte: usize = (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
             let mut decompress_chunk_buf = vec![0_u32; ELEMS_PER_CHUNK as usize];
             for (i, bytes) in data.iter().enumerate() {
-                let mut j = 0;
                 let mut ranges_idx = 0;
                 let mut curr_range_start = bytes_idx_to_range_indices[i][0].start;
-                while j * packed_chunk_size_in_byte < bytes.len() {
-                    let chunk_in_u8: &[u8] =
-                        &bytes[j * packed_chunk_size_in_byte..][..packed_chunk_size_in_byte];
+                let mut chunk_num = 0;
+                while chunk_num * packed_chunk_size_in_byte < bytes.len() {
+                    let chunk_in_u8: &[u8] = &bytes[chunk_num * packed_chunk_size_in_byte..][..packed_chunk_size_in_byte];
+                    chunk_num += 1;
                     let chunk = cast_slice(chunk_in_u8);
                     unsafe {
                         BitPacking::unchecked_unpack(
@@ -557,28 +557,32 @@ fn bitpacked_for_non_neg_decode(
                         );
                     }
                     loop {
-                        if curr_range_start + ELEMS_PER_CHUNK < bytes_idx_to_range_indices[i][ranges_idx].end {
-                            let this_part_len = ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
+                        // case 1: all the elements after (curr_range_start % ELEMS_PER_CHUNK) inside this chunk is needed. 
+                        let elems_after_curr_range_start_in_this_chunk = ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
+                        if curr_range_start + elems_after_curr_range_start_in_this_chunk <= bytes_idx_to_range_indices[i][ranges_idx].end {
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start  % ELEMS_PER_CHUNK) as usize..],
+                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..],
                             );
-                            curr_range_start += this_part_len;
+                            curr_range_start += elems_after_curr_range_start_in_this_chunk;
                             break;
                         } else {
-                            let this_part_len =
-                                bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
+                            // case 2: only part of the elements after (curr_range_start % ELEMS_PER_CHUNK) inside this chunk is needed.
+                            let elems_this_range_needed_in_this_chunk = (bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start).min(ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK);
                             decompressed.extend_from_slice(
                                 &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..]
-                                    [..this_part_len as usize],
+                                    [..elems_this_range_needed_in_this_chunk as usize],
                             );
-                            ranges_idx += 1;
-                            if ranges_idx == bytes_idx_to_range_indices[i].len() {
-                                break;
+                            if curr_range_start + elems_this_range_needed_in_this_chunk == bytes_idx_to_range_indices[i][ranges_idx].end {
+                                ranges_idx += 1;
+                                if ranges_idx == bytes_idx_to_range_indices[i].len() {
+                                    break;
+                                }
+                                curr_range_start = bytes_idx_to_range_indices[i][ranges_idx].start;
+                            } else {
+                                curr_range_start += elems_this_range_needed_in_this_chunk;
                             }
-                            curr_range_start = bytes_idx_to_range_indices[i][ranges_idx].start;
                         }
                     }
-                    j += 1;
                 }
             }
             LanceBuffer::reinterpret_vec(decompressed).to_owned()
