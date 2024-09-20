@@ -545,7 +545,7 @@ impl Dataset {
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
         full_text_query: Option<&PyDict>,
-        materialization_style: Option<PyObject>,
+        late_materialization: Option<PyObject>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -656,21 +656,21 @@ impl Dataset {
             scanner.with_fragments(fragments);
         }
 
-        if let Some(materialization_style) = materialization_style {
-            if let Ok(style_as_bool) = materialization_style.extract::<bool>(self_.py()) {
+        if let Some(late_materialization) = late_materialization {
+            if let Ok(style_as_bool) = late_materialization.extract::<bool>(self_.py()) {
                 if style_as_bool {
                     scanner.materialization_style(MaterializationStyle::AllLate);
                 } else {
                     scanner.materialization_style(MaterializationStyle::AllEarly);
                 }
-            } else if let Ok(columns) = materialization_style.extract::<Vec<String>>(self_.py()) {
+            } else if let Ok(columns) = late_materialization.extract::<Vec<String>>(self_.py()) {
                 scanner.materialization_style(
                     MaterializationStyle::all_early_except(&columns, self_.ds.schema())
                         .infer_error()?,
                 );
             } else {
                 return Err(PyValueError::new_err(
-                    "materialization_style must be a bool or a list of strings",
+                    "late_materialization must be a bool or a list of strings",
                 ));
             }
         }

@@ -2396,38 +2396,36 @@ def test_late_materialization_param(tmp_path: Path):
     filt = "filter % 2 == 0"
 
     assert "(values)" in dataset.scanner(
-        filter=filt, materialization_style=None
+        filter=filt, late_materialization=None
     ).explain_plan(True)
     assert ", values" in dataset.scanner(
-        filter=filt, materialization_style=False
+        filter=filt, late_materialization=False
     ).explain_plan(True)
     assert "(values)" in dataset.scanner(
-        filter=filt, materialization_style=True
+        filter=filt, late_materialization=True
     ).explain_plan(True)
     assert "(values)" in dataset.scanner(
-        filter=filt, materialization_style=["values"]
+        filter=filt, late_materialization=["values"]
     ).explain_plan(True)
     assert ", values" in dataset.scanner(
-        filter=filt, materialization_style=["filter"]
+        filter=filt, late_materialization=["filter"]
     ).explain_plan(True)
 
     # These tests just make sure we can pass in the parameter.  There's no great
     # way to know if late materialization happened or not.  That will have to be
     # for benchmarks
     expected = dataset.to_table(filter=filt)
-    assert dataset.to_table(filter=filt, materialization_style=None) == expected
-    assert dataset.to_table(filter=filt, materialization_style=False) == expected
-    assert dataset.to_table(filter=filt, materialization_style=True) == expected
-    assert dataset.to_table(filter=filt, materialization_style=["values"]) == expected
+    assert dataset.to_table(filter=filt, late_materialization=None) == expected
+    assert dataset.to_table(filter=filt, late_materialization=False) == expected
+    assert dataset.to_table(filter=filt, late_materialization=True) == expected
+    assert dataset.to_table(filter=filt, late_materialization=["values"]) == expected
 
     expected = list(dataset.to_batches(filter=filt))
-    assert list(dataset.to_batches(filter=filt, materialization_style=None)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=None)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=False)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=True)) == expected
     assert (
-        list(dataset.to_batches(filter=filt, materialization_style=False)) == expected
-    )
-    assert list(dataset.to_batches(filter=filt, materialization_style=True)) == expected
-    assert (
-        list(dataset.to_batches(filter=filt, materialization_style=["values"]))
+        list(dataset.to_batches(filter=filt, late_materialization=["values"]))
         == expected
     )
 
@@ -2441,7 +2439,7 @@ def test_late_materialization_batch_size(tmp_path: Path):
         columns=["values"],
         filter="filter % 2 == 0",
         batch_size=32,
-        materialization_style=True,
+        late_materialization=True,
     ):
         assert batch.num_rows == 32
 

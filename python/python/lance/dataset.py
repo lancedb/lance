@@ -254,7 +254,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         fast_search: bool = False,
         io_buffer_size: Optional[int] = None,
-        materialization_style: Optional[bool | List[str]],
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -310,7 +310,7 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
-        materialization_style: bool or List[str], default None
+        late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
             is useful when there are few results or columns are very large.
@@ -374,7 +374,7 @@ class LanceDataset(pa.dataset.Dataset):
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
-            .materialization_style(materialization_style)
+            .late_materialization(late_materialization)
             .with_row_id(with_row_id)
             .with_row_address(with_row_address)
             .use_stats(use_stats)
@@ -429,7 +429,7 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search: bool = False,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
-        materialization_style: Optional[bool | List[str]] = None,
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -476,9 +476,9 @@ class LanceDataset(pa.dataset.Dataset):
             and memory use might increase.
         prefilter: bool, default False
             Run filter before the vector search.
-        materialization_style: bool or List[str], default None
+        late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
-            ``ScannerBuilder.materialization_style`` for more information.
+            ``ScannerBuilder.late_materialization`` for more information.
         with_row_id: bool, default False
             Return row ID.
         with_row_address: bool, default False
@@ -511,7 +511,7 @@ class LanceDataset(pa.dataset.Dataset):
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
-            materialization_style=materialization_style,
+            late_materialization=late_materialization,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -571,7 +571,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
-        materialization_style: Optional[bool | List[str]] = None,
+        late_materialization: Optional[bool | List[str]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -595,7 +595,7 @@ class LanceDataset(pa.dataset.Dataset):
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
-            materialization_style=materialization_style,
+            late_materialization=late_materialization,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2289,7 +2289,7 @@ class ScannerBuilder:
         self._filter = None
         self._substrait_filter = None
         self._prefilter = None
-        self._materialization_style = None
+        self._late_materialization = None
         self._offset = None
         self._columns = None
         self._columns_with_transform = None
@@ -2452,10 +2452,10 @@ class ScannerBuilder:
         self._with_row_address = with_row_address
         return self
 
-    def materialization_style(
-        self, materialization_style: bool | List[str]
+    def late_materialization(
+        self, late_materialization: bool | List[str]
     ) -> ScannerBuilder:
-        self._materialization_style = materialization_style
+        self._late_materialization = late_materialization
         return self
 
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
@@ -2582,7 +2582,7 @@ class ScannerBuilder:
             self._substrait_filter,
             self._fast_search,
             self._full_text_query,
-            self._materialization_style,
+            self._late_materialization,
         )
         return LanceScanner(scanner, self.ds)
 
