@@ -778,7 +778,7 @@ impl Scanner {
             &[],
             &[],
             &plan.schema(),
-            "",
+            None,
             false,
             false,
         )?;

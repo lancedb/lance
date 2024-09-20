@@ -6,12 +6,7 @@ use std::{any::Any, sync::Arc};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider,
-    error::Result as DatafusionResult,
-    execution::context::SessionState,
-    logical_expr::{LogicalPlan, TableType},
-    physical_plan::ExecutionPlan,
-    prelude::Expr,
+    catalog::Session, datasource::TableProvider, error::Result as DatafusionResult, logical_expr::{LogicalPlan, TableType}, physical_plan::ExecutionPlan, prelude::Expr
 };
 
 use crate::Dataset;
@@ -40,7 +35,7 @@ impl TableProvider for Dataset {
 
     async fn scan(
         &self,
-        _: &SessionState,
+        _: &dyn Session,
         projection: Option<&Vec<usize>>,
         _: &[Expr],
         limit: Option<usize>,

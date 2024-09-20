@@ -9,15 +9,10 @@ use std::{
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    dataframe::DataFrame,
-    datasource::{streaming::StreamingTable, TableProvider},
-    error::DataFusionError,
-    execution::{
-        context::{SessionContext, SessionState},
+    catalog::Session, dataframe::DataFrame, datasource::{streaming::StreamingTable, TableProvider}, error::DataFusionError, execution::{
+        context::SessionContext,
         TaskContext,
-    },
-    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream},
+    }, logical_expr::{Expr, TableProviderFilterPushDown, TableType}, physical_plan::{streaming::PartitionStream, ExecutionPlan, SendableRecordBatchStream}
 };
 use lance_arrow::SchemaExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
@@ -69,7 +64,7 @@ impl TableProvider for LanceTableProvider {
 
     async fn scan(
         &self,
-        _state: &SessionState,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,

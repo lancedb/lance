@@ -23,7 +23,7 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::execution::FunctionRegistry;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF,
@@ -160,7 +160,10 @@ impl Default for LanceContextProvider {
         let config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
         let runtime = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
-        let state = SessionState::new_with_config_rt(config, runtime);
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .build();
         Self {
             options: ConfigOptions::default(),
             state,
@@ -381,19 +384,15 @@ impl Planner {
             }
         }
         let context_provider = LanceContextProvider::default();
-        let mut sql_to_rel = SqlToRel::new_with_options(
+        let sql_to_rel = SqlToRel::new_with_options(
             &context_provider,
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
+                enable_options_value_normalization: false, // TODOALEX: false or default?
             },
         );
-        // These planners are not automatically propagated.
-        // See: https://github.com/apache/datafusion/issues/11477
-        for planner in context_provider.state.expr_planners() {
-            sql_to_rel = sql_to_rel.with_user_defined_planner(planner.clone());
-        }
 
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
