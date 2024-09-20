@@ -744,6 +744,7 @@ impl BatchEncoder {
 /// An encoded batch of data and a page table describing it
 ///
 /// This is returned by [`crate::encoder::encode_batch`]
+#[derive(Debug)]
 pub struct EncodedBatch {
     pub data: Bytes,
     pub page_table: Vec<Arc<ColumnInfo>>,

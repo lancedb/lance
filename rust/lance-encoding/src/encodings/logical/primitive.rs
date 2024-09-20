@@ -227,7 +227,7 @@ impl FieldScheduler for PrimitiveFieldScheduler {
     }
 
     fn initialize<'a>(
-        &'a mut self,
+        &'a self,
         _filter: &'a FilterExpression,
         _context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {

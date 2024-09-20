@@ -1224,6 +1224,7 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderMiddlewareChain>::default(),
         )
+        .await
         .unwrap();
 
         assert_eq!(data, decoded);
@@ -1237,6 +1238,7 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderMiddlewareChain>::default(),
         )
+        .await
         .unwrap();
 
         assert_eq!(data, decoded);
@@ -1524,6 +1526,7 @@ pub mod tests {
             Arc::<DecoderMiddlewareChain>::default(),
             file_reader.scheduler.clone(),
             test_cache(),
+            &FilterExpression::no_filter(),
         )
         .await
         .unwrap();

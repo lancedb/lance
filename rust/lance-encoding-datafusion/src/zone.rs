@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use arrow_array::{cast::AsArray, types::UInt32Type, ArrayRef, RecordBatch, UInt32Array};
@@ -148,8 +148,6 @@ pub(crate) fn extract_zone_info(
                 );
                 let (position, size) =
                     col_info.buffer_offsets_and_sizes[zone_map_buffer.buffer_index as usize];
-                let mut new_col_info = col_info.as_ref().clone();
-                new_col_info.encoding = *inner;
                 let column = path_to_expr(cur_path);
                 let unloaded_pushdown = UnloadedPushdown {
                     data_type: data_type.clone(),
@@ -158,7 +156,10 @@ pub(crate) fn extract_zone_info(
                     size,
                 };
                 *result_ref = Some((rows_per_zone, unloaded_pushdown));
-                col_info
+
+                let mut col_info = col_info.as_ref().clone();
+                col_info.encoding = *inner;
+                Arc::new(col_info)
             }
             _ => col_info,
         }
@@ -185,6 +186,13 @@ struct ZoneMap {
     items: Vec<(Expr, NullableInterval)>,
 }
 
+#[derive(Debug)]
+struct InitializedState {
+    zone_maps: Vec<ZoneMap>,
+    filter: Option<Expr>,
+    df_schema: Option<DFSchemaRef>,
+}
+
 /// A top level scheduler that refines the requested range based on
 /// pushdown filtering with zone maps
 #[derive(Debug)]
@@ -195,9 +203,7 @@ pub struct ZoneMapsFieldScheduler {
     pushdown_buffers: HashMap<u32, UnloadedPushdown>,
     rows_per_zone: u32,
     num_rows: u64,
-    zone_maps: Vec<ZoneMap>,
-    filter: Option<Expr>,
-    df_schema: Option<DFSchemaRef>,
+    initialized_state: Mutex<Option<InitializedState>>,
 }
 
 impl ZoneMapsFieldScheduler {
@@ -215,9 +221,7 @@ impl ZoneMapsFieldScheduler {
             rows_per_zone,
             num_rows,
             // These are set during initialization
-            zone_maps: Vec::new(),
-            filter: None,
-            df_schema: None,
+            initialized_state: Mutex::new(None),
         }
     }
 
@@ -233,13 +237,14 @@ impl ZoneMapsFieldScheduler {
             .map(|pushdown| pushdown.position..pushdown.position + pushdown.size)
             .collect();
         let buffers = io.submit_request(ranges, 0).await?;
-        let maps = buffers
-            .into_iter()
-            .zip(pushdowns.iter())
-            .map(|(buffer, pushdown)| {
-                self.parse_zone(buffer, &pushdown.data_type, &pushdown.column)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut maps = Vec::new();
+        for (buffer, pushdown) in buffers.into_iter().zip(pushdowns.iter()) {
+            // There's no point in running this in parallel since it's actually synchronous
+            let map = self
+                .parse_zone(buffer, &pushdown.data_type, &pushdown.column)
+                .await?;
+            maps.push(map);
+        }
         // A this point each item in `maps` is a vector of guarantees for a single field
         // We need to transpose this so that each item is a vector of guarantees for a single zone
         let zone_maps = transpose2(maps)
@@ -269,11 +274,15 @@ impl ZoneMapsFieldScheduler {
     }
 
     async fn do_initialize(
-        &mut self,
+        &self,
         io: &dyn EncodingsIo,
         cache: &FileMetadataCache,
         filter: &FilterExpression,
     ) -> Result<()> {
+        if filter.is_noop() {
+            return Ok(());
+        }
+
         let arrow_schema = ArrowSchema::from(self.schema.as_ref());
         let df_schema = DFSchema::try_from(arrow_schema.clone())?;
         let df_filter = filter.substrait_to_df(Arc::new(arrow_schema))?;
@@ -281,21 +290,31 @@ impl ZoneMapsFieldScheduler {
         let columns = Planner::column_names_in_expr(&df_filter);
         let referenced_schema = self.schema.project(&columns)?;
 
-        self.df_schema = Some(Arc::new(df_schema));
-        self.zone_maps = self.load_maps(io, cache, &referenced_schema).await?;
-        self.filter = Some(df_filter);
+        let df_schema = Some(Arc::new(df_schema));
+        let zone_maps = self.load_maps(io, cache, &referenced_schema).await?;
+        let filter = Some(df_filter);
+
+        let state = InitializedState {
+            zone_maps,
+            filter,
+            df_schema,
+        };
+        let mut initialized_state = self.initialized_state.lock().unwrap();
+        *initialized_state = Some(state);
         Ok(())
     }
 
     fn create_filter(&self) -> Result<impl Fn(u64) -> bool + '_> {
         Ok(move |zone_idx| {
-            let zone_map = &self.zone_maps[zone_idx as usize];
+            let state = self.initialized_state.lock().unwrap();
+            let state = state.as_ref().unwrap();
+            let zone_map = &state.zone_maps[zone_idx as usize];
             let props = ExecutionProps::new();
             let context =
-                SimplifyContext::new(&props).with_schema(self.df_schema.as_ref().unwrap().clone());
+                SimplifyContext::new(&props).with_schema(state.df_schema.as_ref().unwrap().clone());
             let mut simplifier = ExprSimplifier::new(context);
             simplifier = simplifier.with_guarantees(zone_map.items.clone());
-            match simplifier.simplify(self.filter.as_ref().unwrap().clone()) {
+            match simplifier.simplify(state.filter.as_ref().unwrap().clone()) {
                 Ok(expr) => match expr {
                     // Predicate, given guarantees, is always false, we can skip the zone
                     Expr::Literal(ScalarValue::Boolean(Some(false))) => false,
@@ -350,7 +369,7 @@ impl ZoneMapsFieldScheduler {
         guarantees
     }
 
-    fn parse_zone(
+    async fn parse_zone(
         &self,
         buffer: Bytes,
         data_type: &DataType,
@@ -367,7 +386,8 @@ impl ZoneMapsFieldScheduler {
             &zone_maps_batch,
             &FilterExpression::no_filter(),
             Arc::<DecoderMiddlewareChain>::default(),
-        )?;
+        )
+        .await?;
 
         Ok(Self::extract_guarantees(
             &zone_maps_batch,
@@ -419,7 +439,7 @@ impl SchedulingJob for EmptySchedulingJob {
 
 impl FieldScheduler for ZoneMapsFieldScheduler {
     fn initialize<'a>(
-        &'a mut self,
+        &'a self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
@@ -435,6 +455,9 @@ impl FieldScheduler for ZoneMapsFieldScheduler {
         ranges: &[std::ops::Range<u64>],
         filter: &FilterExpression,
     ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        if filter.is_noop() {
+            return self.inner.schedule_ranges(ranges, filter);
+        }
         let zone_filter_fn = self.create_filter()?;
         let zone_filter = ZoneMapsFilter::new(zone_filter_fn, self.rows_per_zone as u64);
         let ranges = zone_filter.refine_ranges(ranges);

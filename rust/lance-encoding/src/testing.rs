@@ -144,6 +144,7 @@ async fn test_decode(
         decode_and_validate,
         io,
         cache,
+        &FilterExpression::no_filter(),
     )
     .await
     .unwrap();

@@ -888,7 +888,9 @@ impl DecodeBatchScheduler {
         decoder_strategy: Arc<DecoderMiddlewareChain>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<FileMetadataCache>,
+        filter: &FilterExpression,
     ) -> Result<Self> {
+        assert!(num_rows > 0);
         let buffers = FileBuffers {
             positions_and_sizes: file_buffer_positions_and_sizes,
         };
@@ -904,14 +906,22 @@ impl DecodeBatchScheduler {
         let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
         let root_type = DataType::Struct(root_fields.clone());
         let mut root_field = Field::try_from(&ArrowField::new("root", root_type, false))?;
+        // root_field.children and schema.fields should be identical at this point but the latter
+        // has field ids and the former does not.  This line restores that.
+        // TODO:  Is there another way to create the root field without forcing a trip through arrow?
+        root_field.children = schema.fields.clone();
         root_field
             .metadata
             .insert("__lance_decoder_root".to_string(), "true".to_string());
         let (_, root_scheduler) =
             decoder_strategy
-                .cursor(io)
+                .cursor(io.clone())
                 .start(&root_field, &mut column_iter, buffers)?;
         let root_scheduler = root_scheduler?;
+
+        let context = SchedulerContext::new(io, cache.clone());
+        root_scheduler.initialize(filter, &context).await?;
+
         Ok(Self {
             root_scheduler,
             root_fields,
@@ -1356,6 +1366,7 @@ async fn create_scheduler_decoder(
         config.decoder_strategy,
         config.io.clone(),
         config.cache,
+        &filter,
     )
     .await?;
 
@@ -1397,6 +1408,9 @@ pub fn schedule_and_decode(
     target_schema: Arc<Schema>,
     config: SchedulerDecoderConfig,
 ) -> BoxStream<'static, ReadBatchTask> {
+    if requested_rows.num_rows() == 0 {
+        return stream::empty().boxed();
+    }
     // For convenience we really want this method to be a snchronous method where all
     // errors happen on the stream.  There is some async initialization that must happen
     // when creating a scheduler.  We wrap that all up in the very first task.
@@ -1709,6 +1723,11 @@ impl FilterExpression {
     pub fn no_filter() -> Self {
         Self(Bytes::new())
     }
+
+    /// Returns true if the filter is the same as the [`Self::no_filter`] filter
+    pub fn is_noop(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// A scheduler for a field's worth of data
@@ -1738,7 +1757,7 @@ impl FilterExpression {
 pub trait FieldScheduler: Send + Sync + std::fmt::Debug {
     /// Called at the beginning of scheduling to initialize the scheduler
     fn initialize<'a>(
-        &'a mut self,
+        &'a self,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>>;
@@ -1856,11 +1875,15 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 }
 
 /// Decodes a batch of data from an in-memory structure created by [`crate::encoder::encode_batch`]
-pub fn decode_batch(
+pub async fn decode_batch(
     batch: &EncodedBatch,
     filter: &FilterExpression,
     field_decoder_strategy: Arc<DecoderMiddlewareChain>,
 ) -> Result<RecordBatch> {
+    // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
+    // Still, if we just use now_or_never we hit misfires because some futures (channels) need to be
+    // polled twice.
+
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
     let cache = Arc::new(FileMetadataCache::with_capacity(
         128 * 1024 * 1024,
@@ -1875,23 +1898,13 @@ pub fn decode_batch(
         field_decoder_strategy,
         io_scheduler.clone(),
         cache,
+        filter,
     )
-    // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
-    // and we use a lot of now_or_never instead
-    .now_or_never()
-    .unwrap()?;
+    .await?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
     #[allow(clippy::single_range_in_vec_init)]
     let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..batch.num_rows]);
     let stream = BatchDecodeStream::new(rx, batch.num_rows as u32, batch.num_rows, root_decoder);
-    stream
-        .into_stream()
-        .next()
-        .now_or_never()
-        .unwrap()
-        .unwrap()
-        .task
-        .now_or_never()
-        .unwrap()
+    stream.into_stream().next().await.unwrap().task.await
 }
