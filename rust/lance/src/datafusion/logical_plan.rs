@@ -6,7 +6,12 @@ use std::{any::Any, sync::Arc};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session, datasource::TableProvider, error::Result as DatafusionResult, logical_expr::{LogicalPlan, TableType}, physical_plan::ExecutionPlan, prelude::Expr
+    catalog::Session,
+    datasource::TableProvider,
+    error::Result as DatafusionResult,
+    logical_expr::{LogicalPlan, TableType},
+    physical_plan::ExecutionPlan,
+    prelude::Expr,
 };
 
 use crate::Dataset;

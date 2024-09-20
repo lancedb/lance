@@ -163,6 +163,7 @@ impl Default for LanceContextProvider {
         let state = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
+            .with_default_features()
             .build();
         Self {
             options: ConfigOptions::default(),
