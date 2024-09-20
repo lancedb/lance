@@ -65,7 +65,7 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   linux-x86:
-    runs-on: "ubunut-24.04"
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     needs: [macos-arm64, linux-arm64]
     defaults:
