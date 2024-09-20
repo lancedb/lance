@@ -199,7 +199,7 @@ macro_rules! encode_fixed_width {
         let num_chunks = ($unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
         let num_full_chunks = $unpacked.num_values / ELEMS_PER_CHUNK;
         let uncompressed_bit_width = std::mem::size_of::<$data_type>() as u64 * 8;
-        
+
         // the output vector type is the same as the input type, for example, when input is u16, output is Vec<u16>
         let packed_chunk_size = 1024 * $self.compressed_bit_width as usize / uncompressed_bit_width as usize;
 
@@ -290,7 +290,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 location: location!(),
             });
         };
-    
+
         match data_type {
             DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
             DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
@@ -444,7 +444,8 @@ fn bitpacked_for_non_neg_decode(
     match uncompressed_bits_per_value {
         8 => {
             let mut decompressed: Vec<u8> = Vec::with_capacity(num_rows as usize);
-            let packed_chunk_size: usize = ELEMS_PER_CHUNK as usize * compressed_bit_width as usize / 8;
+            let packed_chunk_size: usize =
+                ELEMS_PER_CHUNK as usize * compressed_bit_width as usize / 8;
             let mut decompress_chunk_buf = vec![0_u8; ELEMS_PER_CHUNK as usize];
             for (i, bytes) in data.iter().enumerate() {
                 let mut j = 0;
@@ -460,10 +461,14 @@ fn bitpacked_for_non_neg_decode(
                         );
                     }
                     loop {
-                        if curr_range_start + ELEMS_PER_CHUNK < bytes_idx_to_range_indices[i][ranges_idx].end {
-                            let this_part_len = ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
+                        if curr_range_start + ELEMS_PER_CHUNK
+                            < bytes_idx_to_range_indices[i][ranges_idx].end
+                        {
+                            let this_part_len =
+                                ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..],
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..],
                             );
                             curr_range_start += this_part_len;
                             break;
@@ -471,7 +476,8 @@ fn bitpacked_for_non_neg_decode(
                             let this_part_len =
                                 bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..]
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..]
                                     [..this_part_len as usize],
                             );
                             ranges_idx += 1;
@@ -489,7 +495,8 @@ fn bitpacked_for_non_neg_decode(
 
         16 => {
             let mut decompressed: Vec<u16> = Vec::with_capacity(num_rows as usize);
-            let packed_chunk_size_in_byte: usize = (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
+            let packed_chunk_size_in_byte: usize =
+                (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
             let mut decompress_chunk_buf = vec![0_u16; ELEMS_PER_CHUNK as usize];
             for (i, bytes) in data.iter().enumerate() {
                 let mut j = 0;
@@ -507,10 +514,14 @@ fn bitpacked_for_non_neg_decode(
                         );
                     }
                     loop {
-                        if curr_range_start + ELEMS_PER_CHUNK < bytes_idx_to_range_indices[i][ranges_idx].end {
-                            let this_part_len = ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
+                        if curr_range_start + ELEMS_PER_CHUNK
+                            < bytes_idx_to_range_indices[i][ranges_idx].end
+                        {
+                            let this_part_len =
+                                ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..],
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..],
                             );
                             curr_range_start += this_part_len;
 
@@ -521,7 +532,8 @@ fn bitpacked_for_non_neg_decode(
                             let this_part_len =
                                 bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..]
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..]
                                     [..this_part_len as usize],
                             );
                             ranges_idx += 1;
@@ -539,14 +551,16 @@ fn bitpacked_for_non_neg_decode(
 
         32 => {
             let mut decompressed: Vec<u32> = Vec::with_capacity(num_rows as usize);
-            let packed_chunk_size_in_byte: usize = (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
+            let packed_chunk_size_in_byte: usize =
+                (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
             let mut decompress_chunk_buf = vec![0_u32; ELEMS_PER_CHUNK as usize];
             for (i, bytes) in data.iter().enumerate() {
                 let mut ranges_idx = 0;
                 let mut curr_range_start = bytes_idx_to_range_indices[i][0].start;
                 let mut chunk_num = 0;
                 while chunk_num * packed_chunk_size_in_byte < bytes.len() {
-                    let chunk_in_u8: &[u8] = &bytes[chunk_num * packed_chunk_size_in_byte..][..packed_chunk_size_in_byte];
+                    let chunk_in_u8: &[u8] = &bytes[chunk_num * packed_chunk_size_in_byte..]
+                        [..packed_chunk_size_in_byte];
                     chunk_num += 1;
                     let chunk = cast_slice(chunk_in_u8);
                     unsafe {
@@ -557,22 +571,31 @@ fn bitpacked_for_non_neg_decode(
                         );
                     }
                     loop {
-                        // case 1: all the elements after (curr_range_start % ELEMS_PER_CHUNK) inside this chunk is needed. 
-                        let elems_after_curr_range_start_in_this_chunk = ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
-                        if curr_range_start + elems_after_curr_range_start_in_this_chunk <= bytes_idx_to_range_indices[i][ranges_idx].end {
+                        // case 1: all the elements after (curr_range_start % ELEMS_PER_CHUNK) inside this chunk is needed.
+                        let elems_after_curr_range_start_in_this_chunk =
+                            ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
+                        if curr_range_start + elems_after_curr_range_start_in_this_chunk
+                            <= bytes_idx_to_range_indices[i][ranges_idx].end
+                        {
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..],
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..],
                             );
                             curr_range_start += elems_after_curr_range_start_in_this_chunk;
                             break;
                         } else {
                             // case 2: only part of the elements after (curr_range_start % ELEMS_PER_CHUNK) inside this chunk is needed.
-                            let elems_this_range_needed_in_this_chunk = (bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start).min(ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK);
+                            let elems_this_range_needed_in_this_chunk =
+                                (bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start)
+                                    .min(ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK);
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..]
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..]
                                     [..elems_this_range_needed_in_this_chunk as usize],
                             );
-                            if curr_range_start + elems_this_range_needed_in_this_chunk == bytes_idx_to_range_indices[i][ranges_idx].end {
+                            if curr_range_start + elems_this_range_needed_in_this_chunk
+                                == bytes_idx_to_range_indices[i][ranges_idx].end
+                            {
                                 ranges_idx += 1;
                                 if ranges_idx == bytes_idx_to_range_indices[i].len() {
                                     break;
@@ -590,7 +613,8 @@ fn bitpacked_for_non_neg_decode(
 
         64 => {
             let mut decompressed: Vec<u64> = Vec::with_capacity(num_rows as usize);
-            let packed_chunk_size_in_byte: usize = (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
+            let packed_chunk_size_in_byte: usize =
+                (ELEMS_PER_CHUNK * compressed_bit_width) as usize / 8;
             let mut decompress_chunk_buf = vec![0_u64; ELEMS_PER_CHUNK as usize];
             for (i, bytes) in data.iter().enumerate() {
                 let mut j = 0;
@@ -608,10 +632,14 @@ fn bitpacked_for_non_neg_decode(
                         );
                     }
                     loop {
-                        if curr_range_start + ELEMS_PER_CHUNK < bytes_idx_to_range_indices[i][ranges_idx].end {
-                            let this_part_len = ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
+                        if curr_range_start + ELEMS_PER_CHUNK
+                            < bytes_idx_to_range_indices[i][ranges_idx].end
+                        {
+                            let this_part_len =
+                                ELEMS_PER_CHUNK - curr_range_start % ELEMS_PER_CHUNK;
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..],
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..],
                             );
                             curr_range_start += this_part_len;
                             break;
@@ -619,7 +647,8 @@ fn bitpacked_for_non_neg_decode(
                             let this_part_len =
                                 bytes_idx_to_range_indices[i][ranges_idx].end - curr_range_start;
                             decompressed.extend_from_slice(
-                                &decompress_chunk_buf[(curr_range_start % ELEMS_PER_CHUNK) as usize..]
+                                &decompress_chunk_buf
+                                    [(curr_range_start % ELEMS_PER_CHUNK) as usize..]
                                     [..this_part_len as usize],
                             );
                             ranges_idx += 1;
