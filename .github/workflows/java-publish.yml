@@ -35,7 +35,7 @@ jobs:
   linux-arm64:
     name: Build on Linux Arm64
     runs-on: ubuntu-2404-4x-arm64
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ./java
@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: error
   linux-x86:
     runs-on: "ubunut-24.04"
-    timeout-minutes: 30
+    timeout-minutes: 45
     needs: [macos-arm64, linux-arm64]
     defaults:
       run:
