@@ -1930,12 +1930,21 @@ pub mod test_dataset {
         pub tmp_dir: TempDir,
         pub schema: Arc<ArrowSchema>,
         pub dataset: Dataset,
+        dimension: u32,
     }
 
     impl TestVectorDataset {
         pub async fn new(
             data_storage_version: LanceFileVersion,
             stable_row_ids: bool,
+        ) -> Result<Self> {
+            Self::new_with_dimension(data_storage_version, stable_row_ids, 32).await
+        }
+
+        pub async fn new_with_dimension(
+            data_storage_version: LanceFileVersion,
+            stable_row_ids: bool,
+            dimension: u32,
         ) -> Result<Self> {
             let tmp_dir = tempdir()?;
             let path = tmp_dir.path().to_str().unwrap();
@@ -1954,7 +1963,7 @@ pub mod test_dataset {
                         "vec",
                         DataType::FixedSizeList(
                             Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                            256,
+                            dimension as i32,
                         ),
                         true,
                     ),
@@ -1964,9 +1973,11 @@ pub mod test_dataset {
 
             let batches: Vec<RecordBatch> = (0..5)
                 .map(|i| {
-                    let vector_values: Float32Array = (0..256 * 80).map(|v| v as f32).collect();
+                    let vector_values: Float32Array =
+                        (0..dimension * 80).map(|v| v as f32).collect();
                     let vectors =
-                        FixedSizeListArray::try_new_from_values(vector_values, 256).unwrap();
+                        FixedSizeListArray::try_new_from_values(vector_values, dimension as i32)
+                            .unwrap();
                     RecordBatch::try_new(
                         schema.clone(),
                         vec![
@@ -1995,6 +2006,7 @@ pub mod test_dataset {
                 tmp_dir,
                 schema,
                 dataset,
+                dimension,
             })
         }
 
@@ -2024,9 +2036,12 @@ pub mod test_dataset {
         }
 
         pub async fn append_new_data(&mut self) -> Result<()> {
-            let vector_values: Float32Array =
-                (0..10).flat_map(|i| [i as f32; 256].into_iter()).collect();
-            let new_vectors = FixedSizeListArray::try_new_from_values(vector_values, 256).unwrap();
+            let vector_values: Float32Array = (0..10)
+                .flat_map(|i| vec![i as f32; self.dimension as usize].into_iter())
+                .collect();
+            let new_vectors =
+                FixedSizeListArray::try_new_from_values(vector_values, self.dimension as i32)
+                    .unwrap();
             let new_data: Vec<ArrayRef> = vec![
                 Arc::new(Int32Array::from_iter_values(400..410)), // 5 * 80
                 Arc::new(StringArray::from_iter_values(
@@ -2541,6 +2556,8 @@ mod test {
         scan.filter("i > 100").unwrap();
         scan.project(&["i", "vec"]).unwrap();
         scan.refine(5);
+
+        println!("{}", scan.explain_plan(true).await.unwrap());
 
         let results = scan
             .try_into_stream()
@@ -4271,7 +4288,8 @@ mod test {
         #[values(false, true)] stable_row_id: bool,
     ) -> Result<()> {
         // Create a vector dataset
-        let mut dataset = TestVectorDataset::new(data_storage_version, stable_row_id).await?;
+        let mut dataset =
+            TestVectorDataset::new_with_dimension(data_storage_version, stable_row_id, 256).await?;
         let lance_schema = dataset.dataset.schema();
 
         // Scans
@@ -4817,7 +4835,7 @@ mod test {
                 SortExec: TopK(fetch=34), expr=[_distance@2 ASC NULLS LAST]...
                   KNNVectorDistance: metric=l2
                     LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false
-            Take: columns=\"_distance, _rowid, vec\"
+            Take: columns=\"_distance, _rowid, (vec)\"
               CoalesceBatchesExec: target_batch_size=8192
                 SortExec: TopK(fetch=34), expr=[_distance@0 ASC NULLS LAST]...
                   ANNSubIndex: name=idx, k=34, deltas=1
