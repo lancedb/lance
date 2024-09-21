@@ -9,12 +9,12 @@ use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use lance_core::Result;
 
 pub mod buffer;
+pub mod compression_algo;
 pub mod data;
 pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod format;
-pub mod compression_algo;
 #[cfg(test)]
 pub mod testing;
 pub mod version;

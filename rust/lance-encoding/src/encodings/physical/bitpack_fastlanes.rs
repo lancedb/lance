@@ -17,13 +17,13 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
+use crate::compression_algo::fastlanes::BitPacking;
 use crate::data::{DataBlock, FixedWidthDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
 use crate::encoder::{ArrayEncoder, EncodedArray};
 use crate::format::ProtobufUtils;
 use arrow::array::ArrayRef;
 use bytemuck::cast_slice;
-use crate::compression_algo::fastlanes::BitPacking;
 const ELEMS_PER_CHUNK: u64 = 1024;
 
 // Compute the compressed_bit_width for a given array of integers

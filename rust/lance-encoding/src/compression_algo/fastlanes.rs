@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 // This file is a modification of the `fastlanes` crate: https://github.com/spiraldb/fastlanes
-// It is modified to allow a rust stable build 
+// It is modified to allow a rust stable build
 
 use arrayref::{array_mut_ref, array_ref};
 use core::mem::size_of;
@@ -217,41 +217,105 @@ pub trait BitPacking: FastLanes {
 impl BitPacking for u8 {
     unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(output.len(), packed_len, "Output buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            output.len(),
+            packed_len,
+            "Output buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(input.len(), 1024, "Input buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => pack_8_1(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 1 / u8::T]),
-            2 => pack_8_2(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 2 / u8::T]),
-            3 => pack_8_3(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 3 / u8::T]),
-            4 => pack_8_4(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 4 / u8::T]),
-            5 => pack_8_5(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 5 / u8::T]),
-            6 => pack_8_6(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 6 / u8::T]),
-            7 => pack_8_7(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 7 / u8::T]),
-            8 => pack_8_8(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 8 / u8::T]),
+            1 => pack_8_1(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 / 8],
+            ),
+            2 => pack_8_2(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 2 / 8],
+            ),
+            3 => pack_8_3(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 3 / 8],
+            ),
+            4 => pack_8_4(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 4 / 8],
+            ),
+            5 => pack_8_5(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 5 / 8],
+            ),
+            6 => pack_8_6(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 6 / 8],
+            ),
+            7 => pack_8_7(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 7 / 8],
+            ),
+            8 => pack_8_8(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 8 / 8],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(input.len(), packed_len, "Input buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            input.len(),
+            packed_len,
+            "Input buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(output.len(), 1024, "Output buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => unpack_8_1(array_ref![input, 0, 1024 * 1 / u8::T], array_mut_ref![output, 0, 1024]),
-            2 => unpack_8_2(array_ref![input, 0, 1024 * 2 / u8::T], array_mut_ref![output, 0, 1024]),
-            3 => unpack_8_3(array_ref![input, 0, 1024 * 3 / u8::T], array_mut_ref![output, 0, 1024]),
-            4 => unpack_8_4(array_ref![input, 0, 1024 * 4 / u8::T], array_mut_ref![output, 0, 1024]),
-            5 => unpack_8_5(array_ref![input, 0, 1024 * 5 / u8::T], array_mut_ref![output, 0, 1024]),
-            6 => unpack_8_6(array_ref![input, 0, 1024 * 6 / u8::T], array_mut_ref![output, 0, 1024]),
-            7 => unpack_8_7(array_ref![input, 0, 1024 * 7 / u8::T], array_mut_ref![output, 0, 1024]),
-            8 => unpack_8_8(array_ref![input, 0, 1024 * 8 / u8::T], array_mut_ref![output, 0, 1024]),
+            1 => unpack_8_1(
+                array_ref![input, 0, 1024 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            2 => unpack_8_2(
+                array_ref![input, 0, 1024 * 2 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            3 => unpack_8_3(
+                array_ref![input, 0, 1024 * 3 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            4 => unpack_8_4(
+                array_ref![input, 0, 1024 * 4 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            5 => unpack_8_5(
+                array_ref![input, 0, 1024 * 5 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            6 => unpack_8_6(
+                array_ref![input, 0, 1024 * 6 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            7 => unpack_8_7(
+                array_ref![input, 0, 1024 * 7 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
+            8 => unpack_8_8(
+                array_ref![input, 0, 1024 * 8 / 8],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 }
@@ -259,59 +323,171 @@ impl BitPacking for u8 {
 impl BitPacking for u16 {
     unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(output.len(), packed_len, "Output buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            output.len(),
+            packed_len,
+            "Output buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(input.len(), 1024, "Input buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => pack_16_1(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 1 / u16::T]),
-            2 => pack_16_2(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 2 / u16::T]),
-            3 => pack_16_3(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 3 / u16::T]),
-            4 => pack_16_4(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 4 / u16::T]),
-            5 => pack_16_5(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 5 / u16::T]),
-            6 => pack_16_6(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 6 / u16::T]),
-            7 => pack_16_7(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 7 / u16::T]),
-            8 => pack_16_8(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 8 / u16::T]),
-            9 => pack_16_9(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 9 / u16::T]),
+            1 => pack_16_1(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 / 16],
+            ),
+            2 => pack_16_2(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 2 / 16],
+            ),
+            3 => pack_16_3(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 3 / 16],
+            ),
+            4 => pack_16_4(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 4 / 16],
+            ),
+            5 => pack_16_5(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 5 / 16],
+            ),
+            6 => pack_16_6(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 6 / 16],
+            ),
+            7 => pack_16_7(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 7 / 16],
+            ),
+            8 => pack_16_8(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 8 / 16],
+            ),
+            9 => pack_16_9(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 9 / 16],
+            ),
 
-            10 => pack_16_10(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 10 / u16::T]),
-            11 => pack_16_11(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 11 / u16::T]),
-            12 => pack_16_12(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 12 / u16::T]),
-            13 => pack_16_13(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 13 / u16::T]),
-            14 => pack_16_14(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 14 / u16::T]),
-            15 => pack_16_15(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 15 / u16::T]),
-            16 => pack_16_16(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 16 / u16::T]),
+            10 => pack_16_10(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 10 / 16],
+            ),
+            11 => pack_16_11(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 11 / 16],
+            ),
+            12 => pack_16_12(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 12 / 16],
+            ),
+            13 => pack_16_13(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 13 / 16],
+            ),
+            14 => pack_16_14(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 14 / 16],
+            ),
+            15 => pack_16_15(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 15 / 16],
+            ),
+            16 => pack_16_16(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 16 / 16],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(input.len(), packed_len, "Input buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            input.len(),
+            packed_len,
+            "Input buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(output.len(), 1024, "Output buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => unpack_16_1(array_ref![input, 0, 1024 * 1 / u16::T], array_mut_ref![output, 0, 1024]),
-            2 => unpack_16_2(array_ref![input, 0, 1024 * 2 / u16::T], array_mut_ref![output, 0, 1024]),
-            3 => unpack_16_3(array_ref![input, 0, 1024 * 3 / u16::T], array_mut_ref![output, 0, 1024]),
-            4 => unpack_16_4(array_ref![input, 0, 1024 * 4 / u16::T], array_mut_ref![output, 0, 1024]),
-            5 => unpack_16_5(array_ref![input, 0, 1024 * 5 / u16::T], array_mut_ref![output, 0, 1024]),
-            6 => unpack_16_6(array_ref![input, 0, 1024 * 6 / u16::T], array_mut_ref![output, 0, 1024]),
-            7 => unpack_16_7(array_ref![input, 0, 1024 * 7 / u16::T], array_mut_ref![output, 0, 1024]),
-            8 => unpack_16_8(array_ref![input, 0, 1024 * 8 / u16::T], array_mut_ref![output, 0, 1024]),
-            9 => unpack_16_9(array_ref![input, 0, 1024 * 9 / u16::T], array_mut_ref![output, 0, 1024]),
+            1 => unpack_16_1(
+                array_ref![input, 0, 1024 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            2 => unpack_16_2(
+                array_ref![input, 0, 1024 * 2 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            3 => unpack_16_3(
+                array_ref![input, 0, 1024 * 3 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            4 => unpack_16_4(
+                array_ref![input, 0, 1024 * 4 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            5 => unpack_16_5(
+                array_ref![input, 0, 1024 * 5 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            6 => unpack_16_6(
+                array_ref![input, 0, 1024 * 6 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            7 => unpack_16_7(
+                array_ref![input, 0, 1024 * 7 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            8 => unpack_16_8(
+                array_ref![input, 0, 1024 * 8 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            9 => unpack_16_9(
+                array_ref![input, 0, 1024 * 9 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            10 => unpack_16_10(array_ref![input, 0, 1024 * 10 / u16::T], array_mut_ref![output, 0, 1024]),
-            11 => unpack_16_11(array_ref![input, 0, 1024 * 11 / u16::T], array_mut_ref![output, 0, 1024]),
-            12 => unpack_16_12(array_ref![input, 0, 1024 * 12 / u16::T], array_mut_ref![output, 0, 1024]),
-            13 => unpack_16_13(array_ref![input, 0, 1024 * 13 / u16::T], array_mut_ref![output, 0, 1024]),
-            14 => unpack_16_14(array_ref![input, 0, 1024 * 14 / u16::T], array_mut_ref![output, 0, 1024]),
-            15 => unpack_16_15(array_ref![input, 0, 1024 * 15 / u16::T], array_mut_ref![output, 0, 1024]),
-            16 => unpack_16_16(array_ref![input, 0, 1024 * 16 / u16::T], array_mut_ref![output, 0, 1024]),
+            10 => unpack_16_10(
+                array_ref![input, 0, 1024 * 10 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            11 => unpack_16_11(
+                array_ref![input, 0, 1024 * 11 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            12 => unpack_16_12(
+                array_ref![input, 0, 1024 * 12 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            13 => unpack_16_13(
+                array_ref![input, 0, 1024 * 13 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            14 => unpack_16_14(
+                array_ref![input, 0, 1024 * 14 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            15 => unpack_16_15(
+                array_ref![input, 0, 1024 * 15 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
+            16 => unpack_16_16(
+                array_ref![input, 0, 1024 * 16 / 16],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 }
@@ -319,95 +495,303 @@ impl BitPacking for u16 {
 impl BitPacking for u32 {
     unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(output.len(), packed_len, "Output buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            output.len(),
+            packed_len,
+            "Output buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(input.len(), 1024, "Input buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => pack_32_1(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 1 / u32::T]),
-            2 => pack_32_2(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 2 / u32::T]),
-            3 => pack_32_3(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 3 / u32::T]),
-            4 => pack_32_4(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 4 / u32::T]),
-            5 => pack_32_5(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 5 / u32::T]),
-            6 => pack_32_6(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 6 / u32::T]),
-            7 => pack_32_7(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 7 / u32::T]),
-            8 => pack_32_8(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 8 / u32::T]),
-            9 => pack_32_9(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 9 / u32::T]),
+            1 => pack_32_1(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 / 32],
+            ),
+            2 => pack_32_2(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 2 / 32],
+            ),
+            3 => pack_32_3(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 3 / 32],
+            ),
+            4 => pack_32_4(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 4 / 32],
+            ),
+            5 => pack_32_5(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 5 / 32],
+            ),
+            6 => pack_32_6(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 6 / 32],
+            ),
+            7 => pack_32_7(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 7 / 32],
+            ),
+            8 => pack_32_8(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 8 / 32],
+            ),
+            9 => pack_32_9(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 9 / 32],
+            ),
 
-            10 => pack_32_10(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 10 / u32::T]),
-            11 => pack_32_11(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 11 / u32::T]),
-            12 => pack_32_12(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 12 / u32::T]),
-            13 => pack_32_13(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 13 / u32::T]),
-            14 => pack_32_14(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 14 / u32::T]),
-            15 => pack_32_15(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 15 / u32::T]),
-            16 => pack_32_16(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 16 / u32::T]),
-            17 => pack_32_17(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 17 / u32::T]),
-            18 => pack_32_18(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 18 / u32::T]),
-            19 => pack_32_19(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 19 / u32::T]),
+            10 => pack_32_10(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 10 / 32],
+            ),
+            11 => pack_32_11(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 11 / 32],
+            ),
+            12 => pack_32_12(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 12 / 32],
+            ),
+            13 => pack_32_13(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 13 / 32],
+            ),
+            14 => pack_32_14(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 14 / 32],
+            ),
+            15 => pack_32_15(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 15 / 32],
+            ),
+            16 => pack_32_16(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 16 / 32],
+            ),
+            17 => pack_32_17(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 17 / 32],
+            ),
+            18 => pack_32_18(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 18 / 32],
+            ),
+            19 => pack_32_19(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 19 / 32],
+            ),
 
-            20 => pack_32_20(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 20 / u32::T]),
-            21 => pack_32_21(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 21 / u32::T]),
-            22 => pack_32_22(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 22 / u32::T]),
-            23 => pack_32_23(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 23 / u32::T]),
-            24 => pack_32_24(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 24 / u32::T]),
-            25 => pack_32_25(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 25 / u32::T]),
-            26 => pack_32_26(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 26 / u32::T]),
-            27 => pack_32_27(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 27 / u32::T]),
-            28 => pack_32_28(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 28 / u32::T]),
-            29 => pack_32_29(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 29 / u32::T]),
+            20 => pack_32_20(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 20 / 32],
+            ),
+            21 => pack_32_21(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 21 / 32],
+            ),
+            22 => pack_32_22(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 22 / 32],
+            ),
+            23 => pack_32_23(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 23 / 32],
+            ),
+            24 => pack_32_24(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 24 / 32],
+            ),
+            25 => pack_32_25(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 25 / 32],
+            ),
+            26 => pack_32_26(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 26 / 32],
+            ),
+            27 => pack_32_27(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 27 / 32],
+            ),
+            28 => pack_32_28(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 28 / 32],
+            ),
+            29 => pack_32_29(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 29 / 32],
+            ),
 
-            30 => pack_32_30(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 30 / u32::T]),
-            31 => pack_32_31(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 31 / u32::T]),
-            32 => pack_32_32(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 32 / u32::T]),
+            30 => pack_32_30(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 30 / 32],
+            ),
+            31 => pack_32_31(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 31 / 32],
+            ),
+            32 => pack_32_32(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 32 / 32],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(input.len(), packed_len, "Input buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            input.len(),
+            packed_len,
+            "Input buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(output.len(), 1024, "Output buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => unpack_32_1(array_ref![input, 0, 1024 * 1 / u32::T], array_mut_ref![output, 0, 1024]),
-            2 => unpack_32_2(array_ref![input, 0, 1024 * 2 / u32::T], array_mut_ref![output, 0, 1024]),
-            3 => unpack_32_3(array_ref![input, 0, 1024 * 3 / u32::T], array_mut_ref![output, 0, 1024]),
-            4 => unpack_32_4(array_ref![input, 0, 1024 * 4 / u32::T], array_mut_ref![output, 0, 1024]),
-            5 => unpack_32_5(array_ref![input, 0, 1024 * 5 / u32::T], array_mut_ref![output, 0, 1024]),
-            6 => unpack_32_6(array_ref![input, 0, 1024 * 6 / u32::T], array_mut_ref![output, 0, 1024]),
-            7 => unpack_32_7(array_ref![input, 0, 1024 * 7 / u32::T], array_mut_ref![output, 0, 1024]),
-            8 => unpack_32_8(array_ref![input, 0, 1024 * 8 / u32::T], array_mut_ref![output, 0, 1024]),
-            9 => unpack_32_9(array_ref![input, 0, 1024 * 9 / u32::T], array_mut_ref![output, 0, 1024]),
+            1 => unpack_32_1(
+                array_ref![input, 0, 1024 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            2 => unpack_32_2(
+                array_ref![input, 0, 1024 * 2 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            3 => unpack_32_3(
+                array_ref![input, 0, 1024 * 3 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            4 => unpack_32_4(
+                array_ref![input, 0, 1024 * 4 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            5 => unpack_32_5(
+                array_ref![input, 0, 1024 * 5 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            6 => unpack_32_6(
+                array_ref![input, 0, 1024 * 6 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            7 => unpack_32_7(
+                array_ref![input, 0, 1024 * 7 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            8 => unpack_32_8(
+                array_ref![input, 0, 1024 * 8 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            9 => unpack_32_9(
+                array_ref![input, 0, 1024 * 9 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            10 => unpack_32_10(array_ref![input, 0, 1024 * 10 / u32::T], array_mut_ref![output, 0, 1024]),
-            11 => unpack_32_11(array_ref![input, 0, 1024 * 11 / u32::T], array_mut_ref![output, 0, 1024]),
-            12 => unpack_32_12(array_ref![input, 0, 1024 * 12 / u32::T], array_mut_ref![output, 0, 1024]),
-            13 => unpack_32_13(array_ref![input, 0, 1024 * 13 / u32::T], array_mut_ref![output, 0, 1024]),
-            14 => unpack_32_14(array_ref![input, 0, 1024 * 14 / u32::T], array_mut_ref![output, 0, 1024]),
-            15 => unpack_32_15(array_ref![input, 0, 1024 * 15 / u32::T], array_mut_ref![output, 0, 1024]),
-            16 => unpack_32_16(array_ref![input, 0, 1024 * 16 / u32::T], array_mut_ref![output, 0, 1024]),
-            17 => unpack_32_17(array_ref![input, 0, 1024 * 17 / u32::T], array_mut_ref![output, 0, 1024]),
-            18 => unpack_32_18(array_ref![input, 0, 1024 * 18 / u32::T], array_mut_ref![output, 0, 1024]),
-            19 => unpack_32_19(array_ref![input, 0, 1024 * 19 / u32::T], array_mut_ref![output, 0, 1024]),
+            10 => unpack_32_10(
+                array_ref![input, 0, 1024 * 10 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            11 => unpack_32_11(
+                array_ref![input, 0, 1024 * 11 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            12 => unpack_32_12(
+                array_ref![input, 0, 1024 * 12 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            13 => unpack_32_13(
+                array_ref![input, 0, 1024 * 13 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            14 => unpack_32_14(
+                array_ref![input, 0, 1024 * 14 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            15 => unpack_32_15(
+                array_ref![input, 0, 1024 * 15 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            16 => unpack_32_16(
+                array_ref![input, 0, 1024 * 16 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            17 => unpack_32_17(
+                array_ref![input, 0, 1024 * 17 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            18 => unpack_32_18(
+                array_ref![input, 0, 1024 * 18 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            19 => unpack_32_19(
+                array_ref![input, 0, 1024 * 19 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            20 => unpack_32_20(array_ref![input, 0, 1024 * 20 / u32::T], array_mut_ref![output, 0, 1024]),
-            21 => unpack_32_21(array_ref![input, 0, 1024 * 21 / u32::T], array_mut_ref![output, 0, 1024]),
-            22 => unpack_32_22(array_ref![input, 0, 1024 * 22 / u32::T], array_mut_ref![output, 0, 1024]),
-            23 => unpack_32_23(array_ref![input, 0, 1024 * 23 / u32::T], array_mut_ref![output, 0, 1024]),
-            24 => unpack_32_24(array_ref![input, 0, 1024 * 24 / u32::T], array_mut_ref![output, 0, 1024]),
-            25 => unpack_32_25(array_ref![input, 0, 1024 * 25 / u32::T], array_mut_ref![output, 0, 1024]),
-            26 => unpack_32_26(array_ref![input, 0, 1024 * 26 / u32::T], array_mut_ref![output, 0, 1024]),
-            27 => unpack_32_27(array_ref![input, 0, 1024 * 27 / u32::T], array_mut_ref![output, 0, 1024]),
-            28 => unpack_32_28(array_ref![input, 0, 1024 * 28 / u32::T], array_mut_ref![output, 0, 1024]),
-            29 => unpack_32_29(array_ref![input, 0, 1024 * 29 / u32::T], array_mut_ref![output, 0, 1024]),
+            20 => unpack_32_20(
+                array_ref![input, 0, 1024 * 20 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            21 => unpack_32_21(
+                array_ref![input, 0, 1024 * 21 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            22 => unpack_32_22(
+                array_ref![input, 0, 1024 * 22 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            23 => unpack_32_23(
+                array_ref![input, 0, 1024 * 23 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            24 => unpack_32_24(
+                array_ref![input, 0, 1024 * 24 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            25 => unpack_32_25(
+                array_ref![input, 0, 1024 * 25 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            26 => unpack_32_26(
+                array_ref![input, 0, 1024 * 26 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            27 => unpack_32_27(
+                array_ref![input, 0, 1024 * 27 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            28 => unpack_32_28(
+                array_ref![input, 0, 1024 * 28 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            29 => unpack_32_29(
+                array_ref![input, 0, 1024 * 29 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            30 => unpack_32_30(array_ref![input, 0, 1024 * 30 / u32::T], array_mut_ref![output, 0, 1024]),
-            31 => unpack_32_31(array_ref![input, 0, 1024 * 31 / u32::T], array_mut_ref![output, 0, 1024]),
-            32 => unpack_32_32(array_ref![input, 0, 1024 * 32 / u32::T], array_mut_ref![output, 0, 1024]),
+            30 => unpack_32_30(
+                array_ref![input, 0, 1024 * 30 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            31 => unpack_32_31(
+                array_ref![input, 0, 1024 * 31 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
+            32 => unpack_32_32(
+                array_ref![input, 0, 1024 * 32 / 32],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 }
@@ -415,165 +799,565 @@ impl BitPacking for u32 {
 impl BitPacking for u64 {
     unsafe fn unchecked_pack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(output.len(), packed_len, "Output buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            output.len(),
+            packed_len,
+            "Output buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(input.len(), 1024, "Input buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => pack_64_1(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 1 / u64::T]),
-            2 => pack_64_2(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 2 / u64::T]),
-            3 => pack_64_3(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 3 / u64::T]),
-            4 => pack_64_4(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 4 / u64::T]),
-            5 => pack_64_5(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 5 / u64::T]),
-            6 => pack_64_6(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 6 / u64::T]),
-            7 => pack_64_7(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 7 / u64::T]),
-            8 => pack_64_8(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 8 / u64::T]),
-            9 => pack_64_9(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 9 / u64::T]),
+            1 => pack_64_1(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 / 64],
+            ),
+            2 => pack_64_2(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 2 / 64],
+            ),
+            3 => pack_64_3(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 3 / 64],
+            ),
+            4 => pack_64_4(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 4 / 64],
+            ),
+            5 => pack_64_5(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 5 / 64],
+            ),
+            6 => pack_64_6(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 6 / 64],
+            ),
+            7 => pack_64_7(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 7 / 64],
+            ),
+            8 => pack_64_8(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 8 / 64],
+            ),
+            9 => pack_64_9(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 9 / 64],
+            ),
 
-            10 => pack_64_10(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 10 / u64::T]),
-            11 => pack_64_11(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 11 / u64::T]),
-            12 => pack_64_12(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 12 / u64::T]),
-            13 => pack_64_13(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 13 / u64::T]),
-            14 => pack_64_14(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 14 / u64::T]),
-            15 => pack_64_15(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 15 / u64::T]),
-            16 => pack_64_16(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 16 / u64::T]),
-            17 => pack_64_17(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 17 / u64::T]),
-            18 => pack_64_18(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 18 / u64::T]),
-            19 => pack_64_19(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 19 / u64::T]),
+            10 => pack_64_10(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 10 / 64],
+            ),
+            11 => pack_64_11(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 11 / 64],
+            ),
+            12 => pack_64_12(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 12 / 64],
+            ),
+            13 => pack_64_13(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 13 / 64],
+            ),
+            14 => pack_64_14(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 14 / 64],
+            ),
+            15 => pack_64_15(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 15 / 64],
+            ),
+            16 => pack_64_16(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 16 / 64],
+            ),
+            17 => pack_64_17(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 17 / 64],
+            ),
+            18 => pack_64_18(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 18 / 64],
+            ),
+            19 => pack_64_19(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 19 / 64],
+            ),
 
-            20 => pack_64_20(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 20 / u64::T]),
-            21 => pack_64_21(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 21 / u64::T]),
-            22 => pack_64_22(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 22 / u64::T]),
-            23 => pack_64_23(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 23 / u64::T]),
-            24 => pack_64_24(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 24 / u64::T]),
-            25 => pack_64_25(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 25 / u64::T]),
-            26 => pack_64_26(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 26 / u64::T]),
-            27 => pack_64_27(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 27 / u64::T]),
-            28 => pack_64_28(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 28 / u64::T]),
-            29 => pack_64_29(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 29 / u64::T]),
+            20 => pack_64_20(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 20 / 64],
+            ),
+            21 => pack_64_21(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 21 / 64],
+            ),
+            22 => pack_64_22(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 22 / 64],
+            ),
+            23 => pack_64_23(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 23 / 64],
+            ),
+            24 => pack_64_24(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 24 / 64],
+            ),
+            25 => pack_64_25(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 25 / 64],
+            ),
+            26 => pack_64_26(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 26 / 64],
+            ),
+            27 => pack_64_27(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 27 / 64],
+            ),
+            28 => pack_64_28(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 28 / 64],
+            ),
+            29 => pack_64_29(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 29 / 64],
+            ),
 
-            30 => pack_64_30(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 30 / u64::T]),
-            31 => pack_64_31(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 31 / u64::T]),
-            32 => pack_64_32(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 32 / u64::T]),
-            33 => pack_64_33(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 33 / u64::T]),
-            34 => pack_64_34(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 34 / u64::T]),
-            35 => pack_64_35(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 35 / u64::T]),
-            36 => pack_64_36(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 36 / u64::T]),
-            37 => pack_64_37(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 37 / u64::T]),
-            38 => pack_64_38(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 38 / u64::T]),
-            39 => pack_64_39(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 39 / u64::T]),
+            30 => pack_64_30(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 30 / 64],
+            ),
+            31 => pack_64_31(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 31 / 64],
+            ),
+            32 => pack_64_32(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 32 / 64],
+            ),
+            33 => pack_64_33(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 33 / 64],
+            ),
+            34 => pack_64_34(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 34 / 64],
+            ),
+            35 => pack_64_35(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 35 / 64],
+            ),
+            36 => pack_64_36(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 36 / 64],
+            ),
+            37 => pack_64_37(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 37 / 64],
+            ),
+            38 => pack_64_38(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 38 / 64],
+            ),
+            39 => pack_64_39(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 39 / 64],
+            ),
 
-            40 => pack_64_40(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 40 / u64::T]),
-            41 => pack_64_41(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 41 / u64::T]),
-            42 => pack_64_42(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 42 / u64::T]),
-            43 => pack_64_43(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 43 / u64::T]),
-            44 => pack_64_44(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 44 / u64::T]),
-            45 => pack_64_45(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 45 / u64::T]),
-            46 => pack_64_46(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 46 / u64::T]),
-            47 => pack_64_47(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 47 / u64::T]),
-            48 => pack_64_48(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 48 / u64::T]),
-            49 => pack_64_49(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 49 / u64::T]),
+            40 => pack_64_40(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 40 / 64],
+            ),
+            41 => pack_64_41(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 41 / 64],
+            ),
+            42 => pack_64_42(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 42 / 64],
+            ),
+            43 => pack_64_43(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 43 / 64],
+            ),
+            44 => pack_64_44(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 44 / 64],
+            ),
+            45 => pack_64_45(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 45 / 64],
+            ),
+            46 => pack_64_46(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 46 / 64],
+            ),
+            47 => pack_64_47(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 47 / 64],
+            ),
+            48 => pack_64_48(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 48 / 64],
+            ),
+            49 => pack_64_49(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 49 / 64],
+            ),
 
-            50 => pack_64_50(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 50 / u64::T]),
-            51 => pack_64_51(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 51 / u64::T]),
-            52 => pack_64_52(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 52 / u64::T]),
-            53 => pack_64_53(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 53 / u64::T]),
-            54 => pack_64_54(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 54 / u64::T]),
-            55 => pack_64_55(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 55 / u64::T]),
-            56 => pack_64_56(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 56 / u64::T]),
-            57 => pack_64_57(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 57 / u64::T]),
-            58 => pack_64_58(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 58 / u64::T]),
-            59 => pack_64_59(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 59 / u64::T]),
+            50 => pack_64_50(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 50 / 64],
+            ),
+            51 => pack_64_51(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 51 / 64],
+            ),
+            52 => pack_64_52(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 52 / 64],
+            ),
+            53 => pack_64_53(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 53 / 64],
+            ),
+            54 => pack_64_54(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 54 / 64],
+            ),
+            55 => pack_64_55(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 55 / 64],
+            ),
+            56 => pack_64_56(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 56 / 64],
+            ),
+            57 => pack_64_57(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 57 / 64],
+            ),
+            58 => pack_64_58(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 58 / 64],
+            ),
+            59 => pack_64_59(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 59 / 64],
+            ),
 
-            60 => pack_64_60(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 60 / u64::T]),
-            61 => pack_64_61(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 61 / u64::T]),
-            62 => pack_64_62(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 62 / u64::T]),
-            63 => pack_64_63(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 63 / u64::T]),
-            64 => pack_64_64(array_ref![input, 0, 1024], array_mut_ref![output, 0, 1024 * 64 / u64::T]),
+            60 => pack_64_60(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 60 / 64],
+            ),
+            61 => pack_64_61(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 61 / 64],
+            ),
+            62 => pack_64_62(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 62 / 64],
+            ),
+            63 => pack_64_63(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 63 / 64],
+            ),
+            64 => pack_64_64(
+                array_ref![input, 0, 1024],
+                array_mut_ref![output, 0, 1024 * 64 / 64],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 
     unsafe fn unchecked_unpack(width: usize, input: &[Self], output: &mut [Self]) {
         let packed_len = 128 * width / size_of::<Self>();
-        debug_assert_eq!(input.len(), packed_len, "Input buffer must be of size 1024 * W / T");
+        debug_assert_eq!(
+            input.len(),
+            packed_len,
+            "Input buffer must be of size 1024 * W / T"
+        );
         debug_assert_eq!(output.len(), 1024, "Output buffer must be of size 1024");
-        debug_assert!(width <= Self::T, "Width must be less than or equal to {}", Self::T);
+        debug_assert!(
+            width <= Self::T,
+            "Width must be less than or equal to {}",
+            Self::T
+        );
 
         match width {
-            1 => unpack_64_1(array_ref![input, 0, 1024 * 1 / u64::T], array_mut_ref![output, 0, 1024]),
-            2 => unpack_64_2(array_ref![input, 0, 1024 * 2 / u64::T], array_mut_ref![output, 0, 1024]),
-            3 => unpack_64_3(array_ref![input, 0, 1024 * 3 / u64::T], array_mut_ref![output, 0, 1024]),
-            4 => unpack_64_4(array_ref![input, 0, 1024 * 4 / u64::T], array_mut_ref![output, 0, 1024]),
-            5 => unpack_64_5(array_ref![input, 0, 1024 * 5 / u64::T], array_mut_ref![output, 0, 1024]),
-            6 => unpack_64_6(array_ref![input, 0, 1024 * 6 / u64::T], array_mut_ref![output, 0, 1024]),
-            7 => unpack_64_7(array_ref![input, 0, 1024 * 7 / u64::T], array_mut_ref![output, 0, 1024]),
-            8 => unpack_64_8(array_ref![input, 0, 1024 * 8 / u64::T], array_mut_ref![output, 0, 1024]),
-            9 => unpack_64_9(array_ref![input, 0, 1024 * 9 / u64::T], array_mut_ref![output, 0, 1024]),
+            1 => unpack_64_1(
+                array_ref![input, 0, 1024 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            2 => unpack_64_2(
+                array_ref![input, 0, 1024 * 2 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            3 => unpack_64_3(
+                array_ref![input, 0, 1024 * 3 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            4 => unpack_64_4(
+                array_ref![input, 0, 1024 * 4 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            5 => unpack_64_5(
+                array_ref![input, 0, 1024 * 5 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            6 => unpack_64_6(
+                array_ref![input, 0, 1024 * 6 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            7 => unpack_64_7(
+                array_ref![input, 0, 1024 * 7 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            8 => unpack_64_8(
+                array_ref![input, 0, 1024 * 8 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            9 => unpack_64_9(
+                array_ref![input, 0, 1024 * 9 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            10 => unpack_64_10(array_ref![input, 0, 1024 * 10 / u64::T], array_mut_ref![output, 0, 1024]),
-            11 => unpack_64_11(array_ref![input, 0, 1024 * 11 / u64::T], array_mut_ref![output, 0, 1024]),
-            12 => unpack_64_12(array_ref![input, 0, 1024 * 12 / u64::T], array_mut_ref![output, 0, 1024]),
-            13 => unpack_64_13(array_ref![input, 0, 1024 * 13 / u64::T], array_mut_ref![output, 0, 1024]),
-            14 => unpack_64_14(array_ref![input, 0, 1024 * 14 / u64::T], array_mut_ref![output, 0, 1024]),
-            15 => unpack_64_15(array_ref![input, 0, 1024 * 15 / u64::T], array_mut_ref![output, 0, 1024]),
-            16 => unpack_64_16(array_ref![input, 0, 1024 * 16 / u64::T], array_mut_ref![output, 0, 1024]),
-            17 => unpack_64_17(array_ref![input, 0, 1024 * 17 / u64::T], array_mut_ref![output, 0, 1024]),
-            18 => unpack_64_18(array_ref![input, 0, 1024 * 18 / u64::T], array_mut_ref![output, 0, 1024]),
-            19 => unpack_64_19(array_ref![input, 0, 1024 * 19 / u64::T], array_mut_ref![output, 0, 1024]),
+            10 => unpack_64_10(
+                array_ref![input, 0, 1024 * 10 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            11 => unpack_64_11(
+                array_ref![input, 0, 1024 * 11 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            12 => unpack_64_12(
+                array_ref![input, 0, 1024 * 12 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            13 => unpack_64_13(
+                array_ref![input, 0, 1024 * 13 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            14 => unpack_64_14(
+                array_ref![input, 0, 1024 * 14 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            15 => unpack_64_15(
+                array_ref![input, 0, 1024 * 15 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            16 => unpack_64_16(
+                array_ref![input, 0, 1024 * 16 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            17 => unpack_64_17(
+                array_ref![input, 0, 1024 * 17 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            18 => unpack_64_18(
+                array_ref![input, 0, 1024 * 18 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            19 => unpack_64_19(
+                array_ref![input, 0, 1024 * 19 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            20 => unpack_64_20(array_ref![input, 0, 1024 * 20 / u64::T], array_mut_ref![output, 0, 1024]),
-            21 => unpack_64_21(array_ref![input, 0, 1024 * 21 / u64::T], array_mut_ref![output, 0, 1024]),
-            22 => unpack_64_22(array_ref![input, 0, 1024 * 22 / u64::T], array_mut_ref![output, 0, 1024]),
-            23 => unpack_64_23(array_ref![input, 0, 1024 * 23 / u64::T], array_mut_ref![output, 0, 1024]),
-            24 => unpack_64_24(array_ref![input, 0, 1024 * 24 / u64::T], array_mut_ref![output, 0, 1024]),
-            25 => unpack_64_25(array_ref![input, 0, 1024 * 25 / u64::T], array_mut_ref![output, 0, 1024]),
-            26 => unpack_64_26(array_ref![input, 0, 1024 * 26 / u64::T], array_mut_ref![output, 0, 1024]),
-            27 => unpack_64_27(array_ref![input, 0, 1024 * 27 / u64::T], array_mut_ref![output, 0, 1024]),
-            28 => unpack_64_28(array_ref![input, 0, 1024 * 28 / u64::T], array_mut_ref![output, 0, 1024]),
-            29 => unpack_64_29(array_ref![input, 0, 1024 * 29 / u64::T], array_mut_ref![output, 0, 1024]),
+            20 => unpack_64_20(
+                array_ref![input, 0, 1024 * 20 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            21 => unpack_64_21(
+                array_ref![input, 0, 1024 * 21 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            22 => unpack_64_22(
+                array_ref![input, 0, 1024 * 22 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            23 => unpack_64_23(
+                array_ref![input, 0, 1024 * 23 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            24 => unpack_64_24(
+                array_ref![input, 0, 1024 * 24 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            25 => unpack_64_25(
+                array_ref![input, 0, 1024 * 25 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            26 => unpack_64_26(
+                array_ref![input, 0, 1024 * 26 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            27 => unpack_64_27(
+                array_ref![input, 0, 1024 * 27 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            28 => unpack_64_28(
+                array_ref![input, 0, 1024 * 28 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            29 => unpack_64_29(
+                array_ref![input, 0, 1024 * 29 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            30 => unpack_64_30(array_ref![input, 0, 1024 * 30 / u64::T], array_mut_ref![output, 0, 1024]),
-            31 => unpack_64_31(array_ref![input, 0, 1024 * 31 / u64::T], array_mut_ref![output, 0, 1024]),
-            32 => unpack_64_32(array_ref![input, 0, 1024 * 32 / u64::T], array_mut_ref![output, 0, 1024]),
-            33 => unpack_64_33(array_ref![input, 0, 1024 * 33 / u64::T], array_mut_ref![output, 0, 1024]),
-            34 => unpack_64_34(array_ref![input, 0, 1024 * 34 / u64::T], array_mut_ref![output, 0, 1024]),
-            35 => unpack_64_35(array_ref![input, 0, 1024 * 35 / u64::T], array_mut_ref![output, 0, 1024]),
-            36 => unpack_64_36(array_ref![input, 0, 1024 * 36 / u64::T], array_mut_ref![output, 0, 1024]),
-            37 => unpack_64_37(array_ref![input, 0, 1024 * 37 / u64::T], array_mut_ref![output, 0, 1024]),
-            38 => unpack_64_38(array_ref![input, 0, 1024 * 38 / u64::T], array_mut_ref![output, 0, 1024]),
-            39 => unpack_64_39(array_ref![input, 0, 1024 * 39 / u64::T], array_mut_ref![output, 0, 1024]),
+            30 => unpack_64_30(
+                array_ref![input, 0, 1024 * 30 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            31 => unpack_64_31(
+                array_ref![input, 0, 1024 * 31 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            32 => unpack_64_32(
+                array_ref![input, 0, 1024 * 32 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            33 => unpack_64_33(
+                array_ref![input, 0, 1024 * 33 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            34 => unpack_64_34(
+                array_ref![input, 0, 1024 * 34 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            35 => unpack_64_35(
+                array_ref![input, 0, 1024 * 35 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            36 => unpack_64_36(
+                array_ref![input, 0, 1024 * 36 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            37 => unpack_64_37(
+                array_ref![input, 0, 1024 * 37 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            38 => unpack_64_38(
+                array_ref![input, 0, 1024 * 38 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            39 => unpack_64_39(
+                array_ref![input, 0, 1024 * 39 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            40 => unpack_64_40(array_ref![input, 0, 1024 * 40 / u64::T], array_mut_ref![output, 0, 1024]),
-            41 => unpack_64_41(array_ref![input, 0, 1024 * 41 / u64::T], array_mut_ref![output, 0, 1024]),
-            42 => unpack_64_42(array_ref![input, 0, 1024 * 42 / u64::T], array_mut_ref![output, 0, 1024]),
-            43 => unpack_64_43(array_ref![input, 0, 1024 * 43 / u64::T], array_mut_ref![output, 0, 1024]),
-            44 => unpack_64_44(array_ref![input, 0, 1024 * 44 / u64::T], array_mut_ref![output, 0, 1024]),
-            45 => unpack_64_45(array_ref![input, 0, 1024 * 45 / u64::T], array_mut_ref![output, 0, 1024]),
-            46 => unpack_64_46(array_ref![input, 0, 1024 * 46 / u64::T], array_mut_ref![output, 0, 1024]),
-            47 => unpack_64_47(array_ref![input, 0, 1024 * 47 / u64::T], array_mut_ref![output, 0, 1024]),
-            48 => unpack_64_48(array_ref![input, 0, 1024 * 48 / u64::T], array_mut_ref![output, 0, 1024]),
-            49 => unpack_64_49(array_ref![input, 0, 1024 * 49 / u64::T], array_mut_ref![output, 0, 1024]),
+            40 => unpack_64_40(
+                array_ref![input, 0, 1024 * 40 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            41 => unpack_64_41(
+                array_ref![input, 0, 1024 * 41 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            42 => unpack_64_42(
+                array_ref![input, 0, 1024 * 42 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            43 => unpack_64_43(
+                array_ref![input, 0, 1024 * 43 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            44 => unpack_64_44(
+                array_ref![input, 0, 1024 * 44 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            45 => unpack_64_45(
+                array_ref![input, 0, 1024 * 45 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            46 => unpack_64_46(
+                array_ref![input, 0, 1024 * 46 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            47 => unpack_64_47(
+                array_ref![input, 0, 1024 * 47 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            48 => unpack_64_48(
+                array_ref![input, 0, 1024 * 48 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            49 => unpack_64_49(
+                array_ref![input, 0, 1024 * 49 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            50 => unpack_64_50(array_ref![input, 0, 1024 * 50 / u64::T], array_mut_ref![output, 0, 1024]),
-            51 => unpack_64_51(array_ref![input, 0, 1024 * 51 / u64::T], array_mut_ref![output, 0, 1024]),
-            52 => unpack_64_52(array_ref![input, 0, 1024 * 52 / u64::T], array_mut_ref![output, 0, 1024]),
-            53 => unpack_64_53(array_ref![input, 0, 1024 * 53 / u64::T], array_mut_ref![output, 0, 1024]),
-            54 => unpack_64_54(array_ref![input, 0, 1024 * 54 / u64::T], array_mut_ref![output, 0, 1024]),
-            55 => unpack_64_55(array_ref![input, 0, 1024 * 55 / u64::T], array_mut_ref![output, 0, 1024]),
-            56 => unpack_64_56(array_ref![input, 0, 1024 * 56 / u64::T], array_mut_ref![output, 0, 1024]),
-            57 => unpack_64_57(array_ref![input, 0, 1024 * 57 / u64::T], array_mut_ref![output, 0, 1024]),
-            58 => unpack_64_58(array_ref![input, 0, 1024 * 58 / u64::T], array_mut_ref![output, 0, 1024]),
-            59 => unpack_64_59(array_ref![input, 0, 1024 * 59 / u64::T], array_mut_ref![output, 0, 1024]),
+            50 => unpack_64_50(
+                array_ref![input, 0, 1024 * 50 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            51 => unpack_64_51(
+                array_ref![input, 0, 1024 * 51 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            52 => unpack_64_52(
+                array_ref![input, 0, 1024 * 52 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            53 => unpack_64_53(
+                array_ref![input, 0, 1024 * 53 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            54 => unpack_64_54(
+                array_ref![input, 0, 1024 * 54 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            55 => unpack_64_55(
+                array_ref![input, 0, 1024 * 55 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            56 => unpack_64_56(
+                array_ref![input, 0, 1024 * 56 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            57 => unpack_64_57(
+                array_ref![input, 0, 1024 * 57 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            58 => unpack_64_58(
+                array_ref![input, 0, 1024 * 58 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            59 => unpack_64_59(
+                array_ref![input, 0, 1024 * 59 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            60 => unpack_64_60(array_ref![input, 0, 1024 * 60 / u64::T], array_mut_ref![output, 0, 1024]),
-            61 => unpack_64_61(array_ref![input, 0, 1024 * 61 / u64::T], array_mut_ref![output, 0, 1024]),
-            62 => unpack_64_62(array_ref![input, 0, 1024 * 62 / u64::T], array_mut_ref![output, 0, 1024]),
-            63 => unpack_64_63(array_ref![input, 0, 1024 * 63 / u64::T], array_mut_ref![output, 0, 1024]),
-            64 => unpack_64_64(array_ref![input, 0, 1024 * 64 / u64::T], array_mut_ref![output, 0, 1024]),
+            60 => unpack_64_60(
+                array_ref![input, 0, 1024 * 60 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            61 => unpack_64_61(
+                array_ref![input, 0, 1024 * 61 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            62 => unpack_64_62(
+                array_ref![input, 0, 1024 * 62 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            63 => unpack_64_63(
+                array_ref![input, 0, 1024 * 63 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
+            64 => unpack_64_64(
+                array_ref![input, 0, 1024 * 64 / 64],
+                array_mut_ref![output, 0, 1024],
+            ),
 
-            _ => unreachable!("Unsupported width: {}", width)
+            _ => unreachable!("Unsupported width: {}", width),
         }
     }
 }
@@ -603,9 +1387,7 @@ macro_rules! pack_8 {
     ($name:ident, $bits:expr) => {
         fn $name(input: &[u8; 1024], output: &mut [u8; 1024 * $bits / u8::T]) {
             for lane in 0..u8::LANES {
-                pack!(u8, $bits, output, lane, |$idx| {
-                    input[$idx]
-                });
+                pack!(u8, $bits, output, lane, |$idx| { input[$idx] });
             }
         }
     };
@@ -652,9 +1434,7 @@ macro_rules! pack_16 {
     ($name:ident, $bits:expr) => {
         fn $name(input: &[u16; 1024], output: &mut [u16; 1024 * $bits / u16::T]) {
             for lane in 0..u16::LANES {
-                pack!(u16, $bits, output, lane, |$idx| {
-                    input[$idx]
-                });
+                pack!(u16, $bits, output, lane, |$idx| { input[$idx] });
             }
         }
     };
@@ -726,9 +1506,7 @@ macro_rules! pack_32 {
     ($name:ident, $bits:expr) => {
         fn $name(input: &[u32; 1024], output: &mut [u32; 1024 * $bits / u32::BITS as usize]) {
             for lane in 0..u32::LANES {
-                pack!(u32, $bits, output, lane, |$idx| {
-                    input[$idx]
-                });
+                pack!(u32, $bits, output, lane, |$idx| { input[$idx] });
             }
         }
     };
@@ -767,62 +1545,169 @@ pack_32!(pack_32_30, 30);
 pack_32!(pack_32_31, 31);
 pack_32!(pack_32_32, 32);
 
-macro_rules! generate_unpack_64 {
-    ($($n:expr),*) => {
-        $(
-            paste::item! {
-                fn [<unpack_64_ $n>](input: &[u64; 1024 * $n / u64::T], output: &mut [u64; 1024]) {
-                    for lane in 0..u64::LANES {
-                        unpack!(u64, $n, input, lane, |$idx, $elem| {
-                            output[$idx] = $elem
-                        });
-                    }
-                }
+macro_rules! unpack_64 {
+    ($name:ident, $bit_width:expr) => {
+        fn $name(input: &[u64; 1024 * $bit_width / u64::T], output: &mut [u64; 1024]) {
+            for lane in 0..u64::LANES {
+                unpack!(u64, $bit_width, input, lane, |$idx, $elem| {
+                    output[$idx] = $elem
+                });
             }
-        )*
+        }
     };
 }
 
-generate_unpack_64!(
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-    49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
-);
+unpack_64!(unpack_64_1, 1);
+unpack_64!(unpack_64_2, 2);
+unpack_64!(unpack_64_3, 3);
+unpack_64!(unpack_64_4, 4);
+unpack_64!(unpack_64_5, 5);
+unpack_64!(unpack_64_6, 6);
+unpack_64!(unpack_64_7, 7);
+unpack_64!(unpack_64_8, 8);
+unpack_64!(unpack_64_9, 9);
+unpack_64!(unpack_64_10, 10);
+unpack_64!(unpack_64_11, 11);
+unpack_64!(unpack_64_12, 12);
+unpack_64!(unpack_64_13, 13);
+unpack_64!(unpack_64_14, 14);
+unpack_64!(unpack_64_15, 15);
+unpack_64!(unpack_64_16, 16);
+unpack_64!(unpack_64_17, 17);
+unpack_64!(unpack_64_18, 18);
+unpack_64!(unpack_64_19, 19);
+unpack_64!(unpack_64_20, 20);
+unpack_64!(unpack_64_21, 21);
+unpack_64!(unpack_64_22, 22);
+unpack_64!(unpack_64_23, 23);
+unpack_64!(unpack_64_24, 24);
+unpack_64!(unpack_64_25, 25);
+unpack_64!(unpack_64_26, 26);
+unpack_64!(unpack_64_27, 27);
+unpack_64!(unpack_64_28, 28);
+unpack_64!(unpack_64_29, 29);
+unpack_64!(unpack_64_30, 30);
+unpack_64!(unpack_64_31, 31);
+unpack_64!(unpack_64_32, 32);
 
-macro_rules! generate_pack_64 {
-    ($($n:expr),*) => {
-        $(
-            paste::item! {
-                fn [<pack_64_ $n>](input: &[u64; 1024], output: &mut [u64; 1024 * $n / u64::T]) {
-                    for lane in 0..u64::LANES {
-                        pack!(u64, $n, output, lane, |$idx| {
-                            input[$idx]
-                        });
-                    }
-                }
+unpack_64!(unpack_64_33, 33);
+unpack_64!(unpack_64_34, 34);
+unpack_64!(unpack_64_35, 35);
+unpack_64!(unpack_64_36, 36);
+unpack_64!(unpack_64_37, 37);
+unpack_64!(unpack_64_38, 38);
+unpack_64!(unpack_64_39, 39);
+unpack_64!(unpack_64_40, 40);
+unpack_64!(unpack_64_41, 41);
+unpack_64!(unpack_64_42, 42);
+unpack_64!(unpack_64_43, 43);
+unpack_64!(unpack_64_44, 44);
+unpack_64!(unpack_64_45, 45);
+unpack_64!(unpack_64_46, 46);
+unpack_64!(unpack_64_47, 47);
+unpack_64!(unpack_64_48, 48);
+unpack_64!(unpack_64_49, 49);
+unpack_64!(unpack_64_50, 50);
+unpack_64!(unpack_64_51, 51);
+unpack_64!(unpack_64_52, 52);
+unpack_64!(unpack_64_53, 53);
+unpack_64!(unpack_64_54, 54);
+unpack_64!(unpack_64_55, 55);
+unpack_64!(unpack_64_56, 56);
+unpack_64!(unpack_64_57, 57);
+unpack_64!(unpack_64_58, 58);
+unpack_64!(unpack_64_59, 59);
+unpack_64!(unpack_64_60, 60);
+unpack_64!(unpack_64_61, 61);
+unpack_64!(unpack_64_62, 62);
+unpack_64!(unpack_64_63, 63);
+unpack_64!(unpack_64_64, 64);
+
+macro_rules! pack_64 {
+    ($name:ident, $bits:expr) => {
+        fn $name(input: &[u64; 1024], output: &mut [u64; 1024 * $bits / u64::BITS as usize]) {
+            for lane in 0..u64::LANES {
+                pack!(u64, $bits, output, lane, |$idx| { input[$idx] });
             }
-        )*
+        }
     };
 }
 
-generate_pack_64!(
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
-    33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-    49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
-);
+pack_64!(pack_64_1, 1);
+pack_64!(pack_64_2, 2);
+pack_64!(pack_64_3, 3);
+pack_64!(pack_64_4, 4);
+pack_64!(pack_64_5, 5);
+pack_64!(pack_64_6, 6);
+pack_64!(pack_64_7, 7);
+pack_64!(pack_64_8, 8);
+pack_64!(pack_64_9, 9);
+pack_64!(pack_64_10, 10);
+pack_64!(pack_64_11, 11);
+pack_64!(pack_64_12, 12);
+pack_64!(pack_64_13, 13);
+pack_64!(pack_64_14, 14);
+pack_64!(pack_64_15, 15);
+pack_64!(pack_64_16, 16);
+pack_64!(pack_64_17, 17);
+pack_64!(pack_64_18, 18);
+pack_64!(pack_64_19, 19);
+pack_64!(pack_64_20, 20);
+pack_64!(pack_64_21, 21);
+pack_64!(pack_64_22, 22);
+pack_64!(pack_64_23, 23);
+pack_64!(pack_64_24, 24);
+pack_64!(pack_64_25, 25);
+pack_64!(pack_64_26, 26);
+pack_64!(pack_64_27, 27);
+pack_64!(pack_64_28, 28);
+pack_64!(pack_64_29, 29);
+pack_64!(pack_64_30, 30);
+pack_64!(pack_64_31, 31);
+pack_64!(pack_64_32, 32);
 
+pack_64!(pack_64_33, 33);
+pack_64!(pack_64_34, 34);
+pack_64!(pack_64_35, 35);
+pack_64!(pack_64_36, 36);
+pack_64!(pack_64_37, 37);
+pack_64!(pack_64_38, 38);
+pack_64!(pack_64_39, 39);
+pack_64!(pack_64_40, 40);
+pack_64!(pack_64_41, 41);
+pack_64!(pack_64_42, 42);
+pack_64!(pack_64_43, 43);
+pack_64!(pack_64_44, 44);
+pack_64!(pack_64_45, 45);
+pack_64!(pack_64_46, 46);
+pack_64!(pack_64_47, 47);
+pack_64!(pack_64_48, 48);
+pack_64!(pack_64_49, 49);
+pack_64!(pack_64_50, 50);
+pack_64!(pack_64_51, 51);
+pack_64!(pack_64_52, 52);
+pack_64!(pack_64_53, 53);
+pack_64!(pack_64_54, 54);
+pack_64!(pack_64_55, 55);
+pack_64!(pack_64_56, 56);
+pack_64!(pack_64_57, 57);
+pack_64!(pack_64_58, 58);
+pack_64!(pack_64_59, 59);
+pack_64!(pack_64_60, 60);
+pack_64!(pack_64_61, 61);
+pack_64!(pack_64_62, 62);
+pack_64!(pack_64_63, 63);
+pack_64!(pack_64_64, 64);
 #[cfg(test)]
 mod test {
-    use core::array;
     use super::*;
+    use core::array;
 
     #[test]
     fn test_pack() {
         let mut values: [u16; 1024] = [0; 1024];
-        for i in 0..1024 {
-            values[i] = (i % (1 << 15)) as u16;
+        for (i, value) in values.iter_mut().enumerate() {
+            *value = (i % (1 << 15)) as u16;
         }
 
         let mut packed: [u16; 960] = [0; 960];
@@ -835,7 +1720,6 @@ mod test {
 
         let mut packed_orig: [u16; 960] = [0; 960];
         unsafe {
-
             BitPacking::unchecked_pack(15, &values, &mut packed_orig);
         }
 
