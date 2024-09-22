@@ -63,9 +63,7 @@ jobs:
           components: "rustfmt,clippy"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "buildjet-v1"
           workspaces: rust
-          cache-provider: "buildjet"
       - name: Install dependencies
         run: |
           sudo apt update
