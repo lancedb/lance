@@ -63,7 +63,6 @@ jobs:
           components: "rustfmt,clippy"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "buildjet-v1"
           workspaces: rust
       - name: Install dependencies
         run: |
