@@ -144,6 +144,9 @@ jobs:
         with:
           arm-build: "true"
           manylinux: "2_24"
+      - name: Install dependencies
+        run: |
+          apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
       # Make sure wheels are not included in the Rust cache
       - name: Delete wheels
