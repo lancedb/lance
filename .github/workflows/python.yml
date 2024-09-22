@@ -122,10 +122,7 @@ jobs:
   linux-arm:
     timeout-minutes: 45
     runs-on: ubuntu-2404-4x-arm64
-    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
-    strategy:
-      matrix:
-        python-minor-version: ["12"]
+    name: Python Linux 3.12 ARM
     defaults:
       run:
         shell: bash
@@ -136,13 +133,9 @@ jobs:
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        run: |
-          sudo apt update
-          sudo apt install -y -qq wget software-properties-common
-          sudo add-apt-repository ppa:deadsnakes/ppa
-          sudo apt install -y python3.${{ matrix.python-minor-version }}
-          sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
-          sudo apt install -y python3-pip python3.${{ matrix.python-minor-version }}-distutils
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
