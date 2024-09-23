@@ -10,6 +10,7 @@ use lance_table::utils::stream::ReadBatchFutStream;
 use snafu::{location, Location};
 
 use super::fragment::FragmentReader;
+use super::scanner::get_default_batch_size;
 use super::write::{open_writer, GenericWriter};
 use super::Dataset;
 use crate::dataset::FileFragment;
@@ -59,6 +60,7 @@ impl Updater {
         reader: FragmentReader,
         deletion_vector: DeletionVector,
         schemas: Option<(Schema, Schema)>,
+        batch_size: Option<u32>,
     ) -> Result<Self> {
         let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
             (Some(write_schema), Some(final_schema))
@@ -66,9 +68,18 @@ impl Updater {
             (None, None)
         };
 
-        let batch_size = reader.legacy_num_rows_in_batch(0);
+        let legacy_batch_size = reader.legacy_num_rows_in_batch(0);
 
-        let input_stream = reader.read_all(1024)?;
+        let batch_size = match (&legacy_batch_size, batch_size) {
+            // If this is a v1 dataset we must use the row group size of the file
+            (Some(num_rows), _) => *num_rows,
+            // If this is a v2 dataset, let the user pick the batch size
+            (None, Some(legacy_batch_size)) => legacy_batch_size,
+            // Otherwise, default to 1024 if the user didn't specify anything
+            (None, None) => get_default_batch_size().unwrap_or(1024) as u32,
+        };
+
+        let input_stream = reader.read_all(batch_size)?;
 
         Ok(Self {
             fragment,
@@ -78,7 +89,7 @@ impl Updater {
             write_schema,
             final_schema,
             finished: false,
-            deletion_restorer: DeletionRestorer::new(deletion_vector, batch_size),
+            deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
         })
     }
 
@@ -226,7 +237,7 @@ struct DeletionRestorer {
     current_row_id: u32,
 
     /// Number of rows in each batch, only used in legacy files for validation
-    batch_size: Option<u32>,
+    legacy_batch_size: Option<u32>,
 
     deletion_vector_iter: Option<Box<dyn Iterator<Item = u32> + Send>>,
 
@@ -234,10 +245,10 @@ struct DeletionRestorer {
 }
 
 impl DeletionRestorer {
-    fn new(deletion_vector: DeletionVector, batch_size: Option<u32>) -> Self {
+    fn new(deletion_vector: DeletionVector, legacy_batch_size: Option<u32>) -> Self {
         Self {
             current_row_id: 0,
-            batch_size,
+            legacy_batch_size,
             deletion_vector_iter: Some(deletion_vector.into_sorted_iter()),
             last_deleted_row_id: None,
         }
@@ -248,12 +259,12 @@ impl DeletionRestorer {
     }
 
     fn is_full(batch_size: Option<u32>, num_rows: u32) -> bool {
-        if let Some(batch_size) = batch_size {
+        if let Some(legacy_batch_size) = batch_size {
             // We should never encounter the case that `batch_size < num_rows` because
             // that would mean we have a v1 writer and it generated a batch with more rows
             // than expected
-            debug_assert!(batch_size >= num_rows);
-            batch_size == num_rows
+            debug_assert!(legacy_batch_size >= num_rows);
+            legacy_batch_size == num_rows
         } else {
             false
         }
@@ -295,7 +306,8 @@ impl DeletionRestorer {
         loop {
             if let Some(next_deleted_id) = next_deleted_id {
                 if next_deleted_id > last_row_id
-                    || (next_deleted_id == last_row_id && Self::is_full(self.batch_size, num_rows))
+                    || (next_deleted_id == last_row_id
+                        && Self::is_full(self.legacy_batch_size, num_rows))
                 {
                     // Either the next deleted id is out of range or it is the next row but
                     // we are full.  Either way, stash it and return
@@ -322,7 +334,7 @@ impl DeletionRestorer {
         let deleted_batch_offsets = self.deleted_batch_offsets_in_range(batch.num_rows() as u32);
         let batch = add_blanks(batch, &deleted_batch_offsets)?;
 
-        if let Some(batch_size) = self.batch_size {
+        if let Some(batch_size) = self.legacy_batch_size {
             // validation just in case, when the input has a fixed batch size then the
             // output should have the same fixed batch size (except the last batch)
             let is_last = self.is_exhausted();

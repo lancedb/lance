@@ -24,6 +24,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Set,
     TypedDict,
     Union,
 )
@@ -1061,7 +1062,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
-    ):
+    ) -> Dict[str, Any]:
         """
         Update column values for rows matching where.
 
@@ -1072,13 +1073,19 @@ class LanceDataset(pa.dataset.Dataset):
         where : str, optional
             A SQL predicate indicating which rows should be updated.
 
+        Returns
+        -------
+        updates : dict
+            A dictionary containing the number of rows updated.
+
         Examples
         --------
         >>> import lance
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
         >>> dataset = lance.write_dataset(table, "example")
-        >>> dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> update_stats = dataset.update(dict(a = 'a + 2'), where="b != 'a'")
+        >>> update_stats["num_updated_rows"] = 2
         >>> dataset.to_table().to_pandas()
            a  b
         0  1  a
@@ -1087,7 +1094,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(where, pa.compute.Expression):
             where = str(where)
-        self._ds.update(updates, where)
+        return self._ds.update(updates, where)
 
     def versions(self):
         """
@@ -2226,6 +2233,27 @@ class LanceOperation:
             groups = [group._to_inner() for group in self.groups]
             rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
             return _Operation.rewrite(groups, rewritten_indices)
+
+    @dataclass
+    class CreateIndex(BaseOperation):
+        """
+        Operation that creates an index on the dataset.
+        """
+
+        uuid: str
+        name: str
+        fields: List[int]
+        dataset_version: int
+        fragment_ids: Set[int]
+
+        def _to_inner(self):
+            return _Operation.create_index(
+                self.uuid,
+                self.name,
+                self.fields,
+                self.dataset_version,
+                self.fragment_ids,
+            )
 
 
 class ScannerBuilder:

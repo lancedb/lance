@@ -32,6 +32,21 @@ def rand_dataset(tmpdir, request):
     return ds
 
 
+@pytest.fixture
+def mostly_null_dataset(tmpdir, request):
+    vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(np.float32)
+    vectors.shape = -1
+    vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
+    vectors = vectors.to_pylist()
+    vectors = [vec if i % 10 == 0 else None for i, vec in enumerate(vectors)]
+    vectors = pa.array(vectors, pa.list_(pa.float32(), DIMENSION))
+    table = pa.Table.from_arrays([vectors], names=["vectors"])
+
+    uri = str(tmpdir / "nulls_dataset")
+    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+    return ds
+
+
 def test_ivf_centroids(tmpdir, rand_dataset):
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(sample_rate=16)
 
@@ -44,6 +59,16 @@ def test_ivf_centroids(tmpdir, rand_dataset):
     assert ivf.centroids == reloaded.centroids
 
 
+@pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
+def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
+    ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
+        sample_rate=16, distance_type=distance_type
+    )
+
+    assert ivf.distance_type == distance_type
+    assert len(ivf.centroids) == NUM_PARTITIONS
+
+
 @pytest.mark.cuda
 def test_ivf_centroids_cuda(rand_dataset):
     ivf = IndicesBuilder(rand_dataset, "vectors").train_ivf(
@@ -51,6 +76,17 @@ def test_ivf_centroids_cuda(rand_dataset):
     )
 
     assert ivf.distance_type == "l2"
+    assert len(ivf.centroids) == NUM_PARTITIONS
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
+def test_ivf_centroids_mostly_null_cuda(mostly_null_dataset, distance_type):
+    ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
+        sample_rate=16, accelerator="cuda", distance_type=distance_type
+    )
+
+    assert ivf.distance_type == distance_type
     assert len(ivf.centroids) == NUM_PARTITIONS
 
 
@@ -95,6 +131,16 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     assert pq.codebook == reloaded.codebook
 
 
+def test_gen_pq_mostly_null(mostly_null_dataset):
+    centroids = np.random.rand(DIMENSION * 100).astype(np.float32)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
+    ivf = IvfModel(centroids, "l2")
+
+    pq = IndicesBuilder(mostly_null_dataset, "vectors").train_pq(ivf, sample_rate=2)
+    assert pq.dimension == DIMENSION
+    assert pq.num_subvectors == NUM_SUBVECTORS
+
+
 @pytest.mark.cuda
 def test_assign_partitions(rand_dataset, rand_ivf):
     builder = IndicesBuilder(rand_dataset, "vectors")
@@ -111,6 +157,29 @@ def test_assign_partitions(rand_dataset, rand_ivf):
         for part_id in part_ids:
             assert part_id.as_py() < 100
     assert len(found_row_ids) == rand_dataset.count_rows()
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
+def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
+    centroids = np.random.rand(DIMENSION * 100).astype(np.float32)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
+    ivf = IvfModel(centroids, distance_type)
+
+    builder = IndicesBuilder(mostly_null_dataset, "vectors")
+
+    partitions_uri = builder.assign_ivf_partitions(ivf, accelerator="cuda")
+
+    partitions = lance.dataset(partitions_uri)
+    found_row_ids = set()
+    for batch in partitions.to_batches():
+        row_ids = batch["row_id"]
+        for row_id in row_ids:
+            found_row_ids.add(row_id)
+        part_ids = batch["partition"]
+        for part_id in part_ids:
+            assert part_id.as_py() < 100
+    assert len(found_row_ids) == (mostly_null_dataset.count_rows() / 10)
 
 
 @pytest.fixture

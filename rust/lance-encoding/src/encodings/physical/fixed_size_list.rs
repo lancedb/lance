@@ -3,16 +3,16 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, ArrayRef};
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::{
-    data::DataBlock,
+    data::{DataBlock, FixedSizeListBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -78,10 +78,10 @@ impl PrimitivePageDecoder for FixedListDecoder {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_child_rows = num_rows * self.dimension;
         let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
-        let mut child_data = child_data.as_fixed_width()?;
-        child_data.num_values = num_rows;
-        child_data.bits_per_value *= self.dimension;
-        Ok(DataBlock::FixedWidth(child_data))
+        Ok(DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(child_data),
+            dimension: self.dimension,
+        }))
     }
 }
 
@@ -101,23 +101,30 @@ impl FslEncoder {
 }
 
 impl ArrayEncoder for FslEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let inner_arrays = arrays
-            .iter()
-            .map(|arr| arr.as_fixed_size_list().values().clone())
-            .collect::<Vec<_>>();
-        let items_page = self.items_encoder.encode(&inner_arrays, buffer_index)?;
-        Ok(EncodedArray {
-            buffers: items_page.buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeList(Box::new(
-                    pb::FixedSizeList {
-                        dimension: self.dimension,
-                        items: Some(Box::new(items_page.encoding)),
-                    },
-                ))),
-            },
-        })
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let inner_type = match data_type {
+            DataType::FixedSizeList(inner_field, _) => inner_field.data_type().clone(),
+            _ => panic!("Expected fixed size list data type and got {}", data_type),
+        };
+        let data = data.as_fixed_size_list().unwrap();
+        let child = *data.child;
+
+        let encoded_data = self
+            .items_encoder
+            .encode(child, &inner_type, buffer_index)?;
+
+        let data = DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(encoded_data.data),
+            dimension: self.dimension as u64,
+        });
+
+        let encoding = ProtobufUtils::fixed_size_list(encoded_data.encoding, self.dimension);
+        Ok(EncodedArray { data, encoding })
     }
 }
 

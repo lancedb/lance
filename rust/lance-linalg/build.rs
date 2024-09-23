@@ -76,7 +76,8 @@ fn main() -> Result<(), String> {
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
     let mut builder = cc::Build::new();
     builder
-        // TODO: why specify the compiler?
+        // We use clang #pragma to yields better vectorization
+        // See https://github.com/lancedb/lance/pull/2885
         // .compiler("clang")
         .std("c17")
         .file("src/simd/f16.c")
@@ -89,7 +90,7 @@ fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
         // Pedantic will complain about _Float16 in some versions of GCC
         // .flag("-Wpedantic")
         // We pass in the suffix to make sure the symbol names are unique
-        .flag(format!("-DSUFFIX=_{}", suffix));
+        .flag(format!("-DSUFFIX=_{}", suffix).as_str());
 
     for flag in flags {
         builder.flag(flag);

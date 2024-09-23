@@ -4,7 +4,6 @@
 use std::{collections::VecDeque, ops::Range, sync::Arc};
 
 use arrow_array::{cast::AsArray, types::UInt32Type, ArrayRef, RecordBatch, UInt32Array};
-use arrow_buffer::Buffer;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use datafusion_common::{arrow::datatypes::DataType, DFSchemaRef, ScalarValue};
@@ -20,13 +19,14 @@ use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{future::BoxFuture, FutureExt};
 use lance_encoding::{
+    buffer::LanceBuffer,
     decoder::{
         decode_batch, ColumnInfo, DecoderMiddlewareChain, FieldScheduler, FilterExpression,
         PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
-        encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedBuffer, EncodedColumn,
-        EncodingOptions, FieldEncoder,
+        encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedColumn, EncodingOptions,
+        FieldEncoder,
     },
     format::pb,
     EncodingsIo,
@@ -478,7 +478,7 @@ impl ZoneMapsFieldEncoder {
         Ok(())
     }
 
-    async fn maps_to_metadata(&mut self) -> Result<EncodedBuffer> {
+    async fn maps_to_metadata(&mut self) -> Result<LanceBuffer> {
         let maps = std::mem::take(&mut self.maps);
         let (mins, (maxes, null_counts)): (Vec<_>, (Vec<_>, Vec<_>)) = maps
             .into_iter()
@@ -509,9 +509,7 @@ impl ZoneMapsFieldEncoder {
         .await?;
         let zone_maps_buffer = encoded_zone_maps.try_to_mini_lance()?;
 
-        Ok(EncodedBuffer {
-            parts: vec![Buffer::from(zone_maps_buffer)],
-        })
+        Ok(LanceBuffer::from_bytes(zone_maps_buffer, 1))
     }
 }
 

@@ -158,10 +158,22 @@ def train_ivf_centroids_on_accelerator(
 
     k = int(k)
 
-    logging.info("Randomly select %s centroids from %s", k, dataset)
-    samples = dataset.sample(k, [column], sorted=True).combine_chunks()
-    fsl = samples.to_batches()[0][column]
-    init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
+    if dataset.schema.field(column).nullable:
+        filt = f"{column} is not null"
+    else:
+        filt = None
+
+    logging.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
+
+    ds = TorchDataset(
+        dataset,
+        batch_size=k,
+        columns=[column],
+        samples=sample_size,
+        filter=filt,
+    )
+
+    init_centroids = next(iter(ds))
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
@@ -169,6 +181,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=20480,
         columns=[column],
         samples=sample_size,
+        filter=filt,
         cache=True,
     )
 
@@ -250,6 +263,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
+        filter=f"{column} is not null",
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,

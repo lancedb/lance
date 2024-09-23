@@ -3,24 +3,23 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_schema::{DataType, Fields};
+use bytes::Bytes;
+use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
+use crate::data::FixedSizeListBlock;
+use crate::format::ProtobufUtils;
 use crate::{
     buffer::LanceBuffer,
     data::{DataBlock, FixedWidthDataBlock, StructDataBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
-    format::pb::{self},
+    encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
-
-use arrow_buffer::buffer::Buffer;
-use arrow_schema::{DataType, Fields};
-use bytes::Bytes;
-use bytes::BytesMut;
-use lance_core::Result;
 
 #[derive(Debug)]
 pub struct PackedStructPageScheduler {
@@ -142,11 +141,13 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             }
 
             start_index += bytes_per_field;
-            children.push(DataBlock::FixedWidth(FixedWidthDataBlock {
+            let child_block = FixedWidthDataBlock {
                 data: LanceBuffer::from(field_bytes),
                 bits_per_value: bytes_per_field as u64 * 8,
                 num_values: num_rows,
-            }));
+            };
+            let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
+            children.push(child_block);
         }
         Ok(DataBlock::Struct(StructDataBlock { children }))
     }
@@ -163,126 +164,87 @@ impl PackedStructEncoder {
     }
 }
 
-fn pack(encoded_fields: Vec<EncodedArray>, fields_bytes_per_value: Vec<usize>) -> Buffer {
-    // Each EncodedArray can have several EncodedArrayBuffers (e.g. validity, offsets, bytes, etc)
-    // Each EncodedArrayBuffer object has several parts. Each part is a Vec<Buffer>
-    // The code below assumes that for all fields:
-    // (i) Each EncodedArray has only one EncodedArrayBuffer
-    encoded_fields
-        .iter()
-        .for_each(|field| debug_assert!(field.buffers.len() == 1));
-    // (ii) The total number of buffers across all parts in the EncodedArrayBuffer is the same
-    if encoded_fields.len() > 1 {
-        debug_assert!(encoded_fields.windows(2).all(|window| {
-            window[0].buffers[0].parts.len() == window[1].buffers[0].parts.len()
-        }));
-    }
-
-    let total_bytes_per_row = fields_bytes_per_value.iter().sum::<usize>();
-    // This workflow will have to change as we adapt the packed encoding to support more complex datatypes
-    let num_total_bytes: usize = encoded_fields
-        .iter()
-        .map(|field| {
-            field.buffers[0]
-                .parts
-                .iter()
-                .map(|buf| buf.len())
-                .sum::<usize>()
-        })
-        .sum();
-
-    let mut packed_vec: Vec<u8> = vec![0; num_total_bytes];
-
-    let mut field_offset = 0;
-    for (field_index, encoded_field) in encoded_fields.iter().enumerate() {
-        let bytes_per_value = fields_bytes_per_value[field_index];
-        let parts = &encoded_field.buffers[0].parts;
-
-        let mut packed_start = field_offset;
-        for buf in parts {
-            let num_values = buf.len() / bytes_per_value;
-            for value_index in 0..num_values {
-                let start = value_index * bytes_per_value;
-                let buffer_slice = buf.slice_with_length(start, bytes_per_value);
-                let buffer_slice = buffer_slice.as_slice();
-
-                packed_vec[packed_start..packed_start + bytes_per_value]
-                    .copy_from_slice(buffer_slice);
-                packed_start += total_bytes_per_row;
-            }
-        }
-
-        field_offset += bytes_per_value;
-    }
-
-    Buffer::from(packed_vec)
-}
-
 impl ArrayEncoder for PackedStructEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let num_struct_fields = arrays[0]
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap()
-            .num_columns();
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let struct_data = data.as_struct().unwrap();
 
-        let mut inner_encodings = Vec::new();
-        let mut global_packed_vec: Vec<Buffer> = Vec::new();
+        let DataType::Struct(child_types) = data_type else {
+            panic!("Struct datatype expected");
+        };
 
-        for (arr_index, arr) in arrays.iter().enumerate() {
-            let struct_array = arr.as_any().downcast_ref::<StructArray>().unwrap();
-
-            let mut encoded_fields = Vec::new();
-            let mut field_bytes_per_value = Vec::new();
-
-            for field_index in 0..num_struct_fields {
-                let field_datatype = struct_array.column(field_index).data_type();
-                let field_array = struct_array.column(field_index).clone();
-
-                // Compute encoded inner arrays
-                let encoded_field =
-                    self.inner_encoders[field_index].encode(&[field_array], &mut 0)?;
-                let field_buffers = encoded_field.clone().buffers;
-
-                encoded_fields.push(encoded_field.clone());
-
-                // We assume there is only one outer buffer per field
-                assert_eq!(field_buffers.len(), 1);
-
-                // Compute bytes per value for each field
-                let bytes_per_value = field_datatype.byte_width();
-                field_bytes_per_value.push(bytes_per_value);
-
-                if arr_index == 0 {
-                    inner_encodings.push(encoded_field.encoding);
-                }
-            }
-
-            let packed_buffer = pack(encoded_fields, field_bytes_per_value);
-            global_packed_vec.push(packed_buffer);
+        // Encode individual fields
+        let mut encoded_fields = Vec::with_capacity(struct_data.children.len());
+        for ((child, encoder), child_type) in struct_data
+            .children
+            .into_iter()
+            .zip(&self.inner_encoders)
+            .zip(child_types)
+        {
+            encoded_fields.push(encoder.encode(child, child_type.data_type(), &mut 0)?);
         }
 
+        let (encoded_datas, child_encodings): (Vec<_>, Vec<_>) = encoded_fields
+            .into_iter()
+            .map(|field| (field.data, field.encoding))
+            .unzip();
+
+        // Zip together encoded data
+        //
+        // We can currently encode both FixedWidth and FixedSizeList.  In order
+        // to encode the latter we "flatten" it converting a FixedSizeList into
+        // a FixedWidth with very wide items.
+        let fixed_fields = encoded_datas
+            .into_iter()
+            .map(|child| match child {
+                DataBlock::FixedWidth(fixed) => Ok(fixed),
+                DataBlock::FixedSizeList(fixed_size_list) => {
+                    let flattened = fixed_size_list.try_into_flat().ok_or_else(|| {
+                        Error::invalid_input(
+                            "Packed struct encoder cannot pack nullable fixed-width data blocks",
+                            location!(),
+                        )
+                    })?;
+                    Ok(flattened)
+                }
+                _ => Err(Error::invalid_input(
+                    "Packed struct encoder currently only implemented for fixed-width data blocks",
+                    location!(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total_bits_per_value = fixed_fields.iter().map(|f| f.bits_per_value).sum::<u64>();
+
+        let num_values = fixed_fields[0].num_values;
+        debug_assert!(fixed_fields
+            .iter()
+            .all(|field| field.num_values == num_values));
+
+        let zipped_input = fixed_fields
+            .into_iter()
+            .map(|field| (field.data, field.bits_per_value))
+            .collect::<Vec<_>>();
+        let zipped = LanceBuffer::zip_into_one(zipped_input, num_values)?;
+
+        // Create encoding protobuf
         let index = *buffer_index;
         *buffer_index += 1;
 
-        let packed_buffer = EncodedArrayBuffer {
-            parts: global_packed_vec,
-            index,
-        };
+        let packed_data = DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: zipped,
+            bits_per_value: total_bits_per_value,
+            num_values,
+        });
+
+        let encoding = ProtobufUtils::packed_struct(child_encodings, index);
 
         Ok(EncodedArray {
-            buffers: vec![packed_buffer],
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::PackedStruct(
-                    pb::PackedStruct {
-                        inner: inner_encodings,
-                        buffer: Some(pb::Buffer {
-                            buffer_index: index,
-                            buffer_type: pb::buffer::BufferType::Page as i32,
-                        }),
-                    },
-                )),
-            },
+            data: packed_data,
+            encoding,
         })
     }
 }

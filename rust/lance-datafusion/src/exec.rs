@@ -18,8 +18,9 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        stream::RecordBatchStreamAdapter, streaming::PartitionStream, DisplayAs, DisplayFormatType,
-        ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        display::DisplayableExecutionPlan, stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
@@ -29,7 +30,7 @@ use lazy_static::lazy_static;
 use futures::stream;
 use lance_arrow::SchemaExt;
 use lance_core::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 /// An source execution node created from an existing stream
 ///
@@ -241,6 +242,11 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
+    debug!(
+        "Executing plan:\n{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+    );
+
     let session_ctx = get_session_context(options);
 
     // NOTE: we are only executing the first partition here. Therefore, if

@@ -124,24 +124,11 @@ impl FixedWidthDataBlock {
         num_values: u64,
         validate: bool,
     ) -> Result<ArrayData> {
-        let builder = match &data_type {
-            DataType::FixedSizeList(child_field, dim) => {
-                let child_len = num_values * *dim as u64;
-                let child_data =
-                    self.do_into_arrow(child_field.data_type().clone(), child_len, validate)?;
-                ArrayDataBuilder::new(data_type)
-                    .add_child_data(child_data)
-                    .len(num_values as usize)
-                    .null_count(0)
-            }
-            _ => {
-                let data_buffer = self.data.into_buffer();
-                ArrayDataBuilder::new(data_type)
-                    .add_buffer(data_buffer)
-                    .len(num_values as usize)
-                    .null_count(0)
-            }
-        };
+        let data_buffer = self.data.into_buffer();
+        let builder = ArrayDataBuilder::new(data_type)
+            .add_buffer(data_buffer)
+            .len(num_values as usize)
+            .null_count(0);
         if validate {
             Ok(builder.build()?)
         } else {
@@ -170,6 +157,136 @@ impl FixedWidthDataBlock {
         Ok(Self {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
+            num_values: self.num_values,
+        })
+    }
+}
+
+/// A data block to represent a fixed size list
+#[derive(Debug)]
+pub struct FixedSizeListBlock {
+    /// The child data block
+    pub child: Box<DataBlock>,
+    /// The number of items in each list
+    pub dimension: u64,
+}
+
+impl FixedSizeListBlock {
+    fn borrow_and_clone(&mut self) -> Self {
+        Self {
+            child: Box::new(self.child.borrow_and_clone()),
+            dimension: self.dimension,
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            child: Box::new(self.child.try_clone()?),
+            dimension: self.dimension,
+        })
+    }
+
+    fn num_values(&self) -> u64 {
+        self.child.num_values() / self.dimension
+    }
+
+    /// Try to flatten a FixedSizeListBlock into a FixedWidthDataBlock
+    ///
+    /// Returns None if any children are nullable
+    pub fn try_into_flat(self) -> Option<FixedWidthDataBlock> {
+        match *self.child {
+            // Cannot flatten a nullable child
+            DataBlock::Nullable(_) => None,
+            DataBlock::FixedSizeList(inner) => {
+                let mut flat = inner.try_into_flat()?;
+                flat.bits_per_value *= self.dimension;
+                flat.num_values /= self.dimension;
+                Some(flat)
+            }
+            DataBlock::FixedWidth(mut inner) => {
+                inner.bits_per_value *= self.dimension;
+                inner.num_values /= self.dimension;
+                Some(inner)
+            }
+            _ => panic!(
+                "Expected FixedSizeList or FixedWidth data block but found {:?}",
+                self
+            ),
+        }
+    }
+
+    /// Convert a flattened values block into a FixedSizeListBlock
+    pub fn from_flat(data: FixedWidthDataBlock, data_type: &DataType) -> DataBlock {
+        match data_type {
+            DataType::FixedSizeList(child_field, dimension) => {
+                let mut data = data;
+                data.bits_per_value /= *dimension as u64;
+                data.num_values *= *dimension as u64;
+                let child_data = Self::from_flat(data, child_field.data_type());
+                DataBlock::FixedSizeList(Self {
+                    child: Box::new(child_data),
+                    dimension: *dimension as u64,
+                })
+            }
+            // Base case, we've hit a non-list type
+            _ => DataBlock::FixedWidth(data),
+        }
+    }
+
+    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+        let num_values = self.num_values();
+        let builder = match &data_type {
+            DataType::FixedSizeList(child_field, _) => {
+                let child_data = self
+                    .child
+                    .into_arrow(child_field.data_type().clone(), validate)?;
+                ArrayDataBuilder::new(data_type)
+                    .add_child_data(child_data)
+                    .len(num_values as usize)
+                    .null_count(0)
+            }
+            _ => panic!("Expected FixedSizeList data type and got {:?}", data_type),
+        };
+        if validate {
+            Ok(builder.build()?)
+        } else {
+            Ok(unsafe { builder.build_unchecked() })
+        }
+    }
+
+    fn into_buffers(self) -> Vec<LanceBuffer> {
+        self.child.into_buffers()
+    }
+}
+
+/// A data block with no regular structure.  There is no available spot to attach
+/// validity / repdef information and it cannot be converted to Arrow without being
+/// decoded
+#[derive(Debug)]
+pub struct OpaqueBlock {
+    pub buffers: Vec<LanceBuffer>,
+    pub num_values: u64,
+}
+
+impl OpaqueBlock {
+    fn borrow_and_clone(&mut self) -> Self {
+        Self {
+            buffers: self
+                .buffers
+                .iter_mut()
+                .map(|b| b.borrow_and_clone())
+                .collect(),
+            num_values: self.num_values,
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            buffers: self
+                .buffers
+                .iter()
+                .map(|b| b.try_clone())
+                .collect::<Result<_>>()?,
             num_values: self.num_values,
         })
     }
@@ -368,7 +485,9 @@ pub enum DataBlock {
     AllNull(AllNullDataBlock),
     Nullable(NullableDataBlock),
     FixedWidth(FixedWidthDataBlock),
+    FixedSizeList(FixedSizeListBlock),
     VariableWidth(VariableWidthBlock),
+    Opaque(OpaqueBlock),
     Struct(StructDataBlock),
     Dictionary(DictionaryDataBlock),
 }
@@ -380,9 +499,14 @@ impl DataBlock {
             Self::AllNull(inner) => inner.into_arrow(data_type, validate),
             Self::Nullable(inner) => inner.into_arrow(data_type, validate),
             Self::FixedWidth(inner) => inner.into_arrow(data_type, validate),
+            Self::FixedSizeList(inner) => inner.into_arrow(data_type, validate),
             Self::VariableWidth(inner) => inner.into_arrow(data_type, validate),
             Self::Struct(inner) => inner.into_arrow(data_type, validate),
             Self::Dictionary(inner) => inner.into_arrow(data_type, validate),
+            Self::Opaque(_) => Err(Error::Internal {
+                message: "Cannot convert OpaqueBlock to Arrow".to_string(),
+                location: location!(),
+            }),
         }
     }
 
@@ -394,9 +518,11 @@ impl DataBlock {
             Self::AllNull(inner) => inner.into_buffers(),
             Self::Nullable(inner) => inner.into_buffers(),
             Self::FixedWidth(inner) => inner.into_buffers(),
+            Self::FixedSizeList(inner) => inner.into_buffers(),
             Self::VariableWidth(inner) => inner.into_buffers(),
             Self::Struct(inner) => inner.into_buffers(),
             Self::Dictionary(inner) => inner.into_buffers(),
+            Self::Opaque(inner) => inner.buffers,
         }
     }
 
@@ -409,9 +535,11 @@ impl DataBlock {
             Self::AllNull(inner) => Self::AllNull(inner.borrow_and_clone()),
             Self::Nullable(inner) => Self::Nullable(inner.borrow_and_clone()),
             Self::FixedWidth(inner) => Self::FixedWidth(inner.borrow_and_clone()),
+            Self::FixedSizeList(inner) => Self::FixedSizeList(inner.borrow_and_clone()),
             Self::VariableWidth(inner) => Self::VariableWidth(inner.borrow_and_clone()),
             Self::Struct(inner) => Self::Struct(inner.borrow_and_clone()),
             Self::Dictionary(inner) => Self::Dictionary(inner.borrow_and_clone()),
+            Self::Opaque(inner) => Self::Opaque(inner.borrow_and_clone()),
         }
     }
 
@@ -424,9 +552,11 @@ impl DataBlock {
             Self::AllNull(inner) => Ok(Self::AllNull(inner.try_clone()?)),
             Self::Nullable(inner) => Ok(Self::Nullable(inner.try_clone()?)),
             Self::FixedWidth(inner) => Ok(Self::FixedWidth(inner.try_clone()?)),
+            Self::FixedSizeList(inner) => Ok(Self::FixedSizeList(inner.try_clone()?)),
             Self::VariableWidth(inner) => Ok(Self::VariableWidth(inner.try_clone()?)),
             Self::Struct(inner) => Ok(Self::Struct(inner.try_clone()?)),
             Self::Dictionary(inner) => Ok(Self::Dictionary(inner.try_clone()?)),
+            Self::Opaque(inner) => Ok(Self::Opaque(inner.try_clone()?)),
         }
     }
 
@@ -435,9 +565,11 @@ impl DataBlock {
             Self::AllNull(_) => "AllNull",
             Self::Nullable(_) => "Nullable",
             Self::FixedWidth(_) => "FixedWidth",
+            Self::FixedSizeList(_) => "FixedSizeList",
             Self::VariableWidth(_) => "VariableWidth",
             Self::Struct(_) => "Struct",
             Self::Dictionary(_) => "Dictionary",
+            Self::Opaque(_) => "Opaque",
         }
     }
 
@@ -446,22 +578,21 @@ impl DataBlock {
             Self::AllNull(inner) => inner.num_values,
             Self::Nullable(inner) => inner.data.num_values(),
             Self::FixedWidth(inner) => inner.num_values,
+            Self::FixedSizeList(inner) => inner.num_values(),
             Self::VariableWidth(inner) => inner.num_values,
             Self::Struct(inner) => inner.children[0].num_values(),
             Self::Dictionary(inner) => inner.indices.num_values,
+            Self::Opaque(inner) => inner.num_values,
         }
     }
 }
 
 macro_rules! as_type {
     ($fn_name:ident, $inner:tt, $inner_type:ident) => {
-        pub fn $fn_name(self) -> Result<$inner_type> {
+        pub fn $fn_name(self) -> Option<$inner_type> {
             match self {
-                Self::$inner(inner) => Ok(inner),
-                _ => Err(Error::Internal {
-                    message: format!("Expected {}, got {}", stringify!($inner), self.name()),
-                    location: location!(),
-                }),
+                Self::$inner(inner) => Some(inner),
+                _ => None,
             }
         }
     };
@@ -472,6 +603,7 @@ impl DataBlock {
     as_type!(as_all_null, AllNull, AllNullDataBlock);
     as_type!(as_nullable, Nullable, NullableDataBlock);
     as_type!(as_fixed_width, FixedWidth, FixedWidthDataBlock);
+    as_type!(as_fixed_size_list, FixedSizeList, FixedSizeListBlock);
     as_type!(as_variable_width, VariableWidth, VariableWidthBlock);
     as_type!(as_struct, Struct, StructDataBlock);
     as_type!(as_dictionary, Dictionary, DictionaryDataBlock);
@@ -874,15 +1006,10 @@ impl DataBlock {
                     .map(|arr| arr.as_fixed_size_list().values().clone())
                     .collect::<Vec<_>>();
                 let child_block = Self::from_arrays(&children, num_values * *dim as u64);
-                match child_block {
-                    Self::FixedWidth(inner) => {
-                        Self::FixedWidth(FixedWidthDataBlock {
-                        data: inner.data,
-                        bits_per_value: inner.bits_per_value * *dim as u64,
-                        num_values,
-                    })},
-                    _ => panic!("FSL of something that is not fixed-width cannot be converted to data block"),
-                }
+                Self::FixedSizeList(FixedSizeListBlock {
+                    child: Box::new(child_block),
+                    dimension: *dim as u64,
+                })
             }
             DataType::LargeList(_)
             | DataType::List(_)

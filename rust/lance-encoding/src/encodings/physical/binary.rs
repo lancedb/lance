@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{Array, ArrayRef};
-use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, ScalarBuffer};
+use arrow_array::ArrayRef;
+use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use futures::TryFutureExt;
 use futures::{future::BoxFuture, FutureExt};
 
@@ -15,17 +15,19 @@ use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, NullableDataBlock, VariableWidthBlock};
+use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock};
+use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
     EncodingsIo,
 };
 
-use arrow_array::{PrimitiveArray, UInt64Array, UInt8Array};
+use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
 use lance_core::Result;
+
+use super::block_compress::{BufferCompressor, CompressionScheme, GeneralBufferCompressor};
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -314,7 +316,7 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             - bytes_to_skip;
 
         let bytes = self.bytes_decoder.decode(bytes_to_skip, num_bytes)?;
-        let bytes = bytes.as_fixed_width()?;
+        let bytes = bytes.as_fixed_width().unwrap();
         debug_assert_eq!(bytes.bits_per_value, 8);
 
         let string_data = DataBlock::VariableWidth(VariableWidthBlock {
@@ -337,17 +339,41 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 #[derive(Debug)]
 pub struct BinaryEncoder {
     indices_encoder: Box<dyn ArrayEncoder>,
-    bytes_encoder: Box<dyn ArrayEncoder>,
+    compression_scheme: Option<CompressionScheme>,
+    buffer_compressor: Option<Box<dyn BufferCompressor>>,
 }
 
 impl BinaryEncoder {
     pub fn new(
         indices_encoder: Box<dyn ArrayEncoder>,
-        bytes_encoder: Box<dyn ArrayEncoder>,
+        compression_scheme: Option<CompressionScheme>,
     ) -> Self {
+        let buffer_compressor = compression_scheme
+            .map(|scheme| GeneralBufferCompressor::get_compressor(&scheme.to_string()));
         Self {
             indices_encoder,
-            bytes_encoder,
+            compression_scheme,
+            buffer_compressor,
+        }
+    }
+
+    // In 2.1 we will materialize nulls higher up (in the primitive encoder).  Unfortunately,
+    // in 2.0 we actually need to write the offsets.
+    fn all_null_variable_width(data_type: &DataType, num_values: u64) -> VariableWidthBlock {
+        if matches!(data_type, DataType::Binary | DataType::Utf8) {
+            VariableWidthBlock {
+                bits_per_offset: 32,
+                data: LanceBuffer::empty(),
+                num_values,
+                offsets: LanceBuffer::reinterpret_vec(vec![0_u32; num_values as usize + 1]),
+            }
+        } else {
+            VariableWidthBlock {
+                bits_per_offset: 64,
+                data: LanceBuffer::empty(),
+                num_values,
+                offsets: LanceBuffer::reinterpret_vec(vec![0_u64; num_values as usize + 1]),
+            }
         }
     }
 }
@@ -356,50 +382,39 @@ impl BinaryEncoder {
 // Strings are a vector of arrays corresponding to each record batch
 // Zero offset is removed from the start of the offsets array
 // The indices array is computed across all arrays in the vector
-fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
-    let num_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
+fn get_indices_from_string_arrays(
+    mut offsets: LanceBuffer,
+    bits_per_offset: u8,
+    nulls: Option<LanceBuffer>,
+    num_rows: usize,
+) -> (DataBlock, u64) {
     let mut indices = Vec::with_capacity(num_rows);
     let mut last_offset = 0_u64;
-    for array in arrays {
-        if let Some(array) = array.as_string_opt::<i32>() {
-            let offsets = array.offsets().inner();
-            indices.extend(offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                let off = strlen + last_offset;
-                last_offset = off;
-                off
-            }));
-        } else if let Some(array) = array.as_string_opt::<i64>() {
-            let offsets = array.offsets().inner();
-            indices.extend(offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                let off = strlen + last_offset;
-                last_offset = off;
-                off
-            }));
-        } else if let Some(array) = array.as_binary_opt::<i32>() {
-            let offsets = array.offsets().inner();
-            indices.extend(offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                let off = strlen + last_offset;
-                last_offset = off;
-                off
-            }));
-        } else if let Some(array) = array.as_binary_opt::<i64>() {
-            let offsets = array.offsets().inner();
-            indices.extend(offsets.windows(2).map(|w| {
-                let strlen = (w[1] - w[0]) as u64;
-                let off = strlen + last_offset;
-                last_offset = off;
-                off
-            }));
-        } else {
-            panic!("Array is not a string array");
-        }
+    if bits_per_offset == 32 {
+        let offsets = offsets.borrow_to_typed_slice::<i32>();
+        indices.extend(offsets.as_ref().windows(2).map(|w| {
+            let strlen = (w[1] - w[0]) as u64;
+            last_offset += strlen;
+            last_offset
+        }));
+    } else if bits_per_offset == 64 {
+        let offsets = offsets.borrow_to_typed_slice::<i64>();
+        indices.extend(offsets.as_ref().windows(2).map(|w| {
+            let strlen = (w[1] - w[0]) as u64;
+            last_offset += strlen;
+            last_offset
+        }));
     }
 
     if indices.is_empty() {
-        return (Arc::new(UInt64Array::from(Vec::<u64>::default())), 0);
+        return (
+            DataBlock::FixedWidth(FixedWidthDataBlock {
+                bits_per_value: 64,
+                data: LanceBuffer::empty(),
+                num_values: 0,
+            }),
+            0,
+        );
     }
 
     let last_offset = *indices.last().expect("Indices array is empty");
@@ -410,85 +425,87 @@ fn get_indices_from_string_arrays(arrays: &[ArrayRef]) -> (ArrayRef, u64) {
     );
     let null_adjustment: u64 = *indices.last().expect("Indices array is empty") + 1;
 
-    let mut indices_offset = 0;
-    for array in arrays {
-        if let Some(nulls) = array.nulls() {
-            let indices_slice = &mut indices[indices_offset..indices_offset + array.len()];
-            indices_slice
-                .iter_mut()
-                .zip(nulls.iter())
-                .for_each(|(index, is_valid)| {
-                    if !is_valid {
-                        *index += null_adjustment;
-                    }
-                });
-        }
-        indices_offset += array.len();
+    if let Some(nulls) = nulls {
+        let nulls = NullBuffer::new(BooleanBuffer::new(nulls.into_buffer(), 0, num_rows));
+        indices
+            .iter_mut()
+            .zip(nulls.iter())
+            .for_each(|(index, is_valid)| {
+                if !is_valid {
+                    *index += null_adjustment;
+                }
+            });
     }
-    (Arc::new(UInt64Array::from(indices)), null_adjustment)
-}
-
-// Bytes computed across all string arrays, similar to indices above
-fn get_bytes_from_string_arrays(arrays: &[ArrayRef]) -> Vec<ArrayRef> {
-    arrays
-        .iter()
-        .map(|arr| {
-            let (values_buffer, start, stop) = if let Some(arr) = arr.as_string_opt::<i32>() {
-                (
-                    arr.values(),
-                    arr.offsets()[0] as usize,
-                    arr.offsets()[arr.len()] as usize,
-                )
-            } else if let Some(arr) = arr.as_string_opt::<i64>() {
-                (
-                    arr.values(),
-                    arr.offsets()[0] as usize,
-                    arr.offsets()[arr.len()] as usize,
-                )
-            } else if let Some(arr) = arr.as_binary_opt::<i32>() {
-                (
-                    arr.values(),
-                    arr.offsets()[0] as usize,
-                    arr.offsets()[arr.len()] as usize,
-                )
-            } else if let Some(arr) = arr.as_binary_opt::<i64>() {
-                (
-                    arr.values(),
-                    arr.offsets()[0] as usize,
-                    arr.offsets()[arr.len()] as usize,
-                )
-            } else {
-                panic!("Array is not a string / binary array");
-            };
-            let values = ScalarBuffer::new(values_buffer.clone(), start, stop - start);
-            Arc::new(UInt8Array::new(values, None)) as ArrayRef
-        })
-        .collect()
+    let indices = DataBlock::FixedWidth(FixedWidthDataBlock {
+        bits_per_value: 64,
+        data: LanceBuffer::reinterpret_vec(indices),
+        num_values: num_rows as u64,
+    });
+    (indices, null_adjustment)
 }
 
 impl ArrayEncoder for BinaryEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let (index_array, null_adjustment) = get_indices_from_string_arrays(arrays);
-        let encoded_indices = self.indices_encoder.encode(&[index_array], buffer_index)?;
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let (mut data, nulls) = match data {
+            DataBlock::Nullable(nullable) => {
+                let data = nullable.data.as_variable_width().unwrap();
+                (data, Some(nullable.nulls))
+            }
+            DataBlock::VariableWidth(variable) => (variable, None),
+            DataBlock::AllNull(all_null) => {
+                let data = Self::all_null_variable_width(data_type, all_null.num_values);
+                let validity =
+                    LanceBuffer::all_unset(bit_util::ceil(all_null.num_values as usize, 8));
+                (data, Some(validity))
+            }
+            _ => panic!("Expected variable width data block but got {}", data.name()),
+        };
 
-        let byte_arrays = get_bytes_from_string_arrays(arrays);
-        let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
+        let (indices, null_adjustment) = get_indices_from_string_arrays(
+            data.offsets,
+            data.bits_per_offset,
+            nulls,
+            data.num_values as usize,
+        );
+        let encoded_indices =
+            self.indices_encoder
+                .encode(indices, &DataType::UInt64, buffer_index)?;
 
-        let mut encoded_buffers = encoded_indices.buffers;
-        encoded_buffers.extend(encoded_bytes.buffers);
+        let encoded_indices_data = encoded_indices.data.as_fixed_width().unwrap();
 
-        Ok(EncodedArray {
-            buffers: encoded_buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::Binary(Box::new(
-                    pb::Binary {
-                        indices: Some(Box::new(encoded_indices.encoding)),
-                        bytes: Some(Box::new(encoded_bytes.encoding)),
-                        null_adjustment,
-                    },
-                ))),
-            },
-        })
+        assert!(encoded_indices_data.bits_per_value <= 64);
+
+        if let Some(buffer_compressor) = &self.buffer_compressor {
+            let mut compressed_data = Vec::with_capacity(data.data.len());
+            buffer_compressor.compress(&data.data, &mut compressed_data)?;
+            data.data = LanceBuffer::Owned(compressed_data);
+        }
+
+        let data = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: encoded_indices_data.bits_per_value as u8,
+            offsets: encoded_indices_data.data,
+            data: data.data,
+            num_values: data.num_values,
+        });
+
+        let bytes_buffer_index = *buffer_index;
+        *buffer_index += 1;
+
+        let bytes_encoding = ProtobufUtils::flat_encoding(
+            /*bits_per_value=*/ 8,
+            bytes_buffer_index,
+            self.compression_scheme,
+        );
+
+        let encoding =
+            ProtobufUtils::binary(encoded_indices.encoding, bytes_encoding, null_adjustment);
+
+        Ok(EncodedArray { data, encoding })
     }
 }
 
@@ -497,13 +514,15 @@ pub mod tests {
 
     use arrow_array::{
         builder::{LargeStringBuilder, StringBuilder},
-        ArrayRef, LargeStringArray, StringArray, UInt64Array,
+        ArrayRef, StringArray,
     };
     use arrow_schema::{DataType, Field};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::{
+        buffer::LanceBuffer,
+        data::DataBlock,
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
     };
 
     use super::get_indices_from_string_arrays;
@@ -515,53 +534,34 @@ pub mod tests {
     }
 
     #[test]
-    fn test_encode_indices_stitches_offsets() {
-        // Given two string arrays we might have offsets [5, 10, 15] and [0, 3, 7]
-        //
-        // We need to stitch them to [0, 5, 10, 13, 17]
-        let string_array1 = StringArray::from(vec![Some("abcde"), Some("abcde"), Some("abcde")]);
-        let string_array1 = Arc::new(string_array1.slice(1, 2));
-        let string_array2 = Arc::new(StringArray::from(vec![Some("abc"), Some("abcd")]));
-        let (offsets, null_adjustment) =
-            get_indices_from_string_arrays(&[string_array1, string_array2]);
-
-        let expected = Arc::new(UInt64Array::from(vec![5, 10, 13, 17])) as ArrayRef;
-        assert_eq!(&offsets, &expected);
-        assert_eq!(null_adjustment, 18);
-    }
-
-    #[test]
     fn test_encode_indices_adjusts_nulls() {
         // Null entries in string arrays should be adjusted
-        let string_array1 = Arc::new(StringArray::from(vec![None, Some("foo")]));
-        let string_array2 = Arc::new(StringArray::from(vec![Some("foo"), None]));
-        let string_array3 = Arc::new(StringArray::from(vec![None as Option<&str>, None]));
-        let (offsets, null_adjustment) =
-            get_indices_from_string_arrays(&[string_array1, string_array2, string_array3]);
+        let string_array = Arc::new(StringArray::from(vec![
+            None,
+            Some("foo"),
+            Some("foo"),
+            None,
+            None,
+            None,
+        ])) as ArrayRef;
+        let string_data = DataBlock::from(string_array).as_nullable().unwrap();
+        let nulls = string_data.nulls;
+        let string_data = string_data.data.as_variable_width().unwrap();
 
-        let expected = Arc::new(UInt64Array::from(vec![7, 3, 6, 13, 13, 13])) as ArrayRef;
-        assert_eq!(&offsets, &expected);
+        let (indices, null_adjustment) = get_indices_from_string_arrays(
+            string_data.offsets,
+            string_data.bits_per_offset,
+            Some(nulls),
+            string_data.num_values as usize,
+        );
+
+        let indices = indices.as_fixed_width().unwrap();
+        assert_eq!(indices.bits_per_value, 64);
+        assert_eq!(
+            indices.data,
+            LanceBuffer::reinterpret_vec(vec![7_u64, 3, 6, 13, 13, 13])
+        );
         assert_eq!(null_adjustment, 7);
-    }
-
-    #[test]
-    fn test_encode_indices_string_types() {
-        let string_array = Arc::new(LargeStringArray::from(vec![Some("foo")]));
-        let large_string_array = Arc::new(LargeStringArray::from(vec![Some("foo")]));
-        let binary_array = Arc::new(LargeStringArray::from(vec![Some("foo")]));
-        let large_binary_array = Arc::new(LargeStringArray::from(vec![Some("foo")]));
-
-        for arr in [
-            string_array,
-            large_string_array,
-            binary_array,
-            large_binary_array,
-        ] {
-            let (offsets, null_adjustment) = get_indices_from_string_arrays(&[arr]);
-            let expected = Arc::new(UInt64Array::from(vec![3])) as ArrayRef;
-            assert_eq!(&offsets, &expected);
-            assert_eq!(null_adjustment, 4);
-        }
     }
 
     #[test_log::test(tokio::test)]

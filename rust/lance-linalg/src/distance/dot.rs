@@ -133,7 +133,7 @@ impl Dot for f16 {
             SimdSupport::Lsx => unsafe {
                 kernel::dot_f16_lsx(x.as_ptr(), y.as_ptr(), x.len() as u32)
             },
-            _ => dot_scalar::<Self, f32, 16>(x, y),
+            _ => dot_scalar::<Self, f32, 32>(x, y),
         }
     }
 }

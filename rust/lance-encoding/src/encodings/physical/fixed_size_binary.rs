@@ -3,17 +3,17 @@
 
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
-use arrow_buffer::{Buffer, ScalarBuffer};
+use arrow_buffer::ScalarBuffer;
+use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, VariableWidthBlock},
+    data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
-    format::pb,
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -83,7 +83,7 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
         let rows_to_skip = rows_to_skip * self.byte_width;
         let num_bytes = num_rows * self.byte_width;
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
-        let bytes = bytes.as_fixed_width()?;
+        let bytes = bytes.as_fixed_width().unwrap();
         debug_assert_eq!(bytes.bits_per_value, 8);
 
         let offsets_buffer = match self.bytes_per_offset {
@@ -130,92 +130,32 @@ impl FixedSizeBinaryEncoder {
     }
 }
 
-pub fn get_bytes_from_binary_arrays(arrays: &[ArrayRef], byte_width: usize) -> Vec<ArrayRef> {
-    arrays
-        .iter()
-        .map(|arr| {
-            let values_buffer = if let Some(arr) = arr.as_string_opt::<i32>() {
-                let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
-                for i in 0..arr.len() {
-                    let start = arr.offsets()[i] as usize;
-                    let end = arr.offsets()[i + 1] as usize;
-                    if start == end {
-                        // Null value, add byte_width bytes of zeroes
-                        values_vec.extend(std::iter::repeat(0).take(byte_width))
-                    } else {
-                        values_vec.extend_from_slice(&arr.values()[start..end]);
-                    }
-                }
-
-                values_vec
-            } else if let Some(arr) = arr.as_string_opt::<i64>() {
-                let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
-                for i in 0..arr.len() {
-                    let start = arr.offsets()[i] as usize;
-                    let end = arr.offsets()[i + 1] as usize;
-                    if start == end {
-                        // Null value, add byte_width bytes of zeroes
-                        values_vec.extend(std::iter::repeat(0).take(byte_width))
-                    } else {
-                        values_vec.extend_from_slice(&arr.values()[start..end]);
-                    }
-                }
-
-                values_vec
-            } else if let Some(arr) = arr.as_binary_opt::<i32>() {
-                let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
-                for i in 0..arr.len() {
-                    let start = arr.offsets()[i] as usize;
-                    let end = arr.offsets()[i + 1] as usize;
-                    if start == end {
-                        // Null value, add byte_width bytes of zeroes
-                        values_vec.extend(std::iter::repeat(0).take(byte_width))
-                    } else {
-                        values_vec.extend_from_slice(&arr.values()[start..end]);
-                    }
-                }
-
-                values_vec
-            } else if let Some(arr) = arr.as_binary_opt::<i64>() {
-                let mut values_vec = Vec::with_capacity(arr.len() * byte_width);
-                for i in 0..arr.len() {
-                    let start = arr.offsets()[i] as usize;
-                    let end = arr.offsets()[i + 1] as usize;
-                    if start == end {
-                        // Null value, add byte_width bytes of zeroes
-                        values_vec.extend(std::iter::repeat(0).take(byte_width))
-                    } else {
-                        values_vec.extend_from_slice(&arr.values()[start..end]);
-                    }
-                }
-
-                values_vec
-            } else {
-                panic!("Array is not a string / binary array");
-            };
-
-            let len_buffer = values_buffer.len();
-            let values = ScalarBuffer::new(Buffer::from(values_buffer), 0, len_buffer);
-            Arc::new(UInt8Array::new(values, None)) as ArrayRef
-        })
-        .collect()
-}
-
 impl ArrayEncoder for FixedSizeBinaryEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
-        let byte_arrays = get_bytes_from_binary_arrays(arrays, self.byte_width);
-        let encoded_bytes = self.bytes_encoder.encode(&byte_arrays, buffer_index)?;
+    fn encode(
+        &self,
+        data: DataBlock,
+        _data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let bytes_data = data.as_variable_width().unwrap();
+
+        let fixed_data = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 8 * self.byte_width as u64,
+            data: bytes_data.data,
+            num_values: bytes_data.num_values,
+        });
+
+        let encoded_data = self.bytes_encoder.encode(
+            fixed_data,
+            &DataType::FixedSizeBinary(self.byte_width as i32),
+            buffer_index,
+        )?;
+        let encoding =
+            ProtobufUtils::fixed_size_binary(encoded_data.encoding, self.byte_width as u32);
 
         Ok(EncodedArray {
-            buffers: encoded_bytes.buffers,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(pb::array_encoding::ArrayEncoding::FixedSizeBinary(
-                    Box::new(pb::FixedSizeBinary {
-                        bytes: Some(Box::new(encoded_bytes.encoding)),
-                        byte_width: self.byte_width as u32,
-                    }),
-                )),
-            },
+            data: encoded_data.data,
+            encoding,
         })
     }
 }
