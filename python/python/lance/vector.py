@@ -10,10 +10,10 @@ import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
 
-import lance
-
 import pyarrow as pa
 from tqdm.auto import tqdm
+
+import lance
 
 from . import write_dataset
 from .dependencies import _check_for_numpy, torch
@@ -154,6 +154,8 @@ def train_pq_codebook_on_accelerator(
     """Use accelerator (GPU or MPS) to train pq codebook."""
     from lance.torch.data import _to_tensor as to_full_tensor
 
+    column = "__residual_vec"
+
     # cuvs not particularly useful for only 256 centroids without more work
     if accelerator == "cuvs":
         accelerator = "cuda"
@@ -165,34 +167,44 @@ def train_pq_codebook_on_accelerator(
 
     # TODO make new temp dataset files instead of using a to_tensor override fn
 
+    field_names = [f"{column}_{i + 1}" for i in range(num_sub_vectors)]
+    dim = kmeans.centroids.shape[1]
+    subvector_size = dim // num_sub_vectors
+    fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
+    split_schema = pa.schema(fields)
+
+    batch_iterable = dataset.to_batches(columns=[column])
+    def split_batches() -> Iterable[pa.RecordBatch]:
+        for batch in batch_iterable:
+            full = to_full_tensor(batch)
+            split_columns = []
+            vector_dim = full.size(1)
+            #subvector_size = vector_dim // num_sub_vectors
+            for i in range(num_sub_vectors):
+                subvector_tensor = full[:, i * subvector_size: (i + 1) * subvector_size]
+                subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
+                subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
+                #subvector_array = pa.FixedShapeTensorArray.from_numpy_ndarray(subvector_tensor.cpu().detach().numpy())
+                split_columns.append(subvector_fsl)
+            new_batch = pa.RecordBatch.from_arrays(split_columns, schema=split_schema)
+            yield new_batch
+
+    split_dataset_uri = tempfile.mkdtemp()
+    ds_split = write_dataset(
+       split_batches(),
+       split_dataset_uri,
+       schema=split_schema,
+    )
+
     for sub_vector in range(num_sub_vectors):
-
-        def modify_tensor_fn(
-            full: torch.Tensor,
-        ) -> torch.Tensor:
-            full = full.to(device)
-            return to_sub_vectors(full, num_sub_vectors, sub_vector)
-
-        def to_tensor_local(
-            batch: pa.RecordBatch,
-            *,
-            uint64_as_int64: bool = True,
-            hf_converter: Optional[dict] = None,
-        ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
-            full = to_full_tensor(
-                batch, uint64_as_int64=uint64_as_int64, hf_converter=hf_converter
-            )
-            return modify_tensor_fn(full)
-
         ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
-            dataset,
-            "__residual_vec",
-            # column,
+            ds_split,
+            #dataset,
+            #"__residual_vec",
+            field_names[sub_vector],
             256,
             metric_type,
             accelerator,
-            to_tensor_fn=to_tensor_local,
-            modify_tensor_fn=modify_tensor_fn,
         )
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
@@ -263,7 +275,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=20480,
         columns=[column],
         samples=sample_size,
-        filter=filt,
+        #filter=filt,
         cache=True,
         to_tensor_fn=to_tensor_fn,
     )
@@ -362,7 +374,6 @@ def compute_pq_codes(
     str
         The absolute path of the pq codes dataset.
     """
-    from lance.torch.data import LanceDataset as PytorchLanceDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
@@ -401,7 +412,6 @@ def compute_pq_codes(
     # )
     # ivf_centroids = torch.from_numpy(ivf_centroids).to(device)
 
-    from lance import dataset as lance_ds
 
     # Shape: (num_sub_vectors, num_centroids, sub_vector_size)
     centroids_per_sub_vector = torch.stack(
@@ -557,7 +567,6 @@ def compute_partitions(
     allow_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
     """
-    from lance.torch.data import LanceDataset as PytorchLanceDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
