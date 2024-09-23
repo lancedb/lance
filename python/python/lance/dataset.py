@@ -1618,6 +1618,8 @@ class LanceDataset(pa.dataset.Dataset):
 
         kwargs["metric_type"] = metric
 
+        no_pq_accel = False
+
         index_type = index_type.upper()
         valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
         if index_type not in valid_index_types:
@@ -1658,19 +1660,15 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partiton_dataset is provided"
                 )
             if precomputed_partiton_dataset is not None:
-                precomputed_ds = LanceDataset(
-                    precomputed_partiton_dataset, storage_options=storage_options
-                )
-                if len(precomputed_ds.get_fragments()) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one fragment"
-                    )
-                files = precomputed_ds.get_fragments()[0].data_files()
-                if len(files) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one files"
-                    )
-                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
+                raise ValueError(
+                    "precomputed_partition_dataset no longer supported, please add __ivf_part_id column directly")
+
+            if accelerator == "cuda-ivf-only":
+                accelerator = "cuda"
+                no_pq_accel = True
+            if accelerator == "cuvs-ivf-only":
+                accelerator = "cuvs"
+                no_pq_accel = True
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
@@ -1686,10 +1684,10 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
-                partitions_file = compute_partitions(
+                compute_partitions(
                     self, column[0], kmeans, batch_size=20480
                 )
-                kwargs["precomputed_partitions_file"] = partitions_file
+                kwargs["use_precomputed_partitions"] = True
 
             if (ivf_centroids is None) and (pq_codebook is not None):
                 raise ValueError(
@@ -1729,6 +1727,29 @@ class LanceDataset(pa.dataset.Dataset):
                     "num_partitions and num_sub_vectors are required for IVF_PQ"
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
+
+            if pq_codebook is None and accelerator is not None and not no_pq_accel:
+                # Use accelerator to train pq codebook
+                from .vector import (
+                    compute_pq_codes,
+                    train_pq_codebook_on_accelerator,
+                )
+
+                pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
+                    self,
+                    column[0],
+                    metric,
+                    kmeans,
+                    accelerator=accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                )
+                compute_pq_codes(
+                    self,
+                    column[0],
+                    kmeans_list,
+                    batch_size=20480,
+                )
+                kwargs["use_precomputed_pq_codes"] = True
 
             if pq_codebook is not None:
                 # User provided IVF centroids

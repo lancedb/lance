@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
+
+import lance
 
 import pyarrow as pa
 from tqdm.auto import tqdm
@@ -127,6 +129,78 @@ def vec_to_table(
 CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 
 
+@torch.jit.script
+def to_sub_vectors(
+    full: torch.Tensor, num_sub_vectors: int, sub_vector: int
+) -> torch.Tensor:
+    dim = full.shape[1]
+    assert (
+        dim % num_sub_vectors == 0
+    ), f"num_sub_vectors ({num_sub_vectors}) must divide dim ({dim})."
+    sub_vector_size = dim // num_sub_vectors
+    start_idx = sub_vector * sub_vector_size
+    end_idx = start_idx + sub_vector_size
+    return full[:, start_idx:end_idx]
+
+
+def train_pq_codebook_on_accelerator(
+    dataset: LanceDataset,
+    column: str,
+    metric_type: Literal["l2", "cosine", "dot"],
+    kmeans: Any,
+    accelerator: Union[str, "torch.Device"],
+    num_sub_vectors: int,
+) -> (np.ndarray, List[Any]):
+    """Use accelerator (GPU or MPS) to train pq codebook."""
+    from lance.torch.data import _to_tensor as to_full_tensor
+
+    # cuvs not particularly useful for only 256 centroids without more work
+    if accelerator == "cuvs":
+        accelerator = "cuda"
+
+    device = kmeans.device
+
+    centroids_list = []
+    kmeans_list = []
+
+    # TODO make new temp dataset files instead of using a to_tensor override fn
+
+    for sub_vector in range(num_sub_vectors):
+
+        def modify_tensor_fn(
+            full: torch.Tensor,
+        ) -> torch.Tensor:
+            full = full.to(device)
+            return to_sub_vectors(full, num_sub_vectors, sub_vector)
+
+        def to_tensor_local(
+            batch: pa.RecordBatch,
+            *,
+            uint64_as_int64: bool = True,
+            hf_converter: Optional[dict] = None,
+        ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
+            full = to_full_tensor(
+                batch, uint64_as_int64=uint64_as_int64, hf_converter=hf_converter
+            )
+            return modify_tensor_fn(full)
+
+        ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
+            dataset,
+            "__residual_vec",
+            # column,
+            256,
+            metric_type,
+            accelerator,
+            to_tensor_fn=to_tensor_local,
+            modify_tensor_fn=modify_tensor_fn,
+        )
+        centroids_list.append(ivf_centroids_local)
+        kmeans_list.append(kmeans_local)
+
+    pq_codebook = np.stack(centroids_list)
+    return pq_codebook, kmeans_list
+
+
 def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
@@ -136,7 +210,11 @@ def train_ivf_centroids_on_accelerator(
     *,
     sample_rate: int = 256,
     max_iters: int = 50,
-) -> (np.ndarray, str):
+    to_tensor_fn: Optional[
+        callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
+    ] = None,
+    modify_tensor_fn: Optional[callable[[torch.Tensor], torch.Tensor]] = None,
+) -> (np.ndarray, Any):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
         not (
@@ -174,6 +252,10 @@ def train_ivf_centroids_on_accelerator(
     )
 
     init_centroids = next(iter(ds))
+
+    if modify_tensor_fn is not None:
+        init_centroids = modify_tensor_fn(init_centroids)
+
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
@@ -183,6 +265,7 @@ def train_ivf_centroids_on_accelerator(
         samples=sample_size,
         filter=filt,
         cache=True,
+        to_tensor_fn=to_tensor_fn,
     )
 
     if accelerator == "cuvs":
@@ -217,6 +300,233 @@ def train_ivf_centroids_on_accelerator(
     return centroids, kmeans
 
 
+@torch.jit.script
+def compute_pq_codes_batch(
+    vecs: torch.Tensor,
+    centroids: torch.Tensor,
+    num_sub_vectors: int,
+    sub_vector_size: int,
+):
+    # TODO support other distances, move this to a different file
+
+    sub_vecs = vecs.view(
+        vecs.shape[0], num_sub_vectors, sub_vector_size
+    )  # Shape: (batch_size, num_sub_vectors, sub_vector_size)
+
+    # Compute the L2 distance between each sub-vector and its corresponding centroids
+
+    # (batch_size, num_sub_vectors, sub_vector_size) -> (batch_size, num_sub_vectors, 1, sub_vector_size)
+    sub_vecs_expanded = sub_vecs.unsqueeze(2)
+
+    # (num_sub_vectors, num_centroids, sub_vector_size) -> (1, num_sub_vectors, num_centroids, sub_vector_size)
+    centroids_expanded = centroids.unsqueeze(0)
+
+    # Compute squared L2 distance
+    # Shape: (batch_size, num_sub_vectors, num_centroids)
+    dists = torch.sum((sub_vecs_expanded - centroids_expanded) ** 2, dim=-1)
+
+    # Get the index of the nearest centroid for each sub-vector (i.e., the PQ code)
+    pq_codes = torch.argmin(dists, dim=-1)  # Shape: (batch_size, num_sub_vectors)
+
+    return pq_codes
+
+
+def compute_pq_codes(
+    dataset: LanceDataset,
+    column: str,
+    kmeans_list: List[Any],  # KMeans
+    batch_size: int = 1024 * 10 * 4,
+    dst_dataset_uri: Optional[Union[str, Path]] = None,
+    allow_cuda_tf32: bool = True,
+) -> str:
+    """Compute pq codes for each row using GPU kmeans and spill to disk.
+
+    Parameters
+    ----------
+    dataset: LanceDataset
+        Dataset to compute pq codes for.
+    column: str
+        Column name of the vector column.
+    kmeans_list: List[lance.torch.kmeans.KMeans]
+        KMeans models to use to compute pq (one per subspace)
+    batch_size: int, default 10240
+        The batch size used to read the dataset.
+    dst_dataset_uri: Union[str, Path], optional
+        The path to store the partitions.  If not specified a random
+        directory is used instead
+    allow_tf32: bool, default True
+        Whether to allow tf32 for matmul on CUDA.
+
+    Returns
+    -------
+    str
+        The absolute path of the pq codes dataset.
+    """
+    from lance.torch.data import LanceDataset as PytorchLanceDataset
+
+    torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
+
+    num_rows = dataset.count_rows()
+
+    num_sub_vectors = len(kmeans_list)
+
+    # torch_ds = PytorchLanceDataset(
+    #    dataset,
+    #    batch_size=batch_size,
+    #    with_row_id=True,
+    #    columns=[column, "__residual_vec"], #, "id", "partition"],
+    # )
+    # loader = torch.utils.data.DataLoader(
+    #    torch_ds,
+    #    batch_size=1,  # TODO is this significantly inhibiting performance
+    #    pin_memory=True,
+    #    collate_fn=_collate_fn,
+    # )
+    output_schema = pa.schema(
+        [
+            # pa.field("row_id", pa.uint64()),
+            # TODO these should be some kind of merge id, e.g. "__merge_id"
+            # pa.field("id", pa.int64()),
+            pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
+        ]
+    )
+
+    progress = tqdm(total=num_rows)
+
+    device = kmeans_list[0].device
+
+    # ivf_centroids_array = ivf_centroids_batch["_ivf_centroids"]
+    # ivf_centroids = ivf_centroids_array.values.to_numpy().reshape(
+    #     len(ivf_centroids_array), ivf_centroids_array.type.list_size
+    # )
+    # ivf_centroids = torch.from_numpy(ivf_centroids).to(device)
+
+    from lance import dataset as lance_ds
+
+    # Shape: (num_sub_vectors, num_centroids, sub_vector_size)
+    centroids_per_sub_vector = torch.stack(
+        [kmeans.centroids for kmeans in kmeans_list]
+    ).to(device)
+
+    from lance.torch.data import _to_tensor as to_full_tensor
+
+    # def _pq_codes_assignment() -> Iterable[pa.RecordBatch]:
+    def pq_codes_assignment(batch):
+        with torch.no_grad():
+            batch = to_full_tensor(batch)
+            # for batch in loader:
+            # batch["__residual_vec"]
+            vecs = batch.to(device).reshape(
+                -1, kmeans_list[0].centroids.shape[1] * len(kmeans_list)
+            )
+
+            # ids = batch["id"].reshape(-1)
+
+            # row_ids = batch["_rowid"].reshape(-1)
+            # ivf_partitions = batch["partition"].int()
+            # residualize
+            # old-TODO make this __ivf_part_id instead
+            # vecs = vecs - ivf_centroids[ivf_partitions]
+
+
+            # Higher mem option, probably more performant
+            # pq_codes = compute_pq_codes_batch(
+            #     vecs,
+            #     centroids_per_sub_vector,
+            #     num_sub_vectors,
+            #     vecs.shape[1] // num_sub_vectors,
+            # )
+
+            sub_vecs = vecs.view(
+                vecs.shape[0], num_sub_vectors, vecs.shape[1] // num_sub_vectors
+            )
+            pq_codes = torch.stack(
+                [
+                    kmeans_list[i].transform(sub_vecs[:, i, :])
+                    for i in range(num_sub_vectors)
+                ],
+                dim=1,
+            )
+
+            # pq_codes = []
+            # for sub_vector, kmeans in enumerate(kmeans_list):
+            #    sub_vecs = to_sub_vectors(vecs, num_sub_vectors, sub_vector)
+            #    pq_codes.append(kmeans.transform(sub_vecs))
+            # pq_codes = torch.stack(pq_codes, dim=1)
+
+            # this is expected to be true, so just assert
+            # assert vecs.shape[0] == ids.shape[0]
+
+            # ids = ids.cpu()
+            pq_codes = pq_codes.cpu()
+
+            # TODO Ignore any invalid vectors.
+            # Commented out to avoid bottleneck for now
+            # mask = torch.isfinite(pq_codes).all(dim=1).cpu()
+            ## row_ids = row_ids[mask]
+            # ids = ids[mask]
+            # pq_codes = pq_codes[mask]
+
+            pq_codes = pq_codes.to(torch.uint8)
+
+            pq_values = pa.array(pq_codes.numpy().reshape(-1))
+            pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
+            part_batch = pa.RecordBatch.from_arrays(
+                [pq_codes],
+                # [ids, pq_codes],
+                # [row_ids, pq_codes],
+                schema=output_schema,
+            )
+
+            # if len(part_batch) < len(ids):
+            #    logging.warning(
+            #        "%s vectors are ignored during pq codes assignment",
+            #        len(part_batch) - len(ids),
+            #    )
+
+            progress.update(part_batch.num_rows)
+            return part_batch
+            # yield part_batch
+
+    if "__pq_code" in dataset.schema.names:
+        dataset.drop_columns(["__pq_code"])
+
+    @lance.batch_udf(
+        output_schema=output_schema,
+    )
+    def pq_codes_assignment_udf(batch):
+        return pq_codes_assignment(batch)
+
+    dataset.add_columns(pq_codes_assignment_udf, read_columns=["__residual_vec"])
+
+    # Save disk space
+    if "__residual_vec" in dataset.schema.names:
+        dataset.drop_columns(["__residual_vec"])
+
+    # rbr = pa.RecordBatchReader.from_batches(output_schema, _pq_codes_assignment())
+    # if dst_dataset_uri is None:
+    #    dst_dataset_uri = tempfile.mkdtemp()
+    # ds = write_dataset(
+    #    rbr,
+    #    dst_dataset_uri,
+    #    schema=output_schema,
+    #    max_rows_per_file=dataset.count_rows(),
+    #    data_storage_version="stable",
+    # )
+    # assert len(ds.get_fragments()) == 1
+    # files = ds.get_fragments()[0].data_files()
+    # assert len(files) == 1
+
+    progress.close()
+
+    # logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+
+    # pq_codes_dataset = lance_ds(dst_dataset_uri)
+    # TODO merge on something that's actually guaranteed to exist
+    # dataset.merge(pq_codes_dataset, "_rowid", "row_id") # not supported?
+    # dataset.merge(pq_codes_dataset, "id")
+
+
 def _collate_fn(batch):
     return batch[0]
 
@@ -228,7 +538,7 @@ def compute_partitions(
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
-) -> str:
+):
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
     Parameters
@@ -246,11 +556,6 @@ def compute_partitions(
         directory is used instead
     allow_tf32: bool, default True
         Whether to allow tf32 for matmul on CUDA.
-
-    Returns
-    -------
-    str
-        The absolute path of the partition dataset.
     """
     from lance.torch.data import LanceDataset as PytorchLanceDataset
 
@@ -258,75 +563,124 @@ def compute_partitions(
 
     num_rows = dataset.count_rows()
 
-    torch_ds = PytorchLanceDataset(
-        dataset,
-        batch_size=batch_size,
-        with_row_id=True,
-        columns=[column],
-        filter=f"{column} is not null",
-    )
-    loader = torch.utils.data.DataLoader(
-        torch_ds,
-        batch_size=1,
-        pin_memory=True,
-        collate_fn=_collate_fn,
-    )
+    # torch_ds = PytorchLanceDataset(
+    #    dataset,
+    #    batch_size=batch_size,
+    #    with_row_id=True,
+    #    columns=[column],
+    # )
+    # loader = torch.utils.data.DataLoader(
+    #    torch_ds,
+    #    batch_size=1,  # TODO is this significantly inhibiting performance
+    #    pin_memory=True,
+    #    collate_fn=_collate_fn,
+    # )
+
+    dim = kmeans.centroids.shape[1]
+
     output_schema = pa.schema(
         [
-            pa.field("row_id", pa.uint64()),
-            pa.field("partition", pa.uint32()),
+            # pa.field("row_id", pa.uint64()),
+            # pa.field("id", pa.int64()),
+            pa.field("__ivf_part_id", pa.uint32()),
+            pa.field("__residual_vec", pa.list_(pa.float32(), list_size=dim)),
         ]
     )
 
     progress = tqdm(total=num_rows)
 
-    def _partition_assignment() -> Iterable[pa.RecordBatch]:
+    from lance.torch.data import _to_tensor as to_full_tensor
+
+    def _partition_assignment(batch):  # -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
-            for batch in loader:
-                vecs = (
-                    batch[column]
-                    .to(kmeans.device)
-                    .reshape(-1, kmeans.centroids.shape[1])
-                )
+            batch = to_full_tensor(batch)
+            # for batch in loader:
+            # vecs = batch[column].to(kmeans.device).reshape(-1, dim)
+            vecs = batch.to(kmeans.device).reshape(-1, dim)
 
-                partitions = kmeans.transform(vecs)
-                ids = batch["_rowid"].reshape(-1)
-                # this is expected to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
+            partitions = kmeans.transform(vecs)
+            # ids = batch["id"].reshape(-1)
+            # row_ids = batch["_rowid"].reshape(-1)
+            # this is expected to be true, so just assert
+            # assert vecs.shape[0] == row_ids.shape[0]
 
-                # Ignore any invalid vectors.
-                mask = (partitions.isfinite()).cpu()
-                ids = ids[mask]
-                partitions = partitions.cpu()[mask]
+            residual_vecs = vecs - kmeans.centroids[partitions]
 
-                part_batch = pa.RecordBatch.from_arrays(
-                    [ids.numpy(), partitions.cpu().numpy()],
-                    schema=output_schema,
-                )
-                if len(part_batch) < len(ids):
-                    logging.warning(
-                        "%s vectors are ignored during partition assignment",
-                        len(part_batch) - len(ids),
-                    )
+            # ids = ids.cpu()
+            # row_ids = row_ids.cpu()
+            partitions = partitions.cpu()
+            residual_vecs = residual_vecs.cpu()
 
-                progress.update(part_batch.num_rows)
-                yield part_batch
+            # TODO Ignore any invalid vectors.
+            # Also a huge bottleneck, disabled for now
+            # mask = (partitions.isfinite()).cpu()
+            # ids = ids[mask]
+            # row_ids = row_ids[mask]
+            # partitions = partitions[mask]
+            # residual_vecs = residual_vecs[mask]
 
-    rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
-    if dst_dataset_uri is None:
-        dst_dataset_uri = tempfile.mkdtemp()
-    ds = write_dataset(
-        rbr,
-        dst_dataset_uri,
-        schema=output_schema,
-        max_rows_per_file=dataset.count_rows(),
-        data_storage_version="stable",
+            # residual_vecs = residual_vecs.to(vecs.dtype)
+
+            residual_values = pa.array(residual_vecs.numpy().reshape(-1))
+            residual_vecs = pa.FixedSizeListArray.from_arrays(residual_values, dim)
+
+            part_batch = pa.RecordBatch.from_arrays(
+                [
+                    # row_ids.numpy(),
+                    # ids.numpy(),
+                    partitions.numpy(),
+                    residual_vecs,
+                ],
+                schema=output_schema,
+            )
+            # if len(part_batch) < len(ids):
+            #    logging.warning(
+            #        "%s vectors are ignored during partition assignment",
+            #        len(part_batch) - len(ids),
+            #    )
+
+            progress.update(part_batch.num_rows)
+            return part_batch
+            # yield part_batch
+
+    @lance.batch_udf(
+        output_schema=output_schema,
     )
-    assert len(ds.get_fragments()) == 1
-    files = ds.get_fragments()[0].data_files()
-    assert len(files) == 1
+    def partition_assignment_udf(batch):
+        return _partition_assignment(batch)
+
+    # def partition_assignment_iter()-> Iterable[pa.RecordBatch]:
+    #    for batch in loader:
+    #        yield _partition_assignment(batch)
+
+    if "__residual_vec" in dataset.schema.names:
+        dataset.drop_columns(["__residual_vec"])
+    if "__ivf_part_id" in dataset.schema.names:
+        dataset.drop_columns(["__ivf_part_id"])
+
+    dataset.add_columns(partition_assignment_udf, read_columns=[column])
+
+    # rbr = pa.RecordBatchReader.from_batches(output_schema, partition_assignment_iter())
+    # if dst_dataset_uri is None:
+    #    dst_dataset_uri = tempfile.mkdtemp()
+    # ds = write_dataset(
+    #    rbr,
+    #    dst_dataset_uri,
+    #    schema=output_schema,
+    #    max_rows_per_file=dataset.count_rows(),
+    #    data_storage_version="stable",
+    # )
+    # assert len(ds.get_fragments()) == 1
+    # files = ds.get_fragments()[0].data_files()
+    # assert len(files) == 1
 
     progress.close()
 
+    dst_dataset_uri = dataset.uri
+
     logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
-    return str(dst_dataset_uri)
+
+    # dataset.merge(ds, "_rowid", "row_id") # not supported I think
+    # dataset.merge(ds, "id")
+
+    #return str(dst_dataset_uri)

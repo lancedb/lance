@@ -171,6 +171,7 @@ impl Transformer for ResidualTransform {
             compute_residual(&self.centroids, original_vectors, None, Some(part_ids_ref))?;
 
         // Replace original column with residual column.
+        // TODO make this __residual_vec
         let batch = batch.replace_column_by_name(&self.vec_col, Arc::new(residual_arr))?;
         Ok(batch)
     }

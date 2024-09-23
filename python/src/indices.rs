@@ -162,7 +162,8 @@ async fn do_transform_vectors(
     pq_model: ProductQuantizer,
     dst_uri: &str,
     fragments: Vec<FileFragment>,
-    partitions_ds_uri: Option<&str>,
+    with_ivf_precomputed: bool,
+    with_pq_code_precomputed: bool,
 ) -> PyResult<()> {
     let num_rows = dataset.ds.count_rows(None).await.infer_error()?;
     let fragments = fragments.iter().map(|item| item.metadata().inner).collect();
@@ -181,7 +182,6 @@ async fn do_transform_vectors(
     let (obj_store, path) = object_store_from_uri_or_path_no_options(dst_uri).await?;
     let writer = obj_store.create(&path).await.infer_error()?;
     write_vector_storage(
-        &dataset.ds,
         transform_input,
         num_rows as u64,
         ivf_centroids,
@@ -189,7 +189,8 @@ async fn do_transform_vectors(
         distance_type,
         column,
         writer,
-        partitions_ds_uri,
+        with_ivf_precomputed,
+        with_pq_code_precomputed,
     )
     .await
     .infer_error()?;
@@ -209,7 +210,8 @@ pub fn transform_vectors(
     pq_codebook: PyArrowType<ArrayData>,
     dst_uri: &str,
     fragments: Vec<FileFragment>,
-    partitions_ds_uri: Option<&str>,
+    with_ivf_precomputed: bool,
+    with_pq_code_precomputed: bool,
 ) -> PyResult<()> {
     let ivf_centroids = ivf_centroids.0;
     let ivf_centroids = FixedSizeListArray::from(ivf_centroids);
@@ -233,7 +235,8 @@ pub fn transform_vectors(
             pq,
             dst_uri,
             fragments,
-            partitions_ds_uri,
+            with_ivf_precomputed,
+            with_pq_code_precomputed,
         ),
     )?
 }

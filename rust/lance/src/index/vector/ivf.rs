@@ -43,10 +43,7 @@ use lance_index::{
     optimize::OptimizeOptions,
     vector::{
         hnsw::{builder::HnswBuildParams, HNSWIndex, HNSW},
-        ivf::{
-            builder::load_precomputed_partitions, shuffler::shuffle_dataset,
-            storage::IVF_PARTITION_KEY, IvfBuildParams,
-        },
+        ivf::{shuffler::shuffle_dataset, storage::IVF_PARTITION_KEY, IvfBuildParams},
         pq::{PQBuildParams, ProductQuantizer},
         quantizer::{Quantization, QuantizationMetadata, Quantizer},
         sq::ScalarQuantizer,
@@ -82,7 +79,6 @@ use super::{
     pq::{build_pq_model, PQIndex},
     utils::maybe_sample_training_data,
 };
-use crate::dataset::builder::DatasetBuilder;
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
@@ -478,6 +474,8 @@ async fn optimize_ivf_pq_indices(
         pq_index.pq.clone(),
         None,
         true,
+        false,
+        false,
     );
 
     // Shuffled un-indexed data with partition.
@@ -487,7 +485,6 @@ async fn optimize_ivf_pq_indices(
                 unindexed,
                 vector_column,
                 ivf.into(),
-                None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
                 2,
@@ -557,6 +554,8 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         vector_column,
         quantizer.clone(),
         None,
+        false,
+        false,
     )?;
 
     // Shuffled un-indexed data with partition.
@@ -566,7 +565,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
                 unindexed,
                 vector_column,
                 Arc::new(ivf),
-                None,
                 first_idx.ivf.num_partitions() as u32,
                 10000,
                 2,
@@ -1072,9 +1070,9 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
 }
 
 fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
-    if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
+    if ivf.use_precomputed_partitions && ivf.centroids.is_none() {
         return Err(Error::Index {
-            message: "precomputed_partitions_file requires centroids to be set".to_string(),
+            message: "use_precomputed_partitions requires centroids to be set".to_string(),
             location: location!(),
         });
     }
@@ -1086,10 +1084,10 @@ fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
         });
     }
 
-    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitons_file.is_some() {
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.use_precomputed_partitions {
         return Err(Error::Index {
             message:
-                "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
+                "precomputed_shuffle_buffers and use_precomputed_partitions are mutually exclusive"
                     .to_string(),
             location: location!(),
         });
@@ -1221,32 +1219,12 @@ async fn build_ivf_model_and_pq(
 
 async fn scan_index_field_stream(
     dataset: &Dataset,
-    column: &str,
+    columns: &[&str],
 ) -> Result<impl RecordBatchStream + Unpin + 'static> {
     let mut scanner = dataset.scan();
-    scanner.project(&[column])?;
+    scanner.project(columns)?;
     scanner.with_row_id();
     scanner.try_into_stream().await
-}
-
-async fn load_precomputed_partitions_if_available(
-    ivf_params: &IvfBuildParams,
-) -> Result<Option<HashMap<u64, u32>>> {
-    match &ivf_params.precomputed_partitons_file {
-        Some(file) => {
-            info!("Loading precomputed partitions from file: {}", file);
-            let mut builder = DatasetBuilder::from_uri(file);
-            if let Some(storage_options) = &ivf_params.storage_options {
-                builder = builder.with_storage_options(storage_options.clone());
-            }
-            let ds = builder.load().await?;
-            let stream = ds.scan().try_into_stream().await?;
-            Ok(Some(
-                load_precomputed_partitions(stream, ds.count_rows(None).await?).await?,
-            ))
-        }
-        None => Ok(None),
-    }
 }
 
 pub async fn build_ivf_pq_index(
@@ -1260,8 +1238,16 @@ pub async fn build_ivf_pq_index(
 ) -> Result<()> {
     let (ivf_model, pq) =
         build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
-    let stream = scan_index_field_stream(dataset, column).await?;
-    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
+    let stream = if pq_params.use_precomputed_pq_codes && ivf_params.use_precomputed_partitions {
+        scan_index_field_stream(dataset, &[column, "__ivf_part_id", "__pq_code"]).await?
+    } else if ivf_params.use_precomputed_partitions {
+        scan_index_field_stream(dataset, &[column, "__ivf_part_id"]).await?
+    } else {
+        scan_index_field_stream(dataset, &[column]).await?
+    };
+
+    let with_ivf_precomputed = ivf_params.use_precomputed_partitions;
+    let with_pq_code_precomputed = pq_params.use_precomputed_pq_codes;
 
     write_ivf_pq_file(
         dataset.object_store(),
@@ -1274,7 +1260,8 @@ pub async fn build_ivf_pq_index(
         pq,
         metric_type,
         stream,
-        precomputed_partitions,
+        with_ivf_precomputed,
+        with_pq_code_precomputed,
         ivf_params.shuffle_partition_batches,
         ivf_params.shuffle_partition_concurrency,
         ivf_params.precomputed_shuffle_buffers.clone(),
@@ -1295,8 +1282,13 @@ pub async fn build_ivf_hnsw_pq_index(
 ) -> Result<()> {
     let (ivf_model, pq) =
         build_ivf_model_and_pq(dataset, column, metric_type, ivf_params, pq_params).await?;
-    let stream = scan_index_field_stream(dataset, column).await?;
-    let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
+    let stream = if pq_params.use_precomputed_pq_codes {
+        scan_index_field_stream(dataset, &[column, "__pq_code"]).await?
+    } else {
+        scan_index_field_stream(dataset, &[column]).await?
+    };
+    let with_ivf_precomputed = ivf_params.use_precomputed_partitions;
+    let with_pq_code_precomputed = pq_params.use_precomputed_pq_codes;
 
     write_ivf_hnsw_file(
         dataset,
@@ -1308,7 +1300,8 @@ pub async fn build_ivf_hnsw_pq_index(
         metric_type,
         hnsw_params,
         stream,
-        precomputed_partitions,
+        with_ivf_precomputed,
+        with_pq_code_precomputed,
         ivf_params.shuffle_partition_batches,
         ivf_params.shuffle_partition_concurrency,
         ivf_params.precomputed_shuffle_buffers.clone(),
@@ -1451,7 +1444,8 @@ async fn write_ivf_pq_file(
     pq: ProductQuantizer,
     metric_type: MetricType,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitions: Option<HashMap<u64, u32>>,
+    with_ivf_precomputed: bool,
+    with_pq_code_precomputed: bool,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -1469,7 +1463,8 @@ async fn write_ivf_pq_file(
         pq.clone(),
         metric_type,
         0..num_partitions,
-        precomputed_partitions,
+        with_ivf_precomputed,
+        with_pq_code_precomputed,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
         precomputed_shuffle_buffers,
@@ -1544,7 +1539,8 @@ async fn write_ivf_hnsw_file(
     distance_type: DistanceType,
     hnsw_params: &HnswBuildParams,
     stream: impl RecordBatchStream + Unpin + 'static,
-    precomputed_partitions: Option<HashMap<u64, u32>>,
+    with_ivf_precomputed: bool,
+    with_pq_code_precomputed: bool,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -1635,7 +1631,8 @@ async fn write_ivf_hnsw_file(
         distance_type,
         hnsw_params,
         0..num_partitions,
-        precomputed_partitions,
+        with_ivf_precomputed,
+        with_pq_code_precomputed,
         shuffle_partition_batches,
         shuffle_partition_concurrency,
         precomputed_shuffle_buffers,

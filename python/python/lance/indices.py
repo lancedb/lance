@@ -381,7 +381,8 @@ class IndicesBuilder:
         pq: PqModel,
         dest_uri: str,
         fragments: Optional[list[LanceFragment]] = None,
-        partition_ds_uri: Optional[str] = None,
+        with_ivf_precomputed: bool = False,
+        with_pq_code_precomputed: bool = False,
     ):
         """
         Apply transformations to the vectors in the dataset and create an unsorted
@@ -401,10 +402,12 @@ class IndicesBuilder:
         fragments: list[LanceFragment]
             The list of data fragments to use when computing the transformed vectors.
             This is an optional parameter (the default uses all fragments).
-        partition_ds_uri: str
-            The URI of a precomputed partitions dataset.  This allows the partition
-            transform to be skipped, using the precomputed value instead.  This is
-            optional.
+        with_ivf_precomputed: bool
+            Whether the precomputed partitions are already stored in the dataset,
+            under the column "__ivf_part_id".
+        with_pq_code_precomputed: bool
+            Whether the pq codes are already stored in the dataset, under the
+            column "__pq_code".
         """
         dimension = self.dataset.schema.field(self.column[0]).type.list_size
         num_subvectors = pq.num_subvectors
@@ -426,7 +429,8 @@ class IndicesBuilder:
             pq.codebook,
             dest_uri,
             fragments,
-            partition_ds_uri,
+            with_ivf_precomputed,
+            with_pq_code_precomputed,
         )
 
     def shuffle_transformed_vectors(

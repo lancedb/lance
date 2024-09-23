@@ -11,7 +11,6 @@
 //! 1. while groupby column will stay the same, we may want to include extra data columns in the future
 //! 2. shuffling into memory is fast but we should add disk buffer to support bigger datasets
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -20,7 +19,7 @@ use arrow::array::{
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::compute::sort_to_indices;
 use arrow::datatypes::UInt32Type;
-use arrow_array::{cast::AsArray, types::UInt64Type, Array, RecordBatch, UInt32Array};
+use arrow_array::{cast::AsArray, Array, RecordBatch, UInt32Array};
 use arrow_array::{FixedSizeListArray, UInt8Array};
 use arrow_array::{ListArray, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, Fields};
@@ -245,7 +244,6 @@ pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
     column: &str,
     ivf: Arc<IvfTransformer>,
-    precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
@@ -262,63 +260,21 @@ pub async fn shuffle_dataset(
         shuffler
     } else {
         info!(
-            "Calculating IVF partitions for vectors (num_partitions={}, precomputed_partitions={})",
+            "Calculating IVF partitions for vectors (num_partitions={})",
             num_partitions,
-            precomputed_partitions.is_some()
         );
         let mut shuffler = IvfShuffler::try_new(num_partitions, None, true, None)?;
 
         let column = column.to_owned();
-        let precomputed_partitions = precomputed_partitions.map(Arc::new);
         let stream = data
             .zip(repeat_with(move || ivf.clone()))
             .map(move |(b, ivf)| {
                 // If precomputed_partitions map is provided, use it
                 // for fast partitions.
-                let partition_map = precomputed_partitions
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(Arc::new(HashMap::new()));
                 let nan_filter = KeepFiniteVectors::new(&column);
 
                 tokio::task::spawn(async move {
                     let mut batch = b?;
-
-                    if !partition_map.is_empty() {
-                        let row_ids = batch.column_by_name(ROW_ID).ok_or(Error::Index {
-                            message: "column does not exist".to_string(),
-                            location: location!(),
-                        })?;
-                        let part_ids = UInt32Array::from_iter(
-                            row_ids
-                                .as_primitive::<UInt64Type>()
-                                .values()
-                                .iter()
-                                .map(|row_id| partition_map.get(row_id).copied()),
-                        );
-                        let part_ids = UInt32Array::from(part_ids);
-                        batch = batch
-                            .try_with_column(
-                                Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true),
-                                Arc::new(part_ids.clone()),
-                            )
-                            .expect("failed to add part id column");
-
-                        if part_ids.null_count() > 0 {
-                            info!(
-                                "Filter out rows without valid partition IDs: null_count={}",
-                                part_ids.null_count()
-                            );
-                            let indices = UInt32Array::from_iter(
-                                part_ids
-                                    .iter()
-                                    .enumerate()
-                                    .filter_map(|(idx, v)| v.map(|_| idx as u32)),
-                            );
-                            assert_eq!(indices.len(), batch.num_rows() - part_ids.null_count());
-                            batch = batch.take(&indices)?;
-                        }
-                    }
 
                     // Filter out NaNs/Infs
                     batch = nan_filter.transform(&batch)?;

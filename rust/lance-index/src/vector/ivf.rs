@@ -52,6 +52,8 @@ pub fn new_ivf_transformer_with_quantizer(
     vector_column: &str,
     quantizer: Quantizer,
     range: Option<Range<u32>>,
+    with_ivf_precomputed: bool,
+    with_pq_code_precomputed: bool,
 ) -> Result<IvfTransformer> {
     match quantizer {
         Quantizer::Flat(_) => Ok(IvfTransformer::new_flat(
@@ -59,6 +61,7 @@ pub fn new_ivf_transformer_with_quantizer(
             metric_type,
             vector_column,
             range,
+            with_ivf_precomputed,
         )),
         Quantizer::Product(pq) => Ok(IvfTransformer::with_pq(
             centroids,
@@ -67,12 +70,15 @@ pub fn new_ivf_transformer_with_quantizer(
             pq,
             range,
             false,
+            with_ivf_precomputed,
+            with_pq_code_precomputed,
         )),
         Quantizer::Scalar(_) => Ok(IvfTransformer::with_sq(
             centroids,
             metric_type,
             vector_column,
             range,
+            with_ivf_precomputed,
         )),
     }
 }
@@ -112,24 +118,29 @@ impl IvfTransformer {
         distance_type: DistanceType,
         vector_column: &str,
         range: Option<Range<u32>>,
+        with_ivf_precomputed: bool,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
         let dt = if distance_type == DistanceType::Cosine {
-            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
-                vector_column,
-            )));
+            if !with_ivf_precomputed {
+                transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                    vector_column,
+                )));
+            }
             MetricType::L2
         } else {
             distance_type
         };
 
-        let ivf_transform = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
-            dt,
-            vector_column,
-        ));
-        transforms.push(ivf_transform.clone());
+        if !with_ivf_precomputed {
+            let ivf_transform = Arc::new(PartitionTransformer::new(
+                centroids.clone(),
+                dt,
+                vector_column,
+            ));
+            transforms.push(ivf_transform.clone());
+        }
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -153,24 +164,30 @@ impl IvfTransformer {
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
         with_pq_code: bool, // Pass true for v1 index format, otherwise false.
+        with_ivf_precomputed: bool,
+        _with_pq_code_precomputed: bool,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
         let mt = if distance_type == MetricType::Cosine {
-            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
-                vector_column,
-            )));
+            if !with_ivf_precomputed {
+                transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                    vector_column,
+                )));
+            }
             MetricType::L2
         } else {
             distance_type
         };
 
-        let partition_transform = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
-            mt,
-            vector_column,
-        ));
-        transforms.push(partition_transform.clone());
+        if !with_ivf_precomputed {
+            let partition_transform = Arc::new(PartitionTransformer::new(
+                centroids.clone(),
+                mt,
+                vector_column,
+            ));
+            transforms.push(partition_transform.clone());
+        }
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -179,14 +196,17 @@ impl IvfTransformer {
             )));
         }
 
-        if ProductQuantizer::use_residual(distance_type) {
-            transforms.push(Arc::new(ResidualTransform::new(
-                centroids.clone(),
-                PART_ID_COLUMN,
-                vector_column,
-            )));
+        if !with_ivf_precomputed {
+            if ProductQuantizer::use_residual(distance_type) {
+                transforms.push(Arc::new(ResidualTransform::new(
+                    centroids.clone(),
+                    PART_ID_COLUMN,
+                    vector_column,
+                )));
+            }
         }
         if with_pq_code {
+            // PQTransformer doesn't compute anything if __pq_code column is present
             transforms.push(Arc::new(PQTransformer::new(
                 pq.clone(),
                 vector_column,
@@ -205,24 +225,29 @@ impl IvfTransformer {
         metric_type: MetricType,
         vector_column: &str,
         range: Option<Range<u32>>,
+        with_ivf_precomputed: bool,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
         let mt = if metric_type == MetricType::Cosine {
-            transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
-                vector_column,
-            )));
+            if !with_ivf_precomputed {
+                transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
+                    vector_column,
+                )));
+            }
             MetricType::L2
         } else {
             metric_type
         };
 
-        let partition_transformer = Arc::new(PartitionTransformer::new(
-            centroids.clone(),
-            mt,
-            vector_column,
-        ));
-        transforms.push(partition_transformer.clone());
+        if !with_ivf_precomputed {
+            let partition_transformer = Arc::new(PartitionTransformer::new(
+                centroids.clone(),
+                mt,
+                vector_column,
+            ));
+            transforms.push(partition_transformer.clone());
+        }
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(

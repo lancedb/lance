@@ -289,6 +289,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 &self.column,
                 quantizer.into(),
                 Some(0..ivf.num_partitions() as u32),
+                false,
+                false,
             )?,
         );
         let mut transformed_stream = Box::pin(
