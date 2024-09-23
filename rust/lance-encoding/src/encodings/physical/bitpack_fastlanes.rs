@@ -18,7 +18,7 @@ use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 use crate::compression_algo::fastlanes::BitPacking;
-use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
 use crate::encoder::{ArrayEncoder, EncodedArray};
 use crate::format::ProtobufUtils;
@@ -254,7 +254,7 @@ macro_rules! encode_fixed_width {
             num_values: $unpacked.num_values,
         });
 
-        Ok(EncodedArray {
+        Result::Ok(EncodedArray {
             data: packed,
             encoding,
         })
@@ -283,19 +283,64 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
         data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
-        let DataBlock::FixedWidth(mut unpacked) = data else {
-            return Err(Error::InvalidInput {
-                source: "Bitpacking only supports fixed width data blocks".into(),
-                location: location!(),
-            });
-        };
+        match data {
+            DataBlock::AllNull(_) => {
+                let encoding = ProtobufUtils::basic_all_null_encoding();
+                Ok(EncodedArray { data, encoding })
+            }
+            DataBlock::FixedWidth(mut unpacked) => {
+                match data_type {
+                    DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
+                    DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
+                    DataType::UInt32 | DataType::Int32 => encode_fixed_width!(self, unpacked, u32, buffer_index),
+                    DataType::UInt64 | DataType::Int64 => encode_fixed_width!(self, unpacked, u64, buffer_index),
+                    _ => unreachable!("BitpackedForNonNegArrayEncoder only supports data types of UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64"),
+                }
+            }
+            DataBlock::Nullable(nullable) => {
+                let validity_buffer_index = *buffer_index;
+                *buffer_index += 1;
 
-        match data_type {
-            DataType::UInt8 | DataType::Int8 => encode_fixed_width!(self, unpacked, u8, buffer_index),
-            DataType::UInt16 | DataType::Int16 => encode_fixed_width!(self, unpacked, u16, buffer_index),
-            DataType::UInt32 | DataType::Int32 => encode_fixed_width!(self, unpacked, u32, buffer_index),
-            DataType::UInt64 | DataType::Int64 => encode_fixed_width!(self, unpacked, u64, buffer_index),
-            _ => unreachable!("BitpackedForNonNegArrayEncoder only supports data types of UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64"),
+                let validity_desc = ProtobufUtils::flat_encoding(
+                    1,
+                    validity_buffer_index,
+                    /*compression=*/ None,
+                );
+                let encoded_values: EncodedArray;
+                match *nullable.data {
+                    DataBlock::FixedWidth(mut unpacked) => {
+                        match data_type {
+                            DataType::UInt8 | DataType::Int8 => encoded_values = encode_fixed_width!(self, unpacked, u8, buffer_index)?,
+                            DataType::UInt16 | DataType::Int16 => encoded_values = encode_fixed_width!(self, unpacked, u16, buffer_index)?,
+                            DataType::UInt32 | DataType::Int32 => encoded_values = encode_fixed_width!(self, unpacked, u32, buffer_index)?,
+                            DataType::UInt64 | DataType::Int64 => encoded_values = encode_fixed_width!(self, unpacked, u64, buffer_index)?,
+                            _ => unreachable!("BitpackedForNonNegArrayEncoder only supports data types of UInt8, Int8, UInt16, Int16, UInt32, Int32, UInt64, Int64"),
+                        }
+                    }
+                    _ => {
+                        return Err(Error::InvalidInput {
+                            source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
+                            location: location!(),
+                        });
+                    }
+                }
+                let encoding =
+                    ProtobufUtils::basic_some_null_encoding(validity_desc, encoded_values.encoding);
+                let encoded = DataBlock::Nullable(NullableDataBlock {
+                    data: Box::new(encoded_values.data),
+                    nulls: nullable.nulls,
+                });
+                Ok(EncodedArray {
+                    data: encoded,
+                    encoding,
+                })
+            }
+            _ => {
+                return Err(Error::InvalidInput {
+                    source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
+                    location: location!(),
+                });
+            }
         }
     }
 }
@@ -558,10 +603,11 @@ fn bitpacked_for_non_neg_decode(
                 let mut curr_range_start = bytes_idx_to_range_indices[i][0].start;
                 let mut chunk_num = 0;
                 while chunk_num * packed_chunk_size_in_byte < bytes.len() {
-                    let chunk_in_u8: &[u8] = &bytes[chunk_num * packed_chunk_size_in_byte..]
-                        [..packed_chunk_size_in_byte];
+                    // I have to do a copy here for memory alignment
+                    let chunk_in_u8: Vec<u8> = bytes[chunk_num * packed_chunk_size_in_byte..]
+                        [..packed_chunk_size_in_byte].to_vec();
                     chunk_num += 1;
-                    let chunk = cast_slice(chunk_in_u8);
+                    let chunk = cast_slice(&chunk_in_u8);
                     unsafe {
                         BitPacking::unchecked_unpack(
                             compressed_bit_width as usize,
