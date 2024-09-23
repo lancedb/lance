@@ -59,10 +59,13 @@ def test_ivf_centroids(tmpdir, rand_dataset):
     assert ivf.centroids == reloaded.centroids
 
 
-def test_ivf_centroids_mostly_null(mostly_null_dataset):
-    ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(sample_rate=16)
+@pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
+def test_ivf_centroids_mostly_null(mostly_null_dataset, distance_type):
+    ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
+        sample_rate=16, distance_type=distance_type
+    )
 
-    assert ivf.distance_type == "l2"
+    assert ivf.distance_type == distance_type
     assert len(ivf.centroids) == NUM_PARTITIONS
 
 
@@ -77,12 +80,13 @@ def test_ivf_centroids_cuda(rand_dataset):
 
 
 @pytest.mark.cuda
-def test_ivf_centroids_mostly_null_cuda(mostly_null_dataset):
+@pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
+def test_ivf_centroids_mostly_null_cuda(mostly_null_dataset, distance_type):
     ivf = IndicesBuilder(mostly_null_dataset, "vectors").train_ivf(
-        sample_rate=16, accelerator="cuda"
+        sample_rate=16, accelerator="cuda", distance_type=distance_type
     )
 
-    assert ivf.distance_type == "l2"
+    assert ivf.distance_type == distance_type
     assert len(ivf.centroids) == NUM_PARTITIONS
 
 
@@ -156,10 +160,11 @@ def test_assign_partitions(rand_dataset, rand_ivf):
 
 
 @pytest.mark.cuda
-def test_assign_partitions_mostly_null(mostly_null_dataset):
+@pytest.mark.parametrize("distance_type", ["l2", "cosine", "dot"])
+def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
     centroids = np.random.rand(DIMENSION * 100).astype(np.float32)
     centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
-    ivf = IvfModel(centroids, "l2")
+    ivf = IvfModel(centroids, distance_type)
 
     builder = IndicesBuilder(mostly_null_dataset, "vectors")
 
