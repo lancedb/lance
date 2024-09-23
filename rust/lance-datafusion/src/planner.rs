@@ -391,7 +391,7 @@ impl Planner {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
-                enable_options_value_normalization: false, // TODOALEX: false or default?
+                enable_options_value_normalization: false,
             },
         );
 
