@@ -422,11 +422,8 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                 // the offset within the current destination byte to write to
                 let mut dst_offset = 0;
 
-                let is_negative = if self.all_negative {
-                    true
-                } else {
-                    is_encoded_item_negative(src, src_idx, src_offset, self.bits_per_value as usize)
-                };
+                let is_negative = 
+                    is_encoded_item_negative(src, src_idx, src_offset, self.bits_per_value as usize);
 
                 while src_bits_written < self.bits_per_value {
                     // write bits from current source byte into destination
@@ -456,7 +453,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
 
                 // if the type is signed, need to pad out the rest of the byte with 1s
                 let mut negative_padded_current_byte = false;
-                if self.signed && is_negative && dst_offset > 0 {
+                if ((self.signed && is_negative) || self.all_negative) && dst_offset > 0 {
                     negative_padded_current_byte = true;
                     while dst_offset < 8 {
                         dest[dst_idx] |= 1 << dst_offset;
@@ -481,7 +478,7 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
                         dst_idx + byte_len as usize - partial_bytes_written + to_next_byte;
 
                     // pad remaining bytes with 1 for negative signed numbers
-                    if self.signed && is_negative {
+                    if (self.signed && is_negative) || self.all_negative {
                         if !negative_padded_current_byte {
                             dest[dst_idx] = 0xFF;
                         }
