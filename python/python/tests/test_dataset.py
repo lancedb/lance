@@ -1927,6 +1927,39 @@ def test_io_buffer_size(tmp_path: Path):
 
     dataset.scanner(batch_size=10, io_buffer_size=5000).to_table()
 
+    # We need to make sure that different data files within a fragment are
+    # given the same priority.  This is because we scan both files at the same
+    # time in order.
+
+    def datagen():
+        for i in range(2):
+            buf = pa.allocate_buffer(8 * 1024 * 1024)
+            arr = pa.FixedSizeBinaryArray.from_buffers(
+                pa.binary(1024 * 1024), 8, [None, buf]
+            )
+            yield pa.record_batch(
+                [
+                    arr,
+                    pa.array(range(8), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.binary(1024 * 1024), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.add_columns({"c": "b"})
+
+    dataset.scanner(batch_size=1, io_buffer_size=5000).to_table()
+
 
 def test_scan_no_columns(tmp_path: Path):
     base_dir = tmp_path / "dataset"
