@@ -2075,6 +2075,17 @@ def test_dataset_restore(tmp_path: Path):
     assert dataset.count_rows() == 100
 
 
+def test_mixed_mode_overwrite(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(data, tmp_path, data_storage_version="legacy")
+
+    assert dataset.data_storage_version == "0.1"
+
+    dataset = lance.write_dataset(data, tmp_path, mode="overwrite")
+
+    assert dataset.data_storage_version == "0.1"
+
+
 def test_roundtrip_reader(tmp_path: Path):
     # Can roundtrip a reader
     data = pa.table({"a": range(100)})

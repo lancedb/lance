@@ -2868,7 +2868,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: str = "stable",
+    data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
 ) -> LanceDataset:
@@ -2910,11 +2910,10 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default (None)
+        will use the latest stable version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.

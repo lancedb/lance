@@ -147,7 +147,7 @@ class LanceFragment(pa.dataset.Fragment):
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
-        data_storage_version: str = "stable",
+        data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
@@ -180,11 +180,10 @@ class LanceFragment(pa.dataset.Fragment):
             The write mode. If "append" is specified, the data will be checked
             against the existing dataset's schema. Otherwise, pass "create" or
             "overwrite" to assign new field ids to the schema.
-        data_storage_version: optional, str, default "legacy"
+        data_storage_version: optional, str, default None
             The version of the data storage format to use. Newer versions are more
-            efficient but require newer versions of lance to read.  The default is
-            "legacy" which will use the legacy v1 version.  See the user guide
-            for more details.
+            efficient but require newer versions of lance to read.  The default (None)
+            will use the latest stable version.  See the user guide for more details.
         use_legacy_format: bool, default None
             Deprecated parameter.  Use data_storage_version instead.
         storage_options : optional, dict
@@ -529,7 +528,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
-    data_storage_version: str = "stable",
+    data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:
@@ -568,11 +567,10 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default (None)
+        will use the 2.0 version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
