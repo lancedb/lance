@@ -336,10 +336,10 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 })
             }
             _ => {
-                return Err(Error::InvalidInput {
+                Err(Error::InvalidInput {
                     source: "Bitpacking only supports fixed width data blocks or a nullable data block with fixed width data block inside or a all null data block".into(),
                     location: location!(),
-                });
+                })
             }
         }
     }
@@ -605,7 +605,8 @@ fn bitpacked_for_non_neg_decode(
                 while chunk_num * packed_chunk_size_in_byte < bytes.len() {
                     // I have to do a copy here for memory alignment
                     let chunk_in_u8: Vec<u8> = bytes[chunk_num * packed_chunk_size_in_byte..]
-                        [..packed_chunk_size_in_byte].to_vec();
+                        [..packed_chunk_size_in_byte]
+                        .to_vec();
                     chunk_num += 1;
                     let chunk = cast_slice(&chunk_in_u8);
                     unsafe {
