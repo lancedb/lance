@@ -1647,7 +1647,7 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
-                compute_partitions(
+                self = compute_partitions(
                     self, column[0], kmeans, batch_size=20480
                 )
                 kwargs["use_precomputed_partitions"] = True
@@ -1706,7 +1706,7 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
                 )
-                compute_pq_codes(
+                self = compute_pq_codes(
                     self,
                     column[0],
                     kmeans_list,

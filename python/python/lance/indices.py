@@ -327,6 +327,7 @@ class IndicesBuilder:
         *,
         output_uri: Optional[str] = None,
     ) -> str:
+        # TODO this entire function's doc has changed
         """
         Calculates which IVF partition each vector belongs to.  This searches the
         IVF centroids and assigns the closest centroid to the vector.  The result is

@@ -507,7 +507,16 @@ def compute_pq_codes(
     def pq_codes_assignment_udf(batch):
         return pq_codes_assignment(batch)
 
-    dataset.add_columns(pq_codes_assignment_udf, read_columns=["__residual_vec"])
+    #dataset.add_columns(pq_codes_assignment_udf, read_columns=["__residual_vec"])
+
+    fragments = []
+    for fragment in dataset.get_fragments():
+        new_fragment, new_schema = fragment.merge_columns(pq_codes_assignment,
+                                                          columns=["__residual_vec"])
+        fragments.append(new_fragment)
+    operation = lance.LanceOperation.Merge(fragments, new_schema)
+    dataset = lance.LanceDataset.commit(dataset.uri, operation,
+                                        read_version=dataset.version)
 
     # Save disk space
     if "__residual_vec" in dataset.schema.names:
@@ -535,6 +544,8 @@ def compute_pq_codes(
     # TODO merge on something that's actually guaranteed to exist
     # dataset.merge(pq_codes_dataset, "_rowid", "row_id") # not supported?
     # dataset.merge(pq_codes_dataset, "id")
+
+    return dataset
 
 
 def _collate_fn(batch):
@@ -667,7 +678,16 @@ def compute_partitions(
     if "__ivf_part_id" in dataset.schema.names:
         dataset.drop_columns(["__ivf_part_id"])
 
-    dataset.add_columns(partition_assignment_udf, read_columns=[column])
+    #dataset.add_columns(partition_assignment_udf, read_columns=[column])
+
+    fragments = []
+    for fragment in dataset.get_fragments():
+        new_fragment, new_schema = fragment.merge_columns(_partition_assignment,
+                                                          columns=[column])
+        fragments.append(new_fragment)
+    operation = lance.LanceOperation.Merge(fragments, new_schema)
+    dataset = lance.LanceDataset.commit(dataset.uri, operation,
+                                        read_version=dataset.version)
 
     # rbr = pa.RecordBatchReader.from_batches(output_schema, partition_assignment_iter())
     # if dst_dataset_uri is None:
@@ -693,3 +713,5 @@ def compute_partitions(
     # dataset.merge(ds, "id")
 
     #return str(dst_dataset_uri)
+
+    return dataset
