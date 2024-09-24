@@ -187,7 +187,8 @@ struct IoQueueState {
     // Priorities of in-flight requests
     priorities_in_flight: PrioritiesInFlight,
     // Set when the scheduler is finished to notify the I/O loop to shut down
-    closed: bool,
+    // once all outstanding requests have been completed.
+    done_scheduling: bool,
     // Time when the scheduler started
     start: Instant,
     // Last time we warned about backpressure
@@ -201,14 +202,14 @@ impl IoQueueState {
             bytes_avail: io_buffer_size as i64,
             pending_requests: BinaryHeap::new(),
             priorities_in_flight: PrioritiesInFlight::new(io_capacity),
-            closed: false,
+            done_scheduling: false,
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
         }
     }
 
     fn finished(&self) -> bool {
-        self.closed && self.pending_requests.is_empty()
+        self.done_scheduling && self.pending_requests.is_empty()
     }
 
     fn warn_if_needed(&self) {
@@ -339,7 +340,7 @@ impl IoQueue {
 
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
-        state.closed = true;
+        state.done_scheduling = true;
         drop(state);
 
         self.notify.notify_one();
