@@ -39,7 +39,9 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 //
 // The process-wide limit exists when users need a hard limit on the number of parallel
 // IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
-// the network.
+// the network.  (Note: a process-wide limit of X will not neccesarily limit the number of
+// open TCP connections to exactly X.  The underlying object store may open more connections
+// anyways)
 //
 // However, it can be too tough in some cases, e.g. when some scans are reading from
 // cloud storage and other scans are reading from local disk.  In these cases users don't
@@ -47,23 +49,36 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 
 // The IopsQuota enforces the first of the above limits, it is the per-process hard cap
 // on the number of IOPS that can be issued concurrently.
+//
+// The per-scan limits are enforced by IoQueue
 struct IopsQuota {
+    // We record this for error-checking purposes
     initial_capacity: i32,
+    // An Option is used here to avoid mutex overhead if no limit is set
     iops_avail: Option<Mutex<u32>>,
     notify: Notify,
 }
 
+/// A reservation on the global IOPS quota
+///
+/// When the reservation is dropped, the IOPS quota is released unless
+/// [`Self::forget`] is called.
 struct IopsReservation {
     real: bool,
 }
 
 impl IopsReservation {
+    // Forget the reservation, so it won't be released on drop
     fn forget(&mut self) {
         self.real = false;
     }
 }
 
 impl IopsQuota {
+    // By default, there is no process-wide limit on IOPS
+    //
+    // However, the user can request one by setting the environment variable
+    // LANCE_PROCESS_IO_THREADS_LIMIT to a positive integer.
     fn new() -> Self {
         let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
             .map(|s| {
@@ -89,6 +104,7 @@ impl IopsQuota {
         }
     }
 
+    // Return a reservation on the global IOPS quota
     fn release(&self) {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
             {
@@ -103,6 +119,7 @@ impl IopsQuota {
         }
     }
 
+    // Acquire a reservation on the global IOPS quota
     async fn acquire(&self) -> IopsReservation {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
             loop {
@@ -123,7 +140,6 @@ impl IopsQuota {
 }
 
 lazy_static::lazy_static! {
-    // If no limit is set, store None and avoid the Mutex overhead
     static ref IOPS_QUOTA: IopsQuota = IopsQuota::new();
 }
 
