@@ -524,7 +524,7 @@ def compute_pq_codes(
     fragments = []
     with concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn")) as executor:
         futures = [executor.submit(process_fragment_pq_codes_assignment, fragment_index, dataset.uri, "__residual_vec", kmeans_list, output_schema) for fragment_index in range(len(dataset.get_fragments()))]
-        for future in concurrent.futures.as_completed(futures):
+        for future in tqdm(concurrent.futures.as_completed(futures)):
             fragment, new_schema = future.result()
             fragments.append(fragment)
     
@@ -712,7 +712,7 @@ def compute_partitions(
     fragments = []
     with concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn")) as executor:
         futures = [executor.submit(process_fragment_partition_assignment, fragment_index, dataset.uri, column, kmeans, output_schema) for fragment_index in range(len(dataset.get_fragments()))]
-        for future in concurrent.futures.as_completed(futures):
+        for future in tqdm(concurrent.futures.as_completed(futures)):
             fragment, new_schema = future.result()
             fragments.append(fragment)
     
