@@ -25,6 +25,116 @@ const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 
+// There are two structures that control the I/O scheduler concurrency.  First,
+// we have a hard limit on the number of IOPS that can be issued concurrently.
+// This limit is process-wide.
+//
+// Second, we try and limit how many I/O requests can be buffered in memory without
+// being consumed by a decoder of some kind.  This limit is per-scheduler.  We cannot
+// make this limit process wide without introducing deadlock (because the decoder for
+// file 0 might be waiting on IOPS blocked by a queue filled with requests for file 1)
+// and vice-versa.
+//
+// There is also a per-scan limit on the number of IOPS that can be issued concurrently.
+//
+// The process-wide limit exists when users need a hard limit on the number of parallel
+// IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
+// the network.
+//
+// However, it can be too tough in some cases, e.g. when some scans are reading from
+// cloud storage and other scans are reading from local disk.  In these cases users don't
+// need to set a process-limit and can rely on the per-scan limits.
+
+// The IopsQuota enforces the first of the above limits, it is the per-process hard cap
+// on the number of IOPS that can be issued concurrently.
+struct IopsQuota {
+    initial_capacity: i32,
+    iops_avail: Option<Mutex<u32>>,
+    notify: Notify,
+}
+
+struct IopsReservation {
+    real: bool,
+}
+
+impl IopsReservation {
+    fn forget(&mut self) {
+        self.real = false;
+    }
+}
+
+impl IopsQuota {
+    fn new() -> Self {
+        let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
+            .map(|s| {
+                let limit = s
+                    .parse::<i32>()
+                    .expect("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer");
+                if limit <= 0 {
+                    panic!("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer.  To disable the limit, unset the environment variable");
+                }
+                limit
+            })
+            // The default (-1) does not apply any limit
+            .unwrap_or(-1);
+        let iops_avail = if initial_capacity < 0 {
+            None
+        } else {
+            Some(Mutex::new(initial_capacity as u32))
+        };
+        Self {
+            initial_capacity,
+            iops_avail,
+            notify: Notify::new(),
+        }
+    }
+
+    fn release(&self) {
+        if let Some(iops_avail) = self.iops_avail.as_ref() {
+            {
+                let mut iops_avail = iops_avail.lock().unwrap();
+                *iops_avail += 1;
+                debug_assert!(
+                    *iops_avail <= self.initial_capacity as u32,
+                    "IOPS quota exceeded"
+                );
+            }
+            self.notify.notify_one();
+        }
+    }
+
+    async fn acquire(&self) -> IopsReservation {
+        if let Some(iops_avail) = self.iops_avail.as_ref() {
+            loop {
+                {
+                    let mut iops_avail = iops_avail.lock().unwrap();
+                    if *iops_avail > 0 {
+                        *iops_avail -= 1;
+                        return IopsReservation { real: true };
+                    }
+                }
+
+                self.notify.notified().await;
+            }
+        } else {
+            IopsReservation { real: false }
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    // If no limit is set, store None and avoid the Mutex overhead
+    static ref IOPS_QUOTA: IopsQuota = IopsQuota::new();
+}
+
+impl Drop for IopsReservation {
+    fn drop(&mut self) {
+        if self.real {
+            IOPS_QUOTA.release();
+        }
+    }
+}
+
 // We want to allow requests that have a lower priority than any
 // currently in-flight request.  This helps avoid potential deadlocks
 // related to backpressure.  Unfortunately, it is quite expensive to
@@ -95,6 +205,10 @@ impl IoQueueState {
             start: Instant::now(),
             last_warn: AtomicU64::from(0),
         }
+    }
+
+    fn finished(&self) -> bool {
+        self.closed && self.pending_requests.is_empty()
     }
 
     fn warn_if_needed(&self) {
@@ -181,9 +295,22 @@ impl IoQueue {
     async fn pop(&self) -> Option<IoTask> {
         loop {
             {
+                // First, grab a reservation on the global IOPS quota
+                // If we then get a task to run, transfer the reservation
+                // to the task.  Otherwise, the reservation will be released
+                // when iop_res is dropped.
+                let mut iop_res = IOPS_QUOTA.acquire().await;
+                // Next, try and grab a reservation from the queue
                 let mut state = self.state.lock().unwrap();
                 if let Some(task) = state.next_task() {
+                    // Reservation sucessfully acquired, we will release the global
+                    // global reservation after task has run.
+                    iop_res.forget();
                     return Some(task);
+                }
+
+                if state.finished() {
+                    return None;
                 }
             }
 
@@ -338,6 +465,7 @@ impl IoTask {
             .reader
             .get_range(self.to_read.start as usize..self.to_read.end as usize);
         let bytes = bytes_fut.await.map_err(Error::from);
+        IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
 }
