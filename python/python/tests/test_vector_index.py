@@ -19,7 +19,7 @@ from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
 
-def create_table(nvec=1000, ndim=128, nans=0):
+def create_table(nvec=1000, ndim=128, nans=0, nullify=False):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
         nans_mat = np.empty((nans, ndim))
@@ -37,6 +37,13 @@ def create_table(nvec=1000, ndim=128, nans=0):
         .append_column("meta", pa.array(meta))
         .append_column("id", pa.array(range(nvec + nans)))
     )
+    if nullify:
+        idx = tbl.schema.get_field_index("vector")
+        vecs = tbl[idx].to_pylist()
+        nullified = [vec if i % 2 == 0 else None for i, vec in enumerate(vecs)]
+        field = tbl.schema.field(idx)
+        vecs = pa.array(nullified, field.type)
+        tbl = tbl.set_column(idx, field, vecs)
     return tbl
 
 
@@ -191,8 +198,9 @@ def test_index_with_pq_codebook(tmp_path):
 
 
 @pytest.mark.cuda
-def test_create_index_using_cuda(tmp_path):
-    tbl = create_table()
+@pytest.mark.parametrize("nullify", [False, True])
+def test_create_index_using_cuda(tmp_path, nullify):
+    tbl = create_table(nullify=nullify)
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
         "vector",

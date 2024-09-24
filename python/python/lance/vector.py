@@ -139,7 +139,11 @@ def train_ivf_centroids_on_accelerator(
 ) -> (np.ndarray, str):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
-        not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
+        not (
+            CUDA_REGEX.match(accelerator)
+            or accelerator == "mps"
+            or accelerator == "cuvs"
+        )
     ):
         raise ValueError(
             "Train ivf centroids on accelerator: "
@@ -154,10 +158,22 @@ def train_ivf_centroids_on_accelerator(
 
     k = int(k)
 
-    logging.info("Randomly select %s centroids from %s", k, dataset)
-    samples = dataset.sample(k, [column], sorted=True).combine_chunks()
-    fsl = samples.to_batches()[0][column]
-    init_centroids = torch.from_numpy(np.stack(fsl.to_numpy(zero_copy_only=False)))
+    if dataset.schema.field(column).nullable:
+        filt = f"{column} is not null"
+    else:
+        filt = None
+
+    logging.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
+
+    ds = TorchDataset(
+        dataset,
+        batch_size=k,
+        columns=[column],
+        samples=sample_size,
+        filter=filt,
+    )
+
+    init_centroids = next(iter(ds))
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
@@ -165,17 +181,31 @@ def train_ivf_centroids_on_accelerator(
         batch_size=20480,
         columns=[column],
         samples=sample_size,
+        filter=filt,
         cache=True,
     )
 
-    logging.info("Training IVF partitions using GPU(%s)", accelerator)
-    kmeans = KMeans(
-        k,
-        max_iters=max_iters,
-        metric=metric_type,
-        device=accelerator,
-        centroids=init_centroids,
-    )
+    if accelerator == "cuvs":
+        logging.info("Training IVF partitions using cuVS+GPU")
+        print("Training IVF partitions using cuVS+GPU")
+        from lance.cuvs.kmeans import KMeans as KMeansCuVS
+
+        kmeans = KMeansCuVS(
+            k,
+            max_iters=max_iters,
+            metric=metric_type,
+            device="cuda",
+            centroids=init_centroids,
+        )
+    else:
+        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        kmeans = KMeans(
+            k,
+            max_iters=max_iters,
+            metric=metric_type,
+            device=accelerator,
+            centroids=init_centroids,
+        )
     kmeans.fit(ds)
 
     centroids = kmeans.centroids.cpu().numpy()
@@ -233,6 +263,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
+        filter=f"{column} is not null",
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,

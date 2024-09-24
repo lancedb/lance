@@ -514,7 +514,23 @@ impl Dataset {
             )
         };
 
-        let mut storage_version = params.storage_version_or_default();
+        let mut storage_version = match (params.mode, dataset.as_ref()) {
+            (WriteMode::Append, Some(dataset)) => {
+                // If appending to an existing dataset, always use the dataset version
+                let m = dataset.manifest.as_ref();
+                m.data_storage_format.lance_file_version()?
+            }
+            (WriteMode::Overwrite, Some(dataset)) => {
+                // If overwriting an existing dataset, allow the user to specify but use
+                // the existing version if they don't
+                params.data_storage_version.map(Ok).unwrap_or_else(|| {
+                    let m = dataset.manifest.as_ref();
+                    m.data_storage_format.lance_file_version()
+                })?
+            }
+            // Otherwise (no existing dataset) fallback to the default if the user didn't specify
+            _ => params.storage_version_or_default(),
+        };
 
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
@@ -3968,6 +3984,64 @@ mod tests {
         assert_eq!(batch, data);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_mixed_version() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+        let arr = Arc::new(Int32Array::from(vec![1, 2, 3]));
+
+        let data = RecordBatch::try_new(schema.clone(), vec![arr]).unwrap();
+        let reader =
+            RecordBatchIterator::new(vec![data.clone()].into_iter().map(Ok), schema.clone());
+
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()
+                .unwrap(),
+            LanceFileVersion::Legacy
+        );
+
+        let reader = RecordBatchIterator::new(vec![data].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                mode: WriteMode::Overwrite,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dataset
+                .manifest
+                .data_storage_format
+                .lance_file_version()
+                .unwrap(),
+            LanceFileVersion::Legacy
+        );
     }
 
     // Bug: https://github.com/lancedb/lancedb/issues/1223

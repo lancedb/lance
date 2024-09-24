@@ -96,4 +96,10 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// TODO: change to read_at()?
     async fn get_range(&self, range: Range<usize>) -> object_store::Result<Bytes>;
+
+    /// Read all bytes from the object.
+    ///
+    /// By default this reads the size in a separate IOP but some implementations
+    /// may not need the size beforehand.
+    async fn get_all(&self) -> object_store::Result<Bytes>;
 }

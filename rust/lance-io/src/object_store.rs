@@ -4,6 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
@@ -493,6 +495,10 @@ impl ObjectStore {
         self.scheme == "file"
     }
 
+    pub fn is_cloud(&self) -> bool {
+        self.scheme != "file" && self.scheme != "memory"
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }
@@ -648,6 +654,21 @@ impl ObjectStore {
     /// Get file size.
     pub async fn size(&self, path: &Path) -> Result<usize> {
         Ok(self.inner.head(path).await?.size)
+    }
+
+    /// Convenience function to open a reader and read all the bytes
+    pub async fn read_one_all(&self, path: &Path) -> Result<Bytes> {
+        let reader = self.open(path).await?;
+        Ok(reader.get_all().await?)
+    }
+
+    /// Convenience function open a reader and make a single request
+    ///
+    /// If you will be making multiple requests to the path it is more efficient to call [`Self::open`]
+    /// and then call [`Reader::get_range`] multiple times.
+    pub async fn read_one_range(&self, path: &Path, range: Range<usize>) -> Result<Bytes> {
+        let reader = self.open(path).await?;
+        Ok(reader.get_range(range).await?)
     }
 }
 
@@ -1298,6 +1319,26 @@ mod tests {
 
         let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
+    }
+
+    #[tokio::test]
+    async fn test_read_one() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let file_path = temp_dir.path().join("test_file");
+        let mut writer = ObjectStore::create_local_writer(file_path.as_path())
+            .await
+            .unwrap();
+        writer.write_all(b"LOCAL").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
+        let obj_store = ObjectStore::local();
+        let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
+
+        let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
         assert_eq!(buf.as_bytes(), b"LOCAL");
     }
 

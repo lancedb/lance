@@ -37,6 +37,8 @@ use crate::{
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
 
+pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
+
 /// An encoded array
 ///
 /// Maps to a single Arrow array
@@ -215,17 +217,25 @@ impl CoreArrayEncodingStrategy {
             && data_size > 4 * 1024 * 1024
     }
 
+    fn get_field_compression(field_meta: &HashMap<String, String>) -> Option<CompressionScheme> {
+        let compression = field_meta.get(COMPRESSION_META_KEY)?;
+        Some(compression.parse::<CompressionScheme>().unwrap())
+    }
+
     fn default_binary_encoder(
         arrays: &[ArrayRef],
         data_type: &DataType,
+        field_meta: Option<&HashMap<String, String>>,
         data_size: u64,
         version: LanceFileVersion,
     ) -> Result<Box<dyn ArrayEncoder>> {
         let bin_indices_encoder =
             Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
 
-        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder));
-        if Self::can_use_fsst(data_type, data_size, version) {
+        let compression = field_meta.and_then(Self::get_field_compression);
+
+        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, compression));
+        if compression.is_none() && Self::can_use_fsst(data_type, data_size, version) {
             Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
         } else {
             Ok(bin_encoder)
@@ -238,7 +248,7 @@ impl CoreArrayEncodingStrategy {
         data_size: u64,
         use_dict_encoding: bool,
         version: LanceFileVersion,
-        _field_meta: Option<&HashMap<String, String>>,
+        field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
         match data_type {
             DataType::FixedSizeList(inner, dimension) => {
@@ -312,10 +322,12 @@ impl CoreArrayEncodingStrategy {
                             FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
                         ))))
                     } else {
-                        Self::default_binary_encoder(arrays, data_type, data_size, version)
+                        Self::default_binary_encoder(
+                            arrays, data_type, field_meta, data_size, version,
+                        )
                     }
                 } else {
-                    Self::default_binary_encoder(arrays, data_type, data_size, version)
+                    Self::default_binary_encoder(arrays, data_type, field_meta, data_size, version)
                 }
             }
             DataType::Struct(fields) => {

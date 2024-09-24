@@ -66,7 +66,7 @@ impl PrimitivePageDecoder for FsstPageDecoder {
         let compressed_data = self.inner_decoder.decode(rows_to_skip, num_rows)?;
         let (string_data, nulls) = match compressed_data {
             DataBlock::Nullable(nullable) => {
-                let data = nullable.data.as_variable_width()?;
+                let data = nullable.data.as_variable_width().unwrap();
                 Result::Ok((data, Some(nullable.nulls)))
             }
             DataBlock::VariableWidth(variable) => Ok((variable, None)),

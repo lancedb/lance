@@ -29,7 +29,7 @@ env:
 
 jobs:
   linux-build:
-    runs-on: buildjet-8vcpu-ubuntu-2204
+    runs-on: "ubuntu-24.04"
     timeout-minutes: 45
     strategy:
       matrix:
@@ -38,15 +38,15 @@ jobs:
           - nightly
     env:
       # Need up-to-date compilers for kernels
-      CC: gcc-12
-      CXX: g++-12
+      CC: clang-18
+      CXX: clang-18
     steps:
       - uses: actions/checkout@v4
       # pin the toolchain version to avoid surprises
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: ${{ matrix.toolchain == 'stable' }}
         with:
-          toolchain: "1.78.0"
+          toolchain: "stable"
           cache-workspaces: "src/rust"
           # Disable full debug symbol generation to speed up CI build and keep memory down
           # "1" means line tables only, which is useful for panic tracebacks.
@@ -63,9 +63,7 @@ jobs:
           components: "rustfmt,clippy"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "buildjet-v1"
           workspaces: rust
-          cache-provider: "buildjet"
       - name: Install dependencies
         run: |
           sudo apt update
@@ -98,7 +96,7 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
   linux-arm:
-    runs-on: warp-ubuntu-latest-arm64-4x
+    runs-on: ubuntu-2404-4x-arm64
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -107,7 +105,7 @@ jobs:
           workspaces: rust
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: "1.78.0"
+          toolchain: "stable"
           cache-workspaces: "src/rust"
           # Disable full debug symbol generation to speed up CI build and keep memory down
           # "1" means line tables only, which is useful for panic tracebacks.
@@ -127,7 +125,7 @@ jobs:
         run: |
           cargo test --all-features -- --test-threads 1
   clippy_and_benchmark:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
