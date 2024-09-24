@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
 use lance_core::{Error, Result};
 
@@ -52,25 +52,24 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 //
 // The per-scan limits are enforced by IoQueue
 struct IopsQuota {
-    // We record this for error-checking purposes
-    initial_capacity: i32,
     // An Option is used here to avoid mutex overhead if no limit is set
-    iops_avail: Option<Mutex<u32>>,
-    notify: Notify,
+    iops_avail: Option<Semaphore>,
 }
 
 /// A reservation on the global IOPS quota
 ///
 /// When the reservation is dropped, the IOPS quota is released unless
 /// [`Self::forget`] is called.
-struct IopsReservation {
-    real: bool,
+struct IopsReservation<'a> {
+    value: Option<SemaphorePermit<'a>>,
 }
 
-impl IopsReservation {
+impl<'a> IopsReservation<'a> {
     // Forget the reservation, so it won't be released on drop
     fn forget(&mut self) {
-        self.real = false;
+        if let Some(value) = self.value.take() {
+            value.forget();
+        }
     }
 }
 
@@ -95,60 +94,32 @@ impl IopsQuota {
         let iops_avail = if initial_capacity < 0 {
             None
         } else {
-            Some(Mutex::new(initial_capacity as u32))
+            Some(Semaphore::new(initial_capacity as usize))
         };
-        Self {
-            initial_capacity,
-            iops_avail,
-            notify: Notify::new(),
-        }
+        Self { iops_avail }
     }
 
     // Return a reservation on the global IOPS quota
     fn release(&self) {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
-            {
-                let mut iops_avail = iops_avail.lock().unwrap();
-                *iops_avail += 1;
-                debug_assert!(
-                    *iops_avail <= self.initial_capacity as u32,
-                    "IOPS quota exceeded"
-                );
-            }
-            self.notify.notify_one();
+            iops_avail.add_permits(1);
         }
     }
 
     // Acquire a reservation on the global IOPS quota
     async fn acquire(&self) -> IopsReservation {
         if let Some(iops_avail) = self.iops_avail.as_ref() {
-            loop {
-                {
-                    let mut iops_avail = iops_avail.lock().unwrap();
-                    if *iops_avail > 0 {
-                        *iops_avail -= 1;
-                        return IopsReservation { real: true };
-                    }
-                }
-
-                self.notify.notified().await;
+            IopsReservation {
+                value: Some(iops_avail.acquire().await.unwrap()),
             }
         } else {
-            IopsReservation { real: false }
+            IopsReservation { value: None }
         }
     }
 }
 
 lazy_static::lazy_static! {
     static ref IOPS_QUOTA: IopsQuota = IopsQuota::new();
-}
-
-impl Drop for IopsReservation {
-    fn drop(&mut self) {
-        if self.real {
-            IOPS_QUOTA.release();
-        }
-    }
 }
 
 // We want to allow requests that have a lower priority than any
