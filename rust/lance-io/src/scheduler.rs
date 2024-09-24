@@ -167,9 +167,10 @@ impl IoQueue {
 
     fn push(&self, task: IoTask) {
         log::trace!(
-            "Inserting I/O request for {} bytes with priority {} into I/O queue",
+            "Inserting I/O request for {} bytes with priority ({},{}) into I/O queue",
             task.num_bytes(),
-            task.priority
+            task.priority >> 64,
+            task.priority & 0xFFFFFFFFFFFFFFFF
         );
         let mut state = self.state.lock().unwrap();
         state.pending_requests.push(task);
