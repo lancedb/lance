@@ -36,7 +36,7 @@ use crate::scalar::{
 };
 use crate::Index;
 
-use super::builder::InvertedList;
+use super::builder::{InvertedList, PostingReader};
 use super::{wand::*, InvertedIndexBuilder};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
@@ -168,15 +168,11 @@ impl InvertedIndex {
         .await
     }
 
-    async fn to_builder(&self) -> Result<InvertedIndexBuilder> {
+    fn to_builder(&self) -> InvertedIndexBuilder {
         let tokens = self.tokens.clone();
-        let invert_list = InvertedList::load(self.inverted_list.reader.clone()).await?;
+        let inverted_list = self.inverted_list.clone();
         let docs = self.docs.clone();
-        Ok(InvertedIndexBuilder::from_existing_index(
-            tokens,
-            invert_list,
-            docs,
-        ))
+        InvertedIndexBuilder::from_existing_index(tokens, inverted_list, docs)
     }
 }
 
@@ -281,7 +277,7 @@ impl ScalarIndex for InvertedIndex {
         mapping: &HashMap<u64, Option<u64>>,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        self.to_builder().await?.remap(mapping, dest_store).await
+        self.to_builder().remap(mapping, dest_store).await
     }
 
     async fn update(
@@ -289,7 +285,7 @@ impl ScalarIndex for InvertedIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        self.to_builder().await?.update(new_data, dest_store).await
+        self.to_builder().update(new_data, dest_store).await
     }
 }
 
@@ -304,6 +300,14 @@ pub struct TokenSet {
 }
 
 impl TokenSet {
+    pub fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+            next_id: 0,
+            total_length: 0,
+        }
+    }
+
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
@@ -375,7 +379,7 @@ impl TokenSet {
     }
 }
 
-struct InvertedListReader {
+pub(crate) struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
     max_scores: Option<Vec<f32>>,
@@ -452,6 +456,26 @@ impl InvertedListReader {
         next_offset - self.offsets[token_id]
     }
 
+    pub(crate) async fn posting_batch(
+        &self,
+        token_id: u32,
+        with_position: bool,
+    ) -> Result<RecordBatch> {
+        let mut columns = vec![ROW_ID, FREQUENCY_COL];
+        if with_position {
+            columns.push(POSITION_COL);
+        }
+
+        let length = self.posting_len(token_id);
+        let token_id = token_id as usize;
+        let offset = self.offsets[token_id];
+        let batch = self
+            .reader
+            .read_range(offset..offset + length, Some(&columns))
+            .await?;
+        Ok(batch)
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub(crate) async fn posting_list(
         &self,
@@ -461,13 +485,7 @@ impl InvertedListReader {
         let mut posting = self
             .posting_cache
             .try_get_with(token_id, async move {
-                let length = self.posting_len(token_id);
-                let token_id = token_id as usize;
-                let offset = self.offsets[token_id];
-                let batch = self
-                    .reader
-                    .read_range(offset..offset + length, Some(&[ROW_ID, FREQUENCY_COL]))
-                    .await?;
+                let batch = self.posting_batch(token_id, false).await?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
                 let frequencies = batch[FREQUENCY_COL].as_primitive::<Float32Type>().clone();
                 Result::Ok(PostingList::new(
@@ -475,7 +493,7 @@ impl InvertedListReader {
                     frequencies.values().clone(),
                     self.max_scores
                         .as_ref()
-                        .map(|max_scores| max_scores[token_id]),
+                        .map(|max_scores| max_scores[token_id as usize]),
                 ))
             })
             .await
@@ -622,10 +640,17 @@ impl PostingListBuilder {
         max_score * idf(self.len(), num_docs) * (K1 + 1.0)
     }
 
-    pub fn to_batch(mut self, schema: SchemaRef, docs: Arc<DocSet>) -> Result<(RecordBatch, f32)> {
+    pub fn to_batch(
+        mut self,
+        schema: SchemaRef,
+        docs: Option<Arc<DocSet>>,
+    ) -> Result<(RecordBatch, f32)> {
         let length = self.len();
-        let num_docs = docs.len();
-        let avgdl = docs.average_length();
+        let num_docs = docs.as_ref().map(|docs| docs.len()).unwrap_or(0);
+        let avgdl = docs
+            .as_ref()
+            .map(|docs| docs.average_length())
+            .unwrap_or(0.0);
         let mut max_score = 0.0;
 
         let mut row_id_builder = UInt64Builder::with_capacity(length);
@@ -644,10 +669,12 @@ impl PostingListBuilder {
                 position_builder.append(true);
             }
             // calculate the max score
-            let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
-            let score = freq / (freq + doc_norm);
-            if score > max_score {
-                max_score = score;
+            if let Some(docs) = &docs {
+                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
+                let score = freq / (freq + doc_norm);
+                if score > max_score {
+                    max_score = score;
+                }
             }
         }
         max_score *= idf(self.len(), num_docs) * (K1 + 1.0);
