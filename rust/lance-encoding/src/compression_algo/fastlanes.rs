@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// This file is a modification of the `fastlanes` crate: https://github.com/spiraldb/fastlanes
+// NOTICE: This file is a modification of the `fastlanes` crate: https://github.com/spiraldb/fastlanes
 // It is modified to allow a rust stable build
 
 use arrayref::{array_mut_ref, array_ref};

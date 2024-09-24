@@ -351,16 +351,6 @@ pub struct BitpackedForNonNegScheduler {
     buffer_offset: u64,
 }
 
-fn locate_chunk_start(scheduler: &BitpackedForNonNegScheduler, relative_row_num: u64) -> u64 {
-    let chunk_size = ELEMS_PER_CHUNK * scheduler.compressed_bit_width / 8;
-    relative_row_num / ELEMS_PER_CHUNK * chunk_size
-}
-
-fn locate_chunk_end(scheduler: &BitpackedForNonNegScheduler, relative_row_num: u64) -> u64 {
-    let chunk_size = ELEMS_PER_CHUNK * scheduler.compressed_bit_width / 8;
-    relative_row_num / ELEMS_PER_CHUNK * chunk_size + chunk_size
-}
-
 impl BitpackedForNonNegScheduler {
     pub fn new(
         compressed_bit_width: u64,
@@ -372,6 +362,16 @@ impl BitpackedForNonNegScheduler {
             uncompressed_bits_per_value,
             buffer_offset,
         }
+    }
+
+    fn locate_chunk_start(&self, relative_row_num: u64) -> u64 {
+        let chunk_size = ELEMS_PER_CHUNK * self.compressed_bit_width / 8;
+        self.buffer_offset + (relative_row_num / ELEMS_PER_CHUNK * chunk_size)
+    }
+
+    fn locate_chunk_end(&self, relative_row_num: u64) -> u64 {
+        let chunk_size = ELEMS_PER_CHUNK * self.compressed_bit_width / 8;
+        self.buffer_offset + (relative_row_num / ELEMS_PER_CHUNK * chunk_size) + chunk_size
     }
 }
 
@@ -391,26 +391,26 @@ impl PageScheduler for BitpackedForNonNegScheduler {
         // map one bytes to multiple ranges, one bytes has at least one range corresponding to it
         let mut bytes_idx_to_range_indices = vec![];
         let first_byte_range = std::ops::Range {
-            start: self.buffer_offset + locate_chunk_start(self, ranges[0].start),
-            end: self.buffer_offset + locate_chunk_end(self, ranges[0].end - 1),
+            start: self.locate_chunk_start(ranges[0].start),
+            end: self.locate_chunk_end(ranges[0].end - 1),
         }; // the ranges are half-open
         byte_ranges.push(first_byte_range);
         bytes_idx_to_range_indices.push(vec![ranges[0].clone()]);
 
         for (i, range) in ranges.iter().enumerate().skip(1) {
-            let this_start = locate_chunk_start(self, range.start);
-            let this_end = locate_chunk_end(self, range.end - 1);
+            let this_start = self.locate_chunk_start(range.start);
+            let this_end = self.locate_chunk_end(range.end - 1);
 
             // when the current range start is in the same chunk as the previous range's end, we colaesce this two bytes ranges
             // when the current range start is not in the same chunk as the previous range's end, we create a new bytes range
-            if this_start == locate_chunk_start(self, ranges[i - 1].end - 1) {
-                byte_ranges.last_mut().unwrap().end = self.buffer_offset + this_end;
+            if this_start == self.locate_chunk_start(ranges[i - 1].end - 1) {
+                byte_ranges.last_mut().unwrap().end = this_end;
                 bytes_idx_to_range_indices
                     .last_mut()
                     .unwrap()
                     .push(range.clone());
             } else {
-                byte_ranges.push(self.buffer_offset + this_start..self.buffer_offset + this_end);
+                byte_ranges.push(this_start..this_end);
                 bytes_idx_to_range_indices.push(vec![range.clone()]);
             }
         }
