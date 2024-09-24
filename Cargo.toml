@@ -96,7 +96,7 @@ criterion = { version = "0.5", features = [
 ] }
 crossbeam-queue = "0.3"
 datafusion = { version = "41.0", default-features = false, features = [
-    "array_expressions",
+    "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
 ] }
