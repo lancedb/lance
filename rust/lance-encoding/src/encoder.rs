@@ -338,7 +338,7 @@ impl CoreArrayEncodingStrategy {
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                if version >= LanceFileVersion::V2_1 {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
                     let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
                     Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
                         compressed_bit_width as usize,
@@ -354,7 +354,7 @@ impl CoreArrayEncodingStrategy {
             // for signed integers, I intend to make it a cascaded encoding, a sparse array for the negative values and very wide(bit-width) values,
             // then a bitpacked array for the narrow(bit-width) values, I need `BitpackedForNeg` to be merged first
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                if version >= LanceFileVersion::V2_1 {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
                     let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
                     Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
                         compressed_bit_width as usize,
