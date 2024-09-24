@@ -159,6 +159,13 @@ impl Schema {
         }
     }
 
+    /// Convert to a compact string representation.
+    ///
+    /// This is intended for display purposes and not for serialization.
+    pub fn to_compact_string(&self, indent: Indentation) -> String {
+        ArrowSchema::from(self).to_compact_string(indent)
+    }
+
     /// Project the columns over the schema.
     ///
     /// ```ignore

@@ -55,7 +55,13 @@ pub trait DataTypeExt {
     /// Returns true if the [DataType] is a dictionary type.
     fn is_dictionary(&self) -> bool;
 
+    /// Returns the byte width of the data type
+    /// Panics if the data type is not fixed stride.
     fn byte_width(&self) -> usize;
+
+    /// Returns the byte width of the data type, if it is fixed stride.
+    /// Returns None if the data type is not fixed stride.
+    fn byte_width_opt(&self) -> Option<usize>;
 }
 
 impl DataTypeExt for DataType {
@@ -101,36 +107,41 @@ impl DataTypeExt for DataType {
         matches!(self, Self::Dictionary(_, _))
     }
 
-    fn byte_width(&self) -> usize {
+    fn byte_width_opt(&self) -> Option<usize> {
         match self {
-            Self::Int8 => 1,
-            Self::Int16 => 2,
-            Self::Int32 => 4,
-            Self::Int64 => 8,
-            Self::UInt8 => 1,
-            Self::UInt16 => 2,
-            Self::UInt32 => 4,
-            Self::UInt64 => 8,
-            Self::Float16 => 2,
-            Self::Float32 => 4,
-            Self::Float64 => 8,
-            Self::Date32 => 4,
-            Self::Date64 => 8,
-            Self::Time32(_) => 4,
-            Self::Time64(_) => 8,
-            Self::Timestamp(_, _) => 8,
-            Self::Duration(_) => 8,
-            Self::Decimal128(_, _) => 16,
-            Self::Decimal256(_, _) => 32,
+            Self::Int8 => Some(1),
+            Self::Int16 => Some(2),
+            Self::Int32 => Some(4),
+            Self::Int64 => Some(8),
+            Self::UInt8 => Some(1),
+            Self::UInt16 => Some(2),
+            Self::UInt32 => Some(4),
+            Self::UInt64 => Some(8),
+            Self::Float16 => Some(2),
+            Self::Float32 => Some(4),
+            Self::Float64 => Some(8),
+            Self::Date32 => Some(4),
+            Self::Date64 => Some(8),
+            Self::Time32(_) => Some(4),
+            Self::Time64(_) => Some(8),
+            Self::Timestamp(_, _) => Some(8),
+            Self::Duration(_) => Some(8),
+            Self::Decimal128(_, _) => Some(16),
+            Self::Decimal256(_, _) => Some(32),
             Self::Interval(unit) => match unit {
-                IntervalUnit::YearMonth => 4,
-                IntervalUnit::DayTime => 8,
-                IntervalUnit::MonthDayNano => 16,
+                IntervalUnit::YearMonth => Some(4),
+                IntervalUnit::DayTime => Some(8),
+                IntervalUnit::MonthDayNano => Some(16),
             },
-            Self::FixedSizeBinary(s) => *s as usize,
-            Self::FixedSizeList(dt, s) => *s as usize * dt.data_type().byte_width(),
-            _ => panic!("Does not support get byte width on type {self}"),
+            Self::FixedSizeBinary(s) => Some(*s as usize),
+            Self::FixedSizeList(dt, s) => Some(*s as usize * dt.data_type().byte_width()),
+            _ => None,
         }
+    }
+
+    fn byte_width(&self) -> usize {
+        self.byte_width_opt()
+            .unwrap_or_else(|| panic!("Expecting fixed stride data type, found {:?}", self))
     }
 }
 
