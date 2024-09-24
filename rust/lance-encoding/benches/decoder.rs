@@ -66,7 +66,7 @@ fn bench_decode(c: &mut Criterion) {
     for data_type in PRIMITIVE_TYPES {
         let data = lance_datagen::gen()
             .anon_col(lance_datagen::array::rand_type(data_type))
-            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
+            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024 * 1024))
             .unwrap();
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
