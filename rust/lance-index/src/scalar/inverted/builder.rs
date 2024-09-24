@@ -395,11 +395,14 @@ impl PostingReader {
 
         let token = std::mem::take(&mut self.tokens[self.token_idx]);
         let ranges = std::mem::take(self.token_offsets.get_mut(&token).unwrap());
-        let mut batches = stream::iter(ranges)
-            .zip(repeat_with(|| self.reader.clone()))
-            .map(|((offset, length), reader)| async move {
-                reader.read_range(offset..offset + length, None).await
+        let batches = ranges
+            .into_iter()
+            .map(|(offset, length)| {
+                let reader = self.reader.clone();
+                async move { reader.read_range(offset..offset + length, None).await }
             })
+            .collect::<Vec<_>>();
+        let mut batches = stream::iter(batches)
             .buffer_unordered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
