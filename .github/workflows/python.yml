@@ -121,12 +121,8 @@ jobs:
         run: sudo rm -rf target/wheels
   linux-arm:
     timeout-minutes: 45
-    #runs-on: warp-ubuntu-latest-arm64-4x
-    runs-on: buildjet-4vcpu-ubuntu-2204-arm
-    name: Python Linux 3.${{ matrix.python-minor-version }} ARM
-    strategy:
-      matrix:
-        python-minor-version: ["12"]
+    runs-on: ubuntu-2404-4x-arm64
+    name: Python Linux 3.12 ARM
     defaults:
       run:
         shell: bash
@@ -137,13 +133,9 @@ jobs:
           fetch-depth: 0
           lfs: true
       - name: Set up Python
-        run: |
-          sudo apt update
-          sudo apt install -y -qq wget software-properties-common
-          sudo add-apt-repository ppa:deadsnakes/ppa
-          sudo apt install -y python3.${{ matrix.python-minor-version }}
-          sudo update-alternatives --install /usr/bin/python python /usr/bin/python3.${{ matrix.python-minor-version }} 1
-          sudo apt install -y python3-pip python3.${{ matrix.python-minor-version }}-distutils
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.12
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
@@ -152,6 +144,10 @@ jobs:
         with:
           arm-build: "true"
           manylinux: "2_24"
+      - name: Install dependencies
+        run: |
+          sudo apt update -y -qq
+          sudo apt install -y libhdf5-dev
       - uses: ./.github/workflows/run_tests
       # Make sure wheels are not included in the Rust cache
       - name: Delete wheels

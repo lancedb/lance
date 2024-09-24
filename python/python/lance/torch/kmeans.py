@@ -8,7 +8,11 @@ from typing import List, Literal, Optional, Tuple, Union
 import pyarrow as pa
 from tqdm import tqdm
 
-from lance.dependencies import _check_for_numpy, _check_for_torch, torch
+from lance.dependencies import (
+    _check_for_numpy,
+    _check_for_torch,
+    torch,
+)
 from lance.dependencies import numpy as np
 
 from . import preferred_device
@@ -78,6 +82,8 @@ class KMeans:
         self.device = preferred_device(device)
         self.tolerance = tolerance
         self.seed = seed
+
+        self.y2 = None
 
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
@@ -220,14 +226,14 @@ class KMeans:
         )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
-        y2 = (self.centroids * self.centroids).sum(dim=1)
+        self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
-            ids, dists = self._transform(chunk, y2=y2)
+            ids, dists = self._transform(chunk, y2=self.y2)
 
             valid_mask = ids >= 0
             if torch.any(~valid_mask):
@@ -262,6 +268,9 @@ class KMeans:
             dtype
         )
         return total_dist
+
+    def rebuild_index(self):
+        self.y2 = (self.centroids * self.centroids).sum(dim=1)
 
     def _transform(
         self,
