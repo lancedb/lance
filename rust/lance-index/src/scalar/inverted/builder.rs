@@ -149,11 +149,12 @@ impl InvertedIndexBuilder {
                         }
 
                         for (shard, buffer) in token_buffers.iter_mut().enumerate() {
-                            senders[shard]
-                                .blocking_send((std::mem::take(buffer), row_id))
-                                .unwrap();
+                            let buffer = std::mem::take(buffer);
+                            if buffer.is_empty() {
+                                continue;
+                            }
+                            senders[shard].blocking_send((buffer, row_id)).unwrap();
                         }
-                        token_buffers.clear();
 
                         (row_id, num_tokens)
                     },
