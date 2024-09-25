@@ -302,7 +302,7 @@ impl LanceBuffer {
         let original_buffer_len = self.len();
         assert!(
             offset.saturating_add(length) <= original_buffer_len,
-            "the offset of the new Buffer cannot exceed the existing length"
+            "the offset + length of the sliced Buffer cannot exceed the existing length"
         );
         match self {
             Self::Borrowed(buffer) => Self::Borrowed(buffer.slice_with_length(offset, length)),
