@@ -346,7 +346,7 @@ def compute_pq_codes_batch(
     return pq_codes
 
 
-def process_fragment_pq_codes_assignment(fragment_index, ds_uri, column, kmeans_list, output_schema):
+def process_fragment_pq_codes_assignment(fragment_index, ds_uri, column, kmeans_list, output_schema, speed_test=False):
     ds = lance.dataset(ds_uri)
     fragment = ds.get_fragments()[fragment_index]
     from lance.torch.data import _to_tensor as to_full_tensor
@@ -429,6 +429,10 @@ def process_fragment_pq_codes_assignment(fragment_index, ds_uri, column, kmeans_
             #progress.update(part_batch.num_rows)
             return part_batch
             # yield part_batch
+    if speed_test:
+        for batch in fragment.to_batches(columns=[column]):
+            pq_codes_assignment(batch)
+        return fragment
     return fragment.merge_columns(pq_codes_assignment, columns=[column])
 
 
@@ -521,9 +525,10 @@ def compute_pq_codes(
 
     #dataset.add_columns(pq_codes_assignment_udf, read_columns=["__residual_vec"])
 
+    speed_test = False
     fragments = []
     with concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn")) as executor:
-        futures = [executor.submit(process_fragment_pq_codes_assignment, fragment_index, dataset.uri, "__residual_vec", kmeans_list, output_schema) for fragment_index in range(len(dataset.get_fragments()))]
+        futures = [executor.submit(process_fragment_pq_codes_assignment, fragment_index, dataset.uri, "__residual_vec", kmeans_list, output_schema, speed_test) for fragment_index in range(len(dataset.get_fragments()))]
         for future in tqdm(concurrent.futures.as_completed(futures)):
             fragment, new_schema = future.result()
             fragments.append(fragment)
@@ -564,7 +569,7 @@ def compute_pq_codes(
 def _collate_fn(batch):
     return batch[0]
 
-def process_fragment_partition_assignment(fragment_index, ds_uri, column, kmeans, output_schema):
+def process_fragment_partition_assignment(fragment_index, ds_uri, column, kmeans, output_schema, speed_test = False):
     ds = lance.dataset(ds_uri)
     fragment = ds.get_fragments()[fragment_index]
     dim = kmeans.centroids.shape[1]
@@ -622,6 +627,11 @@ def process_fragment_partition_assignment(fragment_index, ds_uri, column, kmeans
             #print(f"Processed {part_batch.num_rows}")
             return part_batch
             # yield part_batch
+    # For speed testing
+    if speed_test:
+        for batch in fragment.to_batches(columns=[column]):
+            _partition_assignment(batch)
+        return fragment
     return fragment.merge_columns(_partition_assignment, columns=[column])
 
 def compute_partitions(
@@ -709,9 +719,10 @@ def compute_partitions(
     # dataset = lance.LanceDataset.commit(dataset.uri, operation,
     #                                     read_version=dataset.version)
     
+    speed_test = False
     fragments = []
     with concurrent.futures.ProcessPoolExecutor(mp_context=multiprocessing.get_context("spawn")) as executor:
-        futures = [executor.submit(process_fragment_partition_assignment, fragment_index, dataset.uri, column, kmeans, output_schema) for fragment_index in range(len(dataset.get_fragments()))]
+        futures = [executor.submit(process_fragment_partition_assignment, fragment_index, dataset.uri, column, kmeans, output_schema, speed_test) for fragment_index in range(len(dataset.get_fragments()))]
         for future in tqdm(concurrent.futures.as_completed(futures)):
             fragment, new_schema = future.result()
             fragments.append(fragment)
