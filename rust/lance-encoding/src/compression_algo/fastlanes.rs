@@ -21,28 +21,6 @@ impl FastLanes for u16 {}
 impl FastLanes for u32 {}
 impl FastLanes for u64 {}
 
-macro_rules! iterate {
-    ($T:ty, $lane: expr, | $_1:tt $idx:ident | $($body:tt)*) => {
-        macro_rules! __kernel__ {( $_1 $idx:ident ) => ( $($body)* )}
-        {
-            use $crate::{seq_t, FL_ORDER};
-            use paste::paste;
-
-            #[inline(always)]
-            fn index(row: usize, lane: usize) -> usize {
-                let o = row / 8;
-                let s = row % 8;
-                (FL_ORDER[o] * 16) + (s * 128) + lane
-            }
-
-            paste!(seq_t!(row in $T {
-                let idx = index(row, $lane);
-                __kernel__!(idx);
-            }));
-        }
-    }
-}
-
 macro_rules! pack {
     ($T:ty, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident | $($body:tt)*) => {
         macro_rules! __kernel__ {( $_1 $idx:ident ) => ( $($body)* )}
@@ -1703,12 +1681,12 @@ mod test {
     pub struct XorShift {
         state: u64,
     }
-    
+
     impl XorShift {
         pub fn new(seed: u64) -> Self {
-            XorShift { state: seed }
+            Self { state: seed }
         }
-    
+
         pub fn next(&mut self) -> u64 {
             let mut x = self.state;
             x ^= x << 13;
@@ -1719,11 +1697,13 @@ mod test {
         }
     }
 
+    // a macro version of this function generalize u8, u16, u32, u64 takes very long time for a test build, so I
+    // write it for each type separately
     fn pack_unpack_u8(bit_width: usize) {
         let mut values: [u8; 1024] = [0; 1024];
         let mut rng = XorShift::new(123456789);
-        for i in 0..1024 {
-            values[i] = (rng.next() % (1 << bit_width)) as u8;
+        for value in &mut values {
+            *value = (rng.next() % (1 << bit_width)) as u8;
         }
 
         let mut packed = vec![0; 1024 * bit_width / 8];
@@ -1748,8 +1728,8 @@ mod test {
     fn pack_unpack_u16(bit_width: usize) {
         let mut values: [u16; 1024] = [0; 1024];
         let mut rng = XorShift::new(123456789);
-        for i in 0..1024 {
-            values[i] = (rng.next() % (1 << bit_width)) as u16;
+        for value in &mut values {
+            *value = (rng.next() % (1 << bit_width)) as u16;
         }
 
         let mut packed = vec![0; 1024 * bit_width / 16];
@@ -1774,8 +1754,8 @@ mod test {
     fn pack_unpack_u32(bit_width: usize) {
         let mut values: [u32; 1024] = [0; 1024];
         let mut rng = XorShift::new(123456789);
-        for i in 0..1024 {
-            values[i] = (rng.next() % (1 << bit_width)) as u32;
+        for value in &mut values {
+            *value = (rng.next() % (1 << bit_width)) as u32;
         }
 
         let mut packed = vec![0; 1024 * bit_width / 32];
@@ -1800,9 +1780,13 @@ mod test {
     fn pack_unpack_u64(bit_width: usize) {
         let mut values: [u64; 1024] = [0; 1024];
         let mut rng = XorShift::new(123456789);
-        if bit_width > 0 {
-            for i in 0..1024 {
-                values[i] = (rng.next() % (1 << (bit_width - 1))) as u64;
+        if bit_width == 64 {
+            for value in &mut values {
+                *value = rng.next();
+            }
+        } else {
+            for value in &mut values {
+                *value = rng.next() % (1 << bit_width);
             }
         }
 
@@ -1956,6 +1940,68 @@ mod test {
         pack_unpack_u64(64);
     }
 
+    fn unchecked_pack_unpack_u8(bit_width: usize) {
+        let mut values = [0u8; 1024];
+        let mut rng = XorShift::new(123456789);
+        for value in &mut values {
+            *value = (rng.next() % (1 << bit_width)) as u8;
+        }
+        let mut packed = vec![0; 1024 * bit_width / 8];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &values, &mut packed);
+        }
+        let mut output = [0; 1024];
+        unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
+        assert_eq!(values, output);
+    }
+
+    fn unchecked_pack_unpack_u16(bit_width: usize) {
+        let mut values = [0u16; 1024];
+        let mut rng = XorShift::new(123456789);
+        for value in &mut values {
+            *value = (rng.next() % (1 << bit_width)) as u16;
+        }
+        let mut packed = vec![0; 1024 * bit_width / u16::T];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &values, &mut packed);
+        }
+        let mut output = [0; 1024];
+        unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
+        assert_eq!(values, output);
+    }
+
+    fn unchecked_pack_unpack_u32(bit_width: usize) {
+        let mut values = [0u32; 1024];
+        let mut rng = XorShift::new(123456789);
+        for value in &mut values {
+            *value = (rng.next() % (1 << bit_width)) as u32;
+        }
+        let mut packed = vec![0; 1024 * bit_width / u32::T];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &values, &mut packed);
+        }
+        let mut output = [0; 1024];
+        unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
+        assert_eq!(values, output);
+    }
+
+    fn unchecked_pack_unpack_u64(bit_width: usize) {
+        let mut values = [0u64; 1024];
+        let mut rng = XorShift::new(123456789);
+        if bit_width == 64 {
+            for value in &mut values {
+                *value = rng.next();
+            }
+        }
+        let mut packed = vec![0; 1024 * bit_width / u64::T];
+        unsafe {
+            BitPacking::unchecked_pack(bit_width, &values, &mut packed);
+        }
+        let mut output = [0; 1024];
+        unsafe { BitPacking::unchecked_unpack(bit_width, &packed, &mut output) };
+        assert_eq!(values, output);
+    }
+
     #[test]
     fn test_unchecked_pack() {
         let input = array::from_fn(|i| i as u32);
@@ -1964,5 +2010,129 @@ mod test {
         let mut output = [0; 1024];
         unsafe { BitPacking::unchecked_unpack(10, &packed, &mut output) };
         assert_eq!(input, output);
+
+        unchecked_pack_unpack_u8(1);
+        unchecked_pack_unpack_u8(2);
+        unchecked_pack_unpack_u8(3);
+        unchecked_pack_unpack_u8(4);
+        unchecked_pack_unpack_u8(5);
+        unchecked_pack_unpack_u8(6);
+        unchecked_pack_unpack_u8(7);
+        unchecked_pack_unpack_u8(8);
+
+        unchecked_pack_unpack_u16(1);
+        unchecked_pack_unpack_u16(2);
+        unchecked_pack_unpack_u16(3);
+        unchecked_pack_unpack_u16(4);
+        unchecked_pack_unpack_u16(5);
+        unchecked_pack_unpack_u16(6);
+        unchecked_pack_unpack_u16(7);
+        unchecked_pack_unpack_u16(8);
+        unchecked_pack_unpack_u16(9);
+        unchecked_pack_unpack_u16(10);
+        unchecked_pack_unpack_u16(11);
+        unchecked_pack_unpack_u16(12);
+        unchecked_pack_unpack_u16(13);
+        unchecked_pack_unpack_u16(14);
+        unchecked_pack_unpack_u16(15);
+        unchecked_pack_unpack_u16(16);
+
+        unchecked_pack_unpack_u32(1);
+        unchecked_pack_unpack_u32(2);
+        unchecked_pack_unpack_u32(3);
+        unchecked_pack_unpack_u32(4);
+        unchecked_pack_unpack_u32(5);
+        unchecked_pack_unpack_u32(6);
+        unchecked_pack_unpack_u32(7);
+        unchecked_pack_unpack_u32(8);
+        unchecked_pack_unpack_u32(9);
+        unchecked_pack_unpack_u32(10);
+        unchecked_pack_unpack_u32(11);
+        unchecked_pack_unpack_u32(12);
+        unchecked_pack_unpack_u32(13);
+        unchecked_pack_unpack_u32(14);
+        unchecked_pack_unpack_u32(15);
+        unchecked_pack_unpack_u32(16);
+        unchecked_pack_unpack_u32(17);
+        unchecked_pack_unpack_u32(18);
+        unchecked_pack_unpack_u32(19);
+        unchecked_pack_unpack_u32(20);
+        unchecked_pack_unpack_u32(21);
+        unchecked_pack_unpack_u32(22);
+        unchecked_pack_unpack_u32(23);
+        unchecked_pack_unpack_u32(24);
+        unchecked_pack_unpack_u32(25);
+        unchecked_pack_unpack_u32(26);
+        unchecked_pack_unpack_u32(27);
+        unchecked_pack_unpack_u32(28);
+        unchecked_pack_unpack_u32(29);
+        unchecked_pack_unpack_u32(30);
+        unchecked_pack_unpack_u32(31);
+        unchecked_pack_unpack_u32(32);
+
+        unchecked_pack_unpack_u64(1);
+        unchecked_pack_unpack_u64(2);
+        unchecked_pack_unpack_u64(3);
+        unchecked_pack_unpack_u64(4);
+        unchecked_pack_unpack_u64(5);
+        unchecked_pack_unpack_u64(6);
+        unchecked_pack_unpack_u64(7);
+        unchecked_pack_unpack_u64(8);
+        unchecked_pack_unpack_u64(9);
+        unchecked_pack_unpack_u64(10);
+        unchecked_pack_unpack_u64(11);
+        unchecked_pack_unpack_u64(12);
+        unchecked_pack_unpack_u64(13);
+        unchecked_pack_unpack_u64(14);
+        unchecked_pack_unpack_u64(15);
+        unchecked_pack_unpack_u64(16);
+        unchecked_pack_unpack_u64(17);
+        unchecked_pack_unpack_u64(18);
+        unchecked_pack_unpack_u64(19);
+        unchecked_pack_unpack_u64(20);
+        unchecked_pack_unpack_u64(21);
+        unchecked_pack_unpack_u64(22);
+        unchecked_pack_unpack_u64(23);
+        unchecked_pack_unpack_u64(24);
+        unchecked_pack_unpack_u64(25);
+        unchecked_pack_unpack_u64(26);
+        unchecked_pack_unpack_u64(27);
+        unchecked_pack_unpack_u64(28);
+        unchecked_pack_unpack_u64(29);
+        unchecked_pack_unpack_u64(30);
+        unchecked_pack_unpack_u64(31);
+        unchecked_pack_unpack_u64(32);
+        unchecked_pack_unpack_u64(33);
+        unchecked_pack_unpack_u64(34);
+        unchecked_pack_unpack_u64(35);
+        unchecked_pack_unpack_u64(36);
+        unchecked_pack_unpack_u64(37);
+        unchecked_pack_unpack_u64(38);
+        unchecked_pack_unpack_u64(39);
+        unchecked_pack_unpack_u64(40);
+        unchecked_pack_unpack_u64(41);
+        unchecked_pack_unpack_u64(42);
+        unchecked_pack_unpack_u64(43);
+        unchecked_pack_unpack_u64(44);
+        unchecked_pack_unpack_u64(45);
+        unchecked_pack_unpack_u64(46);
+        unchecked_pack_unpack_u64(47);
+        unchecked_pack_unpack_u64(48);
+        unchecked_pack_unpack_u64(49);
+        unchecked_pack_unpack_u64(50);
+        unchecked_pack_unpack_u64(51);
+        unchecked_pack_unpack_u64(52);
+        unchecked_pack_unpack_u64(53);
+        unchecked_pack_unpack_u64(54);
+        unchecked_pack_unpack_u64(55);
+        unchecked_pack_unpack_u64(56);
+        unchecked_pack_unpack_u64(57);
+        unchecked_pack_unpack_u64(58);
+        unchecked_pack_unpack_u64(59);
+        unchecked_pack_unpack_u64(60);
+        unchecked_pack_unpack_u64(61);
+        unchecked_pack_unpack_u64(62);
+        unchecked_pack_unpack_u64(63);
+        unchecked_pack_unpack_u64(64);
     }
 }
