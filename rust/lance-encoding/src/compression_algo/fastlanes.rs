@@ -21,7 +21,6 @@ impl FastLanes for u16 {}
 impl FastLanes for u32 {}
 impl FastLanes for u64 {}
 
-#[macro_export]
 macro_rules! iterate {
     ($T:ty, $lane: expr, | $_1:tt $idx:ident | $($body:tt)*) => {
         macro_rules! __kernel__ {( $_1 $idx:ident ) => ( $($body)* )}
@@ -44,7 +43,6 @@ macro_rules! iterate {
     }
 }
 
-#[macro_export]
 macro_rules! pack {
     ($T:ty, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident | $($body:tt)*) => {
         macro_rules! __kernel__ {( $_1 $idx:ident ) => ( $($body)* )}
@@ -109,7 +107,6 @@ macro_rules! pack {
     };
 }
 
-#[macro_export]
 macro_rules! unpack {
     ($T:ty, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident, $_2:tt $elem:ident | $($body:tt)*) => {
         macro_rules! __kernel__ {( $_1 $idx:ident, $_2 $elem:ident ) => ( $($body)* )}
@@ -185,7 +182,6 @@ macro_rules! unpack {
 }
 
 // Macro for repeating a code block bit_size_of::<T> times.
-#[macro_export]
 macro_rules! seq_t {
     ($ident:ident in u8 $body:tt) => {seq_macro::seq!($ident in 0..8 $body)};
     ($ident:ident in u16 $body:tt) => {seq_macro::seq!($ident in 0..16 $body)};
@@ -1698,40 +1694,266 @@ pack_64!(pack_64_61, 61);
 pack_64!(pack_64_62, 62);
 pack_64!(pack_64_63, 63);
 pack_64!(pack_64_64, 64);
+
 #[cfg(test)]
 mod test {
     use super::*;
     use core::array;
+    // a fast random number generator
+    pub struct XorShift {
+        state: u64,
+    }
+    
+    impl XorShift {
+        pub fn new(seed: u64) -> Self {
+            XorShift { state: seed }
+        }
+    
+        pub fn next(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+    }
 
-    #[test]
-    fn test_pack() {
-        let mut values: [u16; 1024] = [0; 1024];
-        for (i, value) in values.iter_mut().enumerate() {
-            *value = (i % (1 << 15)) as u16;
+    fn pack_unpack_u8(bit_width: usize) {
+        let mut values: [u8; 1024] = [0; 1024];
+        let mut rng = XorShift::new(123456789);
+        for i in 0..1024 {
+            values[i] = (rng.next() % (1 << bit_width)) as u8;
         }
 
-        let mut packed: [u16; 960] = [0; 960];
-        for lane in 0..u16::LANES {
+        let mut packed = vec![0; 1024 * bit_width / 8];
+        for lane in 0..u8::LANES {
             // Always loop over lanes first. This is what the compiler vectorizes.
-            pack!(u16, 15, packed, lane, |$pos| {
+            pack!(u8, bit_width, packed, lane, |$pos| {
                 values[$pos]
             });
         }
 
-        let mut packed_orig: [u16; 960] = [0; 960];
-        unsafe {
-            BitPacking::unchecked_pack(15, &values, &mut packed_orig);
-        }
-
-        let mut unpacked: [u16; 1024] = [0; 1024];
-        for lane in 0..u16::LANES {
+        let mut unpacked: [u8; 1024] = [0; 1024];
+        for lane in 0..u8::LANES {
             // Always loop over lanes first. This is what the compiler vectorizes.
-            unpack!(u16, 15, packed, lane, |$idx, $elem| {
+            unpack!(u8, bit_width, packed, lane, |$idx, $elem| {
                 unpacked[$idx] = $elem;
             });
         }
 
         assert_eq!(values, unpacked);
+    }
+
+    fn pack_unpack_u16(bit_width: usize) {
+        let mut values: [u16; 1024] = [0; 1024];
+        let mut rng = XorShift::new(123456789);
+        for i in 0..1024 {
+            values[i] = (rng.next() % (1 << bit_width)) as u16;
+        }
+
+        let mut packed = vec![0; 1024 * bit_width / 16];
+        for lane in 0..u16::LANES {
+            // Always loop over lanes first. This is what the compiler vectorizes.
+            pack!(u16, bit_width, packed, lane, |$pos| {
+                values[$pos]
+            });
+        }
+
+        let mut unpacked: [u16; 1024] = [0; 1024];
+        for lane in 0..u16::LANES {
+            // Always loop over lanes first. This is what the compiler vectorizes.
+            unpack!(u16, bit_width, packed, lane, |$idx, $elem| {
+                unpacked[$idx] = $elem;
+            });
+        }
+
+        assert_eq!(values, unpacked);
+    }
+
+    fn pack_unpack_u32(bit_width: usize) {
+        let mut values: [u32; 1024] = [0; 1024];
+        let mut rng = XorShift::new(123456789);
+        for i in 0..1024 {
+            values[i] = (rng.next() % (1 << bit_width)) as u32;
+        }
+
+        let mut packed = vec![0; 1024 * bit_width / 32];
+        for lane in 0..u32::LANES {
+            // Always loop over lanes first. This is what the compiler vectorizes.
+            pack!(u32, bit_width, packed, lane, |$pos| {
+                values[$pos]
+            });
+        }
+
+        let mut unpacked: [u32; 1024] = [0; 1024];
+        for lane in 0..u32::LANES {
+            // Always loop over lanes first. This is what the compiler vectorizes.
+            unpack!(u32, bit_width, packed, lane, |$idx, $elem| {
+                unpacked[$idx] = $elem;
+            });
+        }
+
+        assert_eq!(values, unpacked);
+    }
+
+    fn pack_unpack_u64(bit_width: usize) {
+        let mut values: [u64; 1024] = [0; 1024];
+        let mut rng = XorShift::new(123456789);
+        if bit_width > 0 {
+            for i in 0..1024 {
+                values[i] = (rng.next() % (1 << (bit_width - 1))) as u64;
+            }
+        }
+
+        let mut packed = vec![0; 1024 * bit_width / 64];
+        for lane in 0..u64::LANES {
+            // Always loop over lanes first. This is what the compiler vectorizes.
+            pack!(u64, bit_width, packed, lane, |$pos| {
+                values[$pos]
+            });
+        }
+
+        let mut unpacked: [u64; 1024] = [0; 1024];
+        for lane in 0..u64::LANES {
+            // Always loop over lanes first. This is what the compiler vectorizes.
+            unpack!(u64, bit_width, packed, lane, |$idx, $elem| {
+                unpacked[$idx] = $elem;
+            });
+        }
+
+        assert_eq!(values, unpacked);
+    }
+
+    #[test]
+    fn test_pack() {
+        pack_unpack_u8(0);
+        pack_unpack_u8(1);
+        pack_unpack_u8(2);
+        pack_unpack_u8(3);
+        pack_unpack_u8(4);
+        pack_unpack_u8(5);
+        pack_unpack_u8(6);
+        pack_unpack_u8(7);
+        pack_unpack_u8(8);
+
+        pack_unpack_u16(0);
+        pack_unpack_u16(1);
+        pack_unpack_u16(2);
+        pack_unpack_u16(3);
+        pack_unpack_u16(4);
+        pack_unpack_u16(5);
+        pack_unpack_u16(6);
+        pack_unpack_u16(7);
+        pack_unpack_u16(8);
+        pack_unpack_u16(9);
+        pack_unpack_u16(10);
+        pack_unpack_u16(11);
+        pack_unpack_u16(12);
+        pack_unpack_u16(13);
+        pack_unpack_u16(14);
+        pack_unpack_u16(15);
+        pack_unpack_u16(16);
+
+        pack_unpack_u32(0);
+        pack_unpack_u32(1);
+        pack_unpack_u32(2);
+        pack_unpack_u32(3);
+        pack_unpack_u32(4);
+        pack_unpack_u32(5);
+        pack_unpack_u32(6);
+        pack_unpack_u32(7);
+        pack_unpack_u32(8);
+        pack_unpack_u32(9);
+        pack_unpack_u32(10);
+        pack_unpack_u32(11);
+        pack_unpack_u32(12);
+        pack_unpack_u32(13);
+        pack_unpack_u32(14);
+        pack_unpack_u32(15);
+        pack_unpack_u32(16);
+        pack_unpack_u32(17);
+        pack_unpack_u32(18);
+        pack_unpack_u32(19);
+        pack_unpack_u32(20);
+        pack_unpack_u32(21);
+        pack_unpack_u32(22);
+        pack_unpack_u32(23);
+        pack_unpack_u32(24);
+        pack_unpack_u32(25);
+        pack_unpack_u32(26);
+        pack_unpack_u32(27);
+        pack_unpack_u32(28);
+        pack_unpack_u32(29);
+        pack_unpack_u32(30);
+        pack_unpack_u32(31);
+        pack_unpack_u32(32);
+
+        pack_unpack_u64(0);
+        pack_unpack_u64(1);
+        pack_unpack_u64(2);
+        pack_unpack_u64(3);
+        pack_unpack_u64(4);
+        pack_unpack_u64(5);
+        pack_unpack_u64(6);
+        pack_unpack_u64(7);
+        pack_unpack_u64(8);
+        pack_unpack_u64(9);
+        pack_unpack_u64(10);
+        pack_unpack_u64(11);
+        pack_unpack_u64(12);
+        pack_unpack_u64(13);
+        pack_unpack_u64(14);
+        pack_unpack_u64(15);
+        pack_unpack_u64(16);
+        pack_unpack_u64(17);
+        pack_unpack_u64(18);
+        pack_unpack_u64(19);
+        pack_unpack_u64(20);
+        pack_unpack_u64(21);
+        pack_unpack_u64(22);
+        pack_unpack_u64(23);
+        pack_unpack_u64(24);
+        pack_unpack_u64(25);
+        pack_unpack_u64(26);
+        pack_unpack_u64(27);
+        pack_unpack_u64(28);
+        pack_unpack_u64(29);
+        pack_unpack_u64(30);
+        pack_unpack_u64(31);
+        pack_unpack_u64(32);
+        pack_unpack_u64(33);
+        pack_unpack_u64(34);
+        pack_unpack_u64(35);
+        pack_unpack_u64(36);
+        pack_unpack_u64(37);
+        pack_unpack_u64(38);
+        pack_unpack_u64(39);
+        pack_unpack_u64(40);
+        pack_unpack_u64(41);
+        pack_unpack_u64(42);
+        pack_unpack_u64(43);
+        pack_unpack_u64(44);
+        pack_unpack_u64(45);
+        pack_unpack_u64(46);
+        pack_unpack_u64(47);
+        pack_unpack_u64(48);
+        pack_unpack_u64(49);
+        pack_unpack_u64(50);
+        pack_unpack_u64(51);
+        pack_unpack_u64(52);
+        pack_unpack_u64(53);
+        pack_unpack_u64(54);
+        pack_unpack_u64(55);
+        pack_unpack_u64(56);
+        pack_unpack_u64(57);
+        pack_unpack_u64(58);
+        pack_unpack_u64(59);
+        pack_unpack_u64(60);
+        pack_unpack_u64(61);
+        pack_unpack_u64(62);
+        pack_unpack_u64(63);
+        pack_unpack_u64(64);
     }
 
     #[test]
