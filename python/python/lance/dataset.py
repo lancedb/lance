@@ -254,6 +254,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         fast_search: bool = False,
         io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -309,6 +310,23 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        late_materialization: bool or List[str], default None
+            Allows custom control over late materialization.  Late materialization
+            fetches non-query columns using a take operation after the filter.  This
+            is useful when there are few results or columns are very large.
+
+            Early materialization can be better when there are many results or the
+            columns are very narrow.
+
+            If True, then all columns are late materialized.
+            If False, then all columns are early materialized.
+            If a list of strings, then only the columns in the list are
+              late materialized.
+
+            The default uses a heuristic that assumes filters will select about 0.1%
+            of the rows.  If your filter is more selective (e.g. find by id) you may
+            want to set this to True.  If your filter is not very selective (e.g.
+            matches 20% of the rows) you may want to set this to False.
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents containing "hello" or "world".
@@ -356,6 +374,7 @@ class LanceDataset(pa.dataset.Dataset):
             .fragment_readahead(fragment_readahead)
             .scan_in_order(scan_in_order)
             .with_fragments(fragments)
+            .late_materialization(late_materialization)
             .with_row_id(with_row_id)
             .with_row_address(with_row_address)
             .use_stats(use_stats)
@@ -410,6 +429,7 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search: bool = False,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -456,6 +476,9 @@ class LanceDataset(pa.dataset.Dataset):
             and memory use might increase.
         prefilter: bool, default False
             Run filter before the vector search.
+        late_materialization: bool or List[str], default None
+            Allows custom control over late materialization.  See
+            ``ScannerBuilder.late_materialization`` for more information.
         with_row_id: bool, default False
             Return row ID.
         with_row_address: bool, default False
@@ -488,6 +511,7 @@ class LanceDataset(pa.dataset.Dataset):
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
+            late_materialization=late_materialization,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -547,6 +571,7 @@ class LanceDataset(pa.dataset.Dataset):
         use_stats: bool = True,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
+        late_materialization: Optional[bool | List[str]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -570,6 +595,7 @@ class LanceDataset(pa.dataset.Dataset):
             io_buffer_size=io_buffer_size,
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
+            late_materialization=late_materialization,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2263,6 +2289,7 @@ class ScannerBuilder:
         self._filter = None
         self._substrait_filter = None
         self._prefilter = None
+        self._late_materialization = None
         self._offset = None
         self._columns = None
         self._columns_with_transform = None
@@ -2425,6 +2452,12 @@ class ScannerBuilder:
         self._with_row_address = with_row_address
         return self
 
+    def late_materialization(
+        self, late_materialization: bool | List[str]
+    ) -> ScannerBuilder:
+        self._late_materialization = late_materialization
+        return self
+
     def use_stats(self, use_stats: bool = True) -> ScannerBuilder:
         """
         Enable use of statistics for query planning.
@@ -2549,6 +2582,7 @@ class ScannerBuilder:
             self._substrait_filter,
             self._fast_search,
             self._full_text_query,
+            self._late_materialization,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -2868,7 +2902,7 @@ def write_dataset(
     commit_lock: Optional[CommitLock] = None,
     progress: Optional[FragmentWriteProgress] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    data_storage_version: str = "stable",
+    data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
 ) -> LanceDataset:
@@ -2910,11 +2944,10 @@ def write_dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default (None)
+        will use the latest stable version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.

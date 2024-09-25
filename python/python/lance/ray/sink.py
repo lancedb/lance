@@ -54,7 +54,7 @@ def _write_fragment(
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
-    data_storage_version: str = "stable",
+    data_storage_version: Optional[str] = None,
     storage_options: Optional[Dict[str, Any]] = None,
 ) -> Tuple[FragmentMetadata, pa.Schema]:
     from ..dependencies import _PANDAS_AVAILABLE
@@ -168,7 +168,7 @@ class LanceDatasink(_BaseLanceDatasink):
         Choices are 'append', 'create', 'overwrite'.
     max_rows_per_file : int, optional
         The maximum number of rows per file. Default is 1024 * 1024.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
         efficient but require newer versions of lance to read.  The default is
         "legacy" which will use the legacy v1 version.  See the user guide
@@ -188,7 +188,7 @@ class LanceDatasink(_BaseLanceDatasink):
         schema: Optional[pa.Schema] = None,
         mode: Literal["create", "append", "overwrite"] = "create",
         max_rows_per_file: int = 1024 * 1024,
-        data_storage_version: str = "stable",
+        data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, Any]] = None,
         *args,
@@ -273,11 +273,10 @@ class LanceFragmentWriter:
     max_rows_per_group : int, optional
         The maximum number of rows per group. Default is 1024.
         Only useful for v1 writer.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default
+        (None) will use the 2.0 version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
@@ -295,7 +294,7 @@ class LanceFragmentWriter:
         max_rows_per_file: int = 1024 * 1024,
         max_bytes_per_file: Optional[int] = None,
         max_rows_per_group: Optional[int] = None,  # Only useful for v1 writer.
-        data_storage_version: str = "stable",
+        data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = False,
         storage_options: Optional[Dict[str, Any]] = None,
     ):
@@ -387,7 +386,7 @@ def write_lance(
     max_rows_per_file: int = 1024 * 1024,
     max_bytes_per_file: Optional[int] = None,
     storage_options: Optional[Dict[str, Any]] = None,
-    data_storage_version: str = "stable",
+    data_storage_version: Optional[str] = None,
 ) -> None:
     """Write Ray dataset at scale.
 
@@ -410,11 +409,10 @@ def write_lance(
         The maximum number of bytes per file. Default is 90GB.
     storage_options : Dict[str, Any], optional
         The storage options for the writer. Default is None.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default
+        (None) will use the 2.0 version.  See the user guide for more details.
     """
     data.map_batches(
         LanceFragmentWriter(

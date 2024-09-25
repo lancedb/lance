@@ -1927,6 +1927,39 @@ def test_io_buffer_size(tmp_path: Path):
 
     dataset.scanner(batch_size=10, io_buffer_size=5000).to_table()
 
+    # We need to make sure that different data files within a fragment are
+    # given the same priority.  This is because we scan both files at the same
+    # time in order.
+
+    def datagen():
+        for i in range(2):
+            buf = pa.allocate_buffer(8 * 1024 * 1024)
+            arr = pa.FixedSizeBinaryArray.from_buffers(
+                pa.binary(1024 * 1024), 8, [None, buf]
+            )
+            yield pa.record_batch(
+                [
+                    arr,
+                    pa.array(range(8), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.binary(1024 * 1024), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.add_columns({"c": "b"})
+
+    dataset.scanner(batch_size=1, io_buffer_size=5000).to_table()
+
 
 def test_scan_no_columns(tmp_path: Path):
     base_dir = tmp_path / "dataset"
@@ -2073,6 +2106,17 @@ def test_dataset_restore(tmp_path: Path):
     dataset.restore()
     assert dataset.version == 3
     assert dataset.count_rows() == 100
+
+
+def test_mixed_mode_overwrite(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(data, tmp_path, data_storage_version="legacy")
+
+    assert dataset.data_storage_version == "0.1"
+
+    dataset = lance.write_dataset(data, tmp_path, mode="overwrite")
+
+    assert dataset.data_storage_version == "0.1"
 
 
 def test_roundtrip_reader(tmp_path: Path):
@@ -2339,13 +2383,63 @@ def test_legacy_dataset(tmp_path: Path):
     assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
 
+def test_late_materialization_param(tmp_path: Path):
+    table = pa.table(
+        {
+            "filter": np.arange(4),
+            "values": pa.array([b"abcd", b"efgh", b"ijkl", b"mnop"]),
+        }
+    )
+    dataset = lance.write_dataset(
+        table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
+    )
+    filt = "filter % 2 == 0"
+
+    assert "(values)" in dataset.scanner(
+        filter=filt, late_materialization=None
+    ).explain_plan(True)
+    assert ", values" in dataset.scanner(
+        filter=filt, late_materialization=False
+    ).explain_plan(True)
+    assert "(values)" in dataset.scanner(
+        filter=filt, late_materialization=True
+    ).explain_plan(True)
+    assert "(values)" in dataset.scanner(
+        filter=filt, late_materialization=["values"]
+    ).explain_plan(True)
+    assert ", values" in dataset.scanner(
+        filter=filt, late_materialization=["filter"]
+    ).explain_plan(True)
+
+    # These tests just make sure we can pass in the parameter.  There's no great
+    # way to know if late materialization happened or not.  That will have to be
+    # for benchmarks
+    expected = dataset.to_table(filter=filt)
+    assert dataset.to_table(filter=filt, late_materialization=None) == expected
+    assert dataset.to_table(filter=filt, late_materialization=False) == expected
+    assert dataset.to_table(filter=filt, late_materialization=True) == expected
+    assert dataset.to_table(filter=filt, late_materialization=["values"]) == expected
+
+    expected = list(dataset.to_batches(filter=filt))
+    assert list(dataset.to_batches(filter=filt, late_materialization=None)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=False)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=True)) == expected
+    assert (
+        list(dataset.to_batches(filter=filt, late_materialization=["values"]))
+        == expected
+    )
+
+
 def test_late_materialization_batch_size(tmp_path: Path):
     table = pa.table({"filter": np.arange(32 * 32), "values": np.arange(32 * 32)})
     dataset = lance.write_dataset(
         table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
     )
     for batch in dataset.to_batches(
-        columns=["values"], filter="filter % 2 == 0", batch_size=32
+        columns=["values"],
+        filter="filter % 2 == 0",
+        batch_size=32,
+        late_materialization=True,
     ):
         assert batch.num_rows == 32
 
