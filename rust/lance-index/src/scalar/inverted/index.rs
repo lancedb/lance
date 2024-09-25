@@ -13,7 +13,7 @@ use arrow_array::{
     Array, ArrayRef, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt32Array,
     UInt64Array,
 };
-use arrow_schema::{DataType, Field, SchemaRef};
+use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
@@ -30,14 +30,13 @@ use snafu::{location, Location};
 use tantivy::tokenizer::Language;
 use tracing::instrument;
 
+use super::builder::inverted_list_schema;
+use super::{wand::*, InvertedIndexBuilder};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex,
 };
 use crate::Index;
-
-use super::builder::{InvertedList, PostingReader};
-use super::{wand::*, InvertedIndexBuilder};
 
 pub const TOKENS_FILE: &str = "tokens.lance";
 pub const INVERT_LIST_FILE: &str = "invert.lance";
@@ -300,14 +299,6 @@ pub struct TokenSet {
 }
 
 impl TokenSet {
-    pub fn new() -> Self {
-        Self {
-            tokens: HashMap::new(),
-            next_id: 0,
-            total_length: 0,
-        }
-    }
-
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
@@ -379,7 +370,7 @@ impl TokenSet {
     }
 }
 
-pub(crate) struct InvertedListReader {
+pub struct InvertedListReader {
     reader: Arc<dyn IndexReader>,
     offsets: Vec<usize>,
     max_scores: Option<Vec<f32>>,
@@ -599,19 +590,46 @@ impl PostingListBuilder {
         }
     }
 
+    pub fn from_batches(batches: &[RecordBatch]) -> Self {
+        let row_ids = batches
+            .iter()
+            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values().iter())
+            .cloned()
+            .collect();
+        let frequencies = batches
+            .iter()
+            .flat_map(|batch| {
+                batch[FREQUENCY_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+            })
+            .cloned()
+            .collect();
+        let mut positions = None;
+        if batches[0].column_by_name(POSITION_COL).is_some() {
+            let mut position_builder = PositionBuilder::new();
+            batches.iter().for_each(|batch| {
+                let positions = batch[POSITION_COL].as_list::<i32>();
+                for i in 0..positions.len() {
+                    let pos = positions.value(i);
+                    position_builder.push(pos.as_primitive::<Int32Type>().values().to_vec());
+                }
+            });
+            positions = Some(position_builder);
+        }
+        Self {
+            row_ids,
+            frequencies,
+            positions,
+        }
+    }
+
     pub fn empty(with_position: bool) -> Self {
         Self {
             row_ids: Vec::new(),
             frequencies: Vec::new(),
             positions: with_position.then(PositionBuilder::new),
-        }
-    }
-
-    pub fn add(&mut self, row_id: u64, term_positions: Vec<i32>) {
-        self.row_ids.push(row_id);
-        self.frequencies.push(term_positions.len() as f32);
-        if let Some(positions) = self.positions.as_mut() {
-            positions.push(term_positions);
         }
     }
 
@@ -623,28 +641,57 @@ impl PostingListBuilder {
         self.len() == 0
     }
 
-    pub fn calculate_max_score(&self, docs: &DocSet) -> f32 {
-        let num_docs = docs.len();
-        let avgdl = docs.average_length();
-        let mut max_score = 0.0;
-        self.row_ids
-            .iter()
-            .zip(self.frequencies.iter())
-            .for_each(|(&row_id, &freq)| {
-                let doc_norm = K1 * (1.0 - B + B * docs.num_tokens(row_id) as f32 / avgdl);
-                let score = freq / (freq + doc_norm);
-                if score > max_score {
-                    max_score = score;
-                }
-            });
-        max_score * idf(self.len(), num_docs) * (K1 + 1.0)
+    pub fn add(&mut self, row_id: u64, term_positions: Vec<i32>) {
+        self.row_ids.push(row_id);
+        self.frequencies.push(term_positions.len() as f32);
+        if let Some(positions) = self.positions.as_mut() {
+            positions.push(term_positions);
+        }
     }
 
-    pub fn to_batch(
-        mut self,
-        schema: SchemaRef,
-        docs: Option<Arc<DocSet>>,
-    ) -> Result<(RecordBatch, f32)> {
+    pub fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) {
+        let mut new_row_ids = Vec::with_capacity(self.len());
+        let mut new_freqs = Vec::with_capacity(self.len());
+        let mut new_positions = self.positions.as_mut().map(|_| PositionBuilder::new());
+
+        for i in 0..self.len() {
+            let row_id = self.row_ids[i];
+            let freq = self.frequencies[i];
+            let positions = self
+                .positions
+                .as_ref()
+                .map(|positions| positions.get(i).to_vec());
+
+            match mapping.get(&row_id) {
+                Some(Some(new_row_id)) => {
+                    new_row_ids.push(*new_row_id);
+                    new_freqs.push(freq);
+                    if let Some(new_positions) = new_positions.as_mut() {
+                        new_positions.push(positions.unwrap());
+                    }
+                }
+                Some(None) => {
+                    // remove the row_id
+                    // do nothing
+                }
+                None => {
+                    new_row_ids.push(row_id);
+                    new_freqs.push(freq);
+                    if let Some(new_positions) = new_positions.as_mut() {
+                        new_positions.push(positions.unwrap());
+                    }
+                }
+            }
+        }
+
+        self.row_ids = new_row_ids;
+        self.frequencies = new_freqs;
+        self.positions = new_positions;
+    }
+
+    // convert the posting list to a record batch
+    // with docs, it would calculate the max score to accelerate the search
+    pub fn to_batch(mut self, docs: Option<Arc<DocSet>>) -> Result<(RecordBatch, f32)> {
         let length = self.len();
         let num_docs = docs.as_ref().map(|docs| docs.len()).unwrap_or(0);
         let avgdl = docs
@@ -686,6 +733,7 @@ impl PostingListBuilder {
             Arc::new(row_id_col) as ArrayRef,
             Arc::new(freq_col) as ArrayRef,
         ];
+        let schema = inverted_list_schema(position_builder.is_some());
         if let Some(mut position_builder) = position_builder {
             let position_col = position_builder.finish();
             columns.push(Arc::new(position_col));
