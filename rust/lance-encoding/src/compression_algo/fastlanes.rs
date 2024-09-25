@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-// NOTICE: This file is a modification of the `fastlanes` crate: https://github.com/spiraldb/fastlanes
+// NOTICE:
+// This file is a modification of the `fastlanes` crate: https://github.com/spiraldb/fastlanes
 // It is modified to allow a rust stable build
+// The original code can be accessed at https://github.com/spiraldb/fastlanes/blob/8e0ff374f815...
+// The original code is licensed under the Apache Software License:
+// https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/LICENSE
 
 use arrayref::{array_mut_ref, array_ref};
 use core::mem::size_of;

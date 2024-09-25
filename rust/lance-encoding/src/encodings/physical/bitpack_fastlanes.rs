@@ -30,10 +30,7 @@ const ELEMS_PER_CHUNK: u64 = 1024;
 // todo: compute all statistics before encoding
 // todo: see how to use rust macro to rewrite this function
 pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
-    // is it possible to get here?
-    if arrays.is_empty() {
-        return 0;
-    }
+    debug_assert!(!arrays.is_empty());
 
     let res;
 
@@ -192,6 +189,13 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
     res
 }
 
+// Bitpack integers using fastlanes algorithm, the input is sliced into chunks of 1024 integers, and bitpacked
+// chunk by chunk. when the input is not a multiple of 1024, the last chunk is padded with zeros, this is fine because
+// we also know the number of rows we have.
+// Here self is a borrow of BitpackedForNonNegArrayEncoder, unpacked is a mutable borrow of FixedWidthDataBlock,
+// data_type can be  one of u8, u16, u32, or u64.
+// buffer_index is a mutable borrow of u32, indicating the buffer index of the output EncodedArray.
+// It outputs an fastlanes bitpacked EncodedArray
 macro_rules! encode_fixed_width {
     ($self:expr, $unpacked:expr, $data_type:ty, $buffer_index:expr) => {{
         let num_chunks = ($unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
@@ -382,10 +386,8 @@ impl PageScheduler for BitpackedForNonNegScheduler {
         scheduler: &Arc<dyn crate::EncodingsIo>,
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
-        // can we get here?
-        if ranges.is_empty() {
-            panic!("cannot schedule empty ranges");
-        }
+        assert!(!ranges.is_empty());
+
         let mut byte_ranges = vec![];
 
         // map one bytes to multiple ranges, one bytes has at least one range corresponding to it
