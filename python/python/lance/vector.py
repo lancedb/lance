@@ -176,6 +176,7 @@ def train_pq_codebook_on_accelerator(
     fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
     split_schema = pa.schema(fields)
 
+    # TODO this is slow, don't use pytorch
     batch_iterable = dataset.to_batches(columns=[column])
     def split_batches() -> Iterable[pa.RecordBatch]:
         for batch in batch_iterable:
