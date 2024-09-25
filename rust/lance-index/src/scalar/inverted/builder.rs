@@ -15,6 +15,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
+use futures::stream::repeat;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
@@ -92,7 +93,7 @@ impl InvertedIndexBuilder {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn update_index(&mut self, mut stream: SendableRecordBatchStream) -> Result<()> {
+    async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
         // init the token maps
         let mut token_maps = (0..NUM_SHARDS).map(|_| HashMap::new()).collect_vec();
         for (token, token_id) in self.tokens.tokens.iter() {
@@ -122,52 +123,64 @@ impl InvertedIndexBuilder {
         }
 
         let start = std::time::Instant::now();
-        while let Some(batch) = stream.try_next().await? {
-            let doc_iter = iter_str_array(batch.column(0));
-            let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
-            let docs = doc_iter
-                .zip(row_id_col.values().iter())
-                .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)))
-                .collect_vec(); // we have to collect so that we can call `into_par_iter()`
+        let senders = Arc::new(senders);
+        let mut stream = stream
+            .zip(repeat(senders))
+            .map(|(batch, senders)| {
+                CPU_RUNTIME.spawn_blocking(move || {
+                    let batch = batch?;
+                    let doc_iter = iter_str_array(batch.column(0));
+                    let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
+                    let docs = doc_iter
+                        .zip(row_id_col.values().iter())
+                        .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)))
+                        .collect_vec(); // we have to collect so that we can call `into_par_iter()`
 
-            let num_tokens = docs
-                .into_par_iter()
-                .map_init(
-                    || (TOKENIZER.clone(), vec![Vec::new(); NUM_SHARDS]),
-                    |(tokenizer, token_buffers), (doc, row_id)| {
-                        // tokenize the document
-                        let mut num_tokens = 0;
-                        let mut token_stream = tokenizer.token_stream(doc);
-                        while token_stream.advance() {
-                            let token = token_stream.token_mut();
-                            let mut hasher = DefaultHasher::new();
-                            hasher.write(token.text.as_bytes());
-                            let shard = hasher.finish() as usize % NUM_SHARDS;
-                            token_buffers[shard]
-                                .push((std::mem::take(&mut token.text), token.position as i32));
-                            num_tokens += 1;
-                        }
+                    let num_tokens = docs
+                        .into_par_iter()
+                        .map_init(
+                            || (TOKENIZER.clone(), vec![Vec::new(); NUM_SHARDS]),
+                            |(tokenizer, token_buffers), (doc, row_id)| {
+                                // tokenize the document
+                                let mut num_tokens = 0;
+                                let mut token_stream = tokenizer.token_stream(doc);
+                                while token_stream.advance() {
+                                    let token = token_stream.token_mut();
+                                    let mut hasher = DefaultHasher::new();
+                                    hasher.write(token.text.as_bytes());
+                                    let shard = hasher.finish() as usize % NUM_SHARDS;
+                                    token_buffers[shard].push((
+                                        std::mem::take(&mut token.text),
+                                        token.position as i32,
+                                    ));
+                                    num_tokens += 1;
+                                }
 
-                        for (shard, buffer) in token_buffers.iter_mut().enumerate() {
-                            let buffer = std::mem::take(buffer);
-                            if buffer.is_empty() {
-                                continue;
-                            }
-                            senders[shard].blocking_send((buffer, row_id)).unwrap();
-                        }
+                                for (shard, buffer) in token_buffers.iter_mut().enumerate() {
+                                    let buffer = std::mem::take(buffer);
+                                    if buffer.is_empty() {
+                                        continue;
+                                    }
+                                    senders[shard].blocking_send((buffer, row_id)).unwrap();
+                                }
 
-                        (row_id, num_tokens)
-                    },
-                )
-                .collect::<Vec<_>>();
-
+                                (row_id, num_tokens)
+                            },
+                        )
+                        .collect::<Vec<_>>();
+                    Result::Ok(num_tokens)
+                })
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus());
+        while let Some(num_tokens) = stream.try_next().await? {
+            let num_tokens = num_tokens?;
             for (row_id, num_tokens) in num_tokens {
                 self.docs.add(row_id, num_tokens);
             }
         }
 
         // wait for the workers to finish
-        drop(senders);
+        drop(stream);
         for result in result_futs {
             let result = result.await??;
             self.posting_readers.push(result);
@@ -364,12 +377,14 @@ impl IndexWorker {
             });
 
         if self.posting_lists.deep_size_of() > *FLUSH_THRESHOLD * 1024 * 1024 {
+            log::info!("flushing posting lists to {}", self.tmpdir.path().display());
             self.flush().await?;
         }
 
         Ok(())
     }
 
+    #[instrument(level = "info", skip_all)]
     async fn flush(&mut self) -> Result<()> {
         if self.posting_lists.is_empty() {
             return Ok(());
