@@ -24,7 +24,6 @@ use lance_core::{Error, Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use object_store::path::Path;
-use rayon::prelude::*;
 use snafu::{location, Location};
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
@@ -42,7 +41,7 @@ lazy_static! {
         .expect("failed to parse FLUSH_THRESHOLD");
 }
 
-const NUM_SHARDS: usize = 16;
+const NUM_SHARDS: usize = 8;
 
 #[derive(Debug, Default, DeepSizeOf)]
 pub struct InvertedIndexBuilder {
@@ -109,12 +108,13 @@ impl InvertedIndexBuilder {
         for token_map in token_maps.into_iter() {
             let inverted_list = self.inverted_list.clone();
             let mut worker = IndexWorker::new(token_map, self.params.with_position).await?;
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
             senders.push(sender);
-            result_futs.push(CPU_RUNTIME.spawn({
+            result_futs.push(tokio::spawn({
                 async move {
-                    while let Some((tokens, row_id)) = receiver.recv().await {
-                        worker.add(tokens, row_id).await?;
+                    while let Some((row_id, tokens)) = receiver.recv().await {
+                        worker.add(row_id, tokens).await?;
                     }
                     let reader = worker.into_reader(inverted_list).await?;
                     Result::Ok(reader)
@@ -124,6 +124,9 @@ impl InvertedIndexBuilder {
 
         let start = std::time::Instant::now();
         let senders = Arc::new(senders);
+        let buffered = get_num_compute_intensive_cpus()
+            .saturating_sub(NUM_SHARDS)
+            .max(1);
         let mut stream = stream
             .zip(repeat(senders))
             .map(|(batch, senders)| {
@@ -133,60 +136,76 @@ impl InvertedIndexBuilder {
                     let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
                     let docs = doc_iter
                         .zip(row_id_col.values().iter())
-                        .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)))
-                        .collect_vec(); // we have to collect so that we can call `into_par_iter()`
+                        .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
+
+                    let mut tokenizer = TOKENIZER.clone();
+                    let mut token_buffers = vec![Vec::new(); NUM_SHARDS];
 
                     let num_tokens = docs
-                        .into_par_iter()
-                        .map_init(
-                            || (TOKENIZER.clone(), vec![Vec::new(); NUM_SHARDS]),
-                            |(tokenizer, token_buffers), (doc, row_id)| {
-                                // tokenize the document
-                                let mut num_tokens = 0;
-                                let mut token_stream = tokenizer.token_stream(doc);
-                                while token_stream.advance() {
-                                    let token = token_stream.token_mut();
-                                    let mut hasher = DefaultHasher::new();
-                                    hasher.write(token.text.as_bytes());
-                                    let shard = hasher.finish() as usize % NUM_SHARDS;
-                                    token_buffers[shard].push((
-                                        std::mem::take(&mut token.text),
-                                        token.position as i32,
-                                    ));
-                                    num_tokens += 1;
-                                }
+                        .map(|(doc, row_id)| {
+                            // tokenize the document
+                            let mut num_tokens = 0;
+                            let mut token_stream = tokenizer.token_stream(doc);
+                            while token_stream.advance() {
+                                let token = token_stream.token_mut();
+                                let mut hasher = DefaultHasher::new();
+                                hasher.write(token.text.as_bytes());
+                                let shard = hasher.finish() as usize % NUM_SHARDS;
+                                token_buffers[shard]
+                                    .push((std::mem::take(&mut token.text), token.position as i32));
+                                num_tokens += 1;
+                            }
 
-                                for (shard, buffer) in token_buffers.iter_mut().enumerate() {
-                                    let buffer = std::mem::take(buffer);
-                                    if buffer.is_empty() {
-                                        continue;
-                                    }
-                                    senders[shard].blocking_send((buffer, row_id)).unwrap();
+                            let start = std::time::Instant::now();
+                            for (shard, buffer) in token_buffers.iter_mut().enumerate() {
+                                if buffer.is_empty() {
+                                    continue;
                                 }
+                                let buffer = std::mem::take(buffer);
+                                senders[shard].blocking_send((row_id, buffer)).unwrap();
+                            }
+                            log::debug!("send tokens elapsed: {:?}", start.elapsed());
 
-                                (row_id, num_tokens)
-                            },
-                        )
-                        .collect::<Vec<_>>();
+                            (row_id, num_tokens)
+                        })
+                        .collect_vec();
                     Result::Ok(num_tokens)
                 })
             })
-            .buffer_unordered(get_num_compute_intensive_cpus());
+            .buffer_unordered(buffered);
+        log::info!(
+            "indexing FTS with {} shards and {} buffer concurrency ",
+            NUM_SHARDS,
+            buffered,
+        );
+
+        let mut last_num_rows = 0;
         while let Some(num_tokens) = stream.try_next().await? {
             let num_tokens = num_tokens?;
             for (row_id, num_tokens) in num_tokens {
                 self.docs.add(row_id, num_tokens);
             }
+
+            if self.docs.len() >= last_num_rows + 10_000 {
+                log::info!(
+                    "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
+                    self.docs.len(),
+                    start.elapsed(),
+                    self.docs.len() as f32 / start.elapsed().as_secs_f32()
+                );
+                last_num_rows = self.docs.len();
+            }
         }
+        // drop the stream to stop receivers
+        drop(stream);
 
         // wait for the workers to finish
-        drop(stream);
         for result in result_futs {
             let result = result.await??;
             self.posting_readers.push(result);
         }
 
-        log::info!("tokenize documents elapsed {:?}", start.elapsed());
+        log::info!("FTS indexing documents elapsed {:?}", start.elapsed());
 
         Ok(())
     }
@@ -326,6 +345,7 @@ struct IndexWorker {
     store: Arc<dyn IndexStore>,
     writer: Box<dyn IndexWriter>,
     token_offsets: HashMap<String, Vec<(usize, usize)>>,
+    estimated_size: usize,
 }
 
 impl IndexWorker {
@@ -350,6 +370,7 @@ impl IndexWorker {
             store,
             writer,
             token_offsets: HashMap::new(),
+            estimated_size: 0,
         })
     }
 
@@ -357,28 +378,28 @@ impl IndexWorker {
         self.schema.column_with_name(POSITION_COL).is_some()
     }
 
-    async fn add(&mut self, tokens: Vec<(String, i32)>, row_id: u64) -> Result<()> {
+    async fn add(&mut self, row_id: u64, tokens: Vec<(String, i32)>) -> Result<()> {
         let mut token_occurrences = HashMap::new();
         for (token, position) in tokens {
             token_occurrences
                 .entry(token)
-                .and_modify(|positions: &mut Vec<i32>| positions.push(position))
-                .or_insert_with(|| vec![position]);
+                .or_insert_with(Vec::new)
+                .push(position);
         }
-
         let with_position = self.has_position();
         token_occurrences
             .into_iter()
             .for_each(|(token, term_positions)| {
+                self.estimated_size += 8 + 4 + term_positions.len() * 4 + 8;
                 self.posting_lists
                     .entry(token)
                     .or_insert_with(|| PostingListBuilder::empty(with_position))
                     .add(row_id, term_positions);
             });
 
-        if self.posting_lists.deep_size_of() > *FLUSH_THRESHOLD * 1024 * 1024 {
-            log::info!("flushing posting lists to {}", self.tmpdir.path().display());
+        if self.estimated_size > *FLUSH_THRESHOLD * 1024 * 1024 {
             self.flush().await?;
+            self.estimated_size = 0;
         }
 
         Ok(())
@@ -390,6 +411,7 @@ impl IndexWorker {
             return Ok(());
         }
 
+        let start = std::time::Instant::now();
         let posting_lists = std::mem::take(&mut self.posting_lists);
         for (token, list) in posting_lists {
             let (batch, _) = list.to_batch(None)?;
@@ -397,9 +419,10 @@ impl IndexWorker {
             let offset = self.writer.write_record_batch(batch).await? as usize;
             self.token_offsets
                 .entry(token)
-                .and_modify(|offsets| offsets.push((offset, length)))
-                .or_insert_with(|| vec![(offset, length)]);
+                .or_insert_with(Vec::new)
+                .push((offset, length));
         }
+        log::info!("flushed posting lists, elapsed: {:?}", start.elapsed());
 
         Ok(())
     }
