@@ -198,6 +198,7 @@ def train_pq_codebook_on_accelerator(
     )
 
     for sub_vector in range(num_sub_vectors):
+        # TODO train here directly with a torch dataset containing all columns
         ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
             ds_split,
             #dataset,
