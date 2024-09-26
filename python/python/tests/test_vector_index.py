@@ -888,3 +888,13 @@ def test_load_indices(dataset):
     )
     indices = dataset.list_indices()
     assert len(indices) == 1
+
+
+def test_optimize_indices(indexed_dataset):
+    data = create_table()
+    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 2

@@ -4,7 +4,7 @@
 //! Secondary Index
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -425,8 +425,20 @@ impl DatasetIndexExt for Dataset {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 
+        let indices_to_optimize = options
+            .index_names
+            .as_ref()
+            .map(|names| names.into_iter().collect::<HashSet<_>>());
         let name_to_indices = indices
             .iter()
+            .filter_map(|idx| {
+                if let Some(indices_to_optimize) = &indices_to_optimize {
+                    if !indices_to_optimize.contains(&idx.name) {
+                        return None;
+                    }
+                }
+                Some(idx)
+            })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
 
@@ -1021,7 +1033,23 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,   // Just create index for delta
+                index_names: Some(vec![]), // Optimize nothing
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0, // Just create index for delta
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1038,6 +1066,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 2,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1122,6 +1151,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0, // Just create index for delta
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1137,6 +1167,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 2,
+                ..Default::default()
             })
             .await
             .unwrap();

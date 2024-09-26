@@ -1142,6 +1142,13 @@ impl Dataset {
             if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
                 options.num_indices_to_merge = num_indices_to_merge.extract()?;
             }
+            if let Some(index_names) = kwargs.get_item("index_names")? {
+                options.index_names = Some(
+                    index_names
+                        .extract::<Vec<String>>()
+                        .map_err(|err| PyValueError::new_err(err.to_string()))?,
+                );
+            }
         }
         RT.block_on(
             None,
