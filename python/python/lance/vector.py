@@ -476,7 +476,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-        filter=f"{column} is not null",
+        #filter=f"{column} is not null",
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
@@ -519,15 +519,17 @@ def compute_partitions(
                 assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                mask_gpu = partitions.isfinite()
-                mask = mask_gpu.cpu()
-                ids = ids[mask]
-                partitions = partitions[mask_gpu].cpu()
+                #mask_gpu = partitions.isfinite()
+                #mask = mask_gpu.cpu()
+                #ids = ids[mask]
+                #partitions = partitions[mask_gpu].cpu()
+
+                partitions = partitions.cpu()
 
                 split_columns = []
                 if num_sub_vectors is not None:
                     residual_vecs = vecs - kmeans.centroids[partitions]
-                    residual_vecs = residual_vecs[mask_gpu]
+                    #residual_vecs = residual_vecs[mask_gpu]
 
                     for i in range(num_sub_vectors):
                         subvector_tensor = residual_vecs[:, i * subvector_size: (i + 1) * subvector_size]
@@ -543,11 +545,11 @@ def compute_partitions(
                     ] + split_columns,
                     schema=output_schema,
                 )
-                if len(part_batch) < len(ids):
-                    logging.warning(
-                        "%s vectors are ignored during partition assignment",
-                        len(part_batch) - len(ids),
-                    )
+                # if len(part_batch) < len(ids):
+                #     logging.warning(
+                #         "%s vectors are ignored during partition assignment",
+                #         len(part_batch) - len(ids),
+                #     )
 
                 progress.update(part_batch.num_rows)
                 yield part_batch
