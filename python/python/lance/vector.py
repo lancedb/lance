@@ -135,6 +135,7 @@ def train_pq_codebook_on_accelerator(
     kmeans: Any,
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
+    batch_size: int = 1024 * 10 * 4,
 ) -> (np.ndarray, List[Any]):
     """Use accelerator (GPU or MPS) to train pq codebook."""
     from lance.torch.data import _to_tensor as to_full_tensor
@@ -157,6 +158,7 @@ def train_pq_codebook_on_accelerator(
     fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
     split_schema = pa.schema(fields)
 
+    from lance.torch.data import LanceDataset as PytorchLanceDataset
     torch_ds = PytorchLanceDataset(
        dataset,
        batch_size=batch_size,
@@ -172,12 +174,12 @@ def train_pq_codebook_on_accelerator(
     def split_batches() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
             for batch in loader:
-                full = to_full_tensor(batch)
+                #batch = to_full_tensor(batch)
                 split_columns = []
-                vector_dim = full.size(1)
+                vector_dim = batch.size(1)
                 #subvector_size = vector_dim // num_sub_vectors
                 for i in range(num_sub_vectors):
-                    subvector_tensor = full[:, i * subvector_size: (i + 1) * subvector_size]
+                    subvector_tensor = batch[:, i * subvector_size: (i + 1) * subvector_size]
                     subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
                     subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
                     #subvector_array = pa.FixedShapeTensorArray.from_numpy_ndarray(subvector_tensor.cpu().detach().numpy())
@@ -218,6 +220,7 @@ def train_ivf_centroids_on_accelerator(
     k: int,
     metric_type: Literal["l2", "cosine", "dot"],
     accelerator: Union[str, "torch.Device"],
+    batch_size: int = 1024 * 10 * 4,
     *,
     sample_rate: int = 256,
     max_iters: int = 50,
@@ -338,6 +341,7 @@ def compute_pq_codes(
 
     num_sub_vectors = len(kmeans_list)
 
+    from lance.torch.data import LanceDataset as PytorchLanceDataset
     torch_ds = PytorchLanceDataset(
        dataset,
        batch_size=batch_size,

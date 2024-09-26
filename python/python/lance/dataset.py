@@ -59,6 +59,8 @@ from .optimize import Compaction
 from .schema import LanceSchema
 from .util import td_to_micros
 
+import os
+
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
@@ -1732,7 +1734,8 @@ class LanceDataset(pa.dataset.Dataset):
 
             if pq_codebook is None and accelerator is not None:
                 partitions_file = kwargs["precomputed_partitions_file"]
-                kwargs["precomputed_partitions_file"] = None
+                del kwargs["precomputed_partitions_file"]
+                import lance
                 partitions_ds = lance.dataset(partitions_file)
                 # Use accelerator to train pq codebook
                 from .vector import (
@@ -1752,12 +1755,14 @@ class LanceDataset(pa.dataset.Dataset):
                     kmeans_list,
                     batch_size=20480,
                 )
+                # TODO delete the partitions_file at this point
+                import lance
                 output_ds = lance.dataset(shuffle_output_dir)
                 shuffle_buffers = [
                     frag.data_files()[0].path() for frag in output_ds.get_fragments()
                 ]
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = path.join(shuffle_output_dir, "data"),
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(shuffle_output_dir, "data")
 
             if pq_codebook is not None:
                 # User provided IVF centroids
