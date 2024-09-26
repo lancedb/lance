@@ -238,12 +238,15 @@ class KMeans:
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk, y2=self.y2)
 
-            valid_mask = ids >= 0
-            if torch.any(~valid_mask):
-                chunk = chunk[valid_mask]
-                ids = ids[valid_mask]
+            # Training is significantly faster w/o these checks
+            # valid_mask = ids >= 0
+            # if torch.any(~valid_mask):
+            #     chunk = chunk[valid_mask]
+            #     ids = ids[valid_mask]
 
-            total_dist += dists.nansum().item()
+            #total_dist += dists.nansum().item()
+
+            total_dist += dists.sum().item()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
