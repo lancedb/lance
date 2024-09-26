@@ -43,9 +43,6 @@ pub struct PQBuildParams {
 
     /// Sample rate to train PQ codebook.
     pub sample_rate: usize,
-
-    /// Use existing PQ codes (user pre-computed)
-    pub use_precomputed_pq_codes: bool,
 }
 
 impl Default for PQBuildParams {
@@ -57,7 +54,6 @@ impl Default for PQBuildParams {
             kmeans_redos: 1,
             codebook: None,
             sample_rate: 256,
-            use_precomputed_pq_codes: false,
         }
     }
 }

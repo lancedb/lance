@@ -1611,9 +1611,9 @@ fn prepare_vector_index_params(
             ivf_params.centroids = Some(Arc::new(centroids.clone()))
         };
 
-        if let Some(val) = kwargs.get_item("use_precomputed_partitions")? {
-            ivf_params.use_precomputed_partitions = val.extract()?;
-        }
+        if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
+            ivf_params.precomputed_partitons_file = Some(f.to_string());
+        };
 
         if let Some(storage_options) = storage_options {
             ivf_params.storage_options = Some(storage_options);
@@ -1676,10 +1676,6 @@ fn prepare_vector_index_params(
             let codebook = as_fixed_size_list_array(batch.column(0));
             pq_params.codebook = Some(codebook.values().clone())
         };
-
-        if let Some(val) = kwargs.get_item("use_precomputed_pq_codes")? {
-            pq_params.use_precomputed_pq_codes = val.extract()?;
-        }
     }
 
     match index_type {

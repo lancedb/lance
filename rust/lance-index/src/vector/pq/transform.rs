@@ -47,10 +47,6 @@ impl Debug for PQTransformer {
 impl Transformer for PQTransformer {
     #[instrument(name = "PQTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        if batch.schema().field_with_name(&self.output_column).is_ok() {
-            let batch = batch.drop_column(&self.input_column)?;
-            return Ok(batch);
-        }
         let input_arr = batch
             .column_by_name(&self.input_column)
             .ok_or(Error::Index {
