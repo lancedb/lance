@@ -428,16 +428,13 @@ impl DatasetIndexExt for Dataset {
         let indices_to_optimize = options
             .index_names
             .as_ref()
-            .map(|names| names.into_iter().collect::<HashSet<_>>());
+            .map(|names| names.iter().collect::<HashSet<_>>());
         let name_to_indices = indices
             .iter()
-            .filter_map(|idx| {
-                if let Some(indices_to_optimize) = &indices_to_optimize {
-                    if !indices_to_optimize.contains(&idx.name) {
-                        return None;
-                    }
-                }
-                Some(idx)
+            .filter(|idx| {
+                indices_to_optimize
+                    .as_ref()
+                    .map_or(true, |names| names.contains(&idx.name))
             })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
