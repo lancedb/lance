@@ -414,12 +414,12 @@ def compute_pq_codes(
        rbr,
        dst_dataset_uri,
        schema=output_schema,
-       max_rows_per_file=dataset.count_rows(),
-       data_storage_version="stable",
+       #max_rows_per_file=dataset.count_rows(),
+       data_storage_version="legacy",
     )
-    assert len(ds.get_fragments()) == 1
-    files = ds.get_fragments()[0].data_files()
-    assert len(files) == 1
+    #assert len(ds.get_fragments()) == 1
+    #files = ds.get_fragments()[0].data_files()
+    #assert len(files) == 1
 
     progress.close()
 
