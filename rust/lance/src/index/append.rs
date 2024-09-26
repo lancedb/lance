@@ -370,6 +370,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0,
+                ..Default::default()
             })
             .await
             .unwrap();

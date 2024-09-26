@@ -495,6 +495,10 @@ impl ObjectStore {
         self.scheme == "file"
     }
 
+    pub fn is_cloud(&self) -> bool {
+        self.scheme != "file" && self.scheme != "memory"
+    }
+
     pub fn block_size(&self) -> usize {
         self.block_size
     }

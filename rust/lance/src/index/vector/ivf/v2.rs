@@ -429,9 +429,11 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 
         let query = self.preprocess_query(partition_id, query)?;
         let param = (&query).into();
+        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+        let k = query.k * refine_factor;
         part_entry
             .index
-            .search(query.key, query.k, param, &part_entry.storage, pre_filter)
+            .search(query.key, k, param, &part_entry.storage, pre_filter)
     }
 
     fn is_loadable(&self) -> bool {

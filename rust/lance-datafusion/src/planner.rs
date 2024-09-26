@@ -5,6 +5,7 @@
 
 //! Exec plan planner
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -327,8 +328,13 @@ impl Planner {
     }
 
     // See datafusion `sqlToRel::parse_sql_number()`
-    fn number(&self, value: &str) -> Result<Expr> {
+    fn number(&self, value: &str, negative: bool) -> Result<Expr> {
         use datafusion::logical_expr::lit;
+        let value: Cow<str> = if negative {
+            Cow::Owned(format!("-{}", value))
+        } else {
+            Cow::Borrowed(value)
+        };
         if let Ok(n) = value.parse::<i64>() {
             Ok(lit(n))
         } else {
@@ -343,7 +349,7 @@ impl Planner {
 
     fn value(&self, value: &Value) -> Result<Expr> {
         Ok(match value {
-            Value::Number(v, _) => self.number(v.as_str())?,
+            Value::Number(v, _) => self.number(v.as_str(), false)?,
             Value::SingleQuotedString(s) => Expr::Literal(ScalarValue::Utf8(Some(s.clone()))),
             Value::HexStringLiteral(hsl) => {
                 Expr::Literal(ScalarValue::Binary(Self::try_decode_hex_literal(hsl)))
@@ -532,21 +538,42 @@ impl Planner {
             SQLExpr::Array(SQLArray { elem, .. }) => {
                 let mut values = vec![];
 
-                for expr in elem {
-                    if let SQLExpr::Value(value) = expr {
-                        if let Expr::Literal(value) = self.value(value)? {
-                            values.push(value);
-                        } else {
-                            return Err(Error::Internal {
-                                message: "Expected a literal value in array.".into(),
-                                location: location!(),
-                            });
+                let array_literal_error = |pos: usize, value: &_| {
+                    Err(Error::io(
+                        format!(
+                            "Expected a literal value in array, instead got {} at position {}",
+                            value, pos
+                        ),
+                        location!(),
+                    ))
+                };
+
+                for (pos, expr) in elem.iter().enumerate() {
+                    match expr {
+                        SQLExpr::Value(value) => {
+                            if let Expr::Literal(value) = self.value(value)? {
+                                values.push(value);
+                            } else {
+                                return array_literal_error(pos, expr);
+                            }
                         }
-                    } else {
-                        return Err(Error::io(
-                            "Only arrays of literals are supported in lance.",
-                            location!(),
-                        ));
+                        SQLExpr::UnaryOp {
+                            op: UnaryOperator::Minus,
+                            expr,
+                        } => {
+                            if let SQLExpr::Value(Value::Number(number, _)) = expr.as_ref() {
+                                if let Expr::Literal(value) = self.number(number, true)? {
+                                    values.push(value);
+                                } else {
+                                    return array_literal_error(pos, expr);
+                                }
+                            } else {
+                                return array_literal_error(pos, expr);
+                            }
+                        }
+                        _ => {
+                            return array_literal_error(pos, expr);
+                        }
                     }
                 }
 
@@ -794,6 +821,7 @@ mod tests {
 
     use super::*;
 
+    use arrow::datatypes::Float64Type;
     use arrow_array::{
         ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
         StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -985,6 +1013,25 @@ mod tests {
                 false, false, false, true, true, true, true, false, false, false
             ])
         );
+    }
+
+    #[test]
+    fn test_negative_array_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = Expr::Literal(ScalarValue::List(Arc::new(
+            ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(
+                [-1_f64, -2.0, -3.0, -4.0, -5.0].map(Some),
+            )]),
+        )));
+
+        let expr = planner
+            .parse_expr("[-1.0, -2.0, -3.0, -4.0, -5.0]")
+            .unwrap();
+
+        assert_eq!(expr, expected);
     }
 
     #[test]
