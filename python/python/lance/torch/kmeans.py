@@ -131,6 +131,7 @@ class KMeans:
             torch.Tensor,
             pa.FixedSizeListArray,
         ],
+        column: Optional[str] = None,
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -160,7 +161,7 @@ class KMeans:
         for i in tqdm(range(self.max_iters)):
             try:
                 self.total_distance = self._fit_once(
-                    data, i, last_dist=self.total_distance
+                    data, i, last_dist=self.total_distance, column=column
                 )
             except StopIteration:
                 break
@@ -199,7 +200,7 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
+        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0, column: Optional[str] = None,
     ) -> float:
         """Train KMean once and return the total distance.
 
@@ -230,6 +231,8 @@ class KMeans:
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            if column is not None:
+                chunk = chunk[column]
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)

@@ -155,15 +155,49 @@ def train_pq_codebook_on_accelerator(
     fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
     split_schema = pa.schema(fields)
 
+    sample_size = 256 * 256
+    from lance.torch.data import LanceDataset as TorchDataset
+    from .torch.kmeans import KMeans
+
+    ds_init = TorchDataset(
+        dataset,
+        batch_size=256,
+        columns=field_names,
+        samples=256,
+    )
+
+    init_centroids = next(iter(ds_init))
+
+    ds_fit = TorchDataset(
+        dataset,
+        batch_size=20480,
+        columns=field_names,
+        samples=sample_size,
+        cache=True,
+    )
+
     for sub_vector in range(num_sub_vectors):
         # TODO train here directly with a torch dataset containing all columns
-        ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
-            dataset,
-            field_names[sub_vector],
+        # ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
+        #     dataset,
+        #     field_names[sub_vector],
+        #     256,
+        #     metric_type,
+        #     accelerator,
+        # )
+
+        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        kmeans_local = KMeans(
             256,
-            metric_type,
-            accelerator,
+            max_iters=50,
+            metric=metric_type,
+            device=accelerator,
+            centroids=init_centroids[field_names[sub_vector]],
         )
+        # TODO might need to adjust this call
+        kmeans_local.fit(ds_fit, column=field_names[sub_vector])
+
+        ivf_centroids_local = kmeans_local.centroids.cpu().numpy()
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
 
@@ -215,7 +249,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=k,
         columns=[column],
         samples=sample_size,
-        filter=filt,
+        #filter=filt,
     )
 
     init_centroids = next(iter(ds))
@@ -311,7 +345,7 @@ def compute_pq_codes(
     )
     loader = torch.utils.data.DataLoader(
        torch_ds,
-       batch_size=1,  # TODO is this significantly inhibiting performance
+       batch_size=1,
        pin_memory=True,
        collate_fn=_collate_fn,
     )
