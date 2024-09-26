@@ -218,9 +218,7 @@ class LanceDataset(pa.dataset.Dataset):
         return Tags(self._ds)
 
     def list_indices(self) -> List[Dict[str, Any]]:
-        if getattr(self, "_list_indices_res", None) is None:
-            self._list_indices_res = self._ds.load_indices()
-        return self._list_indices_res
+        return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(

@@ -877,3 +877,14 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
             fragments=[LanceFragment(dataset, 0)],
         )
         scanner.explain_plan(True)
+
+
+def test_load_indices(dataset):
+    indices = dataset.list_indices()
+    assert len(indices) == 0
+
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+    indices = dataset.list_indices()
+    assert len(indices) == 1
