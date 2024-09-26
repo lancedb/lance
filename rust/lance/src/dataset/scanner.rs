@@ -237,6 +237,13 @@ pub struct Scanner {
 
     nearest: Option<Query>,
 
+    /// If false, do not use any scalar indices for the scan
+    ///
+    /// This can be used to pick a more efficient plan for certain queries where
+    /// scalar indices do not work well (though we should also improve our planning
+    /// to handle this better in the future as well)
+    use_scalar_index: bool,
+
     /// Scan the dataset with a meta column: "_rowid"
     with_row_id: bool,
 
@@ -296,6 +303,7 @@ impl Scanner {
             ordered: true,
             fragments: None,
             fast_search: false,
+            use_scalar_index: true,
         }
     }
 
@@ -527,6 +535,16 @@ impl Scanner {
     /// always scan in parallel and any value set here will be ignored.
     pub fn scan_in_order(&mut self, ordered: bool) -> &mut Self {
         self.ordered = ordered;
+        self
+    }
+
+    /// Set whether to use scalar index.
+    ///
+    /// By default, scalar indices will be used to optimize a query if available.
+    /// However, in some corner cases, scalar indices may not be the best choice.
+    /// This option allows users to disable scalar indices for a query.
+    pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
+        self.use_scalar_index = use_scalar_index;
         self
     }
 
@@ -1016,8 +1034,7 @@ impl Scanner {
             });
         }
         // Scalar indices are only used when prefiltering
-        // TODO: Should we use them when postfiltering if there is no vector search?
-        let use_scalar_index = self.prefilter || self.nearest.is_none();
+        let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));
 
@@ -4602,6 +4619,26 @@ mod test {
         )
         .await?;
 
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                Ok(scan
+                    .nearest("vec", &q, 5)?
+                    .use_scalar_index(false)
+                    .filter("i > 10")?
+                    .prefilter(true))
+            },
+            "ProjectionExec: expr=[i@2 as i, s@3 as s, vec@4 as vec, _distance@0 as _distance]
+  Take: columns=\"_distance, _rowid, (i), (s), (vec)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: TopK(fetch=5), expr=...
+        ANNSubIndex: name=..., k=5, deltas=1
+          ANNIvfPartition: uuid=..., nprobes=1, deltas=1
+          FilterExec: i@0 > 10
+            LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false",
+        )
+        .await?;
+
         dataset.append_new_data().await?;
 
         assert_plan_equals(
@@ -4677,6 +4714,21 @@ mod test {
   Take: columns=\"_rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       MaterializeIndex: query=i > 10",
+        )
+        .await?;
+
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .use_scalar_index(false)
+                    .filter("i > 10")
+            },
+            "ProjectionExec: expr=[s@2 as s]
+  Take: columns=\"i, _rowid, (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      FilterExec: i@0 > 10
+        LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 

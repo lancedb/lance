@@ -546,6 +546,7 @@ impl Dataset {
         fast_search: Option<bool>,
         full_text_query: Option<&PyDict>,
         late_materialization: Option<PyObject>,
+        use_scalar_index: Option<bool>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -673,6 +674,10 @@ impl Dataset {
                     "late_materialization must be a bool or a list of strings",
                 ));
             }
+        }
+
+        if let Some(use_scalar_index) = use_scalar_index {
+            scanner.use_scalar_index(use_scalar_index);
         }
 
         if let Some(nearest) = nearest {
