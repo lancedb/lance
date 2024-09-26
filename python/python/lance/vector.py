@@ -424,7 +424,11 @@ def compute_pq_codes(
     progress.close()
 
     logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
-    return dst_dataset_uri
+    shuffle_buffers = []
+    for frag in ds.get_fragments():
+        for data_file in frag.data_files():
+            shuffle_buffers.append(data_file.path())
+    return dst_dataset_uri, shuffle_buffers
 
 
 def _collate_fn(batch):

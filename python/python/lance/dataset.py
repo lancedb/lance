@@ -1750,17 +1750,12 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
                 )
-                shuffle_output_dir = compute_pq_codes(
+                shuffle_output_dir, shuffle_buffers = compute_pq_codes(
                     partitions_ds,
                     kmeans_list,
                     batch_size=20480,
                 )
                 # TODO delete the partitions_file at this point
-                import lance
-                output_ds = lance.dataset(shuffle_output_dir)
-                shuffle_buffers = [
-                    frag.data_files()[0].path() for frag in output_ds.get_fragments()
-                ]
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
                 kwargs["precomputed_shuffle_buffers_path"] = os.path.join(shuffle_output_dir, "data")
 
