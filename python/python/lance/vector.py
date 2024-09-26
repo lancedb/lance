@@ -155,51 +155,10 @@ def train_pq_codebook_on_accelerator(
     fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
     split_schema = pa.schema(fields)
 
-    # from lance.torch.data import LanceDataset as PytorchLanceDataset
-    # torch_ds = PytorchLanceDataset(
-    #    dataset,
-    #    batch_size=batch_size,
-    #    with_row_id=False,
-    #    columns=[column],
-    # )
-    # loader = torch.utils.data.DataLoader(
-    #    torch_ds,
-    #    batch_size=1,
-    #    pin_memory=True,
-    #    collate_fn=_collate_fn,
-    # )
-    # def split_batches() -> Iterable[pa.RecordBatch]:
-    #     with torch.no_grad():
-    #         for batch in loader:
-    #             #batch = to_full_tensor(batch)
-    #             split_columns = []
-    #             vector_dim = batch.size(1)
-    #             #subvector_size = vector_dim // num_sub_vectors
-    #             for i in range(num_sub_vectors):
-    #                 subvector_tensor = batch[:, i * subvector_size: (i + 1) * subvector_size]
-    #                 subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
-    #                 subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
-    #                 #subvector_array = pa.FixedShapeTensorArray.from_numpy_ndarray(subvector_tensor.cpu().detach().numpy())
-    #                 split_columns.append(subvector_fsl)
-    #             new_batch = pa.RecordBatch.from_arrays(split_columns, schema=split_schema)
-    #             yield new_batch
-
-    # rbr = pa.RecordBatchReader.from_batches(split_schema, split_batches())
-    # split_dataset_uri = tempfile.mkdtemp()
-    # ds_split = write_dataset(
-    #     rbr,
-    #     split_dataset_uri,
-    #     schema=split_schema,
-    #     max_rows_per_file=dataset.count_rows(),
-    #     data_storage_version="stable",
-    # )
-
     for sub_vector in range(num_sub_vectors):
         # TODO train here directly with a torch dataset containing all columns
         ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
-            #ds_split,
             dataset,
-            #"__residual_vec",
             field_names[sub_vector],
             256,
             metric_type,
@@ -207,9 +166,6 @@ def train_pq_codebook_on_accelerator(
         )
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
-
-    # if os.path.exists(split_dataset_uri):
-    #     shutil.rmtree(split_dataset_uri)
 
     pq_codebook = np.stack(centroids_list)
     return pq_codebook, kmeans_list
