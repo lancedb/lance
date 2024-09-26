@@ -166,13 +166,7 @@ impl Schema {
         ArrowSchema::from(self).to_compact_string(indent)
     }
 
-    /// Project the columns over the schema.
-    ///
-    /// ```ignore
-    /// let schema = Schema::from(...);
-    /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
-    /// ```
-    pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+    fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for col in columns {
             let split = col.as_ref().split('.').collect::<Vec<_>>();
@@ -184,7 +178,7 @@ impl Schema {
                 } else {
                     candidates.push(projected_field)
                 }
-            } else {
+            } else if err_on_missing {
                 return Err(Error::Schema {
                     message: format!("Column {} does not exist", col.as_ref()),
                     location: location!(),
@@ -196,6 +190,21 @@ impl Schema {
             fields: candidates,
             metadata: self.metadata.clone(),
         })
+    }
+
+    /// Project the columns over the schema.
+    ///
+    /// ```ignore
+    /// let schema = Schema::from(...);
+    /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
+    /// ```
+    pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        self.do_project(columns, true)
+    }
+
+    /// Project the columns over the schema, dropping unrecognized columns
+    pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
+        self.do_project(columns, false)
     }
 
     /// Check that the top level fields don't contain `.` in their names

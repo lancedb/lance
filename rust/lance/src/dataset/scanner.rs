@@ -181,6 +181,54 @@ impl MaterializationStyle {
     }
 }
 
+/// Filter for filtering rows
+pub enum LanceFilter {
+    /// The filter is an SQL string
+    Sql(String),
+    /// The filter is a Substrait expression
+    Substrait(Vec<u8>),
+    /// The filter is a Datafusion expression
+    Datafusion(Expr),
+}
+
+impl LanceFilter {
+    /// Converts the filter to a Datafusion expression
+    ///
+    /// The schema for this conversion should be the full schema available to
+    /// the filter (`full_schema`).  However, due to a limitation in the way
+    /// we do Substrait conversion today we can only do Substrait conversion with
+    /// the dataset schema (`dataset_schema`).  This means that Substrait will
+    /// not be able to access columns that are not in the dataset schema (e.g.
+    /// _rowid, _rowaddr, etc.)
+    #[allow(unused)]
+    pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
+        match self {
+            Self::Sql(sql) => {
+                let schema = Arc::new(ArrowSchema::from(full_schema));
+                let planner = Planner::new(schema);
+                let filter = planner.parse_filter(sql)?;
+                planner.optimize_expr(filter)
+            }
+            #[cfg(feature = "substrait")]
+            Self::Substrait(expr) => {
+                use futures::FutureExt;
+
+                let schema = Arc::new(ArrowSchema::from(dataset_schema));
+                let expr = parse_substrait(expr, schema.clone())
+                    .now_or_never()
+                    .expect("could not parse the Substrait filter in a synchronous fashion")?;
+                let planner = Planner::new(schema);
+                planner.optimize_expr(expr)
+            }
+            #[cfg(not(feature = "substrait"))]
+            Self::Substrait(_) => {
+                panic!("Substrait filter is not supported in this build");
+            }
+            Self::Datafusion(expr) => Ok(expr.clone()),
+        }
+    }
+}
+
 /// Dataset Scanner
 ///
 /// ```rust,ignore
@@ -206,7 +254,7 @@ pub struct Scanner {
     materialization_style: MaterializationStyle,
 
     /// Optional filter expression.
-    pub(crate) filter: Option<Expr>,
+    filter: Option<LanceFilter>,
 
     /// Optional full text search query
     full_text_query: Option<FullTextSearchQuery>,
@@ -427,10 +475,7 @@ impl Scanner {
     /// Once the filter is applied, Lance will create an optimized I/O plan for filtering.
     ///
     pub fn filter(&mut self, filter: &str) -> Result<&mut Self> {
-        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
-        let planner = Planner::new(schema);
-        self.filter = Some(planner.parse_filter(filter)?);
-        self.filter = Some(planner.optimize_expr(self.filter.take().unwrap())?);
+        self.filter = Some(LanceFilter::Sql(filter.to_string()));
         Ok(self)
     }
 
@@ -467,17 +512,13 @@ impl Scanner {
     ///
     /// The message must contain exactly one expression and that expression
     /// must be a scalar expression whose return type is boolean.
-    #[cfg(feature = "substrait")]
-    pub async fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
-        let schema = Arc::new(ArrowSchema::from(self.dataset.schema()));
-        let expr = parse_substrait(filter, schema.clone()).await?;
-        let planner = Planner::new(schema);
-        self.filter = Some(planner.optimize_expr(expr)?);
+    pub fn filter_substrait(&mut self, filter: &[u8]) -> Result<&mut Self> {
+        self.filter = Some(LanceFilter::Substrait(filter.to_vec()));
         Ok(self)
     }
 
     pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
-        self.filter = Some(filter);
+        self.filter = Some(LanceFilter::Datafusion(filter));
         self
     }
 
@@ -758,11 +799,25 @@ impl Scanner {
         Ok(plan.schema())
     }
 
-    /// The output schema from the initial scan stage of a plan
+    /// Fetches the currently set filter
     ///
-    /// This includes columns that are added by the scan but don't exist in the dataset
-    /// schema (e.g. _distance, _rowid, _rowaddr)
-    pub(crate) fn scan_output_schema(&self, force_row_id: bool) -> Result<Arc<Schema>> {
+    /// Note that this forces the filter to be evaluated and the result will depend on
+    /// the current state of the scanner (e.g. if with_row_id has been called then _rowid
+    /// will be available for filtering but not otherwise) and so you may want to call this
+    /// after setting all other options.
+    pub fn get_filter(&self) -> Result<Option<Expr>> {
+        if let Some(filter) = &self.filter {
+            let filter_schema = self.scan_input_schema()?;
+            Ok(Some(filter.to_datafusion(
+                self.dataset.schema(),
+                filter_schema.as_ref(),
+            )?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn get_extra_columns(&self, force_row_id: bool) -> Vec<ArrowField> {
         let mut extra_columns = vec![];
 
         if self.nearest.as_ref().is_some() {
@@ -780,6 +835,30 @@ impl Scanner {
         if self.with_row_address {
             extra_columns.push(ROW_ADDR_FIELD.clone());
         }
+
+        extra_columns
+    }
+
+    pub(crate) fn scan_input_schema(&self) -> Result<Arc<Schema>> {
+        let extra_columns = self.get_extra_columns(false);
+
+        if !extra_columns.is_empty() {
+            let physical_schema = self
+                .dataset
+                .schema()
+                .merge(&ArrowSchema::new(extra_columns))?;
+            Ok(Arc::new(physical_schema))
+        } else {
+            Ok(Arc::new(self.dataset.schema().clone()))
+        }
+    }
+
+    /// The output schema from the initial scan stage of a plan
+    ///
+    /// This includes columns that are added by the scan but don't exist in the dataset
+    /// schema (e.g. _distance, _rowid, _rowaddr)
+    pub(crate) fn scan_output_schema(&self, force_row_id: bool) -> Result<Arc<Schema>> {
+        let extra_columns = self.get_extra_columns(force_row_id);
 
         let schema = if !extra_columns.is_empty() {
             self.projection_plan
@@ -957,7 +1036,11 @@ impl Scanner {
 
     fn calc_eager_columns(&self, filter_plan: &FilterPlan) -> Result<Arc<Schema>> {
         let columns = filter_plan.refine_columns();
-        let filter_schema = self.dataset.schema().project(&columns)?;
+        // If the column didn't exist in the scan output schema then we wouldn't make
+        // it to this point.  However, there may be columns (like _rowid, _distance, etc.)
+        // which do not exist in the dataset schema but are added by the scan.  We can ignore
+        // those as eager columns.
+        let filter_schema = self.dataset.schema().project_or_drop(&columns)?;
         let physical_schema = self.projection_plan.physical_schema.clone();
         let remaining_schema = physical_schema.exclude(&filter_schema)?;
 
@@ -1040,9 +1123,11 @@ impl Scanner {
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
 
-        let planner = Planner::new(Arc::new(self.dataset.schema().into()));
+        let filter_schema = self.scan_input_schema()?;
+        let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
 
         let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
+            let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
             let index_info = self.dataset.scalar_index_info().await?;
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
@@ -2253,7 +2338,7 @@ mod test {
         assert!(scan.filter.is_none());
 
         scan.filter("i > 50")?;
-        assert_eq!(scan.filter, Some(col("i").gt(lit(50))));
+        assert_eq!(scan.get_filter().unwrap(), Some(col("i").gt(lit(50))));
 
         for use_stats in [false, true] {
             let batches = scan
