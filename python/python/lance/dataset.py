@@ -1799,7 +1799,7 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, name, replace, storage_options, kwargs
         )
         # Save disk space
-        if "precomputed_shuffle_buffers_path" in kwargs.keys():
+        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(kwargs["precomputed_shuffle_buffers_path"]):
             shutil.rmtree(kwargs["precomputed_shuffle_buffers_path"])
         return self
 

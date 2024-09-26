@@ -211,6 +211,9 @@ def train_pq_codebook_on_accelerator(
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
 
+    if os.path.exists(split_dataset_uri):
+        shutil.rmtree(split_dataset_uri)
+
     pq_codebook = np.stack(centroids_list)
     return pq_codebook, kmeans_list
 
