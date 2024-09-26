@@ -218,9 +218,7 @@ class LanceDataset(pa.dataset.Dataset):
         return Tags(self._ds)
 
     def list_indices(self) -> List[Dict[str, Any]]:
-        if getattr(self, "_list_indices_res", None) is None:
-            self._list_indices_res = self._ds.load_indices()
-        return self._list_indices_res
+        return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -2790,6 +2788,15 @@ class DatasetOptimizer:
         the new data to existing partitions.  This means an update is much quicker
         than retraining the entire index but may have less accuracy (especially
         if the new data exhibits new patterns, concepts, or trends)
+
+        Parameters
+        ----------
+        num_indices_to_merge: int, default 1
+            The number of indices to merge.
+            If set to 0, new delta index will be created.
+        index_names: List[str], default None
+            The names of the indices to optimize.
+            If None, all indices will be optimized.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 
