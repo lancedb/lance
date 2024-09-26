@@ -140,9 +140,6 @@ def train_pq_codebook_on_accelerator(
     """Use accelerator (GPU or MPS) to train pq codebook."""
     from lance.torch.data import _to_tensor as to_full_tensor
 
-    # TODO residual vec can be split up into mulitple fields _during_ ivf assignment
-    column = "__residual_vec"
-
     # cuvs not particularly useful for only 256 centroids without more work
     if accelerator == "cuvs":
         accelerator = "cuda"
@@ -152,56 +149,56 @@ def train_pq_codebook_on_accelerator(
     centroids_list = []
     kmeans_list = []
 
-    field_names = [f"{column}_{i + 1}" for i in range(num_sub_vectors)]
+    field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
     dim = kmeans.centroids.shape[1]
     subvector_size = dim // num_sub_vectors
     fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
     split_schema = pa.schema(fields)
 
-    from lance.torch.data import LanceDataset as PytorchLanceDataset
-    torch_ds = PytorchLanceDataset(
-       dataset,
-       batch_size=batch_size,
-       with_row_id=False,
-       columns=[column],
-    )
-    loader = torch.utils.data.DataLoader(
-       torch_ds,
-       batch_size=1,
-       pin_memory=True,
-       collate_fn=_collate_fn,
-    )
-    def split_batches() -> Iterable[pa.RecordBatch]:
-        with torch.no_grad():
-            for batch in loader:
-                #batch = to_full_tensor(batch)
-                split_columns = []
-                vector_dim = batch.size(1)
-                #subvector_size = vector_dim // num_sub_vectors
-                for i in range(num_sub_vectors):
-                    subvector_tensor = batch[:, i * subvector_size: (i + 1) * subvector_size]
-                    subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
-                    subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
-                    #subvector_array = pa.FixedShapeTensorArray.from_numpy_ndarray(subvector_tensor.cpu().detach().numpy())
-                    split_columns.append(subvector_fsl)
-                new_batch = pa.RecordBatch.from_arrays(split_columns, schema=split_schema)
-                yield new_batch
+    # from lance.torch.data import LanceDataset as PytorchLanceDataset
+    # torch_ds = PytorchLanceDataset(
+    #    dataset,
+    #    batch_size=batch_size,
+    #    with_row_id=False,
+    #    columns=[column],
+    # )
+    # loader = torch.utils.data.DataLoader(
+    #    torch_ds,
+    #    batch_size=1,
+    #    pin_memory=True,
+    #    collate_fn=_collate_fn,
+    # )
+    # def split_batches() -> Iterable[pa.RecordBatch]:
+    #     with torch.no_grad():
+    #         for batch in loader:
+    #             #batch = to_full_tensor(batch)
+    #             split_columns = []
+    #             vector_dim = batch.size(1)
+    #             #subvector_size = vector_dim // num_sub_vectors
+    #             for i in range(num_sub_vectors):
+    #                 subvector_tensor = batch[:, i * subvector_size: (i + 1) * subvector_size]
+    #                 subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
+    #                 subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
+    #                 #subvector_array = pa.FixedShapeTensorArray.from_numpy_ndarray(subvector_tensor.cpu().detach().numpy())
+    #                 split_columns.append(subvector_fsl)
+    #             new_batch = pa.RecordBatch.from_arrays(split_columns, schema=split_schema)
+    #             yield new_batch
 
-    rbr = pa.RecordBatchReader.from_batches(split_schema, split_batches())
-    split_dataset_uri = tempfile.mkdtemp()
-    ds_split = write_dataset(
-        rbr,
-        split_dataset_uri,
-        schema=split_schema,
-        max_rows_per_file=dataset.count_rows(),
-        data_storage_version="stable",
-    )
+    # rbr = pa.RecordBatchReader.from_batches(split_schema, split_batches())
+    # split_dataset_uri = tempfile.mkdtemp()
+    # ds_split = write_dataset(
+    #     rbr,
+    #     split_dataset_uri,
+    #     schema=split_schema,
+    #     max_rows_per_file=dataset.count_rows(),
+    #     data_storage_version="stable",
+    # )
 
     for sub_vector in range(num_sub_vectors):
         # TODO train here directly with a torch dataset containing all columns
         ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
-            ds_split,
-            #dataset,
+            #ds_split,
+            dataset,
             #"__residual_vec",
             field_names[sub_vector],
             256,
@@ -211,8 +208,8 @@ def train_pq_codebook_on_accelerator(
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
 
-    if os.path.exists(split_dataset_uri):
-        shutil.rmtree(split_dataset_uri)
+    # if os.path.exists(split_dataset_uri):
+    #     shutil.rmtree(split_dataset_uri)
 
     pq_codebook = np.stack(centroids_list)
     return pq_codebook, kmeans_list
@@ -345,13 +342,16 @@ def compute_pq_codes(
 
     num_sub_vectors = len(kmeans_list)
 
+    field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
+
     from lance.torch.data import LanceDataset as PytorchLanceDataset
     torch_ds = PytorchLanceDataset(
-       dataset,
-       batch_size=batch_size,
-       with_row_id=False,
-       #columns=[column, "__residual_vec"], #, "id", "partition"],
-       columns=["_rowid", "__ivf_part_id", "__residual_vec"],
+        dataset,
+        batch_size=batch_size,
+        with_row_id=False,
+        #columns=[column, "__residual_vec"], #, "id", "partition"],
+        columns=["_rowid", "__ivf_part_id"] + field_names,
+        # , "__residual_vec"],
     )
     loader = torch.utils.data.DataLoader(
        torch_ds,
@@ -378,24 +378,28 @@ def compute_pq_codes(
             for batch in loader:
                 #batch = to_full_tensor(batch)
                 # batch["__residual_vec"]
-                vecs = batch["__residual_vec"].to(device).reshape(
-                    -1, kmeans_list[0].centroids.shape[1] * len(kmeans_list)
-                )
+                # vecs = batch["__residual_vec"].to(device).reshape(
+                #     -1, kmeans_list[0].centroids.shape[1] * len(kmeans_list)
+                # )
+                # sub_vecs = vecs.view(
+                #     vecs.shape[0], num_sub_vectors, vecs.shape[1] // num_sub_vectors
+                # )
+                vecs_lists = [batch[field_names[i]].to(device).reshape(
+                    -1, kmeans_list[i].centroids.shape[1]
+                ) for i in range(num_sub_vectors)]
 
-                ids = batch["_rowid"].reshape(-1)
-                partitions = batch["__ivf_part_id"].reshape(-1)
-
-                sub_vecs = vecs.view(
-                    vecs.shape[0], num_sub_vectors, vecs.shape[1] // num_sub_vectors
-                )
                 pq_codes = torch.stack(
                     [
-                        kmeans_list[i].transform(sub_vecs[:, i, :])
+                        #kmeans_list[i].transform(sub_vecs[:, i, :])
+                        kmeans_list[i].transform(vecs_lists[i])
                         for i in range(num_sub_vectors)
                     ],
                     dim=1,
                 )
                 pq_codes = pq_codes.to(torch.uint8)
+
+                ids = batch["_rowid"].reshape(-1)
+                partitions = batch["__ivf_part_id"].reshape(-1)
 
                 ids = ids.cpu()
                 partitions = partitions.cpu()
@@ -446,6 +450,7 @@ def compute_partitions(
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
+    num_sub_vectors: Optional[int] = None,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -492,14 +497,19 @@ def compute_partitions(
 
     dim = kmeans.centroids.shape[1]
 
-    # TODO add option to not have residual vec. Also split into subvecs here.
+    fields = []
+    if num_sub_vectors is not None:
+        field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
+        subvector_size = dim // num_sub_vectors
+        fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
 
     output_schema = pa.schema(
         [
             pa.field("_rowid", pa.uint64()),
             pa.field("__ivf_part_id", pa.uint32()),
-            pa.field("__residual_vec", pa.list_(pa.float32(), list_size=dim)),
+            #pa.field("__residual_vec", pa.list_(pa.float32(), list_size=dim)),
         ]
+        + fields
     )
 
     progress = tqdm(total=num_rows)
@@ -513,31 +523,34 @@ def compute_partitions(
                     .reshape(-1, kmeans.centroids.shape[1])
                 )
 
-
                 partitions = kmeans.transform(vecs)
                 ids = batch["_rowid"].reshape(-1)
                 # this is expected to be true, so just assert
                 assert vecs.shape[0] == ids.shape[0]
 
-                residual_vecs = vecs - kmeans.centroids[partitions]
-
                 # Ignore any invalid vectors.
-                mask = (partitions.isfinite()).cpu()
+                mask_gpu = partitions.isfinite()
+                mask = mask_gpu.cpu()
                 ids = ids[mask]
-                partitions = partitions.cpu()[mask]
+                partitions = partitions[mask_gpu].cpu()
 
-                residual_vecs = residual_vecs.cpu()[mask]
-                residual_vecs = residual_vecs.to(vecs.dtype)
+                split_columns = []
+                if num_sub_vectors is not None:
+                    residual_vecs = vecs - kmeans.centroids[partitions]
+                    residual_vecs = residual_vecs[mask_gpu]
 
-                residual_values = pa.array(residual_vecs.numpy().reshape(-1))
-                residual_vecs = pa.FixedSizeListArray.from_arrays(residual_values, dim)
+                    for i in range(num_sub_vectors):
+                        subvector_tensor = residual_vecs[:, i * subvector_size: (i + 1) * subvector_size]
+                        subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
+                        subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
+                        split_columns.append(subvector_fsl)
 
                 part_batch = pa.RecordBatch.from_arrays(
                     [
                         ids.numpy(),
                         partitions.numpy(),
-                        residual_vecs,
-                    ],
+                        #residual_vecs,
+                    ] + split_columns,
                     schema=output_schema,
                 )
                 if len(part_batch) < len(ids):

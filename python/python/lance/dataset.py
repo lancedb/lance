@@ -8,6 +8,7 @@ import json
 import os
 import pickle
 import random
+import shutil
 import sqlite3
 import warnings
 from abc import ABC, abstractmethod
@@ -1688,8 +1689,11 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
+                num_sub_vectors_cur = None
+                if "PQ" in index_type and pq_codebook is None:
+                    num_sub_vectors_cur = num_sub_vectors # compute residual subspace columns in the same pass
                 partitions_file = compute_partitions(
-                    self, column[0], kmeans, batch_size=20480
+                    self, column[0], kmeans, batch_size=20480, num_sub_vectors=num_sub_vectors_cur
                 )
                 kwargs["precomputed_partitions_file"] = partitions_file
 
