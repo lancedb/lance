@@ -1755,7 +1755,10 @@ class LanceDataset(pa.dataset.Dataset):
                     kmeans_list,
                     batch_size=20480,
                 )
-                # TODO delete the partitions_file at this point
+                # Save disk space
+                if precomputed_partiton_dataset is not None and os.path.exists(partitions_file):
+                    shutil.rmtree(partitions_file)
+
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
                 kwargs["precomputed_shuffle_buffers_path"] = os.path.join(shuffle_output_dir, "data")
 
@@ -1795,6 +1798,9 @@ class LanceDataset(pa.dataset.Dataset):
         self._ds.create_index(
             column, index_type, name, replace, storage_options, kwargs
         )
+        # Save disk space
+        if "precomputed_shuffle_buffers_path" in kwargs.keys():
+            shutil.rmtree(kwargs["precomputed_shuffle_buffers_path"])
         return self
 
     def session(self) -> Session:
