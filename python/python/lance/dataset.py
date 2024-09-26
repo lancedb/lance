@@ -1618,8 +1618,6 @@ class LanceDataset(pa.dataset.Dataset):
 
         kwargs["metric_type"] = metric
 
-        no_pq_accel = False
-
         index_type = index_type.upper()
         valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
         if index_type not in valid_index_types:
@@ -1660,15 +1658,19 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partiton_dataset is provided"
                 )
             if precomputed_partiton_dataset is not None:
-                raise ValueError(
-                    "precomputed_partition_dataset no longer supported, please add __ivf_part_id column directly")
-
-            if accelerator == "cuda-ivf-only":
-                accelerator = "cuda"
-                no_pq_accel = True
-            if accelerator == "cuvs-ivf-only":
-                accelerator = "cuvs"
-                no_pq_accel = True
+                precomputed_ds = LanceDataset(
+                    precomputed_partiton_dataset, storage_options=storage_options
+                )
+                if len(precomputed_ds.get_fragments()) != 1:
+                    raise ValueError(
+                        "precomputed_partiton_dataset must have only one fragment"
+                    )
+                files = precomputed_ds.get_fragments()[0].data_files()
+                if len(files) != 1:
+                    raise ValueError(
+                        "precomputed_partiton_dataset must have only one files"
+                    )
+                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
@@ -1684,10 +1686,10 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
-                compute_partitions(
+                partitions_file = compute_partitions(
                     self, column[0], kmeans, batch_size=20480
                 )
-                kwargs["use_precomputed_partitions"] = True
+                kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
                 raise ValueError(
@@ -1728,7 +1730,10 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
 
-            if pq_codebook is None and accelerator is not None and not no_pq_accel:
+            if pq_codebook is None and accelerator is not None:
+                partitions_file = kwargs["precomputed_partitions_file"]
+                kwargs["precomputed_partitions_file"] = None
+                partitions_ds = lance.dataset(partitions_file)
                 # Use accelerator to train pq codebook
                 from .vector import (
                     compute_pq_codes,
@@ -1736,20 +1741,23 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
                 pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
-                    self,
-                    column[0],
+                    partitions_ds,
                     metric,
                     kmeans,
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
                 )
-                compute_pq_codes(
-                    self,
-                    column[0],
+                shuffle_output_dir = compute_pq_codes(
+                    partitions_ds,
                     kmeans_list,
                     batch_size=20480,
                 )
-                kwargs["use_precomputed_pq_codes"] = True
+                output_ds = lance.dataset(shuffle_output_dir)
+                shuffle_buffers = [
+                    frag.data_files()[0].path() for frag in output_ds.get_fragments()
+                ]
+                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                kwargs["precomputed_shuffle_buffers_path"] = path.join(shuffle_output_dir, "data"),
 
             if pq_codebook is not None:
                 # User provided IVF centroids
