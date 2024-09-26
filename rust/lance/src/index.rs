@@ -973,7 +973,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let dimensions = 16;
         let column_name = "vec";
-        let field = Field::new(
+        let vec_field = Field::new(
             column_name,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
@@ -981,14 +981,25 @@ mod tests {
             ),
             false,
         );
-        let schema = Arc::new(Schema::new(vec![field]));
+        let other_column_name = "other_vec";
+        let other_vec_field = Field::new(
+            other_column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![vec_field, other_vec_field]));
 
         let float_arr = generate_random_array(512 * dimensions as usize);
 
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let vectors = Arc::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap(),
+        );
 
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let record_batch =
+            RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()]).unwrap();
 
         let reader = RecordBatchIterator::new(
             vec![record_batch.clone()].into_iter().map(Ok),
@@ -1003,6 +1014,16 @@ mod tests {
                 &[column_name],
                 IndexType::Vector,
                 Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &[other_column_name],
+                IndexType::Vector,
+                Some("other_vec_idx".into()),
                 &params,
                 true,
             )
@@ -1042,6 +1063,31 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 1);
         assert_eq!(stats["num_indices"], 1);
+
+        // optimize the other index
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0, // Just create index for delta
+                index_names: Some(vec!["other_vec_idx".to_string()]),
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("other_vec_idx").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 2);
 
         dataset
             .optimize_indices(&OptimizeOptions {
