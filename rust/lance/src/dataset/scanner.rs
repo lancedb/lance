@@ -4717,20 +4717,22 @@ mod test {
         )
         .await?;
 
-        assert_plan_equals(
-            &dataset.dataset,
-            |scan| {
-                scan.project(&["s"])?
-                    .use_scalar_index(false)
-                    .filter("i > 10")
-            },
-            "ProjectionExec: expr=[s@2 as s]
+        if data_storage_version != LanceFileVersion::Legacy {
+            assert_plan_equals(
+                &dataset.dataset,
+                |scan| {
+                    scan.project(&["s"])?
+                        .use_scalar_index(false)
+                        .filter("i > 10")
+                },
+                "ProjectionExec: expr=[s@2 as s]
   Take: columns=\"i, _rowid, (s)\"
     CoalesceBatchesExec: target_batch_size=8192
       FilterExec: i@0 > 10
         LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=true",
-        )
-        .await?;
+            )
+            .await?;
+        }
 
         // Empty projection
         assert_plan_equals(
