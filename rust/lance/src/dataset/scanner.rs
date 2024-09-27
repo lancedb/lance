@@ -1286,8 +1286,7 @@ impl Scanner {
                 let index = self.dataset.load_scalar_index_for_column(column).await?;
                 if let Some(index) = index {
                     let uuid = index.uuid.to_string();
-                    let index_type =
-                        detect_scalar_index_type(&self.dataset, &column, &uuid).await?;
+                    let index_type = detect_scalar_index_type(&self.dataset, column, &uuid).await?;
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         indexed_columns.push(column.clone());
                     }
