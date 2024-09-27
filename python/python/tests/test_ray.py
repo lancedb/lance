@@ -114,4 +114,5 @@ def test_ray_empty_write_lance(tmp_path: Path):
         .write_lance(tmp_path, schema=schema)
     )
     # empty write would not generate dataset.
-    # ds = lance.dataset(tmp_path)
+    with pytest.raises(ValueError):
+        lance.dataset(tmp_path)

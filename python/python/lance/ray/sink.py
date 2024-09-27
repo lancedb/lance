@@ -372,19 +372,8 @@ class LanceCommitter(_BaseLanceDatasink):
         """Passthrough the fragments to commit phase"""
         v = []
         for block in blocks:
-            # Empty sink did not have "fragment" and "schema" in block
-            if isinstance(block, pa.Table) and block.num_columns == 0:
-                continue
-
-            from ..dependencies import _PANDAS_AVAILABLE
-            from ..dependencies import pandas as pd
-
-            # check block as pandas
-            if (
-                _PANDAS_AVAILABLE
-                and isinstance(block, pd.DataFrame)
-                and len(block.columns) == 0
-            ):
+            # If block is empty, skip to get "fragment" and "schema" filed
+            if len(block) == 0:
                 continue
 
             for fragment, schema in zip(
