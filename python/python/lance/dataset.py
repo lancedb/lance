@@ -61,8 +61,6 @@ from .optimize import Compaction
 from .schema import LanceSchema
 from .util import td_to_micros
 
-import os
-
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
 
@@ -1696,7 +1694,8 @@ class LanceDataset(pa.dataset.Dataset):
                 print(f"ivf training time: {times[1]-times[0]}s")
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
-                    num_sub_vectors_cur = num_sub_vectors  # compute residual subspace columns in the same pass
+                    # compute residual subspace columns in the same pass
+                    num_sub_vectors_cur = num_sub_vectors
                 partitions_file = compute_partitions(
                     self,
                     column[0],

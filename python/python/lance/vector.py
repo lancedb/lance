@@ -13,8 +13,6 @@ from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
 import pyarrow as pa
 from tqdm.auto import tqdm
 
-import lance
-
 from . import write_dataset
 from .dependencies import _check_for_numpy, torch
 from .dependencies import numpy as np
@@ -138,28 +136,21 @@ def train_pq_codebook_on_accelerator(
     batch_size: int = 1024 * 10 * 4,
 ) -> (np.ndarray, List[Any]):
     """Use accelerator (GPU or MPS) to train pq codebook."""
-    from lance.torch.data import _to_tensor as to_full_tensor
 
     # cuvs not particularly useful for only 256 centroids without more work
     if accelerator == "cuvs":
         accelerator = "cuda"
 
-    device = kmeans.device
 
     centroids_list = []
     kmeans_list = []
 
     field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
-    dim = kmeans.centroids.shape[1]
-    subvector_size = dim // num_sub_vectors
-    fields = [
-        pa.field(name, pa.list_(pa.float32(), list_size=subvector_size))
-        for name in field_names
-    ]
-    split_schema = pa.schema(fields)
+    kmeans.centroids.shape[1]
 
     sample_size = 256 * 256
     from lance.torch.data import LanceDataset as TorchDataset
+
     from .torch.kmeans import KMeans
 
     ds_init = TorchDataset(
@@ -352,7 +343,6 @@ def compute_pq_codes(
 
     device = kmeans_list[0].device
 
-    from lance.torch.data import _to_tensor as to_full_tensor
 
     def _pq_codes_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
@@ -403,10 +393,11 @@ def compute_pq_codes(
     progress.close()
 
     logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
-    shuffle_buffers = []
-    for frag in ds.get_fragments():
-        for data_file in frag.data_files():
-            shuffle_buffers.append(data_file.path())
+
+    shuffle_buffers = [
+        data_file.path() for frag in ds.get_fragments()
+        for data_file in frag.data_files()
+    ]
     return dst_dataset_uri, shuffle_buffers
 
 
