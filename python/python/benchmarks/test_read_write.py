@@ -29,6 +29,7 @@ for t in tables:
     pq.write_table(res.to_arrow_table(), tpch_dir_path + t + ".parquet")
 """
 
+
 def measure_pyarrow_read_time(path, num_trials, verbose=False):
     """
     Measures the time required to read a parquet file using pyarrow,
@@ -47,7 +48,13 @@ def measure_pyarrow_read_time(path, num_trials, verbose=False):
             )
 
     avg_read_time = parquet_read_time / num_trials
-    print(f"Parquet Read Time: {avg_read_time}s")
+
+    file_size_bytes = os.path.getsize(path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+
+    print(
+        f"Parquet Read Time: {avg_read_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+    )
     return avg_read_time
 
 
@@ -75,11 +82,19 @@ def measure_parquet_write_time(table, path, num_trials, verbose=False):
             )
 
     avg_write_time = parquet_write_time / num_trials
-    print(f"Parquet Write Time: {avg_write_time}s")
+
+    file_size_bytes = os.path.getsize(path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+
+    print(
+        f"Parquet Write Time: {avg_write_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+    )
     return avg_write_time
 
 
-def measure_lance_read_time(path, num_trials, batch_size, verbose=False, lance_version = "2.0"):
+def measure_lance_read_time(
+    path, num_trials, batch_size, verbose=False, lance_version="2.0"
+):
     """
     Measures the time required to read a lance file using lance,
     averaged over multiple trials
@@ -100,11 +115,19 @@ def measure_lance_read_time(path, num_trials, batch_size, verbose=False, lance_v
             )
 
     avg_read_time = lance_read_time / num_trials
-    print("Lance " + lance_version + " Read Time: " + f"{avg_read_time}s")
+
+    file_size_bytes = os.path.getsize(path)
+    file_size_mb = file_size_bytes / (1024 * 1024)
+
+    print(
+        f"Lance {lance_version} Read Time: {avg_read_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+    )
     return avg_read_time
 
 
-def measure_lance_write_time(dataset, path, num_trials=10, verbose=False, lance_version = "2.0"):
+def measure_lance_write_time(
+    dataset, path, num_trials=10, verbose=False, lance_version="2.0"
+):
     """
     Takes a lance dataset object as input, and writes a lance
     file to disk in a directory
@@ -119,7 +142,7 @@ def measure_lance_write_time(dataset, path, num_trials=10, verbose=False, lance_
     lance_write_time = 0
     for trial in range(1, num_trials + 1):
         start = datetime.now()
-        with LanceFileWriter(path, dataset.schema, version = lance_version) as writer:
+        with LanceFileWriter(path, dataset.schema, version=lance_version) as writer:
             for batch in dataset.to_batches():
                 writer.write_batch(batch)
         end = datetime.now()
@@ -134,62 +157,75 @@ def measure_lance_write_time(dataset, path, num_trials=10, verbose=False, lance_
     if os.path.exists(path):
         file_size_bytes = os.path.getsize(path)
         file_size_mb = file_size_bytes / (1024 * 1024)
-        print("Lance " + lance_version + " Write Time: " +  f"{avg_write_time}s", end = "\t")
 
-        # Measure the file size after writing
-        print(f"Lance file size: {file_size_mb:.2f} MB")
+        print(
+            f"Lance {lance_version} Write Time: {avg_write_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+        )
+    else:
+        raise (f"Lance {lance_version} write file {path} failed")
 
     return avg_write_time
 
 
-def benchmark_tpch_lineitem(dataset_dir, num_trials=10, verbose=False, lance_version = "2.0"):
+def benchmark_tpch_lineitem(
+    dataset_dir, num_trials=10, verbose=False, lance_version="2.0"
+):
     name = benchmark_tpch_lineitem.__name__
     dataset_path = dataset_dir + "lineitem.parquet"
     output = csv.writer(open(name + ".csv", "w"))
-    output.writerow(
-        [
-            "name",
-            "dataset",
-            "num_trials",
-            "num_rows",
-            "parquet_size",
-            "pyarrow_read_time",
-            "lance_size",
-            "lance_read_time",
-        ]
-    )
 
     dataset = ds.dataset(dataset_path)
     num_rows = dataset.count_rows()
-    parquet_size = os.path.getsize(dataset_path) / (1024**2)
+    parquet_size = os.path.getsize(dataset_path)
+    parquet_size_mb = parquet_size / (1024 * 1024)
 
     pyarrow_read_time = measure_pyarrow_read_time(dataset_path, num_trials=10)
 
     dataset = ds.dataset(dataset_path)
-    lance_path = "/tmp/tpch.lancev2"
-    measure_lance_write_time(dataset, path=lance_path, num_trials=1, lance_version = lance_version)
-    lance_size = os.path.getsize(lance_path) / (1024**2)
+    lance_path = "/tmp/tpch.lanceV" + lance_version
+    measure_lance_write_time(
+        dataset, path=lance_path, num_trials=1, lance_version=lance_version
+    )
+    lance_size = os.path.getsize(lance_path)
+    lance_size_mb = lance_size / (1024 * 1024)
 
     lance_read_time = measure_lance_read_time(
-        lance_path, num_trials=10, batch_size=1024 * 8, lance_version = lance_version
+        lance_path, num_trials=10, batch_size=1024 * 8, lance_version=lance_version
     )
 
-    output.writerow(
+    output.writerows(
         [
-            name,
-            "tpch_lineitem",
-            num_trials,
-            num_rows,
-            parquet_size,
-            pyarrow_read_time,
-            lance_size,
-            lance_read_time,
+            [
+                "name",
+                "dataset",
+                "num_trials",
+                "num_rows",
+                "parquet_size",
+                "lance_size",
+                "pyarrow_read_time",
+                "lance_read_time",
+            ],
+            [
+                name,
+                "tpch_lineitem",
+                num_trials,
+                num_rows,
+                f"{parquet_size_mb:.2f} MiB",
+                f"{lance_size_mb:.2f} MiB",
+                f"{pyarrow_read_time:.2f} seconds",
+                f"{lance_read_time:.2f} seconds",
+            ],
         ]
     )
 
 
 def benchmark_tpch_encodings(
-    dataset_dir, dataset_name, encoding_type, num_trials=10, verbose=False, lance_version="2.0"
+    dataset_dir,
+    dataset_name,
+    encoding_type,
+    num_trials=10,
+    verbose=False,
+    lance_version="2.0",
 ):
     """
     Loads numeric columns from TPCH tables and benchmarks the read times for
@@ -208,10 +244,10 @@ def benchmark_tpch_encodings(
             "num_trials",
             "num_rows",
             "parquet_size",
-            "parquet_write_time",
-            "parquet_read_time",
             "lance_size",
+            "parquet_write_time",
             "lance_write_time",
+            "parquet_read_time",
             "lance_read_time",
         ]
     )
@@ -241,7 +277,16 @@ def benchmark_tpch_encodings(
         elif encoding_type == "plain_timestamp":
             target_types = [pa.date32()]
         elif encoding_type == "integer":
-            target_types = [pa.int8(), pa.int16(), pa.int32(), pa.int64(), pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64()]
+            target_types = [
+                pa.int8(),
+                pa.int16(),
+                pa.int32(),
+                pa.int64(),
+                pa.uint8(),
+                pa.uint16(),
+                pa.uint32(),
+                pa.uint64(),
+            ]
 
         target_columns = [
             field.name for field in orig_schema if field.type in target_types
@@ -249,7 +294,6 @@ def benchmark_tpch_encodings(
 
         if len(target_columns) == 0:
             continue
-        print("target_columns: ", target_columns)
         table = orig_dataset.to_table(columns=target_columns)
         parquet_path = "/tmp/parquet_ds.parquet"
 
@@ -259,20 +303,25 @@ def benchmark_tpch_encodings(
 
         dataset = ds.dataset(parquet_path)
         num_rows = dataset.count_rows()
-        parquet_size = os.path.getsize(parquet_path) / (1024**3)
+        parquet_size = os.path.getsize(parquet_path)
+        parquet_size_mb = parquet_size / (1024 * 1024)
 
         parquet_read_time = measure_pyarrow_read_time(
             parquet_path, num_trials=num_trials
         )
 
-        lance_path = "/tmp/tpch.lancev2"
+        lance_path = "/tmp/tpch.lanceV" + lance_version
         lance_write_time = measure_lance_write_time(
             table, lance_path, num_trials=num_trials, lance_version=lance_version
         )
-        lance_size = os.path.getsize(lance_path) / (1024**3)
+        lance_size = os.path.getsize(lance_path)
+        lance_size_mb = lance_size / (1024 * 1024)
 
         lance_read_time = measure_lance_read_time(
-            lance_path, num_trials=num_trials, batch_size=1024 * 8, lance_version=lance_version
+            lance_path,
+            num_trials=num_trials,
+            batch_size=1024 * 8,
+            lance_version=lance_version,
         )
 
         output.writerow(
@@ -282,12 +331,12 @@ def benchmark_tpch_encodings(
                 encoding_type,
                 num_trials,
                 num_rows,
-                parquet_size,
-                parquet_write_time,
-                parquet_read_time,
-                lance_size,
-                lance_write_time,
-                lance_read_time,
+                f"{parquet_size_mb:.2f} MiB",
+                f"{lance_size_mb:.2f} MiB",
+                f"{parquet_write_time:.2f} seconds",
+                f"{lance_write_time:.2f} seconds",
+                f"{parquet_read_time:.2f} seconds",
+                f"{lance_read_time:.2f} seconds",
             ]
         )
 
@@ -310,13 +359,18 @@ Data generation (sift)
         dd = dict(zip(range(nvecs), data))
 
     table = vec_to_table(dd)
-    parquet_path = "/home/ubuntu/test/sift1m.parquet"
+    parquet_path = "/tmp/sift1m.parquet"
 
 """
 
 
 def benchmark_sift_vector_encodings(
-    dataset_dir, dataset_name, encoding_type, num_trials=10, verbose=False, lance_version="2.0" 
+    dataset_dir,
+    dataset_name,
+    encoding_type,
+    num_trials=10,
+    verbose=False,
+    lance_version="2.0",
 ):
     benchmark_name = benchmark_sift_vector_encodings.__name__
     output = csv.writer(open(benchmark_name + "_" + encoding_type + ".csv", "w"))
@@ -328,10 +382,10 @@ def benchmark_sift_vector_encodings(
             "num_trials",
             "num_rows",
             "parquet_size",
-            "parquet_write_time",
-            "parquet_read_time",
             "lance_size",
+            "parquet_write_time",
             "lance_write_time",
+            "parquet_read_time",
             "lance_read_time",
         ]
     )
@@ -352,14 +406,17 @@ def benchmark_sift_vector_encodings(
 
     parquet_read_time = measure_pyarrow_read_time(parquet_path, num_trials=num_trials)
 
-    lance_path = "/tmp/tpch.lancev2"
+    lance_path = "/tmp/tpch.lanceV" + lance_version
     lance_write_time = measure_lance_write_time(
         table, lance_path, num_trials=num_trials, lance_version=lance_version
     )
     lance_size = os.path.getsize(lance_path) / (1024**3)
 
     lance_read_time = measure_lance_read_time(
-        lance_path, num_trials=num_trials, batch_size=1024 * 8, lance_version=lance_version
+        lance_path,
+        num_trials=num_trials,
+        batch_size=1024 * 8,
+        lance_version=lance_version,
     )
 
     output.writerow(
@@ -384,41 +441,40 @@ tpch_dir_path = "/tmp/TPCH_SF1/"
 dataset_name = "tpch_sf1"
 
 if __name__ == "__main__":
+    # Version "2.1" test is temporarily disabled due to currently issues when activate it
+    for lance_version in ["2.0"]:
+        benchmark_tpch_lineitem(tpch_dir_path, lance_version)
+        benchmark_tpch_encodings(
+            tpch_dir_path,
+            dataset_name=dataset_name,
+            encoding_type="plain_numeric",
+            lance_version=lance_version,
+        )
+        benchmark_tpch_encodings(
+            tpch_dir_path,
+            dataset_name=dataset_name,
+            encoding_type="plain_non_numeric",
+            lance_version=lance_version,
+        )
+        benchmark_tpch_encodings(
+            tpch_dir_path,
+            dataset_name=dataset_name,
+            encoding_type="plain_timestamp",
+            lance_version=lance_version,
+        )
+        benchmark_tpch_encodings(
+            tpch_dir_path,
+            dataset_name=dataset_name,
+            encoding_type="integer",
+            lance_version=lance_version,
+        )
 
-    lance_version = input("Which Lance file version would you like to test? Please specify one of the following options: 2.0 or 2.1: ")
-
-    if lance_version not in ["2.0", "2.1"]:
-        raise ValueError("Invalid Lance file version specified. Please choose either 2.0 or 2.1.")
-    benchmark_tpch_lineitem(tpch_dir_path, lance_version)
-    benchmark_tpch_encodings(
-        tpch_dir_path,
-        dataset_name=dataset_name,
-        encoding_type="plain_numeric",
-        lance_version=lance_version,
-    )
-    benchmark_tpch_encodings(
-        tpch_dir_path,
-        dataset_name=dataset_name,
-        encoding_type="plain_non_numeric",
-        lance_version=lance_version,
-    )
-    benchmark_tpch_encodings(
-        tpch_dir_path,
-        dataset_name=dataset_name,
-        encoding_type="plain_timestamp",
-        lance_version=lance_version,
-    )
-    benchmark_tpch_encodings(
-        tpch_dir_path,
-        dataset_name=dataset_name,
-        encoding_type="integer",
-        lance_version=lance_version,
-    )
-
-    benchmark_sift_vector_encodings(
-        "/home/ubuntu/test/",
-        dataset_name="sift1m",
-        encoding_type="plain_fixed_size_list",
-        num_trials=5,
-        lance_version=lance_version,
-    )
+        """
+        benchmark_sift_vector_encodings(
+            "/home/ubuntu/test/",
+            dataset_name="sift1m",
+            encoding_type="plain_fixed_size_list",
+            num_trials=5,
+            lance_version=lance_version,
+        )
+        """
