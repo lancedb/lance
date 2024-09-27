@@ -271,22 +271,31 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
         }),
     }?;
 
-    let (substrait_schema, input_schema, index_mapping) =
-        remove_extension_types(envelope.base_schema.as_ref().unwrap(), input_schema.clone())?;
+    let (substrait_schema, input_schema) =
+        if envelope.base_schema.as_ref().unwrap().r#struct.is_some() {
+            let (substrait_schema, input_schema, index_mapping) = remove_extension_types(
+                envelope.base_schema.as_ref().unwrap(),
+                input_schema.clone(),
+            )?;
 
-    if substrait_schema.r#struct.as_ref().unwrap().types.len()
-        != envelope
-            .base_schema
-            .as_ref()
-            .unwrap()
-            .r#struct
-            .as_ref()
-            .unwrap()
-            .types
-            .len()
-    {
-        remap_expr_references(&mut expr, &index_mapping)?;
-    }
+            if substrait_schema.r#struct.as_ref().unwrap().types.len()
+                != envelope
+                    .base_schema
+                    .as_ref()
+                    .unwrap()
+                    .r#struct
+                    .as_ref()
+                    .unwrap()
+                    .types
+                    .len()
+            {
+                remap_expr_references(&mut expr, &index_mapping)?;
+            }
+
+            (substrait_schema, input_schema)
+        } else {
+            (envelope.base_schema.as_ref().unwrap().clone(), input_schema)
+        };
 
     // Datafusion's substrait consumer only supports Plan (not ExtendedExpression) and so
     // we need to create a dummy plan with a single project node

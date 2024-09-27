@@ -299,7 +299,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -323,7 +323,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::RangeFull,
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -349,7 +349,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::Indices(indices),
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -454,7 +454,8 @@ impl FileFragment {
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                DecoderMiddlewareChain::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
+                &dataset.session.file_metadata_cache,
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
@@ -639,8 +640,9 @@ impl FileFragment {
                 v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
-                    DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                     file_metadata,
+                    &self.dataset.session.file_metadata_cache,
                 )
                 .await?,
             );

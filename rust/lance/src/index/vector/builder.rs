@@ -8,6 +8,7 @@ use arrow_array::{RecordBatch, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
+use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
@@ -499,7 +500,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 let reader = FileReader::try_open(
                     scheduler.open_file(&storage_part_path).await?,
                     None,
-                    DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
+                    &FileMetadataCache::no_cache(),
                 )
                 .await?;
                 let batches = reader
@@ -531,7 +533,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
                 let reader = FileReader::try_open(
                     scheduler.open_file(&index_part_path).await?,
                     None,
-                    DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
+                    &FileMetadataCache::no_cache(),
                 )
                 .await?;
                 let batches = reader
