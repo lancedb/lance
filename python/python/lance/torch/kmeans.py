@@ -218,7 +218,7 @@ class KMeans:
         float
             The total distance of the current centroids and the input data.
         """
-        total_dist = 0
+        total_dist = torch.tensor(0.0, device=self.device)
 
         # Use float32 to accumulate centroids, esp. if the vectors are
         # float16 / bfloat16 types.
@@ -246,7 +246,8 @@ class KMeans:
 
             #total_dist += dists.nansum().item()
 
-            total_dist += dists.sum().item()
+            #total_dist += dists.sum().item()
+            total_dist += dists.sum()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
@@ -255,6 +256,8 @@ class KMeans:
             del ids
             del dists
             del chunk
+
+        total_dist = total_dist.item()
 
         # this happens when there are too many NaNs or the data is just the same
         # vectors repeated over and over. Performance may be bad but we don't

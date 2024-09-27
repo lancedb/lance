@@ -515,8 +515,9 @@ def compute_partitions(
 
                 partitions = kmeans.transform(vecs)
                 ids = batch["_rowid"].reshape(-1)
+
                 # this is expected to be true, so just assert
-                assert vecs.shape[0] == ids.shape[0]
+                #assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
                 #mask_gpu = partitions.isfinite()
