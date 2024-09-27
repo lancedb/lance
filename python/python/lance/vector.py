@@ -233,7 +233,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=k,
         columns=[column],
         samples=sample_size,
-        # filter=filt,
+        filter=filt,
     )
 
     init_centroids = next(iter(ds))
@@ -244,7 +244,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=20480,
         columns=[column],
         samples=sample_size,
-        # filter=filt,
+        filter=filt,
         cache=True,
     )
 
@@ -448,7 +448,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-        # filter=f"{column} is not null",
+        filter=f"{column} is not null",
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
