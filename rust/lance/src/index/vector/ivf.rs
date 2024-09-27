@@ -2210,8 +2210,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn test_create_ivf_pq_cosine() {
+    async fn run_ivf_pq_cosine_test(is_v3_index: bool) {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2223,8 +2222,11 @@ mod tests {
 
         let pq_params = PQBuildParams::new(4, 8);
 
-        let params =
-            VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params);
+        let params: VectorIndexParams = if is_v3_index {
+            VectorIndexParams::with_ivf_pq_params_v3(MetricType::Cosine, ivf_params, pq_params)
+        } else {
+            VectorIndexParams::with_ivf_pq_params(MetricType::Cosine, ivf_params, pq_params)
+        };
 
         dataset
             .create_index(&["vector"], IndexType::Vector, None, &params, false)
@@ -2258,6 +2260,269 @@ mod tests {
                     )
                 });
         }
+    }
+
+    async fn run_ivf_pq_dot_test(is_v3_index: bool) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
+
+        let centroids = generate_random_array(2 * DIM);
+        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
+        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
+
+        let codebook = Arc::new(generate_random_array(256 * DIM));
+        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
+
+        let params: VectorIndexParams = if is_v3_index {
+            VectorIndexParams::with_ivf_pq_params_v3(MetricType::Dot, ivf_params, pq_params)
+        } else {
+            VectorIndexParams::with_ivf_pq_params(MetricType::Dot, ivf_params, pq_params)
+        };
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let sample_query = vector_array.value(10);
+        let query = sample_query.as_primitive::<Float32Type>();
+        let results = dataset
+            .scan()
+            .nearest("vector", query, 5)
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(1, results.len());
+        assert_eq!(5, results[0].num_rows());
+
+        for batch in results.iter() {
+            let dist = &batch["_distance"];
+            dist.as_primitive::<Float32Type>()
+                .values()
+                .iter()
+                .for_each(|v| {
+                    assert!(
+                        (-2.0 * DIM as f32..0.0).contains(v),
+                        "Expect dot product value in range [-2.0 * DIM, 0.0], got: {}",
+                        v
+                    )
+                });
+        }
+    }
+
+    async fn run_create_ivf_pq_f16_test(is_v3_index: bool) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params: VectorIndexParams = if is_v3_index {
+            VectorIndexParams::with_ivf_pq_params_v3(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                PQBuildParams::new(4, 8),
+            )
+        } else {
+            VectorIndexParams::with_ivf_pq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                PQBuildParams::new(4, 8),
+            )
+        };
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(
+                "vector",
+                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                5,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let batch = &results[0];
+        assert_eq!(
+            batch.schema(),
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        DIM as i32,
+                    ),
+                    true,
+                ),
+                Field::new("_distance", DataType::Float32, true)
+            ]))
+        );
+    }
+
+    async fn run_create_ivf_pq_f16_with_codebook_test(is_v3_index: bool) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let codebook = Arc::new(generate_random_array_with_seed::<Float16Type>(
+            256 * DIM,
+            [22; 32],
+        ));
+        let params: VectorIndexParams = if is_v3_index {
+            VectorIndexParams::with_ivf_pq_params_v3(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                PQBuildParams::with_codebook(4, 8, codebook),
+            )
+        } else {
+            VectorIndexParams::with_ivf_pq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                PQBuildParams::with_codebook(4, 8, codebook),
+            )
+        };
+
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .nearest(
+                "vector",
+                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
+                5,
+            )
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].num_rows(), 5);
+        let batch = &results[0];
+        assert_eq!(
+            batch.schema(),
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "vector",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float16, true)),
+                        DIM as i32,
+                    ),
+                    true,
+                ),
+                Field::new("_distance", DataType::Float32, true)
+            ]))
+        );
+    }
+
+    async fn run_create_ivf_pq_with_invalid_num_sub_vectors_test(is_v3_index: bool) {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        const DIM: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                DIM as i32,
+            ),
+            true,
+        )]));
+
+        let arr = generate_random_array_with_seed::<Float32Type>(1000 * DIM, [22; 32]);
+        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params: VectorIndexParams = if is_v3_index {
+            VectorIndexParams::with_ivf_pq_params_v3(
+                MetricType::L2,
+                IvfBuildParams::new(256),
+                PQBuildParams::new(6, 8),
+            )
+        } else {
+            VectorIndexParams::with_ivf_pq_params(
+                MetricType::L2,
+                IvfBuildParams::new(256),
+                PQBuildParams::new(6, 8),
+            )
+        };
+
+        let res = dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await;
+        match &res {
+            Err(Error::InvalidInput { source, .. }) => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("num_sub_vectors must divide vector dimension"),
+                    "{:?}",
+                    res
+                );
+            }
+            _ => panic!("Expected InvalidInput error: {:?}", res),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_cosine() {
+        run_ivf_pq_cosine_test(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_ivf_pq_v3_cosine() {
+        run_ivf_pq_cosine_test(true).await;
     }
 
     #[tokio::test]
@@ -2322,228 +2587,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_ivf_pq_dot() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        run_ivf_pq_dot_test(false).await;
+    }
 
-        let (mut dataset, vector_array) = generate_test_dataset(test_uri, 0.0..1.0).await;
-
-        let centroids = generate_random_array(2 * DIM);
-        let ivf_centroids = FixedSizeListArray::try_new_from_values(centroids, DIM as i32).unwrap();
-        let ivf_params = IvfBuildParams::try_with_centroids(2, Arc::new(ivf_centroids)).unwrap();
-
-        let codebook = Arc::new(generate_random_array(256 * DIM));
-        let pq_params = PQBuildParams::with_codebook(4, 8, codebook);
-
-        let params = VectorIndexParams::with_ivf_pq_params(MetricType::Dot, ivf_params, pq_params);
-
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        let sample_query = vector_array.value(10);
-        let query = sample_query.as_primitive::<Float32Type>();
-        let results = dataset
-            .scan()
-            .nearest("vector", query, 5)
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(1, results.len());
-        assert_eq!(5, results[0].num_rows());
-
-        for batch in results.iter() {
-            let dist = &batch["_distance"];
-            dist.as_primitive::<Float32Type>()
-                .values()
-                .iter()
-                .for_each(|v| {
-                    assert!(
-                        (-2.0 * DIM as f32..0.0).contains(v),
-                        "Expect dot product value in range [-2.0 * DIM, 0.0], got: {}",
-                        v
-                    )
-                });
-        }
+    #[tokio::test]
+    async fn test_create_ivf_pq_v3_dot() {
+        run_ivf_pq_dot_test(true).await;
     }
 
     #[tokio::test]
     async fn test_create_ivf_pq_f16() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        run_create_ivf_pq_f16_test(false).await;
+    }
 
-        const DIM: usize = 32;
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float16, true)),
-                DIM as i32,
-            ),
-            true,
-        )]));
-
-        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
-        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
-
-        let params = VectorIndexParams::with_ivf_pq_params(
-            MetricType::L2,
-            IvfBuildParams::new(2),
-            PQBuildParams::new(4, 8),
-        );
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        let results = dataset
-            .scan()
-            .nearest(
-                "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
-                5,
-            )
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].num_rows(), 5);
-        let batch = &results[0];
-        assert_eq!(
-            batch.schema(),
-            Arc::new(Schema::new(vec![
-                Field::new(
-                    "vector",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float16, true)),
-                        DIM as i32,
-                    ),
-                    true,
-                ),
-                Field::new("_distance", DataType::Float32, true)
-            ]))
-        );
+    #[tokio::test]
+    async fn test_create_ivf_pq_v3_f16() {
+        run_create_ivf_pq_f16_test(true).await;
     }
 
     #[tokio::test]
     async fn test_create_ivf_pq_f16_with_codebook() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        run_create_ivf_pq_f16_with_codebook_test(false).await;
+    }
 
-        const DIM: usize = 32;
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float16, true)),
-                DIM as i32,
-            ),
-            true,
-        )]));
-
-        let arr = generate_random_array_with_seed::<Float16Type>(1000 * DIM, [22; 32]);
-        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
-
-        let codebook = Arc::new(generate_random_array_with_seed::<Float16Type>(
-            256 * DIM,
-            [22; 32],
-        ));
-        let params = VectorIndexParams::with_ivf_pq_params(
-            MetricType::L2,
-            IvfBuildParams::new(2),
-            PQBuildParams::with_codebook(4, 8, codebook),
-        );
-        dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await
-            .unwrap();
-
-        let results = dataset
-            .scan()
-            .nearest(
-                "vector",
-                &Float32Array::from_iter_values(repeat(0.5).take(DIM)),
-                5,
-            )
-            .unwrap()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].num_rows(), 5);
-        let batch = &results[0];
-        assert_eq!(
-            batch.schema(),
-            Arc::new(Schema::new(vec![
-                Field::new(
-                    "vector",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float16, true)),
-                        DIM as i32,
-                    ),
-                    true,
-                ),
-                Field::new("_distance", DataType::Float32, true)
-            ]))
-        );
+    #[tokio::test]
+    async fn test_create_ivf_pq_v3_f16_with_codebook() {
+        run_create_ivf_pq_f16_with_codebook_test(true).await;
     }
 
     #[tokio::test]
     async fn test_create_ivf_pq_with_invalid_num_sub_vectors() {
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
+        run_create_ivf_pq_with_invalid_num_sub_vectors_test(false).await;
+    }
 
-        const DIM: usize = 32;
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
-            ),
-            true,
-        )]));
-
-        let arr = generate_random_array_with_seed::<Float32Type>(1000 * DIM, [22; 32]);
-        let fsl = FixedSizeListArray::try_new_from_values(arr, DIM as i32).unwrap();
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
-        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
-        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
-
-        let params = VectorIndexParams::with_ivf_pq_params(
-            MetricType::L2,
-            IvfBuildParams::new(256),
-            PQBuildParams::new(6, 8),
-        );
-        let res = dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, false)
-            .await;
-        match &res {
-            Err(Error::InvalidInput { source, .. }) => {
-                assert!(
-                    source
-                        .to_string()
-                        .contains("num_sub_vectors must divide vector dimension"),
-                    "{:?}",
-                    res
-                );
-            }
-            _ => panic!("Expected InvalidInput error: {:?}", res),
-        }
+    #[tokio::test]
+    async fn test_create_ivf_pq_v3_with_invalid_num_sub_vectors() {
+        run_create_ivf_pq_with_invalid_num_sub_vectors_test(true).await;
     }
 
     fn ground_truth(

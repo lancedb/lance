@@ -662,6 +662,22 @@ mod tests {
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.6)]
+    #[case(4, DistanceType::Dot, 0.2)]
+    #[tokio::test]
+    async fn test_build_ivf_pq_v3(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_pq_params_v3(distance_type, ivf_params, pq_params);
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]

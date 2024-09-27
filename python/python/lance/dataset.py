@@ -1445,6 +1445,7 @@ class LanceDataset(pa.dataset.Dataset):
         ivf_centroids_file: Optional[str] = None,
         precomputed_partiton_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        use_new_vector_index_format: Optional[bool] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1501,6 +1502,9 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        use_new_vector_index_format : bool, optional
+            Allows to use the new V3 index format. Default is False. This is most for
+            IVF_PQ indices which still default to use the legacy format.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1757,6 +1761,9 @@ class LanceDataset(pa.dataset.Dataset):
                     [pq_codebook], ["_pq_codebook"]
                 )
                 kwargs["pq_codebook"] = pq_codebook_batch
+
+        if index_type == "IVF_PQ" and use_new_vector_index_format is not None:
+            kwargs["use_new_vector_index_format"] = use_new_vector_index_format
 
         if shuffle_partition_batches is not None:
             kwargs["shuffle_partition_batches"] = shuffle_partition_batches

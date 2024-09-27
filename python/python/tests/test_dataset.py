@@ -29,6 +29,7 @@ from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
+from lance.file import LanceFileReader
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -2190,6 +2191,12 @@ def test_count_index_rows(tmp_path: Path):
     assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
     assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
+    indices = dataset.list_indices()
+    index_uuid = indices[0]["uuid"]
+    index_dir = base_dir / f"_indices/{index_uuid}"
+    index_path = os.listdir(index_dir)
+    assert len(index_path) == 1
+
 
 def test_dataset_progress(tmp_path: Path):
     data = pa.table({"a": range(10)})
@@ -2482,3 +2489,53 @@ def test_default_storage_version(tmp_path: Path):
     sample_file = frag.to_json()["files"][0]
     assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
     assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+
+def test_ivf_index_creation_with_v3_version(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        use_new_vector_index_format=True,
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    indices = dataset.list_indices()
+    index_uuid = indices[0]["uuid"]
+    storage_path = base_dir / f"_indices/{index_uuid}/auxiliary.idx"
+    reader = LanceFileReader(str(storage_path))
+    metadata = reader.metadata()
+    assert metadata.major_version == 0
+    assert metadata.minor_version == 3
