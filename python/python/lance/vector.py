@@ -432,6 +432,13 @@ def compute_pq_codes(
 def _collate_fn(batch):
     return batch[0]
 
+@torch.jit.script
+def extract_subvectors(vecs, centroids, partitions, subvector_size: int):
+    with torch.no_grad():
+        residual_vecs = vecs - centroids[partitions]
+        # Split the tensor into subvectors
+        split_subvectors = residual_vecs.split(subvector_size, dim=1)
+        return split_subvectors
 
 def compute_partitions(
     dataset: LanceDataset,
@@ -514,7 +521,7 @@ def compute_partitions(
                 )
 
                 partitions = kmeans.transform(vecs)
-                ids = batch["_rowid"].reshape(-1)
+                #ids = batch["_rowid"].reshape(-1)
 
                 # this is expected to be true, so just assert
                 #assert vecs.shape[0] == ids.shape[0]
@@ -529,18 +536,22 @@ def compute_partitions(
 
                 split_columns = []
                 if num_sub_vectors is not None:
-                    residual_vecs = vecs - kmeans.centroids[partitions]
+                    #residual_vecs = vecs - kmeans.centroids[partitions]
+                    split_subvectors = extract_subvectors(vecs, kmeans.centroids, partitions, subvector_size)
                     #residual_vecs = residual_vecs[mask_gpu]
 
-                    for i in range(num_sub_vectors):
-                        subvector_tensor = residual_vecs[:, i * subvector_size: (i + 1) * subvector_size]
-                        subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
+                    #for i in range(num_sub_vectors):
+                    for subvector_tensor in split_subvectors:
+                        #subvector_tensor = residual_vecs[:, i * subvector_size: (i + 1) * subvector_size]
+                        #subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
+                        subvector_arr = pa.array(subvector_tensor.cpu().numpy().ravel())
                         subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
                         split_columns.append(subvector_fsl)
 
                 part_batch = pa.RecordBatch.from_arrays(
                     [
-                        ids.numpy(),
+                        #ids.numpy(),
+                        batch["_rowid"],
                         partitions.numpy(),
                         #residual_vecs,
                     ] + split_columns,
