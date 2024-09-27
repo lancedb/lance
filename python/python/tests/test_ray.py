@@ -101,3 +101,18 @@ def test_ray_write_lance(tmp_path: Path):
     tbl = ds.to_table()
     assert sorted(tbl["id"].to_pylist()) == list(range(10))
     assert set(tbl["str"].to_pylist()) == set([f"str-{i}" for i in range(10)])
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+def test_ray_empty_write_lance(tmp_path: Path):
+    schema = pa.schema([pa.field("id", pa.int64()), pa.field("str", pa.string())])
+
+    (
+        ray.data.range(10)
+        .filter((lambda row: row["id"] > 10))
+        .map(lambda x: {"id": x["id"], "str": f"str-{x['id']}"})
+        .write_lance(tmp_path, schema=schema)
+    )
+    # empty write would not generate dataset.
+    with pytest.raises(ValueError):
+        lance.dataset(tmp_path)
