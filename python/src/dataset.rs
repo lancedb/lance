@@ -1694,7 +1694,7 @@ fn prepare_vector_index_params(
                     m_type, ivf_params, pq_params,
                 )))
             }
-        },
+        }
 
         "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
             m_type,
