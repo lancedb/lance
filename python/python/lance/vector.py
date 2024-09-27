@@ -141,7 +141,6 @@ def train_pq_codebook_on_accelerator(
     if accelerator == "cuvs":
         accelerator = "cuda"
 
-
     centroids_list = []
     kmeans_list = []
 
@@ -343,7 +342,6 @@ def compute_pq_codes(
 
     device = kmeans_list[0].device
 
-
     def _pq_codes_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
             for batch in loader:
@@ -395,7 +393,8 @@ def compute_pq_codes(
     logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
-        data_file.path() for frag in ds.get_fragments()
+        data_file.path()
+        for frag in ds.get_fragments()
         for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
