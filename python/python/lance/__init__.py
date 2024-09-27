@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
+from .blob import BlobColumn
 from .dataset import (
     LanceDataset,
     LanceOperation,
@@ -29,7 +30,10 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "BlobColumn",
+    "FragmentMetadata",
     "LanceDataset",
+    "LanceFragment",
     "LanceOperation",
     "LanceScanner",
     "MergeInsertBuilder",
@@ -38,8 +42,6 @@ __all__ = [
     "schema_to_json",
     "json_to_schema",
     "dataset",
-    "FragmentMetadata",
-    "LanceFragment",
     "batch_udf",
 ]
 
