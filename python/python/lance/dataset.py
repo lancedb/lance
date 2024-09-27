@@ -1692,7 +1692,7 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator,
                 )
                 times.append(time.time())
-                logging.info(f"ivf training time: {times[1]-times[0]}s")
+                logging.info("ivf training time: %ss", times[1] - times[0])
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
                     # compute residual subspace columns in the same pass
@@ -1705,7 +1705,7 @@ class LanceDataset(pa.dataset.Dataset):
                     num_sub_vectors=num_sub_vectors_cur,
                 )
                 times.append(time.time())
-                logging.info(f"ivf transform time: {times[2]-times[1]}s")
+                logging.info("ivf transform time: %ss", times[2] - times[1])
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -1769,14 +1769,14 @@ class LanceDataset(pa.dataset.Dataset):
                     num_sub_vectors=num_sub_vectors,
                 )
                 times.append(time.time())
-                logging.info(f"pq training time: {times[1]-times[0]}s")
+                logging.info("pq training time: %ss", times[1] - times[0])
                 shuffle_output_dir, shuffle_buffers = compute_pq_codes(
                     partitions_ds,
                     kmeans_list,
                     batch_size=20480,
                 )
                 times.append(time.time())
-                logging.info(f"pq transform time: {times[2]-times[1]}s")
+                logging.info("pq transform time: %ss", times[2] - times[1])
                 # Save disk space
                 if precomputed_partiton_dataset is not None and os.path.exists(
                     partitions_file
@@ -1827,7 +1827,7 @@ class LanceDataset(pa.dataset.Dataset):
             column, index_type, name, replace, storage_options, kwargs
         )
         times.append(time.time())
-        logging.info(f"final create_index time: {times[1]-times[0]}s")
+        logging.info("Final create_index time: %ss", times[1] - times[0])
         # Save disk space
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_shuffle_buffers_path"]
