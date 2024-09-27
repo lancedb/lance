@@ -1696,9 +1696,13 @@ class LanceDataset(pa.dataset.Dataset):
                 print(f"ivf training time: {times[1]-times[0]}s")
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
-                    num_sub_vectors_cur = num_sub_vectors # compute residual subspace columns in the same pass
+                    num_sub_vectors_cur = num_sub_vectors  # compute residual subspace columns in the same pass
                 partitions_file = compute_partitions(
-                    self, column[0], kmeans, batch_size=20480, num_sub_vectors=num_sub_vectors_cur
+                    self,
+                    column[0],
+                    kmeans,
+                    batch_size=20480,
+                    num_sub_vectors=num_sub_vectors_cur,
                 )
                 times.append(time.time())
                 print(f"ivf transform time: {times[2]-times[1]}s")
@@ -1747,6 +1751,7 @@ class LanceDataset(pa.dataset.Dataset):
                 partitions_file = kwargs["precomputed_partitions_file"]
                 del kwargs["precomputed_partitions_file"]
                 import lance
+
                 partitions_ds = lance.dataset(partitions_file)
                 # Use accelerator to train pq codebook
                 from .vector import (
@@ -1773,11 +1778,15 @@ class LanceDataset(pa.dataset.Dataset):
                 times.append(time.time())
                 print(f"pq transform time: {times[2]-times[1]}s")
                 # Save disk space
-                if precomputed_partiton_dataset is not None and os.path.exists(partitions_file):
+                if precomputed_partiton_dataset is not None and os.path.exists(
+                    partitions_file
+                ):
                     shutil.rmtree(partitions_file)
 
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(shuffle_output_dir, "data")
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                    shuffle_output_dir, "data"
+                )
 
             if pq_codebook is not None:
                 # User provided IVF centroids
@@ -1820,7 +1829,9 @@ class LanceDataset(pa.dataset.Dataset):
         times.append(time.time())
         print(f"final create_index time: {times[1]-times[0]}s")
         # Save disk space
-        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(kwargs["precomputed_shuffle_buffers_path"]):
+        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_shuffle_buffers_path"]
+        ):
             shutil.rmtree(kwargs["precomputed_shuffle_buffers_path"])
         return self
 

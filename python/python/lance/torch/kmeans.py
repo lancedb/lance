@@ -200,7 +200,11 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0, column: Optional[str] = None,
+        self,
+        data: torch.utils.data.IterableDataset,
+        epoch: int,
+        last_dist: float = 0.0,
+        column: Optional[str] = None,
     ) -> float:
         """Train KMean once and return the total distance.
 
@@ -244,10 +248,10 @@ class KMeans:
                 chunk = chunk[valid_mask]
                 ids = ids[valid_mask]
 
-            total_dist += dists.nansum() #.item()
+            total_dist += dists.nansum()  # .item()
 
-            #total_dist += dists.sum().item()
-            #total_dist += dists.sum()
+            # total_dist += dists.sum().item()
+            # total_dist += dists.sum()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 

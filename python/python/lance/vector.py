@@ -152,7 +152,10 @@ def train_pq_codebook_on_accelerator(
     field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
     dim = kmeans.centroids.shape[1]
     subvector_size = dim // num_sub_vectors
-    fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
+    fields = [
+        pa.field(name, pa.list_(pa.float32(), list_size=subvector_size))
+        for name in field_names
+    ]
     split_schema = pa.schema(fields)
 
     sample_size = 256 * 256
@@ -239,7 +242,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=k,
         columns=[column],
         samples=sample_size,
-        #filter=filt,
+        # filter=filt,
     )
 
     init_centroids = next(iter(ds))
@@ -250,7 +253,7 @@ def train_ivf_centroids_on_accelerator(
         batch_size=20480,
         columns=[column],
         samples=sample_size,
-        #filter=filt,
+        # filter=filt,
         cache=True,
     )
 
@@ -324,6 +327,7 @@ def compute_pq_codes(
     field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
 
     from lance.torch.data import LanceDataset as PytorchLanceDataset
+
     torch_ds = PytorchLanceDataset(
         dataset,
         batch_size=batch_size,
@@ -331,10 +335,10 @@ def compute_pq_codes(
         columns=["row_id", "partition"] + field_names,
     )
     loader = torch.utils.data.DataLoader(
-       torch_ds,
-       batch_size=1,
-       pin_memory=True,
-       collate_fn=_collate_fn,
+        torch_ds,
+        batch_size=1,
+        pin_memory=True,
+        collate_fn=_collate_fn,
     )
     output_schema = pa.schema(
         [
@@ -353,9 +357,12 @@ def compute_pq_codes(
     def _pq_codes_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
             for batch in loader:
-                vecs_lists = [batch[field_names[i]].to(device).reshape(
-                    -1, kmeans_list[i].centroids.shape[1]
-                ) for i in range(num_sub_vectors)]
+                vecs_lists = [
+                    batch[field_names[i]]
+                    .to(device)
+                    .reshape(-1, kmeans_list[i].centroids.shape[1])
+                    for i in range(num_sub_vectors)
+                ]
 
                 pq_codes = torch.stack(
                     [
@@ -385,12 +392,12 @@ def compute_pq_codes(
 
     rbr = pa.RecordBatchReader.from_batches(output_schema, _pq_codes_assignment())
     if dst_dataset_uri is None:
-       dst_dataset_uri = tempfile.mkdtemp()
+        dst_dataset_uri = tempfile.mkdtemp()
     ds = write_dataset(
-       rbr,
-       dst_dataset_uri,
-       schema=output_schema,
-       data_storage_version="legacy",
+        rbr,
+        dst_dataset_uri,
+        schema=output_schema,
+        data_storage_version="legacy",
     )
 
     progress.close()
@@ -405,6 +412,7 @@ def compute_pq_codes(
 
 def _collate_fn(batch):
     return batch[0]
+
 
 def compute_partitions(
     dataset: LanceDataset,
@@ -449,7 +457,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-        #filter=f"{column} is not null",
+        # filter=f"{column} is not null",
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,
@@ -464,7 +472,10 @@ def compute_partitions(
     if num_sub_vectors is not None:
         field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
         subvector_size = dim // num_sub_vectors
-        fields = [pa.field(name, pa.list_(pa.float32(), list_size=subvector_size)) for name in field_names]
+        fields = [
+            pa.field(name, pa.list_(pa.float32(), list_size=subvector_size))
+            for name in field_names
+        ]
 
     output_schema = pa.schema(
         [
@@ -503,16 +514,23 @@ def compute_partitions(
                 if num_sub_vectors is not None:
                     residual_vecs = vecs - kmeans.centroids[partitions]
                     for i in range(num_sub_vectors):
-                        subvector_tensor = residual_vecs[:, i * subvector_size: (i + 1) * subvector_size]
-                        subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
-                        subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
+                        subvector_tensor = residual_vecs[
+                            :, i * subvector_size : (i + 1) * subvector_size
+                        ]
+                        subvector_arr = pa.array(
+                            subvector_tensor.cpu().detach().numpy().reshape(-1)
+                        )
+                        subvector_fsl = pa.FixedSizeListArray.from_arrays(
+                            subvector_arr, subvector_size
+                        )
                         split_columns.append(subvector_fsl)
 
                 part_batch = pa.RecordBatch.from_arrays(
                     [
                         ids.numpy(),
                         partitions.numpy(),
-                    ] + split_columns,
+                    ]
+                    + split_columns,
                     schema=output_schema,
                 )
                 if len(part_batch) < len(ids):
