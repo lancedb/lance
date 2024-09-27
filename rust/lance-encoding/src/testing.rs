@@ -280,6 +280,7 @@ pub struct TestCases {
     batch_size: u32,
     skip_validation: bool,
     max_page_size: Option<u64>,
+    file_version: LanceFileVersion,
 }
 
 impl Default for TestCases {
@@ -290,6 +291,7 @@ impl Default for TestCases {
             indices: Vec::new(),
             skip_validation: false,
             max_page_size: None,
+            file_version: LanceFileVersion::default(),
         }
     }
 }
@@ -323,6 +325,11 @@ impl TestCases {
     fn get_max_page_size(&self) -> u64 {
         self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
     }
+
+    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
+        self.file_version = version;
+        self
+    }
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -341,7 +348,12 @@ pub async fn check_round_trip_encoding_of_data(
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy {
+                version: test_cases.file_version,
+            }),
+            version: test_cases.file_version,
+        };
         let mut column_index_seq = ColumnIndexSequence::default();
         let encoding_options = EncodingOptions {
             cache_bytes_per_column: page_size,

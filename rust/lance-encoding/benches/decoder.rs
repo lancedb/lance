@@ -65,8 +65,8 @@ fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode_primitive");
     for data_type in PRIMITIVE_TYPES {
         let data = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024))
+            .anon_col(lance_datagen::array::rand_type(data_type))
+            .into_batch_rows(lance_datagen::RowCount::from(1024 * 1024 * 1024))
             .unwrap();
         let lance_schema =
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
@@ -96,6 +96,7 @@ fn bench_decode(c: &mut Criterion) {
         });
     }
 }
+
 fn bench_decode_fsl(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive_fsl");
