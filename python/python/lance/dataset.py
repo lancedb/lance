@@ -1503,8 +1503,8 @@ class LanceDataset(pa.dataset.Dataset):
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         use_new_vector_index_format : bool, optional
-            Allows to use the new V3 index format. Default is False. This is most for
-            IVF_PQ indices which still default to use the legacy format.
+            Allows to use the new V3 index format. Default is False. This is mostly for
+            IVF_PQ indices which still defaults to use the legacy format.
         kwargs :
             Parameters passed to the index building process.
 
