@@ -177,15 +177,6 @@ def train_pq_codebook_on_accelerator(
     )
 
     for sub_vector in range(num_sub_vectors):
-        # TODO train here directly with a torch dataset containing all columns
-        # ivf_centroids_local, kmeans_local = train_ivf_centroids_on_accelerator(
-        #     dataset,
-        #     field_names[sub_vector],
-        #     256,
-        #     metric_type,
-        #     accelerator,
-        # )
-
         logging.info("Training IVF partitions using GPU(%s)", accelerator)
         kmeans_local = KMeans(
             256,
@@ -194,7 +185,6 @@ def train_pq_codebook_on_accelerator(
             device=accelerator,
             centroids=init_centroids[field_names[sub_vector]],
         )
-        # TODO might need to adjust this call
         kmeans_local.fit(ds_fit, column=field_names[sub_vector])
 
         ivf_centroids_local = kmeans_local.centroids.cpu().numpy()
@@ -253,7 +243,6 @@ def train_ivf_centroids_on_accelerator(
     )
 
     init_centroids = next(iter(ds))
-
     logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
@@ -339,9 +328,7 @@ def compute_pq_codes(
         dataset,
         batch_size=batch_size,
         with_row_id=False,
-        #columns=[column, "__residual_vec"], #, "id", "partition"],
-        columns=["_rowid", "__ivf_part_id"] + field_names,
-        # , "__residual_vec"],
+        columns=["row_id", "partition"] + field_names,
     )
     loader = torch.utils.data.DataLoader(
        torch_ds,
@@ -366,21 +353,12 @@ def compute_pq_codes(
     def _pq_codes_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
             for batch in loader:
-                #batch = to_full_tensor(batch)
-                # batch["__residual_vec"]
-                # vecs = batch["__residual_vec"].to(device).reshape(
-                #     -1, kmeans_list[0].centroids.shape[1] * len(kmeans_list)
-                # )
-                # sub_vecs = vecs.view(
-                #     vecs.shape[0], num_sub_vectors, vecs.shape[1] // num_sub_vectors
-                # )
                 vecs_lists = [batch[field_names[i]].to(device).reshape(
                     -1, kmeans_list[i].centroids.shape[1]
                 ) for i in range(num_sub_vectors)]
 
                 pq_codes = torch.stack(
                     [
-                        #kmeans_list[i].transform(sub_vecs[:, i, :])
                         kmeans_list[i].transform(vecs_lists[i])
                         for i in range(num_sub_vectors)
                     ],
@@ -388,8 +366,8 @@ def compute_pq_codes(
                 )
                 pq_codes = pq_codes.to(torch.uint8)
 
-                ids = batch["_rowid"].reshape(-1)
-                partitions = batch["__ivf_part_id"].reshape(-1)
+                ids = batch["row_id"].reshape(-1)
+                partitions = batch["partition"].reshape(-1)
 
                 ids = ids.cpu()
                 partitions = partitions.cpu()
@@ -412,12 +390,8 @@ def compute_pq_codes(
        rbr,
        dst_dataset_uri,
        schema=output_schema,
-       #max_rows_per_file=dataset.count_rows(),
        data_storage_version="legacy",
     )
-    #assert len(ds.get_fragments()) == 1
-    #files = ds.get_fragments()[0].data_files()
-    #assert len(files) == 1
 
     progress.close()
 
@@ -431,14 +405,6 @@ def compute_pq_codes(
 
 def _collate_fn(batch):
     return batch[0]
-
-#@torch.jit.script
-#def extract_subvectors(vecs, centroids, partitions, subvector_size: int):
-#    with torch.no_grad():
-#        residual_vecs = vecs - centroids[partitions]
-#        # Split the tensor into subvectors
-#        split_subvectors = residual_vecs.split(subvector_size, dim=1)
-#        return split_subvectors
 
 def compute_partitions(
     dataset: LanceDataset,
@@ -502,9 +468,8 @@ def compute_partitions(
 
     output_schema = pa.schema(
         [
-            pa.field("_rowid", pa.uint64()),
-            pa.field("__ivf_part_id", pa.uint32()),
-            #pa.field("__residual_vec", pa.list_(pa.float32(), list_size=dim)),
+            pa.field("row_id", pa.uint64()),
+            pa.field("partition", pa.uint32()),
         ]
         + fields
     )
@@ -524,44 +489,37 @@ def compute_partitions(
                 ids = batch["_rowid"].reshape(-1)
 
                 # this is expected to be true, so just assert
-                #assert vecs.shape[0] == ids.shape[0]
+                assert vecs.shape[0] == ids.shape[0]
 
                 # Ignore any invalid vectors.
-                #mask_gpu = partitions.isfinite()
-                #mask = mask_gpu.cpu()
-                #ids = ids[mask]
-                #partitions = partitions[mask_gpu].cpu()
+                mask_gpu = partitions.isfinite()
+                mask = mask_gpu.cpu()
+                ids = ids[mask]
+                partitions = partitions[mask_gpu]
 
                 partitions = partitions.cpu()
 
                 split_columns = []
                 if num_sub_vectors is not None:
                     residual_vecs = vecs - kmeans.centroids[partitions]
-                    #split_subvectors = extract_subvectors(vecs, kmeans.centroids, partitions, subvector_size)
-                    #residual_vecs = residual_vecs[mask_gpu]
-
-                    #for subvector_tensor in split_subvectors:
                     for i in range(num_sub_vectors):
                         subvector_tensor = residual_vecs[:, i * subvector_size: (i + 1) * subvector_size]
                         subvector_arr = pa.array(subvector_tensor.cpu().detach().numpy().reshape(-1))
-                        #subvector_arr = pa.array(subvector_tensor.cpu().numpy().ravel())
                         subvector_fsl = pa.FixedSizeListArray.from_arrays(subvector_arr, subvector_size)
                         split_columns.append(subvector_fsl)
 
                 part_batch = pa.RecordBatch.from_arrays(
                     [
                         ids.numpy(),
-                        #batch["_rowid"],
                         partitions.numpy(),
-                        #residual_vecs,
                     ] + split_columns,
                     schema=output_schema,
                 )
-                # if len(part_batch) < len(ids):
-                #     logging.warning(
-                #         "%s vectors are ignored during partition assignment",
-                #         len(part_batch) - len(ids),
-                #     )
+                if len(part_batch) < len(ids):
+                    logging.warning(
+                        "%s vectors are ignored during partition assignment",
+                        len(part_batch) - len(ids),
+                    )
 
                 progress.update(part_batch.num_rows)
                 yield part_batch
