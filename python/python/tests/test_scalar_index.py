@@ -28,6 +28,7 @@ def create_table(nvec=1000, ndim=128):
         .append_column("price", pa.array(price))
         .append_column("meta", pa.array(meta))
         .append_column("doc", pa.array(doc, pa.large_string()))
+        .append_column("doc2", pa.array(doc, pa.string()))
         .append_column("id", pa.array(range(nvec)))
     )
     return tbl
@@ -242,6 +243,36 @@ def test_filter_with_fts_index(dataset):
     results = results["doc"]
     for row in results:
         assert query == row.as_py()
+
+
+def test_fts_with_postfilter(tmp_path):
+    tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
+    dataset = lance.write_dataset(tab, tmp_path)
+    dataset.create_scalar_index("text", index_type="INVERTED", with_position=False)
+
+    results = dataset.to_table(
+        full_text_query="Frodo", filter="id = 7", prefilter=False
+    )
+    assert results.num_rows == 1
+
+    dataset.create_scalar_index("id", index_type="BTREE")
+
+    results = dataset.to_table(
+        full_text_query="Frodo", filter="id = 7", prefilter=False
+    )
+
+    assert results.num_rows == 1
+
+
+def test_fts_with_other_str_scalar_index(dataset):
+    dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
+    dataset.create_scalar_index("doc2", index_type="BTREE")
+
+    row = dataset.take(indices=[0], columns=["doc"])
+    query = row.column(0)[0].as_py()
+    query = query.split(" ")[0]
+
+    assert dataset.to_table(full_text_query=query).num_rows > 0
 
 
 def test_bitmap_index(tmp_path: Path):
