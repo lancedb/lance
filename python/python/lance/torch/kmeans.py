@@ -249,7 +249,6 @@ class KMeans:
                 ids = ids[valid_mask]
 
             total_dist += dists.nansum()
-
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
