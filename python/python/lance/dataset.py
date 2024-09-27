@@ -1750,7 +1750,6 @@ class LanceDataset(pa.dataset.Dataset):
             if (
                 pq_codebook is None
                 and accelerator is not None
-                and kmeans is not None
                 and "precomputed_partitions_file" in kwargs
             ):
                 partitions_file = kwargs["precomputed_partitions_file"]
