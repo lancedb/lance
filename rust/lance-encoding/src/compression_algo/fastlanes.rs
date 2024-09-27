@@ -4,8 +4,8 @@
 // NOTICE:
 // This file is a modification of the `fastlanes` crate: https://github.com/spiraldb/fastlanes
 // It is modified to allow a rust stable build
-// 
-// The original code can be accessed at 
+//
+// The original code can be accessed at
 //      https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/src/bitpacking.rs
 //      https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/src/lib.rs
 //      https://github.com/spiraldb/fastlanes/blob/8e0ff374f815d919d0c0ebdccf5ffd9e6dc7d663/src/macros.rs
