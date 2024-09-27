@@ -10,6 +10,7 @@ import pickle
 import random
 import shutil
 import sqlite3
+import time
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -1682,6 +1683,8 @@ class LanceDataset(pa.dataset.Dataset):
                     train_ivf_centroids_on_accelerator,
                 )
 
+                times = []
+                times.append(time.time())
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
@@ -1689,12 +1692,16 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
+                times.append(time.time())
+                print(f"ivf training time: {times[1]-times[0]}s")
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
                     num_sub_vectors_cur = num_sub_vectors # compute residual subspace columns in the same pass
                 partitions_file = compute_partitions(
                     self, column[0], kmeans, batch_size=20480, num_sub_vectors=num_sub_vectors_cur
                 )
+                times.append(time.time())
+                print(f"ivf transform time: {times[2]-times[1]}s")
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -1747,6 +1754,8 @@ class LanceDataset(pa.dataset.Dataset):
                     train_pq_codebook_on_accelerator,
                 )
 
+                times = []
+                times.append(time.time())
                 pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
                     partitions_ds,
                     metric,
@@ -1754,11 +1763,15 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
                 )
+                times.append(time.time())
+                print(f"pq training time: {times[1]-times[0]}s")
                 shuffle_output_dir, shuffle_buffers = compute_pq_codes(
                     partitions_ds,
                     kmeans_list,
                     batch_size=20480,
                 )
+                times.append(time.time())
+                print(f"pq transform time: {times[2]-times[1]}s")
                 # Save disk space
                 if precomputed_partiton_dataset is not None and os.path.exists(partitions_file):
                     shutil.rmtree(partitions_file)
@@ -1799,9 +1812,13 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
+        times = []
+        times.append(time.time())
         self._ds.create_index(
             column, index_type, name, replace, storage_options, kwargs
         )
+        times.append(time.time())
+        print(f"final create_index time: {times[1]-times[0]}s")
         # Save disk space
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(kwargs["precomputed_shuffle_buffers_path"]):
             shutil.rmtree(kwargs["precomputed_shuffle_buffers_path"])
