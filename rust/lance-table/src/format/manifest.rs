@@ -420,10 +420,13 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .collect::<Result<Vec<_>>>()?,
         );
         let fragment_offsets = compute_fragment_offsets(fragments.as_slice());
-        let fields_with_meta = FieldsWithMeta {
+        let mut fields_with_meta = FieldsWithMeta {
             fields: Fields(p.fields),
             metadata: p.metadata,
         };
+        for f in fields_with_meta.fields.0.iter_mut() {
+            f.metadata.clear();
+        }
 
         if FLAG_MOVE_STABLE_ROW_IDS & p.reader_feature_flags != 0
             && !fragments.iter().all(|frag| frag.row_id_meta.is_some())
