@@ -14,9 +14,6 @@ use object_store::path::Path;
 use crate::utils::path::LancePathExt;
 use crate::Result;
 
-pub const DEFAULT_INDEX_CACHE_SIZE: usize = 128;
-pub const DEFAULT_METADATA_CACHE_SIZE: usize = 128;
-
 type ArcAny = Arc<dyn Any + Send + Sync>;
 
 #[derive(Clone)]

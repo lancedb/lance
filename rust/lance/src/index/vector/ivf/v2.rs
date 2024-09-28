@@ -23,7 +23,7 @@ use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{cache::DEFAULT_INDEX_CACHE_SIZE, Error, Result};
+use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::reader::FileReader;
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -55,6 +55,7 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
+use crate::dataset::DEFAULT_INDEX_CACHE_SIZE;
 use crate::index::vector::builder::index_type_string;
 use crate::{
     index::{
@@ -122,6 +123,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .upgrade()
             .map(|sess| sess.file_metadata_cache.clone())
             .unwrap_or_else(FileMetadataCache::no_cache);
+        let index_cache_capacity = session.upgrade().unwrap().index_cache.capacity();
         let index_reader = FileReader::try_open(
             scheduler
                 .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))
@@ -191,7 +193,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             ivf,
             reader: index_reader,
             storage,
-            partition_cache: Cache::new(DEFAULT_INDEX_CACHE_SIZE as u64),
+            partition_cache: Cache::new(index_cache_capacity),
             partition_locks: PartitionLoadLock::new(num_partitions),
             sub_index_metadata,
             distance_type,
