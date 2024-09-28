@@ -55,7 +55,6 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use crate::dataset::DEFAULT_INDEX_CACHE_SIZE;
 use crate::index::vector::builder::index_type_string;
 use crate::{
     index::{
