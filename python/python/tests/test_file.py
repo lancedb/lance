@@ -245,6 +245,40 @@ def test_list_field_name(tmp_path):
     assert round_tripped.schema.field("list_str").type == weird_string_type
 
 
+def test_field_meta(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field("primitive", pa.int64(), metadata={"foo": "bar"}),
+            pa.field(
+                "list",
+                pa.list_(pa.field("item", pa.int64(), metadata={"list": "yes"})),
+                metadata={"foo": "baz"},
+            ),
+            pa.field(
+                "struct",
+                pa.struct([pa.field("a", pa.int64(), metadata={"struct": "yes"})]),
+                metadata={"foo": "qux"},
+            ),
+        ]
+    )
+    table = pa.table(
+        {
+            "primitive": [1, 2, 3],
+            "list": [[1, 2], [3, 4], [5, 6]],
+            "struct": [{"a": 1}, {"a": 2}, {"a": 3}],
+        },
+        schema=schema,
+    )
+
+    with LanceFileWriter(str(tmp_path / "foo.lance")) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(tmp_path / "foo.lance"))
+    round_tripped = reader.read_all().to_table()
+
+    assert round_tripped == table
+
+
 def test_dictionary(tmp_path):
     # Basic round trip
     dictionary = pa.array(["foo", "bar", "baz"], pa.string())
