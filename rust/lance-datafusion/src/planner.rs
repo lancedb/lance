@@ -276,7 +276,7 @@ impl Planner {
             BinaryOperator::And => Operator::And,
             BinaryOperator::Or => Operator::Or,
             _ => {
-                return Err(Error::io(
+                return Err(Error::invalid_input(
                     format!("Operator {op} is not supported"),
                     location!(),
                 ));
@@ -306,7 +306,7 @@ impl Planner {
                         Err(_) => lit(-n
                             .parse::<f64>()
                             .map_err(|_e| {
-                                Error::io(
+                                Error::invalid_input(
                                     format!("negative operator can be only applied to integer and float operands, got: {n}"),
                                     location!(),
                                 )
@@ -319,7 +319,7 @@ impl Planner {
             }
 
             _ => {
-                return Err(Error::io(
+                return Err(Error::invalid_input(
                     format!("Unary operator '{:?}' is not supported", op),
                     location!(),
                 ));
@@ -339,7 +339,7 @@ impl Planner {
             Ok(lit(n))
         } else {
             value.parse::<f64>().map(lit).map_err(|_| {
-                Error::io(
+                Error::invalid_input(
                     format!("'{value}' is not supported number value."),
                     location!(),
                 )
@@ -364,7 +364,7 @@ impl Planner {
     fn parse_function_args(&self, func_args: &FunctionArg) -> Result<Expr> {
         match func_args {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.parse_sql_expr(expr),
-            _ => Err(Error::io(
+            _ => Err(Error::invalid_input(
                 format!("Unsupported function args: {:?}", func_args),
                 location!(),
             )),
@@ -381,7 +381,7 @@ impl Planner {
         match &func.args {
             FunctionArguments::List(args) => {
                 if func.name.0.len() != 1 {
-                    return Err(Error::io(
+                    return Err(Error::invalid_input(
                         format!("Function name must have 1 part, got: {:?}", func.name.0),
                         location!(),
                     ));
@@ -390,7 +390,7 @@ impl Planner {
                     self.parse_function_args(&args.args[0])?,
                 )))
             }
-            _ => Err(Error::io(
+            _ => Err(Error::invalid_input(
                 format!("Unsupported function args: {:?}", &func.args),
                 location!(),
             )),
@@ -456,7 +456,7 @@ impl Planner {
                 match tz {
                     TimezoneInfo::None => {}
                     _ => {
-                        return Err(Error::io(
+                        return Err(Error::invalid_input(
                             "Timezone not supported in timestamp".to_string(),
                             location!(),
                         ));
@@ -470,7 +470,7 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::io(
+                        return Err(Error::invalid_input(
                             format!("Unsupported datetime resolution: {:?}", resolution),
                             location!(),
                         ));
@@ -486,7 +486,7 @@ impl Planner {
                     Some(6) => TimeUnit::Microsecond,
                     Some(9) => TimeUnit::Nanosecond,
                     _ => {
-                        return Err(Error::io(
+                        return Err(Error::invalid_input(
                             format!("Unsupported datetime resolution: {:?}", resolution),
                             location!(),
                         ));
@@ -498,7 +498,7 @@ impl Planner {
                 ExactNumberInfo::PrecisionAndScale(precision, scale) => {
                     Ok(ArrowDataType::Decimal128(*precision as u8, *scale as i8))
                 }
-                _ => Err(Error::io(
+                _ => Err(Error::invalid_input(
                     format!(
                         "Must provide precision and scale for decimal: {:?}",
                         number_info
@@ -506,7 +506,7 @@ impl Planner {
                     location!(),
                 )),
             },
-            _ => Err(Error::io(
+            _ => Err(Error::invalid_input(
                 format!(
                     "Unsupported data type: {:?}. Supported types: {:?}",
                     data_type, SUPPORTED_TYPES
@@ -539,7 +539,7 @@ impl Planner {
                 let mut values = vec![];
 
                 let array_literal_error = |pos: usize, value: &_| {
-                    Err(Error::io(
+                    Err(Error::invalid_input(
                         format!(
                             "Expected a literal value in array, instead got {} at position {}",
                             value, pos
@@ -582,7 +582,7 @@ impl Planner {
 
                     for value in &mut values {
                         if value.data_type() != data_type {
-                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::io(
+                            *value = safe_coerce_scalar(value, &data_type).ok_or_else(|| Error::invalid_input(
                                 format!("Array expressions must have a consistent datatype. Expected: {}, got: {}", data_type, value.data_type()),
                                 location!()
                             ))?;
@@ -665,7 +665,7 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
-            _ => Err(Error::io(
+            _ => Err(Error::invalid_input(
                 format!("Expression '{expr}' is not supported SQL in lance"),
                 location!(),
             )),
