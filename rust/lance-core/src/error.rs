@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::ArrowError;
+use datafusion_common::DataFusionError;
 use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -305,7 +306,7 @@ impl From<datafusion_sql::sqlparser::tokenizer::TokenizerError> for Error {
 }
 
 #[cfg(feature = "datafusion")]
-impl From<Error> for datafusion_common::DataFusionError {
+impl From<Error> for DataFusionError {
     #[track_caller]
     fn from(e: Error) -> Self {
         Self::Execution(e.to_string())
@@ -313,12 +314,37 @@ impl From<Error> for datafusion_common::DataFusionError {
 }
 
 #[cfg(feature = "datafusion")]
-impl From<datafusion_common::DataFusionError> for Error {
+impl From<DataFusionError> for Error {
     #[track_caller]
-    fn from(e: datafusion_common::DataFusionError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+    fn from(e: DataFusionError) -> Self {
+        let location = std::panic::Location::caller().to_snafu_location();
+        match e {
+            DataFusionError::SQL(..)
+            | DataFusionError::Plan(..)
+            | DataFusionError::Configuration(..) => Self::InvalidInput {
+                source: box_error(e),
+                location,
+            },
+            DataFusionError::SchemaError(..) => Self::Schema {
+                message: e.to_string(),
+                location,
+            },
+            DataFusionError::ArrowError(..) => Self::Arrow {
+                message: e.to_string(),
+                location,
+            },
+            DataFusionError::NotImplemented(..) => Self::NotSupported {
+                source: box_error(e),
+                location,
+            },
+            DataFusionError::Execution(..) => Self::Execution {
+                message: e.to_string(),
+                location,
+            },
+            _ => Self::IO {
+                source: box_error(e),
+                location,
+            },
         }
     }
 }
