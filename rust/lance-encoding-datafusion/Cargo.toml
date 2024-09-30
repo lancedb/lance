@@ -22,6 +22,7 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 bytes.workspace = true
+datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-functions.workspace = true

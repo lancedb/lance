@@ -24,8 +24,9 @@ use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::execution::FunctionRegistry;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::planner::ExprPlanner;
 use datafusion::logical_expr::{
     AggregateUDF, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF,
 };
@@ -154,6 +155,7 @@ impl ScalarUDFImpl for CastListF16Udf {
 struct LanceContextProvider {
     options: datafusion::config::ConfigOptions,
     state: SessionState,
+    expr_planners: Vec<Arc<dyn ExprPlanner>>,
 }
 
 impl Default for LanceContextProvider {
@@ -161,10 +163,21 @@ impl Default for LanceContextProvider {
         let config = SessionConfig::new();
         let runtime_config = RuntimeConfig::new();
         let runtime = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
-        let state = SessionState::new_with_config_rt(config, runtime);
+        let mut state_builder = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .with_default_features();
+
+        // SessionState does not expose expr_planners, so we need to get the default ones from
+        // the builder and store them to return from get_expr_planners
+
+        // unwrap safe because with_default_features sets expr_planners
+        let expr_planners = state_builder.expr_planners().as_ref().unwrap().clone();
+
         Self {
             options: ConfigOptions::default(),
-            state,
+            state: state_builder.build(),
+            expr_planners,
         }
     }
 }
@@ -216,6 +229,10 @@ impl ContextProvider for LanceContextProvider {
 
     fn udwf_names(&self) -> Vec<String> {
         self.state.window_functions().keys().cloned().collect()
+    }
+
+    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
+        &self.expr_planners
     }
 }
 
@@ -387,19 +404,15 @@ impl Planner {
             }
         }
         let context_provider = LanceContextProvider::default();
-        let mut sql_to_rel = SqlToRel::new_with_options(
+        let sql_to_rel = SqlToRel::new_with_options(
             &context_provider,
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
                 support_varchar_with_length: false,
+                enable_options_value_normalization: false,
             },
         );
-        // These planners are not automatically propagated.
-        // See: https://github.com/apache/datafusion/issues/11477
-        for planner in context_provider.state.expr_planners() {
-            sql_to_rel = sql_to_rel.with_user_defined_planner(planner.clone());
-        }
 
         let mut planner_context = PlannerContext::default();
         let schema = DFSchema::try_from(self.schema.as_ref().clone())?;
@@ -1420,5 +1433,11 @@ mod tests {
             expr,
             Expr::Literal(ScalarValue::Binary(Some(vec![b'a', b'b', b'c'])))
         );
+    }
+
+    #[test]
+    fn test_lance_context_provider_expr_planners() {
+        let ctx_provider = LanceContextProvider::default();
+        assert!(!ctx_provider.get_expr_planners().is_empty());
     }
 }

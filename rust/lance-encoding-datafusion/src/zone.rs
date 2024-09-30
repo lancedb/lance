@@ -10,6 +10,7 @@ use std::{
 use arrow_array::{cast::AsArray, types::UInt32Type, ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion_common::{arrow::datatypes::DataType, DFSchema, DFSchemaRef, ScalarValue};
 use datafusion_expr::{
     col,
@@ -20,7 +21,6 @@ use datafusion_expr::{
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
-use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{future::BoxFuture, FutureExt};
 use lance_datafusion::planner::Planner;
 use lance_encoding::{
