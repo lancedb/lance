@@ -63,11 +63,19 @@ impl PostingIterator {
             Some(max_score) => max_score,
             None => idf(list.len(), num_doc) * (K1 + 1.0),
         };
+
+        // move the iterator to the first selected document. This is important
+        // because caller might directly call `doc()` without calling `next()`.
+        let mut index = 0;
+        while index < list.len() && !mask.selected(list.row_id(index)) {
+            index += 1;
+        }
+
         Self {
             token_id,
             position,
             list,
-            index: 0,
+            index,
             mask,
             approximate_upper_bound,
         }

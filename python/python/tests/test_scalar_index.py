@@ -245,6 +245,31 @@ def test_filter_with_fts_index(dataset):
         assert query == row.as_py()
 
 
+def test_indexed_filter_with_fts_index(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "Frodo was a puppy",
+                "There were several kittens playing",
+                "Frodo was a happy puppy",
+                "Frodo was a very happy puppy",
+            ],
+            "sentiment": ["neutral", "neutral", "positive", "positive"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index("text", "INVERTED")
+    ds.create_scalar_index("sentiment", "BITMAP")
+
+    results = ds.to_table(
+        full_text_query="puppy",
+        filter="sentiment='positive'",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [2, 3]
+
+
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
     dataset = lance.write_dataset(tab, tmp_path)
