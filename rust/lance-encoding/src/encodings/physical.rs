@@ -19,6 +19,7 @@ pub mod basic;
 pub mod binary;
 pub mod bitmap;
 pub mod bitpack;
+pub mod bitpack_fastlanes;
 pub mod block_compress;
 pub mod dictionary;
 pub mod fixed_size_binary;
@@ -106,6 +107,19 @@ fn get_bitpacked_buffer_decoder(
         encoding.uncompressed_bits_per_value,
         buffer_offset,
         encoding.signed,
+    ))
+}
+
+fn get_bitpacked_for_non_neg_buffer_decoder(
+    encoding: &pb::BitpackedForNonNeg,
+    buffers: &PageBuffers,
+) -> Box<dyn PageScheduler> {
+    let (buffer_offset, _buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
+
+    Box::new(bitpack_fastlanes::BitpackedForNonNegScheduler::new(
+        encoding.compressed_bits_per_value,
+        encoding.uncompressed_bits_per_value,
+        buffer_offset,
     ))
 }
 
@@ -251,6 +265,9 @@ pub fn decoder_from_array_encoding(
                 data_type.clone(),
                 buffer_offset,
             ))
+        }
+        pb::array_encoding::ArrayEncoding::BitpackedForNonNeg(bitpacked) => {
+            get_bitpacked_for_non_neg_buffer_decoder(bitpacked, buffers)
         }
         // Currently there is no way to encode struct nullability and structs are encoded with a "header" column
         // (that has no data).  We never actually decode that column and so this branch is never actually encountered.

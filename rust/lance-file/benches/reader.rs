@@ -8,6 +8,7 @@ use futures::StreamExt;
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2::{
     reader::FileReader,
+    testing::test_cache,
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::{
@@ -55,7 +56,8 @@ fn bench_reader(c: &mut Criterion) {
                 let reader = FileReader::try_open(
                     scheduler.clone(),
                     None,
-                    DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
+                    &test_cache(),
                 )
                 .await
                 .unwrap();

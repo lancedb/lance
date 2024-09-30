@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -14,6 +14,8 @@ use snafu::{location, Location};
 use crate::buffer::LanceBuffer;
 use crate::data::DataBlock;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
+use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
+use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
@@ -277,7 +279,11 @@ impl CoreArrayEncodingStrategy {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder = Self::choose_array_encoder(
-                        arrays,
+                        // We need to pass arrays to this method to figure out what kind of compression to
+                        // use but we haven't actually calculated the indices yet.  For now, we just assume
+                        // worst case and use the full range.  In the future maybe we can pass in statistics
+                        // instead of the actual data
+                        &[Arc::new(UInt8Array::from_iter_values(0_u8..255_u8))],
                         &DataType::UInt8,
                         data_size,
                         false,
@@ -342,6 +348,36 @@ impl CoreArrayEncodingStrategy {
                 }
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
+            }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                        compressed_bit_width as usize,
+                        data_type.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::default(),
+                    ))))
+                }
+            }
+
+            // TODO: for signed integers, I intend to make it a cascaded encoding, a sparse array for the negative values and very wide(bit-width) values,
+            // then a bitpacked array for the narrow(bit-width) values, I need `BitpackedForNeg` to be merged first, I am
+            // thinking about putting this sparse array in the metadata so bitpacking remain using one page buffer only.
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                        compressed_bit_width as usize,
+                        data_type.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::default(),
+                    ))))
+                }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::default(),
@@ -744,6 +780,7 @@ impl BatchEncoder {
 /// An encoded batch of data and a page table describing it
 ///
 /// This is returned by [`crate::encoder::encode_batch`]
+#[derive(Debug)]
 pub struct EncodedBatch {
     pub data: Bytes,
     pub page_table: Vec<Arc<ColumnInfo>>,

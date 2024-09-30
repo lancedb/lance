@@ -2444,6 +2444,22 @@ def test_late_materialization_batch_size(tmp_path: Path):
         assert batch.num_rows == 32
 
 
+def test_use_scalar_index(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("filter", "BTREE")
+
+    assert "MaterializeIndex" in dataset.scanner(filter="filter = 10").explain_plan(
+        True
+    )
+    assert "MaterializeIndex" in dataset.scanner(
+        filter="filter = 10", use_scalar_index=True
+    ).explain_plan(True)
+    assert "MaterializeIndex" not in dataset.scanner(
+        filter="filter = 10", use_scalar_index=False
+    ).explain_plan(True)
+
+
 EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
 EXPECTED_MAJOR_VERSION = 2
 EXPECTED_MINOR_VERSION = 0

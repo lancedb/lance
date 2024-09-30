@@ -37,6 +37,10 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zstd.workspace = true
+bytemuck = "=1.18.0"
+arrayref = "0.3.7"
+paste = "1.0.15"
+seq-macro = "0.3.5"
 
 [dev-dependencies]
 lance-testing.workspace = true

@@ -18,8 +18,8 @@ use pb::{
     array_encoding::ArrayEncoding as ArrayEncodingEnum,
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
-    ArrayEncoding, Binary, Bitpacked, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst,
-    Nullable, PackedStruct,
+    ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Dictionary, FixedSizeBinary,
+    FixedSizeList, Flat, Fsst, Nullable, PackedStruct,
 };
 
 use crate::encodings::physical::block_compress::CompressionScheme;
@@ -94,6 +94,23 @@ impl ProtobufUtils {
                 }),
                 uncompressed_bits_per_value,
                 signed,
+            })),
+        }
+    }
+
+    pub fn bitpacked_for_non_neg_encoding(
+        compressed_bits_per_value: u64,
+        uncompressed_bits_per_value: u64,
+        buffer_index: u32,
+    ) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::BitpackedForNonNeg(BitpackedForNonNeg {
+                compressed_bits_per_value,
+                buffer: Some(pb::Buffer {
+                    buffer_index,
+                    buffer_type: BufferType::Page as i32,
+                }),
+                uncompressed_bits_per_value,
             })),
         }
     }

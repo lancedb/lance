@@ -12,7 +12,10 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use log::{debug, trace};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use lance_core::Result;
+use lance_core::{
+    cache::{CapacityMode, FileMetadataCache},
+    Result,
+};
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 
 use crate::{
@@ -115,17 +118,22 @@ async fn test_decode(
     schema: &Schema,
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
-    io: &Arc<dyn EncodingsIo>,
+    io: Arc<dyn EncodingsIo>,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
     ) -> (SimpleStructDecoder, BoxFuture<'static, ()>),
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
-    let decode_and_validate =
-        DecoderMiddlewareChain::new().add_strategy(Arc::new(CoreFieldDecoderStrategy {
+    let decode_and_validate = Arc::new(DecoderMiddlewareChain::new().add_strategy(Arc::new(
+        CoreFieldDecoderStrategy {
             validate_data: true,
-        }));
+        },
+    )));
+    let cache = Arc::new(FileMetadataCache::with_capacity(
+        128 * 1024 * 1024,
+        CapacityMode::Bytes,
+    ));
     let column_indices = column_indices_from_schema(schema);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
@@ -133,9 +141,12 @@ async fn test_decode(
         column_infos,
         &Vec::new(),
         num_rows,
-        &decode_and_validate,
+        decode_and_validate,
         io,
+        cache,
+        &FilterExpression::no_filter(),
     )
+    .await
     .unwrap();
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -269,6 +280,7 @@ pub struct TestCases {
     batch_size: u32,
     skip_validation: bool,
     max_page_size: Option<u64>,
+    file_version: LanceFileVersion,
 }
 
 impl Default for TestCases {
@@ -279,6 +291,7 @@ impl Default for TestCases {
             indices: Vec::new(),
             skip_validation: false,
             max_page_size: None,
+            file_version: LanceFileVersion::default(),
         }
     }
 }
@@ -312,6 +325,11 @@ impl TestCases {
     fn get_max_page_size(&self) -> u64 {
         self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
     }
+
+    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
+        self.file_version = version;
+        self
+    }
 }
 
 /// Given specific data and test cases we check round trip encoding and decoding
@@ -330,7 +348,12 @@ pub async fn check_round_trip_encoding_of_data(
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy {
+                version: test_cases.file_version,
+            }),
+            version: test_cases.file_version,
+        };
         let mut column_index_seq = ColumnIndexSequence::default();
         let encoding_options = EncodingOptions {
             cache_bytes_per_column: page_size,
@@ -455,7 +478,7 @@ async fn check_round_trip_encoding_inner(
         &schema,
         &column_infos,
         concat_data.clone(),
-        &scheduler_copy.clone(),
+        scheduler_copy.clone(),
         |mut decode_scheduler, tx| {
             #[allow(clippy::single_range_in_vec_init)]
             let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
@@ -490,7 +513,7 @@ async fn check_round_trip_encoding_inner(
             &schema,
             &column_infos,
             expected,
-            &scheduler.clone(),
+            scheduler.clone(),
             |mut decode_scheduler, tx| {
                 #[allow(clippy::single_range_in_vec_init)]
                 let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
@@ -536,7 +559,7 @@ async fn check_round_trip_encoding_inner(
             &schema,
             &column_infos,
             expected,
-            &scheduler.clone(),
+            scheduler.clone(),
             |mut decode_scheduler, tx| {
                 let root_decoder = decode_scheduler.new_root_decoder_indices(&indices);
                 (

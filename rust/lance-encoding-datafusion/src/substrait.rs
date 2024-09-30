@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
-use datafusion_common::DFSchema;
 use datafusion_common::ScalarValue;
 use datafusion_expr::Expr;
 use futures::FutureExt;
@@ -19,7 +18,7 @@ use lance_encoding::decoder::FilterExpression;
 pub trait FilterExpressionExt {
     /// Convert a lance-encoding filter expression (which we assume is
     /// substrait encoded) into a datafusion expr
-    fn substrait_to_df(&self, schema: &Schema) -> Result<(Expr, DFSchema)>;
+    fn substrait_to_df(&self, schema: Arc<ArrowSchema>) -> Result<Expr>;
     /// Convert a datafusion filter expression into a lance-encoding
     /// filter expression (using substrait)
     fn df_to_substrait(expr: Expr, schema: &Schema) -> Result<Self>
@@ -28,19 +27,12 @@ pub trait FilterExpressionExt {
 }
 
 impl FilterExpressionExt for FilterExpression {
-    fn substrait_to_df(&self, schema: &Schema) -> Result<(Expr, DFSchema)> {
+    fn substrait_to_df(&self, schema: Arc<ArrowSchema>) -> Result<Expr> {
         if self.0.is_empty() {
-            return Ok((
-                Expr::Literal(ScalarValue::Boolean(Some(true))),
-                DFSchema::empty(),
-            ));
+            return Ok(Expr::Literal(ScalarValue::Boolean(Some(true))));
         }
-        let input_schema = Arc::new(ArrowSchema::from(schema));
-        let expr = parse_substrait(&self.0, input_schema.clone())
-            .now_or_never()
-            .unwrap()?;
-        let df_schema = DFSchema::try_from(input_schema.as_ref().clone())?;
-        Ok((expr, df_schema))
+        let expr = parse_substrait(&self.0, schema).now_or_never().unwrap()?;
+        Ok(expr)
     }
 
     fn df_to_substrait(expr: Expr, schema: &Schema) -> Result<Self>

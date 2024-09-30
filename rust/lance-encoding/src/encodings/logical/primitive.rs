@@ -225,6 +225,15 @@ impl FieldScheduler for PrimitiveFieldScheduler {
             ranges.to_vec(),
         )))
     }
+
+    fn initialize<'a>(
+        &'a self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        // 2.0 schedulers do not need to initialize
+        std::future::ready(Ok(())).boxed()
+    }
 }
 
 pub struct PrimitiveFieldDecoder {

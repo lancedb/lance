@@ -675,8 +675,13 @@ impl DatasetIndexInternalExt for Dataset {
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
                 let file = scheduler.open_file(&index_file).await?;
-                let reader =
-                    v2::reader::FileReader::try_open(file, None, Default::default()).await?;
+                let reader = v2::reader::FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &self.session.file_metadata_cache,
+                )
+                .await?;
                 let index_metadata = reader
                     .schema()
                     .metadata

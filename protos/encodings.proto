@@ -190,6 +190,18 @@ message Bitpacked {
   bool signed = 4;
 }
 
+// Items are bitpacked in a buffer
+message BitpackedForNonNeg {
+  // the number of bits used for a value in the buffer
+  uint64 compressed_bits_per_value = 1;
+
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+
+  // The items in the list
+  Buffer buffer = 3;
+}
+
 // An array encoding for shredded structs that will never be null
 //
 // There is no actual data in this column.
@@ -240,6 +252,7 @@ message ArrayEncoding {
         PackedStruct packed_struct = 9;
         Bitpacked bitpacked = 10;
         FixedSizeBinary fixed_size_binary = 11;
+        BitpackedForNonNeg bitpacked_for_non_neg = 12;
     }
 }
 
