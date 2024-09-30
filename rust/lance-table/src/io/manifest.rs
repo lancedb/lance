@@ -6,6 +6,7 @@ use std::{ops::Range, sync::Arc};
 use async_trait::async_trait;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
 use lance_arrow::DataTypeExt;
 use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
@@ -22,7 +23,7 @@ use lance_io::{
     utils::read_message,
 };
 
-use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC};
+use crate::format::{pb, DataStorageFormat, Index, Manifest, MAGIC,  MAJOR_VERSION, MINOR_VERSION};
 
 /// Read Manifest on URI.
 ///
@@ -116,10 +117,10 @@ pub async fn read_manifest_indexes(
 async fn do_write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: &[Index],
 ) -> Result<usize> {
     // Write indices if presented.
-    if let Some(indices) = indices.as_ref() {
+    if !indices.is_empty() {
         let section = pb::IndexSection {
             indices: indices.iter().map(|i| i.into()).collect(),
         };
@@ -134,7 +135,7 @@ async fn do_write_manifest(
 pub async fn write_manifest(
     writer: &mut dyn Writer,
     manifest: &mut Manifest,
-    indices: Option<Vec<Index>>,
+    indices: &[Index],
 ) -> Result<usize> {
     // Write dictionary values.
     let max_field_id = manifest.schema.max_field_id().unwrap_or(-1);
@@ -187,6 +188,23 @@ pub async fn write_manifest(
     do_write_manifest(writer, manifest, indices).await
 }
 
+pub fn write_manifest_file_to_path<'a>(
+    object_store: &'a ObjectStore,
+    manifest: &'a mut Manifest,
+    indices: &'a [Index],
+    path: &'a Path,
+) -> BoxFuture<'a, Result<()>> {
+    Box::pin(async {
+        let mut object_writer = ObjectWriter::new(object_store, path).await?;
+        let pos = write_manifest(&mut object_writer, manifest, indices).await?;
+        object_writer
+            .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
+            .await?;
+        object_writer.shutdown().await?;
+        Ok(())
+    })
+}
+
 /// Implementation of ManifestProvider that describes a Lance file by writing
 /// a manifest that contains nothing but default fields and the schema
 pub struct ManifestDescribing {}
@@ -202,7 +220,7 @@ impl ManifestProvider for ManifestDescribing {
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
         );
-        let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
+        let pos = do_write_manifest(object_writer, &mut manifest, &[]).await?;
         Ok(Some(pos))
     }
 }
@@ -244,7 +262,7 @@ mod test {
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
         let mut manifest = Manifest::new(schema, Arc::new(vec![]), DataStorageFormat::default());
-        let pos = write_manifest(&mut writer, &mut manifest, None)
+        let pos = write_manifest(&mut writer, &mut manifest, &[])
             .await
             .unwrap();
         writer
