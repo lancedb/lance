@@ -10,13 +10,13 @@ use arrow_array::{
 };
 
 use arrow_schema::DataType;
-use futures::future::BoxFuture;
+use futures::{future::BoxFuture, FutureExt};
 use lance_core::Result;
 use log::trace;
 
 use crate::decoder::{
     DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-    NextDecodeTask, ScheduledScanLine, SchedulerContext, SchedulingJob,
+    NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
@@ -31,9 +31,9 @@ impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
-        top_level_row: u64,
+        priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine> {
-        let inner_scan = self.inner.schedule_next(context, top_level_row)?;
+        let inner_scan = self.inner.schedule_next(context, priority)?;
         let wrapped_decoders = inner_scan
             .decoders
             .into_iter()
@@ -89,6 +89,15 @@ impl FieldScheduler for BinaryFieldScheduler {
 
     fn num_rows(&self) -> u64 {
         self.varbin_scheduler.num_rows()
+    }
+
+    fn initialize<'a>(
+        &'a self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        // 2.0 schedulers do not need to initialize
+        std::future::ready(Ok(())).boxed()
     }
 }
 

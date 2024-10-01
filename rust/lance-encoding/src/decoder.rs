@@ -770,7 +770,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             )?;
             return Ok((chain, Ok(scheduler)));
         } else if data_type.is_binary_like() {
-            let column_info = column_infos.next().unwrap();
+            let column_info = column_infos.next().unwrap().clone();
             if let Some(page_info) = column_info.page_infos.first() {
                 if matches!(
                     page_info.encoding,
@@ -797,7 +797,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                         &list_field,
                         column_infos,
                         buffers,
-                        column_info,
+                        &column_info,
                         chain,
                     )?;
                     let binary_scheduler = Arc::new(BinaryFieldScheduler::new(
@@ -809,7 +809,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                     let scheduler = self.create_primitive_scheduler(
                         &data_type,
                         chain.current_path(),
-                        column_info,
+                        &column_info,
                         buffers,
                     )?;
                     return Ok((chain, Ok(scheduler)));
@@ -818,7 +818,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 let scheduler = self.create_primitive_scheduler(
                     &data_type,
                     chain.current_path(),
-                    column_info,
+                    &column_info,
                     buffers,
                 )?;
                 return Ok((chain, Ok(scheduler)));
@@ -842,7 +842,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 }
             }
             DataType::Dictionary(_key_type, value_type) => {
-                if Self::is_primitive(value_type) {
+                if Self::is_primitive(value_type) || value_type.is_binary_like() {
                     let primitive_col = column_infos.expect_next()?;
                     let scheduler = self.create_primitive_scheduler(
                         &data_type,
@@ -863,8 +863,9 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
                 }
             }
             DataType::List(_) | DataType::LargeList(_) => {
-                let offsets_column = column_infos.next().unwrap();
-                self.create_list_scheduler(field, column_infos, buffers, offsets_column, chain)
+                let offsets_column = column_infos.expect_next()?.clone();
+                column_infos.next_top_level();
+                self.create_list_scheduler(field, column_infos, buffers, &offsets_column, chain)
             }
             DataType::Struct(fields) => {
                 let column_info = column_infos.expect_next()?;
