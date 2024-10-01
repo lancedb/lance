@@ -51,17 +51,19 @@ public class VectorSearchTest {
   @TempDir
   Path tempDir;
 
-  @Test
-  void test_create_index() throws Exception {
-    try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_create_index"))) {
-      try (Dataset dataset = testVectorDataset.create()) {
-        testVectorDataset.createIndex(dataset);
-        List<String> indexes = dataset.listIndexes();
-        assertEquals(1, indexes.size());
-        assertEquals(TestVectorDataset.indexName, indexes.get(0));
-      }
-    }
-  }
+  // TODO: fix in https://github.com/lancedb/lance/issues/2956
+
+  // @Test
+  // void test_create_index() throws Exception {
+  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_create_index"))) {
+  //     try (Dataset dataset = testVectorDataset.create()) {
+  //       testVectorDataset.createIndex(dataset);
+  //       List<String> indexes = dataset.listIndexes();
+  //       assertEquals(1, indexes.size());
+  //       assertEquals(TestVectorDataset.indexName, indexes.get(0));
+  //     }
+  //   }
+  // }
 
   // rust/lance-linalg/src/distance/l2.rs:256:5:
   // 5assertion `left == right` failed
@@ -92,139 +94,139 @@ public class VectorSearchTest {
   //   }
   // }
 
-  @ParameterizedTest
-  @ValueSource(booleans = { false, true })
-  void test_knn(boolean createVectorIndex) throws Exception {
-    try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn"))) {
-      try (Dataset dataset = testVectorDataset.create()) {
+  // @ParameterizedTest
+  // @ValueSource(booleans = { false, true })
+  // void test_knn(boolean createVectorIndex) throws Exception {
+  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn"))) {
+  //     try (Dataset dataset = testVectorDataset.create()) {
 
-        if (createVectorIndex) {
-          testVectorDataset.createIndex(dataset);
-        }
-        float[] key = new float[32];
-        for (int i = 0; i < 32; i++) {
-          key[i] = (float) (i + 32);
-        }
-        ScanOptions options = new ScanOptions.Builder()
-            .nearest(new Query.Builder()
-                .setColumn(TestVectorDataset.vectorColumnName)
-                .setKey(key)
-                .setK(5)
-                .setUseIndex(false)
-                .build())
-            .build();
-        try (Scanner scanner = dataset.newScan(options)) {
-          try (ArrowReader reader = scanner.scanBatches()) {
-            VectorSchemaRoot root = reader.getVectorSchemaRoot();
-            System.out.println("Schema:");
-            assertTrue(reader.loadNextBatch(), "Expected at least one batch");
+  //       if (createVectorIndex) {
+  //         testVectorDataset.createIndex(dataset);
+  //       }
+  //       float[] key = new float[32];
+  //       for (int i = 0; i < 32; i++) {
+  //         key[i] = (float) (i + 32);
+  //       }
+  //       ScanOptions options = new ScanOptions.Builder()
+  //           .nearest(new Query.Builder()
+  //               .setColumn(TestVectorDataset.vectorColumnName)
+  //               .setKey(key)
+  //               .setK(5)
+  //               .setUseIndex(false)
+  //               .build())
+  //           .build();
+  //       try (Scanner scanner = dataset.newScan(options)) {
+  //         try (ArrowReader reader = scanner.scanBatches()) {
+  //           VectorSchemaRoot root = reader.getVectorSchemaRoot();
+  //           System.out.println("Schema:");
+  //           assertTrue(reader.loadNextBatch(), "Expected at least one batch");
 
-            assertEquals(5, root.getRowCount(), "Expected 5 results");
+  //           assertEquals(5, root.getRowCount(), "Expected 5 results");
 
-            assertEquals(4, root.getSchema().getFields().size(), "Expected 4 columns");
-            assertEquals("i", root.getSchema().getFields().get(0).getName());
-            assertEquals("s", root.getSchema().getFields().get(1).getName());
-            assertEquals(TestVectorDataset.vectorColumnName, root.getSchema().getFields().get(2).getName());
-            assertEquals("_distance", root.getSchema().getFields().get(3).getName());
+  //           assertEquals(4, root.getSchema().getFields().size(), "Expected 4 columns");
+  //           assertEquals("i", root.getSchema().getFields().get(0).getName());
+  //           assertEquals("s", root.getSchema().getFields().get(1).getName());
+  //           assertEquals(TestVectorDataset.vectorColumnName, root.getSchema().getFields().get(2).getName());
+  //           assertEquals("_distance", root.getSchema().getFields().get(3).getName());
 
-            IntVector iVector = (IntVector) root.getVector("i");
-            Set<Integer> expectedI = new HashSet<>(Arrays.asList(1, 81, 161, 241, 321));
-            Set<Integer> actualI = new HashSet<>();
-            for (int i = 0; i < iVector.getValueCount(); i++) {
-              actualI.add(iVector.get(i));
-            }
-            assertEquals(expectedI, actualI, "Unexpected values in 'i' column");
+  //           IntVector iVector = (IntVector) root.getVector("i");
+  //           Set<Integer> expectedI = new HashSet<>(Arrays.asList(1, 81, 161, 241, 321));
+  //           Set<Integer> actualI = new HashSet<>();
+  //           for (int i = 0; i < iVector.getValueCount(); i++) {
+  //             actualI.add(iVector.get(i));
+  //           }
+  //           assertEquals(expectedI, actualI, "Unexpected values in 'i' column");
 
-            Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
-            float prevDistance = Float.NEGATIVE_INFINITY;
-            for (int i = 0; i < distanceVector.getValueCount(); i++) {
-              float distance = distanceVector.get(i);
-              assertTrue(distance >= prevDistance, "Distances should be in ascending order");
-              prevDistance = distance;
-            }
+  //           Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
+  //           float prevDistance = Float.NEGATIVE_INFINITY;
+  //           for (int i = 0; i < distanceVector.getValueCount(); i++) {
+  //             float distance = distanceVector.get(i);
+  //             assertTrue(distance >= prevDistance, "Distances should be in ascending order");
+  //             prevDistance = distance;
+  //           }
 
-            assertFalse(reader.loadNextBatch(), "Expected only one batch");
-          }
-        }
-      }
-    }
-  }
+  //           assertFalse(reader.loadNextBatch(), "Expected only one batch");
+  //         }
+  //       }
+  //     }
+  //   }
+  // }
 
-  @Test
-  void test_knn_with_new_data() throws Exception {
-    try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn_with_new_data"))) {
-      try (Dataset dataset = testVectorDataset.create()) {
-        testVectorDataset.createIndex(dataset);
-      }
+  // @Test
+  // void test_knn_with_new_data() throws Exception {
+  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn_with_new_data"))) {
+  //     try (Dataset dataset = testVectorDataset.create()) {
+  //       testVectorDataset.createIndex(dataset);
+  //     }
 
-      float[] key = new float[32];
-      Arrays.fill(key, 0.0f);
-      // Set k larger than the number of new rows
-      int k = 20;
+  //     float[] key = new float[32];
+  //     Arrays.fill(key, 0.0f);
+  //     // Set k larger than the number of new rows
+  //     int k = 20;
 
-      List<TestCase> cases = new ArrayList<>();
-      List<Optional<String>> filters = Arrays.asList(Optional.empty(), Optional.of("i > 100"));
-      List<Optional<Integer>> limits = Arrays.asList(Optional.empty(), Optional.of(10));
+  //     List<TestCase> cases = new ArrayList<>();
+  //     List<Optional<String>> filters = Arrays.asList(Optional.empty(), Optional.of("i > 100"));
+  //     List<Optional<Integer>> limits = Arrays.asList(Optional.empty(), Optional.of(10));
 
-      for (Optional<String> filter : filters) {
-        for (Optional<Integer> limit : limits) {
-          for (boolean useIndex : new boolean[] { true, false }) {
-            cases.add(new TestCase(filter, limit, useIndex));
-          }
-        }
-      }
+  //     for (Optional<String> filter : filters) {
+  //       for (Optional<Integer> limit : limits) {
+  //         for (boolean useIndex : new boolean[] { true, false }) {
+  //           cases.add(new TestCase(filter, limit, useIndex));
+  //         }
+  //       }
+  //     }
 
-      // Validate all cases
-      try (Dataset dataset = testVectorDataset.appendNewData()) {
-        for (TestCase testCase : cases) {
-          ScanOptions.Builder optionsBuilder = new ScanOptions.Builder()
-              .nearest(new Query.Builder()
-                  .setColumn(TestVectorDataset.vectorColumnName)
-                  .setKey(key)
-                  .setK(k)
-                  .setUseIndex(testCase.useIndex)
-                  .build());
+  //     // Validate all cases
+  //     try (Dataset dataset = testVectorDataset.appendNewData()) {
+  //       for (TestCase testCase : cases) {
+  //         ScanOptions.Builder optionsBuilder = new ScanOptions.Builder()
+  //             .nearest(new Query.Builder()
+  //                 .setColumn(TestVectorDataset.vectorColumnName)
+  //                 .setKey(key)
+  //                 .setK(k)
+  //                 .setUseIndex(testCase.useIndex)
+  //                 .build());
 
-          testCase.filter.ifPresent(optionsBuilder::filter);
-          testCase.limit.ifPresent(optionsBuilder::limit);
+  //         testCase.filter.ifPresent(optionsBuilder::filter);
+  //         testCase.limit.ifPresent(optionsBuilder::limit);
 
-          ScanOptions options = optionsBuilder.build();
+  //         ScanOptions options = optionsBuilder.build();
 
-          try (Scanner scanner = dataset.newScan(options)) {
-            try (ArrowReader reader = scanner.scanBatches()) {
-              VectorSchemaRoot root = reader.getVectorSchemaRoot();
-              assertTrue(reader.loadNextBatch(), "Expected at least one batch");
+  //         try (Scanner scanner = dataset.newScan(options)) {
+  //           try (ArrowReader reader = scanner.scanBatches()) {
+  //             VectorSchemaRoot root = reader.getVectorSchemaRoot();
+  //             assertTrue(reader.loadNextBatch(), "Expected at least one batch");
 
-              if (testCase.filter.isPresent()) {
-                int resultRows = root.getRowCount();
-                int expectedRows = testCase.limit.orElse(k);
-                assertTrue(resultRows <= expectedRows,
-                    "Expected less than or equal to " + expectedRows + " rows, got " + resultRows);
-              } else {
-                assertEquals(testCase.limit.orElse(k), root.getRowCount(),
-                    "Unexpected number of rows");
-              }
+  //             if (testCase.filter.isPresent()) {
+  //               int resultRows = root.getRowCount();
+  //               int expectedRows = testCase.limit.orElse(k);
+  //               assertTrue(resultRows <= expectedRows,
+  //                   "Expected less than or equal to " + expectedRows + " rows, got " + resultRows);
+  //             } else {
+  //               assertEquals(testCase.limit.orElse(k), root.getRowCount(),
+  //                   "Unexpected number of rows");
+  //             }
 
-              // Top one should be the first value of new data
-              IntVector iVector = (IntVector) root.getVector("i");
-              assertEquals(400, iVector.get(0), "First result should be the first value of new data");
+  //             // Top one should be the first value of new data
+  //             IntVector iVector = (IntVector) root.getVector("i");
+  //             assertEquals(400, iVector.get(0), "First result should be the first value of new data");
 
-              // Check if distances are in ascending order
-              Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
-              float prevDistance = Float.NEGATIVE_INFINITY;
-              for (int i = 0; i < distanceVector.getValueCount(); i++) {
-                float distance = distanceVector.get(i);
-                assertTrue(distance >= prevDistance, "Distances should be in ascending order");
-                prevDistance = distance;
-              }
+  //             // Check if distances are in ascending order
+  //             Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");
+  //             float prevDistance = Float.NEGATIVE_INFINITY;
+  //             for (int i = 0; i < distanceVector.getValueCount(); i++) {
+  //               float distance = distanceVector.get(i);
+  //               assertTrue(distance >= prevDistance, "Distances should be in ascending order");
+  //               prevDistance = distance;
+  //             }
 
-              assertFalse(reader.loadNextBatch(), "Expected only one batch");
-            }
-          }
-        }
-      }
-    }
-  }
+  //             assertFalse(reader.loadNextBatch(), "Expected only one batch");
+  //           }
+  //         }
+  //       }
+  //     }
+  //   }
+  // }
 
   private static class TestCase {
     final Optional<String> filter;

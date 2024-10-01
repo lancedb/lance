@@ -218,9 +218,7 @@ class LanceDataset(pa.dataset.Dataset):
         return Tags(self._ds)
 
     def list_indices(self) -> List[Dict[str, Any]]:
-        if getattr(self, "_list_indices_res", None) is None:
-            self._list_indices_res = self._ds.load_indices()
-        return self._list_indices_res
+        return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(
@@ -255,6 +253,7 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search: bool = False,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        use_scalar_index: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -310,6 +309,10 @@ class LanceDataset(pa.dataset.Dataset):
             number of rows (or be empty) if the rows closest to the query do not
             match the filter.  It's generally good when the filter is not very
             selective.
+        use_scalar_index: bool, default True
+            Lance will automatically use scalar indices to optimize a query.  In some
+            corner cases this can make query performance worse and this parameter can
+            be used to disable scalar indices in these cases.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
@@ -378,6 +381,7 @@ class LanceDataset(pa.dataset.Dataset):
             .with_row_id(with_row_id)
             .with_row_address(with_row_address)
             .use_stats(use_stats)
+            .use_scalar_index(use_scalar_index)
             .fast_search(fast_search)
         )
         if full_text_query is not None:
@@ -430,6 +434,7 @@ class LanceDataset(pa.dataset.Dataset):
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        use_scalar_index: Optional[bool] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -479,6 +484,9 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
             ``ScannerBuilder.late_materialization`` for more information.
+        use_scalar_index: bool, default True
+            Allows custom control over scalar index usage.  See
+            ``ScannerBuilder.use_scalar_index`` for more information.
         with_row_id: bool, default False
             Return row ID.
         with_row_address: bool, default False
@@ -512,6 +520,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
+            use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -572,6 +581,7 @@ class LanceDataset(pa.dataset.Dataset):
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
+        use_scalar_index: Optional[bool] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -596,6 +606,7 @@ class LanceDataset(pa.dataset.Dataset):
             batch_readahead=batch_readahead,
             fragment_readahead=fragment_readahead,
             late_materialization=late_materialization,
+            use_scalar_index=use_scalar_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2305,6 +2316,7 @@ class ScannerBuilder:
         self._use_stats = True
         self._fast_search = None
         self._full_text_query = None
+        self._use_scalar_index = None
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -2468,6 +2480,17 @@ class ScannerBuilder:
         self._use_stats = use_stats
         return self
 
+    def use_scalar_index(self, use_scalar_index: bool = True) -> ScannerBuilder:
+        """
+        Set whether scalar indices should be used in a query
+
+        Scans will use scalar indices, when available, to optimize queries with filters.
+        However, in some corner cases, scalar indices may make performance worse.  This
+        parameter allows users to disable scalar indices in these cases.
+        """
+        self._use_scalar_index = use_scalar_index
+        return self
+
     def with_fragments(
         self, fragments: Optional[Iterable[LanceFragment]]
     ) -> ScannerBuilder:
@@ -2583,6 +2606,7 @@ class ScannerBuilder:
             self._fast_search,
             self._full_text_query,
             self._late_materialization,
+            self._use_scalar_index,
         )
         return LanceScanner(scanner, self.ds)
 
@@ -2790,6 +2814,15 @@ class DatasetOptimizer:
         the new data to existing partitions.  This means an update is much quicker
         than retraining the entire index but may have less accuracy (especially
         if the new data exhibits new patterns, concepts, or trends)
+
+        Parameters
+        ----------
+        num_indices_to_merge: int, default 1
+            The number of indices to merge.
+            If set to 0, new delta index will be created.
+        index_names: List[str], default None
+            The names of the indices to optimize.
+            If None, all indices will be optimized.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

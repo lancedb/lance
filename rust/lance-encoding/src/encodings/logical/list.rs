@@ -16,7 +16,7 @@ use log::trace;
 use snafu::{location, Location};
 use tokio::task::JoinHandle;
 
-use lance_core::{Error, Result};
+use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
@@ -314,6 +314,7 @@ fn decode_offsets(
 ///
 /// This task does not wait for the items data.  That happens on the main decode loop (unless
 /// we have list of list of ... in which case it happens in the outer indirect decode loop)
+#[allow(clippy::too_many_arguments)]
 async fn indirect_schedule_task(
     mut offsets_decoder: Box<dyn LogicalPageDecoder>,
     list_requests: Vec<ListRequest>,
@@ -321,6 +322,7 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
+    cache: Arc<FileMetadataCache>,
     priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();
@@ -357,7 +359,7 @@ async fn indirect_schedule_task(
     let indirect_root_scheduler =
         SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
     let mut indirect_scheduler =
-        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields);
+        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields, cache);
     let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
@@ -440,6 +442,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         let items_scheduler = self.scheduler.items_scheduler.clone();
         let items_type = self.scheduler.items_type.clone();
         let io = context.io().clone();
+        let cache = context.cache().clone();
 
         // Immediately spawn the indirect scheduling
         let indirect_fut = tokio::spawn(indirect_schedule_task(
@@ -449,6 +452,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             items_scheduler,
             items_type,
             io,
+            cache,
             priority.box_clone(),
         ));
 
@@ -558,6 +562,15 @@ impl FieldScheduler for ListFieldScheduler {
 
     fn num_rows(&self) -> u64 {
         self.offsets_scheduler.num_rows()
+    }
+
+    fn initialize<'a>(
+        &'a self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        // 2.0 schedulers do not need to initialize
+        std::future::ready(Ok(())).boxed()
     }
 }
 

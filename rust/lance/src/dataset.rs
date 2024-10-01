@@ -4123,4 +4123,40 @@ mod tests {
             dataset.latest_version_id().await.unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn concurrent_create() {
+        async fn write(uri: &str) -> Result<()> {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+            let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+            Dataset::write(empty_reader, uri, None).await?;
+            Ok(())
+        }
+
+        for _ in 0..5 {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            let (res1, res2) = tokio::join!(write(test_uri), write(test_uri));
+
+            assert!(res1.is_ok() || res2.is_ok());
+            if res1.is_err() {
+                assert!(
+                    matches!(res1, Err(Error::DatasetAlreadyExists { .. })),
+                    "{:?}",
+                    res1
+                );
+            } else {
+                assert!(
+                    matches!(res2, Err(Error::DatasetAlreadyExists { .. })),
+                    "{:?}",
+                    res2
+                );
+            }
+        }
+    }
 }

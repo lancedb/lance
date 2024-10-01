@@ -12,6 +12,7 @@ use future::join_all;
 use futures::prelude::*;
 use lance_arrow::RecordBatchExt;
 use lance_core::{
+    cache::FileMetadataCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
     Error, Result,
 };
@@ -247,7 +248,8 @@ impl ShuffleReader for IvfShufflerReader {
         let reader = FileReader::try_open(
             self.scheduler.open_file(&partition_path).await?,
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
+            &FileMetadataCache::no_cache(),
         )
         .await?;
         let schema = reader.schema().as_ref().into();

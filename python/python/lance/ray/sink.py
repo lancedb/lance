@@ -137,6 +137,10 @@ class _BaseLanceDatasink(ray.data.Datasink):
                 fragment = pickle.loads(fragment_str)
                 fragments.append(fragment)
                 schema = pickle.loads(schema_str)
+        # Check weather writer has fragments or not.
+        # Skip commit when there are no fragments.
+        if not schema:
+            return
         if self.mode in set(["create", "overwrite"]):
             op = lance.LanceOperation.Overwrite(schema, fragments)
         elif self.mode == "append":
@@ -368,6 +372,10 @@ class LanceCommitter(_BaseLanceDatasink):
         """Passthrough the fragments to commit phase"""
         v = []
         for block in blocks:
+            # If block is empty, skip to get "fragment" and "schema" filed
+            if len(block) == 0:
+                continue
+
             for fragment, schema in zip(
                 block["fragment"].to_pylist(), block["schema"].to_pylist()
             ):

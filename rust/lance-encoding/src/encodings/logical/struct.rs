@@ -9,7 +9,7 @@ use std::{
 
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
-use futures::{future::BoxFuture, FutureExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
 use log::trace;
 use snafu::{location, Location};
 
@@ -198,6 +198,26 @@ impl FieldScheduler for SimpleStructScheduler {
 
     fn num_rows(&self) -> u64 {
         self.num_rows
+    }
+
+    fn initialize<'a>(
+        &'a self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        let futures = self
+            .children
+            .iter()
+            .map(|child| child.initialize(_filter, _context))
+            .collect::<FuturesUnordered<_>>();
+        async move {
+            futures
+                .map(|res| res.map(|_| ()))
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(())
+        }
+        .boxed()
     }
 }
 

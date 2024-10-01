@@ -128,7 +128,7 @@ pub(crate) async fn commit_new_dataset(
     let (mut manifest, indices) =
         transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
 
-    write_manifest_file(
+    let result = write_manifest_file(
         object_store,
         commit_handler,
         base_path,
@@ -141,9 +141,18 @@ pub(crate) async fn commit_new_dataset(
         write_config,
         manifest_naming_scheme,
     )
-    .await?;
+    .await;
 
-    Ok(manifest)
+    // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
+    // if there is a conflict.
+    match result {
+        Ok(()) => Ok(manifest),
+        Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
+            uri: base_path.to_string(),
+            location: location!(),
+        }),
+        Err(CommitError::OtherError(err)) => Err(err),
+    }
 }
 
 /// Internal function to check if a manifest could use some migration.

@@ -13,16 +13,16 @@ use std::{
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
-use datafusion::physical_plan::{
-    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
-    union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+use datafusion::{
+    functions_aggregate::min_max::{MaxAccumulator, MinAccumulator},
+    physical_plan::{
+        sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+        union::UnionExec, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
+    },
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
-use datafusion_physical_expr::{
-    expressions::{Column, MaxAccumulator, MinAccumulator},
-    PhysicalSortExpr,
-};
+use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
 use deepsize::DeepSizeOf;
 use futures::{
     future::BoxFuture,
