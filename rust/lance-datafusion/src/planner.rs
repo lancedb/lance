@@ -761,12 +761,10 @@ impl Planner {
                     location!(),
                 ))
             }
-            _ => {
-                Err(Error::invalid_input(
-                    format!("Expression '{expr}' is not supported SQL in lance"),
-                    location!(),
-                ))
-            }
+            _ => Err(Error::invalid_input(
+                format!("Expression '{expr}' is not supported SQL in lance"),
+                location!(),
+            )),
         }
     }
 
@@ -1102,9 +1100,18 @@ mod tests {
 
         let planner = Planner::new(schema.clone());
 
-        let expected = get_field(array_element(col("l"), lit(0)), "f1");
-        let expr = planner.parse_expr("l[0].f1").unwrap();
+        let expected = array_element(col("l"), lit(0_i64));
+        let expr = planner.parse_expr("l[0]").unwrap();
         assert_eq!(expr, expected);
+
+        let expected = get_field(array_element(col("l"), lit(0_i64)), "f1");
+        let expr = planner.parse_expr("l[0]['f1']").unwrap();
+        assert_eq!(expr, expected);
+
+        // FIXME: This should work, but sqlparser doesn't recognize anything
+        // after the period for some reason.
+        // let expr = planner.parse_expr("l[0].f1").unwrap();
+        // assert_eq!(expr, expected);
     }
 
     #[test]
