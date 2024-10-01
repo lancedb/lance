@@ -3,7 +3,7 @@ name: Rust Benchmark
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 9 * * *" # 9AM UTC = 2AM PST
   pull_request:
     paths:
       - ".github/workflows/rust-benchmark.yml"
