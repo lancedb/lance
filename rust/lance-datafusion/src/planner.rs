@@ -743,23 +743,8 @@ impl Planner {
                     }
                 };
 
-                let mut field_access_expr = RawFieldAccessExpr { expr, field_access };
-
-                let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
-
-                for planner in self.context_provider.get_expr_planners() {
-                    match planner.plan_field_access(field_access_expr, &df_schema)? {
-                        PlannerResult::Planned(expr) => return Ok(expr),
-                        PlannerResult::Original(expr) => {
-                            field_access_expr = expr;
-                        }
-                    }
-                }
-
-                Err(Error::invalid_input(
-                    "Field access could not be planned",
-                    location!(),
-                ))
+                let field_access_expr = RawFieldAccessExpr { expr, field_access };
+                self.plan_field_access(field_access_expr)
             }
             _ => Err(Error::invalid_input(
                 format!("Expression '{expr}' is not supported SQL in lance"),
@@ -790,7 +775,6 @@ impl Planner {
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema)?;
-        // dbg!(&resolved);
         Ok(resolved)
     }
 
