@@ -13,7 +13,7 @@ use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
+use lance_linalg::distance::{dot_distance_batch, Cosine, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
 use prost::Message;
@@ -96,7 +96,7 @@ impl ProductQuantizer {
     #[instrument(name = "ProductQuantizer::transform", level = "debug", skip_all)]
     fn transform<T: ArrowPrimitiveType>(&self, vectors: &dyn Array) -> Result<ArrayRef>
     where
-        T::Native: Float + L2 + Dot,
+        T::Native: Float + L2 + Dot + Cosine,
     {
         let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
