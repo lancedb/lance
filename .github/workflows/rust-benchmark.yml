@@ -1,4 +1,4 @@
-name: Benchmark Lance Repo
+name: Rust Benchmark
 
 on:
   workflow_dispatch:
