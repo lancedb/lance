@@ -35,8 +35,8 @@ use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, MapAccessKey, Subscript,
-    TimezoneInfo, UnaryOperator, Value,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript, TimezoneInfo,
+    UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
@@ -762,7 +762,6 @@ impl Planner {
                 ))
             }
             _ => {
-                dbg!(expr);
                 Err(Error::invalid_input(
                     format!("Expression '{expr}' is not supported SQL in lance"),
                     location!(),
@@ -793,6 +792,7 @@ impl Planner {
         let expr = self.parse_sql_expr(&ast_expr)?;
         let schema = Schema::try_from(self.schema.as_ref())?;
         let resolved = resolve_expr(&expr, &schema)?;
+        // dbg!(&resolved);
         Ok(resolved)
     }
 
@@ -927,7 +927,10 @@ mod tests {
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Fields, Schema};
-    use datafusion::logical_expr::{lit, Cast};
+    use datafusion::{
+        logical_expr::{lit, Cast},
+        prelude::{array_element, get_field},
+    };
     use datafusion_functions::core::expr_ext::FieldAccessor;
 
     #[test]
@@ -1082,6 +1085,26 @@ mod tests {
         assert_column_eq(&planner, "st.st.s2", &expected);
         assert_column_eq(&planner, "`st`.`st`.`s2`", &expected);
         assert_column_eq(&planner, "st.st.`s2`", &expected);
+        assert_column_eq(&planner, "st['st'][\"s2\"]", &expected);
+    }
+
+    #[test]
+    fn test_nested_list_refs() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![Field::new("f1", DataType::Utf8, true)])),
+                true,
+            ))),
+            true,
+        )]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = get_field(array_element(col("l"), lit(0)), "f1");
+        let expr = planner.parse_expr("l[0].f1").unwrap();
+        assert_eq!(expr, expected);
     }
 
     #[test]
