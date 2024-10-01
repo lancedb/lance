@@ -1,0 +1,9 @@
+name,dataset,lance_encoding_type,num_trials,num_rows,parquet_size,lance_size,parquet_write_time,lance_write_time,parquet_read_time,lance_read_time
+benchmark_tpch_encodings,tpch_sf1_nation,plain_non_numeric,10,25,0.00 MiB,0.00 MiB,0.00 seconds,0.00 seconds,0.00 seconds,0.00 seconds
+benchmark_tpch_encodings,tpch_sf1_region,plain_non_numeric,10,5,0.00 MiB,0.00 MiB,0.00 seconds,0.00 seconds,0.00 seconds,0.00 seconds
+benchmark_tpch_encodings,tpch_sf1_part,plain_non_numeric,10,200000,4.79 MiB,17.91 MiB,0.09 seconds,3.54 seconds,0.02 seconds,0.05 seconds
+benchmark_tpch_encodings,tpch_sf1_supplier,plain_non_numeric,10,10000,0.73 MiB,1.46 MiB,0.01 seconds,0.01 seconds,0.00 seconds,0.00 seconds
+benchmark_tpch_encodings,tpch_sf1_customer,plain_non_numeric,10,150000,10.74 MiB,23.40 MiB,0.10 seconds,0.48 seconds,0.03 seconds,0.03 seconds
+benchmark_tpch_encodings,tpch_sf1_partsupp,plain_non_numeric,10,800000,32.52 MiB,100.42 MiB,0.28 seconds,0.29 seconds,0.22 seconds,0.02 seconds
+benchmark_tpch_encodings,tpch_sf1_orders,plain_non_numeric,10,1500000,31.15 MiB,116.61 MiB,0.48 seconds,7.10 seconds,0.14 seconds,0.17 seconds
+benchmark_tpch_encodings,tpch_sf1_lineitem,plain_non_numeric,10,6001215,79.77 MiB,220.33 MiB,1.98 seconds,53.63 seconds,0.31 seconds,1.02 seconds

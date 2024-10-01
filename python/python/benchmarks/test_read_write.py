@@ -23,7 +23,8 @@ con = duckdb.connect(database=":memory:")
 con.execute("INSTALL tpch; LOAD tpch")
 con.execute("CALL dbgen(sf=1)")
 
-tables = ["lineitem", "nation", "region", "part", "supplier", "customer", "partsupp", "orders"]
+tables = ["lineitem", "nation", "region", "part", "supplier", "customer", "partsupp",
+    "orders"]
 for t in tables:
     res = con.query("SELECT * FROM " + t)
     pq.write_table(res.to_arrow_table(), tpch_dir_path + t + ".parquet")
@@ -53,7 +54,8 @@ def measure_pyarrow_read_time(path, num_trials, verbose=False):
     file_size_mb = file_size_bytes / (1024 * 1024)
 
     print(
-        f"Parquet Read Time: {avg_read_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+        f"Parquet Read Time: {avg_read_time:.2f}s for file {path} of size: "
+        f"{file_size_mb:.2f} MiB"
     )
     return avg_read_time
 
@@ -87,7 +89,8 @@ def measure_parquet_write_time(table, path, num_trials, verbose=False):
     file_size_mb = file_size_bytes / (1024 * 1024)
 
     print(
-        f"Parquet Write Time: {avg_write_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+        f"Parquet Write Time: {avg_write_time:.2f}s for file {path} of size: "
+        f"{file_size_mb:.2f} MiB"
     )
     return avg_write_time
 
@@ -120,7 +123,8 @@ def measure_lance_read_time(
     file_size_mb = file_size_bytes / (1024 * 1024)
 
     print(
-        f"Lance {lance_version} Read Time: {avg_read_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+        f"Lance {lance_version} Read Time: {avg_read_time:.2f}s for file {path} "
+        f"of size: {file_size_mb:.2f} MiB"
     )
     return avg_read_time
 
@@ -159,7 +163,8 @@ def measure_lance_write_time(
         file_size_mb = file_size_bytes / (1024 * 1024)
 
         print(
-            f"Lance {lance_version} Write Time: {avg_write_time:.2f}s for file {path} of size: {file_size_mb:.2f} MiB"
+            f"Lance {lance_version} Write Time: {avg_write_time:.2f}s for file {path} "
+            f"of size: {file_size_mb:.2f} MiB"
         )
     else:
         raise (f"Lance {lance_version} write file {path} failed")
@@ -441,7 +446,8 @@ tpch_dir_path = "/tmp/TPCH_SF1/"
 dataset_name = "tpch_sf1"
 
 if __name__ == "__main__":
-    # Version "2.1" test is temporarily disabled due to currently issues when activate it
+    # Version "2.1" test is temporarily disabled due to currently issues when
+    # activate it
     for lance_version in ["2.0"]:
         benchmark_tpch_lineitem(tpch_dir_path, lance_version)
         benchmark_tpch_encodings(
