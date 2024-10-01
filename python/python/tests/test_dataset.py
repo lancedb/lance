@@ -576,6 +576,29 @@ def test_nested_projection(tmp_path: Path):
         {"struct.y": [i % 2 == 0 for i in range(100)]}
     )
 
+def test_nested_projection_list(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "list_struct": [[{"x": counter, "y": counter % 2 == 0}] for counter in range(100)],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    scanner = dataset.scanner(columns={"list_struct": "list_struct[1].x"})
+    print(scanner.explain_plan(True))
+
+    projected = dataset.to_table(columns={"list_struct": "list_struct[1]['x']"})
+    assert projected == pa.Table.from_pydict({"list_struct": range(100)})
+
+    projected = dataset.to_table(columns={"list_struct": "list_struct[1].y"})
+    assert projected == pa.Table.from_pydict(
+        {"list_struct": [i % 2 == 0 for i in range(100)]}
+    )
 
 def test_polar_scan(tmp_path: Path):
     some_structs = [{"x": counter, "y": counter} for counter in range(100)]
