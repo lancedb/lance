@@ -34,7 +34,7 @@
 //! |      - |          1 | // Start of new inner-most list (empty list)
 //! |      2 |          1 | // Start of new inner-most list
 //! |      3 |          2 | // Start of new middle list
-//! |      - |          2 | // Start of new inner-most list (empty list)
+//! |      - |          2 | // Start of new middle list (empty list)
 //! |      - |          3 | // Start of new outer-most list (empty list)
 //! |      4 |          0 | // Start of new outer-most list
 //!
@@ -45,9 +45,9 @@
 //!
 //! Definition levels are simpler.  We can think of them as zipping together various validity (from
 //! different levels of nesting) into a single buffer.  For example, we could zip the arrays
-//! [1, 1, 0, 0] and [1, 0, 1, 0] into [11, 10, 01, 00].  However, 00 and 01 are redundant.  If the
-//! outer level is null then the validity of the inner levels is irrelevant.  To save space we instead
-//! encode a "level" which is the "depth" of the null.  Let's look at a more complete example:
+//! [1, 1, 0, 0] and [1, 0, 1, 0] into [11, 10, 01, 00].  However, 00 and 01 have redundancy in them.
+//! If the outer level is null then the validity of the inner levels is irrelevant.  To save space
+//! we instead encode a "level" which is the "depth" of the null.  Let's look at a more complete example:
 //!
 //! Array: [{"middle": {"inner": 1]}}, NULL, {"middle": NULL}, {"middle": {"inner": NULL}}]
 //!
@@ -69,7 +69,8 @@
 //! # Compression
 //!
 //! Note that we only need 2 bits of definition levels to represent 3 levels of nesting.  Definition
-//! levels are always more compact than the input validity arrays.
+//! levels are always more compact than the input validity arrays (if there is only 1 level of nesting
+//! then they are the same size).
 //!
 //! Repetition levels are more complex.  If there are very large lists then a sparse array of offsets
 //! (which has one element per list) might be more compact than a dense array of repetition levels
