@@ -2,7 +2,7 @@ use arrow::datatypes::{
     Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, Int8Array, PrimitiveArray, StringArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, Int8Array, PrimitiveArray, StringArray, UInt64Array, UInt8Array};
 use arrow_schema::DataType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use lance_arrow::DataTypeExt;
@@ -47,12 +47,7 @@ impl StatsSet {
             return;
         }
 
-        let data_size = arrays
-            .iter()
-            .map(|arr| arr.get_buffer_memory_size() as u64)
-            .sum::<u64>();
-        let data_size_array = Arc::new(PrimitiveArray::from(vec![data_size]));
-        self.values.insert(Stat::DataSize, data_size_array);
+        self.compute_data_size(arrays);
 
         self.compute_min(arrays);
 
@@ -61,6 +56,15 @@ impl StatsSet {
         self.compute_compressed_bit_width_for_non_neg(arrays);
 
         self.compute_fixed_size(arrays);
+    }
+
+    fn compute_data_size(&mut self, arrays: &[ArrayRef]) {
+        let data_size = arrays
+        .iter()
+        .map(|arr| arr.get_buffer_memory_size() as u64)
+        .sum::<u64>();
+        let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
+        self.values.insert(Stat::DataSize, data_size_array);
     }
 
     fn compute_min(&mut self, data: &[ArrayRef]) {

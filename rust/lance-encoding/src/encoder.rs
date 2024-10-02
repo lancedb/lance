@@ -233,6 +233,8 @@ impl CoreArrayEncodingStrategy {
         let stats_ref = stats.borrow();
         match &stats_ref.data_type {
             DataType::FixedSizeList(_, dimension) => {
+                // Not sure that we want the statistics of the inner values of fsl yet, 
+                // I can wrap stats in a Option if we don't calculate the fsl inner values
                 let children_stats = stats_ref.children.as_ref().unwrap();
                 assert!(children_stats.len() == 1);
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
@@ -286,8 +288,6 @@ impl CoreArrayEncodingStrategy {
                         dict_items_encoder,
                     )))
                 }
-                // The parent datatype should be binary or utf8 to use the fixed size encoding
-                // The variable 'data_type' is passed through recursion so comparing with it would be incorrect
                 else if fixed_size != u64::MAX {
                     let bytes_encoder =
                         Self::choose_array_encoder(children_stats[1].clone(), field_meta, version)?;
@@ -314,7 +314,6 @@ impl CoreArrayEncodingStrategy {
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                println!("new choose_array_encoder!");
                 let max_bit_width = stats_ref
                     .values
                     .get(&Stat::Bitwidth)
@@ -323,8 +322,6 @@ impl CoreArrayEncodingStrategy {
                     .downcast_ref::<UInt64Array>()
                     .unwrap()
                     .value(0);
-                println!("max_bit_width: {}", max_bit_width);
-                // panic!("I have reached here");
                 let max_bit_width = stats_ref
                     .values
                     .get(&Stat::Bitwidth)
@@ -333,6 +330,7 @@ impl CoreArrayEncodingStrategy {
                     .downcast_ref::<UInt64Array>()
                     .unwrap()
                     .value(0);
+                // I am thinking about a unified signature for `XXXEncoder::new`
                 Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
                     max_bit_width as usize,
                     stats_ref.data_type.clone(),
