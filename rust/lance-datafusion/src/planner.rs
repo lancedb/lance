@@ -26,16 +26,17 @@ use datafusion::execution::context::SessionState;
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::planner::ExprPlanner;
+use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, WindowUDF,
+    AggregateUDF, ColumnarValue, GetFieldAccess, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    WindowUDF,
 };
 use datafusion::optimizer::simplify_expressions::SimplifyContext;
 use datafusion::sql::planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
     Array as SQLArray, BinaryOperator, DataType as SQLDataType, ExactNumberInfo, Expr as SQLExpr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, TimezoneInfo, UnaryOperator,
-    Value,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Subscript, TimezoneInfo,
+    UnaryOperator, Value,
 };
 use datafusion::{
     common::Column,
@@ -238,11 +239,15 @@ impl ContextProvider for LanceContextProvider {
 
 pub struct Planner {
     schema: SchemaRef,
+    context_provider: LanceContextProvider,
 }
 
 impl Planner {
     pub fn new(schema: SchemaRef) -> Self {
-        Self { schema }
+        Self {
+            schema,
+            context_provider: LanceContextProvider::default(),
+        }
     }
 
     fn column(idents: &[Ident]) -> Expr {
@@ -403,9 +408,8 @@ impl Planner {
                 return self.legacy_parse_function(function);
             }
         }
-        let context_provider = LanceContextProvider::default();
         let sql_to_rel = SqlToRel::new_with_options(
-            &context_provider,
+            &self.context_provider,
             ParserOptions {
                 parse_float_as_decimal: false,
                 enable_ident_normalization: false,
@@ -514,6 +518,22 @@ impl Planner {
                 location!(),
             )),
         }
+    }
+
+    fn plan_field_access(&self, mut field_access_expr: RawFieldAccessExpr) -> Result<Expr> {
+        let df_schema = DFSchema::try_from(self.schema.as_ref().clone())?;
+        for planner in self.context_provider.get_expr_planners() {
+            match planner.plan_field_access(field_access_expr, &df_schema)? {
+                PlannerResult::Planned(expr) => return Ok(expr),
+                PlannerResult::Original(expr) => {
+                    field_access_expr = expr;
+                }
+            }
+        }
+        Err(Error::invalid_input(
+            "Field access could not be planned",
+            location!(),
+        ))
     }
 
     fn parse_sql_expr(&self, expr: &SQLExpr) -> Result<Expr> {
@@ -665,6 +685,67 @@ impl Planner {
                 expr: Box::new(self.parse_sql_expr(expr)?),
                 data_type: self.parse_type(data_type)?,
             })),
+            SQLExpr::MapAccess { column, keys } => {
+                let mut expr = self.parse_sql_expr(column)?;
+
+                for key in keys {
+                    let field_access = match &key.key {
+                        SQLExpr::Value(
+                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                        ) => GetFieldAccess::NamedStructField {
+                            name: ScalarValue::from(s.as_str()),
+                        },
+                        SQLExpr::JsonAccess { .. } => {
+                            return Err(Error::invalid_input(
+                                "JSON access is not supported",
+                                location!(),
+                            ));
+                        }
+                        key => {
+                            let key = Box::new(self.parse_sql_expr(key)?);
+                            GetFieldAccess::ListIndex { key }
+                        }
+                    };
+
+                    let field_access_expr = RawFieldAccessExpr { expr, field_access };
+
+                    expr = self.plan_field_access(field_access_expr)?;
+                }
+
+                Ok(expr)
+            }
+            SQLExpr::Subscript { expr, subscript } => {
+                let expr = self.parse_sql_expr(expr)?;
+
+                let field_access = match subscript.as_ref() {
+                    Subscript::Index { index } => match index {
+                        SQLExpr::Value(
+                            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s),
+                        ) => GetFieldAccess::NamedStructField {
+                            name: ScalarValue::from(s.as_str()),
+                        },
+                        SQLExpr::JsonAccess { .. } => {
+                            return Err(Error::invalid_input(
+                                "JSON access is not supported",
+                                location!(),
+                            ));
+                        }
+                        _ => {
+                            let key = Box::new(self.parse_sql_expr(index)?);
+                            GetFieldAccess::ListIndex { key }
+                        }
+                    },
+                    Subscript::Slice { .. } => {
+                        return Err(Error::invalid_input(
+                            "Slice subscript is not supported",
+                            location!(),
+                        ));
+                    }
+                };
+
+                let field_access_expr = RawFieldAccessExpr { expr, field_access };
+                self.plan_field_access(field_access_expr)
+            }
             _ => Err(Error::invalid_input(
                 format!("Expression '{expr}' is not supported SQL in lance"),
                 location!(),
@@ -828,7 +909,10 @@ mod tests {
         TimestampNanosecondArray, TimestampSecondArray,
     };
     use arrow_schema::{DataType, Fields, Schema};
-    use datafusion::logical_expr::{lit, Cast};
+    use datafusion::{
+        logical_expr::{lit, Cast},
+        prelude::{array_element, get_field},
+    };
     use datafusion_functions::core::expr_ext::FieldAccessor;
 
     #[test]
@@ -983,6 +1067,35 @@ mod tests {
         assert_column_eq(&planner, "st.st.s2", &expected);
         assert_column_eq(&planner, "`st`.`st`.`s2`", &expected);
         assert_column_eq(&planner, "st.st.`s2`", &expected);
+        assert_column_eq(&planner, "st['st'][\"s2\"]", &expected);
+    }
+
+    #[test]
+    fn test_nested_list_refs() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "l",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(Fields::from(vec![Field::new("f1", DataType::Utf8, true)])),
+                true,
+            ))),
+            true,
+        )]));
+
+        let planner = Planner::new(schema.clone());
+
+        let expected = array_element(col("l"), lit(0_i64));
+        let expr = planner.parse_expr("l[0]").unwrap();
+        assert_eq!(expr, expected);
+
+        let expected = get_field(array_element(col("l"), lit(0_i64)), "f1");
+        let expr = planner.parse_expr("l[0]['f1']").unwrap();
+        assert_eq!(expr, expected);
+
+        // FIXME: This should work, but sqlparser doesn't recognize anything
+        // after the period for some reason.
+        // let expr = planner.parse_expr("l[0].f1").unwrap();
+        // assert_eq!(expr, expected);
     }
 
     #[test]
