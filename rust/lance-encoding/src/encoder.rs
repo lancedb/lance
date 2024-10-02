@@ -1,9 +1,11 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -20,6 +22,7 @@ use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
+use crate::statistics::{Stat, StatsSet};
 use crate::version::LanceFileVersion;
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -222,6 +225,153 @@ impl CoreArrayEncodingStrategy {
         Some(compression.parse::<CompressionScheme>().unwrap())
     }
 
+    fn choose_array_encoder(
+        stats: Rc<RefCell<StatsSet>>,
+        field_meta: Option<&HashMap<String, String>>,
+        version: LanceFileVersion,
+    ) -> Result<Box<dyn ArrayEncoder>> {
+        let stats_ref = stats.borrow();
+        match &stats_ref.data_type {
+            DataType::FixedSizeList(_, dimension) => {
+                let children_stats = stats_ref.children.as_ref().unwrap();
+                assert!(children_stats.len() == 1);
+                Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
+                    Self::choose_array_encoder(children_stats[0].clone(), field_meta, version)?,
+                    *dimension as u32,
+                )))))
+            }
+            DataType::Dictionary(_, _) => {
+                let children_stats = stats_ref.children.as_ref().unwrap();
+                assert!(children_stats.len() == 2);
+                let key_encoder =
+                    Self::choose_array_encoder(children_stats[0].clone(), field_meta, version)?;
+                let value_encoder =
+                    Self::choose_array_encoder(children_stats[1].clone(), field_meta, version)?;
+
+                Ok(Box::new(AlreadyDictionaryEncoder::new(
+                    key_encoder,
+                    value_encoder,
+                )))
+            }
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+                let children_stats = stats_ref.children.as_ref().unwrap();
+                assert!(children_stats.len() == 2);
+
+                let cardinality = stats_ref
+                    .values
+                    .get(&Stat::Cardinality)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0);
+                let fixed_size =
+                    if let Some(fixed_size_array) = stats_ref.values.get(&Stat::FixedSize) {
+                        fixed_size_array
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap()
+                            .value(0)
+                    } else {
+                        u64::MAX
+                    };
+                if cardinality < get_dict_encoding_threshold() {
+                    let dict_indices_encoder =
+                        Self::choose_array_encoder(children_stats[0].clone(), field_meta, version)?;
+                    let dict_items_encoder =
+                        Self::choose_array_encoder(children_stats[1].clone(), field_meta, version)?;
+
+                    Ok(Box::new(DictionaryEncoder::new(
+                        dict_indices_encoder,
+                        dict_items_encoder,
+                    )))
+                }
+                // The parent datatype should be binary or utf8 to use the fixed size encoding
+                // The variable 'data_type' is passed through recursion so comparing with it would be incorrect
+                else if fixed_size != u64::MAX {
+                    let bytes_encoder =
+                        Self::choose_array_encoder(children_stats[1].clone(), field_meta, version)?;
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        FixedSizeBinaryEncoder::new(bytes_encoder, fixed_size as usize),
+                    ))))
+                } else {
+                    Self::default_binary_encoder(stats.clone(), field_meta, version)
+                }
+            }
+            DataType::Struct(fields) => {
+                let num_fields = fields.len();
+                let mut inner_encoders = Vec::new();
+                let children_stats = stats_ref.children.as_ref().unwrap();
+                // assert!(children_stats.len() == num_fields);
+
+                for i in 0..num_fields {
+                    let inner_datatype = fields[i].data_type();
+                    let inner_encoder =
+                        Self::choose_array_encoder(children_stats[i].clone(), field_meta, version)?;
+                    inner_encoders.push(inner_encoder);
+                }
+
+                Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
+            }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                println!("new choose_array_encoder!");
+                let max_bit_width = stats_ref
+                    .values
+                    .get(&Stat::Bitwidth)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0);
+                println!("max_bit_width: {}", max_bit_width);
+                // panic!("I have reached here");
+                let max_bit_width = stats_ref
+                    .values
+                    .get(&Stat::Bitwidth)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0);
+                Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                    max_bit_width as usize,
+                    stats_ref.data_type.clone(),
+                )))
+            }
+            _ => Ok(Box::new(BasicEncoder::new(Box::new(
+                ValueEncoder::default(),
+            )))),
+        }
+    }
+
+    fn default_binary_encoder(
+        stats: Rc<RefCell<StatsSet>>,
+        field_meta: Option<&HashMap<String, String>>,
+        version: LanceFileVersion,
+    ) -> Result<Box<dyn ArrayEncoder>> {
+        let stats = stats.borrow();
+        let children_stats = stats.children.as_ref().unwrap();
+        assert!(children_stats.len() == 2);
+        let bin_indices_encoder =
+            Self::choose_array_encoder(children_stats[0].clone(), field_meta, version)?;
+
+        let compression = field_meta.and_then(Self::get_field_compression);
+
+        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, compression));
+        let data_size = stats
+            .get(Stat::DataSize)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        if compression.is_none() && Self::can_use_fsst(&stats.data_type, data_size, version) {
+            Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+        } else {
+            Ok(bin_encoder)
+        }
+    }
+    /*
     fn default_binary_encoder(
         arrays: &[ArrayRef],
         data_type: &DataType,
@@ -241,7 +391,9 @@ impl CoreArrayEncodingStrategy {
             Ok(bin_encoder)
         }
     }
+    */
 
+    /*
     fn choose_array_encoder(
         arrays: &[ArrayRef],
         data_type: &DataType,
@@ -384,6 +536,7 @@ impl CoreArrayEncodingStrategy {
             )))),
         }
     }
+    */
 }
 
 fn get_dict_encoding_threshold() -> u64 {
@@ -503,6 +656,7 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
         arrays: &[ArrayRef],
         field: &Field,
     ) -> Result<Box<dyn ArrayEncoder>> {
+        /*
         let data_size = arrays
             .iter()
             .map(|arr| arr.get_buffer_memory_size() as u64)
@@ -520,6 +674,10 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             self.version,
             Some(&field.metadata),
         )
+        */
+        let stats = Rc::new(RefCell::new(StatsSet::new_from_arrays(arrays)));
+        let field_metadata = Some(&field.metadata);
+        Self::choose_array_encoder(stats.clone(), field_metadata, LanceFileVersion::V2_0)
     }
 }
 /// Keeps track of the current column index and makes a mapping
