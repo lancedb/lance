@@ -733,6 +733,11 @@ impl CoreFieldDecoderStrategy {
             offsets_column_buffers,
             self.validate_data,
         )) as Arc<dyn FieldScheduler>;
+        let items_field = match list_field.data_type() {
+            DataType::List(inner) => inner,
+            DataType::LargeList(inner) => inner,
+            _ => unreachable!(),
+        };
         let offset_type = if matches!(list_field.data_type(), DataType::List(_)) {
             DataType::Int32
         } else {
@@ -743,7 +748,7 @@ impl CoreFieldDecoderStrategy {
             Ok(Arc::new(ListFieldScheduler::new(
                 inner,
                 items_scheduler,
-                items_field.clone(),
+                items_field,
                 offset_type,
                 null_offset_adjustments,
             )) as Arc<dyn FieldScheduler>),
