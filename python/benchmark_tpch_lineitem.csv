@@ -1,2 +1,0 @@
-name,dataset,num_trials,num_rows,parquet_size,lance_size,pyarrow_read_time,lance_read_time
-benchmark_tpch_lineitem,tpch_lineitem,2.0,6001215,200.39 MiB,838.45 MiB,0.38 seconds,1.04 seconds

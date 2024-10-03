@@ -1,3 +1,0 @@
-name,dataset,lance_encoding_type,num_trials,num_rows,parquet_size,lance_size,parquet_write_time,lance_write_time,parquet_read_time,lance_read_time
-benchmark_tpch_encodings,tpch_sf1_orders,plain_timestamp,10,1500000,2.17 MiB,5.72 MiB,0.03 seconds,0.01 seconds,0.01 seconds,0.01 seconds
-benchmark_tpch_encodings,tpch_sf1_lineitem,plain_timestamp,10,6001215,25.97 MiB,68.68 MiB,0.33 seconds,0.16 seconds,0.03 seconds,0.04 seconds
