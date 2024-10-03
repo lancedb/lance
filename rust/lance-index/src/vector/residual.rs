@@ -11,7 +11,7 @@ use arrow_array::{
 use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
-use lance_linalg::distance::{DistanceType, Dot, L2};
+use lance_linalg::distance::{Cosine, DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partitions;
 use num_traits::Float;
 use snafu::{location, Location};
@@ -60,7 +60,7 @@ fn do_compute_residual<T: ArrowPrimitiveType>(
     partitions: Option<&UInt32Array>,
 ) -> Result<FixedSizeListArray>
 where
-    T::Native: Float + L2 + Dot,
+    T::Native: Float + L2 + Dot + Cosine,
 {
     let dimension = centroids.value_length() as usize;
     let centroids_slice = centroids.values().as_primitive::<T>().values();
