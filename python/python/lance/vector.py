@@ -533,7 +533,7 @@ def compute_partitions(
     rbr = pa.RecordBatchReader.from_batches(output_schema, _partition_assignment())
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
-    ds = write_dataset(
+    write_dataset(
         rbr,
         dst_dataset_uri,
         schema=output_schema,

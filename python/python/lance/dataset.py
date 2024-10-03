@@ -1670,9 +1670,9 @@ class LanceDataset(pa.dataset.Dataset):
                     and accelerator is not None
                     and "precomputed_partitions_file" in kwargs
                 ):
-                    # In this case, the precomputed partitions file would be used without
-                    # being turned into a set of precomputed buffers, so it needs to have
-                    # a very specific format
+                    # In this case, the precomputed partitions file would be used
+                    # without being turned into a set of precomputed buffers, so it
+                    # needs to have a very specific format
                     if len(precomputed_ds.get_fragments()) != 1:
                         raise ValueError(
                             "precomputed_partition_dataset must have only one fragment"
