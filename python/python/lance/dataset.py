@@ -1446,7 +1446,7 @@ class LanceDataset(pa.dataset.Dataset):
         shuffle_partition_concurrency: Optional[int] = None,
         # experimental parameters
         ivf_centroids_file: Optional[str] = None,
-        precomputed_partiton_dataset: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> LanceDataset:
@@ -1655,14 +1655,14 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_partitions"] = num_partitions
 
-            if (precomputed_partiton_dataset is not None) and (ivf_centroids is None):
+            if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
                     "ivf_centroids must be provided when"
-                    " precomputed_partiton_dataset is provided"
+                    " precomputed_partition_dataset is provided"
                 )
-            if precomputed_partiton_dataset is not None:
+            if precomputed_partition_dataset is not None:
                 precomputed_ds = LanceDataset(
-                    precomputed_partiton_dataset, storage_options=storage_options
+                    precomputed_partition_dataset, storage_options=storage_options
                 )
                 if not (
                     "PQ" in index_type
@@ -1675,14 +1675,14 @@ class LanceDataset(pa.dataset.Dataset):
                     # a very specific format
                     if len(precomputed_ds.get_fragments()) != 1:
                         raise ValueError(
-                            "precomputed_partiton_dataset must have only one fragment"
+                            "precomputed_partition_dataset must have only one fragment"
                         )
                     files = precomputed_ds.get_fragments()[0].data_files()
                     if len(files) != 1:
                         raise ValueError(
-                            "precomputed_partiton_dataset must have only one files"
+                            "precomputed_partition_dataset must have only one files"
                         )
-                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
+                kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
             if accelerator is not None and ivf_centroids is None:
                 # Use accelerator to train ivf centroids
@@ -1791,7 +1791,7 @@ class LanceDataset(pa.dataset.Dataset):
                 times.append(time.time())
                 logging.info("pq transform time: %ss", times[2] - times[1])
                 # Save disk space
-                if precomputed_partiton_dataset is not None and os.path.exists(
+                if precomputed_partition_dataset is not None and os.path.exists(
                     partitions_file
                 ):
                     shutil.rmtree(partitions_file)
