@@ -1664,15 +1664,24 @@ class LanceDataset(pa.dataset.Dataset):
                 precomputed_ds = LanceDataset(
                     precomputed_partiton_dataset, storage_options=storage_options
                 )
-                if len(precomputed_ds.get_fragments()) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one fragment"
-                    )
-                files = precomputed_ds.get_fragments()[0].data_files()
-                if len(files) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one files"
-                    )
+                if not (
+                    "PQ" in index_type
+                    and pq_codebook is None
+                    and accelerator is not None
+                    and "precomputed_partitions_file" in kwargs
+                ):
+                    # In this case, the precomputed partitions file would be used without
+                    # being turned into a set of precomputed buffers, so it needs to have
+                    # a very specific format
+                    if len(precomputed_ds.get_fragments()) != 1:
+                        raise ValueError(
+                            "precomputed_partiton_dataset must have only one fragment"
+                        )
+                    files = precomputed_ds.get_fragments()[0].data_files()
+                    if len(files) != 1:
+                        raise ValueError(
+                            "precomputed_partiton_dataset must have only one files"
+                        )
                 kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
 
             if accelerator is not None and ivf_centroids is None:
