@@ -115,3 +115,30 @@ jobs:
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
+      - name: Find Spark Jar
+        run: |
+          RELATIVE_JAR_PATH=$(find spark/target -name 'lance-spark-2.12-*-jar-with-dependencies.jar')
+          SPARK_JAR_NAME=$(basename $RELATIVE_JAR_PATH)
+          SPARK_JAR_PATH=$(readlink -f "$RELATIVE_JAR_PATH")
+          echo "SPARK_JAR_PATH=$SPARK_JAR_PATH" >> $GITHUB_ENV
+          echo "SPARK_JAR_NAME=$SPARK_JAR_NAME" >> $GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SPARK_JAR_NAME }}
+          path: ${{ env.SPARK_JAR_PATH }}
+          retention-days: 30
+          if-no-files-found: error
+      - name: Build Spark jar with scala 2.13
+        run: |
+          mvn --batch-mode -DskipTests -Pscala-2.13 package
+          RELATIVE_JAR_PATH=$(find spark/target -name 'lance-spark-2.13-*-jar-with-dependencies.jar')
+          SPARK_JAR_NAME=$(basename $RELATIVE_JAR_PATH)
+          SPARK_JAR_PATH=$(readlink -f "$RELATIVE_JAR_PATH")
+          echo "SPARK_13_JAR_PATH=$SPARK_JAR_PATH" >> $GITHUB_ENV
+          echo "SPARK_13_JAR_NAME=$SPARK_JAR_NAME" >> $GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SPARK_13_JAR_NAME }}
+          path: ${{ env.SPARK_13_JAR_PATH }}
+          retention-days: 30
+          if-no-files-found: error
