@@ -130,7 +130,6 @@ CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 def train_pq_codebook_on_accelerator(
     dataset: LanceDataset,
     metric_type: Literal["l2", "cosine", "dot"],
-    kmeans: Any,
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
@@ -145,7 +144,6 @@ def train_pq_codebook_on_accelerator(
     kmeans_list = []
 
     field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
-    kmeans.centroids.shape[1]
 
     sample_size = 256 * 256
     from lance.torch.data import LanceDataset as TorchDataset

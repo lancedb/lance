@@ -1777,7 +1777,6 @@ class LanceDataset(pa.dataset.Dataset):
                 pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
                     partitions_ds,
                     metric,
-                    kmeans,
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
                 )
