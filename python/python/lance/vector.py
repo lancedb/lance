@@ -14,13 +14,11 @@ import pyarrow as pa
 from tqdm.auto import tqdm
 
 from . import write_dataset
+from .cuvs.kmeans import KMeans as KMeansCuVS
 from .dependencies import _check_for_numpy, torch
 from .dependencies import numpy as np
-
 from .torch.data import LanceDataset as TorchDataset
 from .torch.kmeans import KMeans
-from .cuvs.kmeans import KMeans as KMeansCuVS
-
 
 if TYPE_CHECKING:
     from pathlib import Path
