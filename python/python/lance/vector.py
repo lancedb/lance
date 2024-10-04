@@ -337,6 +337,7 @@ def compute_pq_codes(
     )
 
     progress = tqdm(total=num_rows)
+    progress.set_description("Assigning PQ codes")
 
     device = kmeans_list[0].device
 
@@ -474,6 +475,11 @@ def compute_partitions(
     )
 
     progress = tqdm(total=num_rows)
+
+    if num_sub_vectors is not None:
+        progress.set_description("Assigning partitions and computing residuals")
+    else:
+        progress.set_description("Assigning partitions")
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
