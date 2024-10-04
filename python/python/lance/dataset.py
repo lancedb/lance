@@ -1660,6 +1660,7 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partition_dataset is provided"
                 )
             if precomputed_partition_dataset is not None:
+                logging.info("Using provided precomputed partition dataset")
                 precomputed_ds = LanceDataset(
                     precomputed_partition_dataset, storage_options=storage_options
                 )
@@ -1684,6 +1685,7 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
             if accelerator is not None and ivf_centroids is None:
+                logging.info("Computing new precomputed partition dataset")
                 # Use accelerator to train ivf centroids
                 from .vector import (
                     compute_partitions,
@@ -1760,6 +1762,7 @@ class LanceDataset(pa.dataset.Dataset):
                 and accelerator is not None
                 and "precomputed_partitions_file" in kwargs
             ):
+                logging.info("Computing new precomputed shuffle buffers for PQ.")
                 partitions_file = kwargs["precomputed_partitions_file"]
                 del kwargs["precomputed_partitions_file"]
                 import lance
