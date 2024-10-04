@@ -1654,6 +1654,9 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_partitions"] = num_partitions
 
+            # Handle timing for various parts of accelerated builds
+            timers = {}
+
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
                     "ivf_centroids must be provided when"
@@ -1692,8 +1695,7 @@ class LanceDataset(pa.dataset.Dataset):
                     train_ivf_centroids_on_accelerator,
                 )
 
-                times = []
-                times.append(time.time())
+                timers["ivf_train:start"] = time.time()
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
@@ -1701,8 +1703,10 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                 )
-                times.append(time.time())
-                logging.info("ivf training time: %ss", times[1] - times[0])
+                timers["ivf_train:end"] = time.time()
+                ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
+                logging.info("ivf training time: %ss", ivf_train_time)
+                timers["ivf_assign:start"] = time.time()
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
                     # compute residual subspace columns in the same pass
@@ -1714,8 +1718,9 @@ class LanceDataset(pa.dataset.Dataset):
                     batch_size=20480,
                     num_sub_vectors=num_sub_vectors_cur,
                 )
-                times.append(time.time())
-                logging.info("ivf transform time: %ss", times[2] - times[1])
+                timers["ivf_assign:end"] = time.time()
+                ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
+                logging.info("ivf transform time: %ss", ivf_assign_time)
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -1774,23 +1779,25 @@ class LanceDataset(pa.dataset.Dataset):
                     train_pq_codebook_on_accelerator,
                 )
 
-                times = []
-                times.append(time.time())
+                timers["pq_train:start"] = time.time()
                 pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
                     partitions_ds,
                     metric,
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
                 )
-                times.append(time.time())
-                logging.info("pq training time: %ss", times[1] - times[0])
+                timers["pq_train:end"] = time.time()
+                pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
+                logging.info("pq training time: %ss", pq_train_time)
+                timers["pq_assign:start"] = time.time()
                 shuffle_output_dir, shuffle_buffers = compute_pq_codes(
                     partitions_ds,
                     kmeans_list,
                     batch_size=20480,
                 )
-                times.append(time.time())
-                logging.info("pq transform time: %ss", times[2] - times[1])
+                timers["pq_assign:end"] = time.time()
+                pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
+                logging.info("pq transform time: %ss", pq_assign_time)
                 # Save disk space
                 if precomputed_partition_dataset is not None and os.path.exists(
                     partitions_file
