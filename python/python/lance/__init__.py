@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
-from .blob import BlobColumn
+from .blob import BlobColumn, BlobFile
 from .dataset import (
     LanceDataset,
     LanceOperation,
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BlobColumn",
+    "BlobFile",
     "FragmentMetadata",
     "LanceDataset",
     "LanceFragment",

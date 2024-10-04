@@ -8,12 +8,12 @@ use arrow_array::{Array, ArrayRef, LargeBinaryArray, PrimitiveArray, StructArray
 use arrow_buffer::{
     BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow_schema::{DataType, Field, Fields};
+use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
@@ -25,17 +25,6 @@ use crate::{
     format::pb::{column_encoding, Blob, ColumnEncoding},
     EncodingsIo,
 };
-
-lazy_static::lazy_static! {
-    static ref DESC_FIELDS: Fields =
-        Fields::from(vec![
-            Field::new("position", DataType::UInt64, false),
-            Field::new("size", DataType::UInt64, false),
-        ]);
-    pub static ref DESC_FIELD: Field =
-        Field::new("description", DataType::Struct(DESC_FIELDS.clone()), false);
-
-}
 
 /// A field scheduler for large binary data
 ///
@@ -364,7 +353,7 @@ impl BlobFieldEncoder {
         let positions = Arc::new(UInt64Array::from(positions));
         let sizes = Arc::new(UInt64Array::from(sizes));
         let descriptions = Arc::new(StructArray::new(
-            DESC_FIELDS.clone(),
+            BLOB_DESC_FIELDS.clone(),
             vec![positions, sizes],
             None,
         ));
@@ -419,9 +408,9 @@ pub mod tests {
 
     use arrow_array::LargeBinaryArray;
     use arrow_schema::{DataType, Field};
+    use lance_core::datatypes::BLOB_META_KEY;
 
     use crate::{
-        encoder::BLOB_META_KEY,
         format::pb::column_encoding,
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
     };
