@@ -9,7 +9,11 @@ use std::{
 
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
-use futures::{future::BoxFuture, stream::FuturesOrdered, FutureExt, StreamExt, TryStreamExt};
+use futures::{
+    future::BoxFuture,
+    stream::{FuturesOrdered, FuturesUnordered},
+    FutureExt, StreamExt, TryStreamExt,
+};
 use log::trace;
 use snafu::{location, Location};
 

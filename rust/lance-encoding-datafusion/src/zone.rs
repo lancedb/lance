@@ -625,7 +625,7 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         let items_columns = self.items_encoder.finish(external_buffers);
 
         async move {
-            let items_columns = self.items_encoder.finish().await?;
+            let items_columns = items_columns.await?;
             if items_columns.is_empty() {
                 return Err(Error::invalid_input("attempt to apply zone maps to a field encoder that generated zero columns of data".to_string(), location!()))
             }

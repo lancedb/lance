@@ -128,6 +128,14 @@ impl FieldScheduler for BlobFieldScheduler {
     fn num_rows(&self) -> u64 {
         self.descriptions_scheduler.num_rows()
     }
+
+    fn initialize<'a>(
+        &'a self,
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.descriptions_scheduler.initialize(filter, context)
+    }
 }
 
 pub struct BlobFieldDecoder {

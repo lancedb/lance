@@ -458,6 +458,7 @@ impl IoTask {
                 .get_range(self.to_read.start as usize..self.to_read.end as usize);
             bytes_fut.await.map_err(Error::from)
         };
+        IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }
 }
