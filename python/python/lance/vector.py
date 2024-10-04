@@ -17,6 +17,11 @@ from . import write_dataset
 from .dependencies import _check_for_numpy, torch
 from .dependencies import numpy as np
 
+from .torch.data import LanceDataset as TorchDataset
+from .torch.kmeans import KMeans
+from .cuvs.kmeans import KMeans as KMeansCuVS
+
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -146,9 +151,6 @@ def train_pq_codebook_on_accelerator(
     field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
 
     sample_size = 256 * 256
-    from lance.torch.data import LanceDataset as TorchDataset
-
-    from .torch.kmeans import KMeans
 
     ds_init = TorchDataset(
         dataset,
@@ -212,10 +214,6 @@ def train_ivf_centroids_on_accelerator(
 
     sample_size = k * sample_rate
 
-    from lance.torch.data import LanceDataset as TorchDataset
-
-    from .torch.kmeans import KMeans
-
     k = int(k)
 
     if dataset.schema.field(column).nullable:
@@ -248,8 +246,6 @@ def train_ivf_centroids_on_accelerator(
     if accelerator == "cuvs":
         logging.info("Training IVF partitions using cuVS+GPU")
         print("Training IVF partitions using cuVS+GPU")
-        from lance.cuvs.kmeans import KMeans as KMeansCuVS
-
         kmeans = KMeansCuVS(
             k,
             max_iters=max_iters,
@@ -314,9 +310,7 @@ def compute_pq_codes(
 
     field_names = [f"__residual_subvec_{i + 1}" for i in range(num_sub_vectors)]
 
-    from lance.torch.data import LanceDataset as PytorchLanceDataset
-
-    torch_ds = PytorchLanceDataset(
+    torch_ds = TorchDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=False,
@@ -435,13 +429,11 @@ def compute_partitions(
     str
         The absolute path of the partition dataset.
     """
-    from lance.torch.data import LanceDataset as PytorchLanceDataset
-
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
     num_rows = dataset.count_rows()
 
-    torch_ds = PytorchLanceDataset(
+    torch_ds = TorchDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=True,
