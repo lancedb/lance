@@ -130,7 +130,7 @@ impl ArrayEncoder for FslEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use arrow_schema::{DataType, Field};
 
@@ -144,7 +144,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field, HashMap::new()).await;
+            check_round_trip_encoding_random(field).await;
         }
     }
 }

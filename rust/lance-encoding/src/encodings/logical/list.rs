@@ -26,7 +26,10 @@ use crate::{
         LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
+        OutOfLineBuffers,
+    },
     encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
     EncodingsIo,
@@ -1149,7 +1152,11 @@ impl ListFieldEncoder {
 }
 
 impl FieldEncoder for ListFieldEncoder {
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
         // values array could be longer than what we need to encode and so we need
         // to slice down to the region of interest.
@@ -1179,25 +1186,25 @@ impl FieldEncoder for ListFieldEncoder {
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
             .unwrap_or_default();
-        let mut item_tasks = self.items_encoder.maybe_encode(items)?;
+        let mut item_tasks = self.items_encoder.maybe_encode(items, external_buffers)?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
             // a limitation in the current scheduler and could be addressed in the future.  As a result
             // we always need to encode the items page if we encode the offsets page.
             //
             // In practice this isn't usually too bad unless we are targetting very small pages.
-            item_tasks = self.items_encoder.flush()?;
+            item_tasks = self.items_encoder.flush(external_buffers)?;
         }
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
-    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         let offsets_tasks = self
             .offsets_encoder
             .flush()
             .map(|task| vec![task])
             .unwrap_or_default();
-        let item_tasks = self.items_encoder.flush()?;
+        let item_tasks = self.items_encoder.flush(external_buffers)?;
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
@@ -1205,10 +1212,15 @@ impl FieldEncoder for ListFieldEncoder {
         self.items_encoder.num_columns() + 1
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        let inner_columns = self.items_encoder.finish(external_buffers);
         async move {
             let mut columns = vec![EncodedColumn::default()];
-            columns.extend(self.items_encoder.finish().await?);
+            let inner_columns = inner_columns.await?;
+            columns.extend(inner_columns);
             Ok(columns)
         }
         .boxed()
@@ -1243,25 +1255,25 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_list() {
         let field = Field::new("", make_large_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1273,7 +1285,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

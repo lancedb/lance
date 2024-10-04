@@ -269,12 +269,12 @@ pub mod tests {
             Field::new("a", DataType::UInt64, false),
             Field::new("b", DataType::UInt32, false),
         ]));
-        let field = Field::new("", data_type, false);
-
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
 
-        check_round_trip_encoding_random(field, metadata).await;
+        let field = Field::new("", data_type, false).with_metadata(metadata);
+
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

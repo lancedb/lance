@@ -31,7 +31,7 @@ use lance_encoding::{
     },
     encoder::{
         encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedColumn, EncodingOptions,
-        FieldEncoder,
+        FieldEncoder, OutOfLineBuffers,
     },
     format::pb,
     EncodingsIo,
@@ -560,8 +560,7 @@ impl ZoneMapsFieldEncoder {
         Ok(())
     }
 
-    async fn maps_to_metadata(&mut self) -> Result<LanceBuffer> {
-        let maps = std::mem::take(&mut self.maps);
+    async fn maps_to_metadata(maps: Vec<CreatedZoneMap>) -> Result<LanceBuffer> {
         let (mins, (maxes, null_counts)): (Vec<_>, (Vec<_>, Vec<_>)) = maps
             .into_iter()
             .map(|mp| (mp.min, (mp.max, mp.null_count)))
@@ -599,6 +598,7 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
     ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
         // TODO: If we do the zone map calculation as part of the encoding task then we can
         // parallelize statistics gathering.  Could be faster too since the encoding task is
@@ -606,35 +606,45 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         // probably too big for the CPU cache anyways).  We can worry about this if we need
         // to improve write speed.
         self.update(&array)?;
-        self.items_encoder.maybe_encode(array)
+        self.items_encoder.maybe_encode(array, external_buffers)
     }
 
-    fn flush(&mut self) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
-        self.items_encoder.flush()
+    fn flush(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
+        self.items_encoder.flush(external_buffers)
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
-        async move {
-            if self.cur_offset > 0 {
-                // Create final map
-                self.new_map()?;
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        if self.cur_offset > 0 {
+            // Create final map
+            if let Err(err) = self.new_map() {
+                return async move { Err(err) }.boxed();
             }
-            let items_columns = self.items_encoder.finish().await?;
-            if items_columns.len() != 1 {
-                return Err(Error::InvalidInput {
-                    source: format!("attempt to apply zone maps to a field encoder that generated {} columns of data (expected 1)", items_columns.len()).into(),
-                    location: location!()})
+        }
+        let maps = std::mem::take(&mut self.maps);
+        let rows_per_zone = self.rows_per_map;
+        let items_columns = self.items_encoder.finish(external_buffers);
+
+        async move {
+            let items_columns = items_columns.await?;
+            if items_columns.is_empty() {
+                return Err(Error::invalid_input("attempt to apply zone maps to a field encoder that generated zero columns of data".to_string(), location!()))
             }
             let items_column = items_columns.into_iter().next().unwrap();
             let final_pages = items_column.final_pages;
             let mut column_buffers = items_column.column_buffers;
             let zone_buffer_index = column_buffers.len();
-            column_buffers.push(self.maps_to_metadata().await?);
+            column_buffers.push(Self::maps_to_metadata(maps).await?);
             let column_encoding = pb::ColumnEncoding {
                 column_encoding: Some(pb::column_encoding::ColumnEncoding::ZoneIndex(Box::new(
                     pb::ZoneIndex {
                         inner: Some(Box::new(items_column.encoding)),
-                        rows_per_zone: self.rows_per_map,
+                        rows_per_zone,
                         zone_map_buffer: Some(pb::Buffer {
                             buffer_index: zone_buffer_index as u32,
                             buffer_type: i32::from(pb::buffer::BufferType::Column),

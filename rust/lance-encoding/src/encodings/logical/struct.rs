@@ -9,7 +9,11 @@ use std::{
 
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
 use arrow_schema::{DataType, Fields};
-use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt, TryStreamExt};
+use futures::{
+    future::BoxFuture,
+    stream::{FuturesOrdered, FuturesUnordered},
+    FutureExt, StreamExt, TryStreamExt,
+};
 use log::trace;
 use snafu::{location, Location};
 
@@ -19,7 +23,9 @@ use crate::{
         DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
         NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
-    encoder::{EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers,
+    },
     format::pb,
 };
 use lance_core::{Error, Result};
@@ -553,23 +559,27 @@ impl StructFieldEncoder {
 }
 
 impl FieldEncoder for StructFieldEncoder {
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
         let child_tasks = self
             .children
             .iter_mut()
             .zip(struct_array.columns().iter())
-            .map(|(encoder, arr)| encoder.maybe_encode(arr.clone()))
+            .map(|(encoder, arr)| encoder.maybe_encode(arr.clone(), external_buffers))
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
     }
 
-    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         let child_tasks = self
             .children
             .iter_mut()
-            .map(|encoder| encoder.flush())
+            .map(|encoder| encoder.flush(external_buffers))
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
     }
@@ -582,7 +592,17 @@ impl FieldEncoder for StructFieldEncoder {
             + 1
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        let mut child_columns = self
+            .children
+            .iter_mut()
+            .map(|child| child.finish(external_buffers))
+            .collect::<FuturesOrdered<_>>();
+        let num_rows_seen = self.num_rows_seen;
+        let column_index = self.column_index;
         async move {
             let mut columns = Vec::new();
             // Add a column for the struct header
@@ -590,7 +610,7 @@ impl FieldEncoder for StructFieldEncoder {
             header.final_pages.push(EncodedPage {
                 array: EncodedArray {
                     data: DataBlock::AllNull(AllNullDataBlock {
-                        num_values: self.num_rows_seen,
+                        num_values: num_rows_seen,
                     }),
                     encoding: pb::ArrayEncoding {
                         array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
@@ -598,13 +618,13 @@ impl FieldEncoder for StructFieldEncoder {
                         )),
                     },
                 },
-                num_rows: self.num_rows_seen,
-                column_idx: self.column_index,
+                num_rows: num_rows_seen,
+                column_idx: column_index,
             });
             columns.push(header);
             // Now run finish on the children
-            for child in self.children.iter_mut() {
-                columns.extend(child.finish().await?);
+            while let Some(child_cols) = child_columns.next().await {
+                columns.extend(child_cols?);
             }
             Ok(columns)
         }
@@ -634,7 +654,7 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
         let field = Field::new("", data_type, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -648,7 +668,7 @@ mod tests {
             Field::new("outer_int", DataType::Int32, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -670,7 +690,7 @@ mod tests {
             Field::new("outer_binary", DataType::Binary, true),
         ]));
         let field = Field::new("row", data_type, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

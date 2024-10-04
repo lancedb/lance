@@ -7,7 +7,10 @@ use fsst::FsstPageScheduler;
 use lance_arrow::DataTypeExt;
 use packed_struct::PackedStructPageScheduler;
 
-use crate::{decoder::PageScheduler, format::pb};
+use crate::{
+    decoder::PageScheduler,
+    format::pb::{self, PackedStruct},
+};
 
 use self::{
     basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
@@ -119,6 +122,41 @@ fn get_bitpacked_for_non_neg_buffer_decoder(
     Box::new(bitpack_fastlanes::BitpackedForNonNegScheduler::new(
         encoding.compressed_bits_per_value,
         encoding.uncompressed_bits_per_value,
+        buffer_offset,
+    ))
+}
+
+fn decoder_from_packed_struct(
+    packed_struct: &PackedStruct,
+    buffers: &PageBuffers,
+    data_type: &DataType,
+) -> Box<dyn PageScheduler> {
+    let inner_encodings = &packed_struct.inner;
+    let fields = match data_type {
+        DataType::Struct(fields) => Some(fields),
+        _ => None,
+    }
+    .unwrap();
+
+    let inner_datatypes = fields
+        .iter()
+        .map(|field| field.data_type())
+        .collect::<Vec<_>>();
+
+    let mut inner_schedulers = Vec::with_capacity(fields.len());
+    for i in 0..fields.len() {
+        let inner_encoding = &inner_encodings[i];
+        let inner_datatype = inner_datatypes[i];
+        let inner_scheduler = decoder_from_array_encoding(inner_encoding, buffers, inner_datatype);
+        inner_schedulers.push(inner_scheduler);
+    }
+
+    let packed_buffer = packed_struct.buffer.as_ref().unwrap();
+    let (buffer_offset, _) = get_buffer(packed_buffer, buffers);
+
+    Box::new(PackedStructPageScheduler::new(
+        inner_schedulers,
+        data_type.clone(),
         buffer_offset,
     ))
 }
@@ -236,35 +274,7 @@ pub fn decoder_from_array_encoding(
             ))
         }
         pb::array_encoding::ArrayEncoding::PackedStruct(packed_struct) => {
-            let inner_encodings = &packed_struct.inner;
-            let fields = match data_type {
-                DataType::Struct(fields) => Some(fields),
-                _ => None,
-            }
-            .unwrap();
-
-            let inner_datatypes = fields
-                .iter()
-                .map(|field| field.data_type())
-                .collect::<Vec<_>>();
-
-            let mut inner_schedulers = Vec::with_capacity(fields.len());
-            for i in 0..fields.len() {
-                let inner_encoding = &inner_encodings[i];
-                let inner_datatype = inner_datatypes[i];
-                let inner_scheduler =
-                    decoder_from_array_encoding(inner_encoding, buffers, inner_datatype);
-                inner_schedulers.push(inner_scheduler);
-            }
-
-            let packed_buffer = packed_struct.buffer.as_ref().unwrap();
-            let (buffer_offset, _) = get_buffer(packed_buffer, buffers);
-
-            Box::new(PackedStructPageScheduler::new(
-                inner_schedulers,
-                data_type.clone(),
-                buffer_offset,
-            ))
+            decoder_from_packed_struct(packed_struct, buffers, data_type)
         }
         pb::array_encoding::ArrayEncoding::BitpackedForNonNeg(bitpacked) => {
             get_bitpacked_for_non_neg_buffer_decoder(bitpacked, buffers)

@@ -407,3 +407,30 @@ def test_compression(tmp_path):
     size_compress = os.path.getsize(tmp_path / "compress.lance")
 
     assert size_compress < size_default
+
+
+def test_blob(tmp_path):
+    # 100 1MiB values.  If we store as regular large_binary we end up
+    # with several pages of values.  If we store as a blob we get a
+    # single page
+    vals = pa.array([b"0" * (1024 * 1024) for _ in range(100)], pa.large_binary())
+    schema_no_blob = pa.schema([pa.field("val", pa.large_binary())])
+    schema_blob = pa.schema(
+        [pa.field("val", pa.large_binary(), metadata={"lance-encoding:blob": "true"})]
+    )
+
+    path = tmp_path / "no_blob.lance"
+    with LanceFileWriter(str(path), schema_no_blob) as writer:
+        writer.write_batch(pa.table({"val": vals}))
+
+    reader = LanceFileReader(str(path))
+    assert len(reader.metadata().columns[0].pages) > 1
+    assert reader.read_all().to_table() == pa.table({"val": vals})
+
+    path = tmp_path / "blob.lance"
+    with LanceFileWriter(str(path), schema_blob) as writer:
+        writer.write_batch(pa.table({"val": vals}))
+
+    reader = LanceFileReader(str(path))
+    assert len(reader.metadata().columns[0].pages) == 1
+    assert reader.read_all().to_table() == pa.table({"val": vals})
