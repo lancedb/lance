@@ -780,16 +780,6 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let primitive_col = column_infos.expect_next()?;
-            if let Some(blob_col) = Self::unwrap_blob(primitive_col) {
-                let desc_scheduler = self.create_primitive_scheduler(
-                    DESC_FIELD.data_type(),
-                    chain.current_path(),
-                    &blob_col,
-                    buffers,
-                )?;
-                let blob_scheduler = Arc::new(BlobFieldScheduler::new(desc_scheduler));
-                return Ok((chain, Ok(blob_scheduler)));
-            }
             let scheduler = self.create_primitive_scheduler(
                 &data_type,
                 chain.current_path(),
@@ -799,6 +789,16 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             return Ok((chain, Ok(scheduler)));
         } else if data_type.is_binary_like() {
             let column_info = column_infos.next().unwrap().clone();
+            if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
+                let desc_scheduler = self.create_primitive_scheduler(
+                    DESC_FIELD.data_type(),
+                    chain.current_path(),
+                    &blob_col,
+                    buffers,
+                )?;
+                let blob_scheduler = Arc::new(BlobFieldScheduler::new(desc_scheduler));
+                return Ok((chain, Ok(blob_scheduler)));
+            }
             if let Some(page_info) = column_info.page_infos.first() {
                 if matches!(
                     page_info.encoding,

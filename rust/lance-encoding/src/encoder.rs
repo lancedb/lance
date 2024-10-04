@@ -174,8 +174,8 @@ impl OutOfLineBuffers {
         position
     }
 
-    pub fn take_buffers(&mut self) -> Vec<LanceBuffer> {
-        std::mem::take(&mut self.buffers)
+    pub fn take_buffers(self) -> Vec<LanceBuffer> {
+        self.buffers
     }
 
     pub fn reset_position(&mut self, position: u64) {
@@ -908,7 +908,7 @@ pub async fn encode_batch(
                 .or_default()
                 .push(write_page_to_data_buffer(encoded_page, &mut data_buffer));
         }
-        external_buffers.reset_position(data_buffer.len() as u64);
+        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
         let encoded_columns = encoder.finish(&mut external_buffers).await?;
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);
