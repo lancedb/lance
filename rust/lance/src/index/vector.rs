@@ -58,22 +58,44 @@ pub enum StageParams {
     SQ(SQBuildParams),
 }
 
+/// The format of VectorIndex.
+///
+/// V1 - The default format
+#[derive(Debug, Clone, Copy)]
+pub enum VectorIndexFormat {
+    V1,
+    V3,
+}
+
+impl Default for VectorIndexFormat {
+    fn default() -> Self {
+        Self::V1
+    }
+}
+
 /// The parameters to build vector index.
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {
     pub stages: Vec<StageParams>,
 
-    /// Vector distance metrics type.
-    pub metric_type: MetricType,
+    /// Vector distance type.
+    pub distance_type: DistanceType,
+
+    /// Specify the on-disk format of the index.
+    /// Supported formats:
+    ///  - `V1`: The default format.
+    ///  - `V3`: The new format that writes index in Lance V2 format.
+    pub format: Option<VectorIndexFormat>,
 }
 
 impl VectorIndexParams {
-    pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
+    pub fn ivf_flat(num_partitions: usize, distance_type: DistanceType) -> Self {
         let ivf_params = IvfBuildParams::new(num_partitions);
         let stages = vec![StageParams::Ivf(ivf_params)];
         Self {
             stages,
-            metric_type,
+            distance_type,
+            format: None,
         }
     }
 
@@ -84,12 +106,13 @@ impl VectorIndexParams {
     ///  - `num_partitions`: the number of IVF partitions.
     ///  - `num_bits`: the number of bits to present the centroids used in PQ. Can only be `8` for now.
     ///  - `num_sub_vectors`: the number of sub vectors used in PQ.
-    ///  - `metric_type`: how to compute distance, i.e., `L2` or `Cosine`.
+    ///  - `distance_type`: how to compute distance, i.e., `L2` or `Cosine`.
+    ///  - `format`: the on-disk format of the index.
     pub fn ivf_pq(
         num_partitions: usize,
         num_bits: u8,
         num_sub_vectors: usize,
-        metric_type: MetricType,
+        distance_type: DistanceType,
         max_iterations: usize,
     ) -> Self {
         let mut stages: Vec<StageParams> = vec![];
@@ -105,27 +128,29 @@ impl VectorIndexParams {
 
         Self {
             stages,
-            metric_type,
+            distance_type,
+            format: None,
         }
     }
 
     /// Create index parameters with `IVF` and `PQ` parameters, respectively.
     pub fn with_ivf_pq_params(
-        metric_type: MetricType,
+        distance_type: DistanceType,
         ivf: IvfBuildParams,
         pq: PQBuildParams,
     ) -> Self {
         let stages = vec![StageParams::Ivf(ivf), StageParams::PQ(pq)];
         Self {
             stages,
-            metric_type,
+            distance_type,
+            format: None,
         }
     }
 
     /// Create index parameters with `IVF`, `PQ` and `HNSW` parameters, respectively.
     /// This is used for `IVF_HNSW_PQ` index.
     pub fn with_ivf_hnsw_pq_params(
-        metric_type: MetricType,
+        distance_type: DistanceType,
         ivf: IvfBuildParams,
         hnsw: HnswBuildParams,
         pq: PQBuildParams,
@@ -137,14 +162,15 @@ impl VectorIndexParams {
         ];
         Self {
             stages,
-            metric_type,
+            distance_type,
+            format: None,
         }
     }
 
     /// Create index parameters with `IVF`, `HNSW` and `SQ` parameters, respectively.
     /// This is used for `IVF_HNSW_SQ` index.
     pub fn with_ivf_hnsw_sq_params(
-        metric_type: MetricType,
+        distance_type: DistanceType,
         ivf: IvfBuildParams,
         hnsw: HnswBuildParams,
         sq: SQBuildParams,
@@ -156,7 +182,8 @@ impl VectorIndexParams {
         ];
         Self {
             stages,
-            metric_type,
+            distance_type,
+            format: None,
         }
     }
 }
@@ -234,7 +261,7 @@ pub(crate) async fn build_vector_index(
             dataset.clone(),
             column.to_owned(),
             dataset.indices_dir().child(uuid),
-            params.metric_type,
+            params.distance_type,
             Box::new(shuffler),
             Some(ivf_params.clone()),
             Some(()),
@@ -252,16 +279,34 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        build_ivf_pq_index(
-            dataset,
-            column,
-            name,
-            uuid,
-            params.metric_type,
-            ivf_params,
-            pq_params,
-        )
-        .await?;
+        match params.format {
+            Some(VectorIndexFormat::V1) | None => {
+                build_ivf_pq_index(
+                    dataset,
+                    column,
+                    name,
+                    uuid,
+                    params.distance_type,
+                    ivf_params,
+                    pq_params,
+                )
+                .await?;
+            }
+            Some(VectorIndexFormat::V3) => {
+                IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                    dataset.clone(),
+                    column.to_owned(),
+                    dataset.indices_dir().child(uuid),
+                    params.distance_type,
+                    Box::new(shuffler),
+                    Some(ivf_params.clone()),
+                    Some(pq_params.clone()),
+                    (),
+                )?
+                .build()
+                .await?;
+            }
+        }
     } else if is_ivf_hnsw(stages) {
         let len = stages.len();
         let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -279,7 +324,7 @@ pub(crate) async fn build_vector_index(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
-                        params.metric_type,
+                        params.distance_type,
                         Box::new(shuffler),
                         Some(ivf_params.clone()),
                         Some(pq_params.clone()),
@@ -293,7 +338,7 @@ pub(crate) async fn build_vector_index(
                         dataset.clone(),
                         column.to_owned(),
                         dataset.indices_dir().child(uuid),
-                        params.metric_type,
+                        params.distance_type,
                         Box::new(shuffler),
                         Some(ivf_params.clone()),
                         Some(sq_params.clone()),

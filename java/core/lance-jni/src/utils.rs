@@ -242,8 +242,9 @@ pub fn get_index_params(
         }
 
         Some(VectorIndexParams {
-            metric_type: distance_type,
+            distance_type,
             stages,
+            format: None,
         })
     } else {
         None

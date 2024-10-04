@@ -56,9 +56,13 @@ use crate::Dataset;
 use super::utils;
 use super::v2::IVFIndex;
 
-// Builder for IVF index
-// The builder will train the IVF model and quantizer, shuffle the dataset, and build the sub index
-// for each partition.
+// # Builder for IVF index.
+//
+// The builder will do:
+//  - train the IVF (K-means) model and quantizer,
+//  - shuffle the dataset,
+//  - and build the sub index for each partition.
+//
 // To build the index for the whole dataset, call `build` method.
 // To build the index for given IVF, quantizer, data stream,
 // call `with_ivf`, `with_quantizer`, `shuffle_data`, and `build` in order.
