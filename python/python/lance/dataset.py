@@ -1795,7 +1795,11 @@ class LanceDataset(pa.dataset.Dataset):
                 if precomputed_partition_dataset is not None and os.path.exists(
                     partitions_file
                 ):
-                    print(f"Temporary partitions file stored at {partitions_file}, you may want to delete it.")
+                    logging.info(
+                        "Temporary partitions file stored at %s,"
+                        "you may want to delete it.",
+                        partitions_file,
+                    )
 
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
                 kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
@@ -1846,7 +1850,10 @@ class LanceDataset(pa.dataset.Dataset):
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_shuffle_buffers_path"]
         ):
-            print(f"Temporary shuffle buffers stored at {kwargs["precomputed_shuffle_buffers_path"]}, you may want to delete it.")
+            logging.info(
+                "Temporary shuffle buffers stored at %s, you may want to delete it.",
+                kwargs["precomputed_shuffle_buffers_path"],
+            )
         return self
 
     def session(self) -> Session:
