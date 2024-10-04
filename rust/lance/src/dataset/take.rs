@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
+use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
 use crate::{Error, Result};
 use arrow::{array::as_struct_array, compute::concat_batches, datatypes::UInt64Type};
@@ -204,7 +205,7 @@ pub async fn take_rows(
         })?;
 
         let reader = fragment
-            .open(&projection.physical_schema, false, false, None)
+            .open(&projection.physical_schema, FragReadConfig::default(), None)
             .await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
