@@ -56,16 +56,14 @@ use crate::Dataset;
 use super::utils;
 use super::v2::IVFIndex;
 
-// # Builder for IVF index.
-//
-// The builder will do:
-//  - train the IVF (K-means) model and quantizer,
-//  - shuffle the dataset,
-//  - and build the sub index for each partition.
-//
-// To build the index for the whole dataset, call `build` method.
-// To build the index for given IVF, quantizer, data stream,
-// call `with_ivf`, `with_quantizer`, `shuffle_data`, and `build` in order.
+/// # Builder for IVF index.
+///
+/// The builder will do:
+///  - train the IVF (K-means) model and quantizer,
+///  - shuffle the dataset,
+///  - and build the sub index for each partition.
+///
+/// To build the index for the whole dataset, call [`IvfIndex::build()`] method.
 pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     dataset: Dataset,
     column: String,
@@ -146,24 +144,43 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
     // build the index with the all data in the dataset,
     pub async fn build(&mut self) -> Result<()> {
         // step 1. train IVF & quantizer
+        let now = std::time::Instant::now();
+        println!("start to build index");
         if self.ivf.is_none() {
             self.with_ivf(self.load_or_build_ivf().await?);
         }
+        println!(
+            "start to build quantizer: {:02} seconds",
+            now.elapsed().as_secs_f32()
+        );
         if self.quantizer.is_none() {
             self.with_quantizer(self.load_or_build_quantizer().await?);
         }
 
         // step 2. shuffle the dataset
+        println!(
+            "start to shuffle dataset: {:02} seconds",
+            now.elapsed().as_secs_f32()
+        );
         if self.shuffle_reader.is_none() {
             self.shuffle_dataset().await?;
         }
 
         // step 3. build partitions
+        println!(
+            "start to build partitions: {:02} seconds",
+            now.elapsed().as_secs_f32()
+        );
         self.build_partitions().await?;
 
         // step 4. merge all partitions
+        println!(
+            "start to merge partitions: {:02} seconds",
+            now.elapsed().as_secs_f32()
+        );
         self.merge_partitions().await?;
 
+        println!("index built: {:02} seconds", now.elapsed().as_secs_f32());
         Ok(())
     }
 
@@ -187,7 +204,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             "IVF build params not set",
             location!(),
         ))?;
-        let dim = utils::get_vector_dim(&self.dataset, &self.column)?;
+        let dim = utils::get_vector_dim(&self.dataset.schema().into(), &self.column)?;
         super::build_ivf_model(
             &self.dataset,
             &self.column,

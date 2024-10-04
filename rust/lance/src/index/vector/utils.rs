@@ -13,15 +13,14 @@ use tokio::sync::Mutex;
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
-pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
-    let schema = dataset.schema();
-    let field = schema.field(column).ok_or(Error::Index {
+pub fn get_vector_dim(schema: &ArrowSchema, column: &str) -> Result<usize> {
+    let field = schema.field_with_name(column).map_err(|_| Error::Index {
         message: format!("Column {} does not exist in schema {}", column, schema),
         location: location!(),
     })?;
     let data_type = field.data_type();
     if let arrow_schema::DataType::FixedSizeList(_, dim) = data_type {
-        Ok(dim as usize)
+        Ok(*dim as usize)
     } else {
         Err(Error::Index {
             message: format!(

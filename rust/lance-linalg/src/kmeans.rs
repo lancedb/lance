@@ -544,7 +544,6 @@ impl KMeans {
             (DataType::Float16, _) => {
                 Self::train_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(data, k, params)
             }
-
             (DataType::Float32, _) => {
                 Self::train_kmeans::<Float32Type, KMeansAlgoFloat<Float32Type>>(data, k, params)
             }

@@ -14,7 +14,7 @@ use lance::{
     Dataset,
 };
 use lance_index::{DatasetIndexExt, IndexType};
-use lance_linalg::distance::MetricType;
+use lance_linalg::distance::DistanceType;
 use lance_testing::datagen::generate_random_array;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -64,6 +64,8 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     // default tokio runtime
     let rt = tokio::runtime::Runtime::new().unwrap();
 
+    env_logger::init();
+
     const DIM: usize = 768;
     let uri = format!("./ivf_pq_{}d.lance", DIM);
     std::fs::remove_dir_all(&uri).map_or_else(|_| println!("{} not exists", uri), |_| {});
@@ -75,52 +77,58 @@ fn bench_ivf_pq_index(c: &mut Criterion) {
     let ivf_partition = 256;
     let pq = 96;
 
-    c.bench_function(
-        format!(
-            "CreateIVF{},PQ{}(d={},metric=cosine)",
-            ivf_partition, pq, DIM
-        )
-        .as_str(),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                let params =
-                    VectorIndexParams::ivf_pq(ivf_partition, 8, pq, MetricType::Cosine, 50);
+    for distance_type in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
+        c.bench_function(
+            format!(
+                "CreateIndex: IVF{},PQ{}(d={},metric={},v1)",
+                ivf_partition, pq, DIM, distance_type
+            )
+            .as_str(),
+            |b| {
+                b.to_async(&rt).iter(|| async {
+                    let params = VectorIndexParams::ivf_pq(ivf_partition, 8, pq, distance_type, 50);
 
-                dataset
-                    .clone()
-                    .create_index(
-                        vec!["vector"].as_slice(),
-                        IndexType::Vector,
-                        None,
-                        &params,
-                        true,
-                    )
-                    .await
-                    .unwrap();
-            });
-        },
-    );
+                    dataset
+                        .clone()
+                        .create_index(
+                            vec!["vector"].as_slice(),
+                            IndexType::Vector,
+                            None,
+                            &params,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                });
+            },
+        );
 
-    c.bench_function(
-        format!("CreateIVF{},PQ{}(d={},metric=l2)", ivf_partition, pq, DIM).as_str(),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                let params = VectorIndexParams::ivf_pq(ivf_partition, 8, pq, MetricType::L2, 50);
+        c.bench_function(
+            format!(
+                "CreateIndex: IVF{},PQ{}(d={},metric={},v3)",
+                ivf_partition, pq, DIM, distance_type
+            )
+            .as_str(),
+            |b| {
+                b.to_async(&rt).iter(|| async {
+                    let params =
+                        VectorIndexParams::ivf_pq(ivf_partition, 8, pq, distance_type, 50).v3();
 
-                dataset
-                    .clone()
-                    .create_index(
-                        vec!["vector"].as_slice(),
-                        IndexType::Vector,
-                        None,
-                        &params,
-                        true,
-                    )
-                    .await
-                    .unwrap();
-            });
-        },
-    );
+                    dataset
+                        .clone()
+                        .create_index(
+                            vec!["vector"].as_slice(),
+                            IndexType::Vector,
+                            None,
+                            &params,
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                });
+            },
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

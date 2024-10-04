@@ -43,7 +43,6 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use self::{ivf::*, pq::PQIndex};
-
 use super::{pb, DatasetIndexInternalExt, IndexParams};
 use crate::{dataset::Dataset, index::pb::vector_index_stage::Stage, Error, Result};
 
@@ -73,7 +72,14 @@ impl Default for VectorIndexFormat {
     }
 }
 
-/// The parameters to build vector index.
+/// The build parameters for vector index.
+///
+/// To use V3 format, use:
+///
+/// ```
+/// let params = VectorIndexParams::ivf_pq(100, 8, 4, DistanceType::L2, 50).v3();
+/// ```
+///
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {
     pub stages: Vec<StageParams>,
@@ -185,6 +191,13 @@ impl VectorIndexParams {
             distance_type,
             format: None,
         }
+    }
+
+    /// Return a new `VectorIndexParams` with the `V3` format.
+    pub fn v3(&self) -> Self {
+        let mut new = self.clone();
+        new.format = Some(VectorIndexFormat::V3);
+        new
     }
 }
 
