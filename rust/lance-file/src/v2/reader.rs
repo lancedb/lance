@@ -171,16 +171,20 @@ impl ReaderProjection {
         column_indices: &mut Vec<u32>,
     ) -> Result<()> {
         for field in fields {
-            let column_idx = *field_id_to_column_index.get(&(field.id as u32)).ok_or_else(|| Error::InvalidInput {
-                location: location!(),
-                source: format!("the schema referenced a field with id {} which was not in the data file's metadata", field.id).into(),
-            })?;
+            let column_idx = field_id_to_column_index
+                .get(&(field.id as u32))
+                .copied()
+                // If a field isn't in the mapping then it might be a nested
+                // field in packed struct.  Just use a placeholder for now.
+                .unwrap_or(u32::MAX);
             column_indices.push(column_idx);
-            Self::from_field_ids_helper(
-                field.children.iter(),
-                field_id_to_column_index,
-                column_indices,
-            )?;
+            if column_idx != u32::MAX {
+                Self::from_field_ids_helper(
+                    field.children.iter(),
+                    field_id_to_column_index,
+                    column_indices,
+                )?;
+            }
         }
         Ok(())
     }
@@ -606,8 +610,14 @@ impl FileReader {
             ));
         }
         let mut column_indices_seen = BTreeSet::new();
-        for column_index in &projection.column_indices {
-            if !column_indices_seen.insert(*column_index) {
+        for column_index in projection
+            .column_indices
+            .iter()
+            .copied()
+            // u32::MAX is used as a placeholder (see ReaderProjection::from_field_ids)
+            .filter(|idx| *idx != u32::MAX)
+        {
+            if !column_indices_seen.insert(column_index) {
                 return Err(Error::invalid_input(
                     format!(
                         "The projection specified the column index {} more than once",
@@ -616,7 +626,7 @@ impl FileReader {
                     location!(),
                 ));
             }
-            if *column_index >= metadata.column_infos.len() as u32 {
+            if column_index >= metadata.column_infos.len() as u32 {
                 return Err(Error::invalid_input(format!("The projection specified the column index {} but there are only {} columns in the file", column_index, metadata.column_infos.len()), location!()));
             }
         }

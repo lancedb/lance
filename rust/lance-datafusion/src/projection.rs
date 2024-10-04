@@ -3,7 +3,7 @@
 
 use arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::{
     execution::SendableRecordBatchStream, logical_expr::Expr,
     physical_plan::projection::ProjectionExec,
@@ -17,7 +17,10 @@ use std::{
     sync::Arc,
 };
 
-use lance_core::{datatypes::Schema, Error, Result};
+use lance_core::{
+    datatypes::{Field, Schema, BLOB_DESC_FIELDS, BLOB_META_KEY},
+    Error, Result,
+};
 
 use crate::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
@@ -35,9 +38,42 @@ pub struct ProjectionPlan {
 }
 
 impl ProjectionPlan {
+    fn unload_blobs(schema: &Arc<Schema>) -> Arc<Schema> {
+        let mut modified = false;
+        let fields = schema
+            .fields
+            .iter()
+            .map(|f| {
+                if f.metadata.contains_key(BLOB_META_KEY) {
+                    debug_assert!(f.data_type() == DataType::LargeBinary);
+                    modified = true;
+                    let mut unloaded_field = Field::try_from(ArrowField::new(
+                        f.name.clone(),
+                        DataType::Struct(BLOB_DESC_FIELDS.clone()),
+                        f.nullable,
+                    ))
+                    .unwrap();
+                    unloaded_field.id = f.id;
+                    unloaded_field
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+
+        if modified {
+            let mut schema = schema.as_ref().clone();
+            schema.fields = fields;
+            Arc::new(schema)
+        } else {
+            schema.clone()
+        }
+    }
+
     pub fn try_new(
         base_schema: &Schema,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
+        load_blobs: bool,
     ) -> Result<Self> {
         let arrow_schema = Arc::new(ArrowSchema::from(base_schema));
         let planner = Planner::new(arrow_schema);
@@ -62,7 +98,10 @@ impl ProjectionPlan {
             output.insert(output_name.as_ref().to_string(), expr);
         }
 
-        let physical_schema = Arc::new(base_schema.project(&physical_cols)?);
+        let mut physical_schema = Arc::new(base_schema.project(&physical_cols)?);
+        if !load_blobs {
+            physical_schema = Self::unload_blobs(&physical_schema);
+        }
 
         let mut output_cols = vec![];
         for (name, _) in columns {
@@ -78,7 +117,13 @@ impl ProjectionPlan {
         })
     }
 
-    pub fn new_empty(base_schema: Arc<Schema>) -> Self {
+    pub fn new_empty(base_schema: Arc<Schema>, load_blobs: bool) -> Self {
+        let base_schema = if !load_blobs {
+            Self::unload_blobs(&base_schema)
+        } else {
+            base_schema
+        };
+
         let physical_arrow_schema = ArrowSchema::from(base_schema.as_ref());
         let physical_df_schema = Arc::new(DFSchema::try_from(physical_arrow_schema).unwrap());
         Self {

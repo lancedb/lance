@@ -39,6 +39,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
+mod blob;
 pub mod builder;
 pub mod cleanup;
 pub mod fragment;
@@ -69,12 +70,14 @@ use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
+pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
+pub use take::TakeBuilder;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
@@ -254,8 +257,12 @@ impl ProjectionRequest {
 
     pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
         match self {
-            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(schema)),
-            Self::Sql(columns) => ProjectionPlan::try_new(dataset_schema, &columns),
+            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(
+                schema, /*load_blobs=*/ false,
+            )),
+            Self::Sql(columns) => {
+                ProjectionPlan::try_new(dataset_schema, &columns, /*load_blobs=*/ false)
+            }
         }
     }
 }
@@ -1074,12 +1081,26 @@ impl Dataset {
         row_ids: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take_rows(
-            self,
-            row_ids,
-            &projection.into().into_projection_plan(self.schema())?,
-        )
-        .await
+        Arc::new(self.clone())
+            .take_builder(row_ids, projection)?
+            .execute()
+            .await
+    }
+
+    pub fn take_builder(
+        self: &Arc<Self>,
+        row_ids: &[u64],
+        projection: impl Into<ProjectionRequest>,
+    ) -> Result<TakeBuilder> {
+        TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
+    }
+
+    pub async fn take_blobs(
+        self: &Arc<Self>,
+        row_ids: &[u64],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<BlobFile>> {
+        blob::take_blobs(self, row_ids, column.as_ref()).await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.

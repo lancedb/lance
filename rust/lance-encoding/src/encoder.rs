@@ -8,7 +8,10 @@ use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{
+    Field, Schema, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_META_KEY,
+    PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
+};
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
@@ -43,11 +46,6 @@ use crate::{
 
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
-
-pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
-pub const BLOB_META_KEY: &str = "lance-encoding:blob";
-pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
-pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
 
 /// An encoded array
 ///
@@ -948,7 +946,7 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 let mut packed_meta = HashMap::new();
                 packed_meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
                 let desc_field =
-                    Field::try_from(DESC_FIELD.clone().with_metadata(packed_meta)).unwrap();
+                    Field::try_from(BLOB_DESC_FIELD.clone().with_metadata(packed_meta)).unwrap();
                 let desc_encoder = Box::new(PrimitiveFieldEncoder::try_new(
                     options,
                     self.array_encoding_strategy.clone(),

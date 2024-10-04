@@ -282,7 +282,10 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection_plan = ProjectionPlan::new_empty(Arc::new(dataset.schema().clone()));
+        let projection_plan = ProjectionPlan::new_empty(
+            Arc::new(dataset.schema().clone()),
+            /*load_blobs= */ false,
+        );
         Self {
             dataset,
             projection_plan,
@@ -374,8 +377,8 @@ impl Scanner {
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
         let physical_schema = self.scan_output_schema(true)?;
-        let base_schema = self.dataset.schema().merge(physical_schema.as_ref())?;
-        self.projection_plan = ProjectionPlan::try_new(&base_schema, columns)?;
+        self.projection_plan =
+            ProjectionPlan::try_new(&physical_schema, columns, /*load_blobs=*/ false)?;
         Ok(self)
     }
 

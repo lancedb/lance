@@ -502,9 +502,7 @@ impl Field {
         }
     }
 
-    /// Intersection of two [`Field`]s.
-    ///
-    pub fn intersection(&self, other: &Self) -> Result<Self> {
+    pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Arrow {
                 message: format!(
@@ -543,7 +541,7 @@ impl Field {
             return Ok(f);
         }
 
-        if self_type != other_type || self.name != other.name {
+        if (!ignore_types && self_type != other_type) || self.name != other.name {
             return Err(Error::Arrow {
                 message: format!(
                     "Attempt to intersect different fields: ({}, {}) and ({}, {})",
@@ -554,6 +552,17 @@ impl Field {
         }
 
         Ok(self.clone())
+    }
+
+    /// Intersection of two [`Field`]s.
+    ///
+    pub fn intersection(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, false)
+    }
+
+    /// Intersection of two [`Field`]s, ignoring data types.
+    pub fn intersection_ignore_types(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, true)
     }
 
     pub fn exclude(&self, other: &Self) -> Option<Self> {
