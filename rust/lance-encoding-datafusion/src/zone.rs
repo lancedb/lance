@@ -620,6 +620,12 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         &mut self,
         external_buffers: &mut OutOfLineBuffers,
     ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        if self.cur_offset > 0 {
+            // Create final map
+            if let Err(err) = self.new_map() {
+                return async move { Err(err) }.boxed();
+            }
+        }
         let maps = std::mem::take(&mut self.maps);
         let rows_per_zone = self.rows_per_map;
         let items_columns = self.items_encoder.finish(external_buffers);
