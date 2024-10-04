@@ -9,7 +9,6 @@ import logging
 import os
 import pickle
 import random
-import shutil
 import sqlite3
 import time
 import warnings
@@ -1793,7 +1792,7 @@ class LanceDataset(pa.dataset.Dataset):
                 if precomputed_partition_dataset is not None and os.path.exists(
                     partitions_file
                 ):
-                    shutil.rmtree(partitions_file)
+                    print(f"Temporary partitions file stored at {partitions_file}, you may want to delete it.")
 
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
                 kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
@@ -1844,7 +1843,7 @@ class LanceDataset(pa.dataset.Dataset):
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_shuffle_buffers_path"]
         ):
-            shutil.rmtree(kwargs["precomputed_shuffle_buffers_path"])
+            print(f"Temporary shuffle buffers stored at {kwargs["precomputed_shuffle_buffers_path"]}, you may want to delete it.")
         return self
 
     def session(self) -> Session:
