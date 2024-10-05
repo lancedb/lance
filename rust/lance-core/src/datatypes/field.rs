@@ -529,7 +529,7 @@ impl Field {
                 .collect::<Vec<_>>();
             let f = Self {
                 name: self.name.clone(),
-                id: self.id,
+                id: if self.id >= 0 { self.id } else { other.id },
                 parent_id: self.parent_id,
                 logical_type: self.logical_type.clone(),
                 metadata: self.metadata.clone(),
@@ -551,7 +551,11 @@ impl Field {
             });
         }
 
-        Ok(self.clone())
+        Ok(if self.id >= 0 {
+            self.clone()
+        } else {
+            other.clone()
+        })
     }
 
     /// Intersection of two [`Field`]s.
