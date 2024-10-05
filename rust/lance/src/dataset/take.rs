@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::borrow::Cow;
 use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 
 use crate::dataset::rowids::get_row_id_index;
@@ -14,6 +13,7 @@ use arrow_select::interleave::interleave;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
+use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::ROW_ADDR;
@@ -147,28 +147,25 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
-pub async fn take_rows(
-    dataset: &Dataset,
-    row_ids: &[u64],
-    projection: &ProjectionPlan,
-) -> Result<RecordBatch> {
-    if row_ids.is_empty() {
+async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
+    if builder.row_ids.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(
-            projection.output_schema()?,
+            builder.projection.output_schema()?,
         )));
     }
 
-    let row_addrs = if let Some(row_id_index) = get_row_id_index(dataset).await? {
-        let addresses = row_ids
+    let row_addrs = if let Some(row_id_index) = get_row_id_index(&builder.dataset).await? {
+        let addresses = builder
+            .row_ids
             .iter()
             .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
             .collect::<Vec<_>>();
-        Cow::Owned(addresses)
+        addresses
     } else {
-        Cow::Borrowed(row_ids)
+        builder.row_ids
     };
 
-    let projection = Arc::new(projection);
+    let projection = Arc::new(builder.projection);
     let row_addr_stats = check_row_addrs(&row_addrs);
 
     // This method is mostly to annotate the send bound to avoid the
@@ -196,7 +193,7 @@ pub async fn take_rows(
         let range_end = *row_addrs.last().expect("empty range passed to take_rows") as u32 as usize;
         let range = range_start..(range_end + 1);
 
-        let fragment = dataset.get_fragment(fragment_id).ok_or_else(|| {
+        let fragment = builder.dataset.get_fragment(fragment_id).ok_or_else(|| {
             Error::invalid_input(
                 format!("_rowaddr belongs to non-existent fragment: {start}"),
                 location!(),
@@ -233,15 +230,18 @@ pub async fn take_rows(
                 }
             };
 
-            let fragment = dataset.get_fragment(fragment_id as usize).ok_or_else(|| {
-                Error::invalid_input(
-                    format!(
-                        "_rowaddr {} belongs to non-existent fragment: {}",
-                        row_addrs[range.start], fragment_id
-                    ),
-                    location!(),
-                )
-            })?;
+            let fragment = builder
+                .dataset
+                .get_fragment(fragment_id as usize)
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "_rowaddr {} belongs to non-existent fragment: {}",
+                            row_addrs[range.start], fragment_id
+                        ),
+                        location!(),
+                    )
+                })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
             let batch_fut = do_take(
@@ -253,7 +253,7 @@ pub async fn take_rows(
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
-            .buffered(dataset.object_store.io_parallelism())
+            .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect()
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
@@ -269,7 +269,7 @@ pub async fn take_rows(
         let schema_with_row_addr = Arc::new(ArrowSchema::from(&projection_with_row_addr));
 
         // Slow case: need to re-map data into expected order
-        let mut sorted_row_addrs = Vec::from(row_addrs.clone());
+        let mut sorted_row_addrs = row_addrs.clone();
         sorted_row_addrs.sort();
         // Group ROW Ids by the fragment
         let mut row_addrs_per_fragment: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
@@ -283,7 +283,7 @@ pub async fn take_rows(
                 .or_insert_with(|| vec![offset]);
         });
 
-        let fragments = dataset.get_fragments();
+        let fragments = builder.dataset.get_fragments();
         let fragment_and_indices = fragments.into_iter().filter_map(|f| {
             let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
             Some((f, row_offset))
@@ -293,7 +293,7 @@ pub async fn take_rows(
             .map(|(fragment, indices)| {
                 do_take(fragment, indices, projection.physical_schema.clone(), true)
             })
-            .buffered(dataset.object_store.io_parallelism())
+            .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -336,7 +336,15 @@ pub async fn take_rows(
         Ok(as_struct_array(&reordered).into())
     }?;
 
-    projection.project_batch(batch).await
+    let batch = projection.project_batch(batch).await?;
+
+    if builder.with_row_address {
+        let row_addr_col = Arc::new(UInt64Array::from(row_addrs));
+        let row_addr_field = ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);
+        Ok(batch.try_with_column(row_addr_field, row_addr_col)?)
+    } else {
+        Ok(batch)
+    }
 }
 
 /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -397,6 +405,41 @@ fn check_row_addrs(row_ids: &[u64]) -> RowAddressStats {
     }
 
     RowAddressStats { sorted, contiguous }
+}
+
+/// Builder for the `take` operation.
+pub struct TakeBuilder {
+    dataset: Arc<Dataset>,
+    row_ids: Vec<u64>,
+    projection: ProjectionPlan,
+    with_row_address: bool,
+}
+
+impl TakeBuilder {
+    /// Create a new `TakeBuilder` for taking by id
+    pub fn try_new_from_ids(
+        dataset: Arc<Dataset>,
+        row_ids: Vec<u64>,
+        projection: ProjectionRequest,
+    ) -> Result<Self> {
+        Ok(Self {
+            row_ids,
+            projection: projection.into_projection_plan(dataset.schema())?,
+            dataset,
+            with_row_address: false,
+        })
+    }
+
+    /// Adds row addresses to the output
+    pub fn with_row_address(mut self, with_row_address: bool) -> Self {
+        self.with_row_address = with_row_address;
+        self
+    }
+
+    /// Execute the take operation and return a single batch
+    pub async fn execute(self) -> Result<RecordBatch> {
+        take_rows(self).await
+    }
 }
 
 #[cfg(test)]
