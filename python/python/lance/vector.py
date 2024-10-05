@@ -16,10 +16,10 @@ from tqdm.auto import tqdm
 from . import write_dataset
 from .cuvs.kmeans import KMeans as KMeansCuVS
 from .dependencies import (
-    _check_for_numpy,
-    torch,
     _CAGRA_AVAILABLE,
     _RAFT_COMMON_AVAILABLE,
+    _check_for_numpy,
+    torch,
 )
 from .dependencies import numpy as np
 from .torch.data import LanceDataset as TorchDataset
@@ -249,7 +249,7 @@ def train_ivf_centroids_on_accelerator(
     if accelerator == "cuvs":
         logging.info("Training IVF partitions using cuVS+GPU")
         print("Training IVF partitions using cuVS+GPU")
-        if not (_CAGRA_AVAILABLE and _RAFT_COMMON_AVAILABLE and cuvs):
+        if not (_CAGRA_AVAILABLE and _RAFT_COMMON_AVAILABLE):
             logging.error(
                 "Missing cuvs and pylibraft - "
                 "please install cuvs-cu11 and pylibraft-cu11 or "
