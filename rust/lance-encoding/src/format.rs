@@ -84,6 +84,7 @@ impl ProtobufUtils {
         uncompressed_bits_per_value: u64,
         buffer_index: u32,
         signed: bool,
+        all_negative: bool,
     ) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Bitpacked(Bitpacked {
@@ -94,6 +95,7 @@ impl ProtobufUtils {
                 }),
                 uncompressed_bits_per_value,
                 signed,
+                all_negative,
             })),
         }
     }
