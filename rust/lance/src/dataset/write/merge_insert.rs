@@ -71,7 +71,7 @@ use tokio::task::JoinSet;
 use crate::{
     datafusion::dataframe::SessionContextExt,
     dataset::{
-        fragment::FileFragment,
+        fragment::{FileFragment, FragReadConfig},
         transaction::{Operation, Transaction},
         write::open_writer,
     },
@@ -674,7 +674,13 @@ impl MergeInsertJob {
                     if data_storage_version == LanceFileVersion::Legacy {
                         // Need to match the existing batch size exactly, otherwise
                         // we'll get errors.
-                        let reader = fragment.open(dataset.schema(), false, true, None).await?;
+                        let reader = fragment
+                            .open(
+                                dataset.schema(),
+                                FragReadConfig::default().with_row_address(true),
+                                None,
+                            )
+                            .await?;
                         let batch_size = reader.legacy_num_rows_in_batch(0).unwrap();
                         let stream = stream::iter(batches.into_iter().map(Ok));
                         let stream = Box::pin(RecordBatchStreamAdapter::new(
