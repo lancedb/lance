@@ -15,6 +15,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod encodings;
 pub mod format;
+pub mod statistics;
 #[cfg(test)]
 pub mod testing;
 pub mod version;

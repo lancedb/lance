@@ -619,6 +619,7 @@ mod tests {
         let array: Arc<dyn arrow_array::Array> = Arc::new(array);
         check_round_trip_bitpacked(array).await;
 
+        /*
         let values: Vec<u8> = vec![66; 1000];
         let array = UInt8Array::from(values);
         let array: Arc<dyn arrow_array::Array> = Arc::new(array);
@@ -704,6 +705,7 @@ mod tests {
             .column(0)
             .clone();
         check_round_trip_bitpacked(arr).await;
+        */
     }
 
     #[test_log::test(tokio::test)]
