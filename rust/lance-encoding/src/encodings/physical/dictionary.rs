@@ -145,7 +145,8 @@ impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
         let indices = self
             .indices_decoder
             .decode(rows_to_skip, num_rows)?
-            .as_fixed_width()?;
+            .as_fixed_width()
+            .unwrap();
         let dict = self.decoded_dict.try_clone()?;
         Ok(DataBlock::Dictionary(DictionaryDataBlock {
             indices,
@@ -270,7 +271,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
 
         let encoded = DataBlock::Dictionary(DictionaryDataBlock {
             dictionary: Box::new(encoded_items.data),
-            indices: encoded_indices.data.as_fixed_width()?,
+            indices: encoded_indices.data.as_fixed_width().unwrap(),
         });
 
         let encoding = ProtobufUtils::dict_encoding(
@@ -384,7 +385,7 @@ impl ArrayEncoder for DictionaryEncoder {
             .encode(items_data, &DataType::Utf8, buffer_index)?;
 
         let encoded_data = DataBlock::Dictionary(DictionaryDataBlock {
-            indices: encoded_indices.data.as_fixed_width()?,
+            indices: encoded_indices.data.as_fixed_width().unwrap(),
             dictionary: Box::new(encoded_items.data),
         });
 
@@ -444,25 +445,25 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_utf8() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -568,6 +569,6 @@ pub mod tests {
             DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
             false,
         );
-        check_round_trip_encoding_random(dict_field, HashMap::new()).await;
+        check_round_trip_encoding_random(dict_field).await;
     }
 }

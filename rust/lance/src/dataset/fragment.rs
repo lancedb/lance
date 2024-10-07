@@ -299,7 +299,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -323,7 +323,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::RangeFull,
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -349,7 +349,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::Indices(indices),
                     batch_size,
-                    &projection,
+                    projection,
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -454,7 +454,8 @@ impl FileFragment {
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                DecoderMiddlewareChain::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
+                &dataset.session.file_metadata_cache,
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
@@ -587,7 +588,6 @@ impl FileFragment {
         data_file: &DataFile,
         projection: Option<&Schema>,
         scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
-        file_idx: usize,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
         let full_schema = self.dataset.schema();
         // The data file may contain fields that are not part of the dataset any longer, remove those
@@ -632,17 +632,17 @@ impl FileFragment {
                     0,
                 )
             });
-            let priority = file_idx as u64 + priority_offset;
             let file_scheduler = store_scheduler
-                .open_file_with_priority(&path, priority)
+                .open_file_with_priority(&path, priority_offset)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
-                    DecoderMiddlewareChain::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                     file_metadata,
+                    &self.dataset.session.file_metadata_cache,
                 )
                 .await?,
             );
@@ -671,14 +671,9 @@ impl FileFragment {
         scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
         let mut opened_files = vec![];
-        for (file_idx, data_file) in self.metadata.files.iter().enumerate() {
+        for data_file in &self.metadata.files {
             if let Some(reader) = self
-                .open_reader(
-                    data_file,
-                    Some(projection),
-                    scan_scheduler.clone(),
-                    file_idx,
-                )
+                .open_reader(data_file, Some(projection), scan_scheduler.clone())
                 .await?
             {
                 opened_files.push(reader);
@@ -773,7 +768,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(some_file, None, None, 0)
+            .open_reader(some_file, None, None)
             .await?
             .ok_or_else(|| Error::Internal {
                 message: format!(
@@ -867,7 +862,7 @@ impl FileFragment {
 
         let get_lengths = self.metadata.files.iter().map(|data_file| async move {
             let reader = self
-                .open_reader(data_file, None, None, 0)
+                .open_reader(data_file, None, None)
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(

@@ -316,9 +316,34 @@ impl From<Error> for datafusion_common::DataFusionError {
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+        let location = std::panic::Location::caller().to_snafu_location();
+        match e {
+            datafusion_common::DataFusionError::SQL(..)
+            | datafusion_common::DataFusionError::Plan(..)
+            | datafusion_common::DataFusionError::Configuration(..) => Self::InvalidInput {
+                source: box_error(e),
+                location,
+            },
+            datafusion_common::DataFusionError::SchemaError(..) => Self::Schema {
+                message: e.to_string(),
+                location,
+            },
+            datafusion_common::DataFusionError::ArrowError(..) => Self::Arrow {
+                message: e.to_string(),
+                location,
+            },
+            datafusion_common::DataFusionError::NotImplemented(..) => Self::NotSupported {
+                source: box_error(e),
+                location,
+            },
+            datafusion_common::DataFusionError::Execution(..) => Self::Execution {
+                message: e.to_string(),
+                location,
+            },
+            _ => Self::IO {
+                source: box_error(e),
+                location,
+            },
         }
     }
 }

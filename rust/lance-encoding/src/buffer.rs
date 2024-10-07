@@ -283,6 +283,32 @@ impl LanceBuffer {
     pub fn copy_array<const N: usize>(array: [u8; N]) -> Self {
         Self::Owned(Vec::from(array))
     }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(buffer) => buffer.len(),
+            Self::Owned(buffer) => buffer.len(),
+        }
+    }
+
+    /// Returns a new [LanceBuffer] that is a slice of this buffer starting at `offset`,
+    /// with `length` bytes.
+    /// Doing so allows the same memory region to be shared between lance buffers.
+    /// # Panics
+    /// Panics if `(offset + length)` is larger than the existing length.
+    /// If the buffer is owned this method will require a copy.
+    pub fn slice_with_length(&self, offset: usize, length: usize) -> Self {
+        let original_buffer_len = self.len();
+        assert!(
+            offset.saturating_add(length) <= original_buffer_len,
+            "the offset + length of the sliced Buffer cannot exceed the existing length"
+        );
+        match self {
+            Self::Borrowed(buffer) => Self::Borrowed(buffer.slice_with_length(offset, length)),
+            Self::Owned(buffer) => Self::Owned(buffer[offset..offset + length].to_vec()),
+        }
+    }
 }
 
 impl AsRef<[u8]> for LanceBuffer {

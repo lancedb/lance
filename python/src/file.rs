@@ -19,6 +19,7 @@ use arrow_schema::Schema as ArrowSchema;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
+use lance_core::cache::FileMetadataCache;
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::{
     v2::{
@@ -331,9 +332,14 @@ impl LanceFileReader {
             },
         );
         let file = scheduler.open_file(&path).await.infer_error()?;
-        let inner = FileReader::try_open(file, None, DecoderMiddlewareChain::default())
-            .await
-            .infer_error()?;
+        let inner = FileReader::try_open(
+            file,
+            None,
+            Arc::<DecoderMiddlewareChain>::default(),
+            &FileMetadataCache::no_cache(),
+        )
+        .await
+        .infer_error()?;
         Ok(Self {
             inner: Arc::new(inner),
         })

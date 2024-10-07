@@ -16,7 +16,7 @@ use log::trace;
 use snafu::{location, Location};
 use tokio::task::JoinHandle;
 
-use lance_core::{Error, Result};
+use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
@@ -26,7 +26,10 @@ use crate::{
         LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
         SchedulingJob,
     },
-    encoder::{ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder},
+    encoder::{
+        ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
+        OutOfLineBuffers,
+    },
     encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
     EncodingsIo,
@@ -314,6 +317,7 @@ fn decode_offsets(
 ///
 /// This task does not wait for the items data.  That happens on the main decode loop (unless
 /// we have list of list of ... in which case it happens in the outer indirect decode loop)
+#[allow(clippy::too_many_arguments)]
 async fn indirect_schedule_task(
     mut offsets_decoder: Box<dyn LogicalPageDecoder>,
     list_requests: Vec<ListRequest>,
@@ -321,6 +325,7 @@ async fn indirect_schedule_task(
     items_scheduler: Arc<dyn FieldScheduler>,
     items_type: DataType,
     io: Arc<dyn EncodingsIo>,
+    cache: Arc<FileMetadataCache>,
     priority: Box<dyn PriorityRange>,
 ) -> Result<IndirectlyLoaded> {
     let num_offsets = offsets_decoder.num_rows();
@@ -357,7 +362,7 @@ async fn indirect_schedule_task(
     let indirect_root_scheduler =
         SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
     let mut indirect_scheduler =
-        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields);
+        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields, cache);
     let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
@@ -438,8 +443,9 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
-        let items_type = self.scheduler.items_type.clone();
+        let items_type = self.scheduler.items_field.data_type().clone();
         let io = context.io().clone();
+        let cache = context.cache().clone();
 
         // Immediately spawn the indirect scheduling
         let indirect_fut = tokio::spawn(indirect_schedule_task(
@@ -449,6 +455,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             items_scheduler,
             items_type,
             io,
+            cache,
             priority.box_clone(),
         ));
 
@@ -459,10 +466,9 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             item_decoder: None,
             rows_drained: 0,
             rows_loaded: 0,
-            item_field_name: self.scheduler.item_field_name.clone(),
+            items_field: self.scheduler.items_field.clone(),
             num_rows,
             unloaded: Some(indirect_fut),
-            items_type: self.scheduler.items_type.clone(),
             offset_type: self.scheduler.offset_type.clone(),
             data_type: self.scheduler.list_type.clone(),
         });
@@ -496,8 +502,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
 pub struct ListFieldScheduler {
     offsets_scheduler: Arc<dyn FieldScheduler>,
     items_scheduler: Arc<dyn FieldScheduler>,
-    item_field_name: String,
-    items_type: DataType,
+    items_field: Arc<Field>,
     offset_type: DataType,
     list_type: DataType,
     offset_page_info: Vec<OffsetPageInfo>,
@@ -518,26 +523,20 @@ impl ListFieldScheduler {
     pub fn new(
         offsets_scheduler: Arc<dyn FieldScheduler>,
         items_scheduler: Arc<dyn FieldScheduler>,
-        item_field_name: String,
-        items_type: DataType,
+        items_field: Arc<Field>,
         // Should be int32 or int64
         offset_type: DataType,
         offset_page_info: Vec<OffsetPageInfo>,
     ) -> Self {
         let list_type = match &offset_type {
-            DataType::Int32 => {
-                DataType::List(Arc::new(Field::new("item", items_type.clone(), true)))
-            }
-            DataType::Int64 => {
-                DataType::LargeList(Arc::new(Field::new("item", items_type.clone(), true)))
-            }
+            DataType::Int32 => DataType::List(items_field.clone()),
+            DataType::Int64 => DataType::LargeList(items_field.clone()),
             _ => panic!("Unexpected offset type {}", offset_type),
         };
         Self {
             offsets_scheduler,
             items_scheduler,
-            item_field_name,
-            items_type,
+            items_field,
             offset_type,
             offset_page_info,
             list_type,
@@ -558,6 +557,15 @@ impl FieldScheduler for ListFieldScheduler {
 
     fn num_rows(&self) -> u64 {
         self.offsets_scheduler.num_rows()
+    }
+
+    fn initialize<'a>(
+        &'a self,
+        _filter: &'a FilterExpression,
+        _context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        // 2.0 schedulers do not need to initialize
+        std::future::ready(Ok(())).boxed()
     }
 }
 
@@ -581,8 +589,7 @@ struct ListPageDecoder {
     num_rows: u64,
     rows_drained: u64,
     rows_loaded: u64,
-    item_field_name: String,
-    items_type: DataType,
+    items_field: Arc<Field>,
     offset_type: DataType,
     data_type: DataType,
 }
@@ -592,8 +599,7 @@ struct ListDecodeTask {
     validity: BooleanBuffer,
     // Will be None if there are no items (all empty / null lists)
     items: Option<Box<dyn DecodeArrayTask>>,
-    item_field_name: String,
-    items_type: DataType,
+    items_field: Arc<Field>,
     offset_type: DataType,
 }
 
@@ -607,15 +613,7 @@ impl DecodeArrayTask for ListDecodeTask {
                 let wrapped_items = items.decode()?;
                 Result::Ok(wrapped_items.as_struct().column(0).clone())
             })
-            .unwrap_or_else(|| Ok(new_empty_array(&self.items_type)))?;
-
-        // TODO: we default to nullable true here, should probably use the nullability given to
-        // us from the input schema
-        let item_field = Arc::new(Field::new(
-            self.item_field_name,
-            self.items_type.clone(),
-            true,
-        ));
+            .unwrap_or_else(|| Ok(new_empty_array(self.items_field.data_type())))?;
 
         // The offsets are already decoded but they need to be shifted back to 0 and cast
         // to the appropriate type
@@ -638,7 +636,10 @@ impl DecodeArrayTask for ListDecodeTask {
                 let offsets = OffsetBuffer::new(offsets_i32.values().clone());
 
                 Ok(Arc::new(ListArray::try_new(
-                    item_field, offsets, items, validity,
+                    self.items_field.clone(),
+                    offsets,
+                    items,
+                    validity,
                 )?))
             }
             DataType::Int64 => {
@@ -647,7 +648,10 @@ impl DecodeArrayTask for ListDecodeTask {
                 let offsets = OffsetBuffer::new(offsets_i64.values().clone());
 
                 Ok(Arc::new(LargeListArray::try_new(
-                    item_field, offsets, items, validity,
+                    self.items_field.clone(),
+                    offsets,
+                    items,
+                    validity,
                 )?))
             }
             _ => panic!("ListDecodeTask with data type that is not i32 or i64"),
@@ -774,9 +778,8 @@ impl LogicalPageDecoder for ListPageDecoder {
             task: Box::new(ListDecodeTask {
                 offsets,
                 validity,
-                item_field_name: self.item_field_name.clone(),
+                items_field: self.items_field.clone(),
                 items: item_decode,
-                items_type: self.items_type.clone(),
                 offset_type: self.offset_type.clone(),
             }) as Box<dyn DecodeArrayTask>,
         })
@@ -1149,7 +1152,11 @@ impl ListFieldEncoder {
 }
 
 impl FieldEncoder for ListFieldEncoder {
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>> {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
         // values array could be longer than what we need to encode and so we need
         // to slice down to the region of interest.
@@ -1179,25 +1186,25 @@ impl FieldEncoder for ListFieldEncoder {
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
             .unwrap_or_default();
-        let mut item_tasks = self.items_encoder.maybe_encode(items)?;
+        let mut item_tasks = self.items_encoder.maybe_encode(items, external_buffers)?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
             // a limitation in the current scheduler and could be addressed in the future.  As a result
             // we always need to encode the items page if we encode the offsets page.
             //
             // In practice this isn't usually too bad unless we are targetting very small pages.
-            item_tasks = self.items_encoder.flush()?;
+            item_tasks = self.items_encoder.flush(external_buffers)?;
         }
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
-    fn flush(&mut self) -> Result<Vec<EncodeTask>> {
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         let offsets_tasks = self
             .offsets_encoder
             .flush()
             .map(|task| vec![task])
             .unwrap_or_default();
-        let item_tasks = self.items_encoder.flush()?;
+        let item_tasks = self.items_encoder.flush(external_buffers)?;
         Self::combine_tasks(offsets_tasks, item_tasks)
     }
 
@@ -1205,10 +1212,15 @@ impl FieldEncoder for ListFieldEncoder {
         self.items_encoder.num_columns() + 1
     }
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
+        let inner_columns = self.items_encoder.finish(external_buffers);
         async move {
             let mut columns = vec![EncodedColumn::default()];
-            columns.extend(self.items_encoder.finish().await?);
+            let inner_columns = inner_columns.await?;
+            columns.extend(inner_columns);
             Ok(columns)
         }
         .boxed()
@@ -1243,25 +1255,25 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_list() {
         let field = Field::new("", make_large_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1273,7 +1285,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

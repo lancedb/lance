@@ -3,7 +3,83 @@
 
 //! Extension to arrow schema
 
-use arrow_schema::{ArrowError, Field, FieldRef, Schema};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
+
+pub enum Indentation {
+    OneLine,
+    MultiLine(u8),
+}
+
+impl Indentation {
+    fn value(&self) -> String {
+        match self {
+            Self::OneLine => "".to_string(),
+            Self::MultiLine(spaces) => " ".repeat(*spaces as usize),
+        }
+    }
+
+    fn deepen(&self) -> Self {
+        match self {
+            Self::OneLine => Self::OneLine,
+            Self::MultiLine(spaces) => Self::MultiLine(spaces + 2),
+        }
+    }
+}
+
+/// Extends the functionality of [arrow_schema::Field].
+pub trait FieldExt {
+    /// Create a compact string representation of the field
+    ///
+    /// This is intended for display purposes and not for serialization
+    fn to_compact_string(&self, indent: Indentation) -> String;
+}
+
+impl FieldExt for Field {
+    fn to_compact_string(&self, indent: Indentation) -> String {
+        let mut result = format!("{}: ", self.name().clone());
+        match self.data_type() {
+            DataType::Struct(fields) => {
+                result += "{";
+                result += &indent.value();
+                for (field_idx, field) in fields.iter().enumerate() {
+                    result += field.to_compact_string(indent.deepen()).as_str();
+                    if field_idx < fields.len() - 1 {
+                        result += ",";
+                    }
+                    result += indent.value().as_str();
+                }
+                result += "}";
+            }
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field) => {
+                result += "[";
+                result += field.to_compact_string(indent.deepen()).as_str();
+                result += "]";
+            }
+            DataType::FixedSizeList(child, dimension) => {
+                result += &format!(
+                    "[{}; {}]",
+                    child.to_compact_string(indent.deepen()),
+                    dimension
+                );
+            }
+            DataType::Dictionary(key_type, value_type) => {
+                result += &value_type.to_string();
+                result += "@";
+                result += &key_type.to_string();
+            }
+            _ => {
+                result += &self.data_type().to_string();
+            }
+        }
+        if self.is_nullable() {
+            result += "?";
+        }
+        result
+    }
+}
 
 /// Extends the functionality of [arrow_schema::Schema].
 pub trait SchemaExt {
@@ -19,6 +95,11 @@ pub trait SchemaExt {
     fn field_names(&self) -> Vec<&String>;
 
     fn without_column(&self, column_name: &str) -> Schema;
+
+    /// Create a compact string representation of the schema
+    ///
+    /// This is intended for display purposes and not for serialization
+    fn to_compact_string(&self, indent: Indentation) -> String;
 }
 
 impl SchemaExt for Schema {
@@ -68,5 +149,19 @@ impl SchemaExt for Schema {
 
     fn field_names(&self) -> Vec<&String> {
         self.fields().iter().map(|f| f.name()).collect()
+    }
+
+    fn to_compact_string(&self, indent: Indentation) -> String {
+        let mut result = "{".to_string();
+        result += &indent.value();
+        for (field_idx, field) in self.fields.iter().enumerate() {
+            result += field.to_compact_string(indent.deepen()).as_str();
+            if field_idx < self.fields.len() - 1 {
+                result += ",";
+            }
+            result += indent.value().as_str();
+        }
+        result += "}";
+        result
     }
 }

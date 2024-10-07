@@ -237,15 +237,8 @@ impl LanceStream {
             },
         );
 
-        let mut priorities = Vec::with_capacity(file_fragments.len());
-        let mut current_priority = 0;
-        for frag in &file_fragments {
-            priorities.push(current_priority);
-            current_priority += frag.fragment.num_data_files();
-        }
-
-        let batches = stream::iter(file_fragments.into_iter().zip(priorities))
-            .map(move |(file_fragment, priority)| {
+        let batches = stream::iter(file_fragments.into_iter().enumerate())
+            .map(move |(priority, file_fragment)| {
                 let project_schema = project_schema.clone();
                 let scan_scheduler = scan_scheduler.clone();
                 #[allow(clippy::type_complexity)]

@@ -114,7 +114,7 @@ impl ArrayEncoder for CompressedBufferEncoder {
         _data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
-        let uncompressed_data = data.as_fixed_width()?;
+        let uncompressed_data = data.as_fixed_width().unwrap();
 
         let mut compressed_buf = Vec::with_capacity(uncompressed_data.data.len());
         self.compressor

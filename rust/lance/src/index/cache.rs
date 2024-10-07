@@ -10,6 +10,8 @@ use moka::sync::{Cache, ConcurrentCacheExt};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::dataset::DEFAULT_INDEX_CACHE_SIZE;
+
 #[derive(Debug, Default, DeepSizeOf)]
 struct CacheStats {
     hits: AtomicU64,
@@ -69,6 +71,13 @@ impl IndexCache {
             metadata_cache: Arc::new(Cache::new(capacity as u64)),
             cache_stats: Arc::new(CacheStats::default()),
         }
+    }
+
+    pub(crate) fn capacity(&self) -> u64 {
+        self.vector_cache
+            .policy()
+            .max_capacity()
+            .unwrap_or(DEFAULT_INDEX_CACHE_SIZE as u64)
     }
 
     #[allow(dead_code)]

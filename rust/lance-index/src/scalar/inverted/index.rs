@@ -150,7 +150,7 @@ impl InvertedIndex {
                     position as i32,
                     posting,
                     self.docs.len(),
-                    mask.clone(),
+                    mask,
                 ))
             })
             // Use compute count since data hopefully cached

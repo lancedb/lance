@@ -12,6 +12,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
+use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
 use lance_index::prefilter::NoFilter;
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
@@ -29,8 +30,13 @@ fn bench_inverted(c: &mut Criterion) {
 
     let tempdir = tempfile::tempdir().unwrap();
     let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
-    let store = rt
-        .block_on(async { Arc::new(LanceIndexStore::new(ObjectStore::local(), index_dir, None)) });
+    let store = rt.block_on(async {
+        Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            index_dir,
+            FileMetadataCache::no_cache(),
+        ))
+    });
 
     let mut builder = InvertedIndexBuilder::default();
     // generate 2000 different tokens

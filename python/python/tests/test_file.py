@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -132,6 +134,12 @@ def test_with_nulls(tmp_path):
             {
                 "some_null_1": pa.array([1, 2, None], pa.int64()),
                 "some_null_2": pa.array([None, None, 3], pa.int64()),
+                "nullable_list": pa.array(
+                    [[1, 2], None, [None, 3]], pa.list_(pa.int64())
+                ),
+                "nullable_fsl": pa.array(
+                    [[1, 2], None, [None, 3]], pa.list_(pa.int64(), 2)
+                ),
                 "all_null": pa.array([None, None, None], pa.int64()),
                 "null_strings": pa.array([None, "foo", None], pa.string()),
             }
@@ -237,6 +245,40 @@ def test_list_field_name(tmp_path):
     assert round_tripped.schema.field("list_str").type == weird_string_type
 
 
+def test_field_meta(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field("primitive", pa.int64(), metadata={"foo": "bar"}),
+            pa.field(
+                "list",
+                pa.list_(pa.field("item", pa.int64(), metadata={"list": "yes"})),
+                metadata={"foo": "baz"},
+            ),
+            pa.field(
+                "struct",
+                pa.struct([pa.field("a", pa.int64(), metadata={"struct": "yes"})]),
+                metadata={"foo": "qux"},
+            ),
+        ]
+    )
+    table = pa.table(
+        {
+            "primitive": [1, 2, 3],
+            "list": [[1, 2], [3, 4], [5, 6]],
+            "struct": [{"a": 1}, {"a": 2}, {"a": 3}],
+        },
+        schema=schema,
+    )
+
+    with LanceFileWriter(str(tmp_path / "foo.lance")) as writer:
+        writer.write_batch(table)
+
+    reader = LanceFileReader(str(tmp_path / "foo.lance"))
+    round_tripped = reader.read_all().to_table()
+
+    assert round_tripped == table
+
+
 def test_dictionary(tmp_path):
     # Basic round trip
     dictionary = pa.array(["foo", "bar", "baz"], pa.string())
@@ -335,3 +377,60 @@ def test_writer_maintains_order(tmp_path):
         reader = LanceFileReader(str(path))
         result = reader.read_all().to_table()
         assert result == table
+
+
+def test_compression(tmp_path):
+    # 10Ki strings, which should be highly compressible, but not eligible for dictionary
+    compressible_strings = [f"compress_me_please-{i}" for i in range(10 * 1024)]
+    table_default = pa.table({"compressible_strings": compressible_strings})
+
+    schema_compress = pa.schema(
+        [
+            pa.field(
+                "compressible_strings",
+                pa.string(),
+                metadata={"lance-encoding:compression": "zstd"},
+            )
+        ]
+    )
+    table_compress = pa.table(
+        {"compressible_strings": compressible_strings}, schema=schema_compress
+    )
+
+    with LanceFileWriter(str(tmp_path / "default.lance")) as writer:
+        writer.write_batch(table_default)
+
+    with LanceFileWriter(str(tmp_path / "compress.lance"), schema_compress) as writer:
+        writer.write_batch(table_compress)
+
+    size_default = os.path.getsize(tmp_path / "default.lance")
+    size_compress = os.path.getsize(tmp_path / "compress.lance")
+
+    assert size_compress < size_default
+
+
+def test_blob(tmp_path):
+    # 100 1MiB values.  If we store as regular large_binary we end up
+    # with several pages of values.  If we store as a blob we get a
+    # single page
+    vals = pa.array([b"0" * (1024 * 1024) for _ in range(100)], pa.large_binary())
+    schema_no_blob = pa.schema([pa.field("val", pa.large_binary())])
+    schema_blob = pa.schema(
+        [pa.field("val", pa.large_binary(), metadata={"lance-encoding:blob": "true"})]
+    )
+
+    path = tmp_path / "no_blob.lance"
+    with LanceFileWriter(str(path), schema_no_blob) as writer:
+        writer.write_batch(pa.table({"val": vals}))
+
+    reader = LanceFileReader(str(path))
+    assert len(reader.metadata().columns[0].pages) > 1
+    assert reader.read_all().to_table() == pa.table({"val": vals})
+
+    path = tmp_path / "blob.lance"
+    with LanceFileWriter(str(path), schema_blob) as writer:
+        writer.write_batch(pa.table({"val": vals}))
+
+    reader = LanceFileReader(str(path))
+    assert len(reader.metadata().columns[0].pages) == 1
+    assert reader.read_all().to_table() == pa.table({"val": vals})

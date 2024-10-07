@@ -19,7 +19,7 @@ from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
 
-def create_table(nvec=1000, ndim=128, nans=0):
+def create_table(nvec=1000, ndim=128, nans=0, nullify=False):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
         nans_mat = np.empty((nans, ndim))
@@ -37,6 +37,13 @@ def create_table(nvec=1000, ndim=128, nans=0):
         .append_column("meta", pa.array(meta))
         .append_column("id", pa.array(range(nvec + nans)))
     )
+    if nullify:
+        idx = tbl.schema.get_field_index("vector")
+        vecs = tbl[idx].to_pylist()
+        nullified = [vec if i % 2 == 0 else None for i, vec in enumerate(vecs)]
+        field = tbl.schema.field(idx)
+        vecs = pa.array(nullified, field.type)
+        tbl = tbl.set_column(idx, field, vecs)
     return tbl
 
 
@@ -191,8 +198,9 @@ def test_index_with_pq_codebook(tmp_path):
 
 
 @pytest.mark.cuda
-def test_create_index_using_cuda(tmp_path):
-    tbl = create_table()
+@pytest.mark.parametrize("nullify", [False, True])
+def test_create_index_using_cuda(tmp_path, nullify):
+    tbl = create_table(nullify=nullify)
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
         "vector",
@@ -869,3 +877,24 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
             fragments=[LanceFragment(dataset, 0)],
         )
         scanner.explain_plan(True)
+
+
+def test_load_indices(dataset):
+    indices = dataset.list_indices()
+    assert len(indices) == 0
+
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+
+
+def test_optimize_indices(indexed_dataset):
+    data = create_table()
+    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 2

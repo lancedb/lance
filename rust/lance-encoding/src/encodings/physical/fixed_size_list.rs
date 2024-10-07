@@ -9,7 +9,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    data::DataBlock,
+    data::{DataBlock, FixedSizeListBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
@@ -78,10 +78,10 @@ impl PrimitivePageDecoder for FixedListDecoder {
         let rows_to_skip = rows_to_skip * self.dimension;
         let num_child_rows = num_rows * self.dimension;
         let child_data = self.items_decoder.decode(rows_to_skip, num_child_rows)?;
-        let mut child_data = child_data.as_fixed_width()?;
-        child_data.num_values = num_rows;
-        child_data.bits_per_value *= self.dimension;
-        Ok(DataBlock::FixedWidth(child_data))
+        Ok(DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(child_data),
+            dimension: self.dimension,
+        }))
     }
 }
 
@@ -111,21 +111,17 @@ impl ArrayEncoder for FslEncoder {
             DataType::FixedSizeList(inner_field, _) => inner_field.data_type().clone(),
             _ => panic!("Expected fixed size list data type and got {}", data_type),
         };
-        let mut data = data.as_fixed_width()?;
-        data.bits_per_value /= self.dimension as u64;
-        data.num_values *= self.dimension as u64;
-        let data = DataBlock::FixedWidth(data);
+        let data = data.as_fixed_size_list().unwrap();
+        let child = *data.child;
 
-        let encoded_data = self.items_encoder.encode(data, &inner_type, buffer_index)?;
+        let encoded_data = self
+            .items_encoder
+            .encode(child, &inner_type, buffer_index)?;
 
-        let data = match encoded_data.data {
-            DataBlock::FixedWidth(mut data) => {
-                data.bits_per_value *= self.dimension as u64;
-                data.num_values /= self.dimension as u64;
-                DataBlock::FixedWidth(data)
-            }
-            _ => panic!("Expected fixed width data block"),
-        };
+        let data = DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(encoded_data.data),
+            dimension: self.dimension as u64,
+        });
 
         let encoding = ProtobufUtils::fixed_size_list(encoded_data.encoding, self.dimension);
         Ok(EncodedArray { data, encoding })
@@ -134,7 +130,7 @@ impl ArrayEncoder for FslEncoder {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
     use arrow_schema::{DataType, Field};
 
@@ -148,7 +144,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field, HashMap::new()).await;
+            check_round_trip_encoding_random(field).await;
         }
     }
 }

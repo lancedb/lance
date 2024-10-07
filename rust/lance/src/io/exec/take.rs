@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -188,13 +189,25 @@ pub struct TakeExec {
 
 impl DisplayAs for TakeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let extra_fields = self
+            .extra_schema
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect::<HashSet<_>>();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let columns = self
                     .output_schema
                     .fields
                     .iter()
-                    .map(|f| f.name.as_str())
+                    .map(|f| {
+                        if extra_fields.contains(&f.name) {
+                            format!("({})", f.name.as_str())
+                        } else {
+                            f.name.clone()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 write!(f, "Take: columns={:?}", columns)

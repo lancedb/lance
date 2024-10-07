@@ -83,7 +83,7 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
         let rows_to_skip = rows_to_skip * self.byte_width;
         let num_bytes = num_rows * self.byte_width;
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
-        let bytes = bytes.as_fixed_width()?;
+        let bytes = bytes.as_fixed_width().unwrap();
         debug_assert_eq!(bytes.bits_per_value, 8);
 
         let offsets_buffer = match self.bytes_per_offset {
@@ -137,7 +137,7 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
         _data_type: &DataType,
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
-        let bytes_data = data.as_variable_width()?;
+        let bytes_data = data.as_variable_width().unwrap();
 
         let fixed_data = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 8 * self.byte_width as u64,
@@ -176,25 +176,25 @@ mod tests {
     async fn test_fixed_size_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
         // This test only generates fixed size binary arrays anyway
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::ArrowError;
 use futures::TryStreamExt;
-use lance_core::datatypes::Schema;
+use lance_core::{
+    cache::{CapacityMode, FileMetadataCache},
+    datatypes::Schema,
+};
 use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_io::{
     object_store::ObjectStore,
@@ -79,13 +82,20 @@ pub async fn write_lance_file(
     }
 }
 
+pub fn test_cache() -> Arc<FileMetadataCache> {
+    Arc::new(FileMetadataCache::with_capacity(
+        128 * 1024 * 1024,
+        CapacityMode::Bytes,
+    ))
+}
+
 pub async fn read_lance_file(
     fs: &FsFixture,
-    decoder_middleware: DecoderMiddlewareChain,
+    decoder_middleware: Arc<DecoderMiddlewareChain>,
     filter: FilterExpression,
 ) -> Vec<RecordBatch> {
     let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
-    let file_reader = FileReader::try_open(file_scheduler, None, decoder_middleware)
+    let file_reader = FileReader::try_open(file_scheduler, None, decoder_middleware, &test_cache())
         .await
         .unwrap();
 
@@ -101,7 +111,7 @@ pub async fn read_lance_file(
 
 pub async fn count_lance_file(
     fs: &FsFixture,
-    decoder_middleware: DecoderMiddlewareChain,
+    decoder_middleware: Arc<DecoderMiddlewareChain>,
     filter: FilterExpression,
 ) -> usize {
     read_lance_file(fs, decoder_middleware, filter)
