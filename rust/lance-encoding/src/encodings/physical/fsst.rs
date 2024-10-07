@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
@@ -105,12 +105,14 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             data: LanceBuffer::from(bytes_as_bytes_mut),
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_as_bytes_mut),
+            info: HashMap::new(),
         });
 
         if let Some(nulls) = nulls {
             Ok(DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(new_string_data),
                 nulls,
+                info: HashMap::new(),
             }))
         } else {
             Ok(new_string_data)
@@ -169,12 +171,14 @@ impl ArrayEncoder for FsstArrayEncoder {
             data: dest_values,
             num_values,
             offsets: dest_offset,
+            info: HashMap::new(),
         });
 
         let data_block = if let Some(nulls) = nulls {
             DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(dest_data),
                 nulls,
+                info: HashMap::new(),
             })
         } else {
             dest_data

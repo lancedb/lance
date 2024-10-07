@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
@@ -165,6 +165,7 @@ impl PrimitivePageDecoder for BasicPageDecoder {
                 Ok(DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(values),
                     nulls: validity.data,
+                    info: HashMap::new(),
                 }))
             }
             DataNullStatus::All => Ok(DataBlock::AllNull(AllNullDataBlock {
@@ -215,6 +216,7 @@ impl ArrayEncoder for BasicEncoder {
                 let encoded = DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(encoded_values.data),
                     nulls: nullable.nulls,
+                    info: HashMap::new(),
                 });
                 Ok(EncodedArray {
                     data: encoded,

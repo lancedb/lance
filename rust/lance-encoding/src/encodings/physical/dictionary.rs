@@ -194,11 +194,13 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             data: LanceBuffer::from(bytes_buffer),
             offsets: LanceBuffer::from(offsets_buffer),
             num_values: num_rows,
+            info: HashMap::new(),
         });
         if let Some(nulls) = null_buffer {
             Ok(DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(string_data),
                 nulls: LanceBuffer::from(nulls),
+                info: HashMap::new(),
             }))
         } else {
             Ok(string_data)
@@ -251,6 +253,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                         bits_per_value: key_type.byte_width() as u64 * 8,
                         data: LanceBuffer::Borrowed(indices.buffers()[0].clone()),
                         num_values: all_null.num_values,
+                        info: HashMap::new(),
                     },
                     dictionary: Box::new(DataBlock::from_array(values)),
                 }

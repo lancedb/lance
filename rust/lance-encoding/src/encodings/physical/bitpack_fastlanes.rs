@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{
@@ -255,6 +256,7 @@ macro_rules! encode_fixed_width {
             bits_per_value: $self.compressed_bit_width as u64,
             data: LanceBuffer::reinterpret_vec(output),
             num_values: $unpacked.num_values,
+            info: HashMap::new(),
         });
 
         Result::Ok(EncodedArray {
@@ -332,6 +334,7 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                 let encoded = DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(encoded_values.data),
                     nulls: nullable.nulls,
+                    info: HashMap::new(),
                 });
                 Ok(EncodedArray {
                     data: encoded,
@@ -475,6 +478,7 @@ impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
             ),
             bits_per_value: self.uncompressed_bits_per_value,
             num_values: num_rows,
+            info: HashMap::new(),
         }))
     }
 }

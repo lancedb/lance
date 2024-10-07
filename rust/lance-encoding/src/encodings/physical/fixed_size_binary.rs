@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
@@ -109,6 +109,7 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
             data: bytes.data,
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_buffer),
+            info: HashMap::new(),
         });
 
         Ok(string_data)
@@ -143,6 +144,7 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
             bits_per_value: 8 * self.byte_width as u64,
             data: bytes_data.data,
             num_values: bytes_data.num_values,
+            info: HashMap::new(),
         });
 
         let encoded_data = self.bytes_encoder.encode(

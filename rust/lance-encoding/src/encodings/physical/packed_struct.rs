@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Fields};
@@ -145,6 +146,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
                 data: LanceBuffer::from(field_bytes),
                 bits_per_value: bytes_per_field as u64 * 8,
                 num_values: num_rows,
+                info: HashMap::new(),
             };
             let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
             children.push(child_block);
@@ -238,6 +240,7 @@ impl ArrayEncoder for PackedStructEncoder {
             data: zipped,
             bits_per_value: total_bits_per_value,
             num_values,
+            info: HashMap::new(),
         });
 
         let encoding = ProtobufUtils::packed_struct(child_encodings, index);

@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
@@ -205,6 +206,7 @@ impl PrimitivePageDecoder for ValuePageDecoder {
             bits_per_value: self.bytes_per_value * 8,
             data: data_buffer,
             num_values: num_rows,
+            info: HashMap::new(),
         }))
     }
 }

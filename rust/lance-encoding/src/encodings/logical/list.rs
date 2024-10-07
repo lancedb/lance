@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{collections::{HashMap, VecDeque}, ops::Range, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
@@ -1065,6 +1065,7 @@ impl ListOffsetsEncoder {
             bits_per_value: 64,
             data: LanceBuffer::reinterpret_vec(offsets),
             num_values: num_offsets,
+            info: HashMap::new(),
         });
         inner_encoder.encode(offsets_data, &DataType::UInt64, buffer_index)
     }

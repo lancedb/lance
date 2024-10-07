@@ -17,7 +17,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_null_array, Array, ArrayRef, UInt64Array};
+use arrow_array::{new_null_array, Array, ArrayRef, Int32Array, Int64Array, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
@@ -25,7 +25,7 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::buffer::LanceBuffer;
+use crate::{buffer::LanceBuffer, statistics::Stat};
 
 /// A data block with no buffers where everything is null
 ///
@@ -60,6 +60,7 @@ impl AllNullDataBlock {
     }
 }
 
+use std::collections::HashMap;
 /// Wraps a data block and adds nullability information to it
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated
@@ -71,6 +72,8 @@ pub struct NullableDataBlock {
     pub data: Box<DataBlock>,
     /// A bitmap of validity for each value
     pub nulls: LanceBuffer,
+
+    pub info: HashMap<Stat, Arc<dyn Array>>,
 }
 
 impl NullableDataBlock {
@@ -84,7 +87,6 @@ impl NullableDataBlock {
             Ok(unsafe { data.build_unchecked() })
         }
     }
-
     fn into_buffers(self) -> Vec<LanceBuffer> {
         let mut buffers = vec![self.nulls];
         buffers.extend(self.data.into_buffers());
@@ -95,6 +97,7 @@ impl NullableDataBlock {
         Self {
             data: Box::new(self.data.borrow_and_clone()),
             nulls: self.nulls.borrow_and_clone(),
+            info: self.info.clone(),
         }
     }
 
@@ -102,6 +105,7 @@ impl NullableDataBlock {
         Ok(Self {
             data: Box::new(self.data.try_clone()?),
             nulls: self.nulls.try_clone()?,
+            info: self.info.clone(),
         })
     }
 }
@@ -115,6 +119,8 @@ pub struct FixedWidthDataBlock {
     pub bits_per_value: u64,
     /// The number of values represented by this block
     pub num_values: u64,
+
+    pub info: HashMap<Stat, Arc<dyn Array>>,
 }
 
 impl FixedWidthDataBlock {
@@ -150,6 +156,7 @@ impl FixedWidthDataBlock {
             data: self.data.borrow_and_clone(),
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
+            info: self.info.clone(),
         }
     }
 
@@ -158,6 +165,7 @@ impl FixedWidthDataBlock {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
+            info: self.info.clone(),
         })
     }
 }
@@ -305,6 +313,8 @@ pub struct VariableWidthBlock {
     pub bits_per_offset: u8,
     /// The number of values represented by this block
     pub num_values: u64,
+
+    pub info: HashMap<Stat, Arc<dyn Array>>,
 }
 
 impl VariableWidthBlock {
@@ -333,6 +343,7 @@ impl VariableWidthBlock {
             offsets: self.offsets.borrow_and_clone(),
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
+            info: self.info.clone()
         }
     }
 
@@ -342,6 +353,7 @@ impl VariableWidthBlock {
             offsets: self.offsets.try_clone()?,
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
+            info: self.info.clone()
         })
     }
 }
@@ -704,6 +716,7 @@ fn arrow_binary_to_data_block(
         offsets,
         bits_per_offset,
         num_values,
+        info: HashMap::new(),
     })
 }
 
@@ -868,12 +881,14 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             data: LanceBuffer::Owned(indices_bytes),
             bits_per_value: bits_per_index,
             num_values,
+            info: HashMap::new(),
         }
     } else {
         FixedWidthDataBlock {
             data: LanceBuffer::Borrowed(indices.to_data().buffers()[0].clone()),
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
+            info: HashMap::new(),
         }
     };
 
@@ -956,6 +971,7 @@ impl DataBlock {
                     data,
                     bits_per_value: 1,
                     num_values,
+                    info: HashMap::new(),
                 })
             }
             DataType::Date32
@@ -984,6 +1000,7 @@ impl DataBlock {
                     data,
                     bits_per_value: data_type.byte_width() as u64 * 8,
                     num_values,
+                    info: HashMap::new(),
                 })
             }
             DataType::Null => Self::AllNull(AllNullDataBlock { num_values }),
@@ -1030,6 +1047,7 @@ impl DataBlock {
                 Nullability::Some(nulls) => Self::Nullable(NullableDataBlock {
                     data: Box::new(encoded),
                     nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
+                    info: HashMap::new(),
                 }),
                 _ => unreachable!(),
             }
