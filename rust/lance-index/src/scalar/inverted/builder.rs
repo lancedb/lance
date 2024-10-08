@@ -14,9 +14,9 @@ use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use crossbeam_queue::ArrayQueue;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
-use futures::stream::repeat;
 use futures::{stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::iter_str_array;
@@ -138,9 +138,19 @@ impl InvertedIndexBuilder {
 
         let start = std::time::Instant::now();
         let senders = Arc::new(senders);
+        let tokenizer_pool = Arc::new(ArrayQueue::new(num_shards));
+        let token_buffers_pool = Arc::new(ArrayQueue::new(num_shards));
+        for _ in 0..num_shards {
+            let _ = tokenizer_pool.push(TOKENIZER.clone());
+            token_buffers_pool
+                .push(vec![Vec::new(); num_shards])
+                .unwrap();
+        }
         let mut stream = stream
-            .zip(repeat(senders))
-            .map(|(batch, senders)| {
+            .map(move |batch| {
+                let senders = senders.clone();
+                let tokenizer_pool = tokenizer_pool.clone();
+                let token_buffers_pool = token_buffers_pool.clone();
                 CPU_RUNTIME.spawn_blocking(move || {
                     let batch = batch?;
                     let doc_iter = iter_str_array(batch.column(0));
@@ -149,8 +159,8 @@ impl InvertedIndexBuilder {
                         .zip(row_id_col.values().iter())
                         .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
-                    let mut tokenizer = TOKENIZER.clone();
-                    let mut token_buffers = vec![Vec::new(); num_shards];
+                    let mut tokenizer = tokenizer_pool.pop().unwrap();
+                    let mut token_buffers = token_buffers_pool.pop().unwrap();
 
                     let num_tokens = docs
                         .map(|(doc, row_id)| {
@@ -180,6 +190,9 @@ impl InvertedIndexBuilder {
                             (row_id, num_tokens)
                         })
                         .collect_vec();
+
+                    let _ = tokenizer_pool.push(tokenizer);
+                    token_buffers_pool.push(token_buffers).unwrap();
                     Result::Ok(num_tokens)
                 })
             })
@@ -203,6 +216,10 @@ impl InvertedIndexBuilder {
                     self.docs.len(),
                     start.elapsed(),
                     self.docs.len() as f32 / start.elapsed().as_secs_f32()
+                );
+                log::info!(
+                    "docs deep size: {}MiB",
+                    self.docs.deep_size_of() / 1024 / 1024
                 );
                 last_num_rows = self.docs.len();
             }
@@ -472,21 +489,12 @@ impl IndexWorker {
             }
         }
         log::info!(
-            "flushed {} lists of {}MiB",
+            "flushed {} lists of {}MiB, posting_lists size: {}MiB, token_offsets size: {}MiB",
             count,
-            flushed_size / 1024 / 1024
+            flushed_size / 1024 / 1024,
+            self.posting_lists.deep_size_of() / 1024 / 1024,
+            self.token_offsets.deep_size_of() / 1024 / 1024,
         );
-        // let (token, _) = self.largest_list.take().unwrap();
-        // self.flush_posting_list(token).await?;
-
-        // update the largest list
-        // it's not efficient to iterate the whole posting_lists
-        // but we'd assume the number of tokens is not too large
-        // self.largest_list = self
-        //     .posting_lists
-        //     .iter()
-        //     .max_by_key(|(_, list)| list.size())
-        //     .map(|(token, list)| (token.clone(), list.size()));
 
         Ok(())
     }
