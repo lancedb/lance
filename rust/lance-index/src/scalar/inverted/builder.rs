@@ -297,24 +297,23 @@ impl InvertedIndexBuilder {
             )
             .await?;
 
-        let doc = Arc::new(self.docs.clone());
+        let docs = Arc::new(self.docs.clone());
         let mut offsets = Vec::new();
         let mut max_scores = Vec::new();
         let mut num_rows = 0;
         log::info!("writing {} posting lists", self.posting_readers.len());
-        let posting_readers = std::mem::take(&mut self.posting_readers);
-        for reader in posting_readers {
-            let mut batches = reader.stream().await?;
-            while let Some((token, batches)) = batches.try_next().await? {
-                self.tokens.add(token);
-
-                let (batch, max_score) =
-                    PostingListBuilder::from_batches(&batches).to_batch(Some(doc.clone()))?;
-                offsets.push(num_rows);
-                max_scores.push(max_score);
-                num_rows += batch.num_rows();
-                writer.write_record_batch(batch).await?;
-            }
+        let mut posting_streams = Vec::with_capacity(self.posting_readers.len());
+        for reader in std::mem::take(&mut self.posting_readers) {
+            posting_streams.push(reader.stream(docs.clone()).await?);
+        }
+        let mut merged_stream = stream::select_all(posting_streams);
+        while let Some(r) = merged_stream.try_next().await? {
+            let (token, batch, max_score) = r?;
+            self.tokens.add(token);
+            offsets.push(num_rows);
+            max_scores.push(max_score);
+            num_rows += batch.num_rows();
+            writer.write_record_batch(batch).await?;
         }
 
         let metadata = HashMap::from_iter(vec![
@@ -579,9 +578,22 @@ impl PostingReader {
         })
     }
 
+    // returns a stream of (token, batch, max_score)
     async fn stream(
         mut self,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<(String, Vec<RecordBatch>)>> + Send>>> {
+        docs: Arc<DocSet>,
+    ) -> Result<
+        Pin<
+            Box<
+                dyn Stream<
+                        Item = std::result::Result<
+                            Result<(String, RecordBatch, f32)>,
+                            tokio::task::JoinError,
+                        >,
+                    > + Send,
+            >,
+        >,
+    > {
         let mut token_offsets = std::mem::take(&mut self.token_offsets);
         for token in self.existing_tokens.keys() {
             if !token_offsets.contains_key(token) {
@@ -592,11 +604,11 @@ impl PostingReader {
         let schema: Arc<arrow_schema::Schema> = Arc::new(self.reader.schema().into());
         let posting_reader = Arc::new(self);
 
-        let mut inverted_batches_fut = Vec::with_capacity(token_offsets.len());
-        for (token, offsets) in token_offsets {
+        let inverted_batches = token_offsets.into_iter().map(move |(token, offsets)| {
             let posting_reader = posting_reader.clone();
             let schema = schema.clone();
-            let inverted_batches = async move {
+            let docs = docs.clone();
+            tokio::spawn(async move {
                 let batches = offsets.into_iter().map(|(offset, length)| {
                     let reader = posting_reader.reader.clone();
                     let schema = schema.clone();
@@ -628,13 +640,27 @@ impl PostingReader {
                     batches.push(batch);
                 }
 
-                Result::Ok((token, batches))
-            };
-            inverted_batches_fut.push(inverted_batches);
-        }
+                let (batch, max_score) =
+                    PostingListBuilder::from_batches(&batches).to_batch(Some(docs))?;
+
+                // Result::Ok((token, batches))
+                Ok((token, batch, max_score))
+            })
+        });
 
         let stream =
-            stream::iter(inverted_batches_fut).buffer_unordered(get_num_compute_intensive_cpus());
+            stream::iter(inverted_batches).buffer_unordered(get_num_compute_intensive_cpus());
+        // .map(move |r| {
+        //     let docs = docs.clone();
+        //     CPU_RUNTIME.spawn_blocking(move || {
+        //         let (token, batches) = r?;
+        //         let (batch, max_score) =
+        //             PostingListBuilder::from_batches(&batches).to_batch(Some(docs))?;
+        //         Ok((token, batch, max_score))
+        //     })
+        // })
+        // .buffer_unordered(get_num_compute_intensive_cpus());
+        // .map_err(|e| e.into());
         Ok(Box::pin(stream))
     }
 }
