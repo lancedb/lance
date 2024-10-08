@@ -60,6 +60,10 @@ from .lance import _Session as Session
 from .optimize import Compaction
 from .schema import LanceSchema
 from .util import td_to_micros
+from .vector import (
+    compute_pq_codes,
+    train_pq_codebook_on_accelerator,
+)
 
 if TYPE_CHECKING:
     from pyarrow._compute import Expression
@@ -1770,15 +1774,9 @@ class LanceDataset(pa.dataset.Dataset):
                 logging.info("Computing new precomputed shuffle buffers for PQ.")
                 partitions_file = kwargs["precomputed_partitions_file"]
                 del kwargs["precomputed_partitions_file"]
-                import lance
 
-                partitions_ds = lance.dataset(partitions_file)
+                partitions_ds = LanceDataset(partitions_file)
                 # Use accelerator to train pq codebook
-                from .vector import (
-                    compute_pq_codes,
-                    train_pq_codebook_on_accelerator,
-                )
-
                 timers["pq_train:start"] = time.time()
                 pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
                     partitions_ds,
