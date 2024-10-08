@@ -620,10 +620,7 @@ impl PostingReader {
                         }
                     }
                 });
-                let mut batches = stream::iter(batches)
-                    .buffer_unordered(get_num_compute_intensive_cpus())
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                let mut batches = futures::future::try_join_all(batches).await?;
 
                 if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
                     let token_id =
@@ -643,24 +640,12 @@ impl PostingReader {
                 let (batch, max_score) =
                     PostingListBuilder::from_batches(&batches).to_batch(Some(docs))?;
 
-                // Result::Ok((token, batches))
                 Ok((token, batch, max_score))
             })
         });
 
-        let stream =
-            stream::iter(inverted_batches).buffer_unordered(get_num_compute_intensive_cpus());
-        // .map(move |r| {
-        //     let docs = docs.clone();
-        //     CPU_RUNTIME.spawn_blocking(move || {
-        //         let (token, batches) = r?;
-        //         let (batch, max_score) =
-        //             PostingListBuilder::from_batches(&batches).to_batch(Some(docs))?;
-        //         Ok((token, batch, max_score))
-        //     })
-        // })
-        // .buffer_unordered(get_num_compute_intensive_cpus());
-        // .map_err(|e| e.into());
+        let stream = stream::iter(inverted_batches)
+            .buffer_unordered(get_num_compute_intensive_cpus().div_ceil(*NUM_SHARDS));
         Ok(Box::pin(stream))
     }
 }
