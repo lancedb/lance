@@ -110,7 +110,7 @@ pub struct SerializedRepDefs {
 
 impl SerializedRepDefs {
     fn empty() -> Self {
-        SerializedRepDefs {
+        Self {
             repetition_levels: Vec::new(),
             definition_levels: Vec::new(),
             all_null: Vec::new(),
@@ -120,6 +120,10 @@ impl SerializedRepDefs {
 
     pub fn len(&self) -> usize {
         self.definition_levels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -237,7 +241,7 @@ impl RepDefBuilder {
         // self.repdefs.push(RawRepDef::NoNull());
     }
 
-    fn check_offset_len(&mut self, offsets: &Vec<i64>) {
+    fn check_offset_len(&mut self, offsets: &[i64]) {
         if let Some(len) = self.len {
             assert!(offsets.len() == len + 1);
         }
@@ -260,7 +264,7 @@ impl RepDefBuilder {
                 .iter()
                 .copied()
                 .map(|o| o as i64)
-                .collect();
+                .collect::<Vec<_>>();
             self.check_offset_len(&casted);
             self.repdefs.push(RawRepDef::Offsets(casted.into()));
         }
@@ -344,7 +348,7 @@ impl RepDefBuilder {
         }
 
         ctx.map(|ctx| ctx.build(all_null, all_valid))
-            .unwrap_or_else(|| SerializedRepDefs::empty())
+            .unwrap_or_else(SerializedRepDefs::empty)
     }
 }
 
