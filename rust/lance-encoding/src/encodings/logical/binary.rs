@@ -16,7 +16,7 @@ use log::trace;
 
 use crate::decoder::{
     DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-    NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+    MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
@@ -37,12 +37,15 @@ impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
         let wrapped_decoders = inner_scan
             .decoders
             .into_iter()
-            .map(|decoder| DecoderReady {
-                path: decoder.path,
-                decoder: Box::new(BinaryPageDecoder {
-                    inner: decoder.decoder,
-                    data_type: self.scheduler.data_type.clone(),
-                }),
+            .map(|message| {
+                let decoder = message.into_legacy();
+                MessageType::DecoderReady(DecoderReady {
+                    path: decoder.path,
+                    decoder: Box::new(BinaryPageDecoder {
+                        inner: decoder.decoder,
+                        data_type: self.scheduler.data_type.clone(),
+                    }),
+                })
             })
             .collect::<Vec<_>>();
         Ok(ScheduledScanLine {
@@ -167,7 +170,7 @@ impl DecodeArrayTask for BinaryArrayDecoder {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
         let data_type = self.data_type;
         let arr = self.inner.decode()?;
-        match dbg!(data_type) {
+        match data_type {
             DataType::Binary => Ok(Self::from_list_array::<BinaryType>(arr.as_list::<i32>())),
             DataType::LargeBinary => Ok(Self::from_list_array::<LargeBinaryType>(
                 arr.as_list::<i64>(),

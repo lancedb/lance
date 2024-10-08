@@ -16,7 +16,7 @@ use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
-        schedule_and_decode, ColumnInfo, DecoderMiddlewareChain, FilterExpression, PageInfo,
+        schedule_and_decode, ColumnInfo, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
         ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
     },
     encoder::EncodedBatch,
@@ -246,6 +246,11 @@ impl ReaderProjection {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct FileReaderOptions {
+    validate_on_decode: bool,
+}
+
 #[derive(Debug)]
 pub struct FileReader {
     scheduler: Arc<LanceEncodingsIo>,
@@ -253,10 +258,10 @@ pub struct FileReader {
     base_projection: ReaderProjection,
     num_rows: u64,
     metadata: Arc<CachedFileMetadata>,
-    decoder_strategy: Arc<DecoderMiddlewareChain>,
+    decoder_plugins: Arc<DecoderPlugins>,
     cache: Arc<FileMetadataCache>,
+    options: FileReaderOptions,
 }
-
 #[derive(Debug)]
 struct Footer {
     #[allow(dead_code)]
@@ -501,7 +506,12 @@ impl FileReader {
             + (footer_start - footer.global_buff_offsets_start);
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
 
-        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice());
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
 
         Ok(CachedFileMetadata {
             file_schema: Arc::new(schema),
@@ -531,7 +541,10 @@ impl FileReader {
         }
     }
 
-    fn meta_to_col_infos(column_metadatas: &[pbfile::ColumnMetadata]) -> Vec<Arc<ColumnInfo>> {
+    fn meta_to_col_infos(
+        column_metadatas: &[pbfile::ColumnMetadata],
+        file_version: LanceFileVersion,
+    ) -> Vec<Arc<ColumnInfo>> {
         column_metadatas
             .iter()
             .enumerate()
@@ -541,7 +554,18 @@ impl FileReader {
                     .iter()
                     .map(|page| {
                         let num_rows = page.length;
-                        let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
+                        let encoding = match file_version {
+                            LanceFileVersion::V2_0 => {
+                                PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
+                                    page.encoding.as_ref().unwrap(),
+                                ))
+                            }
+                            _ => {
+                                PageEncoding::Structural(Self::fetch_encoding::<pbenc::PageLayout>(
+                                    page.encoding.as_ref().unwrap(),
+                                ))
+                            }
+                        };
                         let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets
                                 .iter()
@@ -553,6 +577,7 @@ impl FileReader {
                             buffer_offsets_and_sizes,
                             encoding,
                             num_rows,
+                            priority: page.priority,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -612,8 +637,9 @@ impl FileReader {
     pub async fn try_open(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
-        decoder_strategy: Arc<DecoderMiddlewareChain>,
+        decoder_strategy: Arc<DecoderPlugins>,
         cache: &FileMetadataCache,
+        options: FileReaderOptions,
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
         Self::try_open_with_file_metadata(
@@ -622,6 +648,7 @@ impl FileReader {
             decoder_strategy,
             file_metadata,
             cache,
+            options,
         )
         .await
     }
@@ -630,9 +657,10 @@ impl FileReader {
     pub async fn try_open_with_file_metadata(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
-        decoder_strategy: Arc<DecoderMiddlewareChain>,
+        decoder_plugins: Arc<DecoderPlugins>,
         file_metadata: Arc<CachedFileMetadata>,
         cache: &FileMetadataCache,
+        options: FileReaderOptions,
     ) -> Result<Self> {
         let cache = Arc::new(cache.with_base_path(scheduler.reader().path().clone()));
 
@@ -647,8 +675,9 @@ impl FileReader {
             )),
             num_rows,
             metadata: file_metadata,
-            decoder_strategy,
+            decoder_plugins,
             cache,
+            options,
         })
     }
 
@@ -678,11 +707,12 @@ impl FileReader {
         io: Arc<dyn EncodingsIo>,
         cache: Arc<FileMetadataCache>,
         num_rows: u64,
-        decoder_strategy: Arc<DecoderMiddlewareChain>,
+        decoder_plugins: Arc<DecoderPlugins>,
         range: Range<u64>,
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
+        should_validate: bool,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Reading range {:?} with batch_size {} from file with {} rows and {} columns into schema with {} columns",
@@ -696,8 +726,9 @@ impl FileReader {
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
-            decoder_strategy,
+            decoder_plugins,
             io,
+            should_validate,
         };
 
         let requested_rows = RequestedRows::Ranges(vec![range]);
@@ -725,11 +756,12 @@ impl FileReader {
             self.scheduler.clone(),
             self.cache.clone(),
             self.num_rows,
-            self.decoder_strategy.clone(),
+            self.decoder_plugins.clone(),
             range,
             batch_size,
             projection,
             filter,
+            self.options.validate_on_decode,
         )
     }
 
@@ -738,11 +770,12 @@ impl FileReader {
         column_infos: Vec<Arc<ColumnInfo>>,
         io: Arc<dyn EncodingsIo>,
         cache: Arc<FileMetadataCache>,
-        decoder_strategy: Arc<DecoderMiddlewareChain>,
+        decoder_plugins: Arc<DecoderPlugins>,
         indices: Vec<u64>,
         batch_size: u32,
         projection: ReaderProjection,
         filter: FilterExpression,
+        should_validate: bool,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         debug!(
             "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
@@ -756,8 +789,9 @@ impl FileReader {
         let config = SchedulerDecoderConfig {
             batch_size,
             cache,
-            decoder_strategy,
+            decoder_plugins,
             io,
+            should_validate,
         };
 
         let requested_rows = RequestedRows::Indices(indices);
@@ -783,11 +817,12 @@ impl FileReader {
             self.collect_columns_from_projection(&projection)?,
             self.scheduler.clone(),
             self.cache.clone(),
-            self.decoder_strategy.clone(),
+            self.decoder_plugins.clone(),
             indices,
             batch_size,
             projection,
             FilterExpression::no_filter(),
+            self.options.validate_on_decode,
         )
     }
 
@@ -999,7 +1034,12 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas);
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
 
         Ok(Self {
             data: bytes,
@@ -1044,7 +1084,12 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas);
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
 
         Ok(Self {
             data: bytes,
@@ -1074,7 +1119,7 @@ pub mod tests {
     use lance_core::datatypes::Schema;
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
-        decoder::{decode_batch, DecodeBatchScheduler, DecoderMiddlewareChain, FilterExpression},
+        decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
         encoder::{encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodingOptions},
     };
     use lance_io::stream::RecordBatchStream;
@@ -1082,7 +1127,7 @@ pub mod tests {
     use tokio::sync::mpsc;
 
     use crate::v2::{
-        reader::{EncodedBatchReaderExt, FileReader, ReaderProjection},
+        reader::{EncodedBatchReaderExt, FileReader, FileReaderOptions, ReaderProjection},
         testing::{test_cache, write_lance_file, FsFixture, WrittenFile},
         writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
     };
@@ -1168,8 +1213,9 @@ pub mod tests {
             let file_reader = FileReader::try_open(
                 file_scheduler,
                 None,
-                Arc::<DecoderMiddlewareChain>::default(),
+                Arc::<DecoderPlugins>::default(),
                 &test_cache(),
+                FileReaderOptions::default(),
             )
             .await
             .unwrap();
@@ -1222,7 +1268,8 @@ pub mod tests {
         let decoded = decode_batch(
             &decoded_batch,
             &FilterExpression::no_filter(),
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1236,7 +1283,8 @@ pub mod tests {
         let decoded = decode_batch(
             &decoded_batch,
             &FilterExpression::no_filter(),
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
+            false,
         )
         .await
         .unwrap();
@@ -1272,8 +1320,9 @@ pub mod tests {
             let file_reader = FileReader::try_open(
                 file_scheduler.clone(),
                 None,
-                Arc::<DecoderMiddlewareChain>::default(),
+                Arc::<DecoderPlugins>::default(),
                 &test_cache(),
+                FileReaderOptions::default(),
             )
             .await
             .unwrap();
@@ -1307,8 +1356,9 @@ pub mod tests {
             let file_reader = FileReader::try_open(
                 file_scheduler.clone(),
                 Some(projection.clone()),
-                Arc::<DecoderMiddlewareChain>::default(),
+                Arc::<DecoderPlugins>::default(),
                 &test_cache(),
+                FileReaderOptions::default(),
             )
             .await
             .unwrap();
@@ -1342,8 +1392,9 @@ pub mod tests {
         assert!(FileReader::try_open(
             file_scheduler.clone(),
             Some(empty_projection),
-            Arc::<DecoderMiddlewareChain>::default(),
-            &test_cache()
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .is_err());
@@ -1362,8 +1413,9 @@ pub mod tests {
         assert!(FileReader::try_open(
             file_scheduler.clone(),
             Some(projection_with_dupes),
-            Arc::<DecoderMiddlewareChain>::default(),
-            &test_cache()
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .is_err());
@@ -1380,8 +1432,9 @@ pub mod tests {
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .unwrap();
@@ -1429,8 +1482,9 @@ pub mod tests {
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .unwrap();
@@ -1460,8 +1514,9 @@ pub mod tests {
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .unwrap();
@@ -1507,8 +1562,9 @@ pub mod tests {
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .unwrap();
@@ -1523,7 +1579,7 @@ pub mod tests {
             &column_infos,
             &vec![],
             total_rows as u64,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             file_reader.scheduler.clone(),
             test_cache(),
             &FilterExpression::no_filter(),
@@ -1581,8 +1637,9 @@ pub mod tests {
         let file_reader = FileReader::try_open(
             file_scheduler.clone(),
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &test_cache(),
+            FileReaderOptions::default(),
         )
         .await
         .unwrap();

@@ -5,7 +5,7 @@
 
 use std::{ops::Deref, ptr::NonNull, sync::Arc};
 
-use arrow_buffer::{ArrowNativeType, Buffer, ScalarBuffer};
+use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use snafu::{location, Location};
 
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
@@ -102,6 +102,20 @@ impl LanceBuffer {
     /// Converts the buffer into a hex string
     pub fn as_hex(&self) -> String {
         hex::encode_upper(self)
+    }
+
+    pub fn as_spaced_hex(&self, bytes_per_word: u32) -> String {
+        let hex = self.as_hex();
+        let chars_per_word = bytes_per_word as usize * 2;
+        let num_words = hex.len() / chars_per_word;
+        let mut spaced_hex = String::with_capacity(hex.len() + num_words);
+        for (i, c) in hex.chars().enumerate() {
+            if i % chars_per_word == 0 && i != 0 {
+                spaced_hex.push(' ');
+            }
+            spaced_hex.push(c);
+        }
+        spaced_hex
     }
 
     /// Create a LanceBuffer from a bytes::Bytes object
@@ -205,10 +219,20 @@ impl LanceBuffer {
 
     /// Reinterprets a LanceBuffer into a Vec<T>
     ///
-    /// Unfortunately, there is no way to do this safely in Rust without a copy, even if
-    /// the source is Vec<u8>.
+    /// If the underlying buffer is not properly aligned, this will involve a copy of the data
     pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
-        ScalarBuffer::<T>::from(self.borrow_and_clone().into_buffer())
+        let align = std::mem::align_of::<T>();
+        let is_aligned = self.as_ptr().align_offset(align) == 0;
+
+        if is_aligned {
+            ScalarBuffer::<T>::from(self.borrow_and_clone().into_buffer())
+        } else {
+            let num_values = self.len() / std::mem::size_of::<T>();
+            let vec = Vec::<T>::with_capacity(num_values);
+            let mut bytes = MutableBuffer::from(vec);
+            bytes.extend_from_slice(self);
+            ScalarBuffer::<T>::from(Buffer::from(bytes))
+        }
     }
 
     /// Concatenates multiple buffers into a single buffer, consuming the input buffers

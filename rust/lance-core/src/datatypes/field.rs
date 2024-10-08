@@ -67,6 +67,10 @@ pub struct Field {
 }
 
 impl Field {
+    pub fn new_arrow(name: &str, data_type: DataType, nullable: bool) -> Result<Self> {
+        Self::try_from(ArrowField::new(name, data_type, nullable))
+    }
+
     /// Returns arrow data type.
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {

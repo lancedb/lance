@@ -10,7 +10,7 @@ use lance_core::{
     cache::{CapacityMode, FileMetadataCache},
     datatypes::Schema,
 };
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -19,7 +19,7 @@ use lance_io::{
 use object_store::path::Path;
 use tempfile::TempDir;
 
-use crate::v2::reader::FileReader;
+use crate::v2::reader::{FileReader, FileReaderOptions};
 
 use super::writer::{FileWriter, FileWriterOptions};
 
@@ -91,13 +91,19 @@ pub fn test_cache() -> Arc<FileMetadataCache> {
 
 pub async fn read_lance_file(
     fs: &FsFixture,
-    decoder_middleware: Arc<DecoderMiddlewareChain>,
+    decoder_middleware: Arc<DecoderPlugins>,
     filter: FilterExpression,
 ) -> Vec<RecordBatch> {
     let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
-    let file_reader = FileReader::try_open(file_scheduler, None, decoder_middleware, &test_cache())
-        .await
-        .unwrap();
+    let file_reader = FileReader::try_open(
+        file_scheduler,
+        None,
+        decoder_middleware,
+        &test_cache(),
+        FileReaderOptions::default(),
+    )
+    .await
+    .unwrap();
 
     let schema = file_reader.schema();
     assert_eq!(schema.metadata.get("foo").unwrap(), "bar");
@@ -111,7 +117,7 @@ pub async fn read_lance_file(
 
 pub async fn count_lance_file(
     fs: &FsFixture,
-    decoder_middleware: Arc<DecoderMiddlewareChain>,
+    decoder_middleware: Arc<DecoderPlugins>,
     filter: FilterExpression,
 ) -> usize {
     read_lance_file(fs, decoder_middleware, filter)

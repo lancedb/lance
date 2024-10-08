@@ -18,8 +18,9 @@ use pb::{
     array_encoding::ArrayEncoding as ArrayEncodingEnum,
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
+    page_layout::Layout,
     ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Dictionary, FixedSizeBinary,
-    FixedSizeList, Flat, Fsst, Nullable, PackedStruct,
+    FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct, PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionScheme;
@@ -184,6 +185,20 @@ impl ProtobufUtils {
                 binary: Some(Box::new(data)),
                 symbol_table,
             }))),
+        }
+    }
+
+    pub fn miniblock(
+        rep_encoding: ArrayEncoding,
+        def_encoding: ArrayEncoding,
+        value_encoding: ArrayEncoding,
+    ) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
+                def_compression: Some(def_encoding),
+                rep_compression: Some(rep_encoding),
+                value_compression: Some(value_encoding),
+            })),
         }
     }
 }
