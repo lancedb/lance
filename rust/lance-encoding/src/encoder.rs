@@ -971,6 +971,9 @@ pub struct RepDefFieldEncodingStrategy {
     pub version: LanceFileVersion,
 }
 
+// For some reason, clippy thinks we can add Default to the above derive but
+// rustc doesn't agree (no default for Arc<dyn Trait>)
+#[allow(clippy::derivable_impls)]
 impl Default for RepDefFieldEncodingStrategy {
     fn default() -> Self {
         Self {
