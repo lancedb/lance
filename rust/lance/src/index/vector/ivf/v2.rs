@@ -24,8 +24,8 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_file::v2::reader::FileReader;
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::{FileReader, FileReaderOptions};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
@@ -128,8 +128,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))
                 .await?,
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
+            FileReaderOptions::default(),
         )
         .await?;
         let index_metadata: IndexMetadata = serde_json::from_str(
@@ -180,8 +181,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 )
                 .await?,
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
+            FileReaderOptions::default(),
         )
         .await?;
         let storage = IvfQuantizationStorage::try_new(storage_reader).await?;

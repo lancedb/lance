@@ -5,9 +5,9 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::StreamExt;
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::{
-    reader::FileReader,
+    reader::{FileReader, FileReaderOptions},
     testing::test_cache,
     writer::{FileWriter, FileWriterOptions},
 };
@@ -56,8 +56,9 @@ fn bench_reader(c: &mut Criterion) {
                 let reader = FileReader::try_open(
                     scheduler.clone(),
                     None,
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
                     &test_cache(),
+                    FileReaderOptions::default(),
                 )
                 .await
                 .unwrap();

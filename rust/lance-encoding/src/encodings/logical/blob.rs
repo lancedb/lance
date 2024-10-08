@@ -19,7 +19,8 @@ use crate::{
     buffer::LanceBuffer,
     decoder::{
         DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-        NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
     format::pb::{column_encoding, Blob, ColumnEncoding},
@@ -35,7 +36,7 @@ lazy_static::lazy_static! {
         ]);
     pub static ref DESC_FIELD: Field =
         Field::new("description", DataType::Struct(DESC_FIELDS.clone()), false);
-
+    pub static ref DESC_FIELD_LANCE: lance_core::datatypes::Field = (&*DESC_FIELD).try_into().unwrap();
 }
 
 /// A field scheduler for large binary data
@@ -76,6 +77,7 @@ impl<'a> SchedulingJob for BlobFieldSchedulingJob<'a> {
         let next_descriptions = self.descriptions_job.schedule_next(context, priority)?;
         let mut priority = priority.current_priority();
         let decoders = next_descriptions.decoders.into_iter().map(|decoder| {
+            let decoder = decoder.into_legacy();
             let path = decoder.path;
             let mut decoder = decoder.decoder;
             let num_rows = decoder.num_rows();
@@ -101,7 +103,7 @@ impl<'a> SchedulingJob for BlobFieldSchedulingJob<'a> {
                 base_priority: priority,
             });
             priority += num_rows;
-            DecoderReady { decoder, path }
+            MessageType::DecoderReady(DecoderReady { decoder, path })
         });
         Ok(ScheduledScanLine {
             decoders: decoders.collect(),
