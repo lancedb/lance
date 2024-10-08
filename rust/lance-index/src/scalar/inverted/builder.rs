@@ -457,8 +457,9 @@ impl IndexWorker {
             .posting_lists
             .iter()
             .map(|(key, list)| (key, list.size()))
-            .sorted_by_key(|(_, size)| *size)
+            .sorted_unstable_by_key(|(_, size)| *size)
             .map(|(key, _)| key)
+            .rev()
             .cloned()
             .collect_vec();
 
