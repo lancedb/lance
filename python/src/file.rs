@@ -20,10 +20,10 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 use lance::io::{ObjectStore, RecordBatchStream};
 use lance_core::cache::FileMetadataCache;
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::{
     v2::{
-        reader::{BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions},
+        reader::{BufferDescriptor, CachedFileMetadata, FileReader},
         writer::{FileWriter, FileWriterOptions},
     },
     version::LanceFileVersion,
@@ -335,9 +335,8 @@ impl LanceFileReader {
         let inner = FileReader::try_open(
             file,
             None,
-            Arc::<DecoderPlugins>::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
             &FileMetadataCache::no_cache(),
-            FileReaderOptions::default(),
         )
         .await
         .infer_error()?;
