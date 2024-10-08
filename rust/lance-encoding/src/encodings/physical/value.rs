@@ -12,12 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock};
-use crate::decoder::{FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
     BlockCompressor, FixedPerValueCompressor, MiniBlockChunk, MiniBlockCompressed,
     MiniBlockCompressor, MAX_MINIBLOCK_SIZE, MINIBLOCK_SECTOR_SIZE, MIN_MINIBLOCK_SIZE,
 };
-use crate::format::pb::{self, ArrayEncoding};
+use crate::format::pb::ArrayEncoding;
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -337,42 +336,6 @@ impl MiniBlockCompressor for ValueEncoder {
                 location: location!(),
             }),
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct ValueDecompressor {
-    bytes_per_value: u64,
-}
-
-impl ValueDecompressor {
-    pub fn new(description: &pb::Flat) -> Self {
-        assert!(description.bits_per_value % 8 == 0);
-        Self {
-            bytes_per_value: description.bits_per_value / 8,
-        }
-    }
-}
-
-impl MiniBlockDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        debug_assert!(data.len() as u64 >= num_values * self.bytes_per_value);
-
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data,
-            bits_per_value: self.bytes_per_value * 8,
-            num_values,
-        }))
-    }
-}
-
-impl FixedPerValueDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        MiniBlockDecompressor::decompress(self, data, num_values)
-    }
-
-    fn bits_per_value(&self) -> u64 {
-        self.bytes_per_value * 8
     }
 }
 

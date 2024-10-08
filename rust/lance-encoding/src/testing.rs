@@ -5,7 +5,6 @@ use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
 use arrow::array::make_comparator;
 use arrow_array::{Array, UInt64Array};
-use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -22,14 +21,14 @@ use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
 use crate::{
     buffer::LanceBuffer,
     decoder::{
-        create_decode_stream, ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins,
-        FilterExpression, PageInfo,
+        BatchDecodeStream, ColumnInfo, CoreFieldDecoderStrategy, DecodeBatchScheduler,
+        DecoderMessage, DecoderMiddlewareChain, FilterExpression, PageInfo,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, CoreArrayEncodingStrategy,
-        CoreFieldEncodingStrategy, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
-        FieldEncodingStrategy, OutOfLineBuffers,
+        ColumnIndexSequence, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodedColumn,
+        EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
     },
+    encodings::logical::r#struct::SimpleStructDecoder,
     repdef::RepDefBuilder,
     version::LanceFileVersion,
     EncodingsIo,
@@ -73,85 +72,37 @@ fn column_indices_from_schema_helper(
     fields: &[FieldRef],
     column_indices: &mut Vec<u32>,
     column_counter: &mut u32,
-    is_structural_encoding: bool,
 ) {
-    // In the old style, every field except FSL gets its own column.  In the new style only primitive
-    // leaf fields get their own column.
+    column_indices.push(*column_counter);
+    *column_counter += 1;
     for field in fields {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if !is_structural_encoding {
-                    column_indices.push(*column_counter);
-                    *column_counter += 1;
-                }
-                column_indices_from_schema_helper(
-                    fields.as_ref(),
-                    column_indices,
-                    column_counter,
-                    is_structural_encoding,
-                );
+                column_indices_from_schema_helper(fields.as_ref(), column_indices, column_counter);
             }
             DataType::List(inner) => {
-                if !is_structural_encoding {
-                    column_indices.push(*column_counter);
-                    *column_counter += 1;
-                }
-                column_indices_from_schema_helper(
-                    &[inner.clone()],
-                    column_indices,
-                    column_counter,
-                    is_structural_encoding,
-                );
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
             }
             DataType::LargeList(inner) => {
-                if !is_structural_encoding {
-                    column_indices.push(*column_counter);
-                    *column_counter += 1;
-                }
-                column_indices_from_schema_helper(
-                    &[inner.clone()],
-                    column_indices,
-                    column_counter,
-                    is_structural_encoding,
-                );
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
             }
             DataType::FixedSizeList(inner, _) => {
-                // FSL(primitive) does not get its own column in either approach
-                column_indices_from_schema_helper(
-                    &[inner.clone()],
-                    column_indices,
-                    column_counter,
-                    is_structural_encoding,
-                );
+                // FSL(primitive) does not get its own column
+                column_indices.pop();
+                *column_counter -= 1;
+                column_indices_from_schema_helper(&[inner.clone()], column_indices, column_counter);
             }
             _ => {
-                column_indices.push(*column_counter);
-                *column_counter += 1;
-
-                column_indices_from_schema_helper(
-                    &[],
-                    column_indices,
-                    column_counter,
-                    is_structural_encoding,
-                );
+                column_indices_from_schema_helper(&[], column_indices, column_counter);
             }
         }
     }
 }
 
-fn column_indices_from_schema(schema: &Schema, is_structural_encoding: bool) -> Vec<u32> {
+fn column_indices_from_schema(schema: &Schema) -> Vec<u32> {
     let mut column_indices = Vec::new();
     let mut column_counter = 0;
-    column_indices_from_schema_helper(
-        schema.fields(),
-        &mut column_indices,
-        &mut column_counter,
-        is_structural_encoding,
-    );
-    println!(
-        "Column indices: {:?} is_structural_encoding={}",
-        column_indices, is_structural_encoding
-    );
+    column_indices_from_schema_helper(schema.fields(), &mut column_indices, &mut column_counter);
     column_indices
 }
 
@@ -163,25 +114,29 @@ async fn test_decode(
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
     io: Arc<dyn EncodingsIo>,
-    is_structural_encoding: bool,
     schedule_fn: impl FnOnce(
         DecodeBatchScheduler,
         UnboundedSender<Result<DecoderMessage>>,
-    ) -> BoxFuture<'static, ()>,
+    ) -> (SimpleStructDecoder, BoxFuture<'static, ()>),
 ) {
     let lance_schema = lance_core::datatypes::Schema::try_from(schema).unwrap();
+    let decode_and_validate = Arc::new(DecoderMiddlewareChain::new().add_strategy(Arc::new(
+        CoreFieldDecoderStrategy {
+            validate_data: true,
+        },
+    )));
     let cache = Arc::new(FileMetadataCache::with_capacity(
         128 * 1024 * 1024,
         CapacityMode::Bytes,
     ));
-    let column_indices = column_indices_from_schema(schema, is_structural_encoding);
+    let column_indices = column_indices_from_schema(schema);
     let decode_scheduler = DecodeBatchScheduler::try_new(
         &lance_schema,
         &column_indices,
         column_infos,
         &Vec::new(),
         num_rows,
-        Arc::<DecoderPlugins>::default(),
+        decode_and_validate,
         io,
         cache,
         &FilterExpression::no_filter(),
@@ -191,18 +146,11 @@ async fn test_decode(
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    let scheduler_fut = schedule_fn(decode_scheduler, tx);
+    let (decoder, scheduler_fut) = schedule_fn(decode_scheduler, tx);
 
     scheduler_fut.await;
 
-    let mut decode_stream = create_decode_stream(
-        &lance_schema,
-        num_rows,
-        batch_size,
-        is_structural_encoding,
-        /*should_validate=*/ true,
-        rx,
-    );
+    let mut decode_stream = BatchDecodeStream::new(rx, batch_size, num_rows, decoder).into_stream();
 
     let mut offset = 0;
     while let Some(batch) = decode_stream.next().await {
@@ -367,11 +315,6 @@ impl TestCases {
         self
     }
 
-    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
-        self.file_version = version;
-        self
-    }
-
     pub fn with_max_page_size(mut self, max_page_size: u64) -> Self {
         self.max_page_size = Some(max_page_size);
         self
@@ -379,6 +322,11 @@ impl TestCases {
 
     fn get_max_page_size(&self) -> u64 {
         self.max_page_size.unwrap_or(MAX_PAGE_BYTES)
+    }
+
+    pub fn with_file_version(mut self, version: LanceFileVersion) -> Self {
+        self.file_version = version;
+        self
     }
 
     pub fn with_verify_encoding(mut self, verify_encoding: Arc<EncodingVerificationFn>) -> Self {
@@ -409,7 +357,12 @@ pub async fn check_round_trip_encoding_of_data(
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
-        let encoding_strategy = default_encoding_strategy(test_cases.file_version);
+        let encoding_strategy = CoreFieldEncodingStrategy {
+            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy {
+                version: test_cases.file_version,
+            }),
+            version: test_cases.file_version,
+        };
         let mut column_index_seq = ColumnIndexSequence::default();
         let encoding_options = EncodingOptions {
             cache_bytes_per_column: page_size,
@@ -418,7 +371,7 @@ pub async fn check_round_trip_encoding_of_data(
         };
         let encoder = encoding_strategy
             .create_field_encoder(
-                encoding_strategy.as_ref(),
+                &encoding_strategy,
                 &lance_field,
                 &mut column_index_seq,
                 &encoding_options,
@@ -542,13 +495,8 @@ async fn check_round_trip_encoding_inner(
         column_infos.push(Arc::new(column_info));
     }
 
-    let encoded_data = writer.encoded_data.freeze();
-    println!(
-        "Encoded data: {}",
-        LanceBuffer::Borrowed(Buffer::from_bytes(encoded_data.clone().into())).as_hex()
-    );
-
-    let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
+    let scheduler =
+        Arc::new(SimulatedScheduler::new(writer.encoded_data.freeze())) as Arc<dyn EncodingsIo>;
 
     let schema = Schema::new(vec![field.clone()]);
 
@@ -559,8 +507,6 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
-    let is_structural_encoding = test_cases.file_version >= LanceFileVersion::V2_1;
-
     debug!("Testing full decode");
     let scheduler_copy = scheduler.clone();
     test_decode(
@@ -570,17 +516,21 @@ async fn check_round_trip_encoding_inner(
         &column_infos,
         concat_data.clone(),
         scheduler_copy.clone(),
-        is_structural_encoding,
         |mut decode_scheduler, tx| {
-            async move {
-                decode_scheduler.schedule_range(
-                    0..num_rows,
-                    &FilterExpression::no_filter(),
-                    tx,
-                    scheduler_copy,
-                )
-            }
-            .boxed()
+            #[allow(clippy::single_range_in_vec_init)]
+            let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
+            (
+                root_decoder,
+                async move {
+                    decode_scheduler.schedule_range(
+                        0..num_rows,
+                        &FilterExpression::no_filter(),
+                        tx,
+                        scheduler_copy,
+                    )
+                }
+                .boxed(),
+            )
         },
     )
     .await;
@@ -601,17 +551,21 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             scheduler.clone(),
-            is_structural_encoding,
             |mut decode_scheduler, tx| {
-                async move {
-                    decode_scheduler.schedule_range(
-                        range,
-                        &FilterExpression::no_filter(),
-                        tx,
-                        scheduler,
-                    )
-                }
-                .boxed()
+                #[allow(clippy::single_range_in_vec_init)]
+                let root_decoder = decode_scheduler.new_root_decoder_ranges(&[0..num_rows]);
+                (
+                    root_decoder,
+                    async move {
+                        decode_scheduler.schedule_range(
+                            range,
+                            &FilterExpression::no_filter(),
+                            tx,
+                            scheduler,
+                        )
+                    }
+                    .boxed(),
+                )
             },
         )
         .await;
@@ -643,17 +597,20 @@ async fn check_round_trip_encoding_inner(
             &column_infos,
             expected,
             scheduler.clone(),
-            is_structural_encoding,
             |mut decode_scheduler, tx| {
-                async move {
-                    decode_scheduler.schedule_take(
-                        &indices,
-                        &FilterExpression::no_filter(),
-                        tx,
-                        scheduler,
-                    )
-                }
-                .boxed()
+                let root_decoder = decode_scheduler.new_root_decoder_indices(&indices);
+                (
+                    root_decoder,
+                    async move {
+                        decode_scheduler.schedule_take(
+                            &indices,
+                            &FilterExpression::no_filter(),
+                            tx,
+                            scheduler,
+                        )
+                    }
+                    .boxed(),
+                )
             },
         )
         .await;

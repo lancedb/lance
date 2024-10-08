@@ -7,12 +7,19 @@ use std::{
 };
 
 use arrow_schema::DataType;
-use lance_core::datatypes::{Field, Schema};
-use lance_encoding::encoder::{
-    default_encoding_strategy, ColumnIndexSequence, EncodingOptions, FieldEncodingStrategy,
+use lance_core::{
+    datatypes::{Field, Schema},
+    Result,
+};
+use lance_encoding::{
+    decoder::{ColumnInfoIter, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
+    encoder::{
+        default_encoding_strategy, ColumnIndexSequence, EncodingOptions, FieldEncodingStrategy,
+    },
+    encodings::physical::FileBuffers,
 };
 use lance_file::version::LanceFileVersion;
-use zone::{UnloadedPushdown, ZoneMapsFieldEncoder};
+use zone::{extract_zone_info, UnloadedPushdown, ZoneMapsFieldEncoder, ZoneMapsFieldScheduler};
 
 pub mod format;
 pub mod substrait;
@@ -21,11 +28,9 @@ pub mod zone;
 #[derive(Debug)]
 struct LanceDfFieldDecoderState {
     /// We assume that all columns have the same number of rows per map
-    #[allow(unused)]
     rows_per_map: Option<u32>,
     /// As we visit the decoding tree we populate this with the pushdown
     /// information that is available.
-    #[allow(unused)]
     zone_map_buffers: HashMap<u32, UnloadedPushdown>,
 }
 
@@ -42,9 +47,7 @@ struct LanceDfFieldDecoderState {
 /// we aren't technically doing any concurrency.
 #[derive(Debug)]
 pub struct LanceDfFieldDecoderStrategy {
-    #[allow(unused)]
     state: Arc<Mutex<Option<LanceDfFieldDecoderState>>>,
-    #[allow(unused)]
     schema: Arc<Schema>,
 }
 
@@ -56,7 +59,6 @@ impl LanceDfFieldDecoderStrategy {
         }
     }
 
-    #[allow(unused)]
     fn initialize(&self) -> bool {
         let mut state = self.state.lock().unwrap();
         if state.is_none() {
@@ -70,7 +72,6 @@ impl LanceDfFieldDecoderStrategy {
         }
     }
 
-    #[allow(unused)]
     fn add_pushdown_field(
         &self,
         field: &Field,
@@ -93,57 +94,56 @@ impl LanceDfFieldDecoderStrategy {
     }
 }
 
-// TODO: Reconnect...again
-// impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
-//     fn create_field_scheduler<'a>(
-//         &self,
-//         field: &Field,
-//         column_infos: &mut ColumnInfoIter,
-//         buffers: FileBuffers,
-//         chain: DecoderMiddlewareChainCursor<'a>,
-//     ) -> Result<(
-//         DecoderMiddlewareChainCursor<'a>,
-//         Result<Box<dyn FieldScheduler>>,
-//     )> {
-//         let is_root = self.initialize();
+impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
+    fn create_field_scheduler<'a>(
+        &self,
+        field: &Field,
+        column_infos: &mut ColumnInfoIter,
+        buffers: FileBuffers,
+        chain: DecoderMiddlewareChainCursor<'a>,
+    ) -> Result<(
+        DecoderMiddlewareChainCursor<'a>,
+        Result<Arc<dyn FieldScheduler>>,
+    )> {
+        let is_root = self.initialize();
 
-//         if let Some((rows_per_map, unloaded_pushdown)) =
-//             extract_zone_info(column_infos, &field.data_type(), chain.current_path())
-//         {
-//             // If there is pushdown info then record it and unwrap the
-//             // pushdown encoding layer.
-//             self.add_pushdown_field(field, rows_per_map, unloaded_pushdown);
-//         }
-//         // Delegate to the rest of the chain to create the decoder
-//         let (chain, next) = chain.next(field, column_infos, buffers)?;
+        if let Some((rows_per_map, unloaded_pushdown)) =
+            extract_zone_info(column_infos, &field.data_type(), chain.current_path())
+        {
+            // If there is pushdown info then record it and unwrap the
+            // pushdown encoding layer.
+            self.add_pushdown_field(field, rows_per_map, unloaded_pushdown);
+        }
+        // Delegate to the rest of the chain to create the decoder
+        let (chain, next) = chain.next(field, column_infos, buffers)?;
 
-//         // If this is the top level decoder then wrap it with our
-//         // pushdown filtering scheduler.
-//         if is_root {
-//             let state = self.state.lock().unwrap().take().unwrap();
-//             let schema = self.schema.clone();
-//             let rows_per_map = state.rows_per_map;
-//             let zone_map_buffers = state.zone_map_buffers;
-//             let next = next?;
-//             let num_rows = next.num_rows();
-//             if rows_per_map.is_none() {
-//                 // No columns had any pushdown info
-//                 Ok((chain, Ok(next)))
-//             } else {
-//                 let scheduler = ZoneMapsFieldScheduler::new(
-//                     next.into(),
-//                     schema,
-//                     zone_map_buffers,
-//                     rows_per_map.unwrap(),
-//                     num_rows,
-//                 );
-//                 Ok((chain, Ok(Box::new(scheduler))))
-//             }
-//         } else {
-//             Ok((chain, next))
-//         }
-//     }
-// }
+        // If this is the top level decoder then wrap it with our
+        // pushdown filtering scheduler.
+        if is_root {
+            let state = self.state.lock().unwrap().take().unwrap();
+            let schema = self.schema.clone();
+            let rows_per_map = state.rows_per_map;
+            let zone_map_buffers = state.zone_map_buffers;
+            let next = next?;
+            let num_rows = next.num_rows();
+            if rows_per_map.is_none() {
+                // No columns had any pushdown info
+                Ok((chain, Ok(next)))
+            } else {
+                let scheduler = ZoneMapsFieldScheduler::new(
+                    next,
+                    schema,
+                    zone_map_buffers,
+                    rows_per_map.unwrap(),
+                    num_rows,
+                );
+                Ok((chain, Ok(Arc::new(scheduler))))
+            }
+        } else {
+            Ok((chain, next))
+        }
+    }
+}
 
 /// Wraps the core encoding strategy and adds the encoders from this
 /// crate

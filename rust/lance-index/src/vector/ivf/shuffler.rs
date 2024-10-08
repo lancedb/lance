@@ -30,9 +30,9 @@ use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CapacityMode, FileMetadataCache};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::reader::FileReader;
-use lance_file::v2::reader::{FileReader as Lancev2FileReader, FileReaderOptions};
+use lance_file::v2::reader::FileReader as Lancev2FileReader;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
@@ -515,14 +515,8 @@ impl IvfShuffler {
                 let cache =
                     FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
 
-                let reader = Lancev2FileReader::try_open(
-                    file,
-                    None,
-                    Default::default(),
-                    &cache,
-                    FileReaderOptions::default(),
-                )
-                .await?;
+                let reader =
+                    Lancev2FileReader::try_open(file, None, Default::default(), &cache).await?;
                 let num_batches = reader.metadata().num_rows / (SHUFFLE_BATCH_SIZE as u64);
                 total_batches.push(num_batches as usize);
             }
@@ -575,7 +569,6 @@ impl IvfShuffler {
                     None,
                     Default::default(),
                     &FileMetadataCache::no_cache(),
-                    FileReaderOptions::default(),
                 )
                 .await?;
                 let mut stream = reader
@@ -647,7 +640,6 @@ impl IvfShuffler {
                     None,
                     Default::default(),
                     &FileMetadataCache::no_cache(),
-                    FileReaderOptions::default(),
                 )
                 .await?;
                 reader
@@ -820,9 +812,8 @@ impl IvfShuffler {
             let reader = lance_file::v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                Arc::<DecoderPlugins>::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
                 &FileMetadataCache::no_cache(),
-                FileReaderOptions::default(),
             )
             .await?;
             let stream = reader
