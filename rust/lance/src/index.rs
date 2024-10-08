@@ -13,7 +13,6 @@ use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_file::reader::FileReader;
 use lance_file::v2;
-use lance_file::v2::reader::FileReaderOptions;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
@@ -681,7 +680,6 @@ impl DatasetIndexInternalExt for Dataset {
                     None,
                     Default::default(),
                     &self.session.file_metadata_cache,
-                    FileReaderOptions::default(),
                 )
                 .await?;
                 let index_metadata = reader

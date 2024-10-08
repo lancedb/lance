@@ -16,7 +16,7 @@ use log::trace;
 
 use crate::decoder::{
     DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-    MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+    NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
 };
 
 /// Wraps a varbin scheduler and uses a BinaryPageDecoder to cast
@@ -37,15 +37,12 @@ impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
         let wrapped_decoders = inner_scan
             .decoders
             .into_iter()
-            .map(|message| {
-                let decoder = message.into_legacy();
-                MessageType::DecoderReady(DecoderReady {
-                    path: decoder.path,
-                    decoder: Box::new(BinaryPageDecoder {
-                        inner: decoder.decoder,
-                        data_type: self.scheduler.data_type.clone(),
-                    }),
-                })
+            .map(|decoder| DecoderReady {
+                path: decoder.path,
+                decoder: Box::new(BinaryPageDecoder {
+                    inner: decoder.decoder,
+                    data_type: self.scheduler.data_type.clone(),
+                }),
             })
             .collect::<Vec<_>>();
         Ok(ScheduledScanLine {

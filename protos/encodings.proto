@@ -279,18 +279,3 @@ message ColumnEncoding {
     Blob blob = 3;
   }
 }
-
-message MiniBlockLayout {
-  // Description of the compression of repetition levels (e.g. how many bits per rep)
-  ArrayEncoding rep_compression = 1;
-  // Description of the compression of definition levels (e.g. how many bits per def)
-  ArrayEncoding def_compression = 2;
-  // Description of the compression of values
-  ArrayEncoding value_compression = 3;
-}
-
-message PageLayout {
-  oneof layout {
-    MiniBlockLayout mini_block_layout = 1;
-  }
-}

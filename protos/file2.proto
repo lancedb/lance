@@ -182,11 +182,6 @@ message ColumnMetadata {
     uint64 length = 3;
     // The encoding used to encode the page
     Encoding encoding = 4;
-    // The priority of the page
-    //
-    // For tabular data this will be the top-level row number of the first row
-    // in the page (and top-level rows should not split across pages).
-    uint64 priority = 5;
   }
   // Encoding information about the column itself.  This typically describes
   // how to interpret the column metadata buffers.  For example, it could

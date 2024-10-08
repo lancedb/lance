@@ -23,8 +23,8 @@ use crate::{
     data::{DataBlock, FixedWidthDataBlock},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -32,7 +32,6 @@ use crate::{
     },
     encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
-    repdef::RepDefBuilder,
     EncodingsIo,
 };
 
@@ -357,18 +356,14 @@ async fn indirect_schedule_task(
         });
     }
     let item_ranges = item_ranges.into_iter().collect::<Vec<_>>();
-    let num_items = item_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
     // Create a new root scheduler, which has one column, which is our items data
     let root_fields = Fields::from(vec![Field::new("item", items_type, true)]);
     let indirect_root_scheduler =
         SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
-    let mut indirect_scheduler = DecodeBatchScheduler::from_scheduler(
-        Arc::new(indirect_root_scheduler),
-        root_fields.clone(),
-        cache,
-    );
-    let mut root_decoder = SimpleStructDecoder::new(root_fields, num_items);
+    let mut indirect_scheduler =
+        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields, cache);
+    let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
 
@@ -382,7 +377,6 @@ async fn indirect_schedule_task(
 
     for message in indirect_messages {
         for decoder in message.decoders {
-            let decoder = decoder.into_legacy();
             if !decoder.path.is_empty() {
                 root_decoder.accept_child(decoder)?;
             }
@@ -429,7 +423,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         &mut self,
         context: &mut SchedulerContext,
         priority: &dyn PriorityRange,
-    ) -> Result<ScheduledScanLine> {
+    ) -> Result<crate::decoder::ScheduledScanLine> {
         let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
@@ -446,13 +440,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             .all(|req| req.null_offset_adjustment == null_offset_adjustment));
         let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
-        let next_offsets_decoder = next_offsets
-            .decoders
-            .into_iter()
-            .next()
-            .unwrap()
-            .into_legacy()
-            .decoder;
+        let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
         let items_type = self.scheduler.items_field.data_type().clone();
@@ -486,7 +474,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         });
         let decoder = context.locate_decoder(decoder);
         Ok(ScheduledScanLine {
-            decoders: vec![MessageType::DecoderReady(decoder)],
+            decoders: vec![decoder],
             rows_scheduled: num_rows,
         })
     }
@@ -932,13 +920,10 @@ impl ListOffsetsEncoder {
                 num_rows,
                 inner_encoder,
             )?;
-            let (data, description) = array.into_buffers();
             Ok(EncodedPage {
-                data,
-                description: PageEncoding::Legacy(description),
+                array,
                 num_rows,
                 column_idx,
-                row_number: 0, // Legacy encoders do not use
             })
         })
         .map(|res_res| res_res.unwrap())
@@ -950,13 +935,11 @@ impl ListOffsetsEncoder {
         let validity = Self::extract_validity(list_arr);
         // Either inserting the offsets OR inserting the validity could cause the
         // accumulation queue to fill up
-        if let Some(mut arrays) = self.accumulation_queue.insert(offsets, /*row_number=*/ 0) {
-            arrays.0.push(validity);
-            Some(self.make_encode_task(arrays.0))
-        } else if let Some(arrays) =
-            self.accumulation_queue.insert(validity, /*row_number=*/ 0)
-        {
-            Some(self.make_encode_task(arrays.0))
+        if let Some(mut arrays) = self.accumulation_queue.insert(offsets) {
+            arrays.push(validity);
+            Some(self.make_encode_task(arrays))
+        } else if let Some(arrays) = self.accumulation_queue.insert(validity) {
+            Some(self.make_encode_task(arrays))
         } else {
             None
         }
@@ -964,7 +947,7 @@ impl ListOffsetsEncoder {
 
     fn flush(&mut self) -> Option<EncodeTask> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Some(self.make_encode_task(arrays.0))
+            Some(self.make_encode_task(arrays))
         } else {
             None
         }
@@ -1173,8 +1156,6 @@ impl FieldEncoder for ListFieldEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
-        repdef: RepDefBuilder,
-        row_number: u64,
     ) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
         // values array could be longer than what we need to encode and so we need
@@ -1205,9 +1186,7 @@ impl FieldEncoder for ListFieldEncoder {
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
             .unwrap_or_default();
-        let mut item_tasks =
-            self.items_encoder
-                .maybe_encode(items, external_buffers, repdef, row_number)?;
+        let mut item_tasks = self.items_encoder.maybe_encode(items, external_buffers)?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
             // a limitation in the current scheduler and could be addressed in the future.  As a result

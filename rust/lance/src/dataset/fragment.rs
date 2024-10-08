@@ -23,9 +23,9 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
-use lance_encoding::decoder::DecoderPlugins;
+use lance_encoding::decoder::DecoderMiddlewareChain;
 use lance_file::reader::{read_batch, FileReader};
-use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
+use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
 use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
@@ -454,9 +454,8 @@ impl FileFragment {
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                Arc::<DecoderPlugins>::default(),
+                Arc::<DecoderMiddlewareChain>::default(),
                 &dataset.session.file_metadata_cache,
-                FileReaderOptions::default(),
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
@@ -641,10 +640,9 @@ impl FileFragment {
                 v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
-                    Arc::<DecoderPlugins>::default(),
+                    Arc::<DecoderMiddlewareChain>::default(),
                     file_metadata,
                     &self.dataset.session.file_metadata_cache,
-                    FileReaderOptions::default(),
                 )
                 .await?,
             );

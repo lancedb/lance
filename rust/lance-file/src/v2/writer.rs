@@ -12,12 +12,10 @@ use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
-use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
     BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
     EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
 };
-use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
@@ -143,7 +141,7 @@ impl FileWriter {
     }
 
     async fn write_page(&mut self, encoded_page: EncodedPage) -> Result<()> {
-        let buffers = encoded_page.data;
+        let buffers = encoded_page.array.data.into_buffers();
         let mut buffer_offsets = Vec::with_capacity(buffers.len());
         let mut buffer_sizes = Vec::with_capacity(buffers.len());
         for buffer in buffers {
@@ -151,10 +149,7 @@ impl FileWriter {
             buffer_sizes.push(buffer.len() as u64);
             self.writer.write_all(&buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = Any::from_msg(&encoded_page.array.encoding)?.encode_to_vec();
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -164,7 +159,6 @@ impl FileWriter {
                 })),
             }),
             length: encoded_page.num_rows,
-            priority: encoded_page.row_number,
         };
         self.column_metadata[encoded_page.column_idx as usize]
             .pages
@@ -274,13 +268,7 @@ impl FileWriter {
                         .into(),
                         location: location!(),
                     })?;
-                let repdef = RepDefBuilder::default();
-                column_writer.maybe_encode(
-                    array.clone(),
-                    external_buffers,
-                    repdef,
-                    self.rows_written,
-                )
+                column_writer.maybe_encode(array.clone(), external_buffers)
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -305,6 +293,12 @@ impl FileWriter {
                 location: location!(),
             });
         }
+        self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
+            Some(rows_written) => rows_written,
+            None => {
+                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^32 rows", num_rows, self.rows_written).into(), location: location!() });
+            }
+        };
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
         let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
@@ -318,13 +312,6 @@ impl FileWriter {
             .into_iter()
             .flatten()
             .collect::<FuturesOrdered<_>>();
-
-        self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
-            Some(rows_written) => rows_written,
-            None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^32 rows", num_rows, self.rows_written).into(), location: location!() });
-            }
-        };
 
         self.write_pages(encoding_tasks).await?;
 
@@ -577,14 +564,7 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = Any::from_msg(&page_info.encoding)?.encode_to_vec();
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()
@@ -600,7 +580,6 @@ fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<Bytes
                         })),
                     }),
                     length: page_info.num_rows,
-                    priority: page_info.priority,
                 })
             })
             .collect::<Result<Vec<_>>>()?;

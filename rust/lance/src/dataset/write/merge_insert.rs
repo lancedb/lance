@@ -1367,7 +1367,12 @@ mod tests {
     #[rstest::rstest]
     #[tokio::test]
     async fn test_basic_merge(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_0)] version: LanceFileVersion,
+        #[values(
+            LanceFileVersion::Legacy,
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1
+        )]
+        version: LanceFileVersion,
     ) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::UInt32, false),

@@ -13,9 +13,8 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::FileMetadataCache, Error, Result};
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
 use lance_file::v2;
-use lance_file::v2::reader::FileReaderOptions;
 use lance_file::writer::FileWriterOptions;
 use lance_file::{
     reader::FileReader,
@@ -237,9 +236,8 @@ impl IndexStore for LanceIndexStore {
         match v2::reader::FileReader::try_open(
             file_scheduler,
             None,
-            Arc::<DecoderPlugins>::default(),
+            Arc::<DecoderMiddlewareChain>::default(),
             &self.metadata_cache,
-            FileReaderOptions::default(),
         )
         .await
         {
