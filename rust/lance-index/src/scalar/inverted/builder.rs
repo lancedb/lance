@@ -41,6 +41,10 @@ lazy_static! {
         .unwrap_or_else(|_| "256".to_string())
         .parse()
         .expect("failed to parse FLUSH_THRESHOLD");
+    static ref FLUSH_SIZE: usize = std::env::var("FLUSH_SIZE")
+        .unwrap_or_else(|_| "64".to_string())
+        .parse()
+        .expect("failed to parse FLUSH_SIZE");
     static ref NUM_SHARDS: usize = std::env::var("NUM_SHARDS")
         .unwrap_or_else(|_| "8".to_string())
         .parse()
@@ -415,7 +419,12 @@ impl IndexWorker {
                     .posting_lists
                     .entry(token.clone())
                     .or_insert_with(|| PostingListBuilder::empty(with_position));
-                let old_size = posting_list.size();
+
+                let old_size = if posting_list.is_empty() {
+                    0
+                } else {
+                    posting_list.size()
+                };
                 posting_list.add(row_id, term_positions);
                 let new_size = posting_list.size();
                 self.estimated_size += new_size - old_size;
@@ -444,30 +453,45 @@ impl IndexWorker {
             return Ok(());
         }
 
-        if flush_all {
-            let keys = self.posting_lists.keys().cloned().collect_vec();
-            for key in keys {
-                self.flush_posting_list(key).await?;
-            }
-        } else {
-            assert!(self.largest_list.is_some());
-            let (token, _) = self.largest_list.take().unwrap();
-            self.flush_posting_list(token).await?;
+        let keys = self
+            .posting_lists
+            .iter()
+            .map(|(key, list)| (key, list.size()))
+            .sorted_by_key(|(_, size)| *size)
+            .map(|(key, _)| key)
+            .cloned()
+            .collect_vec();
 
-            // update the largest list
-            // it's not efficient to iterate the whole posting_lists
-            // but we'd assume the number of tokens is not too large
-            self.largest_list = self
-                .posting_lists
-                .iter()
-                .max_by_key(|(_, list)| list.size())
-                .map(|(token, list)| (token.clone(), list.size()));
+        let mut flushed_size = 0;
+        let mut count = 0;
+        for key in keys {
+            flushed_size += self.flush_posting_list(key).await?;
+            count += 1;
+            if !flush_all && flushed_size >= *FLUSH_SIZE * 1024 * 1024 {
+                break;
+            }
         }
+        log::info!(
+            "flushed {} lists of {}MiB",
+            count,
+            flushed_size / 1024 / 1024
+        );
+        // let (token, _) = self.largest_list.take().unwrap();
+        // self.flush_posting_list(token).await?;
+
+        // update the largest list
+        // it's not efficient to iterate the whole posting_lists
+        // but we'd assume the number of tokens is not too large
+        // self.largest_list = self
+        //     .posting_lists
+        //     .iter()
+        //     .max_by_key(|(_, list)| list.size())
+        //     .map(|(token, list)| (token.clone(), list.size()));
 
         Ok(())
     }
 
-    async fn flush_posting_list(&mut self, token: String) -> Result<()> {
+    async fn flush_posting_list(&mut self, token: String) -> Result<usize> {
         if let Some(posting_list) = self.posting_lists.remove(&token) {
             let size = posting_list.size();
             self.estimated_size -= size;
@@ -475,7 +499,7 @@ impl IndexWorker {
             let length = batch.num_rows();
             assert!(length > 0);
             self.writer.write_record_batch(batch).await?;
-            log::info!(
+            log::debug!(
                 "flushed posting list, token: {}, size: {}MiB, total size: {}MiB",
                 token,
                 size / 1024 / 1024,
@@ -486,9 +510,10 @@ impl IndexWorker {
                 .or_insert_with(Vec::new)
                 .push((self.offset, length));
             self.offset += length;
+            return Ok(size);
         }
 
-        Ok(())
+        Ok(0)
     }
 
     async fn into_reader(
