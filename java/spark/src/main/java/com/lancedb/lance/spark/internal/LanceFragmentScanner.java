@@ -16,9 +16,12 @@ package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.Dataset;
 import com.lancedb.lance.DatasetFragment;
+import com.lancedb.lance.ReadOptions;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.read.LanceInputPartition;
+import com.lancedb.lance.spark.SparkOptions;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructField;
@@ -46,7 +49,9 @@ public class LanceFragmentScanner implements AutoCloseable {
     DatasetFragment fragment = null;
     LanceScanner scanner = null;
     try {
-      dataset = Dataset.open(inputPartition.getConfig().getDatasetUri(), allocator);
+      LanceConfig config = inputPartition.getConfig();
+      ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+      dataset = Dataset.open(allocator, config.getDatasetUri(), options);
       fragment = dataset.getFragments().get(fragmentId);
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));
