@@ -31,6 +31,10 @@ use lance_core::{Error, Result};
 
 use crate::{buffer::LanceBuffer, statistics::Stat};
 
+/// `Encoding` enum serves as a encoding registeration center.
+/// All the encodings added to Lance should register here, and
+/// these encodings can be dynamically selected during encoding,
+/// users can also specify the particular encoding they want to use in the field metadata.
 #[derive(Debug)]
 pub enum Encoding {
     Bitpack,
