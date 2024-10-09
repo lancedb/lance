@@ -1723,7 +1723,7 @@ class LanceDataset(pa.dataset.Dataset):
                     kmeans,
                     batch_size=20480,
                     num_sub_vectors=num_sub_vectors_cur,
-                    disable_null_filter,
+                    disable_null_filter=disable_null_filter,
                 )
                 timers["ivf_assign:end"] = time.time()
                 ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]

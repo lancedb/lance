@@ -448,7 +448,7 @@ def compute_partitions(
 
     null_filter = f"{column} is not null"
     if disable_null_filter:
-        null_filter=None
+        null_filter = None
     torch_ds = TorchDataset(
         dataset,
         batch_size=batch_size,
