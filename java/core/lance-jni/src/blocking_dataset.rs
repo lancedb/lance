@@ -86,8 +86,12 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
-    pub fn commit(uri: &str, operation: Operation, read_version: Option<u64>,
-                  storage_options: HashMap<String, String>,) -> Result<Self> {
+    pub fn commit(
+        uri: &str,
+        operation: Operation,
+        read_version: Option<u64>,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Self> {
         let object_store_registry = Arc::new(ObjectStoreRegistry::default());
         let mut object_params = ObjectStoreParams::default();
         object_params.storage_options = Some(storage_options);
@@ -145,10 +149,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     _obj: JObject,
     arrow_schema_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -170,10 +174,10 @@ fn inner_create_with_ffi_schema<'local>(
     env: &mut JNIEnv<'local>,
     arrow_schema_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -199,10 +203,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     _obj: JObject,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -224,10 +228,10 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
@@ -303,21 +307,27 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
-    read_version_obj: JObject, // Optional<Long>
-    fragments_obj: JObject,    // List<String>, String is json serialized Fragment
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_append(&mut env, path, read_version_obj, fragments_obj, storage_options_obj)
+        inner_commit_append(
+            &mut env,
+            path,
+            read_version_obj,
+            fragments_obj,
+            storage_options_obj
+        )
     )
 }
 
 pub fn inner_commit_append<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
-    read_version_obj: JObject, // Optional<Long>
-    fragments_obj: JObject,    // List<String>, String is json serialized Fragment)
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment)
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let json_fragments = env.get_strings(&fragments_obj)?;

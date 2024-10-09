@@ -19,6 +19,7 @@ use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{StageParams, VectorIndexParams};
+use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -26,7 +27,6 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::IndexParams;
 use lance_linalg::distance::DistanceType;
-use lance::io::ObjectStoreParams;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
