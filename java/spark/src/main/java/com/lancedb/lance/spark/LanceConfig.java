@@ -33,13 +33,15 @@ public class LanceConfig implements Serializable {
   private final String datasetName;
   private final String datasetUri;
   private final boolean pushDownFilters;
+  private final Map<String, String> options;
 
   private LanceConfig(String dbPath, String datasetName,
-      String datasetUri, boolean pushDownFilters) {
+      String datasetUri, boolean pushDownFilters, CaseInsensitiveStringMap options) {
     this.dbPath = dbPath;
     this.datasetName = datasetName;
     this.datasetUri = datasetUri;
     this.pushDownFilters = pushDownFilters;
+    this.options = options.asCaseSensitiveMap();
   }
 
   public static LanceConfig from(Map<String, String> properties) {
@@ -65,7 +67,7 @@ public class LanceConfig implements Serializable {
     boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS,
         DEFAULT_PUSH_DOWN_FILTERS);
     String[] paths = extractDbPathAndDatasetName(datasetUri);
-    return new LanceConfig(paths[0], paths[1], datasetUri, pushDownFilters);
+    return new LanceConfig(paths[0], paths[1], datasetUri, pushDownFilters, options);
   }
 
   public static String getDatasetUri(String dbPath, String datasetUri) {
@@ -106,5 +108,9 @@ public class LanceConfig implements Serializable {
 
   public boolean isPushDownFilters() {
     return pushDownFilters;
+  }
+
+  public Map<String, String> getOptions() {
+    return options;
   }
 }

@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -36,13 +37,16 @@ public class WriteParams {
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
+  private final Map<String, String> storageOptions;
 
   private WriteParams(Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<WriteMode> mode) {
+      Optional<Long> maxBytesPerFile, Optional<WriteMode> mode,
+      Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
     this.maxBytesPerFile = maxBytesPerFile;
     this.mode = mode;
+    this.storageOptions = storageOptions;
   }
 
   public Optional<Integer> getMaxRowsPerFile() {
@@ -65,6 +69,10 @@ public class WriteParams {
     return mode.map(Enum::name);
   }
 
+  public Map<String, String> getStorageOptions() {
+    return storageOptions;
+  }
+
   @Override
   public String toString() {
     return new ToStringBuilder(this)
@@ -83,6 +91,7 @@ public class WriteParams {
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
+    private Map<String, String> storageOptions;
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
@@ -104,8 +113,14 @@ public class WriteParams {
       return this;
     }
 
+    public Builder withStorageOptions(Map<String, String> storageOptions) {
+      this.storageOptions = storageOptions;
+      return this;
+    }
+
     public WriteParams build() {
-      return new WriteParams(maxRowsPerFile, maxRowsPerGroup, maxBytesPerFile, mode);
+      return new WriteParams(maxRowsPerFile, maxRowsPerGroup, maxBytesPerFile, mode,
+              storageOptions);
     }
   }
 }
