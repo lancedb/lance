@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{ops::Range, sync::Arc};
 
 use arrow_buffer::BooleanBufferBuilder;
 use bytes::Bytes;
@@ -12,7 +12,7 @@ use log::trace;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
@@ -118,7 +118,8 @@ impl PrimitivePageDecoder for BitmapDecoder {
             data: LanceBuffer::from(bool_buffer),
             bits_per_value: 1,
             num_values: num_rows,
-            info: HashMap::new(),
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }

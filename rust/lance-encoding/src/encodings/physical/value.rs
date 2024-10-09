@@ -6,12 +6,11 @@ use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
-use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding};
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -206,7 +205,8 @@ impl PrimitivePageDecoder for ValuePageDecoder {
             bits_per_value: self.bytes_per_value * 8,
             data: data_buffer,
             num_values: num_rows,
-            info: HashMap::new(),
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 
 use crate::{
-    data::{AllNullDataBlock, DataBlock, NullableDataBlock},
+    data::{AllNullDataBlock, BlockInfo, DataBlock, NullableDataBlock, UsedEncoding},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
@@ -165,7 +165,8 @@ impl PrimitivePageDecoder for BasicPageDecoder {
                 Ok(DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(values),
                     nulls: validity.data,
-                    info: HashMap::new(),
+                    block_info: BlockInfo::new(),
+                    used_encoding: UsedEncoding::new(),
                 }))
             }
             DataNullStatus::All => Ok(DataBlock::AllNull(AllNullDataBlock {
@@ -216,7 +217,8 @@ impl ArrayEncoder for BasicEncoder {
                 let encoded = DataBlock::Nullable(NullableDataBlock {
                     data: Box::new(encoded_values.data),
                     nulls: nullable.nulls,
-                    info: HashMap::new(),
+                    block_info: BlockInfo::new(),
+                    used_encoding: UsedEncoding::new(),
                 });
                 Ok(EncodedArray {
                     data: encoded,
