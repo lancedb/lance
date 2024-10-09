@@ -501,7 +501,7 @@ impl IndexWorker {
             self.writer.write_record_batch(batch).await?;
             self.token_offsets
                 .entry(token)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((self.offset, length));
             self.offset += length;
             return Ok(size);
@@ -516,14 +516,14 @@ impl IndexWorker {
     ) -> Result<PostingReader> {
         self.flush(true).await?;
         self.writer.finish().await?;
-        Ok(PostingReader::new(
+        PostingReader::new(
             Some(self.tmpdir),
             self.existing_tokens,
             inverted_list,
             self.store,
             self.token_offsets,
         )
-        .await?)
+        .await
     }
 }
 
