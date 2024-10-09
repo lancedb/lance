@@ -49,6 +49,10 @@ lazy_static! {
         .unwrap_or_else(|_| "8".to_string())
         .parse()
         .expect("failed to parse NUM_SHARDS");
+    static ref CHANNEL_SIZE: usize = std::env::var("CHANNEL_SIZE")
+        .unwrap_or_else(|_| "8".to_string())
+        .parse()
+        .expect("failed to parse CHANNEL_SIZE");
 }
 
 #[derive(Debug, Default, DeepSizeOf)]
@@ -123,7 +127,7 @@ impl InvertedIndexBuilder {
             let inverted_list = self.inverted_list.clone();
             let mut worker = IndexWorker::new(token_map, self.params.with_position).await?;
 
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(buffer_size);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(*CHANNEL_SIZE);
             senders.push(sender);
             result_futs.push(tokio::spawn({
                 async move {
@@ -177,7 +181,6 @@ impl InvertedIndexBuilder {
                                 num_tokens += 1;
                             }
 
-                            let start = std::time::Instant::now();
                             for (shard, buffer) in token_buffers.iter_mut().enumerate() {
                                 if buffer.is_empty() {
                                     continue;
@@ -185,7 +188,6 @@ impl InvertedIndexBuilder {
                                 let buffer = std::mem::take(buffer);
                                 senders[shard].blocking_send((row_id, buffer)).unwrap();
                             }
-                            log::debug!("send tokens elapsed: {:?}", start.elapsed());
 
                             (row_id, num_tokens)
                         })
@@ -211,15 +213,11 @@ impl InvertedIndexBuilder {
             }
 
             if self.docs.len() >= last_num_rows + 100_000 {
-                log::info!(
+                log::debug!(
                     "indexed {} documents, elapsed: {:?}, speed: {}rows/s",
                     self.docs.len(),
                     start.elapsed(),
                     self.docs.len() as f32 / start.elapsed().as_secs_f32()
-                );
-                log::info!(
-                    "docs deep size: {}MiB",
-                    self.docs.deep_size_of() / 1024 / 1024
                 );
                 last_num_rows = self.docs.len();
             }
@@ -324,6 +322,8 @@ impl InvertedIndexBuilder {
             posting_streams.push(reader.stream(docs.clone()).await?);
         }
         let mut merged_stream = stream::select_all(posting_streams);
+        let mut last_num_rows = 0;
+        let start = std::time::Instant::now();
         while let Some(r) = merged_stream.try_next().await? {
             let (token, batch, max_score) = r?;
             self.tokens.add(token);
@@ -331,6 +331,10 @@ impl InvertedIndexBuilder {
             max_scores.push(max_score);
             num_rows += batch.num_rows();
             writer.write_record_batch(batch).await?;
+            if num_rows > last_num_rows + 100_000 {
+                log::debug!("written {} rows, elapsed: {:?}", num_rows, start.elapsed());
+                last_num_rows = num_rows;
+            }
         }
 
         let metadata = HashMap::from_iter(vec![
@@ -377,7 +381,6 @@ struct IndexWorker {
     // because we need to know the token id when we receive posting list from existing inverted list
     existing_tokens: HashMap<String, u32>,
     posting_lists: HashMap<String, PostingListBuilder>,
-    largest_list: Option<(String, usize)>,
     schema: SchemaRef,
     tmpdir: TempDir,
     store: Arc<dyn IndexStore>,
@@ -404,7 +407,6 @@ impl IndexWorker {
         Ok(Self {
             existing_tokens,
             posting_lists: HashMap::new(),
-            largest_list: None,
             schema,
             tmpdir,
             store,
@@ -444,16 +446,6 @@ impl IndexWorker {
                 posting_list.add(row_id, term_positions);
                 let new_size = posting_list.size();
                 self.estimated_size += new_size - old_size;
-                log::debug!("added size: {}Bytes", (new_size - old_size));
-                if new_size
-                    > self
-                        .largest_list
-                        .as_ref()
-                        .map(|(_, size)| *size)
-                        .unwrap_or(0)
-                {
-                    self.largest_list = Some((token, new_size));
-                }
             });
 
         if self.estimated_size > *FLUSH_THRESHOLD * 1024 * 1024 {
@@ -488,12 +480,12 @@ impl IndexWorker {
                 break;
             }
         }
-        log::info!(
-            "flushed {} lists of {}MiB, posting_lists size: {}MiB, token_offsets size: {}MiB",
+        log::debug!(
+            "flushed {} lists of {}MiB, posting_lists num: {}, posting_lists size: {}MiB",
             count,
             flushed_size / 1024 / 1024,
+            self.posting_lists.len(),
             self.posting_lists.deep_size_of() / 1024 / 1024,
-            self.token_offsets.deep_size_of() / 1024 / 1024,
         );
 
         Ok(())
@@ -507,12 +499,6 @@ impl IndexWorker {
             let length = batch.num_rows();
             assert!(length > 0);
             self.writer.write_record_batch(batch).await?;
-            log::debug!(
-                "flushed posting list, token: {}, size: {}MiB, total size: {}MiB",
-                token,
-                size / 1024 / 1024,
-                self.estimated_size / 1024 / 1024
-            );
             self.token_offsets
                 .entry(token)
                 .or_insert_with(Vec::new)
