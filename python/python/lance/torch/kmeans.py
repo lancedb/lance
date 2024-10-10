@@ -60,7 +60,7 @@ class KMeans:
         centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
-        balance_factor=None,
+        balance_factor: Optional[float] = None,
     ):
         self.k = k
         self.max_iters = max_iters

@@ -202,6 +202,7 @@ def train_ivf_centroids_on_accelerator(
     sample_rate: int = 256,
     max_iters: int = 50,
     filter_nan: bool = True,
+    balance_factor: Optional[float] = None,
 ) -> (np.ndarray, Any):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
@@ -264,6 +265,7 @@ def train_ivf_centroids_on_accelerator(
             metric=metric_type,
             device="cuda",
             centroids=init_centroids,
+            balance_factor=balance_factor,
         )
     else:
         logging.info("Training IVF partitions using GPU(%s)", accelerator)
@@ -273,6 +275,7 @@ def train_ivf_centroids_on_accelerator(
             metric=metric_type,
             device=accelerator,
             centroids=init_centroids,
+            balance_factor=balance_factor,
         )
     kmeans.fit(ds)
 
