@@ -107,7 +107,7 @@ impl NullableDataBlock {
 }
 
 /// A data block for a single buffer of data where each element has a fixed number of bits
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct FixedWidthDataBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -136,16 +136,16 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
 
-    fn into_buffers(self) -> Vec<LanceBuffer> {
+    pub fn into_buffers(self) -> Vec<LanceBuffer> {
         vec![self.data]
     }
 
-    fn borrow_and_clone(&mut self) -> Self {
+    pub fn borrow_and_clone(&mut self) -> Self {
         Self {
             data: self.data.borrow_and_clone(),
             bits_per_value: self.bits_per_value,
@@ -153,7 +153,7 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn try_clone(&self) -> Result<Self> {
+    pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
@@ -184,6 +184,13 @@ impl FixedSizeListBlock {
             child: Box::new(self.child.try_clone()?),
             dimension: self.dimension,
         })
+    }
+
+    fn remove_validity(self) -> Self {
+        Self {
+            child: Box::new(self.child.remove_validity()),
+            dimension: self.dimension,
+        }
     }
 
     fn num_values(&self) -> u64 {
@@ -377,6 +384,16 @@ impl StructDataBlock {
         }
     }
 
+    fn remove_validity(self) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|c| c.remove_validity())
+                .collect(),
+        }
+    }
+
     fn into_buffers(self) -> Vec<LanceBuffer> {
         self.children
             .into_iter()
@@ -406,10 +423,6 @@ impl StructDataBlock {
 }
 
 /// A data block for dictionary encoded data
-///
-/// Note that, unlike Arrow, there is only one canonical place to store nulls, and that is
-/// in the dictionary itself.  This simplifies the representation of dictionary encoded data
-/// and makes it more efficient to encode and decode.
 #[derive(Debug)]
 pub struct DictionaryDataBlock {
     /// The indices buffer
@@ -583,6 +596,19 @@ impl DataBlock {
             Self::Struct(inner) => inner.children[0].num_values(),
             Self::Dictionary(inner) => inner.indices.num_values,
             Self::Opaque(inner) => inner.num_values,
+        }
+    }
+
+    pub fn remove_validity(self) -> Self {
+        match self {
+            Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
+            Self::Nullable(inner) => *inner.data,
+            Self::FixedWidth(inner) => Self::FixedWidth(inner),
+            Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
+            Self::VariableWidth(inner) => Self::VariableWidth(inner),
+            Self::Struct(inner) => Self::Struct(inner.remove_validity()),
+            Self::Dictionary(inner) => Self::FixedWidth(inner.indices),
+            Self::Opaque(inner) => Self::Opaque(inner),
         }
     }
 }

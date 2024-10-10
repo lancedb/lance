@@ -16,8 +16,8 @@ use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
-        schedule_and_decode, ColumnInfo, DecoderMiddlewareChain, FilterExpression, PageInfo,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
+        schedule_and_decode, ColumnInfo, DecoderMiddlewareChain, FilterExpression, PageEncoding,
+        PageInfo, ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
@@ -501,7 +501,12 @@ impl FileReader {
             + (footer_start - footer.global_buff_offsets_start);
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
 
-        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice());
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
 
         Ok(CachedFileMetadata {
             file_schema: Arc::new(schema),
@@ -531,7 +536,10 @@ impl FileReader {
         }
     }
 
-    fn meta_to_col_infos(column_metadatas: &[pbfile::ColumnMetadata]) -> Vec<Arc<ColumnInfo>> {
+    fn meta_to_col_infos(
+        column_metadatas: &[pbfile::ColumnMetadata],
+        file_version: LanceFileVersion,
+    ) -> Vec<Arc<ColumnInfo>> {
         column_metadatas
             .iter()
             .enumerate()
@@ -541,7 +549,18 @@ impl FileReader {
                     .iter()
                     .map(|page| {
                         let num_rows = page.length;
-                        let encoding = Self::fetch_encoding(page.encoding.as_ref().unwrap());
+                        let encoding = match file_version {
+                            LanceFileVersion::V2_0 => {
+                                PageEncoding::Legacy(Self::fetch_encoding::<pbenc::ArrayEncoding>(
+                                    page.encoding.as_ref().unwrap(),
+                                ))
+                            }
+                            _ => {
+                                PageEncoding::Structural(Self::fetch_encoding::<pbenc::PageLayout>(
+                                    page.encoding.as_ref().unwrap(),
+                                ))
+                            }
+                        };
                         let buffer_offsets_and_sizes = Arc::from(
                             page.buffer_offsets
                                 .iter()
@@ -553,6 +572,7 @@ impl FileReader {
                             buffer_offsets_and_sizes,
                             encoding,
                             num_rows,
+                            priority: page.priority,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -999,7 +1019,12 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas);
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
 
         Ok(Self {
             data: bytes,
@@ -1044,7 +1069,12 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let column_metadatas =
             FileReader::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let page_table = FileReader::meta_to_col_infos(&column_metadatas);
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let page_table = FileReader::meta_to_col_infos(&column_metadatas, file_version);
 
         Ok(Self {
             data: bytes,

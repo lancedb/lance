@@ -14,10 +14,11 @@ use lance_core::{
 use lance_encoding::{
     decoder::{ColumnInfoIter, DecoderMiddlewareChainCursor, FieldDecoderStrategy, FieldScheduler},
     encoder::{
-        ColumnIndexSequence, CoreFieldEncodingStrategy, EncodingOptions, FieldEncodingStrategy,
+        default_encoding_strategy, ColumnIndexSequence, EncodingOptions, FieldEncodingStrategy,
     },
     encodings::physical::FileBuffers,
 };
+use lance_file::version::LanceFileVersion;
 use zone::{extract_zone_info, UnloadedPushdown, ZoneMapsFieldEncoder, ZoneMapsFieldScheduler};
 
 pub mod format;
@@ -148,14 +149,14 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
 /// crate
 #[derive(Debug)]
 pub struct LanceDfFieldEncodingStrategy {
-    core: CoreFieldEncodingStrategy,
+    inner: Box<dyn FieldEncodingStrategy>,
     rows_per_map: u32,
 }
 
 impl Default for LanceDfFieldEncodingStrategy {
     fn default() -> Self {
         Self {
-            core: CoreFieldEncodingStrategy::default(),
+            inner: default_encoding_strategy(LanceFileVersion::default()),
             rows_per_map: 10000,
         }
     }
@@ -176,9 +177,9 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 DataType::Boolean | DataType::Utf8 | DataType::LargeUtf8
             )
         {
-            let inner_encoder = self.core.create_field_encoder(
+            let inner_encoder = self.inner.create_field_encoder(
                 // Don't collect stats on inner string fields
-                &self.core,
+                self.inner.as_ref(),
                 field,
                 column_index,
                 options,
@@ -189,7 +190,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
                 self.rows_per_map,
             )?))
         } else {
-            self.core
+            self.inner
                 .create_field_encoder(encoding_strategy_root, field, column_index, options)
         }
     }
