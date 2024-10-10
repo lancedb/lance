@@ -92,7 +92,7 @@ class KMeans:
             # self.balance_factor also requires counts (from training sample)
             # can add this as a param later
             raise ValueError(
-                f"balance_factor and centroids are mutually-exclusive parameters"
+                "balance_factor and centroids are mutually-exclusive parameters"
             )
 
         self.y2 = None
@@ -287,9 +287,16 @@ class KMeans:
         self.centroids = self._updated_centroids(new_centroids).type(dtype)
         return total_dist
 
-    def rebuild_index(self):
-        self.y2 = (self.centroids * self.centroids).sum(dim=1)
-        if self.balance_factor is not None:
+    def pad_centroids(self):
+        if self.metric == "dot":
+            self.padded_centroids = torch.cat(
+                [
+                    self.centroids,
+                    -(self.balance_factor * self.counts).unsqueeze(1),
+                ],
+                dim=1,
+            )
+        else:
             self.padded_centroids = torch.cat(
                 [
                     self.centroids,
@@ -297,7 +304,30 @@ class KMeans:
                 ],
                 dim=1,
             )
-            # self.y2 = (self.padded_centroids * self.padded_centroids).sum(dim=1) # TODO is this needed?
+        self.y2 = (self.padded_centroids * self.padded_centroids).sum(dim=1)
+
+    def rebuild_index(self):
+        self.y2 = (self.centroids * self.centroids).sum(dim=1)
+        if self.balance_factor is not None:
+            self.pad_centroids()
+
+    def pad_data(self, data):
+        if self.metric == "dot":
+            return torch.cat(
+                [
+                    data,
+                    torch.ones(data.size(0), 1, device=data.device, dtype=data.dtype),
+                ],
+                dim=1,
+            )
+        else:
+            return torch.cat(
+                [
+                    data,
+                    torch.zeros(data.size(0), 1, device=data.device, dtype=data.dtype),
+                ],
+                dim=1,
+            )
 
     def _transform(
         self,
@@ -310,13 +340,7 @@ class KMeans:
         centroids = self.centroids
         if self.padded_centroids is not None:
             centroids = self.padded_centroids
-            data = torch.cat(
-                [
-                    data,
-                    torch.zeros(data.size(0), 1, device=data.device, dtype=data.dtype),
-                ],
-                dim=1,
-            )
+            data = self.pad_data(data)
 
         if self.metric in ["l2", "cosine"]:
             return self.dist_func(data, centroids, y2=y2)
