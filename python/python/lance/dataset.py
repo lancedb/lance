@@ -1447,7 +1447,7 @@ class LanceDataset(pa.dataset.Dataset):
         ivf_centroids_file: Optional[str] = None,
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        disable_null_filter: bool = False,
+        filter_nan: bool = True,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1504,10 +1504,10 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-        disable_null_filter: bool
-            Defaults to false. True is UNSAFE. Disable the null filter used for nullable
-            columns. Will crash if any nulls are present in the column. Obtains a small
-            speed boost.
+        filter_nan: bool
+            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan values
+            are present (and otherwise will not). Disables the null filter used for nullable
+            columns. Obtains a small speed boost.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1707,7 +1707,7 @@ class LanceDataset(pa.dataset.Dataset):
                     num_partitions,
                     metric,
                     accelerator,
-                    disable_null_filter,
+                    filter_nan=filter_nan,
                 )
                 timers["ivf_train:end"] = time.time()
                 ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
@@ -1723,7 +1723,7 @@ class LanceDataset(pa.dataset.Dataset):
                     kmeans,
                     batch_size=20480,
                     num_sub_vectors=num_sub_vectors_cur,
-                    disable_null_filter=disable_null_filter,
+                    filter_nan=filter_nan,
                 )
                 timers["ivf_assign:end"] = time.time()
                 ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
