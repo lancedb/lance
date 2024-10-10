@@ -3,11 +3,13 @@
 
 mod builder;
 mod index;
+mod tokenizer;
 mod wand;
 
 pub use builder::InvertedIndexBuilder;
 pub use index::*;
 use lance_core::Result;
+pub use tokenizer::*;
 
 use super::btree::TrainingSource;
 use super::{IndexStore, InvertedIndexParams};
