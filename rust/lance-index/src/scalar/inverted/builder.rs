@@ -144,8 +144,9 @@ impl InvertedIndexBuilder {
         let senders = Arc::new(senders);
         let tokenizer_pool = Arc::new(ArrayQueue::new(num_shards));
         let token_buffers_pool = Arc::new(ArrayQueue::new(num_shards));
+        let tokenizer = self.params.tokenizer_config.build()?;
         for _ in 0..num_shards {
-            let _ = tokenizer_pool.push(TOKENIZER.clone());
+            let _ = tokenizer_pool.push(tokenizer.clone());
             token_buffers_pool
                 .push(vec![Vec::new(); num_shards])
                 .unwrap();
@@ -355,7 +356,10 @@ impl InvertedIndexBuilder {
         let batch = tokens.to_batch()?;
         let mut writer = store.new_index_file(TOKENS_FILE, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await?;
+
+        let tokenizer = serde_json::to_string(&self.params.tokenizer_config)?;
+        let metadata = HashMap::from_iter(vec![("tokenizer".to_owned(), tokenizer)]);
+        writer.finish_with_metadata(metadata).await?;
 
         log::info!("finished writing tokens");
         Ok(())
