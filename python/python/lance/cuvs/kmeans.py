@@ -56,7 +56,7 @@ class KMeans(KMeansTorch):
         seed: Optional[int] = None,
         device: Optional[str] = None,
         itopk_size: int = 10,
-        balance_factor=None,
+        balance_factor: Optional[float] = None,
     ):
         if metric == "dot":
             raise ValueError(

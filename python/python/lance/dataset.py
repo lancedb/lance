@@ -1448,6 +1448,7 @@ class LanceDataset(pa.dataset.Dataset):
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
+        balance_factor: Optional[float] = None,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1508,6 +1509,9 @@ class LanceDataset(pa.dataset.Dataset):
             Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
             values are present (and otherwise will not). Disables the null filter used
             for nullable columns. Obtains a small speed boost.
+        balance_factor: float, optional
+            A factor used to balance clusters. No balancing by default. 1 is often a
+            good value. Only enabled if using an accelerator.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1708,6 +1712,7 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator,
                     filter_nan=filter_nan,
+                    balance_factor=balance_factor,
                 )
                 timers["ivf_train:end"] = time.time()
                 ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
