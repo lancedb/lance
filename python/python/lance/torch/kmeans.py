@@ -86,7 +86,7 @@ class KMeans:
         self.balance_factor = balance_factor
         self.padded_centroids = None
 
-        self.counts = torch.zeros(k, dtype=torch.int64)
+        self.counts = torch.zeros(k, device=self.device)
         # TODO add counts as a param
 
         self.y2 = None
