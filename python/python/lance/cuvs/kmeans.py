@@ -56,6 +56,7 @@ class KMeans(KMeansTorch):
         seed: Optional[int] = None,
         device: Optional[str] = None,
         itopk_size: int = 10,
+        balance_factor=None,
     ):
         if metric == "dot":
             raise ValueError(
@@ -95,9 +96,20 @@ class KMeans(KMeansTorch):
         logging.info("Total rebuild time: %s", self.time_rebuild)
 
     def rebuild_index(self):
+        centroids = self.centroids
+        if self.balance_factor is not None:
+            self.padded_centroids = torch.cat(
+                [
+                    self.centroids,
+                    torch.sqrt(self.balance_factor * self.counts).unsqueeze(1),
+                ],
+                dim=1,
+            )
+            centroids = self.padded_centroids
+
         rebuild_time_start = time.time()
         cagra_metric = "sqeuclidean"
-        dim = self.centroids.shape[1]
+        dim = centroids.shape[1]
         graph_degree = max(dim // 4, 32)
         nn_descent_degree = graph_degree * 2
         index_params = cagra.IndexParams(
@@ -107,7 +119,7 @@ class KMeans(KMeansTorch):
             build_algo="nn_descent",
             compression=None,
         )
-        self.index = cagra.build(index_params, self.centroids)
+        self.index = cagra.build(index_params, centroids)
         rebuild_time_end = time.time()
         self.time_rebuild += rebuild_time_end - rebuild_time_start
 
