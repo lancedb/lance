@@ -98,14 +98,7 @@ class KMeans(KMeansTorch):
     def rebuild_index(self):
         centroids = self.centroids
         if self.balance_factor is not None:
-            self.padded_centroids = torch.cat(
-                [
-                    self.centroids,
-                    torch.sqrt(self.balance_factor * self.counts).unsqueeze(1),
-                ],
-                dim=1,
-            )
-            centroids = self.padded_centroids
+            self.pad_centroids()
 
         rebuild_time_start = time.time()
         cagra_metric = "sqeuclidean"
@@ -132,6 +125,9 @@ class KMeans(KMeansTorch):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
+
+        if self.padded_centroids is not None:
+            data = self.pad_data(data)
 
         search_time_start = time.time()
         device = torch.device("cuda")
