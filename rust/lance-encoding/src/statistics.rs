@@ -19,8 +19,7 @@ use std::{fmt, sync::Arc};
 use arrow_array::{Array, UInt64Array};
 
 use crate::data::{
-    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, OpaqueBlock, StructDataBlock,
-    VariableWidthBlock,
+    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, OpaqueBlock, StructDataBlock, VariableWidthBlock
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,10 +114,53 @@ impl VariableWidthBlock {
 
 impl FixedWidthDataBlock {
     fn compute_statistics(&mut self) {
+        // compute this datablock's data_size
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
+
+        // compute this datablock's max_bit_width
+        let max_bit_width = self.max_bit_width();
+
         let mut info = self.block_info.info.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
+        info.insert(Stat::BitWidth, max_bit_width);
+    }
+
+    fn max_bit_width(&mut self) -> Arc<dyn Array> {
+        match self.bits_per_value {
+            8 => {
+                    let u8_slice_ref= self.data.borrow_to_typed_slice::<u8>();
+                    let u8_slice = u8_slice_ref.as_ref();
+                    let max_value = u8_slice.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    Arc::new(UInt64Array::from(vec![max_bit_width]))
+                }
+            16 => {
+                    let u8_slice_ref= self.data.borrow_to_typed_slice::<u16>();
+                    let u8_slice = u8_slice_ref.as_ref();
+                    let max_value = u8_slice.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    Arc::new(UInt64Array::from(vec![max_bit_width]))
+                }
+            32 => {
+                    let u8_slice_ref= self.data.borrow_to_typed_slice::<u32>();
+                    let u8_slice = u8_slice_ref.as_ref();
+                    let max_value = u8_slice.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    Arc::new(UInt64Array::from(vec![max_bit_width]))
+                }
+            64 => {
+                    let u8_slice_ref= self.data.borrow_to_typed_slice::<u64>();
+                    let u8_slice = u8_slice_ref.as_ref();
+                    let max_value = u8_slice.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    Arc::new(UInt64Array::from(vec![max_bit_width]))
+                }
+            // TODO: Decimal128
+            // when self.bits_per_value is not (8, 16, 32, 64), it is already bit-packed and `self.bits_per_value`
+            // is it's max_bit_width(except Decimal128, Decimal256)
+            _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
+        }
     }
 }
 
@@ -148,7 +190,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::Int32Type;
-    use arrow_array::UInt64Array;
+    use arrow_array::{ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
     use arrow_schema::{DataType, Field};
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
@@ -362,5 +404,623 @@ mod tests {
             "Expected Stat::NullCount to be None for data block of type: {}",
             block.name()
         );
+    }
+    
+    // NOTE: FixedSizeList can also have `bit_width` but not tested here.
+    #[test]
+    fn test_bit_width_stat_for_integers() {
+        let int8_array = Int8Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from(vec![0x1, 0x2, 0x3, 0x7F]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![7])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from(vec![0x1, 0x2, 0x3, 0xF, 0x1F]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![5])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from(vec![-1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int8_array
+        );
+
+        let int16_array = Int16Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int16_array
+        );
+
+        let int16_array = Int16Array::from(vec![0x1, 0x2, 0x3, 0x7F]);
+        let array_ref: ArrayRef = Arc::new(int16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![7])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int16_array
+        );
+
+        let int16_array = Int16Array::from(vec![0x1, 0x2, 0x3, 0xFF]);
+        let array_ref: ArrayRef = Arc::new(int16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int16_array
+        );
+
+        let int16_array = Int16Array::from(vec![0x1, 0x2, 0x3, 0x1FF]);
+        let array_ref: ArrayRef = Arc::new(int16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![9])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int16_array
+        );
+        let int16_array = Int16Array::from(vec![0x1, 0x2, 0x3, 0xF, 0x1F]);
+        let array_ref: ArrayRef = Arc::new(int16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![5])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int16_array
+        );
+
+        let int16_array = Int16Array::from(vec![-1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![16])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int16_array
+        );
+
+        let int32_array = Int32Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int32_array
+        );
+
+        let int32_array = Int32Array::from(vec![0x1, 0x2, 0x3, 0xFF]);
+        let array_ref: ArrayRef = Arc::new(int32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int32_array
+        );
+
+        let int32_array = Int32Array::from(vec![0x1, 0x2, 0x3, 0xFF, 0x1FF]);
+        let array_ref: ArrayRef = Arc::new(int32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![9])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int32_array
+        );
+
+        let int32_array = Int32Array::from(vec![-1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![32])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int32_array
+        );
+
+        let int32_array = Int32Array::from(vec![-1, 2, 3, -88]);
+        let array_ref: ArrayRef = Arc::new(int32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![32])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int32_array
+        );
+
+        let int64_array = Int64Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int64_array
+        );
+
+        let int64_array = Int64Array::from(vec![0x1, 0x2, 0x3, 0xFF]);
+        let array_ref: ArrayRef = Arc::new(int64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int64_array
+        );
+
+        let int64_array = Int64Array::from(vec![0x1, 0x2, 0x3, 0xFF, 0x1FF]);
+        let array_ref: ArrayRef = Arc::new(int64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![9])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int64_array
+        );
+
+        let int64_array = Int64Array::from(vec![-1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![64])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int64_array
+        );
+
+        let int64_array = Int64Array::from(vec![-1, 2, 3, -88]);
+        let array_ref: ArrayRef = Arc::new(int64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![64])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            int64_array
+        );
+
+        let uint8_array =UInt8Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(uint8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint8_array
+        );
+
+        let uint8_array =UInt8Array::from(vec![0x1, 0x2, 0x3, 0x7F]);
+        let array_ref: ArrayRef = Arc::new(uint8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![7])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint8_array
+        );
+
+        let uint8_array =UInt8Array::from(vec![0x1, 0x2, 0x3, 0xF, 0x1F]);
+        let array_ref: ArrayRef = Arc::new(uint8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![5])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint8_array
+        );
+
+        let uint8_array =UInt8Array::from(vec![1, 2, 3, 0xF]);
+        let array_ref: ArrayRef = Arc::new(uint8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![4])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint8_array
+        );
+
+        let uint16_array =UInt16Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(uint16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint16_array
+        );
+
+        let uint16_array =UInt16Array::from(vec![0x1, 0x2, 0x3, 0x7F]);
+        let array_ref: ArrayRef = Arc::new(uint16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![7])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint16_array
+        );
+
+        let uint16_array =UInt16Array::from(vec![0x1, 0x2, 0x3, 0xFF]);
+        let array_ref: ArrayRef = Arc::new(uint16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint16_array
+        );
+
+        let uint16_array =UInt16Array::from(vec![0x1, 0x2, 0x3, 0x1FF]);
+        let array_ref: ArrayRef = Arc::new(uint16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![9])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint16_array
+        );
+        let uint16_array =UInt16Array::from(vec![0x1, 0x2, 0x3, 0xF, 0x1F]);
+        let array_ref: ArrayRef = Arc::new(uint16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![5])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint16_array
+        );
+
+        let uint16_array =UInt16Array::from(vec![1, 2, 3, 0xFFFF]);
+        let array_ref: ArrayRef = Arc::new(uint16_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![16])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint16_array
+        );
+
+        let uint32_array =UInt32Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(uint32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint32_array
+        );
+
+        let uint32_array =UInt32Array::from(vec![0x1, 0x2, 0x3, 0xFF]);
+        let array_ref: ArrayRef = Arc::new(uint32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint32_array
+        );
+
+        let uint32_array =UInt32Array::from(vec![0x1, 0x2, 0x3, 0xFF, 0x1FF]);
+        let array_ref: ArrayRef = Arc::new(uint32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![9])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint32_array
+        );
+
+        let uint32_array =UInt32Array::from(vec![1, 2, 3, 0xF]);
+        let array_ref: ArrayRef = Arc::new(uint32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![4])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint32_array
+        );
+
+        let uint32_array = UInt32Array::from(vec![1, 2, 3, 0x77]);
+        let array_ref: ArrayRef = Arc::new(uint32_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![7])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint32_array
+        );
+
+        let uint64_array =UInt64Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(uint64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint64_array
+        );
+
+        let uint64_array =UInt64Array::from(vec![0x1, 0x2, 0x3, 0xFF]);
+        let array_ref: ArrayRef = Arc::new(uint64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![8])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint64_array
+        );
+
+        let uint64_array =UInt64Array::from(vec![0x1, 0x2, 0x3, 0xFF, 0x1FF]);
+        let array_ref: ArrayRef = Arc::new(uint64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![9])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint64_array
+        );
+
+        let uint64_array =UInt64Array::from(vec![0, 2, 3, 0xFFFF]);
+        let array_ref: ArrayRef = Arc::new(uint64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![16])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint64_array
+        );
+
+        let uint64_array =UInt64Array::from(vec![1, 2, 3, 0xFFFF_FFFF_FFFF_FFFF]);
+        let array_ref: ArrayRef = Arc::new(uint64_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![64])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::BitWidth);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}", 
+            expected_bit_width,
+            uint64_array
+        );
+
+    }
+    #[test]
+    fn test_bit_width_when_none() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert_eq!(
+            block.get_stat(Stat::BitWidth),
+            None,
+            "Expected Stat::BitWidth to be None for data block: {:?}",
+            block.name()
+        );
+
+
     }
 }

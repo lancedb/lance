@@ -36,7 +36,7 @@ use crate::{buffer::LanceBuffer, statistics::Stat};
 /// All the encodings added to Lance should register here, and
 /// these encodings can be dynamically selected during encoding,
 /// users can also specify the particular encoding they want to use in the field metadata.
-#[derive(Debug)]
+#[derive(Eq, Hash, PartialEq, Debug)]
 pub enum Encoding {
     Bitpack,
     Fsst,
@@ -101,7 +101,7 @@ impl BlockInfo {
 // `UsedEncoding` is used to record the encodings that has applied to a `DataBlock`
 #[derive(Debug, Clone)]
 pub struct UsedEncoding {
-    pub used_encoding: Arc<RwLock<HashSet<Encoding>>>,
+    pub used: Arc<RwLock<HashSet<Encoding>>>,
 }
 
 impl Default for UsedEncoding {
@@ -113,7 +113,7 @@ impl Default for UsedEncoding {
 impl UsedEncoding {
     pub fn new() -> Self {
         Self {
-            used_encoding: Arc::new(RwLock::new(HashSet::new())),
+            used: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 }
@@ -217,7 +217,7 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
