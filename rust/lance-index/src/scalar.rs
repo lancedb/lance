@@ -4,6 +4,7 @@
 //! Scalar indices for metadata search & filtering
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -17,6 +18,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
+use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
@@ -91,19 +93,36 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Clone)]
 pub struct InvertedIndexParams {
     /// If true, store the position of the term in the document
     /// This can significantly increase the size of the index
     /// If false, only store the frequency of the term in the document
     /// Default is true
     pub with_position: bool,
+
+    pub tokenizer_config: TokenizerConfig,
+}
+
+impl Debug for InvertedIndexParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvertedIndexParams")
+            .field("with_position", &self.with_position)
+            .finish()
+    }
+}
+
+impl DeepSizeOf for InvertedIndexParams {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        0
+    }
 }
 
 impl Default for InvertedIndexParams {
     fn default() -> Self {
         Self {
             with_position: true,
+            tokenizer_config: TokenizerConfig::default(),
         }
     }
 }

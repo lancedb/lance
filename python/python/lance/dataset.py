@@ -1337,6 +1337,27 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        base_tokenizer: str, default "simple"
+            This is for the ``INVERTED`` index. The base tokenizer to use. The value
+            can be:
+            * "simple": splits tokens on whitespace and punctuation.
+            * "whitespace": splits tokens on whitespace.
+            * "raw": no tokenization.
+        language: str, default "English"
+            This is for the ``INVERTED`` index. The language for stemming
+            and stop words. This is only used when `stem` or `remove_stop_words` is true
+        max_token_length: Optional[int], default 40
+            This is for the ``INVERTED`` index. The maximum token length.
+            Any token longer than this will be removed.
+        lower_case: bool, default True
+            This is for the ``INVERTED`` index. If True, the index will convert all
+            text to lowercase.
+        stem: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will stem the
+            tokens.
+        remove_stop_words: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will remove
+            stop words.
 
         Examples
         --------
