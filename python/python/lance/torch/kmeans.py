@@ -87,13 +87,7 @@ class KMeans:
         self.padded_centroids = None
 
         self.counts = torch.zeros(k, dtype=torch.int64)
-
-        if self.balance_factor is not None and self.centroids is not None:
-            # self.balance_factor also requires counts (from training sample)
-            # can add this as a param later
-            raise ValueError(
-                "balance_factor and centroids are mutually-exclusive parameters"
-            )
+        # TODO add counts as a param
 
         self.y2 = None
 
