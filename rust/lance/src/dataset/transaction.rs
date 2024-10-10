@@ -22,20 +22,27 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project |
-//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|
-//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      |
-//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      |
-//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      |
-//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      |
-//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      |
-//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      |
-//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      |
+//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project | SetMetadata | DeleteMetadata |
+//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|-------------|----------------|
+//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      | ✅          | ✅             |
+//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      | ✅          | ✅             |
+//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      | (2)         | (2)            |
+//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      | ✅          | ✅             |
+//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      | ✅          | ✅             |
+//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      | ✅          | ✅             |
+//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      | ✅          | ✅             |
+//! | SetMetadata      | ✅     | ✅              | (2)              | ✅           | ✅      | ✅    | ✅      | (2)         | (2)            |
+//! | DeleteMetadata   | ✅     | ✅              | (2)              | ✅           | ✅      | ✅    | ✅      | (2)         | ✅             |
 //!
 //! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
+//! (2) Table metadata operations are compatible with each other if they affect distinct
+//! metadata keys. Otherwise, they conflict.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
@@ -93,6 +100,7 @@ pub enum Operation {
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
+        table_metadata: Option<HashMap<String, String>>,
     },
     /// A new index has been created.
     CreateIndex {
@@ -139,6 +147,14 @@ pub enum Operation {
 
     /// Project to a new schema. This only changes the schema, not the data.
     Project { schema: Schema },
+
+    /// Change the table metadata.
+    SetMetadata {
+        table_metadata: HashMap<String, String>,
+    },
+
+    /// Delete keys from the table metadata.
+    DeleteMetadata { table_metadata_keys: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +181,8 @@ impl Operation {
             | Self::CreateIndex { .. }
             | Self::ReserveFragments { .. }
             | Self::Project { .. }
+            | Self::SetMetadata { .. }
+            | Self::DeleteMetadata { .. }
             | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
                 updated_fragments,
@@ -195,11 +213,39 @@ impl Operation {
         }
     }
 
+    /// Returns the metadata keys that have been modified by this operation.
+    fn metadata_keys(&self) -> Vec<String> {
+        match self {
+            Self::Overwrite {
+                table_metadata: Some(tm),
+                ..
+            } => {
+                let vec: Vec<String> = tm.keys().cloned().collect();
+                vec
+            }
+            Self::SetMetadata { table_metadata } => {
+                let vec: Vec<String> = table_metadata.keys().cloned().collect();
+                vec
+            }
+            Self::DeleteMetadata {
+                table_metadata_keys,
+            } => table_metadata_keys.clone(),
+            _ => Vec::<String>::new(),
+        }
+    }
+
     /// Check whether another operation modifies the same fragment IDs as this one.
     fn modifies_same_ids(&self, other: &Self) -> bool {
         let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
         let mut other_ids = other.modified_fragment_ids();
         other_ids.any(|id| self_ids.contains(&id))
+    }
+
+    /// Check whether another operation modifies the same table metadata as this one.
+    fn modifies_same_metadata(&self, other: &Self) -> bool {
+        let self_keys = self.metadata_keys();
+        let other_keys = other.metadata_keys();
+        self_keys.iter().any(|x| other_keys.contains(x))
     }
 
     pub fn name(&self) -> &str {
@@ -214,6 +260,8 @@ impl Operation {
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
+            Self::SetMetadata { .. } => "SetMetadata",
+            Self::DeleteMetadata { .. } => "DeleteMetadata",
         }
     }
 }
@@ -245,6 +293,8 @@ impl Transaction {
                 Operation::Delete { .. } | Operation::Update { .. } => false,
                 Operation::ReserveFragments { .. } => false,
                 Operation::Project { .. } => false,
+                Operation::SetMetadata { .. } => false,
+                Operation::DeleteMetadata { .. } => false,
                 _ => true,
             },
             Operation::Rewrite { .. } => match &other.operation {
@@ -259,10 +309,11 @@ impl Transaction {
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 Operation::Project { .. } => false,
+                Operation::SetMetadata { .. } => false,
+                Operation::DeleteMetadata { .. } => false,
                 _ => true,
             },
-            // Overwrite and Restore always succeed
-            Operation::Overwrite { .. } => false,
+            // Restore always succeeds
             Operation::Restore { .. } => false,
             // ReserveFragments is compatible with anything that doesn't reset the
             // max fragment id.
@@ -285,6 +336,8 @@ impl Transaction {
                 // TODO: we could be smarter here and only invalidate the index
                 // if the rewrite changed more than X% of row ids.
                 Operation::Rewrite { .. } => true,
+                Operation::SetMetadata { .. } => false,
+                Operation::DeleteMetadata { .. } => false,
                 _ => true,
             },
             Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
@@ -296,18 +349,40 @@ impl Transaction {
                 }
                 Operation::Project { .. } => false,
                 Operation::Append { .. } => false,
+                Operation::SetMetadata { .. } => false,
+                Operation::DeleteMetadata { .. } => false,
                 _ => true,
             },
+            Operation::Overwrite { .. } | Operation::SetMetadata { .. } => match &other.operation {
+                Operation::Overwrite { .. }
+                | Operation::SetMetadata { .. }
+                | Operation::DeleteMetadata { .. } => {
+                    self.operation.modifies_same_metadata(&other.operation)
+                }
+                _ => false,
+            },
+            Operation::DeleteMetadata { .. } => match &other.operation {
+                Operation::Overwrite { .. } | Operation::SetMetadata { .. } => {
+                    self.operation.modifies_same_metadata(&other.operation)
+                }
+                Operation::DeleteMetadata { .. } => false,
+                _ => false,
+            },
             // Merge changes the schema, but preserves row ids, so the only operations
-            // it's compatible with is CreateIndex and ReserveFragments.
+            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
             Operation::Merge { .. } => !matches!(
                 &other.operation,
-                Operation::CreateIndex { .. } | Operation::ReserveFragments { .. }
+                Operation::CreateIndex { .. }
+                    | Operation::ReserveFragments { .. }
+                    | Operation::SetMetadata { .. }
+                    | Operation::DeleteMetadata { .. }
             ),
             Operation::Project { .. } => match &other.operation {
                 // Project is compatible with anything that doesn't change the schema
                 Operation::CreateIndex { .. } => false,
                 Operation::Overwrite { .. } => false,
+                Operation::SetMetadata { .. } => false,
+                Operation::DeleteMetadata { .. } => false,
                 _ => true,
             },
         }
@@ -586,6 +661,7 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
+            Operation::SetMetadata { .. } | Operation::DeleteMetadata { .. } => {}
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -625,6 +701,26 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
+
+        match &self.operation {
+            Operation::Overwrite {
+                table_metadata: Some(tm),
+                ..
+            } => manifest.set_metadata(tm.clone()),
+            Operation::SetMetadata { table_metadata } => {
+                manifest.set_metadata(table_metadata.clone())
+            }
+            Operation::DeleteMetadata {
+                table_metadata_keys,
+            } => manifest.delete_metadata(
+                table_metadata_keys
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            ),
+            _ => {}
+        }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
             manifest.max_fragment_id += num_fragments;
@@ -824,13 +920,23 @@ impl TryFrom<pb::Transaction> for Transaction {
                 fragments,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
-            })) => Operation::Overwrite {
-                fragments: fragments
-                    .into_iter()
-                    .map(Fragment::try_from)
-                    .collect::<Result<Vec<_>>>()?,
-                schema: Schema::from(&Fields(schema.clone())),
-            },
+                table_metadata,
+            })) => {
+                let table_metadata_option = if table_metadata.is_empty() {
+                    Some(table_metadata)
+                } else {
+                    None
+                };
+
+                Operation::Overwrite {
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    schema: Schema::from(&Fields(schema.clone())),
+                    table_metadata: table_metadata_option,
+                }
+            }
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
             )) => Operation::ReserveFragments { num_fragments },
@@ -914,6 +1020,16 @@ impl TryFrom<pb::Transaction> for Transaction {
                     schema: Schema::from(&Fields(schema.clone())),
                 }
             }
+            Some(pb::transaction::Operation::SetMetadata(pb::transaction::SetMetadata {
+                metadata,
+            })) => Operation::SetMetadata {
+                table_metadata: metadata,
+            },
+            Some(pb::transaction::Operation::DeleteMetadata(pb::transaction::DeleteMetadata {
+                metadata_keys,
+            })) => Operation::DeleteMetadata {
+                table_metadata_keys: metadata_keys,
+            },
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -1002,11 +1118,16 @@ impl From<&Transaction> for pb::Transaction {
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             }),
-            Operation::Overwrite { fragments, schema } => {
+            Operation::Overwrite {
+                fragments,
+                schema,
+                table_metadata,
+            } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     schema: Fields::from(schema).0,
                     schema_metadata: Default::default(), // TODO: handle metadata
+                    table_metadata: table_metadata.clone().unwrap_or(Default::default()),
                 })
             }
             Operation::ReserveFragments { num_fragments } => {
@@ -1062,6 +1183,16 @@ impl From<&Transaction> for pb::Transaction {
                     schema: Fields::from(schema).0,
                 })
             }
+            Operation::SetMetadata { table_metadata } => {
+                pb::transaction::Operation::SetMetadata(pb::transaction::SetMetadata {
+                    metadata: table_metadata.clone(),
+                })
+            }
+            Operation::DeleteMetadata {
+                table_metadata_keys,
+            } => pb::transaction::Operation::DeleteMetadata(pb::transaction::DeleteMetadata {
+                metadata_keys: table_metadata_keys.clone(),
+            }),
         };
 
         Self {
@@ -1102,7 +1233,14 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
 /// Validate the operation is valid for the given manifest.
 pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
     let manifest = match (manifest, operation) {
-        (None, Operation::Overwrite { fragments, schema }) => {
+        (
+            None,
+            Operation::Overwrite {
+                fragments,
+                schema,
+                table_metadata: None,
+            },
+        ) => {
             // Validate here because we are going to return early.
             schema_fragments_valid(schema, fragments)?;
 
@@ -1128,9 +1266,12 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         Operation::Project { schema } => {
             schema_fragments_valid(schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema } | Operation::Overwrite { fragments, schema } => {
-            schema_fragments_valid(schema, fragments)
-        }
+        Operation::Merge { fragments, schema }
+        | Operation::Overwrite {
+            fragments,
+            schema,
+            table_metadata: None,
+        } => schema_fragments_valid(schema, fragments),
         Operation::Update {
             updated_fragments,
             new_fragments,
@@ -1207,6 +1348,10 @@ mod tests {
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
                 schema: Schema::default(),
+                table_metadata: Some(HashMap::from_iter(vec![(
+                    "overwrite-key".to_string(),
+                    "value".to_string(),
+                )])),
             },
             Operation::Rewrite {
                 groups: vec![RewriteGroup {
@@ -1221,6 +1366,15 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
             },
+            Operation::SetMetadata {
+                table_metadata: HashMap::from_iter(vec![(
+                    "lance:test".to_string(),
+                    "value".to_string(),
+                )]),
+            },
+            Operation::DeleteMetadata {
+                table_metadata_keys: vec!["remove-key".to_string()],
+            },
         ];
         let other_transactions = other_operations
             .iter()
@@ -1234,7 +1388,9 @@ mod tests {
                 Operation::Append {
                     fragments: vec![fragment0.clone()],
                 },
-                [false, false, false, true, true, false, false, false],
+                [
+                    false, false, false, true, true, false, false, false, false, false,
+                ],
             ),
             (
                 Operation::Delete {
@@ -1243,7 +1399,9 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [false, false, false, true, true, false, false, true],
+                [
+                    false, false, false, true, true, false, false, true, false, false,
+                ],
             ),
             (
                 Operation::Delete {
@@ -1252,16 +1410,21 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [false, false, true, true, true, true, false, true],
+                [
+                    false, false, true, true, true, true, false, true, false, false,
+                ],
             ),
             (
                 Operation::Overwrite {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
                     schema: Schema::default(),
+                    table_metadata: None,
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.
-                [false, false, false, false, false, false, false, false],
+                [
+                    false, false, false, false, false, false, false, false, false, false,
+                ],
             ),
             (
                 Operation::CreateIndex {
@@ -1269,7 +1432,9 @@ mod tests {
                     removed_indices: vec![index0.clone()],
                 },
                 // Will only conflict with operations that modify row ids.
-                [false, false, false, false, true, true, false, false],
+                [
+                    false, false, false, false, true, true, false, false, false, false,
+                ],
             ),
             (
                 // Rewrite that affects different fragments
@@ -1280,7 +1445,9 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, false, true, true, false, false, true],
+                [
+                    false, true, false, true, true, false, false, true, false, false,
+                ],
             ),
             (
                 // Rewrite that affects the same fragments
@@ -1291,7 +1458,9 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, true, true, true, true, false, true],
+                [
+                    false, true, true, true, true, true, false, true, false, false,
+                ],
             ),
             (
                 Operation::Merge {
@@ -1299,12 +1468,16 @@ mod tests {
                     schema: Schema::default(),
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [true, false, true, true, true, true, false, true],
+                [
+                    true, false, true, true, true, true, false, true, false, false,
+                ],
             ),
             (
                 Operation::ReserveFragments { num_fragments: 2 },
                 // ReserveFragments only conflicts with Overwrite and Restore.
-                [false, false, false, false, true, false, false, false],
+                [
+                    false, false, false, false, true, false, false, false, false, false,
+                ],
             ),
             (
                 Operation::Update {
@@ -1313,7 +1486,63 @@ mod tests {
                     removed_fragment_ids: vec![],
                     new_fragments: vec![fragment2.clone()],
                 },
-                [false, false, true, true, true, true, false, true],
+                [
+                    false, false, true, true, true, true, false, true, false, false,
+                ],
+            ),
+            (
+                // Set metadata that should not conflict with anything
+                Operation::SetMetadata {
+                    table_metadata: HashMap::from_iter(vec![(
+                        "other-key".to_string(),
+                        "new-value".to_string(),
+                    )]),
+                },
+                [
+                    false, false, false, false, false, false, false, false, false, false,
+                ],
+            ),
+            (
+                // Set metadata that conflicts with other SetMetadata operation
+                Operation::SetMetadata {
+                    table_metadata: HashMap::from_iter(vec![(
+                        "lance:test".to_string(),
+                        "new-value".to_string(),
+                    )]),
+                },
+                [
+                    false, false, false, false, false, false, false, false, true, false,
+                ],
+            ),
+            (
+                // Set metadata that conflicts with other DeleteMetadata operation
+                Operation::SetMetadata {
+                    table_metadata: HashMap::from_iter(vec![(
+                        "remove-key".to_string(),
+                        "new-value".to_string(),
+                    )]),
+                },
+                [
+                    false, false, false, false, false, false, false, false, false, true,
+                ],
+            ),
+            (
+                // Delete metadata currently being deleted by other DeleteMetadata operation
+                Operation::DeleteMetadata {
+                    table_metadata_keys: vec!["remove-key".to_string()],
+                },
+                [
+                    false, false, false, false, false, false, false, false, false, false,
+                ],
+            ),
+            (
+                // Delete metadata currently being set by other SetMetadata operation
+                Operation::DeleteMetadata {
+                    table_metadata_keys: vec!["lance:test".to_string()],
+                },
+                [
+                    false, false, false, false, false, false, false, false, true, false,
+                ],
             ),
         ];
 
