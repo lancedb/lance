@@ -201,6 +201,7 @@ def train_ivf_centroids_on_accelerator(
     *,
     sample_rate: int = 256,
     max_iters: int = 50,
+    filter_nan: bool = True,
 ) -> (np.ndarray, Any):
     """Use accelerator (GPU or MPS) to train kmeans."""
     if isinstance(accelerator, str) and (
@@ -219,7 +220,7 @@ def train_ivf_centroids_on_accelerator(
 
     k = int(k)
 
-    if dataset.schema.field(column).nullable:
+    if dataset.schema.field(column).nullable and filter_nan:
         filt = f"{column} is not null"
     else:
         filt = None
@@ -416,6 +417,7 @@ def compute_partitions(
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
     num_sub_vectors: Optional[int] = None,
+    filter_nan: bool = True,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -444,12 +446,17 @@ def compute_partitions(
 
     num_rows = dataset.count_rows()
 
+    if dataset.schema.field(column).nullable and filter_nan:
+        filt = f"{column} is not null"
+    else:
+        filt = None
+
     torch_ds = TorchDataset(
         dataset,
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-        filter=f"{column} is not null",
+        filter=filt,
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,

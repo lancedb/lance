@@ -1447,6 +1447,7 @@ class LanceDataset(pa.dataset.Dataset):
         ivf_centroids_file: Optional[str] = None,
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1503,6 +1504,10 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        filter_nan: bool
+            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
+            values are present (and otherwise will not). Disables the null filter used
+            for nullable columns. Obtains a small speed boost.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1702,6 +1707,7 @@ class LanceDataset(pa.dataset.Dataset):
                     num_partitions,
                     metric,
                     accelerator,
+                    filter_nan=filter_nan,
                 )
                 timers["ivf_train:end"] = time.time()
                 ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
@@ -1717,6 +1723,7 @@ class LanceDataset(pa.dataset.Dataset):
                     kmeans,
                     batch_size=20480,
                     num_sub_vectors=num_sub_vectors_cur,
+                    filter_nan=filter_nan,
                 )
                 timers["ivf_assign:end"] = time.time()
                 ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
