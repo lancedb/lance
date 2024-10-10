@@ -456,7 +456,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
-        filter=null_filter,
+        filter=filt,
     )
     loader = torch.utils.data.DataLoader(
         torch_ds,

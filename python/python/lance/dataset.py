@@ -1505,9 +1505,9 @@ class LanceDataset(pa.dataset.Dataset):
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         filter_nan: bool
-            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan values
-            are present (and otherwise will not). Disables the null filter used for nullable
-            columns. Obtains a small speed boost.
+            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
+            values are present (and otherwise will not). Disables the null filter used
+            for nullable columns. Obtains a small speed boost.
         kwargs :
             Parameters passed to the index building process.
 
