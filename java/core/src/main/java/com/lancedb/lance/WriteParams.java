@@ -16,6 +16,7 @@ package com.lancedb.lance;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -37,7 +38,7 @@ public class WriteParams {
   private final Optional<Integer> maxRowsPerGroup;
   private final Optional<Long> maxBytesPerFile;
   private final Optional<WriteMode> mode;
-  private final Map<String, String> storageOptions;
+  private Map<String, String> storageOptions = new HashMap<>();
 
   private WriteParams(Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
       Optional<Long> maxBytesPerFile, Optional<WriteMode> mode,
@@ -91,7 +92,7 @@ public class WriteParams {
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
     private Optional<Long> maxBytesPerFile = Optional.empty();
     private Optional<WriteMode> mode = Optional.empty();
-    private Map<String, String> storageOptions;
+    private Map<String, String> storageOptions = new HashMap<>();
 
     public Builder withMaxRowsPerFile(int maxRowsPerFile) {
       this.maxRowsPerFile = Optional.of(maxRowsPerFile);
