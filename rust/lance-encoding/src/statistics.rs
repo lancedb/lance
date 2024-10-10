@@ -16,11 +16,11 @@
 
 use std::{fmt, sync::Arc};
 
-use arrow_array::{Array, Int64Array, UInt64Array};
+use arrow_array::{Array, UInt64Array};
 
 use crate::data::{
-    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock, OpaqueBlock,
-    StructDataBlock, VariableWidthBlock,
+    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, OpaqueBlock, StructDataBlock,
+    VariableWidthBlock,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,10 +57,13 @@ impl GetStat for DataBlock {
     fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
         match self {
             Self::AllNull(_) => {
-                // the null count is not calculated here as this enum is going to deprecated anyway
-                Some(Arc::new(Int64Array::from(vec![0i64])))
+                //  the statistics is not calculated here as this enum is going to deprecated soon anyway
+                None
             }
-            Self::Nullable(data_block) => data_block.get_stat(stat),
+            Self::Nullable(_) => {
+                //  the statistics is not calculated here as this enum is going to deprecated soon anyway
+                None
+            }
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
             Self::FixedSizeList(data_block) => data_block.child.get_stat(stat),
             Self::VariableWidth(data_block) => data_block.get_stat(stat),
@@ -71,44 +74,32 @@ impl GetStat for DataBlock {
     }
 }
 
-impl GetStat for NullableDataBlock {
+impl GetStat for FixedWidthDataBlock {
     fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
-        // Initialize statistics if not already done
-        if self.block_info.info.read().unwrap().is_empty() {
-            self.compute_statistics();
-        }
-
         match stat {
-            Stat::BitWidth | Stat::Cardinality | Stat::FixedSize => self.data.get_stat(stat),
-            Stat::DataSize | Stat::NullCount => {
+            Stat::NullCount => None,
+            _ => {
+                // initialize statistics
+                if self.block_info.info.read().unwrap().is_empty() {
+                    self.compute_statistics();
+                }
                 self.block_info.info.read().unwrap().get(&stat).cloned()
             }
         }
     }
 }
 
-impl GetStat for FixedWidthDataBlock {
-    fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
-        // initialize statistics
-        if self.block_info.info.read().unwrap().is_empty() {
-            self.compute_statistics();
-        }
-        match stat {
-            Stat::NullCount => None,
-            _ => self.block_info.info.read().unwrap().get(&stat).cloned(),
-        }
-    }
-}
-
 impl GetStat for VariableWidthBlock {
     fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
-        if self.block_info.info.read().unwrap().is_empty() {
-            self.compute_statistics();
-        }
         match stat {
             Stat::BitWidth => None,
             Stat::NullCount => None,
-            _ => self.block_info.info.read().unwrap().get(&stat).cloned(),
+            _ => {
+                if self.block_info.info.read().unwrap().is_empty() {
+                    self.compute_statistics();
+                }
+                self.block_info.info.read().unwrap().get(&stat).cloned()
+            }
         }
     }
 }
@@ -127,20 +118,6 @@ impl FixedWidthDataBlock {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
         let mut info = self.block_info.info.write().unwrap();
-        info.insert(Stat::DataSize, data_size_array);
-    }
-}
-
-impl NullableDataBlock {
-    fn compute_statistics(&mut self) {
-        let null_count = self.count_nulls();
-        let null_count_array = Arc::new(UInt64Array::from(vec![null_count]));
-
-        let data_size = self.data_size();
-        let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
-
-        let mut info = self.block_info.info.write().unwrap();
-        info.insert(Stat::NullCount, null_count_array);
         info.insert(Stat::DataSize, data_size_array);
     }
 }
@@ -171,7 +148,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, StringArray, UInt64Array};
+    use arrow_array::UInt64Array;
+    use arrow_schema::{DataType, Field};
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
@@ -182,167 +160,9 @@ mod tests {
     use arrow::compute::concat;
     use arrow_array::Array;
     #[test]
-    fn test_count_nulls() {
-        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-
-        // test NullableDatablock with FixedWidthDataBlock inside
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, true]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 1);
-
-        let arr = gen.generate(RowCount::from(6), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 2);
-
-        let arr = gen.generate(RowCount::from(9), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 3);
-
-        let arr = gen.generate(RowCount::from(90), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 30);
-
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, true]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 2);
-
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, true]);
-        let arr = gen.generate(RowCount::from(6), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 4);
-
-        let arr = gen.generate(RowCount::from(9), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 6);
-
-        let arr = gen.generate(RowCount::from(90), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 60);
-
-        // test NullableDatablock with VariableWidthDataBlock inside
-        let mut gen = array::rand_varbin(8.into(), false).with_nulls(&[false, false, true]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 1);
-
-        let arr = gen.generate(RowCount::from(6), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 2);
-
-        let arr = gen.generate(RowCount::from(9), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 3);
-
-        let arr = gen.generate(RowCount::from(90), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 30);
-
-        let mut gen = array::rand_varbin(8.into(), false).with_nulls(&[false, true, true]);
-
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 2);
-
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, true]);
-        let arr = gen.generate(RowCount::from(6), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 4);
-
-        let arr = gen.generate(RowCount::from(9), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 6);
-
-        let arr = gen.generate(RowCount::from(90), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 60);
-
-        let mut gen = array::rand_varbin(800.into(), false).with_nulls(&[false, true, true]);
-
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 2);
-
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, true]);
-        let arr = gen.generate(RowCount::from(6), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 4);
-
-        let arr = gen.generate(RowCount::from(9), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 6);
-
-        let arr = gen.generate(RowCount::from(90), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 60);
-
-        // test NullableDatablock with VariableWidthDataBlock inside, with datatype LargeString
-        let mut gen = array::rand_varbin(800.into(), true).with_nulls(&[false, true, true]);
-
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr);
-        assert!(block.as_nullable().unwrap().count_nulls() == 2);
-    }
-    #[test]
-    fn test_null_count_stat() {
-        // Converting string arrays that contain nulls to DataBlock
-        let strings1 = StringArray::from(vec![Some("hello"), None, Some("world")]);
-        let strings2 = StringArray::from(vec![Some("a"), Some("b")]);
-        let strings3 = StringArray::from(vec![Option::<&'static str>::None, None]);
-
-        let arrays = &[strings1, strings2, strings3]
-            .iter()
-            .map(|arr| Arc::new(arr.clone()) as ArrayRef)
-            .collect::<Vec<_>>();
-
-        let mut block = DataBlock::from_arrays(arrays, 7);
-
-        let null_count_array = block.get_stat(Stat::NullCount).unwrap();
-        let null_count = null_count_array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .value(0);
-        assert!(null_count == 3);
-
-        let ints1 = Int32Array::from(vec![Some(1), None, Some(2)]);
-        let ints2 = Int32Array::from(vec![Some(3), Some(4)]);
-        let ints3 = Int32Array::from(vec![None, None]);
-
-        let arrays = &[ints1, ints2, ints3]
-            .iter()
-            .map(|arr| Arc::new(arr.clone()) as ArrayRef)
-            .collect::<Vec<_>>();
-
-        let mut block = DataBlock::from_arrays(arrays, 7);
-
-        let null_count_array = block.get_stat(Stat::NullCount).unwrap();
-        let null_count = null_count_array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .value(0);
-        assert!(null_count == 3);
-
-        let ints1 = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
-        let ints2 = Int32Array::from(vec![Some(3), Some(4)]);
-        let ints3 = Int32Array::from(vec![Some(5), Some(6)]);
-
-        let arrays = &[ints1, ints2, ints3]
-            .iter()
-            .map(|arr| Arc::new(arr.clone()) as ArrayRef)
-            .collect::<Vec<_>>();
-
-        let mut block = DataBlock::from_arrays(arrays, 7);
-
-        assert!(block.get_stat(Stat::NullCount).is_none());
-    }
-
-    #[test]
     fn test_data_size_stat() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
         let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
@@ -355,26 +175,192 @@ mod tests {
         ])
         .unwrap();
 
-        if let Some(data_size_array) = block.get_stat(Stat::DataSize) {
-            let data_size = data_size_array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .value(0);
-            let total_buffer_size: usize = concatenated_array
-                .to_data()
-                .buffers()
-                .iter()
-                .map(|buffer| buffer.len())
-                .sum();
-            let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
-            assert!(data_size == (total_buffer_size + total_nulls_size_in_bytes) as u64);
-        } else {
+        let data_size_array = block.get_stat(Stat::DataSize).unwrap_or_else(|| {
             panic!(
-                "A data block of type: {} should have valid {:?} statistics",
+                "A data block of type: {} should have valid {} statistics",
                 block.name(),
                 Stat::DataSize
-            );
-        }
+            )
+        });
+        let data_size = data_size_array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+
+        let total_buffer_size: usize = concatenated_array
+            .to_data()
+            .buffers()
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum();
+        assert!(data_size == total_buffer_size as u64);
+
+        // test FixedSizeList
+        let mut gen = lance_datagen::array::rand_type(&DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            1024,
+        ));
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        let data_size_array = block.get_stat(Stat::DataSize).unwrap_or_else(|| {
+            panic!(
+                "A data block of type: {} should have valid {} statistics",
+                block.name(),
+                Stat::DataSize
+            )
+        });
+        let data_size = data_size_array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        // the data buffer of `FixedSizeList` resides in its `child_data`
+        let total_buffer_size: usize = arr
+            .to_data()
+            .child_data()
+            .iter()
+            .flat_map(|child| child.buffers().iter().map(|buffer| buffer.len()))
+            .sum();
+        assert!(data_size == total_buffer_size as u64);
+
+        // test DataType::Binary
+        let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        let data_size_array = block.get_stat(Stat::DataSize).unwrap_or_else(|| {
+            panic!(
+                "A data block of type: {} should have valid {} statistics",
+                block.name(),
+                Stat::DataSize
+            )
+        });
+
+        let data_size = data_size_array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        let total_buffer_size: usize = arr
+            .to_data()
+            .buffers()
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum();
+        assert!(data_size == total_buffer_size as u64);
+
+        // test DataType::Struct
+        let fields = vec![
+            Arc::new(Field::new("int_field", DataType::Int32, false)),
+            Arc::new(Field::new("float_field", DataType::Float32, false)),
+            Arc::new(Field::new(
+                "fsl_field",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
+                false,
+            )),
+        ]
+        .into();
+
+        let mut gen = lance_datagen::array::rand_type(&DataType::Struct(fields));
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::DataSize).is_none(),
+            "Expected Stat::DataSize to be None for data block of type: {}",
+            block.name()
+        );
+
+        // test DataType::Dictionary
+        let mut gen = array::rand_type(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Utf8),
+        ));
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::DataSize).is_none(),
+            "Expected Stat::DataSize to be None for data block of type: {}",
+            block.name()
+        );
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::DataSize).is_none(),
+            "Expected Stat::DataSize to be None for data block of type: {}",
+            block.name()
+        );
+    }
+    #[test]
+    fn test_null_count_stat() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+
+        // test DataType::Int32Type
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::NullCount).is_none(),
+            "Expected Stat::NullCount to be None for data block of type: {}",
+            block.name()
+        );
+
+        // test FixedSizeList
+        let mut gen = lance_datagen::array::rand_type(&DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            1024,
+        ));
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::NullCount).is_none(),
+            "Expected Stat::NullCount to be None for data block of type: {}",
+            block.name()
+        );
+
+        // test DataType::Binary
+        let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::NullCount).is_none(),
+            "Expected Stat::NullCount to be None for data block of type: {}",
+            block.name()
+        );
+
+        // test DataType::Struct
+        let fields = vec![
+            Arc::new(Field::new("int_field", DataType::Int32, false)),
+            Arc::new(Field::new("float_field", DataType::Float32, false)),
+            Arc::new(Field::new(
+                "fsl_field",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
+                false,
+            )),
+        ]
+        .into();
+
+        let mut gen = lance_datagen::array::rand_type(&DataType::Struct(fields));
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::NullCount).is_none(),
+            "Expected Stat::NullCount to be None for data block of type: {}",
+            block.name()
+        );
+
+        // test DataType::Dictionary
+        let mut gen = array::rand_type(&DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Utf8),
+        ));
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let mut block = DataBlock::from_array(arr.clone());
+        assert!(
+            block.get_stat(Stat::NullCount).is_none(),
+            "Expected Stat::NullCount to be None for data block of type: {}",
+            block.name()
+        );
     }
 }
