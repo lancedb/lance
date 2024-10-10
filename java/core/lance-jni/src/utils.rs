@@ -15,10 +15,11 @@
 use std::sync::Arc;
 
 use arrow::array::Float32Array;
-use jni::objects::{JObject, JString};
+use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::index::vector::{StageParams, VectorIndexParams};
+use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
 use lance_index::vector::ivf::IvfBuildParams;
@@ -31,6 +32,7 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 
 use lance_index::vector::Query;
+use std::collections::HashMap;
 
 pub fn extract_write_params(
     env: &mut JNIEnv,
@@ -38,6 +40,7 @@ pub fn extract_write_params(
     max_rows_per_group: &JObject,
     max_bytes_per_file: &JObject,
     mode: &JObject,
+    storage_options_obj: &JObject,
 ) -> Result<WriteParams> {
     let mut write_params = WriteParams::default();
 
@@ -55,6 +58,24 @@ pub fn extract_write_params(
     }
     // Java code always sets the data storage version to Legacy for now
     write_params.data_storage_version = Some(LanceFileVersion::Legacy);
+    let jmap = JMap::from_env(env, storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+        Ok::<_, Error>(map)
+    })?;
+
+    write_params.store_params = Some(ObjectStoreParams {
+        storage_options: Some(storage_options),
+        ..Default::default()
+    });
     Ok(write_params)
 }
 

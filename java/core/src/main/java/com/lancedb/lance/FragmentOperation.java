@@ -15,6 +15,7 @@
 package com.lancedb.lance;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.arrow.memory.BufferAllocator;
@@ -29,7 +30,7 @@ public abstract class FragmentOperation {
   }
 
   public abstract Dataset commit(BufferAllocator allocator, String path,
-      Optional<Long> readVersion);
+      Optional<Long> readVersion, Map<String, String> storageOptions);
 
   /** Fragment append operation. */
   public static class Append extends FragmentOperation {
@@ -41,12 +42,14 @@ public abstract class FragmentOperation {
     }
 
     @Override
-    public Dataset commit(BufferAllocator allocator, String path, Optional<Long> readVersion) {
+    public Dataset commit(BufferAllocator allocator, String path, Optional<Long> readVersion,
+                          Map<String, String> storageOptions) {
       Preconditions.checkNotNull(allocator);
       Preconditions.checkNotNull(path);
       Preconditions.checkNotNull(readVersion);
       return Dataset.commitAppend(path, readVersion,
-          fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()));
+          fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()),
+          storageOptions);
     }
   }
 }

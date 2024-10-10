@@ -14,6 +14,7 @@
 
 package com.lancedb.lance.spark;
 
+import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
@@ -31,6 +32,7 @@ import scala.Some;
 import java.util.Map;
 
 public class LanceCatalog implements TableCatalog {
+  private CaseInsensitiveStringMap options;
   @Override
   public Identifier[] listTables(String[] namespace) throws NoSuchNamespaceException {
     throw new UnsupportedOperationException("Please use lancedb catalog for dataset listing");
@@ -38,23 +40,25 @@ public class LanceCatalog implements TableCatalog {
 
   @Override
   public Table loadTable(Identifier ident) throws NoSuchTableException {
-    LanceConfig config = LanceConfig.from(ident.name());
-    Optional<StructType> schema = LanceDatasetAdapter.getSchema(ident.name());
+    LanceConfig config = LanceConfig.from(options, ident.name());
+    Optional<StructType> schema = LanceDatasetAdapter.getSchema(config);
     if (schema.isEmpty()) {
       throw new NoSuchTableException(config.getDbPath(), config.getDatasetName());
     }
-    return new LanceDataset(LanceConfig.from(ident.name()), schema.get());
+    return new LanceDataset(config, schema.get());
   }
 
   @Override
   public Table createTable(Identifier ident, StructType schema, Transform[] partitions,
       Map<String, String> properties) throws TableAlreadyExistsException, NoSuchNamespaceException {
     try {
-      LanceDatasetAdapter.createDataset(ident.name(), schema);
+      LanceConfig config = LanceConfig.from(options, ident.name());
+      WriteParams params = SparkOptions.genWriteParamsFromConfig(config);
+      LanceDatasetAdapter.createDataset(ident.name(), schema, params);
     } catch (IllegalArgumentException e) {
       throw new TableAlreadyExistsException(ident.name(), new Some<>(e));
     }
-    return new LanceDataset(LanceConfig.from(properties, ident.name()), schema);
+    return new LanceDataset(LanceConfig.from(options, ident.name()), schema);
   }
 
   @Override
@@ -75,7 +79,7 @@ public class LanceCatalog implements TableCatalog {
 
   @Override
   public void initialize(String name, CaseInsensitiveStringMap options) {
-    // Do nothing here
+    this.options = options;
   }
 
   @Override

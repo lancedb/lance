@@ -38,6 +38,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
 
@@ -169,6 +170,7 @@ public class TestUtils {
                 .withMaxRowsPerFile(10)
                 .withMaxRowsPerGroup(20)
                 .withMode(WriteParams.WriteMode.CREATE)
+                .withStorageOptions(new HashMap<>())
                 .build())) {
           assertEquals(ROW_COUNT, dataset.countRows());
           schema = reader.getVectorSchemaRoot().getSchema();
