@@ -60,6 +60,8 @@ class KMeans:
         centroids: Optional[torch.Tensor] = None,
         seed: Optional[int] = None,
         device: Optional[str] = None,
+        balance_factor: Optional[float] = None,
+        cluster_counts: Optional[torch.Tensor] = None,
     ):
         self.k = k
         self.max_iters = max_iters
@@ -82,6 +84,13 @@ class KMeans:
         self.device = preferred_device(device)
         self.tolerance = tolerance
         self.seed = seed
+        self.balance_factor = balance_factor
+        self.padded_centroids = None
+
+        if cluster_counts is None:
+            self.counts = torch.zeros(k, device=self.device)
+        else:
+            self.counts = cluster_counts
 
         self.y2 = None
 
@@ -169,14 +178,12 @@ class KMeans:
                 logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
         logging.info("Finish KMean training in %s", time.time() - start)
 
-    def _updated_centroids(
-        self, centroids: torch.Tensor, counts: torch.Tensor
-    ) -> torch.Tensor:
-        centroids = centroids / counts[:, None]
-        zero_counts = counts == 0
+    def _updated_centroids(self, centroids: torch.Tensor) -> torch.Tensor:
+        centroids = centroids / self.counts[:, None]
+        zero_counts = self.counts == 0
         for idx in zero_counts.nonzero(as_tuple=False):
             # split the largest cluster and remove empty cluster
-            max_idx = torch.argmax(counts).item()
+            max_idx = torch.argmax(self.counts).item()
             # add 1% gassuian noise to the largest centroid
             # do this twice so we effectively split the largest cluster into 2
             # rand_like returns on [0, 1) so we need to shift it to [-0.5, 0.5)
@@ -229,9 +236,9 @@ class KMeans:
         new_centroids = torch.zeros_like(
             self.centroids, device=self.device, dtype=torch.float32
         )
-        counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
-        ones = torch.ones(1024 * 16, device=self.device)
         self.rebuild_index()
+        self.counts = torch.zeros(self.k, device=self.device)
+        ones = torch.ones(1024 * 16, device=self.device)
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
@@ -253,7 +260,7 @@ class KMeans:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
             new_centroids.index_add_(0, ids, chunk.type(torch.float32))
-            counts_per_part.index_add_(0, ids, ones[: ids.shape[0]])
+            self.counts.index_add_(0, ids, ones[: ids.shape[0]])
             del ids
             del dists
             del chunk
@@ -274,13 +281,50 @@ class KMeans:
             raise StopIteration("kmeans: converged")
 
         # cast to the type we get the data in
-        self.centroids = self._updated_centroids(new_centroids, counts_per_part).type(
-            dtype
-        )
+        self.centroids = self._updated_centroids(new_centroids).type(dtype)
         return total_dist
+
+    def pad_centroids(self):
+        if self.metric == "dot":
+            self.padded_centroids = torch.cat(
+                [
+                    self.centroids,
+                    -(self.balance_factor * self.counts).unsqueeze(1),
+                ],
+                dim=1,
+            )
+        else:
+            self.padded_centroids = torch.cat(
+                [
+                    self.centroids,
+                    torch.sqrt(self.balance_factor * self.counts).unsqueeze(1),
+                ],
+                dim=1,
+            )
+        self.y2 = (self.padded_centroids * self.padded_centroids).sum(dim=1)
 
     def rebuild_index(self):
         self.y2 = (self.centroids * self.centroids).sum(dim=1)
+        if self.balance_factor is not None:
+            self.pad_centroids()
+
+    def pad_data(self, data):
+        if self.metric == "dot":
+            return torch.cat(
+                [
+                    data,
+                    torch.ones(data.size(0), 1, device=data.device, dtype=data.dtype),
+                ],
+                dim=1,
+            )
+        else:
+            return torch.cat(
+                [
+                    data,
+                    torch.zeros(data.size(0), 1, device=data.device, dtype=data.dtype),
+                ],
+                dim=1,
+            )
 
     def _transform(
         self,
@@ -290,10 +334,15 @@ class KMeans:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
 
+        centroids = self.centroids
+        if self.padded_centroids is not None:
+            centroids = self.padded_centroids
+            data = self.pad_data(data)
+
         if self.metric in ["l2", "cosine"]:
-            return self.dist_func(data, self.centroids, y2=y2)
+            return self.dist_func(data, centroids, y2=y2)
         else:
-            return self.dist_func(data, self.centroids)
+            return self.dist_func(data, centroids)
 
     def transform(
         self, data: Union[pa.Array, np.ndarray, torch.Tensor]

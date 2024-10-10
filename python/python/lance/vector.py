@@ -210,6 +210,7 @@ def train_ivf_centroids_on_accelerator(
     sample_rate: int = 256,
     max_iters: int = 50,
     filter_nan: bool = True,
+    balance_factor: Optional[float] = None,
 ) -> (np.ndarray, Any):
     """Use accelerator (GPU or MPS) to train kmeans."""
 
@@ -277,6 +278,7 @@ def train_ivf_centroids_on_accelerator(
             metric=metric_type,
             device="cuda",
             centroids=init_centroids,
+            balance_factor=balance_factor,
         )
     else:
         logging.info("Training IVF partitions using GPU(%s)", accelerator)
@@ -286,14 +288,21 @@ def train_ivf_centroids_on_accelerator(
             metric=metric_type,
             device=accelerator,
             centroids=init_centroids,
+            balance_factor=balance_factor,
         )
     kmeans.fit(ds)
 
     centroids = kmeans.centroids.cpu().numpy()
+    counts = kmeans.counts.cpu().numpy()
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         np.save(f, centroids)
     logging.info("Saved centroids to %s", f.name)
+
+    if balance_factor is not None:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            np.save(f, counts)
+        logging.info("Saved cluster counts to %s", f.name)
 
     return centroids, kmeans
 
@@ -598,6 +607,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     sample_rate: int = 256,
     max_iters: int = 50,
     filter_nan: bool = True,
+    balance_factor: Optional[float] = None,
 ):
     centroids, kmeans = train_ivf_centroids_on_accelerator(
         dataset,
@@ -609,6 +619,7 @@ def one_pass_train_ivf_pq_on_accelerator(
         sample_rate=sample_rate,
         max_iters=max_iters,
         filter_nan=filter_nan,
+        balance_factor=balance_factor,
     )
     dataset_residuals = compute_partitions(
         dataset,

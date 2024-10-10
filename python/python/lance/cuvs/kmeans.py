@@ -56,6 +56,8 @@ class KMeans(KMeansTorch):
         seed: Optional[int] = None,
         device: Optional[str] = None,
         itopk_size: int = 10,
+        balance_factor: Optional[float] = None,
+        cluster_counts: Optional[torch.Tensor] = None,
     ):
         if metric == "dot":
             raise ValueError(
@@ -70,6 +72,8 @@ class KMeans(KMeansTorch):
             centroids=centroids,
             seed=seed,
             device=device,
+            balance_factor=balance_factor,
+            cluster_counts=cluster_counts,
         )
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -95,9 +99,13 @@ class KMeans(KMeansTorch):
         logging.info("Total rebuild time: %s", self.time_rebuild)
 
     def rebuild_index(self):
+        centroids = self.centroids
+        if self.balance_factor is not None:
+            self.pad_centroids()
+
         rebuild_time_start = time.time()
         cagra_metric = "sqeuclidean"
-        dim = self.centroids.shape[1]
+        dim = centroids.shape[1]
         graph_degree = max(dim // 4, 32)
         nn_descent_degree = graph_degree * 2
         index_params = cagra.IndexParams(
@@ -107,7 +115,7 @@ class KMeans(KMeansTorch):
             build_algo="nn_descent",
             compression=None,
         )
-        self.index = cagra.build(index_params, self.centroids)
+        self.index = cagra.build(index_params, centroids)
         rebuild_time_end = time.time()
         self.time_rebuild += rebuild_time_end - rebuild_time_start
 
@@ -120,6 +128,9 @@ class KMeans(KMeansTorch):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.metric == "cosine":
             data = torch.nn.functional.normalize(data)
+
+        if self.padded_centroids is not None:
+            data = self.pad_data(data)
 
         search_time_start = time.time()
         device = torch.device("cuda")
