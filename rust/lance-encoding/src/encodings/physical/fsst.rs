@@ -11,7 +11,7 @@ use lance_core::Result;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, NullableDataBlock, VariableWidthBlock},
+    data::{BlockInfo, DataBlock, NullableDataBlock, UsedEncoding, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
@@ -105,12 +105,16 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             data: LanceBuffer::from(bytes_as_bytes_mut),
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_as_bytes_mut),
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
         });
 
         if let Some(nulls) = nulls {
             Ok(DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(new_string_data),
                 nulls,
+                block_info: BlockInfo::new(),
+                used_encoding: UsedEncoding::new(),
             }))
         } else {
             Ok(new_string_data)
@@ -169,12 +173,16 @@ impl ArrayEncoder for FsstArrayEncoder {
             data: dest_values,
             num_values,
             offsets: dest_offset,
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
         });
 
         let data_block = if let Some(nulls) = nulls {
             DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(dest_data),
                 nulls,
+                block_info: BlockInfo::new(),
+                used_encoding: UsedEncoding::new(),
             })
         } else {
             dest_data

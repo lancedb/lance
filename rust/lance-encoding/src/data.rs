@@ -14,7 +14,11 @@
 //! slight penalty on encode (to normalize arrow data) but make the development of encoders
 //! and decoders easier (since they can rely on a normalized representation)
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    collections::HashSet,
+    ops::Range,
+    sync::{Arc, RwLock},
+};
 
 use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
 use arrow_array::{new_null_array, Array, ArrayRef, UInt64Array};
@@ -25,8 +29,19 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::buffer::LanceBuffer;
+use crate::{buffer::LanceBuffer, statistics::Stat};
 
+/// `Encoding` enum serves as a encoding registeration center.
+///
+/// All the encodings added to Lance should register here, and
+/// these encodings can be dynamically selected during encoding,
+/// users can also specify the particular encoding they want to use in the field metadata.
+#[derive(Debug)]
+pub enum Encoding {
+    Bitpack,
+    Fsst,
+    FixedSizeBinary,
+}
 /// A data block with no buffers where everything is null
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated
@@ -60,6 +75,49 @@ impl AllNullDataBlock {
     }
 }
 
+use std::collections::HashMap;
+
+// `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
+// `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
+#[derive(Debug, Clone)]
+pub struct BlockInfo {
+    pub info: Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>,
+}
+
+impl Default for BlockInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockInfo {
+    pub fn new() -> Self {
+        Self {
+            info: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+// `UsedEncoding` is used to record the encodings that has applied to a `DataBlock`
+#[derive(Debug, Clone)]
+pub struct UsedEncoding {
+    pub used_encoding: Arc<RwLock<HashSet<Encoding>>>,
+}
+
+impl Default for UsedEncoding {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UsedEncoding {
+    pub fn new() -> Self {
+        Self {
+            used_encoding: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+}
+
 /// Wraps a data block and adds nullability information to it
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated
@@ -71,6 +129,10 @@ pub struct NullableDataBlock {
     pub data: Box<DataBlock>,
     /// A bitmap of validity for each value
     pub nulls: LanceBuffer,
+
+    pub block_info: BlockInfo,
+
+    pub used_encoding: UsedEncoding,
 }
 
 impl NullableDataBlock {
@@ -95,6 +157,8 @@ impl NullableDataBlock {
         Self {
             data: Box::new(self.data.borrow_and_clone()),
             nulls: self.nulls.borrow_and_clone(),
+            block_info: self.block_info.clone(),
+            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -102,7 +166,20 @@ impl NullableDataBlock {
         Ok(Self {
             data: Box::new(self.data.try_clone()?),
             nulls: self.nulls.try_clone()?,
+            block_info: self.block_info.clone(),
+            used_encoding: self.used_encoding.clone(),
         })
+    }
+
+    // count_nulls will be handled differently after V2.1
+    pub fn count_nulls(&mut self) -> u64 {
+        let nulls_buf = &self.borrow_and_clone().into_buffers()[0];
+        let boolean_buf = BooleanBuffer::new(nulls_buf.into(), 0, nulls_buf.len() * 8);
+        self.data.num_values() - boolean_buf.count_set_bits() as u64
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.data.data_size() + self.nulls.len() as u64
     }
 }
 
@@ -115,6 +192,10 @@ pub struct FixedWidthDataBlock {
     pub bits_per_value: u64,
     /// The number of values represented by this block
     pub num_values: u64,
+
+    pub block_info: BlockInfo,
+
+    pub used_encoding: UsedEncoding,
 }
 
 impl FixedWidthDataBlock {
@@ -150,6 +231,8 @@ impl FixedWidthDataBlock {
             data: self.data.borrow_and_clone(),
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -158,7 +241,13 @@ impl FixedWidthDataBlock {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+            used_encoding: self.used_encoding.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.data.len() as u64
     }
 }
 
@@ -257,6 +346,10 @@ impl FixedSizeListBlock {
     fn into_buffers(self) -> Vec<LanceBuffer> {
         self.child.into_buffers()
     }
+
+    fn data_size(&self) -> u64 {
+        self.child.data_size()
+    }
 }
 
 /// A data block with no regular structure.  There is no available spot to attach
@@ -266,6 +359,8 @@ impl FixedSizeListBlock {
 pub struct OpaqueBlock {
     pub buffers: Vec<LanceBuffer>,
     pub num_values: u64,
+    pub block_info: BlockInfo,
+    pub used_encoding: UsedEncoding,
 }
 
 impl OpaqueBlock {
@@ -277,6 +372,8 @@ impl OpaqueBlock {
                 .map(|b| b.borrow_and_clone())
                 .collect(),
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -288,7 +385,13 @@ impl OpaqueBlock {
                 .map(|b| b.try_clone())
                 .collect::<Result<_>>()?,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+            used_encoding: self.used_encoding.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.buffers.iter().map(|b| b.len() as u64).sum()
     }
 }
 
@@ -305,6 +408,10 @@ pub struct VariableWidthBlock {
     pub bits_per_offset: u8,
     /// The number of values represented by this block
     pub num_values: u64,
+
+    pub block_info: BlockInfo,
+
+    pub used_encodings: UsedEncoding,
 }
 
 impl VariableWidthBlock {
@@ -333,6 +440,8 @@ impl VariableWidthBlock {
             offsets: self.offsets.borrow_and_clone(),
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+            used_encodings: self.used_encodings.clone(),
         }
     }
 
@@ -342,7 +451,13 @@ impl VariableWidthBlock {
             offsets: self.offsets.try_clone()?,
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
+            block_info: self.block_info.clone(),
+            used_encodings: self.used_encodings.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        (self.data.len() + self.offsets.len()) as u64
     }
 }
 
@@ -585,6 +700,21 @@ impl DataBlock {
             Self::Opaque(inner) => inner.num_values,
         }
     }
+
+    pub fn data_size(&self) -> u64 {
+        match self {
+            Self::AllNull(_) => 0,
+            Self::Nullable(inner) => inner.data_size(),
+            Self::FixedWidth(inner) => inner.data_size(),
+            Self::FixedSizeList(inner) => inner.data_size(),
+            Self::VariableWidth(inner) => inner.data_size(),
+            // not implemented yet
+            Self::Struct(_) => 0,
+            // not implemented yet
+            Self::Dictionary(_) => 0,
+            Self::Opaque(inner) => inner.data_size(), // Handle OpaqueBlock case
+        }
+    }
 }
 
 macro_rules! as_type {
@@ -704,6 +834,8 @@ fn arrow_binary_to_data_block(
         offsets,
         bits_per_offset,
         num_values,
+        block_info: BlockInfo::new(),
+        used_encodings: UsedEncoding::new(),
     })
 }
 
@@ -868,12 +1000,16 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             data: LanceBuffer::Owned(indices_bytes),
             bits_per_value: bits_per_index,
             num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }
     } else {
         FixedWidthDataBlock {
             data: LanceBuffer::Borrowed(indices.to_data().buffers()[0].clone()),
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }
     };
 
@@ -956,6 +1092,8 @@ impl DataBlock {
                     data,
                     bits_per_value: 1,
                     num_values,
+                    block_info: BlockInfo::new(),
+                    used_encoding: UsedEncoding::new(),
                 })
             }
             DataType::Date32
@@ -984,6 +1122,8 @@ impl DataBlock {
                     data,
                     bits_per_value: data_type.byte_width() as u64 * 8,
                     num_values,
+                    block_info: BlockInfo::new(),
+                    used_encoding: UsedEncoding::new(),
                 })
             }
             DataType::Null => Self::AllNull(AllNullDataBlock { num_values }),
@@ -1030,6 +1170,8 @@ impl DataBlock {
                 Nullability::Some(nulls) => Self::Nullable(NullableDataBlock {
                     data: Box::new(encoded),
                     nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
+                    block_info: BlockInfo::new(),
+                    used_encoding: UsedEncoding::new(),
                 }),
                 _ => unreachable!(),
             }
@@ -1056,16 +1198,21 @@ impl From<ArrayRef> for DataBlock {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int8Type;
+    use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
         ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
+    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
+    use rand::SeedableRng;
+
     use crate::buffer::LanceBuffer;
 
     use super::DataBlock;
 
+    use arrow::compute::concat;
+    use arrow_array::Array;
     #[test]
     fn test_string_to_data_block() {
         // Converting string arrays that contain nulls to DataBlock
@@ -1318,5 +1465,78 @@ mod tests {
             dict.dictionary.as_variable_width().unwrap().data.len(),
             65536
         );
+    }
+
+    #[test]
+    fn test_data_size() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
+        // test data_size() when input has no nulls
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
+
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+        assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
+
+        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+        assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
+
+        // test data_size() when input has nulls
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        // the NullBuffer.len() returns the length in bits so we divide_round_up by 8
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
+        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
+        let block = DataBlock::from_array(arr.clone());
+
+        let array_data = arr.to_data();
+        let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
+        let array_nulls_size_in_bytes = (arr.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
+
+        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
+        let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
+        let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
+
+        let concatenated_array = concat(&[
+            &*Arc::new(arr1.clone()) as &dyn Array,
+            &*Arc::new(arr2.clone()) as &dyn Array,
+            &*Arc::new(arr3.clone()) as &dyn Array,
+        ])
+        .unwrap();
+        let total_buffer_size: usize = concatenated_array
+            .to_data()
+            .buffers()
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum();
+
+        let total_nulls_size_in_bytes = (concatenated_array.nulls().unwrap().len() + 7) / 8;
+        assert!(block.data_size() == (total_buffer_size + total_nulls_size_in_bytes) as u64);
     }
 }

@@ -15,7 +15,9 @@ use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock, VariableWidthBlock};
+use crate::data::{
+    BlockInfo, DataBlock, FixedWidthDataBlock, NullableDataBlock, UsedEncoding, VariableWidthBlock,
+};
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -324,11 +326,15 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
             data: bytes.data,
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_buffer),
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
         });
         if let Some(validity) = validity_buffer {
             Ok(DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(string_data),
                 nulls: LanceBuffer::from(validity),
+                block_info: BlockInfo::new(),
+                used_encoding: UsedEncoding::new(),
             }))
         } else {
             Ok(string_data)
@@ -366,6 +372,8 @@ impl BinaryEncoder {
                 data: LanceBuffer::empty(),
                 num_values,
                 offsets: LanceBuffer::reinterpret_vec(vec![0_u32; num_values as usize + 1]),
+                block_info: BlockInfo::new(),
+                used_encodings: UsedEncoding::new(),
             }
         } else {
             VariableWidthBlock {
@@ -373,6 +381,8 @@ impl BinaryEncoder {
                 data: LanceBuffer::empty(),
                 num_values,
                 offsets: LanceBuffer::reinterpret_vec(vec![0_u64; num_values as usize + 1]),
+                block_info: BlockInfo::new(),
+                used_encodings: UsedEncoding::new(),
             }
         }
     }
@@ -412,6 +422,8 @@ fn get_indices_from_string_arrays(
                 bits_per_value: 64,
                 data: LanceBuffer::empty(),
                 num_values: 0,
+                block_info: BlockInfo::new(),
+                used_encoding: UsedEncoding::new(),
             }),
             0,
         );
@@ -440,6 +452,8 @@ fn get_indices_from_string_arrays(
         bits_per_value: 64,
         data: LanceBuffer::reinterpret_vec(indices),
         num_values: num_rows as u64,
+        block_info: BlockInfo::new(),
+        used_encoding: UsedEncoding::new(),
     });
     (indices, null_adjustment)
 }
@@ -491,6 +505,8 @@ impl ArrayEncoder for BinaryEncoder {
             offsets: encoded_indices_data.data,
             data: data.data,
             num_values: data.num_values,
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
         });
 
         let bytes_buffer_index = *buffer_index;

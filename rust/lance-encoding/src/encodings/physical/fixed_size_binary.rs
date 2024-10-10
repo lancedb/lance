@@ -10,7 +10,7 @@ use lance_core::Result;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
@@ -109,6 +109,8 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
             data: bytes.data,
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_buffer),
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
         });
 
         Ok(string_data)
@@ -143,6 +145,8 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
             bits_per_value: 8 * self.byte_width as u64,
             data: bytes_data.data,
             num_values: bytes_data.num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         });
 
         let encoded_data = self.bytes_encoder.encode(

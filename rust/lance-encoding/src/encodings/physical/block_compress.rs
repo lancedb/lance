@@ -11,7 +11,7 @@ use std::{
 use lance_core::{Error, Result};
 
 use crate::{
-    data::{DataBlock, OpaqueBlock},
+    data::{BlockInfo, DataBlock, OpaqueBlock, UsedEncoding},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
 };
@@ -123,6 +123,8 @@ impl ArrayEncoder for CompressedBufferEncoder {
         let compressed_data = DataBlock::Opaque(OpaqueBlock {
             buffers: vec![compressed_buf.into()],
             num_values: uncompressed_data.num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         });
 
         let comp_buf_index = *buffer_index;

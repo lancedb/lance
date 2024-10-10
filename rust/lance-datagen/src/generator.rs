@@ -373,7 +373,7 @@ where
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct Seed(u64);
+pub struct Seed(pub u64);
 pub const DEFAULT_SEED: Seed = Seed(42);
 
 impl From<u64> for Seed {
