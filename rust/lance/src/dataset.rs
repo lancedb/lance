@@ -332,6 +332,12 @@ impl Dataset {
         }
     }
 
+    /// Check out the latest version of the dataset
+    pub async fn checkout_latest(&mut self) -> Result<()> {
+        self.manifest = Arc::new(self.latest_manifest().await?);
+        Ok(())
+    }
+
     async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_location = self
@@ -3210,6 +3216,11 @@ mod tests {
         assert_eq!(dataset.count_fragments(), 1);
         assert_eq!(fragments[0].metadata.deletion_file, None);
         assert_eq!(dataset.manifest, original_manifest);
+
+        // Checkout latest and then go back.
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+        let mut dataset = dataset.checkout_version(1).await.unwrap();
 
         // Restore to a previous version
         dataset.restore().await.unwrap();

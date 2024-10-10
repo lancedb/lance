@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import pickle
 import random
 import sqlite3
+import time
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -1443,8 +1445,9 @@ class LanceDataset(pa.dataset.Dataset):
         shuffle_partition_concurrency: Optional[int] = None,
         # experimental parameters
         ivf_centroids_file: Optional[str] = None,
-        precomputed_partiton_dataset: Optional[str] = None,
+        precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        filter_nan: bool = True,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1501,6 +1504,10 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
+        filter_nan: bool
+            Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
+            values are present (and otherwise will not). Disables the null filter used
+            for nullable columns. Obtains a small speed boost.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1652,43 +1659,75 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_partitions"] = num_partitions
 
-            if (precomputed_partiton_dataset is not None) and (ivf_centroids is None):
+            # Handle timing for various parts of accelerated builds
+            timers = {}
+
+            if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
                     "ivf_centroids must be provided when"
-                    " precomputed_partiton_dataset is provided"
+                    " precomputed_partition_dataset is provided"
                 )
-            if precomputed_partiton_dataset is not None:
+            if precomputed_partition_dataset is not None:
+                logging.info("Using provided precomputed partition dataset")
                 precomputed_ds = LanceDataset(
-                    precomputed_partiton_dataset, storage_options=storage_options
+                    precomputed_partition_dataset, storage_options=storage_options
                 )
-                if len(precomputed_ds.get_fragments()) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one fragment"
-                    )
-                files = precomputed_ds.get_fragments()[0].data_files()
-                if len(files) != 1:
-                    raise ValueError(
-                        "precomputed_partiton_dataset must have only one files"
-                    )
-                kwargs["precomputed_partitions_file"] = precomputed_partiton_dataset
+                if not (
+                    "PQ" in index_type
+                    and pq_codebook is None
+                    and accelerator is not None
+                    and "precomputed_partitions_file" in kwargs
+                ):
+                    # In this case, the precomputed partitions file would be used
+                    # without being turned into a set of precomputed buffers, so it
+                    # needs to have a very specific format
+                    if len(precomputed_ds.get_fragments()) != 1:
+                        raise ValueError(
+                            "precomputed_partition_dataset must have only one fragment"
+                        )
+                    files = precomputed_ds.get_fragments()[0].data_files()
+                    if len(files) != 1:
+                        raise ValueError(
+                            "precomputed_partition_dataset must have only one files"
+                        )
+                kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
             if accelerator is not None and ivf_centroids is None:
+                logging.info("Computing new precomputed partition dataset")
                 # Use accelerator to train ivf centroids
                 from .vector import (
                     compute_partitions,
                     train_ivf_centroids_on_accelerator,
                 )
 
+                timers["ivf_train:start"] = time.time()
                 ivf_centroids, kmeans = train_ivf_centroids_on_accelerator(
                     self,
                     column[0],
                     num_partitions,
                     metric,
                     accelerator,
+                    filter_nan=filter_nan,
                 )
+                timers["ivf_train:end"] = time.time()
+                ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
+                logging.info("ivf training time: %ss", ivf_train_time)
+                timers["ivf_assign:start"] = time.time()
+                num_sub_vectors_cur = None
+                if "PQ" in index_type and pq_codebook is None:
+                    # compute residual subspace columns in the same pass
+                    num_sub_vectors_cur = num_sub_vectors
                 partitions_file = compute_partitions(
-                    self, column[0], kmeans, batch_size=20480
+                    self,
+                    column[0],
+                    kmeans,
+                    batch_size=20480,
+                    num_sub_vectors=num_sub_vectors_cur,
+                    filter_nan=filter_nan,
                 )
+                timers["ivf_assign:end"] = time.time()
+                ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
+                logging.info("ivf transform time: %ss", ivf_assign_time)
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -1730,6 +1769,56 @@ class LanceDataset(pa.dataset.Dataset):
                 )
             kwargs["num_sub_vectors"] = num_sub_vectors
 
+            if (
+                pq_codebook is None
+                and accelerator is not None
+                and "precomputed_partitions_file" in kwargs
+            ):
+                logging.info("Computing new precomputed shuffle buffers for PQ.")
+                partitions_file = kwargs["precomputed_partitions_file"]
+                del kwargs["precomputed_partitions_file"]
+
+                partitions_ds = LanceDataset(partitions_file)
+                # Use accelerator to train pq codebook
+                from .vector import (
+                    compute_pq_codes,
+                    train_pq_codebook_on_accelerator,
+                )
+
+                timers["pq_train:start"] = time.time()
+                pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
+                    partitions_ds,
+                    metric,
+                    accelerator=accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                )
+                timers["pq_train:end"] = time.time()
+                pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
+                logging.info("pq training time: %ss", pq_train_time)
+                timers["pq_assign:start"] = time.time()
+                shuffle_output_dir, shuffle_buffers = compute_pq_codes(
+                    partitions_ds,
+                    kmeans_list,
+                    batch_size=20480,
+                )
+                timers["pq_assign:end"] = time.time()
+                pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
+                logging.info("pq transform time: %ss", pq_assign_time)
+                # Save disk space
+                if precomputed_partition_dataset is not None and os.path.exists(
+                    partitions_file
+                ):
+                    logging.info(
+                        "Temporary partitions file stored at %s,"
+                        "you may want to delete it.",
+                        partitions_file,
+                    )
+
+                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                    shuffle_output_dir, "data"
+                )
+
             if pq_codebook is not None:
                 # User provided IVF centroids
                 if _check_for_numpy(pq_codebook) and isinstance(
@@ -1763,9 +1852,21 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
+        times = []
+        times.append(time.time())
         self._ds.create_index(
             column, index_type, name, replace, storage_options, kwargs
         )
+        times.append(time.time())
+        logging.info("Final create_index time: %ss", times[1] - times[0])
+        # Save disk space
+        if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_shuffle_buffers_path"]
+        ):
+            logging.info(
+                "Temporary shuffle buffers stored at %s, you may want to delete it.",
+                kwargs["precomputed_shuffle_buffers_path"],
+            )
         return self
 
     def session(self) -> Session:
