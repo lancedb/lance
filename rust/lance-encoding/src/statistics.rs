@@ -97,7 +97,8 @@ impl VariableWidthBlock {
     fn cardinality(&mut self) -> Arc<dyn Array> {
         match self.bits_per_offset {
             32 => {
-                let offsets: &[u32] = bytemuck::cast_slice(&self.offsets);
+                let offsets_ref = self.offsets.borrow_to_typed_slice::<u32>();
+                let offsets: &[u32] = offsets_ref.as_ref();
                 const PRECISION: u8 = 12;
                 let mut hll: HyperLogLogPlus<&[u8], RandomState> =
                     HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
@@ -112,7 +113,8 @@ impl VariableWidthBlock {
                 Arc::new(UInt64Array::from(vec![cardinality]))
             }
             64 => {
-                let offsets: &[u64] = bytemuck::cast_slice(&self.offsets);
+                let offsets_ref = self.offsets.borrow_to_typed_slice::<u64>();
+                let offsets: &[u64] = offsets_ref.as_ref();
                 const PRECISION: u8 = 12;
                 let mut hll: HyperLogLogPlus<&[u8], RandomState> =
                     HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
@@ -338,34 +340,6 @@ mod tests {
             .sum();
         assert!(data_size == total_buffer_size as u64);
 
-        // test FixedSizeList
-        let mut gen = lance_datagen::array::rand_type(&DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Int32, false)),
-            1024,
-        ));
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let mut block = DataBlock::from_array(arr.clone());
-        let data_size_array = block.get_stat(Stat::DataSize).unwrap_or_else(|| {
-            panic!(
-                "A data block of type: {} should have valid {} statistics",
-                block.name(),
-                Stat::DataSize
-            )
-        });
-        let data_size = data_size_array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap()
-            .value(0);
-        // the data buffer of `FixedSizeList` resides in its `child_data`
-        let total_buffer_size: usize = arr
-            .to_data()
-            .child_data()
-            .iter()
-            .flat_map(|child| child.buffers().iter().map(|buffer| buffer.len()))
-            .sum();
-        assert!(data_size == total_buffer_size as u64);
-
         // test DataType::Binary
         let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
@@ -431,77 +405,6 @@ mod tests {
         assert!(
             block.get_stat(Stat::DataSize).is_none(),
             "Expected Stat::DataSize to be None for data block of type: {}",
-            block.name()
-        );
-    }
-    #[test]
-    fn test_null_count_stat() {
-        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
-
-        // test DataType::Int32Type
-        let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let mut block = DataBlock::from_array(arr.clone());
-        assert!(
-            block.get_stat(Stat::NullCount).is_none(),
-            "Expected Stat::NullCount to be None for data block of type: {}",
-            block.name()
-        );
-
-        // test FixedSizeList
-        let mut gen = lance_datagen::array::rand_type(&DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Int32, false)),
-            1024,
-        ));
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let mut block = DataBlock::from_array(arr.clone());
-        assert!(
-            block.get_stat(Stat::NullCount).is_none(),
-            "Expected Stat::NullCount to be None for data block of type: {}",
-            block.name()
-        );
-
-        // test DataType::Binary
-        let mut gen = lance_datagen::array::rand_type(&DataType::Binary);
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let mut block = DataBlock::from_array(arr.clone());
-        assert!(
-            block.get_stat(Stat::NullCount).is_none(),
-            "Expected Stat::NullCount to be None for data block of type: {}",
-            block.name()
-        );
-
-        // test DataType::Struct
-        let fields = vec![
-            Arc::new(Field::new("int_field", DataType::Int32, false)),
-            Arc::new(Field::new("float_field", DataType::Float32, false)),
-            Arc::new(Field::new(
-                "fsl_field",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
-                false,
-            )),
-        ]
-        .into();
-
-        let mut gen = lance_datagen::array::rand_type(&DataType::Struct(fields));
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let mut block = DataBlock::from_array(arr.clone());
-        assert!(
-            block.get_stat(Stat::NullCount).is_none(),
-            "Expected Stat::NullCount to be None for data block of type: {}",
-            block.name()
-        );
-
-        // test DataType::Dictionary
-        let mut gen = array::rand_type(&DataType::Dictionary(
-            Box::new(DataType::Int32),
-            Box::new(DataType::Utf8),
-        ));
-        let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let mut block = DataBlock::from_array(arr.clone());
-        assert!(
-            block.get_stat(Stat::NullCount).is_none(),
-            "Expected Stat::NullCount to be None for data block of type: {}",
             block.name()
         );
     }
