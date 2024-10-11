@@ -102,7 +102,7 @@ use lance_core::{Error, Result};
 use snafu::{location, Location};
 
 // We assume 16 bits is good enough for rep-def levels.  This gives us
-// 65536 levels of struct nested and 16 levels of list nesting.
+// 65536 levels of struct nesting and list nesting.
 pub type LevelBuffer = Vec<u16>;
 
 // As we build up rep/def from arrow arrays we record a
