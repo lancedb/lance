@@ -105,6 +105,8 @@ use snafu::{location, Location};
 // 65536 levels of struct nested and 16 levels of list nesting.
 pub type LevelBuffer = Vec<u16>;
 
+// As we build up rep/def from arrow arrays we record a
+// series of RawRepDef objects
 #[derive(Clone, Debug)]
 enum RawRepDef {
     Offsets(Arc<[i64]>),
@@ -112,6 +114,8 @@ enum RawRepDef {
     NoNull(usize),
 }
 
+/// Represents repetition and definition levels that have been
+/// serialized into a pair of (optional) level buffers
 #[derive(Debug)]
 pub struct SerializedRepDefs {
     // If None, there are no lists
@@ -121,7 +125,8 @@ pub struct SerializedRepDefs {
 }
 
 impl SerializedRepDefs {
-    fn empty() -> Self {
+    /// Creates an empty SerializedRepDefs (no repetition, all valid)
+    pub fn empty() -> Self {
         Self {
             repetition_levels: None,
             definition_levels: None,
@@ -129,6 +134,38 @@ impl SerializedRepDefs {
     }
 }
 
+/// The RepDefBuilder is used to collect offsets & validity buffers
+/// from arrow structures.  Once we have those we use the SerializerContext
+/// to build the actual repetition and definition levels by walking through
+/// the arrow constructs in reverse order.
+///
+/// The algorithm for definition levels is pretty simple
+///
+/// Given:
+///  - a validity buffer of [T, F, F, T, T]
+///  - a current def level of 5
+///  - a current definitions of [0, 1, 3, 3, 0]
+///
+/// We walk through the definitions and replace them with
+///   the current level whenever a value is invalid.  Thus
+///   our output is: [0, 5, 5, 3, 0]
+///
+/// The algorithm for repetition levels is more complex.
+///
+/// The first time we see an offsets buffer we initialize the
+/// rep levels to have a value of 1 whenever a list starts and 0
+/// otherwise.
+///
+/// So, given offsets of [0, 3, 5] and no repetition we create
+/// rep levels [1 0 0 1 0]
+///
+/// However, we also record the offsets into our current rep and
+/// def levels and all operations happen in context of those offsets.
+///
+/// For example, continuing the above scenario we might then see validity
+/// of [T, F].  This is strange since our validity bitmap has 2 items but
+/// we would have 5 definition levels.  We can use our current offsets
+/// ([0, 3, 5]) to expand [T, F] into [T, T, T, F, F].
 struct SerializerContext {
     last_offsets: Option<Arc<[i64]>>,
     rep_levels: LevelBuffer,
@@ -225,9 +262,20 @@ impl SerializerContext {
     }
 }
 
+/// A structure used to collect validity buffers and offsets from arrow
+/// arrays and eventually create repetition and definition levels
+///
+/// As we are encoding the structural encoders are given this struct and
+/// will record the arrow information into it.  Once we hit a leaf node we
+/// serialize the data into rep/def levels and write these into the page.
 #[derive(Clone, Default)]
 pub struct RepDefBuilder {
+    // The rep/def info we have collected so far
     repdefs: Vec<RawRepDef>,
+    // The current length, can get larger as we traverse lists (e.g. an
+    // array might have 5 lists which results in 50 items)
+    //
+    // Starts uninitialized until we see the first rep/def item
     len: Option<usize>,
 }
 
@@ -249,23 +297,24 @@ impl RepDefBuilder {
             .all(|r| matches!(r, RawRepDef::NoNull(_)))
     }
 
+    /// Return True if any layer has a validity bitmap
+    ///
+    /// Return False if all layers are non-null (the def levels can
+    /// be skipped in this case)
     pub fn has_nulls(&self) -> bool {
         self.repdefs
             .iter()
             .any(|rd| matches!(rd, RawRepDef::Validity(_)))
     }
 
+    /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
         self.check_validity_len(&validity);
         self.repdefs
             .push(RawRepDef::Validity(validity.into_inner()));
     }
 
-    pub fn add_all_null(&mut self, len: usize) {
-        self.repdefs
-            .push(RawRepDef::Validity(BooleanBuffer::new_unset(len)))
-    }
-
+    /// Registers an all-valid validity layer
     pub fn add_no_null(&mut self, len: usize) {
         self.repdefs.push(RawRepDef::NoNull(len));
     }
@@ -277,6 +326,10 @@ impl RepDefBuilder {
         self.len = Some(offsets[offsets.len() - 1] as usize);
     }
 
+    /// Adds a layer of offsets
+    ///
+    /// Note: a List/LargeList/etc. array has both offsets and validity.  The
+    /// caller should register the validity before registering the offsets
     pub fn add_offsets<O: OffsetSizeTrait>(&mut self, repetition: OffsetBuffer<O>) {
         // We should be able to zero-copy
         if O::IS_LARGE {
@@ -343,6 +396,8 @@ impl RepDefBuilder {
         }
     }
 
+    /// Converts the validity / offsets buffers that have been gathered so far
+    /// into repetition and definition levels
     pub fn serialize(builders: Vec<Self>) -> SerializedRepDefs {
         if builders.is_empty() {
             return SerializedRepDefs::empty();
@@ -376,6 +431,10 @@ impl RepDefBuilder {
     }
 }
 
+/// Starts with serialized repetition and definition levels and unravels
+/// them into validity buffers and offsets buffers
+///
+/// This is used during decoding to create the neccesary arrow structures
 #[derive(Debug)]
 pub struct RepDefUnraveler {
     rep_levels: Option<LevelBuffer>,
@@ -385,6 +444,7 @@ pub struct RepDefUnraveler {
 }
 
 impl RepDefUnraveler {
+    /// Creates a new unraveler from serialized repetition and definition information
     pub fn new(rep_levels: Option<LevelBuffer>, def_levels: Option<LevelBuffer>) -> Self {
         Self {
             rep_levels,
@@ -393,6 +453,10 @@ impl RepDefUnraveler {
         }
     }
 
+    /// Unravels a layer of offsets from the unraveler into the given offset width
+    ///
+    /// When decoding a list the caller should first unravel the offsets and then
+    /// unravel the validity (this is the opposite order used during encoding)
     pub fn unravel_offsets<T: ArrowNativeType>(&mut self) -> Result<OffsetBuffer<T>> {
         let rep_levels = self
             .rep_levels
@@ -463,6 +527,7 @@ impl RepDefUnraveler {
         }
     }
 
+    /// Unravels a layer of validity from the definition levels
     pub fn unravel_validity(&mut self) -> Option<NullBuffer> {
         let Some(def_levels) = &self.def_levels else {
             return None;

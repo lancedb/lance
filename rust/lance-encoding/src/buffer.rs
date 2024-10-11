@@ -104,6 +104,8 @@ impl LanceBuffer {
         hex::encode_upper(self)
     }
 
+    /// Converts the buffer into a hex string, inserting a space
+    /// between words
     pub fn as_spaced_hex(&self, bytes_per_word: u32) -> String {
         let hex = self.as_hex();
         let chars_per_word = bytes_per_word as usize * 2;

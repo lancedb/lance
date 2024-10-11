@@ -106,6 +106,7 @@ impl NullableDataBlock {
     }
 }
 
+/// A block representing the same constant value repeated many times
 #[derive(Debug, PartialEq)]
 pub struct ConstantDataBlock {
     /// Data buffer containing the value
@@ -647,6 +648,11 @@ impl DataBlock {
         }
     }
 
+    /// Removes any validity information from the block
+    ///
+    /// This does not filter the block (e.g. remove rows).  It only removes
+    /// the validity bitmaps (if present).  Any garbage masked by null bits
+    /// will now appear as proper values.
     pub fn remove_validity(self) -> Self {
         match self {
             Self::Empty() => Self::Empty(),
