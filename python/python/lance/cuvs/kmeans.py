@@ -57,6 +57,7 @@ class KMeans(KMeansTorch):
         device: Optional[str] = None,
         itopk_size: int = 10,
         balance_factor: Optional[float] = None,
+        cluster_counts: Optional[torch.Tensor] = None,
     ):
         if metric == "dot":
             raise ValueError(
@@ -71,6 +72,8 @@ class KMeans(KMeansTorch):
             centroids=centroids,
             seed=seed,
             device=device,
+            balance_factor=balance_factor,
+            cluster_counts=cluster_counts,
         )
 
         if self.device.type != "cuda" or not torch.cuda.is_available():
