@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    hash::{Hash, RandomState},
+    sync::Arc,
+};
 
 use arrow_array::{Array, UInt64Array};
+use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 
 use crate::data::{
     DataBlock, DictionaryDataBlock, FixedWidthDataBlock, OpaqueBlock, StructDataBlock,
@@ -61,21 +66,6 @@ impl GetStat for DataBlock {
     }
 }
 
-impl GetStat for FixedWidthDataBlock {
-    fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
-        match stat {
-            Stat::NullCount => None,
-            _ => {
-                // initialize statistics
-                if self.block_info.info.read().unwrap().is_empty() {
-                    self.compute_statistics();
-                }
-                self.block_info.info.read().unwrap().get(&stat).cloned()
-            }
-        }
-    }
-}
-
 impl GetStat for VariableWidthBlock {
     fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
         match stat {
@@ -95,8 +85,66 @@ impl VariableWidthBlock {
     fn compute_statistics(&mut self) {
         let data_size = self.data_size();
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
+
+        let cardinality_array = self.cardinality();
         let mut info = self.block_info.info.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
+        info.insert(Stat::Cardinality, cardinality_array);
+    }
+
+    // Caveat: the computation here assumes VariableWidthBlock.offsets maps directly to VariableWidthBlock.data
+    // without any adjustment(for example, no null_adjustment for offsets)
+    fn cardinality(&mut self) -> Arc<dyn Array> {
+        match self.bits_per_offset {
+            32 => {
+                let offsets: &[u32] = bytemuck::cast_slice(&self.offsets);
+                const PRECISION: u8 = 12;
+                let mut hll: HyperLogLogPlus<&[u8], RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+
+                for i in 0..self.num_values as usize {
+                    let start = offsets[i] as usize;
+                    let end = offsets[i + 1] as usize;
+                    let binary_slice = &self.data[start..end];
+                    hll.insert(binary_slice);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            64 => {
+                let offsets: &[u64] = bytemuck::cast_slice(&self.offsets);
+                const PRECISION: u8 = 12;
+                let mut hll: HyperLogLogPlus<&[u8], RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+
+                for i in 0..self.num_values as usize {
+                    let start = offsets[i] as usize;
+                    let end = offsets[i + 1] as usize;
+                    let binary_slice = &self.data[start..end];
+                    hll.insert(binary_slice);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            _ => {
+                unreachable!("the bits_per_offset of VariableWidthBlock can only be 32 or 64")
+            }
+        }
+    }
+}
+
+impl GetStat for FixedWidthDataBlock {
+    fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
+        match stat {
+            Stat::NullCount => None,
+            _ => {
+                // initialize statistics
+                if self.block_info.info.read().unwrap().is_empty() {
+                    self.compute_statistics();
+                }
+                self.block_info.info.read().unwrap().get(&stat).cloned()
+            }
+        }
     }
 }
 
@@ -109,9 +157,11 @@ impl FixedWidthDataBlock {
         // compute this datablock's max_bit_width
         let max_bit_width = self.max_bit_width();
 
+        let cardinality = self.cardinality();
         let mut info = self.block_info.info.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::BitWidth, max_bit_width);
+        info.insert(Stat::Cardinality, cardinality);
     }
 
     fn max_bit_width(&mut self) -> Arc<dyn Array> {
@@ -149,6 +199,66 @@ impl FixedWidthDataBlock {
             _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
         }
     }
+
+    fn cardinality(&mut self) -> Arc<dyn Array> {
+        match self.bits_per_value {
+            8 => {
+                let u8_slice_ref = self.data.borrow_to_typed_slice::<u8>();
+                let u8_slice = u8_slice_ref.as_ref();
+
+                const PRECISION: u8 = 12;
+                let mut hll: HyperLogLogPlus<u8, RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+                for val in u8_slice {
+                    hll.insert(val);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            16 => {
+                let u16_slice_ref = self.data.borrow_to_typed_slice::<u16>();
+                let u16_slice = u16_slice_ref.as_ref();
+                const PRECISION: u8 = 12;
+                let mut hll: HyperLogLogPlus<u16, RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+                for val in u16_slice {
+                    hll.insert(val);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            32 => {
+                let u32_slice_ref = self.data.borrow_to_typed_slice::<u32>();
+                let u32_slice = u32_slice_ref.as_ref();
+
+                const PRECISION: u8 = 12;
+                let mut hll: HyperLogLogPlus<u32, RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+                for val in u32_slice {
+                    hll.insert(val);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            64 => {
+                let u64_slice_ref = self.data.borrow_to_typed_slice::<u64>();
+                let u64_slice = u64_slice_ref.as_ref();
+
+                const PRECISION: u8 = 12;
+                let mut hll: HyperLogLogPlus<u64, RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+                for val in u64_slice {
+                    hll.insert(val);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            // when self.bits_per_value is not (8, 16, 32, 64), it's a `DataBlock` generated from
+            // `bitpack` and it's cardinality should equal to it's parent `DataBlock`'s cardinaliry
+            // (Except Decimal128, Decimal256)
+            _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
+        }
+    }
 }
 
 impl GetStat for OpaqueBlock {
@@ -178,8 +288,8 @@ mod tests {
 
     use arrow::datatypes::Int32Type;
     use arrow_array::{
-        ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array,
-        UInt64Array, UInt8Array,
+        ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
@@ -1008,6 +1118,230 @@ mod tests {
             None,
             "Expected Stat::BitWidth to be None for data block: {:?}",
             block.name()
+        );
+    }
+
+    #[test]
+    fn test_cardinality_fixed_width_datablock() {
+        let int8_array = Int8Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+        println!(
+            "block.get_stat(Stat::Cardinality): {:?}",
+            block.get_stat(Stat::Cardinality)
+        );
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![3])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from(vec![1, 1, 1]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+        println!(
+            "block.get_stat(Stat::Cardinality): {:?}",
+            block.get_stat(Stat::Cardinality)
+        );
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![1])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from_iter(0..10);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+        println!(
+            "block.get_stat(Stat::Cardinality): {:?}",
+            block.get_stat(Stat::Cardinality)
+        );
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![10])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from_iter(-10..10);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let mut block = DataBlock::from_array(array_ref);
+        println!(
+            "block.get_stat(Stat::Cardinality): {:?}",
+            block.get_stat(Stat::Cardinality)
+        );
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![20])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            int8_array
+        );
+
+        let int8_array = Int8Array::from_iter(-100..100);
+        let int8_array2 = Int8Array::from_iter(-10..10);
+        let array_ref1: ArrayRef = Arc::new(int8_array.clone());
+        let array_ref2: ArrayRef = Arc::new(int8_array2.clone());
+        let mut block = DataBlock::from_arrays(
+            &[array_ref1, array_ref2],
+            (int8_array.len() + int8_array2.len()) as u64,
+        );
+        println!(
+            "block.get_stat(Stat::Cardinality): {:?}",
+            block.get_stat(Stat::Cardinality)
+        );
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![200])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            int8_array
+        );
+
+        let int16_array = Int16Array::from_iter(-100..100);
+        let int16_array2 = Int16Array::from_iter(-10..10);
+        let array_ref1: ArrayRef = Arc::new(int16_array.clone());
+        let array_ref2: ArrayRef = Arc::new(int16_array2.clone());
+        let mut block = DataBlock::from_arrays(
+            &[array_ref1, array_ref2],
+            (int16_array.len() + int8_array2.len()) as u64,
+        );
+        println!(
+            "block.get_stat(Stat::Cardinality): {:?}",
+            block.get_stat(Stat::Cardinality)
+        );
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![200])) as ArrayRef;
+        let actual_bit_width = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_bit_width,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            int16_array
+        );
+    }
+
+    #[test]
+    fn test_cardinality_variable_width_datablock() {
+        let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_cardinality = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_cardinality = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_cardinality,
+            Some(expected_cardinality.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_cardinality,
+            string_array,
+        );
+
+        let string_array = StringArray::from(vec![
+            Some("to be named by variables"),
+            Some("to be passed as arguments to procedures"),
+            Some("to be returned as values of procedures"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_cardinality = Arc::new(UInt64Array::from(vec![3])) as ArrayRef;
+        let actual_cardinality = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_cardinality,
+            Some(expected_cardinality.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_cardinality,
+            string_array,
+        );
+
+        let string_array = StringArray::from(vec![
+            Some("Samuel Eilenberg"),
+            Some("Saunders Mac Lane"),
+            Some("Samuel Eilenberg"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_cardinality = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_cardinality = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_cardinality,
+            Some(expected_cardinality.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_cardinality,
+            string_array,
+        );
+
+        let string_array = LargeStringArray::from(vec![Some("hello"), Some("world")]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_cardinality = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_cardinality = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_cardinality,
+            Some(expected_cardinality.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_cardinality,
+            string_array,
+        );
+
+        let string_array = LargeStringArray::from(vec![
+            Some("to be named by variables"),
+            Some("to be passed as arguments to procedures"),
+            Some("to be returned as values of procedures"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_cardinality = Arc::new(UInt64Array::from(vec![3])) as ArrayRef;
+        let actual_cardinality = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_cardinality,
+            Some(expected_cardinality.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_cardinality,
+            string_array,
+        );
+
+        let string_array = LargeStringArray::from(vec![
+            Some("Samuel Eilenberg"),
+            Some("Saunders Mac Lane"),
+            Some("Samuel Eilenberg"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_cardinality = Arc::new(UInt64Array::from(vec![2])) as ArrayRef;
+        let actual_cardinality = block.get_stat(Stat::Cardinality);
+
+        assert_eq!(
+            actual_cardinality,
+            Some(expected_cardinality.clone()),
+            "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
+            expected_cardinality,
+            string_array,
         );
     }
 }
