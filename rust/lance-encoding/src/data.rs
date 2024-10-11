@@ -171,13 +171,6 @@ impl NullableDataBlock {
         })
     }
 
-    // count_nulls will be handled differently after V2.1
-    pub fn count_nulls(&mut self) -> u64 {
-        let nulls_buf = &self.borrow_and_clone().into_buffers()[0];
-        let boolean_buf = BooleanBuffer::new(nulls_buf.into(), 0, nulls_buf.len() * 8);
-        self.data.num_values() - boolean_buf.count_set_bits() as u64
-    }
-
     pub fn data_size(&self) -> u64 {
         self.data.data_size() + self.nulls.len() as u64
     }
@@ -217,7 +210,7 @@ impl FixedWidthDataBlock {
         }
     }
 
-    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
@@ -708,11 +701,13 @@ impl DataBlock {
             Self::FixedWidth(inner) => inner.data_size(),
             Self::FixedSizeList(inner) => inner.data_size(),
             Self::VariableWidth(inner) => inner.data_size(),
-            // not implemented yet
-            Self::Struct(_) => 0,
-            // not implemented yet
-            Self::Dictionary(_) => 0,
-            Self::Opaque(inner) => inner.data_size(), // Handle OpaqueBlock case
+            Self::Struct(_) => {
+                todo!("the data_size method for StructDataBlock is not implemented yet")
+            }
+            Self::Dictionary(_) => {
+                todo!("the data_size method for DictionaryDataBlock is not implemented yet")
+            }
+            Self::Opaque(inner) => inner.data_size(),
         }
     }
 }
