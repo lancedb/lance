@@ -156,7 +156,7 @@ impl SerializerContext {
 
     fn record_all_valid(&mut self, len: usize) {
         self.current_def += 1;
-        if self.def_levels.len() == 0 {
+        if self.def_levels.is_empty() {
             self.def_levels.resize(len, 0);
         }
     }
@@ -185,7 +185,7 @@ impl SerializerContext {
         self.has_nulls = true;
         let def_level = self.current_def;
         self.current_def += 1;
-        if self.def_levels.len() == 0 {
+        if self.def_levels.is_empty() {
             self.def_levels.resize(validity.len(), 0);
         }
         if let Some(last_offsets) = &self.last_offsets {
@@ -333,9 +333,8 @@ impl RepDefBuilder {
                 all_offsets.extend(offsets.iter().copied());
                 for layer in layers {
                     let last = *all_offsets.last().unwrap();
-                    let offsets = match layer {
-                        RawRepDef::Offsets(offsets) => offsets,
-                        _ => unreachable!(),
+                    let RawRepDef::Offsets(offsets) = layer else {
+                        unreachable!()
                     };
                     all_offsets.extend(offsets.iter().skip(1).map(|off| *off + last));
                 }
@@ -465,9 +464,8 @@ impl RepDefUnraveler {
     }
 
     pub fn unravel_validity(&mut self) -> Option<NullBuffer> {
-        let def_levels = match &self.def_levels {
-            Some(def_levels) => def_levels,
-            None => return None,
+        let Some(def_levels) = &self.def_levels else {
+            return None;
         };
         let current_def_cmp = self.current_def_cmp;
         self.current_def_cmp += 1;

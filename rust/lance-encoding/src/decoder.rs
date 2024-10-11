@@ -1000,7 +1000,7 @@ impl DecodeBatchScheduler {
         // root_field.children and schema.fields should be identical at this point but the latter
         // has field ids and the former does not.  This line restores that.
         // TODO:  Is there another way to create the root field without forcing a trip through arrow?
-        root_field.children = schema.fields.clone();
+        root_field.children.clone_from(&schema.fields);
         root_field
             .metadata
             .insert("__lance_decoder_root".to_string(), "true".to_string());

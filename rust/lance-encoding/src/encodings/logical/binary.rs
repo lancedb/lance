@@ -167,7 +167,7 @@ impl DecodeArrayTask for BinaryArrayDecoder {
     fn decode(self: Box<Self>) -> Result<ArrayRef> {
         let data_type = self.data_type;
         let arr = self.inner.decode()?;
-        match dbg!(data_type) {
+        match data_type {
             DataType::Binary => Ok(Self::from_list_array::<BinaryType>(arr.as_list::<i32>())),
             DataType::LargeBinary => Ok(Self::from_list_array::<LargeBinaryType>(
                 arr.as_list::<i64>(),
