@@ -473,30 +473,23 @@ impl RepDefUnraveler {
             // This is a strange access pattern.  We are iterating over the rep/def levels and
             // at the same time writing the rep/def levels.  This means we need both a mutable
             // and immutable reference to the rep/def levels.
-            //
-            // SAFETY: We can cheat mutability here because the write will always be to values
-            //         we have already read in the iteration
-            // SAFETY: We are doing our own bounds checking by asserting the lens are the same
-            unsafe {
-                let mut rep_read_iter = rep_levels.as_mut_ptr();
-                let mut def_read_iter = def_levels.as_mut_ptr();
-
-                let mut rep_write_iter = rep_levels.as_mut_ptr();
-                let mut def_write_iter = def_levels.as_mut_ptr();
-
-                let rep_end = rep_read_iter.add(rep_levels.len());
-                while rep_read_iter != rep_end {
-                    if *rep_read_iter != 0 {
+            let mut read_idx = 0;
+            let mut write_idx = 0;
+            while read_idx < rep_levels.len() {
+                // SAFETY: We assert that rep_levels and def_levels have the same
+                // len and read_idx and write_idx can never go past the end.
+                unsafe {
+                    let rep_val = *rep_levels.get_unchecked(read_idx);
+                    if rep_val != 0 {
                         // Finish the current list
                         offsets.push(to_offset(curlen)?);
-                        *rep_write_iter = *rep_read_iter - 1;
-                        *def_write_iter = *def_read_iter;
-                        rep_write_iter = rep_write_iter.add(1);
-                        def_write_iter = def_write_iter.add(1);
+                        *rep_levels.get_unchecked_mut(write_idx) = rep_val - 1;
+                        *def_levels.get_unchecked_mut(write_idx) =
+                            *def_levels.get_unchecked(read_idx);
+                        write_idx += 1;
                     }
                     curlen += 1;
-                    rep_read_iter = rep_read_iter.add(1);
-                    def_read_iter = def_read_iter.add(1);
+                    read_idx += 1;
                 }
             }
             offsets.push(to_offset(curlen)?);
@@ -505,20 +498,20 @@ impl RepDefUnraveler {
             Ok(OffsetBuffer::new(ScalarBuffer::from(offsets)))
         } else {
             // SAFETY: See above loop
-            unsafe {
-                let mut rep_read_iter = rep_levels.as_mut_ptr();
-                let mut rep_write_iter = rep_levels.as_mut_ptr();
-
-                let rep_end = rep_read_iter.add(rep_levels.len());
-                while rep_read_iter != rep_end {
-                    if *rep_read_iter != 0 {
+            let mut read_idx = 0;
+            let mut write_idx = 0;
+            while read_idx < rep_levels.len() {
+                // SAFETY: read_idx / write_idx cannot go past rep_levels.len()
+                unsafe {
+                    let rep_val = *rep_levels.get_unchecked(read_idx);
+                    if rep_val != 0 {
                         // Finish the current list
                         offsets.push(to_offset(curlen)?);
-                        *rep_write_iter = *rep_read_iter - 1;
-                        rep_write_iter = rep_write_iter.add(1);
+                        *rep_levels.get_unchecked_mut(write_idx) = rep_val - 1;
+                        write_idx += 1;
                     }
                     curlen += 1;
-                    rep_read_iter = rep_read_iter.add(1);
+                    read_idx += 1;
                 }
             }
             offsets.push(to_offset(curlen)?);
