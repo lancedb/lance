@@ -175,6 +175,14 @@ message Flat {
   Compression compression = 3;
 }
 
+// Compression algorithm where all values have a constant value
+message Constant {
+  // The value (TODO: define encoding for literals?)
+  bytes value = 1;
+  // The number of values
+  uint64 num_values = 2;
+}
+
 // Items are bitpacked in a buffer
 message Bitpacked {
   // the number of bits used for a value in the buffer
@@ -253,6 +261,7 @@ message ArrayEncoding {
         Bitpacked bitpacked = 10;
         FixedSizeBinary fixed_size_binary = 11;
         BitpackedForNonNeg bitpacked_for_non_neg = 12;
+        Constant constant = 13;
     }
 }
 
@@ -277,5 +286,20 @@ message ColumnEncoding {
     google.protobuf.Empty values = 1;
     ZoneIndex zone_index = 2;
     Blob blob = 3;
+  }
+}
+
+message MiniBlockLayout {
+  // Description of the compression of repetition levels (e.g. how many bits per rep)
+  ArrayEncoding rep_compression = 1;
+  // Description of the compression of definition levels (e.g. how many bits per def)
+  ArrayEncoding def_compression = 2;
+  // Description of the compression of values
+  ArrayEncoding value_compression = 3;
+}
+
+message PageLayout {
+  oneof layout {
+    MiniBlockLayout mini_block_layout = 1;
   }
 }

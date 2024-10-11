@@ -14,19 +14,19 @@ use futures::{
     stream::{FuturesOrdered, FuturesUnordered},
     FutureExt, StreamExt, TryStreamExt,
 };
+use itertools::Itertools;
 use log::trace;
 use snafu::{location, Location};
 
 use crate::{
-    data::{AllNullDataBlock, DataBlock},
     decoder::{
         DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-        NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        NextDecodeTask, PageEncoding, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
-    encoder::{
-        EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers,
-    },
+    encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
+    repdef::RepDefBuilder,
 };
 use lance_core::{Error, Result};
 
@@ -541,6 +541,80 @@ impl DecodeArrayTask for SimpleStructDecodeTask {
     }
 }
 
+/// A structural encoder for struct fields
+///
+/// The struct's validity is added to the rep/def builder
+/// and the builder is cloned to all children.
+pub struct StructStructuralEncoder {
+    children: Vec<Box<dyn FieldEncoder>>,
+}
+
+impl StructStructuralEncoder {
+    pub fn new(children: Vec<Box<dyn FieldEncoder>>) -> Self {
+        Self { children }
+    }
+}
+
+impl FieldEncoder for StructStructuralEncoder {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        mut repdef: RepDefBuilder,
+        row_number: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        let struct_array = array.as_struct();
+        if let Some(validity) = struct_array.nulls() {
+            repdef.add_validity_bitmap(validity.clone());
+        } else {
+            repdef.add_no_null(struct_array.len());
+        }
+        let child_tasks = self
+            .children
+            .iter_mut()
+            .zip(struct_array.columns().iter())
+            .map(|(encoder, arr)| {
+                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
+    }
+
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        self.children
+            .iter_mut()
+            .map(|encoder| encoder.flush(external_buffers))
+            .flatten_ok()
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn num_columns(&self) -> u32 {
+        self.children
+            .iter()
+            .map(|child| child.num_columns())
+            .sum::<u32>()
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        let mut child_columns = self
+            .children
+            .iter_mut()
+            .map(|child| child.finish(external_buffers))
+            .collect::<FuturesOrdered<_>>();
+        async move {
+            let mut encoded_columns = Vec::new();
+            while let Some(child_cols) = child_columns.next().await {
+                encoded_columns.extend(child_cols?);
+            }
+            Ok(encoded_columns)
+        }
+        .boxed()
+    }
+}
+
 pub struct StructFieldEncoder {
     children: Vec<Box<dyn FieldEncoder>>,
     column_index: u32,
@@ -563,6 +637,8 @@ impl FieldEncoder for StructFieldEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
     ) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
@@ -570,7 +646,9 @@ impl FieldEncoder for StructFieldEncoder {
             .children
             .iter_mut()
             .zip(struct_array.columns().iter())
-            .map(|(encoder, arr)| encoder.maybe_encode(arr.clone(), external_buffers))
+            .map(|(encoder, arr)| {
+                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
     }
@@ -608,18 +686,15 @@ impl FieldEncoder for StructFieldEncoder {
             // Add a column for the struct header
             let mut header = EncodedColumn::default();
             header.final_pages.push(EncodedPage {
-                array: EncodedArray {
-                    data: DataBlock::AllNull(AllNullDataBlock {
-                        num_values: num_rows_seen,
-                    }),
-                    encoding: pb::ArrayEncoding {
-                        array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
-                            pb::SimpleStruct {},
-                        )),
-                    },
-                },
+                data: Vec::new(),
+                description: PageEncoding::Legacy(pb::ArrayEncoding {
+                    array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
+                        pb::SimpleStruct {},
+                    )),
+                }),
                 num_rows: num_rows_seen,
                 column_idx: column_index,
+                row_number: 0, // Not used by legacy encoding
             });
             columns.push(header);
             // Now run finish on the children

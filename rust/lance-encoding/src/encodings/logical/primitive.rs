@@ -1,31 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, ops::Range, sync::Arc, vec};
+use std::{fmt::Debug, iter, ops::Range, sync::Arc, vec};
 
 use arrow::array::AsArray;
 use arrow_array::{make_array, Array, ArrayRef};
-use arrow_buffer::bit_util;
+use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
 use snafu::{location, Location};
 
-use lance_core::{datatypes::Field, Result};
+use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
-    data::DataBlock,
+    buffer::LanceBuffer,
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{
         DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
-        PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange, ScheduledScanLine,
-        SchedulerContext, SchedulingJob,
+        PageEncoding, PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange,
+        ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
-        ArrayEncodingStrategy, EncodeTask, EncodedColumn, EncodedPage, EncodingOptions,
-        FieldEncoder, OutOfLineBuffers,
+        ArrayEncodingStrategy, CompressionStrategy, EncodeTask, EncodedColumn, EncodedPage,
+        EncodingOptions, FieldEncoder, MiniBlockChunk, MiniBlockCompressed, OutOfLineBuffers,
     },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
+    format::{pb, ProtobufUtils},
+    repdef::{LevelBuffer, RepDefBuilder},
 };
 
 #[derive(Debug)]
@@ -74,8 +77,11 @@ impl PrimitiveFieldScheduler {
                     column_buffers: buffers,
                     positions_and_sizes: &page.buffer_offsets_and_sizes,
                 };
-                let scheduler =
-                    decoder_from_array_encoding(&page.encoding, &page_buffers, &data_type);
+                let scheduler = decoder_from_array_encoding(
+                    page.encoding.as_legacy(),
+                    &page_buffers,
+                    &data_type,
+                );
                 PrimitivePage {
                     scheduler,
                     num_rows: page.num_rows,
@@ -396,6 +402,8 @@ pub struct AccumulationQueue {
     keep_original_array: bool,
     buffered_arrays: Vec<ArrayRef>,
     current_bytes: u64,
+    // Row number of the first item in buffered_arrays, reset on flush
+    row_number: u64,
     // This is only for logging / debugging purposes
     column_index: u32,
 }
@@ -408,12 +416,16 @@ impl AccumulationQueue {
             current_bytes: 0,
             column_index,
             keep_original_array,
+            row_number: u64::MAX,
         }
     }
 
     /// Adds an array to the queue, if there is enough data then the queue is flushed
     /// and returned
-    pub fn insert(&mut self, array: ArrayRef) -> Option<Vec<ArrayRef>> {
+    pub fn insert(&mut self, array: ArrayRef, row_number: u64) -> Option<(Vec<ArrayRef>, u64)> {
+        if self.row_number == u64::MAX {
+            self.row_number = row_number;
+        }
         self.current_bytes += array.get_array_memory_size() as u64;
         if self.current_bytes > self.cache_bytes {
             debug!(
@@ -423,7 +435,9 @@ impl AccumulationQueue {
             // Push into buffered_arrays without copy since we are about to flush anyways
             self.buffered_arrays.push(array);
             self.current_bytes = 0;
-            Some(std::mem::take(&mut self.buffered_arrays))
+            let row_number = self.row_number;
+            self.row_number = u64::MAX;
+            Some((std::mem::take(&mut self.buffered_arrays), row_number))
         } else {
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
@@ -439,7 +453,7 @@ impl AccumulationQueue {
         }
     }
 
-    pub fn flush(&mut self) -> Option<Vec<ArrayRef>> {
+    pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64)> {
         if self.buffered_arrays.is_empty() {
             trace!(
                 "No final flush since no data at column {}",
@@ -453,7 +467,9 @@ impl AccumulationQueue {
                 self.current_bytes
             );
             self.current_bytes = 0;
-            Some(std::mem::take(&mut self.buffered_arrays))
+            let row_number = self.row_number;
+            self.row_number = 0;
+            Some((std::mem::take(&mut self.buffered_arrays), row_number))
         }
     }
 }
@@ -498,10 +514,13 @@ impl PrimitiveFieldEncoder {
             let data = DataBlock::from_arrays(&arrays, num_values);
             let mut buffer_index = 0;
             let array = encoder.encode(data, &data_type, &mut buffer_index)?;
+            let (data, description) = array.into_buffers();
             Ok(EncodedPage {
-                array,
+                data,
+                description: PageEncoding::Legacy(description),
                 num_rows: num_values,
                 column_idx,
+                row_number: 0, // legacy encoders do not use
             })
         })
         .map(|res_res| res_res.unwrap())
@@ -552,9 +571,11 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         &mut self,
         array: ArrayRef,
         _external_buffers: &mut OutOfLineBuffers,
+        _repdef: RepDefBuilder,
+        _row_number: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(arrays) = self.accumulation_queue.insert(array) {
-            Ok(self.do_flush(arrays)?)
+        if let Some(arrays) = self.accumulation_queue.insert(array, /*row_number=*/ 0) {
+            Ok(self.do_flush(arrays.0)?)
         } else {
             Ok(vec![])
         }
@@ -563,7 +584,368 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Ok(self.do_flush(arrays)?)
+            Ok(self.do_flush(arrays.0)?)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    fn num_columns(&self) -> u32 {
+        1
+    }
+
+    fn finish(
+        &mut self,
+        _external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
+    }
+}
+
+/// An encoder for primitive (leaf) arrays
+///
+/// This encoder is fairly complicated and follows a number of paths depending
+/// on the data.
+///
+/// First, we convert the validity & offsets information into repetition and
+/// definition levels.  Then we compress the data itself into a single buffer.
+///
+/// If the data is narrow then we encode the data in small chunks (each chunk
+/// should be 1-2 disk sectors or 4KiB - 8KiB and contains a buffer of
+/// repetition, a buffer of definition, and a buffer of value data).  This
+/// approach is called "mini-block".  These mini-blocks are stored into a
+/// single data buffer.
+///
+/// If the data is wide then we zip together the repetition and definition value
+/// with the value data into a single buffer.  This approach is called "zipped".
+///
+/// If there is any repetition information then we create a repetition index (TODO)
+///
+/// In addition, the compression process may create zero or more metadata buffers.
+/// For example, a dictionary compression will create dictionary metadata.  Any
+/// mini-block approach has a metadata buffer of block sizes.  This metadata is
+/// stored in a separate buffer on disk and read at initialization time.
+///
+/// TODO: We should concatenate metadata buffers from all pages into a single buffer
+/// at (roughly) the end of the file so there is, at most, one read per column of
+/// metadata per file.
+pub struct PrimitiveStructuralEncoder {
+    // Accumulates arrays until we have enough data to justify a disk page
+    accumulation_queue: AccumulationQueue,
+    accumulated_repdefs: Vec<RepDefBuilder>,
+    // The compression strategy we will use to compress the data
+    compression_strategy: Arc<dyn CompressionStrategy>,
+    column_index: u32,
+    field: Field,
+}
+
+impl PrimitiveStructuralEncoder {
+    pub fn try_new(
+        options: &EncodingOptions,
+        compression_strategy: Arc<dyn CompressionStrategy>,
+        column_index: u32,
+        field: Field,
+    ) -> Result<Self> {
+        Ok(Self {
+            accumulation_queue: AccumulationQueue::new(
+                options.cache_bytes_per_column,
+                column_index,
+                options.keep_original_array,
+            ),
+            accumulated_repdefs: Vec::new(),
+            column_index,
+            compression_strategy,
+            field,
+        })
+    }
+
+    // TODO: This is a heuristic we may need to tune at some point
+    //
+    // As data gets narrow then the "zipping" process gets too expensive
+    //   and we prefer mini-block
+    // As data gets wide then the # of values per block shrinks (very wide)
+    //   data doesn't even fit in a mini-block and the block overhead gets
+    //   too large and we prefer zipped.
+    fn is_narrow(num_rows: u64, num_bytes: u64) -> bool {
+        let avg_bytes_per_row = num_bytes as f64 / num_rows as f64;
+        avg_bytes_per_row < 128.0
+    }
+
+    // Converts value data, repetition levels, and definition levels into a single
+    // buffer of mini-blocks.  In addition, creates a buffer of mini-block metadata
+    // which tells us the size of each block.
+    //
+    // Each chunk is serialized as:
+    // | rep_len (2 bytes) | def_len (2 bytes) | rep | def | values |
+    //
+    // Each block has a u16 word of metadata.  The upper 12 bits contain 1/4 the
+    // # of bytes in the block (if the block does not have an even number of bytes
+    // then up to 3 bytes of padding are added).  The lower 4 bits describe the log_2
+    // number of value (e.g. if there are 1024 then the lower 4 bits will be
+    // 0xA)  All blocks except the last must have power-of-two number of values.
+    // This not only makes metadata smaller but it makes decoding easier since
+    // batch sizes are typically a power of 2.
+    //
+    // This means blocks can have 1 to 32Ki values and 2 - 8Ki bytes.  However,
+    // blocks may be limited to smaller values if there are extreme amounts of
+    // repetition or definition levels.  E.g. the worst case will have 2 bytes
+    // each of repetition and definition which means a block would be limited
+    // to 1024 values (giving 4KiB for value data and 4KiB for rep/def)
+    //
+    // TODO: We should pass a "max num values" to the mini-block compressor.  Today
+    // we don't expect any miniblocks to contain more than 1Ki values so maybe we
+    // could also make that the max.
+    //
+    // All metadata words are serialized (as little endian) into a single buffer
+    // of metadata values.
+    fn serialize_miniblocks(
+        miniblocks: MiniBlockCompressed,
+        rep: Vec<LanceBuffer>,
+        def: Vec<LanceBuffer>,
+    ) -> (LanceBuffer, LanceBuffer) {
+        let bytes_rep = rep.iter().map(|r| r.len()).sum::<usize>();
+        let bytes_def = def.iter().map(|d| d.len()).sum::<usize>();
+        // Each chunk starts with the size of the rep buffer (2 bytes) and the size of
+        // the def buffer (2 bytes)
+        let bytes_repdef_len = rep.len() * 4;
+        let mut data_buffer =
+            Vec::with_capacity(miniblocks.data.len() + bytes_rep + bytes_def + bytes_repdef_len);
+        let mut meta_buffer = Vec::with_capacity(miniblocks.data.len() * 2);
+
+        let mut value_offset = 0;
+        for ((chunk, rep), def) in miniblocks.chunks.into_iter().zip(rep).zip(def) {
+            let chunk_bytes = chunk.num_bytes as u64 + rep.len() as u64 + def.len() as u64 + 4;
+            // TODO: Might there be some corner cases where this fails?  E.g. what happens
+            // if a chunk has 32Ki values and the rep/def is very wide and ends up being
+            // more than 8KiB?
+            assert!(chunk_bytes <= 16 * 1024);
+            assert!(chunk_bytes > 0);
+            let quarter_chunk_bytes = (chunk_bytes - 1).div_ceil(4);
+            let pad_bytes = (4 * quarter_chunk_bytes) - (chunk_bytes - 1);
+
+            let metadata = ((quarter_chunk_bytes << 4) | chunk.log_num_values as u64) as u16;
+            meta_buffer.extend_from_slice(&metadata.to_le_bytes());
+
+            assert!(rep.len() < u16::MAX as usize);
+            assert!(def.len() < u16::MAX as usize);
+            let bytes_rep = rep.len() as u16;
+            let bytes_def = def.len() as u16;
+
+            data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
+            data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
+
+            data_buffer.extend_from_slice(&rep);
+            data_buffer.extend_from_slice(&def);
+
+            let num_value_bytes = chunk.num_bytes as usize;
+            let values =
+                &miniblocks.data[value_offset as usize..value_offset as usize + num_value_bytes];
+            data_buffer.extend_from_slice(values);
+
+            data_buffer.extend(iter::repeat(0).take(pad_bytes as usize));
+
+            value_offset += num_value_bytes as u64;
+        }
+
+        (
+            LanceBuffer::Owned(data_buffer),
+            LanceBuffer::Owned(meta_buffer),
+        )
+    }
+
+    /// Compresses a buffer of levels
+    ///
+    /// TODO: Use bit-packing here
+    fn compress_levels(
+        levels: Option<LevelBuffer>,
+        num_values: u64,
+        compression_strategy: &dyn CompressionStrategy,
+        chunks: &[MiniBlockChunk],
+    ) -> Result<(Vec<LanceBuffer>, pb::ArrayEncoding)> {
+        if let Some(levels) = levels {
+            debug_assert_eq!(num_values as usize, levels.len());
+            // Make the levels into a FixedWidth data block
+            let mut levels_buf = LanceBuffer::reinterpret_vec(levels);
+            let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: levels_buf.borrow_and_clone(),
+                bits_per_value: 16,
+                num_values,
+                block_info: BlockInfo::new(),
+                used_encoding: UsedEncoding::new(),
+            });
+            let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
+            // Pick a block compressor
+            let (compressor, compressor_desc) =
+                compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
+            // Compress blocks of levels (sized according to the chunks)
+            let mut buffers = Vec::with_capacity(chunks.len());
+            let mut off = 0;
+            let mut values_counter = 0;
+            for chunk in chunks {
+                let chunk_num_values = chunk.num_values(values_counter, num_values);
+                values_counter += chunk_num_values;
+                let level_bytes = chunk_num_values as usize * 2;
+                let chunk_levels = levels_buf.slice_with_length(off, level_bytes);
+                let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: chunk_levels,
+                    bits_per_value: 16,
+                    num_values: chunk_num_values,
+                    block_info: BlockInfo::new(),
+                    used_encoding: UsedEncoding::new(),
+                });
+                let compressed_levels = compressor.compress(chunk_levels_block)?;
+                off += level_bytes;
+                buffers.push(compressed_levels);
+            }
+            Ok((buffers, compressor_desc))
+        } else {
+            // Everything is valid or we have no repetition so we encode as a constant
+            // array of 0
+            let data = chunks.iter().map(|_| LanceBuffer::empty()).collect();
+            let scalar = 0_u16.to_le_bytes().to_vec();
+            let encoding = ProtobufUtils::constant(scalar, num_values);
+            Ok((data, encoding))
+        }
+    }
+
+    fn encode_miniblock(
+        column_idx: u32,
+        field: &Field,
+        compression_strategy: &dyn CompressionStrategy,
+        arrays: Vec<ArrayRef>,
+        repdefs: Vec<RepDefBuilder>,
+        num_values: u64,
+        row_number: u64,
+    ) -> Result<EncodedPage> {
+        let repdef = RepDefBuilder::serialize(repdefs);
+
+        // TODO: Parquet sparsely encodes values here.  We could do the same but
+        // then we won't have log2 values per chunk.  This means more metadata
+        // and potentially more decoder assymetry.  However, it may be worth
+        // investigating at some point
+
+        let data = DataBlock::from_arrays(&arrays, num_values);
+        let num_values = data.num_values();
+        // The validity is encoded in repdef so we can remove it
+        let data = data.remove_validity();
+
+        let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
+        let (compressed_data, value_encoding) = compressor.compress(data)?;
+
+        let (compressed_rep, rep_encoding) = Self::compress_levels(
+            repdef.repetition_levels,
+            num_values,
+            compression_strategy,
+            &compressed_data.chunks,
+        )?;
+
+        let (compressed_def, def_encoding) = Self::compress_levels(
+            repdef.definition_levels,
+            num_values,
+            compression_strategy,
+            &compressed_data.chunks,
+        )?;
+
+        let (block_value_buffer, block_meta_buffer) =
+            Self::serialize_miniblocks(compressed_data, compressed_rep, compressed_def);
+
+        let description = ProtobufUtils::miniblock(rep_encoding, def_encoding, value_encoding);
+        Ok(EncodedPage {
+            num_rows: num_values,
+            column_idx,
+            data: vec![block_meta_buffer, block_value_buffer],
+            description: PageEncoding::Structural(description),
+            row_number,
+        })
+    }
+
+    // Creates an encode task, consuming all buffered data
+    fn do_flush(
+        &mut self,
+        arrays: Vec<ArrayRef>,
+        repdefs: Vec<RepDefBuilder>,
+        row_number: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        let column_idx = self.column_index;
+        let compression_strategy = self.compression_strategy.clone();
+        let field = self.field.clone();
+        let task = spawn_cpu(move || {
+            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+            let num_bytes = arrays
+                .iter()
+                .map(|arr| arr.get_buffer_memory_size() as u64)
+                .sum();
+
+            // TODO: Calculation of statistics that can be used to choose compression algorithm
+
+            if Self::is_narrow(num_values, num_bytes) {
+                Self::encode_miniblock(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    arrays,
+                    repdefs,
+                    num_values,
+                    row_number,
+                )
+            } else {
+                todo!("Full zipped encoding")
+            }
+        })
+        .boxed();
+        Ok(vec![task])
+    }
+
+    fn extract_validity_buf(array: &dyn Array, repdef: &mut RepDefBuilder) {
+        if let Some(validity) = array.nulls() {
+            repdef.add_validity_bitmap(validity.clone());
+        } else {
+            repdef.add_no_null(array.len());
+        }
+    }
+
+    fn extract_validity(array: &dyn Array, repdef: &mut RepDefBuilder) {
+        match array.data_type() {
+            DataType::Null => {
+                repdef.add_validity_bitmap(NullBuffer::new(BooleanBuffer::new_unset(array.len())));
+            }
+            DataType::FixedSizeList(_, _) => {
+                Self::extract_validity_buf(array, repdef);
+                Self::extract_validity(array.as_fixed_size_list().values(), repdef);
+            }
+            DataType::Dictionary(_, _) => {
+                unreachable!()
+            }
+            _ => Self::extract_validity_buf(array, repdef),
+        }
+    }
+}
+
+impl FieldEncoder for PrimitiveStructuralEncoder {
+    // Buffers data, if there is enough to write a page then we create an encode task
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        _external_buffers: &mut OutOfLineBuffers,
+        mut repdef: RepDefBuilder,
+        row_number: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        Self::extract_validity(array.as_ref(), &mut repdef);
+        self.accumulated_repdefs.push(repdef);
+
+        if let Some((arrays, row_number)) = self.accumulation_queue.insert(array, row_number) {
+            let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
+            Ok(self.do_flush(arrays, accumulated_repdefs, row_number)?)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // If there is any data left in the buffer then create an encode task from it
+    fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        if let Some((arrays, row_number)) = self.accumulation_queue.flush() {
+            let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
+            Ok(self.do_flush(arrays, accumulated_repdefs, row_number)?)
         } else {
             Ok(vec![])
         }

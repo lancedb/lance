@@ -67,6 +67,12 @@ pub struct Field {
 }
 
 impl Field {
+    /// Shortcut for creating a field with no field id (i.e. from the same info
+    /// needed to create an Arrow field)
+    pub fn new_arrow(name: &str, data_type: DataType, nullable: bool) -> Result<Self> {
+        Self::try_from(ArrowField::new(name, data_type, nullable))
+    }
+
     /// Returns arrow data type.
     pub fn data_type(&self) -> DataType {
         match &self.logical_type {

@@ -337,7 +337,7 @@ impl LanceFileReader {
             None,
             Arc::<DecoderMiddlewareChain>::default(),
             &FileMetadataCache::no_cache(),
-        )
+                    )
         .await
         .infer_error()?;
         Ok(Self {
