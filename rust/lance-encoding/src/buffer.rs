@@ -225,6 +225,9 @@ impl LanceBuffer {
     pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
+        if self.len() % std::mem::size_of::<T>() != 0 {
+            panic!("attempt to borrow_to_typed_slice to data type of size {} but we have {} bytes which isn't evenly divisible", std::mem::size_of::<T>(), self.len());
+        }
 
         if is_aligned {
             ScalarBuffer::<T>::from(self.borrow_and_clone().into_buffer())
@@ -446,5 +449,36 @@ mod tests {
     fn test_hex() {
         let buf = LanceBuffer::Owned(vec![1, 2, 15, 20]);
         assert_eq!("01020F14", buf.as_hex());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_to_typed_slice_invalid() {
+        let mut buf = LanceBuffer::Owned(vec![0, 1, 2]);
+        buf.borrow_to_typed_slice::<u16>();
+    }
+
+    #[test]
+    fn test_to_typed_slice() {
+        // Buffer is aligned, no copy will be made, both calls
+        // should get same ptr
+        let mut buf = LanceBuffer::Owned(vec![0, 1]);
+        let borrow = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr = borrow.as_ref().as_ptr();
+        let borrow2 = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr2 = borrow2.as_ref().as_ptr();
+
+        assert_eq!(view_ptr, view_ptr2);
+
+        let bytes = bytes::Bytes::from(vec![0, 1, 2]);
+        let sliced = bytes.slice(1..3);
+        // Intentionally LYING about alignment here to trigger test
+        let mut buf = LanceBuffer::from_bytes(sliced, 1);
+        let borrow = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr = borrow.as_ref().as_ptr();
+        let borrow2 = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr2 = borrow2.as_ref().as_ptr();
+
+        assert_ne!(view_ptr, view_ptr2);
     }
 }
