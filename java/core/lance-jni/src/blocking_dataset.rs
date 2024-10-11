@@ -171,6 +171,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_with_ffi_schema<'local>(
     env: &mut JNIEnv<'local>,
     arrow_schema_addr: jlong,
@@ -225,6 +226,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     arrow_array_stream_addr: jlong,
@@ -249,6 +251,7 @@ fn inner_create_with_ffi_stream<'local>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_dataset<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
