@@ -280,10 +280,16 @@ def train_ivf_centroids_on_accelerator(
     kmeans.fit(ds)
 
     centroids = kmeans.centroids.cpu().numpy()
+    counts = kmeans.counts.cpu().numpy()
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         np.save(f, centroids)
     logging.info("Saved centroids to %s", f.name)
+
+    if balance_factor is not None:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            np.save(f, counts)
+        logging.info("Saved cluster counts to %s", f.name)
 
     return centroids, kmeans
 

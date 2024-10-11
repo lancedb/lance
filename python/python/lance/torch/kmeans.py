@@ -61,6 +61,7 @@ class KMeans:
         seed: Optional[int] = None,
         device: Optional[str] = None,
         balance_factor: Optional[float] = None,
+        cluster_counts: Optional[torch.Tensor] = None,
     ):
         self.k = k
         self.max_iters = max_iters
@@ -86,8 +87,10 @@ class KMeans:
         self.balance_factor = balance_factor
         self.padded_centroids = None
 
-        self.counts = torch.zeros(k, device=self.device)
-        # TODO add counts as a param
+        if cluster_counts is None:
+            self.counts = torch.zeros(k, device=self.device)
+        else:
+            self.counts = cluster_counts
 
         self.y2 = None
 
