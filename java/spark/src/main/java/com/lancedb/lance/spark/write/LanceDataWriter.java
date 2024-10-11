@@ -15,7 +15,9 @@
 package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.FragmentMetadata;
+import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.SparkOptions;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.write.DataWriter;
@@ -90,8 +92,9 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
     @Override
     public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
       LanceArrowWriter arrowWriter = LanceDatasetAdapter.getArrowWriter(schema, 1024);
+      WriteParams params = SparkOptions.genWriteParamsFromConfig(config);
       Callable<FragmentMetadata> fragmentCreator
-          = () -> LanceDatasetAdapter.createFragment(config.getDatasetUri(), arrowWriter);
+          = () -> LanceDatasetAdapter.createFragment(config.getDatasetUri(), arrowWriter, params);
       FutureTask<FragmentMetadata> fragmentCreationTask = new FutureTask<>(fragmentCreator);
       Thread fragmentCreationThread = new Thread(fragmentCreationTask);
       fragmentCreationThread.start();
