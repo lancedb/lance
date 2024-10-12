@@ -506,7 +506,7 @@ def compute_partitions(
                     ids = torch.arange(id_offset, id_offset + vecs.size(0))
                     id_offset += vecs.size(0)
 
-                vecs = batch.to(kmeans.device).reshape(-1, kmeans.centroids.shape[1])
+                vecs = vecs.to(kmeans.device).reshape(-1, kmeans.centroids.shape[1])
 
                 partitions = kmeans.transform(vecs)
 
