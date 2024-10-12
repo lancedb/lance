@@ -17,7 +17,7 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_null_array, Array, ArrayRef, UInt64Array};
+use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
@@ -106,8 +106,43 @@ impl NullableDataBlock {
     }
 }
 
+/// A block representing the same constant value repeated many times
+#[derive(Debug, PartialEq)]
+pub struct ConstantDataBlock {
+    /// Data buffer containing the value
+    pub data: LanceBuffer,
+    /// The number of values
+    pub num_values: u64,
+}
+
+impl ConstantDataBlock {
+    fn into_buffers(self) -> Vec<LanceBuffer> {
+        vec![self.data]
+    }
+
+    fn into_arrow(self, _data_type: DataType, _validate: bool) -> Result<ArrayData> {
+        // We don't need this yet but if we come up with some way of serializing
+        // scalars to/from bytes then we could implement it.
+        todo!()
+    }
+
+    pub fn borrow_and_clone(&mut self) -> Self {
+        Self {
+            data: self.data.borrow_and_clone(),
+            num_values: self.num_values,
+        }
+    }
+
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            data: self.data.try_clone()?,
+            num_values: self.num_values,
+        })
+    }
+}
+
 /// A data block for a single buffer of data where each element has a fixed number of bits
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct FixedWidthDataBlock {
     /// The data buffer
     pub data: LanceBuffer,
@@ -136,16 +171,16 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
+    pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         let root_num_values = self.num_values;
         self.do_into_arrow(data_type, root_num_values, validate)
     }
 
-    fn into_buffers(self) -> Vec<LanceBuffer> {
+    pub fn into_buffers(self) -> Vec<LanceBuffer> {
         vec![self.data]
     }
 
-    fn borrow_and_clone(&mut self) -> Self {
+    pub fn borrow_and_clone(&mut self) -> Self {
         Self {
             data: self.data.borrow_and_clone(),
             bits_per_value: self.bits_per_value,
@@ -153,7 +188,7 @@ impl FixedWidthDataBlock {
         }
     }
 
-    fn try_clone(&self) -> Result<Self> {
+    pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             data: self.data.try_clone()?,
             bits_per_value: self.bits_per_value,
@@ -184,6 +219,13 @@ impl FixedSizeListBlock {
             child: Box::new(self.child.try_clone()?),
             dimension: self.dimension,
         })
+    }
+
+    fn remove_validity(self) -> Self {
+        Self {
+            child: Box::new(self.child.remove_validity()),
+            dimension: self.dimension,
+        }
     }
 
     fn num_values(&self) -> u64 {
@@ -377,6 +419,16 @@ impl StructDataBlock {
         }
     }
 
+    fn remove_validity(self) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|c| c.remove_validity())
+                .collect(),
+        }
+    }
+
     fn into_buffers(self) -> Vec<LanceBuffer> {
         self.children
             .into_iter()
@@ -406,10 +458,6 @@ impl StructDataBlock {
 }
 
 /// A data block for dictionary encoded data
-///
-/// Note that, unlike Arrow, there is only one canonical place to store nulls, and that is
-/// in the dictionary itself.  This simplifies the representation of dictionary encoded data
-/// and makes it more efficient to encode and decode.
 #[derive(Debug)]
 pub struct DictionaryDataBlock {
     /// The indices buffer
@@ -482,6 +530,8 @@ impl DictionaryDataBlock {
 /// operation as some normalization may be required.
 #[derive(Debug)]
 pub enum DataBlock {
+    Empty(),
+    Constant(ConstantDataBlock),
     AllNull(AllNullDataBlock),
     Nullable(NullableDataBlock),
     FixedWidth(FixedWidthDataBlock),
@@ -496,6 +546,8 @@ impl DataBlock {
     /// Convert self into an Arrow ArrayData
     pub fn into_arrow(self, data_type: DataType, validate: bool) -> Result<ArrayData> {
         match self {
+            Self::Empty() => Ok(new_empty_array(&data_type).to_data()),
+            Self::Constant(inner) => inner.into_arrow(data_type, validate),
             Self::AllNull(inner) => inner.into_arrow(data_type, validate),
             Self::Nullable(inner) => inner.into_arrow(data_type, validate),
             Self::FixedWidth(inner) => inner.into_arrow(data_type, validate),
@@ -515,6 +567,8 @@ impl DataBlock {
     /// The order matters and will be used to reconstruct the data block at read time.
     pub fn into_buffers(self) -> Vec<LanceBuffer> {
         match self {
+            Self::Empty() => Vec::default(),
+            Self::Constant(inner) => inner.into_buffers(),
             Self::AllNull(inner) => inner.into_buffers(),
             Self::Nullable(inner) => inner.into_buffers(),
             Self::FixedWidth(inner) => inner.into_buffers(),
@@ -532,6 +586,8 @@ impl DataBlock {
     /// all buffers will be in Borrowed mode.
     pub fn borrow_and_clone(&mut self) -> Self {
         match self {
+            Self::Empty() => Self::Empty(),
+            Self::Constant(inner) => Self::Constant(inner.borrow_and_clone()),
             Self::AllNull(inner) => Self::AllNull(inner.borrow_and_clone()),
             Self::Nullable(inner) => Self::Nullable(inner.borrow_and_clone()),
             Self::FixedWidth(inner) => Self::FixedWidth(inner.borrow_and_clone()),
@@ -549,6 +605,8 @@ impl DataBlock {
     /// ensure that all buffers are in borrowed mode before calling this method.
     pub fn try_clone(&self) -> Result<Self> {
         match self {
+            Self::Empty() => Ok(Self::Empty()),
+            Self::Constant(inner) => Ok(Self::Constant(inner.try_clone()?)),
             Self::AllNull(inner) => Ok(Self::AllNull(inner.try_clone()?)),
             Self::Nullable(inner) => Ok(Self::Nullable(inner.try_clone()?)),
             Self::FixedWidth(inner) => Ok(Self::FixedWidth(inner.try_clone()?)),
@@ -562,6 +620,8 @@ impl DataBlock {
 
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Constant(_) => "Constant",
+            Self::Empty() => "Empty",
             Self::AllNull(_) => "AllNull",
             Self::Nullable(_) => "Nullable",
             Self::FixedWidth(_) => "FixedWidth",
@@ -575,6 +635,8 @@ impl DataBlock {
 
     pub fn num_values(&self) -> u64 {
         match self {
+            Self::Empty() => 0,
+            Self::Constant(inner) => inner.num_values,
             Self::AllNull(inner) => inner.num_values,
             Self::Nullable(inner) => inner.data.num_values(),
             Self::FixedWidth(inner) => inner.num_values,
@@ -583,6 +645,26 @@ impl DataBlock {
             Self::Struct(inner) => inner.children[0].num_values(),
             Self::Dictionary(inner) => inner.indices.num_values,
             Self::Opaque(inner) => inner.num_values,
+        }
+    }
+
+    /// Removes any validity information from the block
+    ///
+    /// This does not filter the block (e.g. remove rows).  It only removes
+    /// the validity bitmaps (if present).  Any garbage masked by null bits
+    /// will now appear as proper values.
+    pub fn remove_validity(self) -> Self {
+        match self {
+            Self::Empty() => Self::Empty(),
+            Self::Constant(inner) => Self::Constant(inner),
+            Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
+            Self::Nullable(inner) => *inner.data,
+            Self::FixedWidth(inner) => Self::FixedWidth(inner),
+            Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
+            Self::VariableWidth(inner) => Self::VariableWidth(inner),
+            Self::Struct(inner) => Self::Struct(inner.remove_validity()),
+            Self::Dictionary(inner) => Self::FixedWidth(inner.indices),
+            Self::Opaque(inner) => Self::Opaque(inner),
         }
     }
 }

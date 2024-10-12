@@ -86,13 +86,21 @@ impl BlockingDataset {
         Ok(Self { inner })
     }
 
-    pub fn commit(uri: &str, operation: Operation, read_version: Option<u64>) -> Result<Self> {
+    pub fn commit(
+        uri: &str,
+        operation: Operation,
+        read_version: Option<u64>,
+        storage_options: HashMap<String, String>,
+    ) -> Result<Self> {
         let object_store_registry = Arc::new(ObjectStoreRegistry::default());
         let inner = RT.block_on(Dataset::commit(
             uri,
             operation,
             read_version,
-            None,
+            Some(ObjectStoreParams {
+                storage_options: Some(storage_options),
+                ..Default::default()
+            }),
             None,
             object_store_registry,
             false, // TODO: support enable_v2_manifest_paths
@@ -142,10 +150,11 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
     _obj: JObject,
     arrow_schema_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -156,19 +165,22 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiSchema<'local
             max_rows_per_file,
             max_rows_per_group,
             max_bytes_per_file,
-            mode
+            mode,
+            storage_options_obj
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_with_ffi_schema<'local>(
     env: &mut JNIEnv<'local>,
     arrow_schema_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
@@ -182,6 +194,7 @@ fn inner_create_with_ffi_schema<'local>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
+        storage_options_obj,
         reader,
     )
 }
@@ -192,10 +205,11 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
     _obj: JObject,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -206,19 +220,22 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_createWithFfiStream<'local
             max_rows_per_file,
             max_rows_per_group,
             max_bytes_per_file,
-            mode
+            mode,
+            storage_options_obj
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     arrow_array_stream_addr: jlong,
     path: JString,
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -229,10 +246,12 @@ fn inner_create_with_ffi_stream<'local>(
         max_rows_per_group,
         max_bytes_per_file,
         mode,
+        storage_options_obj,
         reader,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_dataset<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
@@ -240,6 +259,7 @@ fn create_dataset<'local>(
     max_rows_per_group: JObject,
     max_bytes_per_file: JObject,
     mode: JObject,
+    storage_options_obj: JObject,
     reader: impl RecordBatchReader + Send + 'static,
 ) -> Result<JObject<'local>> {
     let path_str = path.extract(env)?;
@@ -250,6 +270,7 @@ fn create_dataset<'local>(
         &max_rows_per_group,
         &max_bytes_per_file,
         &mode,
+        &storage_options_obj,
     )?;
 
     let dataset = BlockingDataset::write(reader, &path_str, Some(write_params))?;
@@ -290,20 +311,28 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitAppend<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
-    read_version_obj: JObject, // Optional<Long>
-    fragments_obj: JObject,    // List<String>, String is json serialized Fragment
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
-        inner_commit_append(&mut env, path, read_version_obj, fragments_obj)
+        inner_commit_append(
+            &mut env,
+            path,
+            read_version_obj,
+            fragments_obj,
+            storage_options_obj
+        )
     )
 }
 
 pub fn inner_commit_append<'local>(
     env: &mut JNIEnv<'local>,
     path: JString,
-    read_version_obj: JObject, // Optional<Long>
-    fragments_obj: JObject,    // List<String>, String is json serialized Fragment)
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment)
+    storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
     let json_fragments = env.get_strings(&fragments_obj)?;
     let mut fragments: Vec<Fragment> = Vec::new();
@@ -314,7 +343,20 @@ pub fn inner_commit_append<'local>(
     let op = Operation::Append { fragments };
     let path_str = path.extract(env)?;
     let read_version = env.get_u64_opt(&read_version_obj)?;
-    let dataset = BlockingDataset::commit(&path_str, op, read_version)?;
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+        Ok::<_, Error>(map)
+    })?;
+    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
     dataset.into_java(env)
 }
 
