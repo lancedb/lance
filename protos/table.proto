@@ -141,6 +141,10 @@ message Manifest {
   DataStorageFormat data_format = 15;
   
   // Table metadata.
+  //
+  // Keys with the prefix "lance." are reserved for the Lance library. Other
+  // libraries may wish to similarly prefix their configuration keys
+  // appropriately.
   map<string, string> table_metadata = 16;
 } // Manifest
 
