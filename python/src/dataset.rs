@@ -272,7 +272,7 @@ impl Operation {
         let op = LanceOperation::Overwrite {
             fragments,
             schema,
-            table_metadata: None,
+            config_upsert_values: None,
         };
         Ok(Self(op))
     }

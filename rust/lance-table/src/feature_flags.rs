@@ -58,7 +58,7 @@ pub fn apply_feature_flags(manifest: &mut Manifest, enable_stable_row_id: bool) 
     }
 
     // Test whether any table metadata has been set
-    if !manifest.table_metadata.is_empty() {
+    if !manifest.config.is_empty() {
         manifest.reader_feature_flags |= FLAG_TABLE_METADATA;
         manifest.writer_feature_flags |= FLAG_TABLE_METADATA;
     }

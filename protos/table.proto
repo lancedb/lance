@@ -86,7 +86,7 @@ message Manifest {
   // * 2: move_stable_row_ids: row IDs are tracked and stable after move operations
   //       (such as compaction), but not updates.
   // * 4: use v2 format (deprecated)
-  // * 8: table metadata are present
+  // * 8: table config is present
   uint64 reader_feature_flags = 9;
 
   // Feature flags for writers.
@@ -140,12 +140,12 @@ message Manifest {
   // This specifies what format is used to store the data files.
   DataStorageFormat data_format = 15;
   
-  // Table metadata.
+  // Table config.
   //
   // Keys with the prefix "lance." are reserved for the Lance library. Other
   // libraries may wish to similarly prefix their configuration keys
   // appropriately.
-  map<string, string> table_metadata = 16;
+  map<string, string> config = 16;
 } // Manifest
 
 // Auxiliary Data attached to a version.

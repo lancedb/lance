@@ -79,8 +79,8 @@ pub struct Manifest {
     /// The storage format of the data files.
     pub data_storage_format: DataStorageFormat,
 
-    /// Table metadata.
-    pub table_metadata: HashMap<String, String>,
+    /// Table configuration.
+    pub config: HashMap<String, String>,
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -120,7 +120,7 @@ impl Manifest {
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
-            table_metadata: HashMap::new(),
+            config: HashMap::new(),
         }
     }
 
@@ -147,7 +147,7 @@ impl Manifest {
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
-            table_metadata: previous.table_metadata.clone(),
+            config: previous.config.clone(),
         }
     }
 
@@ -167,15 +167,15 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
-    /// Set the `table_metadata` from a metadata iterator
-    pub fn set_metadata(&mut self, metadata: impl IntoIterator<Item = (String, String)>) {
-        self.table_metadata.extend(metadata);
+    /// Set the `config` from an iterator
+    pub fn update_config(&mut self, upsert_values: impl IntoIterator<Item = (String, String)>) {
+        self.config.extend(upsert_values);
     }
 
-    /// Delete `table_metadata` keys using a slice of metadata keys
-    pub fn delete_metadata(&mut self, metadata_keys: &[&str]) {
-        self.table_metadata
-            .retain(|key, _| !metadata_keys.contains(&key.as_str()));
+    /// Delete `config` keys using a slice of keys
+    pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
+        self.config
+            .retain(|key, _| !delete_keys.contains(&key.as_str()));
     }
 
     /// Check the current fragment list and update the high water mark
@@ -489,7 +489,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
-            table_metadata: p.table_metadata,
+            config: p.config,
         })
     }
 }
@@ -532,7 +532,7 @@ impl From<&Manifest> for pb::Manifest {
                 file_format: m.data_storage_format.file_format.clone(),
                 version: m.data_storage_format.version.clone(),
             }),
-            table_metadata: m.table_metadata.clone(),
+            config: m.config.clone(),
         }
     }
 }
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_table_metadata() {
+    fn test_config() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "a",
             arrow_schema::DataType::Int64,
@@ -728,15 +728,15 @@ mod tests {
         ];
         let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
-        let mut metadata = HashMap::new();
-        metadata.insert("lance:test".to_string(), "value".to_string());
-        metadata.insert("other-key".to_string(), "other-value".to_string());
+        let mut config = HashMap::new();
+        config.insert("lance:test".to_string(), "value".to_string());
+        config.insert("other-key".to_string(), "other-value".to_string());
 
-        manifest.set_metadata(metadata.clone());
-        assert_eq!(manifest.table_metadata, metadata.clone());
+        manifest.update_config(config.clone());
+        assert_eq!(manifest.config, config.clone());
 
-        metadata.remove("other-key");
-        manifest.delete_metadata(&["other-key"]);
-        assert_eq!(manifest.table_metadata, metadata);
+        config.remove("other-key");
+        manifest.delete_config_keys(&["other-key"]);
+        assert_eq!(manifest.config, config);
     }
 }

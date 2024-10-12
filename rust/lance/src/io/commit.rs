@@ -939,14 +939,14 @@ mod tests {
     async fn test_good_concurrent_config_writes() {
         let dataset = get_empty_dataset().await;
 
-        // Test successful concurrent set operations
+        // Test successful concurrent insert config operations
         let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
             .iter()
             .map(|key| {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .set_table_metadata(vec![(key.to_string(), "value".to_string())])
+                        .update_config(vec![(key.to_string(), "value".to_string())])
                         .await
                 })
             })
@@ -959,7 +959,7 @@ mod tests {
         }
 
         let dataset = dataset.checkout_version(6).await.unwrap();
-        assert_eq!(dataset.manifest.table_metadata.len(), 5);
+        assert_eq!(dataset.manifest.config.len(), 5);
 
         dataset.validate().await.unwrap();
 
@@ -969,7 +969,7 @@ mod tests {
             .iter()
             .map(|key| {
                 let mut dataset = dataset.clone();
-                tokio::spawn(async move { dataset.delete_table_metadata(&[key]).await })
+                tokio::spawn(async move { dataset.delete_config_keys(&[key]).await })
             })
             .collect();
         let results = join_all(futures).await;
@@ -982,14 +982,14 @@ mod tests {
         let dataset = dataset.checkout_version(11).await.unwrap();
 
         // There are now two fewer keys
-        assert_eq!(dataset.manifest.table_metadata.len(), 3);
+        assert_eq!(dataset.manifest.config.len(), 3);
 
         dataset.validate().await.unwrap()
     }
 
     #[tokio::test]
     async fn test_bad_concurrent_config_writes() {
-        // If two concurrent set metadata operations occur for the same key, a
+        // If two concurrent insert config operations occur for the same key, a
         // `CommitConflict` should be returned
         let dataset = get_empty_dataset().await;
 
@@ -999,7 +999,7 @@ mod tests {
                 let mut dataset = dataset.clone();
                 tokio::spawn(async move {
                     dataset
-                        .set_table_metadata(vec![(key.to_string(), "value".to_string())])
+                        .update_config(vec![(key.to_string(), "value".to_string())])
                         .await
                 })
             })
