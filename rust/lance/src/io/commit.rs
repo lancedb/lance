@@ -969,11 +969,7 @@ mod tests {
             .iter()
             .map(|key| {
                 let mut dataset = dataset.clone();
-                tokio::spawn(async move {
-                    dataset
-                        .delete_table_metadata(&[key])
-                        .await
-                })
+                tokio::spawn(async move { dataset.delete_table_metadata(&[key]).await })
             })
             .collect();
         let results = join_all(futures).await;
@@ -993,7 +989,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_concurrent_config_writes() {
-        // If two concurrent set metadata operations occur for the same key, a 
+        // If two concurrent set metadata operations occur for the same key, a
         // `CommitConflict` should be returned
         let dataset = get_empty_dataset().await;
 
@@ -1008,7 +1004,7 @@ mod tests {
                 })
             })
             .collect();
-        
+
         let results = join_all(futures).await;
 
         // Assert that either the first or the second operation fails
@@ -1019,16 +1015,24 @@ mod tests {
                 0 => {
                     if !matches!(result, Ok(Ok(_))) {
                         first_operation_failed = true;
-                        assert!(result.unwrap().err().unwrap().to_string().contains(error_fragment));
+                        assert!(result
+                            .unwrap()
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains(error_fragment));
                     }
+                }
+                1 => match first_operation_failed {
+                    true => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
+                    false => assert!(result
+                        .unwrap()
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains(error_fragment)),
                 },
-                1 => {
-                    match first_operation_failed {
-                        true => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
-                        false => assert!(result.unwrap().err().unwrap().to_string().contains(error_fragment))
-                    }
-                },
-                _ => assert!(matches!(result, Ok(Ok(_))), "{:?}", result)
+                _ => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
             }
         }
     }
