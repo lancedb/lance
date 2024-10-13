@@ -148,35 +148,13 @@ pub struct MiniBlockCompressed {
 
 /// Describes the size of a mini-block chunk of data
 ///
-/// Mini-block chunks are designed to be small (just 1-2 disk sectors)
+/// Mini-block chunks are designed to be small (just a few disk sectors)
 /// and contain a power-of-two number of values (except for the last chunk)
 ///
 /// To enforce this we limit a chunk to 4Ki values and slightly less than
 /// 8KiB of compressed data.  This means that even in the extreme case
 /// where we have 4 bytes of rep/def then we will have at most 24KiB of
-/// data per mini-block.
-///
-/// We can then describe this chunk using 2 bytes of external metadata.
-/// 12 bits to describe the size in bytes (we technically store
-/// (size + 1) / 4) and 4 bits to describe the log_2 of the number of
-/// values.
-///
-/// TODO: This approach is definitely something to experiment with.  For
-/// example, if we used 3 bytes of metadata per chunk we could handle far
-/// more values per chunk.
-///
-/// This approach is limited to handling at most 2 bytes of rep/def per
-/// value which would give us 8KiB of repdef, up to (8KiB - 4) bytes of
-/// compressed data, and 4 bytes that we need ot describe the size of the
-/// rep and def buffers for a total of 16KiB per block.
-///
-/// This approach also requires up to 7 bytes of in-block metadata (up to
-/// 3 bytes of padding to make a multiple of 4 and then 4 bytes to describe
-/// the size of the rep/def levels)
-///
-/// If we have more than 2 bytes of rep/def per value we will need to fall
-/// back to some more complex scheme (e.g. 3 bytes of metadata per block)
-/// but that would be extremely unusual.
+/// data (values, repetition, and definition) per mini-block.
 pub struct MiniBlockChunk {
     // The number of bytes that make up the chunk
     //

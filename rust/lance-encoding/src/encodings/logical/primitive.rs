@@ -602,6 +602,16 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     }
 }
 
+// If we just record the size in bytes with 12 bits we would be limited to
+// 4KiB which is too small.  As a compromise we divide the size by this
+// constant which gives us up to 24KiB be introduces some padding into each
+// miniblock.  We want 24KiB so we can handle even the worst case of
+// - 4Ki values compressed into an 8188 byte buffer
+// - 4 bytes to describe rep & def lengths
+// - 16KiB of rep & def buffer (this will almost never happen)
+const MINIBLOCK_SIZE_MULTIPLIER: u64 = 6;
+const MINIBLOCK_MAX_PADDING: u64 = MINIBLOCK_SIZE_MULTIPLIER - 1;
+
 /// An encoder for primitive (leaf) arrays
 ///
 /// This encoder is fairly complicated and follows a number of paths depending
@@ -611,10 +621,9 @@ impl FieldEncoder for PrimitiveFieldEncoder {
 /// definition levels.  Then we compress the data itself into a single buffer.
 ///
 /// If the data is narrow then we encode the data in small chunks (each chunk
-/// should be 1-2 disk sectors or 4KiB - 8KiB and contains a buffer of
-/// repetition, a buffer of definition, and a buffer of value data).  This
-/// approach is called "mini-block".  These mini-blocks are stored into a
-/// single data buffer.
+/// should be a few disk sectors and contains a buffer of repetition, a buffer
+/// of definition, and a buffer of value data).  This approach is called
+/// "mini-block".  These mini-blocks are stored into a single data buffer.
 ///
 /// If the data is wide then we zip together the repetition and definition value
 /// with the value data into a single buffer.  This approach is called "zipped".
@@ -678,23 +687,19 @@ impl PrimitiveStructuralEncoder {
     // Each chunk is serialized as:
     // | rep_len (2 bytes) | def_len (2 bytes) | rep | def | values |
     //
-    // Each block has a u16 word of metadata.  The upper 12 bits contain 1/4 the
+    // Each block has a u16 word of metadata.  The upper 12 bits contain 1/6 the
     // # of bytes in the block (if the block does not have an even number of bytes
-    // then up to 3 bytes of padding are added).  The lower 4 bits describe the log_2
+    // then up to 5 bytes of padding are added).  The lower 4 bits describe the log_2
     // number of value (e.g. if there are 1024 then the lower 4 bits will be
     // 0xA)  All blocks except the last must have power-of-two number of values.
     // This not only makes metadata smaller but it makes decoding easier since
-    // batch sizes are typically a power of 2.
+    // batch sizes are typically a power of 2.  4 bits would allow us to express
+    // up to 16Ki values but we restrict this further to 4Ki values.
     //
-    // This means blocks can have 1 to 32Ki values and 2 - 8Ki bytes.  However,
-    // blocks may be limited to smaller values if there are extreme amounts of
-    // repetition or definition levels.  E.g. the worst case will have 2 bytes
-    // each of repetition and definition which means a block would be limited
-    // to 1024 values (giving 4KiB for value data and 4KiB for rep/def)
-    //
-    // TODO: We should pass a "max num values" to the mini-block compressor.  Today
-    // we don't expect any miniblocks to contain more than 1Ki values so maybe we
-    // could also make that the max.
+    // This means blocks can have 1 to 4Ki values and 6 - 24Ki bytes.  E.g.
+    // the worst case will have 2 bytes each of repetition and definition
+    // which means a block would be limited to 1024 values (giving 4KiB for
+    // value data and 4KiB for rep/def)
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
@@ -707,23 +712,28 @@ impl PrimitiveStructuralEncoder {
         let bytes_def = def.iter().map(|d| d.len()).sum::<usize>();
         // Each chunk starts with the size of the rep buffer (2 bytes) and the size of
         // the def buffer (2 bytes)
-        let bytes_repdef_len = rep.len() * 4;
-        let mut data_buffer =
-            Vec::with_capacity(miniblocks.data.len() + bytes_rep + bytes_def + bytes_repdef_len);
+        let max_bytes_repdef_len = rep.len() * 4;
+        let mut data_buffer = Vec::with_capacity(
+            miniblocks.data.len()
+                + bytes_rep
+                + bytes_def
+                + max_bytes_repdef_len
+                + MINIBLOCK_MAX_PADDING as usize,
+        );
         let mut meta_buffer = Vec::with_capacity(miniblocks.data.len() * 2);
 
         let mut value_offset = 0;
         for ((chunk, rep), def) in miniblocks.chunks.into_iter().zip(rep).zip(def) {
             let chunk_bytes = chunk.num_bytes as u64 + rep.len() as u64 + def.len() as u64 + 4;
-            // TODO: Might there be some corner cases where this fails?  E.g. what happens
-            // if a chunk has 32Ki values and the rep/def is very wide and ends up being
-            // more than 8KiB?
             assert!(chunk_bytes <= 16 * 1024);
             assert!(chunk_bytes > 0);
-            let quarter_chunk_bytes = (chunk_bytes - 1).div_ceil(4);
-            let pad_bytes = (4 * quarter_chunk_bytes) - (chunk_bytes - 1);
+            // We subtract 1 here from chunk_bytes because we want to be able to express
+            // a size of 24KiB and not (24Ki - 6)B which is what we'd get otherwise with
+            // 0xFFF
+            let divided_bytes = (chunk_bytes - 1).div_ceil(MINIBLOCK_SIZE_MULTIPLIER);
+            let pad_bytes = (MINIBLOCK_SIZE_MULTIPLIER * divided_bytes) - (chunk_bytes - 1);
 
-            let metadata = ((quarter_chunk_bytes << 4) | chunk.log_num_values as u64) as u16;
+            let metadata = ((divided_bytes << 4) | chunk.log_num_values as u64) as u16;
             meta_buffer.extend_from_slice(&metadata.to_le_bytes());
 
             assert!(rep.len() < u16::MAX as usize);
