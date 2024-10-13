@@ -36,6 +36,7 @@ lazy_static::lazy_static! {
         ]);
     pub static ref BLOB_DESC_FIELD: ArrowField =
     ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), false);
+    pub static ref BLOB_DESC_LANCE_FIELD: Field = Field::try_from(&*BLOB_DESC_FIELD).unwrap();
 }
 
 /// LogicalType is a string presentation of arrow type.

@@ -19,7 +19,8 @@ use crate::{
     buffer::LanceBuffer,
     decoder::{
         DecodeArrayTask, DecoderReady, FieldScheduler, FilterExpression, LogicalPageDecoder,
-        NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        MessageType, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
+        SchedulingJob,
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
     format::pb::{column_encoding, Blob, ColumnEncoding},
@@ -65,6 +66,7 @@ impl<'a> SchedulingJob for BlobFieldSchedulingJob<'a> {
         let next_descriptions = self.descriptions_job.schedule_next(context, priority)?;
         let mut priority = priority.current_priority();
         let decoders = next_descriptions.decoders.into_iter().map(|decoder| {
+            let decoder = decoder.into_legacy();
             let path = decoder.path;
             let mut decoder = decoder.decoder;
             let num_rows = decoder.num_rows();
@@ -90,7 +92,7 @@ impl<'a> SchedulingJob for BlobFieldSchedulingJob<'a> {
                 base_priority: priority,
             });
             priority += num_rows;
-            DecoderReady { decoder, path }
+            MessageType::DecoderReady(DecoderReady { decoder, path })
         });
         Ok(ScheduledScanLine {
             decoders: decoders.collect(),
@@ -416,6 +418,7 @@ pub mod tests {
     use crate::{
         format::pb::column_encoding,
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     lazy_static::lazy_static! {
@@ -429,7 +432,7 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_blob() {
         let field = Field::new("", DataType::LargeBinary, false).with_metadata(BLOB_META.clone());
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]

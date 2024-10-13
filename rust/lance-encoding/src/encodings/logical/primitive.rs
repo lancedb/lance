@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{fmt::Debug, iter, ops::Range, sync::Arc, vec};
+use std::{collections::VecDeque, fmt::Debug, iter, ops::Range, sync::Arc, vec};
 
 use arrow::array::AsArray;
 use arrow_array::{make_array, Array, ArrayRef};
 use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer};
-use arrow_schema::DataType;
-use futures::{future::BoxFuture, FutureExt};
-use lance_arrow::deepcopy::deep_copy_array;
+use arrow_schema::{DataType, Field as ArrowField};
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
+use lance_arrow::{deepcopy::deep_copy_array, DataTypeExt};
 use log::{debug, trace};
 use snafu::{location, Location};
 
@@ -16,11 +16,14 @@ use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
+    data::{BlockInfo, DataBlock, DataBlockBuilder, FixedWidthDataBlock, UsedEncoding},
     decoder::{
-        DecodeArrayTask, FieldScheduler, FilterExpression, LogicalPageDecoder, NextDecodeTask,
-        PageEncoding, PageInfo, PageScheduler, PrimitivePageDecoder, PriorityRange,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        BlockDecompressor, ColumnInfo, DecodeArrayTask, DecodePageTask, DecodedArray, DecodedPage,
+        DecompressorStrategy, FieldScheduler, FilterExpression, LoadedPage, LogicalPageDecoder,
+        MessageType, MiniBlockDecompressor, NextDecodeTask, PageEncoding, PageInfo, PageScheduler,
+        PrimitivePageDecoder, PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+        StructuralPageDecoder, StructuralSchedulingJob, UnloadedPage,
     },
     encoder::{
         ArrayEncodingStrategy, CompressionStrategy, EncodeTask, EncodedColumn, EncodedPage,
@@ -28,7 +31,8 @@ use crate::{
     },
     encodings::physical::{decoder_from_array_encoding, ColumnBuffers, PageBuffers},
     format::{pb, ProtobufUtils},
-    repdef::{LevelBuffer, RepDefBuilder},
+    repdef::{LevelBuffer, RepDefBuilder, RepDefUnraveler},
+    EncodingsIo,
 };
 
 #[derive(Debug)]
@@ -205,7 +209,7 @@ impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
         let decoder = Box::new(logical_decoder);
         let decoder_ready = context.locate_decoder(decoder);
         Ok(ScheduledScanLine {
-            decoders: vec![decoder_ready],
+            decoders: vec![MessageType::DecoderReady(decoder_ready)],
             rows_scheduled: num_rows_in_next,
         })
     }
@@ -239,6 +243,727 @@ impl FieldScheduler for PrimitiveFieldScheduler {
     ) -> BoxFuture<'a, Result<()>> {
         // 2.0 schedulers do not need to initialize
         std::future::ready(Ok(())).boxed()
+    }
+}
+
+/// A trait for figuring out how to schedule the data within
+/// a single page.
+trait StructuralPageScheduler: std::fmt::Debug + Send {
+    /// Fetches any metadata required for the page
+    fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>>;
+    /// Schedules the read of the given ranges in the page
+    fn schedule_ranges(
+        &self,
+        ranges: &[Range<u64>],
+        io: &dyn EncodingsIo,
+    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>>;
+}
+
+/// Metadata describing the decoded size of a mini-block
+#[derive(Debug)]
+struct ChunkMeta {
+    num_values: u64,
+    chunk_size_bytes: u64,
+}
+
+/// A task to decode a one or more mini-blocks of data into an output batch
+///
+/// Note: Two batches might share the same mini-block of data.  When this happens
+/// then each batch gets a copy of the block and each batch decodes the block independently.
+///
+/// This means we have duplicated work but it is necessary to avoid having to synchronize
+/// the decoding of the block. (TODO: test this theory)
+#[derive(Debug)]
+struct DecodeMiniBlockTask {
+    // The decompressors for the rep, def, and value buffers
+    rep_decompressor: Arc<dyn BlockDecompressor>,
+    def_decompressor: Arc<dyn BlockDecompressor>,
+    value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    // The mini-blocks to decode
+    //
+    // For each mini-block we also have the ranges of rows that we want to decode
+    // from that mini-block.  For example, if the user asks for rows 10, 10000, and 20000
+    // then we will have three chunks here and each chunk will have a small range of 1 row.
+    chunks: Vec<ScheduledChunk>,
+    // The offset into the first chunk that we want to start decoding from
+    offset_into_first_chunk: u64,
+    // The total number of rows that we are decoding
+    num_rows: u64,
+}
+
+impl DecodeMiniBlockTask {
+    fn decode_levels(
+        rep_decompressor: &dyn BlockDecompressor,
+        levels: LanceBuffer,
+    ) -> Result<Option<impl AsRef<[u16]>>> {
+        let rep = rep_decompressor.decompress(levels)?;
+        match rep {
+            DataBlock::FixedWidth(mut rep) => Ok(Some(rep.data.borrow_to_typed_slice::<u16>())),
+            DataBlock::Constant(constant) => {
+                assert_eq!(constant.data.len(), 2);
+                if constant.data[0] == 0 && constant.data[1] == 0 {
+                    Ok(None)
+                } else {
+                    // Maybe in the future we will encode all-null def or
+                    // constant rep (all 1-item lists?) in a constant encoding
+                    // but that doesn't happen today so we don't need to worry.
+                    todo!()
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // We are building a LevelBuffer (levels) and want to copy into it `total_len`
+    // values from `level_buf` starting at `offset`.
+    //
+    // We need to handle both the case where `levels` is None (no nulls encountered
+    // yet) and the case where `level_buf` is None (the input we are copying from has
+    // no nulls)
+    fn extend_levels(
+        offset: usize,
+        range: Range<u64>,
+        levels: &mut Option<LevelBuffer>,
+        level_buf: &Option<impl AsRef<[u16]>>,
+        dest_offset: usize,
+    ) {
+        if let Some(level_buf) = level_buf {
+            if levels.is_none() {
+                // This is the first non-empty def buf we've hit, fill in the past
+                // with 0 (valid)
+                let mut new_levels_vec =
+                    LevelBuffer::with_capacity(offset + (range.end - range.start) as usize);
+                new_levels_vec.extend(iter::repeat(0).take(dest_offset));
+                *levels = Some(new_levels_vec);
+            }
+            levels.as_mut().unwrap().extend(
+                level_buf.as_ref()[range.start as usize..range.end as usize]
+                    .iter()
+                    .copied(),
+            );
+        } else if let Some(levels) = levels {
+            let num_values = (range.end - range.start) as usize;
+            // This is an all-valid level_buf but we had nulls earlier and so we
+            // need to materialize it
+            levels.extend(iter::repeat(0).take(num_values));
+        }
+    }
+}
+
+impl DecodePageTask for DecodeMiniBlockTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        // First, we create output buffers for the rep and def and data
+        let mut repbuf: Option<LevelBuffer> = None;
+        let mut defbuf: Option<LevelBuffer> = None;
+        let rep_decompressor = self.rep_decompressor;
+        let def_decompressor = self.def_decompressor;
+
+        let mut remaining = self.num_rows;
+        let estimated_size_bytes = self
+            .chunks
+            .iter()
+            .map(|chunk| chunk.data.len())
+            .sum::<usize>()
+            * 2;
+        let mut data_builder =
+            DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
+        let mut to_skip = self.offset_into_first_chunk;
+        // We need to keep track of the offset into repbuf/defbuf that we are building up
+        let mut level_offset = 0;
+        // Now we iterate through each chunk and decode the data into the output buffers
+        for chunk in self.chunks.into_iter() {
+            // We always decode the entire chunk
+            let buf = chunk.data.into_buffer();
+            // The first 4 bytes describe the size of the rep/def buffers
+            let bytes_rep = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+            let bytes_def = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+            let bytes_val = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+            debug_assert!(buf.len() >= bytes_rep + bytes_def + bytes_val + 6);
+            debug_assert!(
+                buf.len() <= bytes_rep + bytes_def + bytes_val + 6 + MINIBLOCK_MAX_PADDING as usize
+            );
+            let rep = buf.slice_with_length(6, bytes_rep);
+            let def = buf.slice_with_length(6 + bytes_rep, bytes_def);
+            let values = buf.slice_with_length(6 + bytes_rep + bytes_def, bytes_val);
+
+            let values = self
+                .value_decompressor
+                .decompress(LanceBuffer::Borrowed(values), chunk.vals_in_chunk)?;
+
+            let rep = Self::decode_levels(rep_decompressor.as_ref(), LanceBuffer::Borrowed(rep))?;
+            let def = Self::decode_levels(def_decompressor.as_ref(), LanceBuffer::Borrowed(def))?;
+
+            // We've decoded the entire block.  Now we need to factor in:
+            // - The offset into the first chunk
+            // - The ranges the user asked for
+            // - The total # of rows in this task
+            //
+            // From these we can figure out which values to keep.
+            //
+            // For example, maybe we've are asked to decode 100 rows, with an offset of 50, from
+            // a block with 1024 values, and the user asked for the ranges 400..500 and 600..700
+            //
+            // In this case we want to take the values 450..500 and 600..650 from the block.
+            let mut offset = to_skip;
+            for range in chunk.ranges {
+                if to_skip > range.end - range.start {
+                    to_skip -= range.end - range.start;
+                    continue;
+                }
+                // Substract skip from start of range
+                let range = range.start + to_skip..range.end;
+                to_skip = 0;
+
+                // Truncate range to fit remaining
+                let range_len = range.end - range.start;
+                let to_take = range_len.min(remaining);
+                let range = range.start..range.start + to_take;
+
+                // Grab values and add to what we are building
+                Self::extend_levels(
+                    offset as usize,
+                    range.clone(),
+                    &mut repbuf,
+                    &rep,
+                    level_offset,
+                );
+                Self::extend_levels(
+                    offset as usize,
+                    range.clone(),
+                    &mut defbuf,
+                    &def,
+                    level_offset,
+                );
+                data_builder.append(&values, range);
+                remaining -= to_take;
+                offset += to_take;
+                level_offset += to_take as usize;
+            }
+        }
+        debug_assert_eq!(remaining, 0);
+
+        let data = data_builder.finish();
+
+        Ok(DecodedPage {
+            data,
+            repetition: repbuf,
+            definition: defbuf,
+        })
+    }
+}
+
+/// Decodes mini-block formatted data.  See [`PrimitiveStructuralEncoder`] for more
+/// details on the different layouts.
+#[derive(Debug)]
+struct MiniBlockDecoder {
+    rep_decompressor: Arc<dyn BlockDecompressor>,
+    def_decompressor: Arc<dyn BlockDecompressor>,
+    value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    data: VecDeque<ScheduledChunk>,
+    offset_in_current_chunk: u64,
+    num_rows: u64,
+}
+
+impl StructuralPageDecoder for MiniBlockDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        let mut remaining = num_rows;
+        let mut chunks = Vec::new();
+        let offset_into_first_chunk = self.offset_in_current_chunk;
+        while remaining > 0 {
+            if remaining >= self.data.front().unwrap().vals_in_chunk - self.offset_in_current_chunk
+            {
+                // We are fully consuming the next chunk
+                let chunk = self.data.pop_front().unwrap();
+                remaining -= chunk.vals_in_chunk - self.offset_in_current_chunk;
+                chunks.push(chunk);
+                self.offset_in_current_chunk = 0;
+            } else {
+                // We are partially consuming the next chunk
+                let chunk = self.data.front().unwrap().clone();
+                self.offset_in_current_chunk += remaining;
+                debug_assert!(self.offset_in_current_chunk > 0);
+                remaining = 0;
+                chunks.push(chunk);
+            }
+        }
+        Ok(Box::new(DecodeMiniBlockTask {
+            chunks,
+            rep_decompressor: self.rep_decompressor.clone(),
+            def_decompressor: self.def_decompressor.clone(),
+            value_decompressor: self.value_decompressor.clone(),
+            num_rows,
+            offset_into_first_chunk,
+        }))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+}
+
+/// A scheduler for all-null data
+///
+/// Note that all-null data might still require buffers.  If there are definition levels
+/// then we need to distinguish between null structs and null values.  If there are repetition
+/// levels then we need to distinguish between null lists, lists of null, and empty lists.
+#[derive(Debug, Default)]
+pub struct AllNullScheduler {}
+
+impl StructuralPageScheduler for AllNullScheduler {
+    fn initialize<'a>(&'a mut self, _io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+        std::future::ready(Ok(())).boxed()
+    }
+
+    fn schedule_ranges(
+        &self,
+        _ranges: &[Range<u64>],
+        _io: &dyn EncodingsIo,
+    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        Ok(std::future::ready(Ok(
+            Box::new(AllNullPageDecoder {}) as Box<dyn StructuralPageDecoder>
+        ))
+        .boxed())
+    }
+}
+
+#[derive(Debug)]
+struct AllNullDecodePageTask {}
+impl DecodePageTask for AllNullDecodePageTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        // TODO: Not that trivial, we might have rep/def that we need to encode / decode still
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+pub struct AllNullPageDecoder {}
+
+impl StructuralPageDecoder for AllNullPageDecoder {
+    fn drain(&mut self, _num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        todo!()
+    }
+
+    fn num_rows(&self) -> u64 {
+        todo!()
+    }
+}
+
+/// A scheduler for a page that has been encoded with the mini-block layout
+#[derive(Debug)]
+pub struct MiniBlockScheduler {
+    // These come from the protobuf
+    meta_buf_position: u64,
+    meta_buf_size: u64,
+    data_buf_position: u64,
+    priority: u64,
+    rows_in_page: u64,
+    rep_decompressor: Arc<dyn BlockDecompressor>,
+    def_decompressor: Arc<dyn BlockDecompressor>,
+    value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    // This is set after initialization
+    chunk_meta: Vec<ChunkMeta>,
+}
+
+impl MiniBlockScheduler {
+    fn try_new(
+        buffer_offsets_and_sizes: &[(u64, u64)],
+        priority: u64,
+        rows_in_page: u64,
+        layout: &pb::MiniBlockLayout,
+        decompressors: &dyn DecompressorStrategy,
+    ) -> Result<Self> {
+        let (meta_buf_position, meta_buf_size) = buffer_offsets_and_sizes[0];
+        // We don't use the data buf size since we can get it from the metadata
+        let (data_buf_position, _) = buffer_offsets_and_sizes[1];
+        let rep_decompressor =
+            decompressors.create_block_decompressor(layout.rep_compression.as_ref().unwrap())?;
+        let def_decompressor =
+            decompressors.create_block_decompressor(layout.def_compression.as_ref().unwrap())?;
+        let value_decompressor = decompressors
+            .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
+        Ok(Self {
+            meta_buf_position,
+            meta_buf_size,
+            data_buf_position,
+            rep_decompressor: rep_decompressor.into(),
+            def_decompressor: def_decompressor.into(),
+            value_decompressor: value_decompressor.into(),
+            priority,
+            rows_in_page,
+            chunk_meta: Vec::new(),
+        })
+    }
+
+    /// Calculates the overlap between a user-supplied range and a chunk of mini-block data
+    fn calc_overlap(
+        range: &mut Range<u64>,
+        chunk: &ChunkMeta,
+        rows_offset: u64,
+        dst: &mut ScheduledChunk,
+    ) -> ChunkOverlap {
+        if range.start > chunk.num_values + rows_offset {
+            ChunkOverlap::RangeAfterChunk
+        } else {
+            let start_in_chunk = range.start - rows_offset;
+            let end_in_chunk = (start_in_chunk + range.end - range.start).min(chunk.num_values);
+            let rows_in_chunk = end_in_chunk - start_in_chunk;
+            range.start += rows_in_chunk;
+            dst.ranges.push(start_in_chunk..end_in_chunk);
+            ChunkOverlap::Overlap
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ScheduledChunk {
+    data: LanceBuffer,
+    vals_in_chunk: u64,
+    ranges: Vec<Range<u64>>,
+}
+
+impl Clone for ScheduledChunk {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.try_clone().unwrap(),
+            vals_in_chunk: self.vals_in_chunk,
+            ranges: self.ranges.clone(),
+        }
+    }
+}
+
+pub enum ChunkOverlap {
+    RangeAfterChunk,
+    Overlap,
+}
+
+impl StructuralPageScheduler for MiniBlockScheduler {
+    fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+        let metadata = io.submit_single(
+            self.meta_buf_position..self.meta_buf_position + self.meta_buf_size,
+            0,
+        );
+        async move {
+            let bytes = metadata.await?;
+            assert!(bytes.len() % 2 == 0);
+            let mut bytes = LanceBuffer::from_bytes(bytes, 2);
+            let words = bytes.borrow_to_typed_slice::<u16>();
+            let words = words.as_ref();
+            self.chunk_meta.reserve(words.len());
+            let mut rows_counter = 0;
+            for (word_idx, word) in words.iter().enumerate() {
+                let log_num_values = word & 0x0F;
+                let divided_bytes = word >> 4;
+                let num_bytes =
+                    divided_bytes as u64 * MINIBLOCK_SIZE_MULTIPLIER + MINIBLOCK_SIZE_MULTIPLIER;
+                debug_assert!(num_bytes > 0);
+                let num_values = if word_idx < words.len() - 1 {
+                    debug_assert!(log_num_values > 0);
+                    1 << log_num_values
+                } else {
+                    debug_assert_eq!(log_num_values, 0);
+                    self.rows_in_page - rows_counter
+                };
+                rows_counter += num_values;
+
+                self.chunk_meta.push(ChunkMeta {
+                    num_values,
+                    chunk_size_bytes: num_bytes,
+                });
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn schedule_ranges(
+        &self,
+        ranges: &[Range<u64>],
+        io: &dyn EncodingsIo,
+    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        let mut chunk_meta_iter = self.chunk_meta.iter();
+        let mut current_chunk = chunk_meta_iter.next().unwrap();
+        let mut row_offset = 0;
+        let mut bytes_offset = 0;
+
+        let mut scheduled_chunks = VecDeque::with_capacity(self.chunk_meta.len());
+        let mut ranges_to_req = Vec::with_capacity(self.chunk_meta.len());
+        let mut num_rows = 0;
+
+        let mut current_scheduled_chunk = ScheduledChunk {
+            data: LanceBuffer::empty(),
+            ranges: Vec::new(),
+            vals_in_chunk: current_chunk.num_values,
+        };
+
+        // There can be both multiple ranges per chunk and multiple chunks per range
+        for range in ranges {
+            num_rows += range.end - range.start;
+            let mut range = range.clone();
+            while !range.is_empty() {
+                Self::calc_overlap(
+                    &mut range,
+                    current_chunk,
+                    row_offset,
+                    &mut current_scheduled_chunk,
+                );
+                // Might be empty if entire chunk is skipped
+                if !range.is_empty() {
+                    if !current_scheduled_chunk.ranges.is_empty() {
+                        scheduled_chunks.push_back(current_scheduled_chunk);
+                        ranges_to_req.push(
+                            (self.data_buf_position + bytes_offset)
+                                ..(self.data_buf_position
+                                    + bytes_offset
+                                    + current_chunk.chunk_size_bytes),
+                        );
+                    }
+                    row_offset += current_chunk.num_values;
+                    bytes_offset += current_chunk.chunk_size_bytes;
+                    if let Some(next_chunk) = chunk_meta_iter.next() {
+                        current_chunk = next_chunk;
+                    }
+                    current_scheduled_chunk = ScheduledChunk {
+                        data: LanceBuffer::empty(),
+                        ranges: Vec::new(),
+                        vals_in_chunk: current_chunk.num_values,
+                    };
+                }
+            }
+        }
+        if !current_scheduled_chunk.ranges.is_empty() {
+            scheduled_chunks.push_back(current_scheduled_chunk);
+            ranges_to_req.push(
+                (self.data_buf_position + bytes_offset)
+                    ..(self.data_buf_position + bytes_offset + current_chunk.chunk_size_bytes),
+            );
+        }
+
+        let data = io.submit_request(ranges_to_req, self.priority);
+
+        let rep_decompressor = self.rep_decompressor.clone();
+        let def_decompressor = self.def_decompressor.clone();
+        let value_decompressor = self.value_decompressor.clone();
+
+        Ok(async move {
+            let data = data.await?;
+            for (chunk, data) in scheduled_chunks.iter_mut().zip(data) {
+                chunk.data = LanceBuffer::from_bytes(data, 1);
+            }
+            Ok(Box::new(MiniBlockDecoder {
+                rep_decompressor,
+                def_decompressor,
+                value_decompressor,
+                data: scheduled_chunks,
+                offset_in_current_chunk: 0,
+                num_rows,
+            }) as Box<dyn StructuralPageDecoder>)
+        }
+        .boxed())
+    }
+}
+
+#[derive(Debug)]
+struct StructuralPrimitiveFieldSchedulingJob<'a> {
+    scheduler: &'a StructuralPrimitiveFieldScheduler,
+    ranges: Vec<Range<u64>>,
+    page_idx: usize,
+    range_idx: usize,
+    range_offset: u64,
+    global_row_offset: u64,
+}
+
+impl<'a> StructuralPrimitiveFieldSchedulingJob<'a> {
+    pub fn new(scheduler: &'a StructuralPrimitiveFieldScheduler, ranges: Vec<Range<u64>>) -> Self {
+        Self {
+            scheduler,
+            ranges,
+            page_idx: 0,
+            range_idx: 0,
+            range_offset: 0,
+            global_row_offset: 0,
+        }
+    }
+}
+
+impl<'a> StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'a> {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+    ) -> Result<Option<ScheduledScanLine>> {
+        if self.range_idx >= self.ranges.len() {
+            return Ok(None);
+        }
+        // Get our current range
+        let mut range = self.ranges[self.range_idx].clone();
+        range.start += self.range_offset;
+        let priority = range.start;
+
+        let mut cur_page = &self.scheduler.page_schedulers[self.page_idx];
+        trace!(
+            "Current range is {:?} and current page has {} rows",
+            range,
+            cur_page.num_rows
+        );
+        // Skip entire pages until we have some overlap with our next range
+        while cur_page.num_rows + self.global_row_offset <= range.start {
+            self.global_row_offset += cur_page.num_rows;
+            self.page_idx += 1;
+            trace!("Skipping entire page of {} rows", cur_page.num_rows);
+            cur_page = &self.scheduler.page_schedulers[self.page_idx];
+        }
+
+        // Now the cur_page has overlap with range.  Continue looping through ranges
+        // until we find a range that exceeds the current page
+
+        let mut ranges_in_page = Vec::new();
+        while cur_page.num_rows + self.global_row_offset > range.start {
+            range.start = range.start.max(self.global_row_offset);
+            let start_in_page = range.start - self.global_row_offset;
+            let end_in_page = start_in_page + (range.end - range.start);
+            let end_in_page = end_in_page.min(cur_page.num_rows);
+            let last_in_range = (end_in_page + self.global_row_offset) >= range.end;
+
+            ranges_in_page.push(start_in_page..end_in_page);
+            if last_in_range {
+                self.range_idx += 1;
+                if self.range_idx == self.ranges.len() {
+                    break;
+                }
+                range = self.ranges[self.range_idx].clone();
+            } else {
+                break;
+            }
+        }
+
+        let num_rows_in_next = ranges_in_page.iter().map(|r| r.end - r.start).sum();
+        trace!(
+            "Scheduling {} rows across {} ranges from page with {} rows (priority={}, column_index={}, page_index={})",
+            num_rows_in_next,
+            ranges_in_page.len(),
+            cur_page.num_rows,
+            priority,
+            self.scheduler.column_index,
+            cur_page.page_index,
+        );
+
+        self.global_row_offset += cur_page.num_rows;
+        self.page_idx += 1;
+
+        let page_decoder = cur_page
+            .scheduler
+            .schedule_ranges(&ranges_in_page, context.io().as_ref())?;
+
+        let cur_path = context.current_path();
+        let page_index = cur_page.page_index;
+        let unloaded_page = async move {
+            let page_decoder = page_decoder.await?;
+            Ok(LoadedPage {
+                decoder: page_decoder,
+                path: cur_path,
+                page_index,
+            })
+        }
+        .boxed();
+
+        Ok(Some(ScheduledScanLine {
+            decoders: vec![MessageType::UnloadedPage(UnloadedPage(unloaded_page))],
+            rows_scheduled: num_rows_in_next,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct PageInfoAndScheduler {
+    page_index: usize,
+    num_rows: u64,
+    scheduler: Box<dyn StructuralPageScheduler>,
+}
+
+/// A scheduler for a leaf node
+///
+/// Here we look at the layout of the various pages and delegate scheduling to a scheduler
+/// appropriate for the layout of the page.
+#[derive(Debug)]
+pub struct StructuralPrimitiveFieldScheduler {
+    page_schedulers: Vec<PageInfoAndScheduler>,
+    column_index: u32,
+}
+
+impl StructuralPrimitiveFieldScheduler {
+    pub fn try_new(
+        column_info: &ColumnInfo,
+        decompressors: &dyn DecompressorStrategy,
+    ) -> Result<Self> {
+        let page_schedulers = column_info
+            .page_infos
+            .iter()
+            .enumerate()
+            .map(|(page_index, page_info)| {
+                Self::page_info_to_scheduler(page_info, page_index, decompressors)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            page_schedulers,
+            column_index: column_info.index,
+        })
+    }
+
+    fn page_info_to_scheduler(
+        page_info: &PageInfo,
+        page_index: usize,
+        decompressors: &dyn DecompressorStrategy,
+    ) -> Result<PageInfoAndScheduler> {
+        let scheduler: Box<dyn StructuralPageScheduler> =
+            match page_info.encoding.as_structural().layout.as_ref() {
+                Some(pb::page_layout::Layout::MiniBlockLayout(mini_block)) => {
+                    Box::new(MiniBlockScheduler::try_new(
+                        &page_info.buffer_offsets_and_sizes,
+                        page_info.priority,
+                        page_info.num_rows,
+                        mini_block,
+                        decompressors,
+                    )?)
+                }
+                Some(pb::page_layout::Layout::AllNullLayout(_)) => {
+                    Box::new(AllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
+                }
+                _ => todo!(),
+            };
+        Ok(PageInfoAndScheduler {
+            page_index,
+            num_rows: page_info.num_rows,
+            scheduler,
+        })
+    }
+}
+
+impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
+    fn initialize<'a>(
+        &'a mut self,
+        _filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        let page_init = self
+            .page_schedulers
+            .iter_mut()
+            .map(|s| s.scheduler.initialize(context.io()))
+            .collect::<FuturesUnordered<_>>();
+        async move {
+            page_init.try_collect::<Vec<_>>().await?;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        _filter: &FilterExpression,
+    ) -> Result<Box<dyn StructuralSchedulingJob + 'a>> {
+        let ranges = ranges.to_vec();
+        Ok(Box::new(StructuralPrimitiveFieldSchedulingJob::new(
+            self, ranges,
+        )))
     }
 }
 
@@ -393,6 +1118,140 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 
     fn data_type(&self) -> &DataType {
         &self.data_type
+    }
+}
+
+/// Takes the output from several pages decoders and
+/// concatenates them.
+#[derive(Debug)]
+pub struct StructuralCompositeDecodeArrayTask {
+    tasks: Vec<Box<dyn DecodePageTask>>,
+    num_values: u64,
+    data_type: DataType,
+    should_validate: bool,
+}
+
+impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
+    fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        let mut arrays = Vec::with_capacity(self.tasks.len());
+        let mut all_rep = LevelBuffer::with_capacity(self.num_values as usize);
+        let mut all_def = LevelBuffer::with_capacity(self.num_values as usize);
+        let mut offset = 0;
+        let mut has_def = false;
+        for task in self.tasks {
+            let decoded = task.decode()?;
+
+            if let Some(rep) = &decoded.repetition {
+                // Note: if one chunk has repetition, all chunks will have repetition
+                // and so all_rep will either end up with len=num_values or len=0
+                all_rep.extend(rep);
+            }
+            if let Some(def) = &decoded.definition {
+                if !has_def {
+                    // This is the first validity we have seen, need to backfill with all-valid
+                    // if we've processed any all-valid pages
+                    has_def = true;
+                    all_def.extend(iter::repeat(0).take(offset));
+                }
+                all_def.extend(def);
+            }
+
+            let array = make_array(
+                decoded
+                    .data
+                    .into_arrow(self.data_type.clone(), self.should_validate)?,
+            );
+
+            offset += array.len();
+            arrays.push(array);
+        }
+        let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
+        let array = arrow_select::concat::concat(&array_refs)?;
+        let all_rep = if all_rep.is_empty() {
+            None
+        } else {
+            Some(all_rep)
+        };
+        let all_def = if all_def.is_empty() {
+            None
+        } else {
+            Some(all_def)
+        };
+        let mut repdef = RepDefUnraveler::new(all_rep, all_def);
+
+        // The primitive array itself has a validity
+        let validity = repdef.unravel_validity();
+        if let Some(validity) = validity.as_ref() {
+            assert!(validity.len() == array.len());
+        }
+        // SAFETY: We are just replacing the validity and asserted it is the correct size
+        let array = make_array(unsafe {
+            array
+                .to_data()
+                .into_builder()
+                .nulls(validity)
+                .build_unchecked()
+        });
+        Ok(DecodedArray { array, repdef })
+    }
+}
+
+#[derive(Debug)]
+pub struct StructuralPrimitiveFieldDecoder {
+    field: Arc<ArrowField>,
+    page_decoders: VecDeque<Box<dyn StructuralPageDecoder>>,
+    should_validate: bool,
+    rows_drained_in_current: u64,
+}
+
+impl StructuralPrimitiveFieldDecoder {
+    pub fn new(field: &Arc<ArrowField>, should_validate: bool) -> Self {
+        Self {
+            field: field.clone(),
+            page_decoders: VecDeque::new(),
+            should_validate,
+            rows_drained_in_current: 0,
+        }
+    }
+}
+
+impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
+    fn accept_page(&mut self, child: LoadedPage) -> Result<()> {
+        assert!(child.path.is_empty());
+        self.page_decoders.push_back(child.decoder);
+        Ok(())
+    }
+
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>> {
+        let mut remaining = num_rows;
+        let mut tasks = Vec::new();
+        while remaining > 0 {
+            let cur_page = self.page_decoders.front_mut().unwrap();
+            let num_in_page = cur_page.num_rows() - self.rows_drained_in_current;
+            let to_take = num_in_page.min(remaining);
+
+            let task = cur_page.drain(to_take)?;
+            tasks.push(task);
+
+            if to_take == num_in_page {
+                self.page_decoders.pop_front();
+                self.rows_drained_in_current = 0;
+            } else {
+                self.rows_drained_in_current += to_take;
+            }
+
+            remaining -= to_take;
+        }
+        Ok(Box::new(StructuralCompositeDecodeArrayTask {
+            tasks,
+            data_type: self.field.data_type().clone(),
+            should_validate: self.should_validate,
+            num_values: num_rows,
+        }))
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.field.data_type()
     }
 }
 
@@ -606,7 +1465,7 @@ impl FieldEncoder for PrimitiveFieldEncoder {
 // 4KiB which is too small.  As a compromise we divide the size by this
 // constant which gives us up to 24KiB be introduces some padding into each
 // miniblock.  We want 24KiB so we can handle even the worst case of
-// - 4Ki values compressed into an 8188 byte buffer
+// - 4Ki values compressed into an 8186 byte buffer
 // - 4 bytes to describe rep & def lengths
 // - 16KiB of rep & def buffer (this will almost never happen)
 const MINIBLOCK_SIZE_MULTIPLIER: u64 = 6;
@@ -675,9 +1534,9 @@ impl PrimitiveStructuralEncoder {
     // As data gets wide then the # of values per block shrinks (very wide)
     //   data doesn't even fit in a mini-block and the block overhead gets
     //   too large and we prefer zipped.
-    fn is_narrow(num_rows: u64, num_bytes: u64) -> bool {
-        let avg_bytes_per_row = num_bytes as f64 / num_rows as f64;
-        avg_bytes_per_row < 128.0
+    fn is_narrow(arrays: &[ArrayRef], data_type: &DataType) -> bool {
+        let avg_bytes_per_row = Self::get_avg_value_size(arrays, data_type);
+        avg_bytes_per_row < 128
     }
 
     // Converts value data, repetition levels, and definition levels into a single
@@ -685,7 +1544,7 @@ impl PrimitiveStructuralEncoder {
     // which tells us the size of each block.
     //
     // Each chunk is serialized as:
-    // | rep_len (2 bytes) | def_len (2 bytes) | rep | def | values |
+    // | rep_len (2 bytes) | def_len (2 bytes) | values_len (2 byte) | rep | def | values |
     //
     // Each block has a u16 word of metadata.  The upper 12 bits contain 1/6 the
     // # of bytes in the block (if the block does not have an even number of bytes
@@ -724,25 +1583,28 @@ impl PrimitiveStructuralEncoder {
 
         let mut value_offset = 0;
         for ((chunk, rep), def) in miniblocks.chunks.into_iter().zip(rep).zip(def) {
-            let chunk_bytes = chunk.num_bytes as u64 + rep.len() as u64 + def.len() as u64 + 4;
+            let chunk_bytes = chunk.num_bytes as u64 + rep.len() as u64 + def.len() as u64 + 6;
             assert!(chunk_bytes <= 16 * 1024);
             assert!(chunk_bytes > 0);
             // We subtract 1 here from chunk_bytes because we want to be able to express
             // a size of 24KiB and not (24Ki - 6)B which is what we'd get otherwise with
             // 0xFFF
-            let divided_bytes = (chunk_bytes - 1).div_ceil(MINIBLOCK_SIZE_MULTIPLIER);
-            let pad_bytes = (MINIBLOCK_SIZE_MULTIPLIER * divided_bytes) - (chunk_bytes - 1);
+            let divided_bytes = chunk_bytes.div_ceil(MINIBLOCK_SIZE_MULTIPLIER);
+            let pad_bytes = (MINIBLOCK_SIZE_MULTIPLIER * divided_bytes) - chunk_bytes;
+            let divided_bytes_minus_one = divided_bytes - 1;
 
-            let metadata = ((divided_bytes << 4) | chunk.log_num_values as u64) as u16;
+            let metadata = ((divided_bytes_minus_one << 4) | chunk.log_num_values as u64) as u16;
             meta_buffer.extend_from_slice(&metadata.to_le_bytes());
 
             assert!(rep.len() < u16::MAX as usize);
             assert!(def.len() < u16::MAX as usize);
             let bytes_rep = rep.len() as u16;
             let bytes_def = def.len() as u16;
+            let bytes_val = chunk.num_bytes;
 
             data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
             data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
+            data_buffer.extend_from_slice(&bytes_val.to_le_bytes());
 
             data_buffer.extend_from_slice(&rep);
             data_buffer.extend_from_slice(&def);
@@ -818,6 +1680,17 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    fn encode_all_null(column_idx: u32, num_rows: u64, row_number: u64) -> Result<EncodedPage> {
+        let description = ProtobufUtils::all_null_layout();
+        Ok(EncodedPage {
+            column_idx,
+            data: vec![],
+            description: PageEncoding::Structural(description),
+            num_rows,
+            row_number,
+        })
+    }
+
     fn encode_miniblock(
         column_idx: u32,
         field: &Field,
@@ -859,7 +1732,8 @@ impl PrimitiveStructuralEncoder {
         let (block_value_buffer, block_meta_buffer) =
             Self::serialize_miniblocks(compressed_data, compressed_rep, compressed_def);
 
-        let description = ProtobufUtils::miniblock(rep_encoding, def_encoding, value_encoding);
+        let description =
+            ProtobufUtils::miniblock_layout(rep_encoding, def_encoding, value_encoding);
         Ok(EncodedPage {
             num_rows: num_values,
             column_idx,
@@ -867,6 +1741,17 @@ impl PrimitiveStructuralEncoder {
             description: PageEncoding::Structural(description),
             row_number,
         })
+    }
+
+    fn get_avg_value_size(_arrays: &[ArrayRef], data_type: &DataType) -> u64 {
+        // Simple types, we can infer avg size without looking at value
+        let byte_width = data_type.byte_width_opt();
+        if let Some(byte_width) = byte_width {
+            return byte_width as u64;
+        }
+
+        // Other types, we need to inspect buffers
+        todo!()
     }
 
     // Creates an encode task, consuming all buffered data
@@ -881,14 +1766,14 @@ impl PrimitiveStructuralEncoder {
         let field = self.field.clone();
         let task = spawn_cpu(move || {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
-            let num_bytes = arrays
+            let num_nulls = arrays
                 .iter()
-                .map(|arr| arr.get_buffer_memory_size() as u64)
-                .sum();
+                .map(|arr| arr.logical_nulls().map(|n| n.null_count()).unwrap_or(0) as u64)
+                .sum::<u64>();
 
-            // TODO: Calculation of statistics that can be used to choose compression algorithm
-
-            if Self::is_narrow(num_values, num_bytes) {
+            if num_values == num_nulls {
+                Self::encode_all_null(column_idx, num_values, row_number)
+            } else if Self::is_narrow(&arrays, &field.data_type()) {
                 Self::encode_miniblock(
                     column_idx,
                     &field,
