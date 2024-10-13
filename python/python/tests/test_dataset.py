@@ -2200,7 +2200,6 @@ def test_random_dataset_recall_accelerated(tmp_path: Path):
     dataset.create_index(
         "a",
         "IVF_PQ",
-        name=index_name,
         num_partitions=2,
         num_sub_vectors=32,
         accelerator=torch.device("cpu"),
@@ -2226,7 +2225,6 @@ def test_random_dataset_recall_accelerated_one_pass(tmp_path: Path):
     dataset.create_index(
         "a",
         "IVF_PQ",
-        name=index_name,
         num_partitions=2,
         num_sub_vectors=32,
         accelerator=torch.device("cpu"),
