@@ -174,14 +174,22 @@ def train_pq_codebook_on_accelerator(
 
     for sub_vector in range(num_sub_vectors):
         logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        if num_sub_vectors == 1:
+            # sampler has different behaviour with one column
+            init_centroids_slice = init_centroids
+        else:
+            init_centroids_slice = init_centroids[field_names[sub_vector]]
         kmeans_local = KMeans(
             256,
             max_iters=50,
             metric=metric_type,
             device=accelerator,
-            centroids=init_centroids[field_names[sub_vector]],
+            centroids=init_centroids_slice,
         )
-        kmeans_local.fit(ds_fit, column=field_names[sub_vector])
+        if num_sub_vectors == 1:
+            kmeans_local.fit(ds_fit)
+        else:
+            kmeans_local.fit(ds_fit, column=field_names[sub_vector])
 
         ivf_centroids_local = kmeans_local.centroids.cpu().numpy()
         centroids_list.append(ivf_centroids_local)
