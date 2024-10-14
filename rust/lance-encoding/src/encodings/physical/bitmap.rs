@@ -12,7 +12,7 @@ use log::trace;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
@@ -118,6 +118,8 @@ impl PrimitivePageDecoder for BitmapDecoder {
             data: LanceBuffer::from(bool_buffer),
             bits_per_value: 1,
             num_values: num_rows,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }
