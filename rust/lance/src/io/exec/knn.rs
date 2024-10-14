@@ -73,9 +73,11 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
 #[derive(Debug)]
 pub struct KNNVectorDistanceExec {
     /// Inner input node.
+    //! WARNING: Internal API with no stability guarantees.
     pub input: Arc<dyn ExecutionPlan>,
 
     /// The vector query to execute.
+    //! WARNING: Internal API with no stability guarantees.
     pub query: ArrayRef,
     column: String,
     distance_type: DistanceType,

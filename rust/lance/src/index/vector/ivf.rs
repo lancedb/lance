@@ -98,6 +98,7 @@ pub struct IVFIndex {
     uuid: String,
 
     /// Ivf model
+    //! WARNING: Internal API with no stability guarantees.
     pub ivf: IvfModel,
 
     reader: Arc<dyn Reader>,
@@ -107,6 +108,7 @@ pub struct IVFIndex {
 
     partition_locks: PartitionLoadLock,
 
+    //! WARNING: Internal API with no stability guarantees.
     pub metric_type: MetricType,
 
     // The session cache holds an Arc to this object so we need to
