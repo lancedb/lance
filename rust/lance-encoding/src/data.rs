@@ -80,9 +80,7 @@ use std::collections::HashMap;
 // `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
 // `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
 #[derive(Debug, Clone)]
-pub struct BlockInfo(
-    pub Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>
-);
+pub struct BlockInfo(pub Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>);
 
 impl Default for BlockInfo {
     fn default() -> Self {
@@ -105,9 +103,7 @@ impl PartialEq for BlockInfo {
 }
 // `UsedEncoding` is used to record the encodings that has applied to a `DataBlock`
 #[derive(Debug, Clone)]
-pub struct UsedEncoding(
-    Arc<RwLock<HashSet<Encoding>>>,
-);
+pub struct UsedEncoding(Arc<RwLock<HashSet<Encoding>>>);
 
 impl Default for UsedEncoding {
     fn default() -> Self {
