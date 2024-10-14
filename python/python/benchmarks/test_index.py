@@ -55,6 +55,41 @@ def test_create_ivf_pq(test_dataset, benchmark):
 
 
 @pytest.mark.benchmark(group="create_index")
+def test_create_ivf_pq_torch_cpu(test_dataset, benchmark):
+    from lance.dependencies import torch
+
+    benchmark(
+        test_dataset.create_index,
+        column="vector",
+        index_type="IVF_PQ",
+        metric_type="L2",
+        num_partitions=8,
+        num_sub_vectors=2,
+        num_bits=8,
+        replace=True,
+        accelerator=torch.device("cpu"),
+    )
+
+
+@pytest.mark.benchmark(group="create_index")
+def test_create_ivf_pq_torch_cpu_one_pass(test_dataset, benchmark):
+    from lance.dependencies import torch
+
+    benchmark(
+        test_dataset.create_index,
+        column="vector",
+        index_type="IVF_PQ",
+        metric_type="L2",
+        num_partitions=8,
+        num_sub_vectors=2,
+        num_bits=8,
+        replace=True,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+
+
+@pytest.mark.benchmark(group="create_index")
 @pytest.mark.cuda
 def test_create_ivf_pq_cuda(test_dataset, benchmark):
     benchmark(
@@ -67,6 +102,23 @@ def test_create_ivf_pq_cuda(test_dataset, benchmark):
         num_bits=8,
         accelerator="cuda",
         replace=True,
+    )
+
+
+@pytest.mark.benchmark(group="create_index")
+@pytest.mark.cuda
+def test_create_ivf_pq_cuda_one_pass(test_dataset, benchmark):
+    benchmark(
+        test_dataset.create_index,
+        column="vector",
+        index_type="IVF_PQ",
+        metric_type="L2",
+        num_partitions=8,
+        num_sub_vectors=2,
+        num_bits=8,
+        accelerator="cuda",
+        replace=True,
+        one_pass_ivfpq=True,
     )
 
 
