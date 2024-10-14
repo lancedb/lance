@@ -3,7 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -13,7 +13,10 @@ use snafu::{location, Location};
 
 use crate::buffer::LanceBuffer;
 use crate::data::DataBlock;
+use crate::encodings::logical::blob::{BlobFieldEncoder, DESC_FIELD};
 use crate::encodings::logical::r#struct::StructFieldEncoder;
+use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
+use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
@@ -36,6 +39,9 @@ use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
 
 pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
+pub const BLOB_META_KEY: &str = "lance-encoding:blob";
+pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
+pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
 
 /// An encoded array
 ///
@@ -135,6 +141,48 @@ impl Default for EncodedColumn {
     }
 }
 
+/// A tool to reserve space for buffers that are not in-line with the data
+///
+/// In most cases, buffers are stored in the page and referred to in the encoding
+/// metadata by their index in the page.  This keeps all buffers within a page together.
+/// As a result, most encoders should not need to use this structure.
+///
+/// In some cases (currently only the large binary encoding) there is a need to access
+/// buffers that are not in the page (becuase storing the position / offset of every page
+/// in the page metadata would be too expensive).
+///
+/// To do this you can add a buffer with `add_buffer` and then use the returned position
+/// in some way (in the large binary encoding the returned position is stored in the page
+/// data as a position / size array).
+pub struct OutOfLineBuffers {
+    position: u64,
+    buffers: Vec<LanceBuffer>,
+}
+
+impl OutOfLineBuffers {
+    pub fn new(base_position: u64) -> Self {
+        Self {
+            position: base_position,
+            buffers: Vec::new(),
+        }
+    }
+
+    pub fn add_buffer(&mut self, buffer: LanceBuffer) -> u64 {
+        let position = self.position;
+        self.position += buffer.len() as u64;
+        self.buffers.push(buffer);
+        position
+    }
+
+    pub fn take_buffers(self) -> Vec<LanceBuffer> {
+        self.buffers
+    }
+
+    pub fn reset_position(&mut self, position: u64) {
+        self.position = position;
+    }
+}
+
 /// A task to create a page of data
 pub type EncodeTask = BoxFuture<'static, Result<EncodedPage>>;
 
@@ -160,7 +208,11 @@ pub trait FieldEncoder: Send {
     /// than a single disk page.
     ///
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
-    fn maybe_encode(&mut self, array: ArrayRef) -> Result<Vec<EncodeTask>>;
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
     ///
     /// Each encode task produces a single page.  The order of these pages will be maintained
@@ -169,13 +221,16 @@ pub trait FieldEncoder: Send {
     ///
     /// This may be called intermittently throughout encoding but will always be called
     /// once at the end of encoding just before calling finish
-    fn flush(&mut self) -> Result<Vec<EncodeTask>>;
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>>;
     /// Finish encoding and return column metadata
     ///
     /// This is called only once, after all encode tasks have completed
     ///
     /// This returns a Vec because a single field may have created multiple columns
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>>;
 
     /// The number of output columns this encoding will create
     fn num_columns(&self) -> u32;
@@ -277,7 +332,11 @@ impl CoreArrayEncodingStrategy {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
                     let dict_indices_encoder = Self::choose_array_encoder(
-                        arrays,
+                        // We need to pass arrays to this method to figure out what kind of compression to
+                        // use but we haven't actually calculated the indices yet.  For now, we just assume
+                        // worst case and use the full range.  In the future maybe we can pass in statistics
+                        // instead of the actual data
+                        &[Arc::new(UInt8Array::from_iter_values(0_u8..255_u8))],
                         &DataType::UInt8,
                         data_size,
                         false,
@@ -342,6 +401,36 @@ impl CoreArrayEncodingStrategy {
                 }
 
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
+            }
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                        compressed_bit_width as usize,
+                        data_type.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::default(),
+                    ))))
+                }
+            }
+
+            // TODO: for signed integers, I intend to make it a cascaded encoding, a sparse array for the negative values and very wide(bit-width) values,
+            // then a bitpacked array for the narrow(bit-width) values, I need `BitpackedForNeg` to be merged first, I am
+            // thinking about putting this sparse array in the metadata so bitpacking remain using one page buffer only.
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                    let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
+                    Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
+                        compressed_bit_width as usize,
+                        data_type.clone(),
+                    )))
+                } else {
+                    Ok(Box::new(BasicEncoder::new(Box::new(
+                        ValueEncoder::default(),
+                    ))))
+                }
             }
             _ => Ok(Box::new(BasicEncoder::new(Box::new(
                 ValueEncoder::default(),
@@ -615,12 +704,27 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
         if Self::is_primitive_type(&data_type) {
-            Ok(Box::new(PrimitiveFieldEncoder::try_new(
-                options,
-                self.array_encoding_strategy.clone(),
-                column_index.next_column_index(field.id as u32),
-                field.clone(),
-            )?))
+            let column_index = column_index.next_column_index(field.id as u32);
+            if field.metadata.contains_key(BLOB_META_KEY) {
+                let mut packed_meta = HashMap::new();
+                packed_meta.insert(PACKED_STRUCT_META_KEY.to_string(), "true".to_string());
+                let desc_field =
+                    Field::try_from(DESC_FIELD.clone().with_metadata(packed_meta)).unwrap();
+                let desc_encoder = Box::new(PrimitiveFieldEncoder::try_new(
+                    options,
+                    self.array_encoding_strategy.clone(),
+                    column_index,
+                    desc_field,
+                )?);
+                Ok(Box::new(BlobFieldEncoder::new(desc_encoder)))
+            } else {
+                Ok(Box::new(PrimitiveFieldEncoder::try_new(
+                    options,
+                    self.array_encoding_strategy.clone(),
+                    column_index,
+                    field.clone(),
+                )?))
+            }
         } else {
             match data_type {
                 DataType::List(_child) | DataType::LargeList(_child) => {
@@ -644,9 +748,9 @@ impl FieldEncodingStrategy for CoreFieldEncodingStrategy {
                 DataType::Struct(_) => {
                     let field_metadata = &field.metadata;
                     if field_metadata
-                        .get("packed")
+                        .get(PACKED_STRUCT_LEGACY_META_KEY)
                         .map(|v| v == "true")
-                        .unwrap_or(false)
+                        .unwrap_or(field_metadata.contains_key(PACKED_STRUCT_META_KEY))
                     {
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
@@ -744,6 +848,7 @@ impl BatchEncoder {
 /// An encoded batch of data and a page table describing it
 ///
 /// This is returned by [`crate::encoder::encode_batch`]
+#[derive(Debug)]
 pub struct EncodedBatch {
     pub data: Bytes,
     pub page_table: Vec<Arc<ColumnInfo>>,
@@ -788,17 +893,26 @@ pub async fn encode_batch(
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
-        let mut tasks = encoder.maybe_encode(arr.clone())?;
-        tasks.extend(encoder.flush()?);
+        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
+        let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers)?;
+        tasks.extend(encoder.flush(&mut external_buffers)?);
+        for buffer in external_buffers.take_buffers() {
+            data_buffer.extend_from_slice(&buffer);
+        }
         let mut pages = HashMap::<u32, Vec<PageInfo>>::new();
         for task in tasks {
             let encoded_page = task.await?;
+            // Write external buffers first
             pages
                 .entry(encoded_page.column_idx)
                 .or_default()
                 .push(write_page_to_data_buffer(encoded_page, &mut data_buffer));
         }
-        let encoded_columns = encoder.finish().await?;
+        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
+        let encoded_columns = encoder.finish(&mut external_buffers).await?;
+        for buffer in external_buffers.take_buffers() {
+            data_buffer.extend_from_slice(&buffer);
+        }
         let num_columns = encoded_columns.len();
         for (col_idx, encoded_column) in encoded_columns.into_iter().enumerate() {
             let col_idx = col_idx + col_idx_offset;

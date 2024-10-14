@@ -128,7 +128,7 @@ pub(crate) async fn commit_new_dataset(
     let (mut manifest, indices) =
         transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
 
-    write_manifest_file(
+    let result = write_manifest_file(
         object_store,
         commit_handler,
         base_path,
@@ -141,9 +141,18 @@ pub(crate) async fn commit_new_dataset(
         write_config,
         manifest_naming_scheme,
     )
-    .await?;
+    .await;
 
-    Ok(manifest)
+    // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
+    // if there is a conflict.
+    match result {
+        Ok(()) => Ok(manifest),
+        Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
+            uri: base_path.to_string(),
+            location: location!(),
+        }),
+        Err(CommitError::OtherError(err)) => Err(err),
+    }
 }
 
 /// Internal function to check if a manifest could use some migration.
@@ -904,6 +913,127 @@ mod tests {
             }
 
             dataset.validate().await.unwrap()
+        }
+    }
+
+    async fn get_empty_dataset() -> Dataset {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_good_concurrent_config_writes() {
+        let dataset = get_empty_dataset().await;
+
+        // Test successful concurrent insert config operations
+        let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .await
+                })
+            })
+            .collect();
+        let results = join_all(futures).await;
+
+        // Assert all succeeded
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        let dataset = dataset.checkout_version(6).await.unwrap();
+        assert_eq!(dataset.manifest.config.len(), 5);
+
+        dataset.validate().await.unwrap();
+
+        // Test successful concurrent delete operations. If multiple delete
+        // operations attempt to delete the same key, they are all successful.
+        let futures: Vec<_> = ["key1", "key1", "key1", "key2", "key2"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move { dataset.delete_config_keys(&[key]).await })
+            })
+            .collect();
+        let results = join_all(futures).await;
+
+        // Assert all succeeded
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        let dataset = dataset.checkout_version(11).await.unwrap();
+
+        // There are now two fewer keys
+        assert_eq!(dataset.manifest.config.len(), 3);
+
+        dataset.validate().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_bad_concurrent_config_writes() {
+        // If two concurrent insert config operations occur for the same key, a
+        // `CommitConflict` should be returned
+        let dataset = get_empty_dataset().await;
+
+        let futures: Vec<_> = ["key1", "key1", "key2", "key3", "key4"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .await
+                })
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        // Assert that either the first or the second operation fails
+        let mut first_operation_failed = false;
+        let error_fragment = "Commit conflict for version";
+        for (i, result) in results.into_iter().enumerate() {
+            match i {
+                0 => {
+                    if !matches!(result, Ok(Ok(_))) {
+                        first_operation_failed = true;
+                        assert!(result
+                            .unwrap()
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains(error_fragment));
+                    }
+                }
+                1 => match first_operation_failed {
+                    true => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
+                    false => assert!(result
+                        .unwrap()
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains(error_fragment)),
+                },
+                _ => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
+            }
         }
     }
 

@@ -5,7 +5,7 @@
 
 use std::{ops::Deref, ptr::NonNull, sync::Arc};
 
-use arrow_buffer::{ArrowNativeType, Buffer, ScalarBuffer};
+use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use snafu::{location, Location};
 
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
@@ -102,6 +102,22 @@ impl LanceBuffer {
     /// Converts the buffer into a hex string
     pub fn as_hex(&self) -> String {
         hex::encode_upper(self)
+    }
+
+    /// Converts the buffer into a hex string, inserting a space
+    /// between words
+    pub fn as_spaced_hex(&self, bytes_per_word: u32) -> String {
+        let hex = self.as_hex();
+        let chars_per_word = bytes_per_word as usize * 2;
+        let num_words = hex.len() / chars_per_word;
+        let mut spaced_hex = String::with_capacity(hex.len() + num_words);
+        for (i, c) in hex.chars().enumerate() {
+            if i % chars_per_word == 0 && i != 0 {
+                spaced_hex.push(' ');
+            }
+            spaced_hex.push(c);
+        }
+        spaced_hex
     }
 
     /// Create a LanceBuffer from a bytes::Bytes object
@@ -205,10 +221,23 @@ impl LanceBuffer {
 
     /// Reinterprets a LanceBuffer into a Vec<T>
     ///
-    /// Unfortunately, there is no way to do this safely in Rust without a copy, even if
-    /// the source is Vec<u8>.
+    /// If the underlying buffer is not properly aligned, this will involve a copy of the data
     pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
-        ScalarBuffer::<T>::from(self.borrow_and_clone().into_buffer())
+        let align = std::mem::align_of::<T>();
+        let is_aligned = self.as_ptr().align_offset(align) == 0;
+        if self.len() % std::mem::size_of::<T>() != 0 {
+            panic!("attempt to borrow_to_typed_slice to data type of size {} but we have {} bytes which isn't evenly divisible", std::mem::size_of::<T>(), self.len());
+        }
+
+        if is_aligned {
+            ScalarBuffer::<T>::from(self.borrow_and_clone().into_buffer())
+        } else {
+            let num_values = self.len() / std::mem::size_of::<T>();
+            let vec = Vec::<T>::with_capacity(num_values);
+            let mut bytes = MutableBuffer::from(vec);
+            bytes.extend_from_slice(self);
+            ScalarBuffer::<T>::from(Buffer::from(bytes))
+        }
     }
 
     /// Concatenates multiple buffers into a single buffer, consuming the input buffers
@@ -282,6 +311,32 @@ impl LanceBuffer {
     /// thus we can't forget it.
     pub fn copy_array<const N: usize>(array: [u8; N]) -> Self {
         Self::Owned(Vec::from(array))
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(buffer) => buffer.len(),
+            Self::Owned(buffer) => buffer.len(),
+        }
+    }
+
+    /// Returns a new [LanceBuffer] that is a slice of this buffer starting at `offset`,
+    /// with `length` bytes.
+    /// Doing so allows the same memory region to be shared between lance buffers.
+    /// # Panics
+    /// Panics if `(offset + length)` is larger than the existing length.
+    /// If the buffer is owned this method will require a copy.
+    pub fn slice_with_length(&self, offset: usize, length: usize) -> Self {
+        let original_buffer_len = self.len();
+        assert!(
+            offset.saturating_add(length) <= original_buffer_len,
+            "the offset + length of the sliced Buffer cannot exceed the existing length"
+        );
+        match self {
+            Self::Borrowed(buffer) => Self::Borrowed(buffer.slice_with_length(offset, length)),
+            Self::Owned(buffer) => Self::Owned(buffer[offset..offset + length].to_vec()),
+        }
     }
 }
 
@@ -394,5 +449,36 @@ mod tests {
     fn test_hex() {
         let buf = LanceBuffer::Owned(vec![1, 2, 15, 20]);
         assert_eq!("01020F14", buf.as_hex());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_to_typed_slice_invalid() {
+        let mut buf = LanceBuffer::Owned(vec![0, 1, 2]);
+        buf.borrow_to_typed_slice::<u16>();
+    }
+
+    #[test]
+    fn test_to_typed_slice() {
+        // Buffer is aligned, no copy will be made, both calls
+        // should get same ptr
+        let mut buf = LanceBuffer::Owned(vec![0, 1]);
+        let borrow = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr = borrow.as_ref().as_ptr();
+        let borrow2 = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr2 = borrow2.as_ref().as_ptr();
+
+        assert_eq!(view_ptr, view_ptr2);
+
+        let bytes = bytes::Bytes::from(vec![0, 1, 2]);
+        let sliced = bytes.slice(1..3);
+        // Intentionally LYING about alignment here to trigger test
+        let mut buf = LanceBuffer::from_bytes(sliced, 1);
+        let borrow = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr = borrow.as_ref().as_ptr();
+        let borrow2 = buf.borrow_to_typed_slice::<u16>();
+        let view_ptr2 = borrow2.as_ref().as_ptr();
+
+        assert_ne!(view_ptr, view_ptr2);
     }
 }

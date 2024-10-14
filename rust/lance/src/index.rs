@@ -675,8 +675,13 @@ impl DatasetIndexInternalExt for Dataset {
                     SchedulerConfig::max_bandwidth(&self.object_store),
                 );
                 let file = scheduler.open_file(&index_file).await?;
-                let reader =
-                    v2::reader::FileReader::try_open(file, None, Default::default()).await?;
+                let reader = v2::reader::FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &self.session.file_metadata_cache,
+                )
+                .await?;
                 let index_metadata = reader
                     .schema()
                     .metadata
@@ -776,7 +781,14 @@ impl DatasetIndexInternalExt for Dataset {
         let indices = self.load_indices().await?;
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
-        for index in indices.iter().filter(|idx| idx.fields.len() == 1) {
+        for index in indices.iter().filter(|idx| {
+            let idx_schema = schema.project_by_ids(idx.fields.as_slice());
+            let is_vector_index = idx_schema
+                .fields
+                .iter()
+                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+            idx.fields.len() == 1 && !is_vector_index
+        }) {
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
                 message: format!(

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use arrow_schema::DataType;
 use lance_core::{
@@ -27,7 +30,7 @@ struct LanceDfFieldDecoderState {
     rows_per_map: Option<u32>,
     /// As we visit the decoding tree we populate this with the pushdown
     /// information that is available.
-    zone_map_buffers: Vec<UnloadedPushdown>,
+    zone_map_buffers: HashMap<u32, UnloadedPushdown>,
 }
 
 /// This strategy is responsible for creating the field scheduler
@@ -60,7 +63,7 @@ impl LanceDfFieldDecoderStrategy {
         if state.is_none() {
             *state = Some(LanceDfFieldDecoderState {
                 rows_per_map: None,
-                zone_map_buffers: Vec::new(),
+                zone_map_buffers: HashMap::new(),
             });
             true
         } else {
@@ -68,7 +71,12 @@ impl LanceDfFieldDecoderStrategy {
         }
     }
 
-    fn add_pushdown_field(&self, rows_per_map: u32, unloaded_pushdown: UnloadedPushdown) {
+    fn add_pushdown_field(
+        &self,
+        field: &Field,
+        rows_per_map: u32,
+        unloaded_pushdown: UnloadedPushdown,
+    ) {
         let mut state = self.state.lock().unwrap();
         let state = state.as_mut().unwrap();
         match state.rows_per_map {
@@ -79,7 +87,9 @@ impl LanceDfFieldDecoderStrategy {
                 state.rows_per_map = Some(rows_per_map);
             }
         }
-        state.zone_map_buffers.push(unloaded_pushdown);
+        state
+            .zone_map_buffers
+            .insert(field.id as u32, unloaded_pushdown);
     }
 }
 
@@ -96,55 +106,40 @@ impl FieldDecoderStrategy for LanceDfFieldDecoderStrategy {
     )> {
         let is_root = self.initialize();
 
-        if let Some((rows_per_map, unloaded_pushdown)) = extract_zone_info(
-            column_infos.next().unwrap(),
-            &field.data_type(),
-            chain.current_path(),
-        ) {
+        if let Some((rows_per_map, unloaded_pushdown)) =
+            extract_zone_info(column_infos, &field.data_type(), chain.current_path())
+        {
             // If there is pushdown info then record it and unwrap the
             // pushdown encoding layer.
-            self.add_pushdown_field(rows_per_map, unloaded_pushdown);
+            self.add_pushdown_field(field, rows_per_map, unloaded_pushdown);
         }
         // Delegate to the rest of the chain to create the decoder
         let (chain, next) = chain.next(field, column_infos, buffers)?;
 
         // If this is the top level decoder then wrap it with our
         // pushdown filtering scheduler.
-        let state = if is_root {
-            self.state.lock().unwrap().take()
-        } else {
-            None
-        };
-        let schema = self.schema.clone();
-        let _io = chain.io().clone();
-
-        let next = next?;
         if is_root {
-            let state = state.unwrap();
+            let state = self.state.lock().unwrap().take().unwrap();
+            let schema = self.schema.clone();
             let rows_per_map = state.rows_per_map;
             let zone_map_buffers = state.zone_map_buffers;
+            let next = next?;
             let num_rows = next.num_rows();
             if rows_per_map.is_none() {
                 // No columns had any pushdown info
                 Ok((chain, Ok(next)))
             } else {
-                let mut _scheduler = ZoneMapsFieldScheduler::new(
+                let scheduler = ZoneMapsFieldScheduler::new(
                     next,
                     schema,
                     zone_map_buffers,
                     rows_per_map.unwrap(),
                     num_rows,
                 );
-                // Load all the zone maps from disk
-                // TODO: it would be slightly more efficient to do this
-                // later when we know what columns are actually used
-                // for filtering.
-                // scheduler.initialize(io.as_ref()).await?;
-                // Ok(Arc::new(scheduler) as Arc<dyn FieldScheduler>)
-                todo!()
+                Ok((chain, Ok(Arc::new(scheduler))))
             }
         } else {
-            Ok((chain, Ok(next)))
+            Ok((chain, next))
         }
     }
 }

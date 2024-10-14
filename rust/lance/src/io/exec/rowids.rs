@@ -11,6 +11,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion_physical_expr::EquivalenceProperties;
 use futures::StreamExt;
 use lance_core::{ROW_ADDR_FIELD, ROW_ID};
 use lance_table::rowids::RowIdIndex;
@@ -91,7 +92,10 @@ impl AddRowAddrExec {
 
         // Is just a simple projections, so it inherits the partitioning and
         // execution mode from parent.
-        let properties = input.properties().clone();
+        let properties = input
+            .properties()
+            .clone()
+            .with_eq_properties(EquivalenceProperties::new(output_schema.clone()));
 
         Ok(Self {
             input,

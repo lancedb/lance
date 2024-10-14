@@ -42,7 +42,7 @@ use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::PlannerIndexExt;
 use lance_index::scalar::inverted::SCORE_COL;
-use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
 use lance_io::stream::RecordBatchStream;
@@ -53,6 +53,7 @@ use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
 use crate::datatypes::Schema;
+use crate::index::scalar::detect_scalar_index_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::FtsExec;
 use crate::io::exec::get_physical_optimizer;
@@ -867,7 +868,7 @@ impl Scanner {
             &[],
             &[],
             &plan.schema(),
-            "",
+            None,
             false,
             false,
         )?;
@@ -1098,12 +1099,25 @@ impl Scanner {
                     filter_plan = FilterPlan::default();
                     source
                 } else {
+                    // If we are postfiltering then we can't use scalar indices for the filter
+                    // and will need to run the postfilter in memory
+                    filter_plan.make_refine_only();
                     self.knn(&FilterPlan::default()).await?
                 }
             }
             (None, Some(query)) => {
-                // The source is a full text search
-                self.fts(&filter_plan, query).await?
+                // The source is an FTS search
+                if self.prefilter {
+                    // If we are prefiltering then the fts node will take care of the filter
+                    let source = self.fts(&filter_plan, query).await?;
+                    filter_plan = FilterPlan::default();
+                    source
+                } else {
+                    // If we are postfiltering then we can't use scalar indices for the filter
+                    // and will need to run the postfilter in memory
+                    filter_plan.make_refine_only();
+                    self.fts(&FilterPlan::default(), query).await?
+                }
             }
             (None, None) => {
                 let fragments = if let Some(fragments) = self.fragments.as_ref() {
@@ -1287,8 +1301,12 @@ impl Scanner {
             let mut indexed_columns = Vec::new();
             for column in string_columns {
                 let index = self.dataset.load_scalar_index_for_column(column).await?;
-                if index.is_some() {
-                    indexed_columns.push(column.clone());
+                if let Some(index) = index {
+                    let uuid = index.uuid.to_string();
+                    let index_type = detect_scalar_index_type(&self.dataset, column, &uuid).await?;
+                    if matches!(index_type, ScalarIndexType::Inverted) {
+                        indexed_columns.push(column.clone());
+                    }
                 }
             }
 

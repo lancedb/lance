@@ -55,39 +55,13 @@ tests = [
     "polars[pyarrow,pandas]",
     "pytest",
     "tensorflow",
-    # Remove when https://github.com/h5py/h5py/issues/2408 is resolved
-    # We don't need h5py but it is transitive from tensorflow and 3.11
-    # is missing wheels for arm so we need to prevent that version.
-    "h5py<3.11",
     "tqdm",
 ]
 dev = ["ruff==0.4.1"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
-cuvs-py39-cu11 = [
-   "cuvs-cu11 @ https://pypi.nvidia.com/cuvs-cu11/cuvs_cu11-24.8.0-cp39-cp39-manylinux_2_28_x86_64.whl",
-   "pylibraft-cu11 @ https://pypi.nvidia.com/pylibraft-cu11/pylibraft_cu11-24.8.1-cp39-cp39-manylinux_2_28_x86_64.whl"
-]
-cuvs-py310-cu11 = [
-   "cuvs-cu11 @ https://pypi.nvidia.com/cuvs-cu11/cuvs_cu11-24.8.0-cp310-cp310-manylinux_2_28_x86_64.whl",
-   "pylibraft-cu11 @ https://pypi.nvidia.com/pylibraft-cu11/pylibraft_cu11-24.8.1-cp310-cp310-manylinux_2_28_x86_64.whl"
-]
-cuvs-py311-cu11 = [
-   "cuvs-cu11 @ https://pypi.nvidia.com/cuvs-cu11/cuvs_cu11-24.8.0-cp311-cp311-manylinux_2_28_x86_64.whl",
-   "pylibraft-cu11 @ https://pypi.nvidia.com/pylibraft-cu11/pylibraft_cu11-24.8.1-cp311-cp311-manylinux_2_28_x86_64.whl"
-]
-cuvs-py39-cu12 = [
-   "cuvs-cu12 @ https://pypi.nvidia.com/cuvs-cu12/cuvs_cu12-24.8.0-cp39-cp39-manylinux_2_28_x86_64.whl",
-   "pylibraft-cu12 @ https://pypi.nvidia.com/pylibraft-cu12/pylibraft_cu12-24.8.1-cp39-cp39-manylinux_2_28_x86_64.whl"
-]
-cuvs-py310-cu12 = [
-   "cuvs-cu12 @ https://pypi.nvidia.com/cuvs-cu12/cuvs_cu12-24.8.0-cp310-cp310-manylinux_2_28_x86_64.whl",
-   "pylibraft-cu12 @ https://pypi.nvidia.com/pylibraft-cu12/pylibraft_cu12-24.8.1-cp310-cp310-manylinux_2_28_x86_64.whl"
-]
-cuvs-py311-cu12 = [
-   "cuvs-cu12 @ https://pypi.nvidia.com/cuvs-cu12/cuvs_cu12-24.8.0-cp311-cp311-manylinux_2_28_x86_64.whl",
-   "pylibraft-cu12 @ https://pypi.nvidia.com/pylibraft-cu12/pylibraft_cu12-24.8.1-cp311-cp311-manylinux_2_28_x86_64.whl"
-]
+cuvs-cu11 = ["cuvs-cu11", "pylibraft-cu11"]
+cuvs-cu12 = ["cuvs-cu12", "pylibraft-cu12"]
 ray = ["ray[data]; python_version<'3.12'"]
 
 [tool.ruff]

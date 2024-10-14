@@ -11,17 +11,15 @@ use futures::Future;
 use moka::sync::Cache;
 use object_store::path::Path;
 
+use crate::utils::path::LancePathExt;
 use crate::Result;
-
-pub const DEFAULT_INDEX_CACHE_SIZE: usize = 128;
-pub const DEFAULT_METADATA_CACHE_SIZE: usize = 128;
 
 type ArcAny = Arc<dyn Any + Send + Sync>;
 
 #[derive(Clone)]
 struct SizedRecord {
     record: ArcAny,
-    size_accessor: Arc<dyn Fn(ArcAny) -> usize + Send + Sync>,
+    size_accessor: Arc<dyn Fn(&ArcAny) -> usize + Send + Sync>,
 }
 
 impl std::fmt::Debug for SizedRecord {
@@ -35,7 +33,7 @@ impl std::fmt::Debug for SizedRecord {
 impl SizedRecord {
     fn new<T: DeepSizeOf + Send + Sync + 'static>(record: Arc<T>) -> Self {
         let size_accessor =
-            |record: ArcAny| -> usize { record.downcast_ref::<T>().unwrap().deep_size_of() };
+            |record: &ArcAny| -> usize { record.downcast_ref::<T>().unwrap().deep_size_of() };
         Self {
             record,
             size_accessor: Arc::new(size_accessor),
@@ -48,38 +46,104 @@ impl SizedRecord {
 /// The cache is keyed by the file path and the type of metadata.
 #[derive(Clone, Debug)]
 pub struct FileMetadataCache {
-    cache: Arc<Cache<(Path, TypeId), SizedRecord>>,
+    cache: Option<Arc<Cache<(Path, TypeId), SizedRecord>>>,
+    base_path: Option<Path>,
 }
 
 impl DeepSizeOf for FileMetadataCache {
     fn deep_size_of_children(&self, _: &mut Context) -> usize {
         self.cache
-            .iter()
-            .map(|(_, v)| (v.size_accessor)(v.record))
-            .sum()
+            .as_ref()
+            .map(|cache| {
+                cache
+                    .iter()
+                    .map(|(_, v)| (v.size_accessor)(&v.record))
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 }
 
+pub enum CapacityMode {
+    Items,
+    Bytes,
+}
+
 impl FileMetadataCache {
+    /// Instantiates a new cache which, for legacy reasons, uses Items capacity mode.
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache: Arc::new(Cache::new(capacity as u64)),
+            cache: Some(Arc::new(Cache::new(capacity as u64))),
+            base_path: None,
+        }
+    }
+
+    /// Instantiates a dummy cache that will never cache anything.
+    pub fn no_cache() -> Self {
+        Self {
+            cache: None,
+            base_path: None,
+        }
+    }
+
+    /// Instantiates a new cache with a given capacity and capacity mode.
+    pub fn with_capacity(capacity: usize, mode: CapacityMode) -> Self {
+        match mode {
+            CapacityMode::Items => Self::new(capacity),
+            CapacityMode::Bytes => Self {
+                cache: Some(Arc::new(
+                    Cache::builder()
+                        .weigher(|_, v: &SizedRecord| {
+                            (v.size_accessor)(&v.record).try_into().unwrap_or(u32::MAX)
+                        })
+                        .build(),
+                )),
+                base_path: None,
+            },
+        }
+    }
+
+    /// Creates a new cache which shares the same underlying cache but prepends `base_path` to all
+    /// keys.
+    pub fn with_base_path(&self, base_path: Path) -> Self {
+        Self {
+            cache: self.cache.clone(),
+            base_path: Some(base_path),
         }
     }
 
     pub fn size(&self) -> usize {
-        self.cache.entry_count() as usize
+        if let Some(cache) = self.cache.as_ref() {
+            cache.entry_count() as usize
+        } else {
+            0
+        }
     }
 
     pub fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
-        self.cache
+        let cache = self.cache.as_ref()?;
+        let temp: Path;
+        let path = if let Some(base_path) = &self.base_path {
+            temp = base_path.child_path(path);
+            &temp
+        } else {
+            path
+        };
+        cache
             .get(&(path.to_owned(), TypeId::of::<T>()))
             .map(|metadata| metadata.record.clone().downcast::<T>().unwrap())
     }
 
     pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
-        self.cache
-            .insert((path, TypeId::of::<T>()), SizedRecord::new(metadata));
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let path = if let Some(base_path) = &self.base_path {
+            base_path.child_path(&path)
+        } else {
+            path
+        };
+        cache.insert((path, TypeId::of::<T>()), SizedRecord::new(metadata));
     }
 
     /// Get an item

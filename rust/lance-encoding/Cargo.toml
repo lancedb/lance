@@ -27,6 +27,7 @@ futures.workspace = true
 fsst.workspace = true
 hex = "0.4.3"
 itertools.workspace = true
+lazy_static.workspace = true
 log.workspace = true
 num-traits.workspace = true
 prost.workspace = true
@@ -37,6 +38,10 @@ snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zstd.workspace = true
+bytemuck = "=1.18.0"
+arrayref = "0.3.7"
+paste = "1.0.15"
+seq-macro = "0.3.5"
 
 [dev-dependencies]
 lance-testing.workspace = true
@@ -45,6 +50,7 @@ rand.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 criterion = { workspace = true }
+rand_xoshiro = "0.6.0"
 
 [build-dependencies]
 prost-build.workspace = true

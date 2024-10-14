@@ -21,7 +21,7 @@ datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
-datafusion-substrait = { version = "40.0", optional = true }
+datafusion-substrait = { version = "41.0", optional = true }
 futures.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }

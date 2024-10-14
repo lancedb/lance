@@ -450,10 +450,14 @@ impl IoTask {
     }
 
     async fn run(self) {
-        let bytes_fut = self
-            .reader
-            .get_range(self.to_read.start as usize..self.to_read.end as usize);
-        let bytes = bytes_fut.await.map_err(Error::from);
+        let bytes = if self.to_read.start == self.to_read.end {
+            Ok(Bytes::new())
+        } else {
+            let bytes_fut = self
+                .reader
+                .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            bytes_fut.await.map_err(Error::from)
+        };
         IOPS_QUOTA.release();
         (self.when_done)(bytes);
     }

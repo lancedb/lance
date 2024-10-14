@@ -29,6 +29,7 @@ from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
+from lance.util import validate_vector_index
 from lance.file import LanceFileReader
 
 # Various valid inputs for write_dataset
@@ -576,6 +577,33 @@ def test_nested_projection(tmp_path: Path):
     assert projected == pa.Table.from_pydict(
         {"struct.y": [i % 2 == 0 for i in range(100)]}
     )
+
+
+def test_nested_projection_list(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "list_struct": [
+                [{"x": counter, "y": counter % 2 == 0}] for counter in range(100)
+            ],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    projected = dataset.to_table(columns={"list_struct": "list_struct[1]['x']"})
+    assert projected == pa.Table.from_pydict({"list_struct": range(100)})
+
+    # FIXME: sqlparser seems to ignore the .y part, but I can't create a simple
+    # reproducible example for sqlparser. Possibly an issue in our dialect.
+    # projected = dataset.to_table(
+    #   columns={"list_struct": "array_element(list_struct, 1).y"})
+    # assert projected == pa.Table.from_pydict(
+    #     {"list_struct": [i % 2 == 0 for i in range(100)]}
+    # )
 
 
 def test_polar_scan(tmp_path: Path):
@@ -2153,6 +2181,146 @@ def test_scan_with_row_ids(tmp_path: Path):
 
     tbl2 = ds._take_rows(row_ids)
     assert tbl2["a"] == tbl["a"]
+
+
+def test_random_dataset_recall_accelerated(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=32,
+        accelerator=torch.device("cpu"),
+    )
+    validate_vector_index(dataset, "a", pass_threshold=0.5)
+
+
+def test_random_dataset_recall_accelerated_one_pass(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=32,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    validate_vector_index(dataset, "a", pass_threshold=0.5)
+
+
+def test_count_index_rows_accelerated(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        accelerator=torch.device("cpu"),
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+
+def test_count_index_rows_accelerated_one_pass(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
 
 def test_count_index_rows(tmp_path: Path):

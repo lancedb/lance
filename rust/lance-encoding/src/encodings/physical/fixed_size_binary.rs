@@ -10,7 +10,7 @@ use lance_core::Result;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding, VariableWidthBlock},
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
@@ -109,6 +109,8 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
             data: bytes.data,
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_buffer),
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
         });
 
         Ok(string_data)
@@ -143,6 +145,8 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
             bits_per_value: 8 * self.byte_width as u64,
             data: bytes_data.data,
             num_values: bytes_data.num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         });
 
         let encoded_data = self.bytes_encoder.encode(
@@ -176,25 +180,25 @@ mod tests {
     async fn test_fixed_size_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
         // This test only generates fixed size binary arrays anyway
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test_log::test(tokio::test)]

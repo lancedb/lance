@@ -332,6 +332,12 @@ impl Dataset {
         }
     }
 
+    /// Check out the latest version of the dataset
+    pub async fn checkout_latest(&mut self) -> Result<()> {
+        self.manifest = Arc::new(self.latest_manifest().await?);
+        Ok(())
+    }
+
     async fn checkout_by_version_number(&self, version: u64) -> Result<Self> {
         let base_path = self.base.clone();
         let manifest_location = self
@@ -584,7 +590,11 @@ impl Dataset {
         .await?;
 
         let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                fragments,
+                config_upsert_values: None,
+            },
             WriteMode::Append => Operation::Append { fragments },
         };
 
@@ -1498,6 +1508,63 @@ impl Dataset {
     ) -> Result<()> {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
+    }
+
+    /// Update key-value pairs in config.
+    pub async fn update_config(
+        &mut self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateConfig {
+                upsert_values: Some(HashMap::from_iter(upsert_values)),
+                delete_keys: None,
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
+    /// Delete keys from the config.
+    pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateConfig {
+                upsert_values: None,
+                delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
     }
 }
 
@@ -2796,6 +2863,7 @@ mod tests {
         let operation = Operation::Overwrite {
             fragments: vec![],
             schema,
+            config_upsert_values: None,
         };
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -3211,6 +3279,11 @@ mod tests {
         assert_eq!(fragments[0].metadata.deletion_file, None);
         assert_eq!(dataset.manifest, original_manifest);
 
+        // Checkout latest and then go back.
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest.version, 2);
+        let mut dataset = dataset.checkout_version(1).await.unwrap();
+
         // Restore to a previous version
         dataset.restore().await.unwrap();
         assert_eq!(dataset.manifest.version, 3);
@@ -3224,6 +3297,38 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_update_config() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let mut desired_config = HashMap::new();
+        desired_config.insert("lance:test".to_string(), "value".to_string());
+        desired_config.insert("other-key".to_string(), "other-value".to_string());
+
+        dataset.update_config(desired_config.clone()).await.unwrap();
+        assert_eq!(dataset.manifest.config, desired_config);
+
+        desired_config.remove("other-key");
+        dataset.delete_config_keys(&["other-key"]).await.unwrap();
+        assert_eq!(dataset.manifest.config, desired_config);
     }
 
     #[rstest]
@@ -4122,5 +4227,41 @@ mod tests {
             ds2.latest_version_id().await.unwrap(),
             dataset.latest_version_id().await.unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create() {
+        async fn write(uri: &str) -> Result<()> {
+            let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )]));
+            let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+            Dataset::write(empty_reader, uri, None).await?;
+            Ok(())
+        }
+
+        for _ in 0..5 {
+            let test_dir = tempdir().unwrap();
+            let test_uri = test_dir.path().to_str().unwrap();
+
+            let (res1, res2) = tokio::join!(write(test_uri), write(test_uri));
+
+            assert!(res1.is_ok() || res2.is_ok());
+            if res1.is_err() {
+                assert!(
+                    matches!(res1, Err(Error::DatasetAlreadyExists { .. })),
+                    "{:?}",
+                    res1
+                );
+            } else {
+                assert!(
+                    matches!(res2, Err(Error::DatasetAlreadyExists { .. })),
+                    "{:?}",
+                    res2
+                );
+            }
+        }
     }
 }

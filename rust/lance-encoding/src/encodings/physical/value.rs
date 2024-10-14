@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding};
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -205,6 +205,8 @@ impl PrimitivePageDecoder for ValuePageDecoder {
             bits_per_value: self.bytes_per_value * 8,
             data: data_buffer,
             num_values: num_rows,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }
@@ -244,7 +246,6 @@ impl ArrayEncoder for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::HashMap;
 
     use arrow_schema::{DataType, Field, TimeUnit};
 
@@ -282,7 +283,7 @@ pub(crate) mod tests {
         for data_type in PRIMITIVE_TYPES {
             log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field, HashMap::new()).await;
+            check_round_trip_encoding_random(field).await;
         }
     }
 }

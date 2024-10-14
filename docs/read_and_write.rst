@@ -517,8 +517,12 @@ For example, the following filter string is acceptable:
 
 .. code-block:: SQL
 
-  ((label IN [10, 20]) AND (note.email IS NOT NULL))
-      OR NOT note.created
+  ((label IN [10, 20]) AND (note['email'] IS NOT NULL))
+      OR NOT note['created']
+
+Nested fields can be accessed using the subscripts. Struct fields can be 
+subscripted using field names, while list fields can be subscripted using
+indices.
 
 If your column name contains special characters or is a `SQL Keyword <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>`_,
 you can use backtick (`````) to escape it. For nested fields, each segment of the

@@ -12,7 +12,7 @@ use log::trace;
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{PageScheduler, PrimitivePageDecoder},
     EncodingsIo,
 };
@@ -118,13 +118,14 @@ impl PrimitivePageDecoder for BitmapDecoder {
             data: LanceBuffer::from(bool_buffer),
             bits_per_value: 1,
             num_values: num_rows,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use arrow_schema::{DataType, Field};
     use bytes::Bytes;
@@ -138,7 +139,7 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding_random(field, HashMap::new()).await;
+        check_round_trip_encoding_random(field).await;
     }
 
     #[test]
