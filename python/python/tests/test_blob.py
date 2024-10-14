@@ -52,13 +52,15 @@ def test_blob_descriptions(tmp_path):
 @pytest.fixture
 def dataset_with_blobs(tmp_path):
     values = pa.array([b"foo", b"bar", b"baz"], pa.large_binary())
+    idx = pa.array([0, 1, 2], pa.uint64())
     table = pa.table(
-        [values],
+        [values, idx],
         schema=pa.schema(
             [
                 pa.field(
                     "blobs", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
-                )
+                ),
+                pa.field("idx", pa.uint64()),
             ]
         ),
     )
@@ -89,3 +91,18 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
     with blobs[1] as f:
         assert f.seek(1) == 1
         assert f.read(1) == b"a"
+
+
+def test_take_deleted_blob(tmp_path, dataset_with_blobs):
+    row_ids = (
+        dataset_with_blobs.to_table(columns=[], with_row_id=True)
+        .column("_rowid")
+        .to_pylist()
+    )
+    dataset_with_blobs.delete("idx = 1")
+
+    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
+
+    for expected in [b"foo", b"bar", b"baz"]:
+        with blobs.pop(0) as f:
+            assert f.read() == expected
