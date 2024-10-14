@@ -125,7 +125,7 @@ impl BlobFile {
         self.do_with_reader(|cursor, reader| async move {
             let start = position as usize + cursor as usize;
             let size = len.min((size - cursor) as usize);
-            let end = position as usize + size;
+            let end = start + size;
             let data = reader.get_range(start..end).await?;
             Ok((end as u64, data))
         })

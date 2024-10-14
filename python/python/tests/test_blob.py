@@ -4,7 +4,7 @@
 import lance
 import pyarrow as pa
 import pytest
-from lance import BlobColumn, BlobFile
+from lance import BlobColumn
 
 
 def test_blob_read_from_binary():
@@ -49,7 +49,8 @@ def test_blob_descriptions(tmp_path):
     assert descriptions.field(1) == expected_sizes
 
 
-def test_blob_files(tmp_path):
+@pytest.fixture
+def dataset_with_blobs(tmp_path):
     values = pa.array([b"foo", b"bar", b"baz"], pa.large_binary())
     table = pa.table(
         [values],
@@ -62,9 +63,29 @@ def test_blob_files(tmp_path):
         ),
     )
     ds = lance.write_dataset(table, tmp_path / "test_ds")
-    row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid").to_pylist()
-    blobs = ds.take_blobs(row_ids, "blobs")
+    return ds
+
+
+def test_blob_files(tmp_path, dataset_with_blobs):
+    row_ids = (
+        dataset_with_blobs.to_table(columns=[], with_row_id=True)
+        .column("_rowid")
+        .to_pylist()
+    )
+    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
 
     for expected in [b"foo", b"bar", b"baz"]:
-        with BlobFile(blobs.pop(0)) as f:
+        with blobs.pop(0) as f:
             assert f.read() == expected
+
+
+def test_blob_file_seek(tmp_path, dataset_with_blobs):
+    row_ids = (
+        dataset_with_blobs.to_table(columns=[], with_row_id=True)
+        .column("_rowid")
+        .to_pylist()
+    )
+    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
+    with blobs[1] as f:
+        assert f.seek(1) == 1
+        assert f.read(1) == b"a"

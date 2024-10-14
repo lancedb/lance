@@ -100,7 +100,7 @@ class BlobFile(io.RawIOBase):
         return self.inner.readall()
 
     def readinto(self, b: bytearray) -> int:
-        return self.inner.readinto(b)
+        return self.inner.read_into(b)
 
     def __repr__(self) -> str:
         return f"<BlobFile size={self.size()}>"

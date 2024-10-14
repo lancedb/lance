@@ -78,7 +78,7 @@ impl LanceBlobFile {
             // GIL since then and so no other Python code could have modified
             // the buffer.
             unsafe {
-                dst.as_bytes_mut().copy_from_slice(&data);
+                dst.as_bytes_mut()[0..data.len()].copy_from_slice(&data);
             }
             Ok(data.len())
         }
