@@ -98,7 +98,7 @@ pub struct IVFIndex {
     uuid: String,
 
     /// Ivf model
-    ivf: IvfModel,
+    pub ivf: IvfModel,
 
     reader: Arc<dyn Reader>,
 
@@ -107,7 +107,7 @@ pub struct IVFIndex {
 
     partition_locks: PartitionLoadLock,
 
-    metric_type: MetricType,
+    pub metric_type: MetricType,
 
     // The session cache holds an Arc to this object so we need to
     // hold a weak pointer to avoid cycles

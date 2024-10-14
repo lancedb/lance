@@ -274,15 +274,15 @@ pub fn new_knn_exec(
 /// ```
 #[derive(Debug)]
 pub struct ANNIvfPartitionExec {
-    dataset: Arc<Dataset>,
+    pub dataset: Arc<Dataset>,
 
     /// The vector query to execute.
-    query: Query,
+    pub query: Query,
 
     /// The UUIDs of the indices to search.
-    index_uuids: Vec<String>,
+    pub index_uuids: Vec<String>,
 
-    properties: PlanProperties,
+    pub properties: PlanProperties,
 }
 
 impl ANNIvfPartitionExec {
