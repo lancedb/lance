@@ -131,6 +131,7 @@ class KMeans:
             torch.Tensor,
             pa.FixedSizeListArray,
         ],
+        column: Optional[str] = None,
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -160,7 +161,7 @@ class KMeans:
         for i in tqdm(range(self.max_iters)):
             try:
                 self.total_distance = self._fit_once(
-                    data, i, last_dist=self.total_distance
+                    data, i, last_dist=self.total_distance, column=column
                 )
             except StopIteration:
                 break
@@ -199,7 +200,11 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
+        self,
+        data: torch.utils.data.IterableDataset,
+        epoch: int,
+        last_dist: float = 0.0,
+        column: Optional[str] = None,
     ) -> float:
         """Train KMean once and return the total distance.
 
@@ -217,7 +222,7 @@ class KMeans:
         float
             The total distance of the current centroids and the input data.
         """
-        total_dist = 0
+        total_dist = torch.tensor(0.0, device=self.device)
 
         # Use float32 to accumulate centroids, esp. if the vectors are
         # float16 / bfloat16 types.
@@ -230,17 +235,20 @@ class KMeans:
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            if column is not None:
+                chunk = chunk[column]
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk, y2=self.y2)
 
+            # Training is significantly faster w/o these checks
             valid_mask = ids >= 0
             if torch.any(~valid_mask):
                 chunk = chunk[valid_mask]
                 ids = ids[valid_mask]
 
-            total_dist += dists.nansum().item()
+            total_dist += dists.nansum()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
@@ -249,6 +257,8 @@ class KMeans:
             del ids
             del dists
             del chunk
+
+        total_dist = total_dist.item()
 
         # this happens when there are too many NaNs or the data is just the same
         # vectors repeated over and over. Performance may be bad but we don't

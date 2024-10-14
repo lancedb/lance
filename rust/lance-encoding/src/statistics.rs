@@ -48,6 +48,8 @@ pub trait GetStat {
 impl GetStat for DataBlock {
     fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
         match self {
+            Self::Empty() => None,
+            Self::Constant(_) => None,
             Self::AllNull(_) => {
                 //  the statistics is not calculated here as this enum is going to deprecated soon anyway
                 None
