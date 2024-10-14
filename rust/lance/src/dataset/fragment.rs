@@ -2357,6 +2357,7 @@ mod tests {
         let op = Operation::Overwrite {
             schema: schema.clone(),
             fragments,
+            config_upsert_values: None,
         };
 
         let registry = Arc::new(ObjectStoreRegistry::default());
@@ -2457,6 +2458,7 @@ mod tests {
             let op = Operation::Overwrite {
                 fragments: vec![new_fragment],
                 schema: full_schema.clone(),
+                config_upsert_values: None,
             };
 
             let registry = Arc::new(ObjectStoreRegistry::default());
