@@ -80,9 +80,9 @@ use std::collections::HashMap;
 // `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
 // `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
 #[derive(Debug, Clone)]
-pub struct BlockInfo {
-    pub info: Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>,
-}
+pub struct BlockInfo(
+    pub Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>
+);
 
 impl Default for BlockInfo {
     fn default() -> Self {
@@ -92,24 +92,22 @@ impl Default for BlockInfo {
 
 impl BlockInfo {
     pub fn new() -> Self {
-        Self {
-            info: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self(Arc::new(RwLock::new(HashMap::new())))
     }
 }
 
 impl PartialEq for BlockInfo {
     fn eq(&self, other: &Self) -> bool {
-        let self_info = self.info.read().unwrap();
-        let other_info = other.info.read().unwrap();
+        let self_info = self.0.read().unwrap();
+        let other_info = other.0.read().unwrap();
         *self_info == *other_info
     }
 }
 // `UsedEncoding` is used to record the encodings that has applied to a `DataBlock`
 #[derive(Debug, Clone)]
-pub struct UsedEncoding {
-    pub used: Arc<RwLock<HashSet<Encoding>>>,
-}
+pub struct UsedEncoding(
+    Arc<RwLock<HashSet<Encoding>>>,
+);
 
 impl Default for UsedEncoding {
     fn default() -> Self {
@@ -119,16 +117,14 @@ impl Default for UsedEncoding {
 
 impl UsedEncoding {
     pub fn new() -> Self {
-        Self {
-            used: Arc::new(RwLock::new(HashSet::new())),
-        }
+        Self(Arc::new(RwLock::new(HashSet::new())))
     }
 }
 
 impl PartialEq for UsedEncoding {
     fn eq(&self, other: &Self) -> bool {
-        let self_used = self.used.read().unwrap();
-        let other_used = other.used.read().unwrap();
+        let self_used = self.0.read().unwrap();
+        let other_used = other.0.read().unwrap();
         *self_used == *other_used
     }
 }

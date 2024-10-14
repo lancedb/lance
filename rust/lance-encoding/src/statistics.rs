@@ -74,10 +74,10 @@ impl GetStat for VariableWidthBlock {
             Stat::BitWidth => None,
             Stat::NullCount => None,
             _ => {
-                if self.block_info.info.read().unwrap().is_empty() {
+                if self.block_info.0.read().unwrap().is_empty() {
                     self.compute_statistics();
                 }
-                self.block_info.info.read().unwrap().get(&stat).cloned()
+                self.block_info.0.read().unwrap().get(&stat).cloned()
             }
         }
     }
@@ -89,7 +89,7 @@ impl VariableWidthBlock {
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
 
         let cardinality_array = self.cardinality();
-        let mut info = self.block_info.info.write().unwrap();
+        let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::Cardinality, cardinality_array);
     }
@@ -143,10 +143,10 @@ impl GetStat for FixedWidthDataBlock {
             Stat::NullCount => None,
             _ => {
                 // initialize statistics
-                if self.block_info.info.read().unwrap().is_empty() {
+                if self.block_info.0.read().unwrap().is_empty() {
                     self.compute_statistics();
                 }
-                self.block_info.info.read().unwrap().get(&stat).cloned()
+                self.block_info.0.read().unwrap().get(&stat).cloned()
             }
         }
     }
@@ -162,7 +162,7 @@ impl FixedWidthDataBlock {
         let max_bit_width = self.max_bit_width();
 
         let cardinality = self.cardinality();
-        let mut info = self.block_info.info.write().unwrap();
+        let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::BitWidth, max_bit_width);
         info.insert(Stat::Cardinality, cardinality);
@@ -260,7 +260,7 @@ impl FixedWidthDataBlock {
             // when self.bits_per_value is not (8, 16, 32, 64), it's a `DataBlock` generated from
             // `bitpack` and it's cardinality should equal to it's parent `DataBlock`'s cardinaliry
             // (Except Decimal128, Decimal256)
-            _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
+            _ => Arc::new(UInt64Array::from(vec![self.num_values])),
         }
     }
 }
@@ -268,7 +268,7 @@ impl FixedWidthDataBlock {
 impl GetStat for OpaqueBlock {
     fn get_stat(&mut self, stat: Stat) -> Option<Arc<dyn Array>> {
         match stat {
-            Stat::DataSize => self.block_info.info.read().unwrap().get(&stat).cloned(),
+            Stat::DataSize => self.block_info.0.read().unwrap().get(&stat).cloned(),
             _ => None,
         }
     }
