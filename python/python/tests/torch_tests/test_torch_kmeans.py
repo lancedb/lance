@@ -12,7 +12,7 @@ torch = pytest.importorskip("torch")
 
 from lance.torch import preferred_device  # noqa: E402
 from lance.torch.kmeans import KMeans  # noqa: E402
-from lance.vector import train_ivf_centroids_on_accelerator  # noqa: E402
+from lance.torch.vector import train_ivf_centroids_on_accelerator  # noqa: E402
 
 
 @pytest.mark.skip(reason="flaky")
