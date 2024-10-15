@@ -341,7 +341,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        dataset::{scanner::DEFAULT_IO_BUFFER_SIZE, WriteParams},
+        dataset::WriteParams,
         io::exec::{LanceScanConfig, LanceScanExec},
     };
 
@@ -430,7 +430,7 @@ mod tests {
 
         let config = LanceScanConfig {
             with_row_id: true,
-            ..Default::default(),
+            ..Default::default()
         };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
@@ -466,7 +466,7 @@ mod tests {
             dataset.fragments().clone(),
             None,
             scan_schema,
-            ..Default::default(),
+            LanceScanConfig::default(),
         ));
         assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
     }
@@ -477,7 +477,7 @@ mod tests {
 
         let config = LanceScanConfig {
             with_row_id: true,
-            ..Default::default(),
+            ..Default::default()
         };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),

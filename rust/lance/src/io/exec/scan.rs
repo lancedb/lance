@@ -30,7 +30,10 @@ use log::debug;
 use snafu::{location, Location};
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
-use crate::dataset::scanner::{DEFAULT_FRAGMENT_READAHEAD, LEGACY_DEFAULT_FRAGMENT_READAHEAD};
+use crate::dataset::scanner::{
+    BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
+    LEGACY_DEFAULT_FRAGMENT_READAHEAD,
+};
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
@@ -393,6 +396,23 @@ pub struct LanceScanConfig {
     pub with_row_address: bool,
     pub with_make_deletions_null: bool,
     pub ordered_output: bool,
+}
+
+// This is mostly for testing purposes, end users are unlikely to create this
+// on their own.
+impl Default for LanceScanConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: BATCH_SIZE_FALLBACK,
+            batch_readahead: get_num_compute_intensive_cpus(),
+            fragment_readahead: None,
+            io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
+            with_row_id: false,
+            with_row_address: false,
+            with_make_deletions_null: false,
+            ordered_output: false,
+        }
+    }
 }
 
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset

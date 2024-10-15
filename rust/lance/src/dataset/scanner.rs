@@ -68,7 +68,7 @@ use snafu::{location, Location};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-const BATCH_SIZE_FALLBACK: usize = 8192;
+pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 // For backwards compatibility / historical reasons we re-calculate the default batch size
 // on each call
 pub fn get_default_batch_size() -> Option<usize> {
