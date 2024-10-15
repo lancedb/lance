@@ -23,6 +23,7 @@ use crate::{
     },
     encoder::{EncodeTask, FieldEncoder, OutOfLineBuffers},
     format::pb::{column_encoding, Blob, ColumnEncoding},
+    repdef::RepDefBuilder,
     EncodingsIo,
 };
 
@@ -34,7 +35,7 @@ lazy_static::lazy_static! {
         ]);
     pub static ref DESC_FIELD: Field =
         Field::new("description", DataType::Struct(DESC_FIELDS.clone()), false);
-
+    pub static ref DESC_FIELD_LANCE: lance_core::datatypes::Field = (&*DESC_FIELD).try_into().unwrap();
 }
 
 /// A field scheduler for large binary data
@@ -377,10 +378,12 @@ impl FieldEncoder for BlobFieldEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
     ) -> Result<Vec<EncodeTask>> {
         let descriptions = Self::write_bins(array, external_buffers)?;
         self.description_encoder
-            .maybe_encode(descriptions, external_buffers)
+            .maybe_encode(descriptions, external_buffers, repdef, row_number)
     }
 
     // If there is any data left in the buffer then create an encode task from it

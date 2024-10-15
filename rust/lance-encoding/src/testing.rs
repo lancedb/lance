@@ -29,6 +29,7 @@ use crate::{
         EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
     },
     encodings::logical::r#struct::SimpleStructDecoder,
+    repdef::RepDefBuilder,
     version::LanceFileVersion,
     EncodingsIo,
 };
@@ -408,8 +409,8 @@ impl SimulatedWriter {
 
     fn write_page(&mut self, encoded_page: EncodedPage) {
         trace!("Encoded page {:?}", encoded_page);
-        let page_buffers = encoded_page.array.data.into_buffers();
-        let page_encoding = encoded_page.array.encoding;
+        let page_buffers = encoded_page.data;
+        let page_encoding = encoded_page.description;
         let buffer_offsets_and_sizes = page_buffers
             .into_iter()
             .map(|b| self.write_buffer(b))
@@ -419,6 +420,7 @@ impl SimulatedWriter {
             num_rows: encoded_page.num_rows,
             encoding: page_encoding,
             buffer_offsets_and_sizes: Arc::from(buffer_offsets_and_sizes.clone()),
+            priority: encoded_page.row_number,
         };
 
         let col_idx = encoded_page.column_idx as usize;
@@ -439,17 +441,21 @@ async fn check_round_trip_encoding_inner(
 ) {
     let mut writer = SimulatedWriter::new(encoder.num_columns());
 
+    let mut row_number = 0;
     for arr in &data {
         let mut external_buffers = writer.new_external_buffers();
+        let repdef = RepDefBuilder::default();
         let encode_tasks = encoder
-            .maybe_encode(arr.clone(), &mut external_buffers)
+            .maybe_encode(arr.clone(), &mut external_buffers, repdef, row_number)
             .unwrap();
         for buffer in external_buffers.take_buffers() {
             writer.write_lance_buffer(buffer);
         }
-        for task in encode_tasks {
-            writer.write_page(task.await.unwrap());
+        for encode_task in encode_tasks {
+            let encoded_page = encode_task.await.unwrap();
+            writer.write_page(encoded_page);
         }
+        row_number += arr.len() as u64;
     }
 
     let mut external_buffers = writer.new_external_buffers();
