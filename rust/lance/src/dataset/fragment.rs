@@ -506,6 +506,14 @@ impl FileFragment {
         self.metadata.files.len()
     }
 
+    /// Gets the data file for a given field
+    pub fn data_file_for_field(&self, field_id: u32) -> Option<&DataFile> {
+        self.metadata
+            .files
+            .iter()
+            .find(|f| f.fields.contains(&(field_id as i32)))
+    }
+
     /// Open a FileFragment with a given default projection.
     ///
     /// All read operations (other than `read_projected`) will use the supplied
@@ -594,7 +602,7 @@ impl FileFragment {
         let data_file_schema = data_file.schema(full_schema);
         let projection = projection.unwrap_or(full_schema);
         // Also remove any fields that are not part of the user's provided projection
-        let schema_per_file = Arc::new(data_file_schema.intersection(projection)?);
+        let schema_per_file = Arc::new(projection.intersection_ignore_types(&data_file_schema)?);
 
         if data_file.is_legacy_file() {
             let max_field_id = data_file.fields.iter().max().unwrap();

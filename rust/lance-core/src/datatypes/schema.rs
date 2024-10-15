@@ -252,10 +252,19 @@ impl Schema {
 
     /// Intersection between two [`Schema`].
     pub fn intersection(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, false)
+    }
+
+    /// Intersection between two [`Schema`], ignoring data types.
+    pub fn intersection_ignore_types(&self, other: &Self) -> Result<Self> {
+        self.do_intersection(other, true)
+    }
+
+    fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         for field in other.fields.iter() {
             if let Some(candidate_field) = self.field(&field.name) {
-                candidates.push(candidate_field.intersection(field)?);
+                candidates.push(candidate_field.do_intersection(field, ignore_types)?);
             }
         }
 

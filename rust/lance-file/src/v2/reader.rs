@@ -171,16 +171,14 @@ impl ReaderProjection {
         column_indices: &mut Vec<u32>,
     ) -> Result<()> {
         for field in fields {
-            let column_idx = *field_id_to_column_index.get(&(field.id as u32)).ok_or_else(|| Error::InvalidInput {
-                location: location!(),
-                source: format!("the schema referenced a field with id {} which was not in the data file's metadata", field.id).into(),
-            })?;
-            column_indices.push(column_idx);
-            Self::from_field_ids_helper(
-                field.children.iter(),
-                field_id_to_column_index,
-                column_indices,
-            )?;
+            if let Some(column_idx) = field_id_to_column_index.get(&(field.id as u32)).copied() {
+                column_indices.push(column_idx);
+                Self::from_field_ids_helper(
+                    field.children.iter(),
+                    field_id_to_column_index,
+                    column_indices,
+                )?;
+            }
         }
         Ok(())
     }

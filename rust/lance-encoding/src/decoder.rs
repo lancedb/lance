@@ -225,7 +225,7 @@ use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::{CapacityMode, FileMetadataCache};
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{Field, Schema, BLOB_DESC_FIELD};
 use log::{debug, trace, warn};
 use snafu::{location, Location};
 use tokio::sync::mpsc::error::SendError;
@@ -237,7 +237,7 @@ use tracing::instrument;
 use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
-use crate::encodings::logical::blob::{BlobFieldScheduler, DESC_FIELD};
+use crate::encodings::logical::blob::BlobFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
@@ -836,9 +836,10 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             return Ok((chain, Ok(scheduler)));
         } else if data_type.is_binary_like() {
             let column_info = column_infos.next().unwrap().clone();
+            // Column is blob and user is asking for binary data
             if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
                 let desc_scheduler = self.create_primitive_scheduler(
-                    DESC_FIELD.data_type(),
+                    BLOB_DESC_FIELD.data_type(),
                     chain.current_path(),
                     &blob_col,
                     buffers,
@@ -945,6 +946,18 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             DataType::Struct(fields) => {
                 let column_info = column_infos.expect_next()?;
 
+                // Column is blob and user is asking for descriptions
+                if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
+                    // Can use primitive scheduler here since descriptions are always packed struct
+                    let desc_scheduler = self.create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        &blob_col,
+                        buffers,
+                    )?;
+                    return Ok((chain, Ok(desc_scheduler)));
+                }
+
                 if Self::check_packed_struct(column_info) {
                     // use packed struct encoding
                     let scheduler = self.create_primitive_scheduler(
@@ -1040,7 +1053,7 @@ impl DecodeBatchScheduler {
         columns.extend(column_infos.iter().cloned());
         let adjusted_column_indices = [0_u32]
             .into_iter()
-            .chain(column_indices.iter().map(|i| *i + 1))
+            .chain(column_indices.iter().map(|i| i.saturating_add(1)))
             .collect::<Vec<_>>();
         let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
         let root_type = DataType::Struct(root_fields.clone());

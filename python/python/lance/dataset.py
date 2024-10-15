@@ -35,6 +35,7 @@ import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
+from .blob import BlobFile
 from .dependencies import (
     _check_for_hugging_face,
     _check_for_numpy,
@@ -712,6 +713,28 @@ class LanceDataset(pa.dataset.Dataset):
         return pa.Table.from_batches(
             [self._ds.take_rows(row_ids, columns, columns_with_transform)]
         )
+
+    def take_blobs(
+        self,
+        row_ids: Union[List[int], pa.Array],
+        blob_column: str,
+    ) -> List[BlobFile]:
+        """
+        Select blobs by row_ids.
+
+        Parameters
+        ----------
+        row_ids : List Array or array-like
+            row IDs to select in the dataset.
+        blob_column : str
+            The name of the blob column to select.
+
+        Returns
+        -------
+        blob_files : List[BlobFile]
+        """
+        lance_blob_files = self._ds.take_blobs(row_ids, blob_column)
+        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
         """
