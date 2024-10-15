@@ -102,6 +102,7 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
     dataset_with_blobs.delete("idx = 1")
 
     with pytest.raises(
-        ValueError, match="some of the row ids requested have been deleted"
+        NotImplementedError,
+        match="A take operation that includes row addresses must not target deleted",
     ):
         dataset_with_blobs.take_blobs(row_ids, "blobs")
