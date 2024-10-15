@@ -396,14 +396,8 @@ mod tests {
 
         // With row id
         let config = LanceScanConfig {
-            batch_size: 10,
-            batch_readahead: 10,
-            fragment_readahead: Some(4),
-            io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: true,
-            with_row_address: false,
-            with_make_deletions_null: false,
-            ordered_output: true,
+            ..Default::default()
         };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
@@ -435,14 +429,8 @@ mod tests {
         let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
 
         let config = LanceScanConfig {
-            batch_size: 10,
-            batch_readahead: 10,
-            fragment_readahead: Some(4),
-            io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: true,
-            with_row_address: false,
-            with_make_deletions_null: false,
-            ordered_output: true,
+            ..Default::default(),
         };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
@@ -473,22 +461,12 @@ mod tests {
         let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
 
         // No row ID
-        let config = LanceScanConfig {
-            batch_size: 10,
-            batch_readahead: 10,
-            fragment_readahead: Some(4),
-            io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
-            with_row_id: false,
-            with_row_address: false,
-            with_make_deletions_null: false,
-            ordered_output: true,
-        };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
             None,
             scan_schema,
-            config,
+            ..Default::default(),
         ));
         assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
     }
