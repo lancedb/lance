@@ -498,14 +498,8 @@ mod tests {
         let dataset = create_dataset().await;
 
         let config = LanceScanConfig {
-            batch_size: 10,
-            batch_readahead: 10,
-            fragment_readahead: Some(4),
-            io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
             with_row_id: true,
-            with_row_address: false,
-            with_make_deletions_null: false,
-            ordered_output: true,
+            ..Default::default(),
         };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
