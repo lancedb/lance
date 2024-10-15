@@ -604,8 +604,8 @@ impl FileReader {
             ));
         }
         let mut column_indices_seen = BTreeSet::new();
-        for column_index in projection.column_indices.iter().copied() {
-            if !column_indices_seen.insert(column_index) {
+        for column_index in &projection.column_indices {
+            if !column_indices_seen.insert(*column_index) {
                 return Err(Error::invalid_input(
                     format!(
                         "The projection specified the column index {} more than once",
@@ -614,7 +614,7 @@ impl FileReader {
                     location!(),
                 ));
             }
-            if column_index >= metadata.column_infos.len() as u32 {
+            if *column_index >= metadata.column_infos.len() as u32 {
                 return Err(Error::invalid_input(format!("The projection specified the column index {} but there are only {} columns in the file", column_index, metadata.column_infos.len()), location!()));
             }
         }

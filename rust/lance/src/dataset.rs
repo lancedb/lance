@@ -258,7 +258,8 @@ impl ProjectionRequest {
     pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
         match self {
             Self::Schema(schema) => Ok(ProjectionPlan::new_empty(
-                schema, /*load_blobs=*/ false,
+                Arc::new(dataset_schema.project_by_schema(schema.as_ref())?),
+                /*load_blobs=*/ false,
             )),
             Self::Sql(columns) => {
                 ProjectionPlan::try_new(dataset_schema, &columns, /*load_blobs=*/ false)
