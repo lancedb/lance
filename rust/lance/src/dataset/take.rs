@@ -338,6 +338,20 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
 
     let batch = projection.project_batch(batch).await?;
 
+    // We could delete the rows, returning fewer than asked for...but that might be confusing for the user.  Also,
+    // it could be difficult to map which addresses were deleted.  We could also insert NULL.  But, for now, we
+    // just return an error.
+    if batch.num_rows() != row_addrs.len() {
+        return Err(Error::InvalidInput {
+            source: format!(
+                "Expected {} rows, got {}.  It is possible some of the row ids requested have been deleted.",
+                row_addrs.len(),
+                batch.num_rows()
+            ).into(),
+            location: location!(),
+        });
+    }
+
     if builder.with_row_address {
         let row_addr_col = Arc::new(UInt64Array::from(row_addrs));
         let row_addr_field = ArrowField::new(ROW_ADDR, arrow::datatypes::DataType::UInt64, false);

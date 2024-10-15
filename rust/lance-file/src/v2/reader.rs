@@ -171,14 +171,8 @@ impl ReaderProjection {
         column_indices: &mut Vec<u32>,
     ) -> Result<()> {
         for field in fields {
-            let column_idx = field_id_to_column_index
-                .get(&(field.id as u32))
-                .copied()
-                // If a field isn't in the mapping then it might be a nested
-                // field in packed struct.  Just use a placeholder for now.
-                .unwrap_or(u32::MAX);
-            column_indices.push(column_idx);
-            if column_idx != u32::MAX {
+            if let Some(column_idx) = field_id_to_column_index.get(&(field.id as u32)).copied() {
+                column_indices.push(column_idx);
                 Self::from_field_ids_helper(
                     field.children.iter(),
                     field_id_to_column_index,
@@ -610,13 +604,7 @@ impl FileReader {
             ));
         }
         let mut column_indices_seen = BTreeSet::new();
-        for column_index in projection
-            .column_indices
-            .iter()
-            .copied()
-            // u32::MAX is used as a placeholder (see ReaderProjection::from_field_ids)
-            .filter(|idx| *idx != u32::MAX)
-        {
+        for column_index in projection.column_indices.iter().copied() {
             if !column_indices_seen.insert(column_index) {
                 return Err(Error::invalid_input(
                     format!(

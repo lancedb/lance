@@ -101,8 +101,7 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
     )
     dataset_with_blobs.delete("idx = 1")
 
-    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
-
-    for expected in [b"foo", b"bar", b"baz"]:
-        with blobs.pop(0) as f:
-            assert f.read() == expected
+    with pytest.raises(
+        ValueError, match="some of the row ids requested have been deleted"
+    ):
+        dataset_with_blobs.take_blobs(row_ids, "blobs")
