@@ -11,12 +11,13 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding};
+use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock, UsedEncoding};
+use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
     BlockCompressor, FixedPerValueCompressor, MiniBlockChunk, MiniBlockCompressed,
     MiniBlockCompressor, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
 };
-use crate::format::pb::ArrayEncoding;
+use crate::format::pb::{self, ArrayEncoding};
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -352,6 +353,85 @@ impl MiniBlockCompressor for ValueEncoder {
     }
 }
 
+/// A decompressor for constant-encoded data
+#[derive(Debug)]
+pub struct ConstantDecompressor {
+    scalar: LanceBuffer,
+    num_values: u64,
+}
+
+impl ConstantDecompressor {
+    pub fn new(scalar: LanceBuffer, num_values: u64) -> Self {
+        Self {
+            scalar: scalar.into_borrowed(),
+            num_values,
+        }
+    }
+}
+
+impl BlockDecompressor for ConstantDecompressor {
+    fn decompress(&self, _data: LanceBuffer) -> Result<DataBlock> {
+        Ok(DataBlock::Constant(ConstantDataBlock {
+            data: self.scalar.try_clone().unwrap(),
+            num_values: self.num_values,
+        }))
+    }
+}
+
+/// A decompressor for fixed-width data that has
+/// been written, as-is, to disk in single contiguous array
+#[derive(Debug)]
+pub struct ValueDecompressor {
+    bytes_per_value: u64,
+}
+
+impl ValueDecompressor {
+    pub fn new(description: &pb::Flat) -> Self {
+        assert!(description.bits_per_value % 8 == 0);
+        Self {
+            bytes_per_value: description.bits_per_value / 8,
+        }
+    }
+}
+
+impl BlockDecompressor for ValueDecompressor {
+    fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
+        let num_values = data.len() as u64 / self.bytes_per_value;
+        assert_eq!(data.len() as u64 % self.bytes_per_value, 0);
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            data,
+            num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
+        }))
+    }
+}
+
+impl MiniBlockDecompressor for ValueDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        debug_assert!(data.len() as u64 >= num_values * self.bytes_per_value);
+
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data,
+            bits_per_value: self.bytes_per_value * 8,
+            num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
+        }))
+    }
+}
+
+impl FixedPerValueDecompressor for ValueDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        MiniBlockDecompressor::decompress(self, data, num_values)
+    }
+
+    fn bits_per_value(&self) -> u64 {
+        self.bytes_per_value * 8
+    }
+}
+
 impl FixedPerValueCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, ArrayEncoding)> {
         let (data, encoding) = match data {
@@ -373,8 +453,9 @@ impl FixedPerValueCompressor for ValueEncoder {
 pub(crate) mod tests {
 
     use arrow_schema::{DataType, Field, TimeUnit};
+    use rstest::rstest;
 
-    use crate::testing::check_round_trip_encoding_random;
+    use crate::{testing::check_round_trip_encoding_random, version::LanceFileVersion};
 
     const PRIMITIVE_TYPES: &[DataType] = &[
         DataType::Null,
@@ -403,12 +484,15 @@ pub(crate) mod tests {
         // DataType::Interval(IntervalUnit::DayTime),
     ];
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_value_primitive() {
+    async fn test_value_primitive(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         for data_type in PRIMITIVE_TYPES {
             log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, version).await;
         }
     }
 }

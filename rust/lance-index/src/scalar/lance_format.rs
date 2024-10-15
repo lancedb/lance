@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::FileMetadataCache, Error, Result};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_file::writer::FileWriterOptions;
 use lance_file::{
     reader::FileReader,
@@ -162,7 +163,10 @@ impl IndexReader for v2::reader::FileReader {
         let projection = if let Some(projection) = projection {
             v2::reader::ReaderProjection::from_column_names(self.schema(), projection)?
         } else {
-            v2::reader::ReaderProjection::from_whole_schema(self.schema())
+            v2::reader::ReaderProjection::from_whole_schema(
+                self.schema(),
+                self.metadata().version(),
+            )
         };
         let batches = self
             .read_stream_projected(
@@ -236,8 +240,9 @@ impl IndexStore for LanceIndexStore {
         match v2::reader::FileReader::try_open(
             file_scheduler,
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &self.metadata_cache,
+            FileReaderOptions::default(),
         )
         .await
         {

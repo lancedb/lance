@@ -134,7 +134,7 @@ mod tests {
 
     use arrow_schema::{DataType, Field};
 
-    use crate::testing::check_round_trip_encoding_random;
+    use crate::{testing::check_round_trip_encoding_random, version::LanceFileVersion};
 
     const PRIMITIVE_TYPES: &[DataType] = &[DataType::Int8, DataType::Float32, DataType::Float64];
 
@@ -144,7 +144,7 @@ mod tests {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field).await;
+            check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
         }
     }
 }

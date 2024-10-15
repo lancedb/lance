@@ -132,7 +132,7 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
     ) -> Result<EncodedArray>;
 }
 
-pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 4;
+pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
 
 /// Page data that has been compressed into a series of chunks put into
@@ -158,7 +158,7 @@ pub struct MiniBlockCompressed {
 pub struct MiniBlockChunk {
     // The number of bytes that make up the chunk
     //
-    // This value must be less than or equal to 8Ki - 4 (8188)
+    // This value must be less than or equal to 8Ki - 6 (8188)
     pub num_bytes: u16,
     // The log (base 2) of the number of values in the chunk.  If this is the final chunk
     // then this should be 0 (the number of values will be calculated by subtracting the

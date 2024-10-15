@@ -290,6 +290,46 @@ impl FixedWidthDataBlock {
     }
 }
 
+pub struct FixedWidthDataBlockBuilder {
+    bits_per_value: u64,
+    bytes_per_value: u64,
+    values: Vec<u8>,
+}
+
+impl FixedWidthDataBlockBuilder {
+    fn new(bits_per_value: u64, estimated_size_bytes: u64) -> Self {
+        assert!(bits_per_value % 8 == 0);
+        Self {
+            bits_per_value,
+            bytes_per_value: bits_per_value / 8,
+            values: Vec::with_capacity(estimated_size_bytes as usize),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
+    fn append(&mut self, data_block: DataBlock, selection: &[Range<u64>]) {
+        let block = data_block.as_fixed_width().unwrap();
+        assert_eq!(self.bits_per_value, block.bits_per_value);
+        for rng in selection {
+            let start = rng.start as usize * self.bytes_per_value as usize;
+            let end = rng.end as usize * self.bytes_per_value as usize;
+            self.values.extend_from_slice(&block.data[start..end]);
+        }
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: LanceBuffer::Owned(self.values),
+            bits_per_value: self.bits_per_value,
+            num_values,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
+        })
+    }
+}
+
 /// A data block to represent a fixed size list
 #[derive(Debug)]
 pub struct FixedSizeListBlock {
@@ -805,6 +845,16 @@ impl DataBlock {
             Self::Opaque(inner) => Self::Opaque(inner),
         }
     }
+
+    pub fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
+        match self {
+            Self::FixedWidth(inner) => Box::new(FixedWidthDataBlockBuilder::new(
+                inner.bits_per_value,
+                estimated_size_bytes,
+            )),
+            _ => todo!(),
+        }
+    }
 }
 
 macro_rules! as_type {
@@ -1281,6 +1331,41 @@ impl From<ArrayRef> for DataBlock {
     fn from(array: ArrayRef) -> Self {
         let num_values = array.len() as u64;
         Self::from_arrays(&[array], num_values)
+    }
+}
+
+pub trait DataBlockBuilderImpl {
+    fn append(&mut self, data_block: DataBlock, selection: &[Range<u64>]);
+    fn finish(self: Box<Self>) -> DataBlock;
+}
+
+pub struct DataBlockBuilder {
+    estimated_size_bytes: u64,
+    builder: Option<Box<dyn DataBlockBuilderImpl>>,
+}
+
+impl DataBlockBuilder {
+    pub fn with_capacity_estimate(estimated_size_bytes: u64) -> Self {
+        Self {
+            estimated_size_bytes,
+            builder: None,
+        }
+    }
+
+    fn get_builder(&mut self, block: &DataBlock) -> &mut dyn DataBlockBuilderImpl {
+        if self.builder.is_none() {
+            self.builder = Some(block.make_builder(self.estimated_size_bytes));
+        }
+        self.builder.as_mut().unwrap().as_mut()
+    }
+
+    pub fn append(&mut self, data_block: DataBlock, selection: &[Range<u64>]) {
+        self.get_builder(&data_block).append(data_block, selection);
+    }
+
+    pub fn finish(self) -> DataBlock {
+        let builder = self.builder.expect("DataBlockBuilder didn't see any data");
+        builder.finish()
     }
 }
 

@@ -58,6 +58,7 @@ impl Iterator for LanceReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let stream = self.stream.clone();
+        let _span = tracing::debug_span!("LanceReader::next").entered();
         RT.spawn(None, async move {
             let mut stream = stream.lock().await;
             stream.next().await
