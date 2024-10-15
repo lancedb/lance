@@ -13,21 +13,21 @@ from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
 import pyarrow as pa
 from tqdm.auto import tqdm
 
-from . import write_dataset
-from .cuvs.kmeans import KMeans as KMeansCuVS
-from .dependencies import (
+from .. import write_dataset
+from ..cuvs.kmeans import KMeans as KMeansCuVS
+from ..dependencies import (
     _CAGRA_AVAILABLE,
     _RAFT_COMMON_AVAILABLE,
     torch,
 )
-from .dependencies import numpy as np
-from .torch.data import LanceDataset as TorchDataset
-from .torch.kmeans import KMeans
+from ..dependencies import numpy as np
+from ..torch.data import LanceDataset as TorchDataset
+from ..torch.kmeans import KMeans
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from . import LanceDataset
+    from .. import LanceDataset
 
 
 CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
