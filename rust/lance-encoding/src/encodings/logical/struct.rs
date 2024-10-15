@@ -605,7 +605,7 @@ impl FieldEncoder for StructStructuralEncoder {
             .map(|child| child.finish(external_buffers))
             .collect::<FuturesOrdered<_>>();
         async move {
-            let mut encoded_columns = Vec::new();
+            let mut encoded_columns = Vec::with_capacity(child_columns.len());
             while let Some(child_cols) = child_columns.next().await {
                 encoded_columns.extend(child_cols?);
             }

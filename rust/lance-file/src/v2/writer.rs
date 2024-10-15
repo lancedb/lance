@@ -322,7 +322,7 @@ impl FileWriter {
         self.rows_written = match self.rows_written.checked_add(batch.num_rows() as u64) {
             Some(rows_written) => rows_written,
             None => {
-                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^32 rows", num_rows, self.rows_written).into(), location: location!() });
+                return Err(Error::InvalidInput { source: format!("cannot write batch with {} rows because {} rows have already been written and Lance files cannot contain more than 2^64 rows", num_rows, self.rows_written).into(), location: location!() });
             }
         };
 

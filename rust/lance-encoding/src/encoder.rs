@@ -233,7 +233,7 @@ pub trait FixedPerValueCompressor: std::fmt::Debug + Send + Sync {
 /// Accessing this data will require 2 IOPS and accessing in a random-access fashion will require
 /// a repetition index.
 pub trait VariablePerValueCompressor: std::fmt::Debug + Send + Sync {
-    /// Compress the data into a single buffer where each value is encoded with the same number of bits
+    /// Compress the data into a single buffer where each value is encoded with a different size
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
     fn compress(&self, data: DataBlock) -> Result<(VariableWidthBlock, pb::ArrayEncoding)>;

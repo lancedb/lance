@@ -248,7 +248,7 @@ use crate::{BufferScheduler, EncodingsIo};
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 
-/// Top-levle encoding message for a page.  Wraps both the
+/// Top-level encoding message for a page.  Wraps both the
 /// legacy pb::ArrayEncoding and the newer pb::PageLayout
 ///
 /// A file should only use one or the other and never both.
