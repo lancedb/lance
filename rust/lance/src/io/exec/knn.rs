@@ -70,6 +70,7 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector column.
+///
 /// WARNING: Internal API with no stability guarantees.
 #[derive(Debug)]
 pub struct KNNVectorDistanceExec {
