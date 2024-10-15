@@ -5,9 +5,6 @@ from datetime import datetime
 
 import lance
 import pyarrow.parquet as pq
-from lance.tracing import trace_to_chrome
-
-trace_to_chrome(file="/tmp/foo.trace", level="debug")
 
 # This file compares the performance of lance v1 and v2 on the lineitem dataset,
 # specifically for random access scans

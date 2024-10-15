@@ -1665,7 +1665,7 @@ class LanceDataset(pa.dataset.Dataset):
         # Handle timing for various parts of accelerated builds
         timers = {}
         if one_pass_ivfpq and accelerator is not None:
-            from .vector import (
+            from .torch.vector import (
                 one_pass_assign_ivf_pq_on_accelerator,
                 one_pass_train_ivf_pq_on_accelerator,
             )
@@ -1673,17 +1673,20 @@ class LanceDataset(pa.dataset.Dataset):
             logging.info("Doing one-pass ivfpq accelerated computations")
 
             timers["ivf+pq_train:start"] = time.time()
-            ivf_centroids, ivf_kmeans, pq_codebook, pq_kmeans_list = (
-                one_pass_train_ivf_pq_on_accelerator(
-                    self,
-                    column[0],
-                    num_partitions,
-                    metric,
-                    accelerator,
-                    num_sub_vectors=num_sub_vectors,
-                    batch_size=20480,
-                    filter_nan=filter_nan,
-                )
+            (
+                ivf_centroids,
+                ivf_kmeans,
+                pq_codebook,
+                pq_kmeans_list,
+            ) = one_pass_train_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                num_partitions,
+                metric,
+                accelerator,
+                num_sub_vectors=num_sub_vectors,
+                batch_size=20480,
+                filter_nan=filter_nan,
             )
             timers["ivf+pq_train:end"] = time.time()
             ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
@@ -1770,7 +1773,7 @@ class LanceDataset(pa.dataset.Dataset):
             if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
                 logging.info("Computing new precomputed partition dataset")
                 # Use accelerator to train ivf centroids
-                from .vector import (
+                from .torch.vector import (
                     compute_partitions,
                     train_ivf_centroids_on_accelerator,
                 )
@@ -1856,7 +1859,7 @@ class LanceDataset(pa.dataset.Dataset):
 
                 partitions_ds = LanceDataset(partitions_file)
                 # Use accelerator to train pq codebook
-                from .vector import (
+                from .torch.vector import (
                     compute_pq_codes,
                     train_pq_codebook_on_accelerator,
                 )

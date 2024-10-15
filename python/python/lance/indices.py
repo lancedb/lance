@@ -246,7 +246,7 @@ class IndicesBuilder:
             return IvfModel(ivf_centroids, distance_type)
         else:
             # Use accelerator to train ivf centroids
-            from .vector import train_ivf_centroids_on_accelerator
+            from .torch.vector import train_ivf_centroids_on_accelerator
 
             ivf_centroids, _ = train_ivf_centroids_on_accelerator(
                 self.dataset,
@@ -360,7 +360,7 @@ class IndicesBuilder:
         """
         from .dependencies import torch
         from .torch.kmeans import KMeans
-        from .vector import compute_partitions
+        from .torch.vector import compute_partitions
 
         centroids = torch.from_numpy(
             np.stack(ivf_model.centroids.to_numpy(zero_copy_only=False))

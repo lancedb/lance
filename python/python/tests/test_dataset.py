@@ -2182,6 +2182,7 @@ def test_scan_with_row_ids(tmp_path: Path):
     assert tbl2["a"] == tbl["a"]
 
 
+@pytest.mark.cuda
 def test_random_dataset_recall_accelerated(tmp_path: Path):
     dims = 32
     schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
@@ -2207,6 +2208,7 @@ def test_random_dataset_recall_accelerated(tmp_path: Path):
     validate_vector_index(dataset, "a", pass_threshold=0.5)
 
 
+@pytest.mark.cuda
 def test_random_dataset_recall_accelerated_one_pass(tmp_path: Path):
     dims = 32
     schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
@@ -2233,6 +2235,7 @@ def test_random_dataset_recall_accelerated_one_pass(tmp_path: Path):
     validate_vector_index(dataset, "a", pass_threshold=0.5)
 
 
+@pytest.mark.cuda
 def test_count_index_rows_accelerated(tmp_path: Path):
     dims = 32
     schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
@@ -2277,6 +2280,7 @@ def test_count_index_rows_accelerated(tmp_path: Path):
     assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
 
+@pytest.mark.cuda
 def test_count_index_rows_accelerated_one_pass(tmp_path: Path):
     dims = 32
     schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
