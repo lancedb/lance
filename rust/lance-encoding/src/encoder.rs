@@ -18,7 +18,7 @@ use snafu::{location, Location};
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::decoder::PageEncoding;
-use crate::encodings::logical::blob::{BlobFieldEncoder, DESC_FIELD};
+use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
