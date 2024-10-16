@@ -326,9 +326,10 @@ async fn add_columns_from_stream(
     let mut last_seen_batch: Option<RecordBatch> = None;
     for fragment in fragments {
         let mut updater = fragment
-            .updater::<String>(None, schemas.clone(), batch_size)
+            .updater::<String>(Some(&[]), schemas.clone(), batch_size)
             .await?;
         while let Some(batch) = updater.next().await? {
+            debug_assert_eq!(batch.num_columns(), 1);
             let mut rows_remaining = batch.num_rows();
 
             let mut batches = Vec::new();
