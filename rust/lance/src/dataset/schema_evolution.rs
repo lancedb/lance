@@ -375,6 +375,15 @@ async fn add_columns_from_stream(
         }
         new_fragments.push(updater.finish().await?);
     }
+
+    // Ensure the stream is fully consumed
+    if last_seen_batch.is_some() || stream.next().await.is_some() {
+        return Err(Error::invalid_input(
+            format!("Stream produced more values than expected for dataset"),
+            location!(),
+        ));
+    }
+
     Ok(new_fragments)
 }
 
