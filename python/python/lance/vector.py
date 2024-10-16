@@ -14,7 +14,6 @@ import pyarrow as pa
 from tqdm.auto import tqdm
 
 from . import write_dataset
-from .cuvs.kmeans import KMeans as KMeansCuVS
 from .dependencies import (
     _CAGRA_AVAILABLE,
     _RAFT_COMMON_AVAILABLE,
@@ -22,8 +21,6 @@ from .dependencies import (
     torch,
 )
 from .dependencies import numpy as np
-from .torch.data import LanceDataset as TorchDataset
-from .torch.kmeans import KMeans
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -144,6 +141,9 @@ def train_pq_codebook_on_accelerator(
 ) -> (np.ndarray, List[Any]):
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
+    from .torch.data import LanceDataset as TorchDataset
+    from .torch.kmeans import KMeans
+
     # cuvs not particularly useful for only 256 centroids without more work
     if accelerator == "cuvs":
         accelerator = "cuda"
@@ -212,6 +212,11 @@ def train_ivf_centroids_on_accelerator(
     filter_nan: bool = True,
 ) -> (np.ndarray, Any):
     """Use accelerator (GPU or MPS) to train kmeans."""
+
+    from .cuvs.kmeans import KMeans as KMeansCuVS
+    from .torch.data import LanceDataset as TorchDataset
+    from .torch.kmeans import KMeans
+
     if isinstance(accelerator, str) and (
         not (
             CUDA_REGEX.match(accelerator)
@@ -321,6 +326,7 @@ def compute_pq_codes(
     str
         The absolute path of the pq codes dataset.
     """
+    from .torch.data import LanceDataset as TorchDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
@@ -451,6 +457,8 @@ def compute_partitions(
     str
         The absolute path of the partition dataset.
     """
+    from .torch.data import LanceDataset as TorchDataset
+
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
     num_rows = dataset.count_rows()
@@ -640,6 +648,8 @@ def one_pass_assign_ivf_pq_on_accelerator(
     str
         The absolute path of the ivfpq codes dataset, as precomputed partition buffers.
     """
+    from .torch.data import LanceDataset as TorchDataset
+
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
     num_rows = dataset.count_rows()
