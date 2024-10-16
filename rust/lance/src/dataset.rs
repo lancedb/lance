@@ -1999,6 +1999,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
+        use fragment::FragReadConfig;
+
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2034,7 +2036,7 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment
-                .open(dataset.schema(), false, false, None)
+                .open(dataset.schema(), FragReadConfig::default(), None)
                 .await
                 .unwrap();
             // No group / batch concept in v2

@@ -341,8 +341,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
-        dataset::{scanner::DEFAULT_IO_BUFFER_SIZE, WriteParams},
-        io::exec::LanceScanExec,
+        dataset::WriteParams,
+        io::exec::{LanceScanConfig, LanceScanExec},
     };
 
     async fn create_dataset() -> Arc<Dataset> {
@@ -395,19 +395,16 @@ mod tests {
         let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
 
         // With row id
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
             None,
             scan_schema,
-            10,
-            10,
-            Some(4),
-            *DEFAULT_IO_BUFFER_SIZE,
-            true,
-            false,
-            false,
-            true,
+            config,
         ));
         let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
         let schema = take_exec.schema();
@@ -431,19 +428,16 @@ mod tests {
         let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
         let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
 
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
             None,
             scan_schema,
-            10,
-            10,
-            Some(4),
-            *DEFAULT_IO_BUFFER_SIZE,
-            true,
-            false,
-            false,
-            true,
+            config,
         ));
         let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
         let schema = take_exec.schema();
@@ -472,14 +466,7 @@ mod tests {
             dataset.fragments().clone(),
             None,
             scan_schema,
-            10,
-            10,
-            Some(4),
-            *DEFAULT_IO_BUFFER_SIZE,
-            false,
-            false,
-            false,
-            true,
+            LanceScanConfig::default(),
         ));
         assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
     }
@@ -488,19 +475,16 @@ mod tests {
     async fn test_with_new_children() -> Result<()> {
         let dataset = create_dataset().await;
 
+        let config = LanceScanConfig {
+            with_row_id: true,
+            ..Default::default()
+        };
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
             None,
             Arc::new(dataset.schema().project(&["i"])?),
-            10,
-            10,
-            Some(4),
-            *DEFAULT_IO_BUFFER_SIZE,
-            true,
-            false,
-            false,
-            true,
+            config,
         ));
         assert_eq!(input.schema().field_names(), vec!["i", ROW_ID],);
         let take_exec = TakeExec::try_new(

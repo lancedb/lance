@@ -386,6 +386,26 @@ mod v2_adapter {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct FragReadConfig {
+    // Add the row id column
+    pub with_row_id: bool,
+    // Add the row address column
+    pub with_row_address: bool,
+}
+
+impl FragReadConfig {
+    pub fn with_row_id(mut self, value: bool) -> Self {
+        self.with_row_id = value;
+        self
+    }
+
+    pub fn with_row_address(mut self, value: bool) -> Self {
+        self.with_row_address = value;
+        self
+    }
+}
+
 impl FileFragment {
     /// Creates a new FileFragment.
     pub fn new(dataset: Arc<Dataset>, metadata: Fragment) -> Self {
@@ -522,8 +542,7 @@ impl FileFragment {
     ///
     /// Parameters
     /// - `projection`: The projection schema.
-    /// - `with_row_id`: If true, the row id will be included in the output.
-    /// - `with_row_address`: If true, the row address will be included in the output.
+    /// - `read_config`: Controls what columns are included in the output.
     /// - `scan_scheduler`: The scheduler to use for reading data files.  If not supplied
     ///                     and the data is v2 data then a new scheduler will be created
     ///
@@ -532,8 +551,7 @@ impl FileFragment {
     pub async fn open(
         &self,
         projection: &Schema,
-        with_row_id: bool,
-        with_row_address: bool,
+        read_config: FragReadConfig,
         scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
     ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, scan_scheduler);
@@ -554,7 +572,7 @@ impl FileFragment {
         let deletion_vec = deletion_vec?;
         let row_id_sequence = row_id_sequence?;
 
-        if opened_files.is_empty() && !with_row_id && !with_row_address {
+        if opened_files.is_empty() && !read_config.with_row_id && !read_config.with_row_address {
             return Err(Error::io(
                 format!(
                     "Did not find any data files for schema: {}\nfragment_id={}",
@@ -577,10 +595,10 @@ impl FileFragment {
             num_physical_rows,
         )?;
 
-        if with_row_id {
+        if read_config.with_row_id {
             reader.with_row_id();
         }
-        if with_row_address {
+        if read_config.with_row_address {
             reader.with_row_address();
         }
 
@@ -1084,8 +1102,13 @@ impl FileFragment {
         projection: &Schema,
         with_row_address: bool,
     ) -> Result<RecordBatch> {
-        // TODO: support taking row addresses
-        let reader = self.open(projection, false, with_row_address, None).await?;
+        let reader = self
+            .open(
+                projection,
+                FragReadConfig::default().with_row_address(with_row_address),
+                None,
+            )
+            .await?;
 
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
@@ -1154,7 +1177,11 @@ impl FileFragment {
         // If there is no projection, we at least need to read the row addresses
         with_row_addr |= schema.fields.is_empty();
 
-        let reader = self.open(&schema, false, with_row_addr, None);
+        let reader = self.open(
+            &schema,
+            FragReadConfig::default().with_row_address(with_row_addr),
+            None,
+        );
         let deletion_vector = read_deletion_file(
             &self.dataset.base,
             &self.metadata,
@@ -2037,7 +2064,11 @@ mod tests {
         // Test with take_range (all rows addressible)
         for with_row_id in [false, true] {
             let reader = fragment
-                .open(fragment.schema(), with_row_id, false, None)
+                .open(
+                    fragment.schema(),
+                    FragReadConfig::default().with_row_id(with_row_id),
+                    None,
+                )
                 .await
                 .unwrap();
             for valid_range in [0..40, 20..40] {
@@ -2057,7 +2088,11 @@ mod tests {
         // Test with read_range (only non-deleted rows addressible)
         for with_row_id in [false, true] {
             let reader = fragment
-                .open(fragment.schema(), with_row_id, false, None)
+                .open(
+                    fragment.schema(),
+                    FragReadConfig::default().with_row_id(with_row_id),
+                    None,
+                )
                 .await
                 .unwrap();
             for valid_range in [0..20, 0..10, 10..20] {
@@ -2088,7 +2123,11 @@ mod tests {
 
         let fragment = &dataset.get_fragments()[0];
         let mut reader = fragment
-            .open(dataset.schema(), true, false, None)
+            .open(
+                dataset.schema(),
+                FragReadConfig::default().with_row_id(true),
+                None,
+            )
             .await
             .unwrap();
         reader.with_make_deletions_null();
@@ -2176,7 +2215,11 @@ mod tests {
 
             let fragment = &dataset.get_fragments()[0];
             let reader = fragment
-                .open(dataset.schema(), true, false, None)
+                .open(
+                    dataset.schema(),
+                    FragReadConfig::default().with_row_id(true),
+                    None,
+                )
                 .await
                 .unwrap();
 
@@ -2715,7 +2758,7 @@ mod tests {
             .get_fragments()
             .first()
             .unwrap()
-            .open(dataset.schema(), false, false, None)
+            .open(dataset.schema(), FragReadConfig::default(), None)
             .await?;
         let actual_data = reader.take_as_batch(&[0, 1, 2]).await?;
         assert_eq!(expected_data.slice(0, 3), actual_data);
@@ -2766,7 +2809,11 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         let reader = fragment
-            .open(&dataset.schema().project::<&str>(&[])?, true, false, None)
+            .open(
+                &dataset.schema().project::<&str>(&[])?,
+                FragReadConfig::default().with_row_id(true),
+                None,
+            )
             .await?;
         let batch = reader.legacy_read_range_as_batch(0..20).await?;
 
@@ -2778,7 +2825,11 @@ mod tests {
 
         // We should get error if we pass empty schema and with_row_id false
         let res = fragment
-            .open(&dataset.schema().project::<&str>(&[])?, false, false, None)
+            .open(
+                &dataset.schema().project::<&str>(&[])?,
+                FragReadConfig::default(),
+                None,
+            )
             .await;
         assert!(matches!(res, Err(Error::IO { .. })));
 

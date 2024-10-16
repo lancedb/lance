@@ -34,6 +34,7 @@ use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
 use snafu::{location, Location};
 
+use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
 use crate::Error;
 use crate::{
@@ -273,7 +274,9 @@ impl FragmentScanner {
 
         // We will call the reader with projections. In order for this to work
         // we must ensure that we open the fragment with the maximal schema.
-        let mut reader = fragment.open(dataset.schema(), false, false, None).await?;
+        let mut reader = fragment
+            .open(dataset.schema(), FragReadConfig::default(), None)
+            .await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
