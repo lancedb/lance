@@ -11,6 +11,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance.file import LanceFileReader, LanceFileWriter
 
 
 def test_drop_columns(tmp_path: Path):
@@ -84,6 +85,32 @@ def test_add_columns_udf(tmp_path):
     dataset.add_columns(triple_a, read_columns=["a"])
 
     expected = expected.append_column("triple_a", pa.array([3 * x for x in range(100)]))
+    assert expected == dataset.to_table()
+
+
+def test_add_columns_from_file(tmp_path):
+    tab = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(tab, tmp_path / "dataset", max_rows_per_file=25)
+
+    tbl_one = dataset.to_table(columns={"double_b": "b * 2"}, limit=50)
+    with LanceFileWriter(tmp_path / "tbl_0") as writer:
+        writer.write_batch(tbl_one)
+
+    tbl_two = dataset.to_table(columns={"double_b": "b * 2"}, offset=50, limit=50)
+    with LanceFileWriter(tmp_path / "tbl_1") as writer:
+        writer.write_batch(tbl_two)
+
+    def data_gen():
+        for i in range(2):
+            reader = LanceFileReader(str(tmp_path / f"tbl_{i}"))
+            for batch in reader.read_all().to_batches():
+                yield batch
+
+    reader_schema = pa.schema([pa.field("double_b", pa.int64())])
+
+    dataset.add_columns(data_gen(), reader_schema=reader_schema)
+
+    expected = tab.append_column("double_b", pa.array([2 * x for x in range(100)]))
     assert expected == dataset.to_table()
 
 

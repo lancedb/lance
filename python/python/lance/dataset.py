@@ -914,23 +914,28 @@ class LanceDataset(pa.dataset.Dataset):
 
     def add_columns(
         self,
-        transforms: Dict[str, str] | BatchUDF,
+        transforms: Dict[str, str] | BatchUDF | ReaderLike,
         read_columns: List[str] | None = None,
+        reader_schema: Optional[pa.Schema] = None,
     ):
         """
         Add new columns with defined values.
 
-        There are two ways to specify the new columns. First, you can provide
+        There are several ways to specify the new columns. First, you can provide
         SQL expressions for each new column. Second you can provide a UDF that
         takes a batch of existing data and returns a new batch with the new
         columns. These new columns will be appended to the dataset.
+
+        You can also provide a RecordBatchReader which will read the new column
+        values from some external source.  This is often useful when the new column
+        values have already been staged to files (often by some distributed process)
 
         See the :func:`lance.add_columns_udf` decorator for more information on
         writing UDFs.
 
         Parameters
         ----------
-        transforms : dict or AddColumnsUDF
+        transforms : dict or AddColumnsUDF or ReaderLike
             If this is a dictionary, then the keys are the names of the new
             columns and the values are SQL expression strings. These strings can
             reference existing columns in the dataset.
@@ -940,6 +945,9 @@ class LanceDataset(pa.dataset.Dataset):
             The names of the columns that the UDF will read. If None, then the
             UDF will read all columns. This is only used when transforms is a
             UDF. Otherwise, the read columns are inferred from the SQL expressions.
+        reader_scheam: pa.Schema, optional
+            Only valid if transforms is a `ReaderLike` object.  This will be used to
+            determine the schema of the reader.
 
         Examples
         --------
@@ -988,7 +996,17 @@ class LanceDataset(pa.dataset.Dataset):
                         f"Column expressions must be a string. Got {type(k)}"
                     )
         else:
-            raise TypeError("transforms must be a dict or AddColumnsUDF")
+            try:
+                reader = _coerce_reader(transforms, reader_schema)
+                self._ds.add_columns_from_reader(reader)
+                return
+
+            except TypeError as inner_err:
+                raise TypeError(
+                    "transforms must be a dict, AddColumnsUDF, or a ReaderLike value.  "
+                    f"Received {type(transforms)}.  Could not coerce to a "
+                    f"reader: {inner_err}"
+                )
 
         self._ds.add_columns(transforms, read_columns)
 
@@ -1673,17 +1691,20 @@ class LanceDataset(pa.dataset.Dataset):
             logging.info("Doing one-pass ivfpq accelerated computations")
 
             timers["ivf+pq_train:start"] = time.time()
-            ivf_centroids, ivf_kmeans, pq_codebook, pq_kmeans_list = (
-                one_pass_train_ivf_pq_on_accelerator(
-                    self,
-                    column[0],
-                    num_partitions,
-                    metric,
-                    accelerator,
-                    num_sub_vectors=num_sub_vectors,
-                    batch_size=20480,
-                    filter_nan=filter_nan,
-                )
+            (
+                ivf_centroids,
+                ivf_kmeans,
+                pq_codebook,
+                pq_kmeans_list,
+            ) = one_pass_train_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                num_partitions,
+                metric,
+                accelerator,
+                num_sub_vectors=num_sub_vectors,
+                batch_size=20480,
+                filter_nan=filter_nan,
             )
             timers["ivf+pq_train:end"] = time.time()
             ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]

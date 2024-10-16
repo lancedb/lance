@@ -113,6 +113,21 @@ fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
     })
 }
 
+fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
+    let py = reader.py();
+    if reader.is_instance_of::<Scanner>() {
+        let scanner: Scanner = reader.extract()?;
+        Ok(Box::new(
+            RT.spawn(Some(py), async move { scanner.to_reader().await })?
+                .map_err(|err| PyValueError::new_err(err.to_string()))?,
+        ))
+    } else {
+        Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
+            reader,
+        )?))
+    }
+}
+
 #[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
 pub struct MergeInsertBuilder {
     builder: LanceMergeInsertBuilder,
@@ -190,16 +205,7 @@ impl MergeInsertBuilder {
 
     pub fn execute(&mut self, new_data: &Bound<PyAny>) -> PyResult<PyObject> {
         let py = new_data.py();
-
-        let new_data: Box<dyn RecordBatchReader + Send> = if new_data.is_instance_of::<Scanner>() {
-            let scanner: Scanner = new_data.extract()?;
-            Box::new(
-                RT.spawn(Some(py), async move { scanner.to_reader().await })?
-                    .map_err(|err| PyValueError::new_err(err.to_string()))?,
-            )
-        } else {
-            Box::new(ArrowArrayStreamReader::from_pyarrow_bound(new_data)?)
-        };
+        let new_data = convert_reader(new_data)?;
 
         let job = self
             .builder
@@ -1375,11 +1381,29 @@ impl Dataset {
         Ok(())
     }
 
+    fn add_columns_from_reader(&mut self, reader: &Bound<PyAny>) -> PyResult<()> {
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+
+        let transforms = NewColumnTransform::Reader(Box::new(batches));
+
+        let mut new_self = self.ds.as_ref().clone();
+        let new_self = RT
+            .spawn(None, async move {
+                new_self.add_columns(transforms, None).await?;
+                Ok(new_self)
+            })?
+            .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
+    }
+
     fn add_columns(
         &mut self,
         transforms: &PyAny,
         read_columns: Option<Vec<String>>,
     ) -> PyResult<()> {
+        println!("add_columns");
         let transforms = if let Ok(transforms) = transforms.extract::<&PyDict>() {
             let expressions = transforms
                 .iter()
