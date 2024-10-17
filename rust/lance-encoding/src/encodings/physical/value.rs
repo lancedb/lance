@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
@@ -10,7 +11,12 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock};
+use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding};
+use crate::encoder::{
+    BlockCompressor, FixedPerValueCompressor, MiniBlockChunk, MiniBlockCompressed,
+    MiniBlockCompressor, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
+};
+use crate::format::pb::ArrayEncoding;
 use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
@@ -205,12 +211,92 @@ impl PrimitivePageDecoder for ValuePageDecoder {
             bits_per_value: self.bytes_per_value * 8,
             data: data_buffer,
             num_values: num_rows,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         }))
     }
 }
 
+/// A compression strategy that writes fixed-width data as-is (no compression)
 #[derive(Debug, Default)]
 pub struct ValueEncoder {}
+
+impl ValueEncoder {
+    /// Use the largest chunk we can smaller than 4KiB
+    fn find_log_vals_per_chunk(bytes_per_value: u64) -> (u64, u64) {
+        let mut size_bytes = 2 * bytes_per_value;
+        let mut log_num_vals = 1;
+        let mut num_vals = 2;
+
+        // If the type is so wide that we can't even fit 2 values we shouldn't be here
+        assert!(size_bytes < MAX_MINIBLOCK_BYTES);
+
+        while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals < MAX_MINIBLOCK_VALUES {
+            log_num_vals += 1;
+            size_bytes *= 2;
+            num_vals *= 2;
+        }
+
+        (log_num_vals, num_vals)
+    }
+
+    fn chunk_data(data: FixedWidthDataBlock) -> MiniBlockCompressed {
+        // For now, only support byte-sized data
+        debug_assert!(data.bits_per_value % 8 == 0);
+        let bytes_per_value = data.bits_per_value / 8;
+
+        // Aim for 4KiB chunks
+        let (log_vals_per_chunk, vals_per_chunk) = Self::find_log_vals_per_chunk(bytes_per_value);
+        let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
+        let bytes_per_chunk = bytes_per_value * vals_per_chunk;
+        let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
+
+        let data_buffer = data.data;
+
+        let mut row_offset = 0;
+        let mut chunks = Vec::with_capacity(num_chunks);
+
+        let mut bytes_counter = 0;
+        loop {
+            if row_offset + vals_per_chunk <= data.num_values {
+                chunks.push(MiniBlockChunk {
+                    log_num_values: log_vals_per_chunk as u8,
+                    num_bytes: bytes_per_chunk,
+                });
+                row_offset += vals_per_chunk;
+                bytes_counter += bytes_per_chunk as u64;
+            } else {
+                // Final chunk, special values
+                let num_bytes = data_buffer.len() as u64 - bytes_counter;
+                let num_bytes = u16::try_from(num_bytes).unwrap();
+                chunks.push(MiniBlockChunk {
+                    log_num_values: 0,
+                    num_bytes,
+                });
+                break;
+            }
+        }
+
+        MiniBlockCompressed {
+            chunks,
+            data: data_buffer,
+            num_values: data.num_values,
+        }
+    }
+}
+
+impl BlockCompressor for ValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let data = match data {
+            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+            _ => unimplemented!(
+                "Cannot compress block of type {} with ValueEncoder",
+                data.name()
+            ),
+        };
+        Ok(data)
+    }
+}
 
 impl ArrayEncoder for ValueEncoder {
     fn encode(
@@ -238,6 +324,47 @@ impl ArrayEncoder for ValueEncoder {
             }),
         }?;
         Ok(EncodedArray { data, encoding })
+    }
+}
+
+impl MiniBlockCompressor for ValueEncoder {
+    fn compress(
+        &self,
+        chunk: DataBlock,
+    ) -> Result<(
+        crate::encoder::MiniBlockCompressed,
+        crate::format::pb::ArrayEncoding,
+    )> {
+        match chunk {
+            DataBlock::FixedWidth(fixed_width) => {
+                let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
+                Ok((Self::chunk_data(fixed_width), encoding))
+            }
+            _ => Err(Error::InvalidInput {
+                source: format!(
+                    "Cannot compress a data block of type {} with ValueEncoder",
+                    chunk.name()
+                )
+                .into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+impl FixedPerValueCompressor for ValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, ArrayEncoding)> {
+        let (data, encoding) = match data {
+            DataBlock::FixedWidth(fixed_width) => {
+                let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
+                (fixed_width, encoding)
+            }
+            _ => unimplemented!(
+                "Cannot compress block of type {} with ValueEncoder",
+                data.name()
+            ),
+        };
+        Ok((data, encoding))
     }
 }
 

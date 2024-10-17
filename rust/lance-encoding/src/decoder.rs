@@ -225,7 +225,7 @@ use futures::stream::{self, BoxStream};
 use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::{CapacityMode, FileMetadataCache};
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{Field, Schema, BLOB_DESC_FIELD};
 use log::{debug, trace, warn};
 use snafu::{location, Location};
 use tokio::sync::mpsc::error::SendError;
@@ -237,7 +237,7 @@ use tracing::instrument;
 use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
-use crate::encodings::logical::blob::{BlobFieldScheduler, DESC_FIELD};
+use crate::encodings::logical::blob::BlobFieldScheduler;
 use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
 use crate::encodings::logical::primitive::PrimitiveFieldScheduler;
 use crate::encodings::logical::r#struct::{SimpleStructDecoder, SimpleStructScheduler};
@@ -248,6 +248,38 @@ use crate::{BufferScheduler, EncodingsIo};
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
 const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 
+/// Top-level encoding message for a page.  Wraps both the
+/// legacy pb::ArrayEncoding and the newer pb::PageLayout
+///
+/// A file should only use one or the other and never both.
+/// 2.0 decoders can always assume this is pb::ArrayEncoding
+/// and 2.1+ decoders can always assume this is pb::PageLayout
+#[derive(Debug)]
+pub enum PageEncoding {
+    Legacy(pb::ArrayEncoding),
+    Structural(pb::PageLayout),
+}
+
+impl PageEncoding {
+    pub fn as_legacy(&self) -> &pb::ArrayEncoding {
+        match self {
+            Self::Legacy(enc) => enc,
+            Self::Structural(_) => panic!("Expected a legacy encoding"),
+        }
+    }
+
+    pub fn as_structural(&self) -> &pb::PageLayout {
+        match self {
+            Self::Structural(enc) => enc,
+            Self::Legacy(_) => panic!("Expected a structural encoding"),
+        }
+    }
+
+    pub fn is_structural(&self) -> bool {
+        matches!(self, Self::Structural(_))
+    }
+}
+
 /// Metadata describing a page in a file
 ///
 /// This is typically created by reading the metadata section of a Lance file
@@ -255,8 +287,12 @@ const BATCH_SIZE_BYTES_WARNING: u64 = 10 * 1024 * 1024;
 pub struct PageInfo {
     /// The number of rows in the page
     pub num_rows: u64,
+    /// The priority (top level row number) of the page
+    ///
+    /// This is only set in 2.1 files and will be 0 for 2.0 files
+    pub priority: u64,
     /// The encoding that explains the buffers in the page
-    pub encoding: pb::ArrayEncoding,
+    pub encoding: PageEncoding,
     /// The offsets and sizes of the buffers in the file
     pub buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
 }
@@ -289,6 +325,14 @@ impl ColumnInfo {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.into_boxed_slice().into(),
             encoding,
         }
+    }
+
+    pub fn is_structural(&self) -> bool {
+        self.page_infos
+            // Can just look at the first since all should be the same
+            .first()
+            .map(|page| page.encoding.is_structural())
+            .unwrap_or(false)
     }
 }
 
@@ -498,7 +542,7 @@ impl<'a> ColumnInfoIter<'a> {
     pub fn expect_next(&mut self) -> Result<&Arc<ColumnInfo>> {
         self.next().ok_or_else(|| {
             Error::invalid_input(
-                "there were more fields in the schema than provided column indices",
+                "there were more fields in the schema than provided column indices / infos",
                 location!(),
             )
         })
@@ -665,7 +709,7 @@ impl CoreFieldDecoderStrategy {
             return Err(Error::InvalidInput { source: format!("Due to schema we expected a struct column but we received a column with {} pages and right now we only support struct columns with 1 page", column_info.page_infos.len()).into(), location: location!() });
         }
         let encoding = &column_info.page_infos[0].encoding;
-        match encoding.array_encoding.as_ref().unwrap() {
+        match encoding.as_legacy().array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Struct(_) => Ok(()),
             _ => Err(Error::InvalidInput { source: format!("Expected a struct encoding because we have a struct field in the schema but got the encoding {:?}", encoding).into(), location: location!() }),
         }
@@ -674,7 +718,7 @@ impl CoreFieldDecoderStrategy {
     fn check_packed_struct(column_info: &ColumnInfo) -> bool {
         let encoding = &column_info.page_infos[0].encoding;
         matches!(
-            encoding.array_encoding.as_ref().unwrap(),
+            encoding.as_legacy().array_encoding.as_ref().unwrap(),
             pb::array_encoding::ArrayEncoding::PackedStruct(_)
         )
     }
@@ -706,12 +750,15 @@ impl CoreFieldDecoderStrategy {
             .filter(|offsets_page| offsets_page.num_rows > 0)
             .map(|offsets_page| {
                 if let Some(pb::array_encoding::ArrayEncoding::List(list_encoding)) =
-                    &offsets_page.encoding.array_encoding
+                    &offsets_page.encoding.as_legacy().array_encoding
                 {
                     let inner = PageInfo {
                         buffer_offsets_and_sizes: offsets_page.buffer_offsets_and_sizes.clone(),
-                        encoding: list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
+                        encoding: PageEncoding::Legacy(
+                            list_encoding.offsets.as_ref().unwrap().as_ref().clone(),
+                        ),
                         num_rows: offsets_page.num_rows,
+                        priority: 0,
                     };
                     (
                         inner,
@@ -789,9 +836,10 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             return Ok((chain, Ok(scheduler)));
         } else if data_type.is_binary_like() {
             let column_info = column_infos.next().unwrap().clone();
+            // Column is blob and user is asking for binary data
             if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
                 let desc_scheduler = self.create_primitive_scheduler(
-                    DESC_FIELD.data_type(),
+                    BLOB_DESC_FIELD.data_type(),
                     chain.current_path(),
                     &blob_col,
                     buffers,
@@ -801,7 +849,7 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             }
             if let Some(page_info) = column_info.page_infos.first() {
                 if matches!(
-                    page_info.encoding,
+                    page_info.encoding.as_legacy(),
                     pb::ArrayEncoding {
                         array_encoding: Some(pb::array_encoding::ArrayEncoding::List(..))
                     }
@@ -898,6 +946,18 @@ impl FieldDecoderStrategy for CoreFieldDecoderStrategy {
             DataType::Struct(fields) => {
                 let column_info = column_infos.expect_next()?;
 
+                // Column is blob and user is asking for descriptions
+                if let Some(blob_col) = Self::unwrap_blob(column_info.as_ref()) {
+                    // Can use primitive scheduler here since descriptions are always packed struct
+                    let desc_scheduler = self.create_primitive_scheduler(
+                        &data_type,
+                        chain.current_path(),
+                        &blob_col,
+                        buffers,
+                    )?;
+                    return Ok((chain, Ok(desc_scheduler)));
+                }
+
                 if Self::check_packed_struct(column_info) {
                     // use packed struct encoding
                     let scheduler = self.create_primitive_scheduler(
@@ -950,11 +1010,12 @@ fn root_column(num_rows: u64) -> ColumnInfo {
             } else {
                 u64::MAX
             },
-            encoding: pb::ArrayEncoding {
+            encoding: PageEncoding::Legacy(pb::ArrayEncoding {
                 array_encoding: Some(pb::array_encoding::ArrayEncoding::Struct(
                     pb::SimpleStruct {},
                 )),
-            },
+            }),
+            priority: 0, // not used in legacy scheduler
             buffer_offsets_and_sizes: Arc::new([]),
         })
         .collect::<Vec<_>>();
@@ -992,7 +1053,7 @@ impl DecodeBatchScheduler {
         columns.extend(column_infos.iter().cloned());
         let adjusted_column_indices = [0_u32]
             .into_iter()
-            .chain(column_indices.iter().map(|i| *i + 1))
+            .chain(column_indices.iter().map(|i| i.saturating_add(1)))
             .collect::<Vec<_>>();
         let mut column_iter = ColumnInfoIter::new(columns, &adjusted_column_indices);
         let root_type = DataType::Struct(root_fields.clone());
@@ -1000,7 +1061,7 @@ impl DecodeBatchScheduler {
         // root_field.children and schema.fields should be identical at this point but the latter
         // has field ids and the former does not.  This line restores that.
         // TODO:  Is there another way to create the root field without forcing a trip through arrow?
-        root_field.children = schema.fields.clone();
+        root_field.children.clone_from(&schema.fields);
         root_field
             .metadata
             .insert("__lance_decoder_root".to_string(), "true".to_string());
@@ -1117,7 +1178,7 @@ impl DecodeBatchScheduler {
         decode_messages.into_iter().collect::<Result<Vec<_>>>()
     }
 
-    /// Schedules the load of a multiple ranges of rows
+    /// Schedules the load of multiple ranges of rows
     ///
     /// Ranges must be non-overlapping and in sorted order
     ///

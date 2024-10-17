@@ -39,6 +39,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
+mod blob;
 pub mod builder;
 pub mod cleanup;
 pub mod fragment;
@@ -69,12 +70,14 @@ use crate::io::commit::{commit_new_dataset, commit_transaction};
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
+pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
 use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
+pub use take::TakeBuilder;
 pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
@@ -254,8 +257,13 @@ impl ProjectionRequest {
 
     pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
         match self {
-            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(schema)),
-            Self::Sql(columns) => ProjectionPlan::try_new(dataset_schema, &columns),
+            Self::Schema(schema) => Ok(ProjectionPlan::new_empty(
+                Arc::new(dataset_schema.project_by_schema(schema.as_ref())?),
+                /*load_blobs=*/ false,
+            )),
+            Self::Sql(columns) => {
+                ProjectionPlan::try_new(dataset_schema, &columns, /*load_blobs=*/ false)
+            }
         }
     }
 }
@@ -590,7 +598,11 @@ impl Dataset {
         .await?;
 
         let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite { schema, fragments },
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema,
+                fragments,
+                config_upsert_values: None,
+            },
             WriteMode::Append => Operation::Append { fragments },
         };
 
@@ -1070,12 +1082,26 @@ impl Dataset {
         row_ids: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take_rows(
-            self,
-            row_ids,
-            &projection.into().into_projection_plan(self.schema())?,
-        )
-        .await
+        Arc::new(self.clone())
+            .take_builder(row_ids, projection)?
+            .execute()
+            .await
+    }
+
+    pub fn take_builder(
+        self: &Arc<Self>,
+        row_ids: &[u64],
+        projection: impl Into<ProjectionRequest>,
+    ) -> Result<TakeBuilder> {
+        TakeBuilder::try_new_from_ids(self.clone(), row_ids.to_vec(), projection.into())
+    }
+
+    pub async fn take_blobs(
+        self: &Arc<Self>,
+        row_ids: &[u64],
+        column: impl AsRef<str>,
+    ) -> Result<Vec<BlobFile>> {
+        blob::take_blobs(self, row_ids, column.as_ref()).await
     }
 
     /// Get a stream of batches based on iterator of ranges of row numbers.
@@ -1505,6 +1531,63 @@ impl Dataset {
         let stream = Box::new(stream);
         self.merge_impl(stream, left_on, right_on).await
     }
+
+    /// Update key-value pairs in config.
+    pub async fn update_config(
+        &mut self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateConfig {
+                upsert_values: Some(HashMap::from_iter(upsert_values)),
+                delete_keys: None,
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
+
+    /// Delete keys from the config.
+    pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::UpdateConfig {
+                upsert_values: None,
+                delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
+            },
+            None,
+        );
+
+        let manifest = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(manifest);
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -1916,6 +1999,8 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
+        use fragment::FragReadConfig;
+
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1951,7 +2036,7 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows().await.unwrap(), 100);
             let reader = fragment
-                .open(dataset.schema(), false, false, None)
+                .open(dataset.schema(), FragReadConfig::default(), None)
                 .await
                 .unwrap();
             // No group / batch concept in v2
@@ -2802,6 +2887,7 @@ mod tests {
         let operation = Operation::Overwrite {
             fragments: vec![],
             schema,
+            config_upsert_values: None,
         };
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -3235,6 +3321,38 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(dataset.count_fragments(), 1);
         assert!(fragments[0].metadata.deletion_file.is_some());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_update_config() {
+        // Create a table
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let data = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        );
+        let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+
+        let mut desired_config = HashMap::new();
+        desired_config.insert("lance:test".to_string(), "value".to_string());
+        desired_config.insert("other-key".to_string(), "other-value".to_string());
+
+        dataset.update_config(desired_config.clone()).await.unwrap();
+        assert_eq!(dataset.manifest.config, desired_config);
+
+        desired_config.remove("other-key");
+        dataset.delete_config_keys(&["other-key"]).await.unwrap();
+        assert_eq!(dataset.manifest.config, desired_config);
     }
 
     #[rstest]

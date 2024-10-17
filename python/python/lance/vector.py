@@ -14,7 +14,6 @@ import pyarrow as pa
 from tqdm.auto import tqdm
 
 from . import write_dataset
-from .cuvs.kmeans import KMeans as KMeansCuVS
 from .dependencies import (
     _CAGRA_AVAILABLE,
     _RAFT_COMMON_AVAILABLE,
@@ -22,8 +21,6 @@ from .dependencies import (
     torch,
 )
 from .dependencies import numpy as np
-from .torch.data import LanceDataset as TorchDataset
-from .torch.kmeans import KMeans
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -144,6 +141,9 @@ def train_pq_codebook_on_accelerator(
 ) -> (np.ndarray, List[Any]):
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
+    from .torch.data import LanceDataset as TorchDataset
+    from .torch.kmeans import KMeans
+
     # cuvs not particularly useful for only 256 centroids without more work
     if accelerator == "cuvs":
         accelerator = "cuda"
@@ -174,14 +174,22 @@ def train_pq_codebook_on_accelerator(
 
     for sub_vector in range(num_sub_vectors):
         logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        if num_sub_vectors == 1:
+            # sampler has different behaviour with one column
+            init_centroids_slice = init_centroids
+        else:
+            init_centroids_slice = init_centroids[field_names[sub_vector]]
         kmeans_local = KMeans(
             256,
             max_iters=50,
             metric=metric_type,
             device=accelerator,
-            centroids=init_centroids[field_names[sub_vector]],
+            centroids=init_centroids_slice,
         )
-        kmeans_local.fit(ds_fit, column=field_names[sub_vector])
+        if num_sub_vectors == 1:
+            kmeans_local.fit(ds_fit)
+        else:
+            kmeans_local.fit(ds_fit, column=field_names[sub_vector])
 
         ivf_centroids_local = kmeans_local.centroids.cpu().numpy()
         centroids_list.append(ivf_centroids_local)
@@ -204,6 +212,11 @@ def train_ivf_centroids_on_accelerator(
     filter_nan: bool = True,
 ) -> (np.ndarray, Any):
     """Use accelerator (GPU or MPS) to train kmeans."""
+
+    from .cuvs.kmeans import KMeans as KMeansCuVS
+    from .torch.data import LanceDataset as TorchDataset
+    from .torch.kmeans import KMeans
+
     if isinstance(accelerator, str) and (
         not (
             CUDA_REGEX.match(accelerator)
@@ -313,6 +326,7 @@ def compute_pq_codes(
     str
         The absolute path of the pq codes dataset.
     """
+    from .torch.data import LanceDataset as TorchDataset
 
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
@@ -418,6 +432,7 @@ def compute_partitions(
     allow_cuda_tf32: bool = True,
     num_sub_vectors: Optional[int] = None,
     filter_nan: bool = True,
+    sample_size: Optional[int] = None,
 ) -> str:
     """Compute partitions for each row using GPU kmeans and spill to disk.
 
@@ -442,6 +457,8 @@ def compute_partitions(
     str
         The absolute path of the partition dataset.
     """
+    from .torch.data import LanceDataset as TorchDataset
+
     torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
 
     num_rows = dataset.count_rows()
@@ -456,6 +473,7 @@ def compute_partitions(
         batch_size=batch_size,
         with_row_id=True,
         columns=[column],
+        samples=sample_size,
         filter=filt,
     )
     loader = torch.utils.data.DataLoader(
@@ -492,16 +510,21 @@ def compute_partitions(
         progress.set_description("Assigning partitions")
 
     def _partition_assignment() -> Iterable[pa.RecordBatch]:
+        id_offset = 0
         with torch.no_grad():
             for batch in loader:
-                vecs = (
-                    batch[column]
-                    .to(kmeans.device)
-                    .reshape(-1, kmeans.centroids.shape[1])
-                )
+                if sample_size is None:
+                    vecs = batch[column]
+                    ids = batch["_rowid"].reshape(-1)
+                else:
+                    # No row ids with sampling
+                    vecs = batch
+                    ids = torch.arange(id_offset, id_offset + vecs.size(0))
+                    id_offset += vecs.size(0)
+
+                vecs = vecs.to(kmeans.device).reshape(-1, kmeans.centroids.shape[1])
 
                 partitions = kmeans.transform(vecs)
-                ids = batch["_rowid"].reshape(-1)
 
                 # this is expected to be true, so just assert
                 assert vecs.shape[0] == ids.shape[0]
@@ -561,3 +584,181 @@ def compute_partitions(
 
     logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
     return str(dst_dataset_uri)
+
+
+def one_pass_train_ivf_pq_on_accelerator(
+    dataset: LanceDataset,
+    column: str,
+    k: int,
+    metric_type: Literal["l2", "cosine", "dot"],
+    accelerator: Union[str, "torch.Device"],
+    num_sub_vectors: int,
+    batch_size: int = 1024 * 10 * 4,
+    *,
+    sample_rate: int = 256,
+    max_iters: int = 50,
+    filter_nan: bool = True,
+):
+    centroids, kmeans = train_ivf_centroids_on_accelerator(
+        dataset,
+        column,
+        k,
+        metric_type,
+        accelerator,
+        batch_size,
+        sample_rate=sample_rate,
+        max_iters=max_iters,
+        filter_nan=filter_nan,
+    )
+    dataset_residuals = compute_partitions(
+        dataset,
+        column,
+        kmeans,
+        batch_size,
+        num_sub_vectors=num_sub_vectors,
+        filter_nan=filter_nan,
+        sample_size=256 * 256,
+    )
+    pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
+        dataset_residuals, metric_type, accelerator, num_sub_vectors, batch_size
+    )
+    return centroids, kmeans, pq_codebook, kmeans_list
+
+
+def one_pass_assign_ivf_pq_on_accelerator(
+    dataset: LanceDataset,
+    column: str,
+    metric_type: Literal["l2", "cosine", "dot"],
+    accelerator: Union[str, "torch.Device"],
+    ivf_kmeans: Any,  # KMeans
+    pq_kmeans_list: List[Any],  # List[KMeans]
+    dst_dataset_uri: Optional[Union[str, Path]] = None,
+    batch_size: int = 1024 * 10 * 4,
+    *,
+    filter_nan: bool = True,
+    allow_cuda_tf32: bool = True,
+):
+    """Compute partitions for each row using GPU kmeans and spill to disk.
+
+    Parameters
+    ----------
+
+    Returns
+    -------
+    str
+        The absolute path of the ivfpq codes dataset, as precomputed partition buffers.
+    """
+    from .torch.data import LanceDataset as TorchDataset
+
+    torch.backends.cuda.matmul.allow_tf32 = allow_cuda_tf32
+
+    num_rows = dataset.count_rows()
+
+    if dataset.schema.field(column).nullable and filter_nan:
+        filt = f"{column} is not null"
+    else:
+        filt = None
+
+    torch_ds = TorchDataset(
+        dataset,
+        batch_size=batch_size,
+        with_row_id=True,
+        columns=[column],
+        filter=filt,
+    )
+    loader = torch.utils.data.DataLoader(
+        torch_ds,
+        batch_size=1,
+        pin_memory=True,
+        collate_fn=_collate_fn,
+    )
+
+    num_sub_vectors = len(pq_kmeans_list)
+    dim = ivf_kmeans.centroids.shape[1]
+    subvector_size = dim // num_sub_vectors
+
+    output_schema = pa.schema(
+        [
+            pa.field("_rowid", pa.uint64()),
+            pa.field("__ivf_part_id", pa.uint32()),
+            pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
+        ]
+    )
+
+    progress = tqdm(total=num_rows)
+
+    progress.set_description("Assigning partitions and computing pq codes")
+
+    def _partition_and_pq_codes_assignment() -> Iterable[pa.RecordBatch]:
+        with torch.no_grad():
+            for batch in loader:
+                vecs = (
+                    batch[column]
+                    .to(ivf_kmeans.device)
+                    .reshape(-1, ivf_kmeans.centroids.shape[1])
+                )
+
+                partitions = ivf_kmeans.transform(vecs)
+                ids = batch["_rowid"].reshape(-1)
+
+                # this is expected to be true, so just assert
+                assert vecs.shape[0] == ids.shape[0]
+
+                # Ignore any invalid vectors.
+                mask_gpu = partitions.isfinite()
+                ids = ids.to(ivf_kmeans.device)[mask_gpu].cpu().reshape(-1)
+                partitions = partitions[mask_gpu].cpu()
+                vecs = vecs[mask_gpu]
+
+                residual_vecs = vecs - ivf_kmeans.centroids[partitions]
+                pq_codes = torch.stack(
+                    [
+                        pq_kmeans_list[i].transform(
+                            residual_vecs[
+                                :, i * subvector_size : (i + 1) * subvector_size
+                            ]
+                        )
+                        for i in range(num_sub_vectors)
+                    ],
+                    dim=1,
+                )
+                pq_codes = pq_codes.to(torch.uint8)
+
+                pq_values = pa.array(pq_codes.cpu().numpy().reshape(-1))
+                pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
+                part_batch = pa.RecordBatch.from_arrays(
+                    [ids, partitions, pq_codes],
+                    schema=output_schema,
+                )
+
+                if len(part_batch) < len(ids):
+                    logging.warning(
+                        "%s vectors are ignored during partition assignment",
+                        len(part_batch) - len(ids),
+                    )
+
+                progress.update(part_batch.num_rows)
+                yield part_batch
+
+    rbr = pa.RecordBatchReader.from_batches(
+        output_schema, _partition_and_pq_codes_assignment()
+    )
+    if dst_dataset_uri is None:
+        dst_dataset_uri = tempfile.mkdtemp()
+    ds = write_dataset(
+        rbr,
+        dst_dataset_uri,
+        schema=output_schema,
+        data_storage_version="legacy",
+    )
+
+    progress.close()
+
+    logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+
+    shuffle_buffers = [
+        data_file.path()
+        for frag in ds.get_fragments()
+        for data_file in frag.data_files()
+    ]
+    return dst_dataset_uri, shuffle_buffers

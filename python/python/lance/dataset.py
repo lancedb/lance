@@ -35,6 +35,7 @@ import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
 
+from .blob import BlobFile
 from .dependencies import (
     _check_for_hugging_face,
     _check_for_numpy,
@@ -712,6 +713,28 @@ class LanceDataset(pa.dataset.Dataset):
         return pa.Table.from_batches(
             [self._ds.take_rows(row_ids, columns, columns_with_transform)]
         )
+
+    def take_blobs(
+        self,
+        row_ids: Union[List[int], pa.Array],
+        blob_column: str,
+    ) -> List[BlobFile]:
+        """
+        Select blobs by row_ids.
+
+        Parameters
+        ----------
+        row_ids : List Array or array-like
+            row IDs to select in the dataset.
+        blob_column : str
+            The name of the blob column to select.
+
+        Returns
+        -------
+        blob_files : List[BlobFile]
+        """
+        lance_blob_files = self._ds.take_blobs(row_ids, blob_column)
+        return [BlobFile(lance_blob_file) for lance_blob_file in lance_blob_files]
 
     def head(self, num_rows, **kwargs):
         """
@@ -1448,6 +1471,7 @@ class LanceDataset(pa.dataset.Dataset):
         precomputed_partition_dataset: Optional[str] = None,
         storage_options: Optional[Dict[str, str]] = None,
         filter_nan: bool = True,
+        one_pass_ivfpq: bool = False,
         **kwargs,
     ) -> LanceDataset:
         """Create index on column.
@@ -1508,6 +1532,8 @@ class LanceDataset(pa.dataset.Dataset):
             Defaults to True. False is UNSAFE, and will cause a crash if any null/nan
             values are present (and otherwise will not). Disables the null filter used
             for nullable columns. Obtains a small speed boost.
+        one_pass_ivfpq: bool
+            Defaults to False. If enabled, index type must be "IVF_PQ". Reduces disk IO.
         kwargs :
             Parameters passed to the index building process.
 
@@ -1631,6 +1657,58 @@ class LanceDataset(pa.dataset.Dataset):
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. " f"Got {index_type}"
             )
+        if index_type != "IVF_PQ" and one_pass_ivfpq:
+            raise ValueError(
+                f'one_pass_ivfpq requires index_type="IVF_PQ", got {index_type}'
+            )
+
+        # Handle timing for various parts of accelerated builds
+        timers = {}
+        if one_pass_ivfpq and accelerator is not None:
+            from .vector import (
+                one_pass_assign_ivf_pq_on_accelerator,
+                one_pass_train_ivf_pq_on_accelerator,
+            )
+
+            logging.info("Doing one-pass ivfpq accelerated computations")
+
+            timers["ivf+pq_train:start"] = time.time()
+            ivf_centroids, ivf_kmeans, pq_codebook, pq_kmeans_list = (
+                one_pass_train_ivf_pq_on_accelerator(
+                    self,
+                    column[0],
+                    num_partitions,
+                    metric,
+                    accelerator,
+                    num_sub_vectors=num_sub_vectors,
+                    batch_size=20480,
+                    filter_nan=filter_nan,
+                )
+            )
+            timers["ivf+pq_train:end"] = time.time()
+            ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
+            logging.info("ivf+pq training time: %ss", ivfpq_train_time)
+            timers["ivf+pq_assign:start"] = time.time()
+            shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                metric,
+                accelerator,
+                ivf_kmeans,
+                pq_kmeans_list,
+                batch_size=20480,
+                filter_nan=filter_nan,
+            )
+            timers["ivf+pq_assign:end"] = time.time()
+            ivfpq_assign_time = (
+                timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+            )
+            logging.info("ivf+pq transform time: %ss", ivfpq_assign_time)
+
+            kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+            kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                shuffle_output_dir, "data"
+            )
         if index_type.startswith("IVF"):
             if (ivf_centroids is not None) and (ivf_centroids_file is not None):
                 raise ValueError(
@@ -1658,9 +1736,6 @@ class LanceDataset(pa.dataset.Dataset):
                     f"num_partitions must be int, got {type(num_partitions)}"
                 )
             kwargs["num_partitions"] = num_partitions
-
-            # Handle timing for various parts of accelerated builds
-            timers = {}
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -1692,7 +1767,7 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                 kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
-            if accelerator is not None and ivf_centroids is None:
+            if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
                 logging.info("Computing new precomputed partition dataset")
                 # Use accelerator to train ivf centroids
                 from .vector import (
@@ -1773,6 +1848,7 @@ class LanceDataset(pa.dataset.Dataset):
                 pq_codebook is None
                 and accelerator is not None
                 and "precomputed_partitions_file" in kwargs
+                and not one_pass_ivfpq
             ):
                 logging.info("Computing new precomputed shuffle buffers for PQ.")
                 partitions_file = kwargs["precomputed_partitions_file"]
@@ -1852,13 +1928,15 @@ class LanceDataset(pa.dataset.Dataset):
         if shuffle_partition_concurrency is not None:
             kwargs["shuffle_partition_concurrency"] = shuffle_partition_concurrency
 
-        times = []
-        times.append(time.time())
+        timers["final_create_index:start"] = time.time()
         self._ds.create_index(
             column, index_type, name, replace, storage_options, kwargs
         )
-        times.append(time.time())
-        logging.info("Final create_index time: %ss", times[1] - times[0])
+        timers["final_create_index:end"] = time.time()
+        final_create_index_time = (
+            timers["final_create_index:end"] - timers["final_create_index:start"]
+        )
+        logging.info("Final create_index rust time: %ss", final_create_index_time)
         # Save disk space
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_shuffle_buffers_path"]

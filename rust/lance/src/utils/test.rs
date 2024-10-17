@@ -110,7 +110,11 @@ impl TestDatasetGenerator {
             }
         }
 
-        let operation = Operation::Overwrite { fragments, schema };
+        let operation = Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values: None,
+        };
 
         let registry = Arc::new(ObjectStoreRegistry::default());
         Dataset::commit(

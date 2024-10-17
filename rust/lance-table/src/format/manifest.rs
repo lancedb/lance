@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -77,6 +78,9 @@ pub struct Manifest {
 
     /// The storage format of the data files.
     pub data_storage_format: DataStorageFormat,
+
+    /// Table configuration.
+    pub config: HashMap<String, String>,
 }
 
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
@@ -99,6 +103,7 @@ impl Manifest {
         data_storage_format: DataStorageFormat,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+
         Self {
             schema,
             version: 1,
@@ -115,6 +120,7 @@ impl Manifest {
             fragment_offsets,
             next_row_id: 0,
             data_storage_format,
+            config: HashMap::new(),
         }
     }
 
@@ -141,6 +147,7 @@ impl Manifest {
             fragment_offsets,
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
+            config: previous.config.clone(),
         }
     }
 
@@ -158,6 +165,17 @@ impl Manifest {
     /// Set the `timestamp_nanos` value from a Utc DateTime
     pub fn set_timestamp(&mut self, nanos: u128) {
         self.timestamp_nanos = nanos;
+    }
+
+    /// Set the `config` from an iterator
+    pub fn update_config(&mut self, upsert_values: impl IntoIterator<Item = (String, String)>) {
+        self.config.extend(upsert_values);
+    }
+
+    /// Delete `config` keys using a slice of keys
+    pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
+        self.config
+            .retain(|key, _| !delete_keys.contains(&key.as_str()));
     }
 
     /// Check the current fragment list and update the high water mark
@@ -471,6 +489,7 @@ impl TryFrom<pb::Manifest> for Manifest {
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
+            config: p.config,
         })
     }
 }
@@ -513,6 +532,7 @@ impl From<&Manifest> for pb::Manifest {
                 file_format: m.data_storage_format.file_format.clone(),
                 version: m.data_storage_format.version.clone(),
             }),
+            config: m.config.clone(),
         }
     }
 }
@@ -691,5 +711,32 @@ mod tests {
         let manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
 
         assert_eq!(manifest.max_field_id(), 43);
+    }
+
+    #[test]
+    fn test_config() {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let schema = Schema::try_from(&arrow_schema).unwrap();
+        let fragments = vec![
+            Fragment::with_file_legacy(0, "path1", &schema, Some(10)),
+            Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
+            Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
+        ];
+        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+
+        let mut config = HashMap::new();
+        config.insert("lance:test".to_string(), "value".to_string());
+        config.insert("other-key".to_string(), "other-value".to_string());
+
+        manifest.update_config(config.clone());
+        assert_eq!(manifest.config, config.clone());
+
+        config.remove("other-key");
+        manifest.delete_config_keys(&["other-key"]);
+        assert_eq!(manifest.config, config);
     }
 }

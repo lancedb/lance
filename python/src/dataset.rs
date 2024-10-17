@@ -22,6 +22,7 @@ use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
+use blob::LanceBlobFile;
 use chrono::Duration;
 
 use arrow_array::Array;
@@ -82,6 +83,7 @@ use crate::{LanceReader, Scanner};
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
 
+pub mod blob;
 pub mod cleanup;
 pub mod commit;
 pub mod optimize;
@@ -269,7 +271,11 @@ impl Operation {
     ) -> PyResult<Self> {
         let schema = convert_schema(&schema.0)?;
         let fragments = into_fragments(fragments);
-        let op = LanceOperation::Overwrite { fragments, schema };
+        let op = LanceOperation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values: None,
+        };
         Ok(Self(op))
     }
 
@@ -839,6 +845,20 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
+    }
+
+    fn take_blobs(
+        self_: PyRef<'_, Self>,
+        row_indices: Vec<u64>,
+        blob_column: &str,
+    ) -> PyResult<Vec<LanceBlobFile>> {
+        let blobs = RT
+            .block_on(
+                Some(self_.py()),
+                self_.ds.take_blobs(&row_indices, blob_column),
+            )?
+            .infer_error()?;
+        Ok(blobs.into_iter().map(LanceBlobFile::from).collect())
     }
 
     #[pyo3(signature = (row_slices, columns = None, batch_readahead = 10))]
