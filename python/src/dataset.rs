@@ -1200,7 +1200,7 @@ impl Dataset {
             "BTREE" => IndexType::Scalar,
             "BITMAP" => IndexType::Bitmap,
             "LABEL_LIST" => IndexType::LabelList,
-            "INVERTED" => IndexType::Inverted,
+            "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
@@ -1219,7 +1219,7 @@ impl Dataset {
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
             }),
-            "INVERTED" => {
+            "INVERTED" | "FTS" => {
                 let mut params = InvertedIndexParams::default();
                 if let Some(kwargs) = kwargs {
                     if let Some(with_position) = kwargs.get_item("with_position")? {

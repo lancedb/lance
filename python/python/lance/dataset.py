@@ -1275,6 +1275,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["BITMAP"],
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
+            Literal["FTS"],
         ],
         name: Optional[str] = None,
         *,
@@ -1328,7 +1329,7 @@ class LanceDataset(pa.dataset.Dataset):
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
           with a ``LABEL_LIST`` index.  This index can only speedup queries with
           ``array_has_any`` or ``array_has_all`` filters.
-        * ``INVERTED``. It is used to index document columns. This index
+        * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
 
@@ -1345,7 +1346,7 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"`` or ``"INVERTED"``.
+            ``"LABEL_LIST"``, "FTS" or ``"INVERTED"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1432,7 +1433,7 @@ class LanceDataset(pa.dataset.Dataset):
         elif index_type == "LABEL_LIST":
             if not pa.types.is_list(field.type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
-        elif index_type == "INVERTED":
+        elif index_type in ["INVERTED", "FTS"]:
             if not pa.types.is_string(field.type) and not pa.types.is_large_string(
                 field.type
             ):
@@ -1673,17 +1674,20 @@ class LanceDataset(pa.dataset.Dataset):
             logging.info("Doing one-pass ivfpq accelerated computations")
 
             timers["ivf+pq_train:start"] = time.time()
-            ivf_centroids, ivf_kmeans, pq_codebook, pq_kmeans_list = (
-                one_pass_train_ivf_pq_on_accelerator(
-                    self,
-                    column[0],
-                    num_partitions,
-                    metric,
-                    accelerator,
-                    num_sub_vectors=num_sub_vectors,
-                    batch_size=20480,
-                    filter_nan=filter_nan,
-                )
+            (
+                ivf_centroids,
+                ivf_kmeans,
+                pq_codebook,
+                pq_kmeans_list,
+            ) = one_pass_train_ivf_pq_on_accelerator(
+                self,
+                column[0],
+                num_partitions,
+                metric,
+                accelerator,
+                num_sub_vectors=num_sub_vectors,
+                batch_size=20480,
+                filter_nan=filter_nan,
             )
             timers["ivf+pq_train:end"] = time.time()
             ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
