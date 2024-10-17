@@ -1358,6 +1358,10 @@ class LanceDataset(pa.dataset.Dataset):
         remove_stop_words: bool, default False
             This is for the ``INVERTED`` index. If True, the index will remove
             stop words.
+        ascii_folding: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will convert
+            non-ascii characters to ascii characters if possible.
+            This would remove accents like "é" -> "e".
 
         Examples
         --------

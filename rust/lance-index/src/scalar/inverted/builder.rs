@@ -517,6 +517,7 @@ impl IndexWorker {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn flush_posting_list(&mut self, token: String) -> Result<usize> {
         if let Some(posting_list) = self.posting_lists.remove(&token) {
             let size = posting_list.size();
