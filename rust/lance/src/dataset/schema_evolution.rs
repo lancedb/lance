@@ -376,10 +376,10 @@ async fn add_columns_from_stream(
 
     // Ensure the stream is fully consumed
     if last_seen_batch.is_some() || stream.next().await.is_some() {
-        return Err(Error::invalid_input(
-            format!("Stream produced more values than expected for dataset"),
-            location!(),
-        ));
+        return Err(Error::InvalidInput {
+            source: "Stream produced more values than expected for dataset".into(),
+            location: location!(),
+        });
     }
 
     Ok(new_fragments)
