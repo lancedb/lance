@@ -349,12 +349,16 @@ async fn add_columns_from_stream(
             }
 
             while rows_remaining > 0 {
-                let next_batch = stream.next().await.ok_or_else(|| {
-                    Error::invalid_input(
-                        "Stream ended before producing values for all rows in dataset",
-                        location!(),
-                    )
-                })??;
+                let next_batch = if let Some(last_seen_batch) = last_seen_batch {
+                    last_seen_batch
+                } else {
+                    stream.next().await.ok_or_else(|| {
+                        Error::invalid_input(
+                            "Stream ended before producing values for all rows in dataset",
+                            location!(),
+                        )
+                    })??
+                }
                 let num_rows = next_batch.num_rows();
                 if num_rows > rows_remaining {
                     let new_batch = next_batch.slice(0, rows_remaining);
