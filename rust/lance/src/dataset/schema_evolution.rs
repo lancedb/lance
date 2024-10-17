@@ -128,10 +128,24 @@ pub(super) async fn add_columns(
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
 ) -> Result<()> {
-    // We just transform the SQL expression into a UDF backed by DataFusion
-    // physical expressions.
+    // Check names early (before calling add_columns_impl) to avoid extra work if
+    // the names are wrong.
+    let check_names = |output_schema: &ArrowSchema| {
+        let new_names = output_schema.field_names();
+        for field in &dataset.schema().fields {
+            if new_names.contains(&&field.name) {
+                return Err(Error::invalid_input(
+                    format!("Column {} already exists in the dataset", field.name),
+                    location!(),
+                ));
+            }
+        }
+        Ok(())
+    };
+
     let (output_schema, fragments) = match transforms {
         NewColumnTransform::BatchUDF(udf) => {
+            check_names(udf.output_schema.as_ref())?;
             let fragments = add_columns_impl(
                 dataset,
                 read_columns,
@@ -143,6 +157,8 @@ pub(super) async fn add_columns(
             Result::Ok((udf.output_schema, fragments))
         }
         NewColumnTransform::SqlExpressions(expressions) => {
+            // We just transform the SQL expression into a UDF backed by DataFusion
+            // physical expressions.
             let arrow_schema = Arc::new(ArrowSchema::from(dataset.schema()));
             let planner = Planner::new(arrow_schema);
             let exprs = expressions
@@ -185,6 +201,7 @@ pub(super) async fn add_columns(
                     })
                     .collect::<Result<Vec<_>>>()?,
             ));
+            check_names(output_schema.as_ref())?;
 
             let schema_ref = output_schema.clone();
             let mapper = move |batch: &RecordBatch| {
@@ -205,28 +222,18 @@ pub(super) async fn add_columns(
         }
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
+            check_names(output_schema.as_ref())?;
             let fragments = add_columns_from_stream(dataset, stream, None, None).await?;
             Ok((output_schema, fragments))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
+            check_names(output_schema.as_ref())?;
             let stream = reader_to_stream(reader);
             let fragments = add_columns_from_stream(dataset, stream, None, None).await?;
             Ok((output_schema, fragments))
         }
     }?;
-
-    {
-        let new_names = output_schema.field_names();
-        for field in &dataset.schema().fields {
-            if new_names.contains(&&field.name) {
-                return Err(Error::invalid_input(
-                    format!("Column {} already exists in the dataset", field.name),
-                    location!(),
-                ));
-            }
-        }
-    }
 
     let mut schema = dataset.schema().merge(output_schema.as_ref())?;
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
@@ -333,20 +340,6 @@ async fn add_columns_from_stream(
             let mut rows_remaining = batch.num_rows();
 
             let mut batches = Vec::new();
-            if let Some(last_batch) = last_seen_batch.take() {
-                if last_batch.num_rows() > rows_remaining {
-                    let new_batch = last_batch.slice(0, rows_remaining);
-                    batches.push(new_batch);
-                    last_seen_batch = Some(
-                        last_batch.slice(rows_remaining, last_batch.num_rows() - rows_remaining),
-                    );
-                    rows_remaining = 0;
-                } else {
-                    rows_remaining -= last_batch.num_rows();
-                    batches.push(last_batch);
-                    last_seen_batch = None;
-                }
-            }
 
             while rows_remaining > 0 {
                 let next_batch = if let Some(last_seen_batch) = last_seen_batch {
@@ -358,7 +351,7 @@ async fn add_columns_from_stream(
                             location!(),
                         )
                     })??
-                }
+                };
                 let num_rows = next_batch.num_rows();
                 if num_rows > rows_remaining {
                     let new_batch = next_batch.slice(0, rows_remaining);
