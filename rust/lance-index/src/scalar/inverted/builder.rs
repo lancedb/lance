@@ -42,7 +42,7 @@ lazy_static! {
         .parse()
         .expect("failed to parse FLUSH_THRESHOLD");
     static ref FLUSH_SIZE: usize = std::env::var("FLUSH_SIZE")
-        .unwrap_or_else(|_| "64".to_string())
+        .unwrap_or_else(|_| "32".to_string())
         .parse()
         .expect("failed to parse FLUSH_SIZE");
     static ref NUM_SHARDS: usize = std::env::var("NUM_SHARDS")
@@ -357,7 +357,10 @@ impl InvertedIndexBuilder {
             ("max_scores".to_owned(), serde_json::to_string(&max_scores)?),
         ]);
         writer.finish_with_metadata(metadata).await?;
-        log::info!("finished writing posting lists");
+        log::info!(
+            "finished writing posting lists, elapsed: {:?}",
+            start.elapsed()
+        );
 
         Ok(())
     }
