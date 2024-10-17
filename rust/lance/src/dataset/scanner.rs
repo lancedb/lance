@@ -56,8 +56,8 @@ use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::FtsExec;
-use crate::io::exec::get_physical_optimizer;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
+use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -68,7 +68,7 @@ use snafu::{location, Location};
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-const BATCH_SIZE_FALLBACK: usize = 8192;
+pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 // For backwards compatibility / historical reasons we re-calculate the default batch size
 // on each call
 pub fn get_default_batch_size() -> Option<usize> {
@@ -282,7 +282,10 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
-        let projection_plan = ProjectionPlan::new_empty(Arc::new(dataset.schema().clone()));
+        let projection_plan = ProjectionPlan::new_empty(
+            Arc::new(dataset.schema().clone()),
+            /*load_blobs= */ false,
+        );
         Self {
             dataset,
             projection_plan,
@@ -374,8 +377,8 @@ impl Scanner {
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
         let physical_schema = self.scan_output_schema(true)?;
-        let base_schema = self.dataset.schema().merge(physical_schema.as_ref())?;
-        self.projection_plan = ProjectionPlan::try_new(&base_schema, columns)?;
+        self.projection_plan =
+            ProjectionPlan::try_new(&physical_schema, columns, /*load_blobs=*/ false)?;
         Ok(self)
     }
 
@@ -1702,19 +1705,22 @@ impl Scanner {
         range: Option<Range<u64>>,
         ordered: bool,
     ) -> Arc<dyn ExecutionPlan> {
+        let config = LanceScanConfig {
+            batch_size: self.get_batch_size(),
+            batch_readahead: self.batch_readahead,
+            fragment_readahead: self.fragment_readahead,
+            io_buffer_size: self.get_io_buffer_size(),
+            with_row_id,
+            with_row_address,
+            with_make_deletions_null,
+            ordered_output: ordered,
+        };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
             fragments,
             range,
             projection,
-            self.get_batch_size(),
-            self.batch_readahead,
-            self.fragment_readahead,
-            self.get_io_buffer_size(),
-            with_row_id,
-            with_row_address,
-            with_make_deletions_null,
-            ordered,
+            config,
         ))
     }
 

@@ -20,11 +20,11 @@ use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{DataBlock, FixedWidthDataBlock},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, NextDecodeTask, PriorityRange, ScheduledScanLine, SchedulerContext,
-        SchedulingJob,
+        LogicalPageDecoder, NextDecodeTask, PageEncoding, PriorityRange, ScheduledScanLine,
+        SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -32,6 +32,7 @@ use crate::{
     },
     encodings::logical::r#struct::SimpleStructScheduler,
     format::pb,
+    repdef::RepDefBuilder,
     EncodingsIo,
 };
 
@@ -920,10 +921,13 @@ impl ListOffsetsEncoder {
                 num_rows,
                 inner_encoder,
             )?;
+            let (data, description) = array.into_buffers();
             Ok(EncodedPage {
-                array,
+                data,
+                description: PageEncoding::Legacy(description),
                 num_rows,
                 column_idx,
+                row_number: 0, // Legacy encoders do not use
             })
         })
         .map(|res_res| res_res.unwrap())
@@ -935,11 +939,13 @@ impl ListOffsetsEncoder {
         let validity = Self::extract_validity(list_arr);
         // Either inserting the offsets OR inserting the validity could cause the
         // accumulation queue to fill up
-        if let Some(mut arrays) = self.accumulation_queue.insert(offsets) {
-            arrays.push(validity);
-            Some(self.make_encode_task(arrays))
-        } else if let Some(arrays) = self.accumulation_queue.insert(validity) {
-            Some(self.make_encode_task(arrays))
+        if let Some(mut arrays) = self.accumulation_queue.insert(offsets, /*row_number=*/ 0) {
+            arrays.0.push(validity);
+            Some(self.make_encode_task(arrays.0))
+        } else if let Some(arrays) =
+            self.accumulation_queue.insert(validity, /*row_number=*/ 0)
+        {
+            Some(self.make_encode_task(arrays.0))
         } else {
             None
         }
@@ -947,7 +953,7 @@ impl ListOffsetsEncoder {
 
     fn flush(&mut self) -> Option<EncodeTask> {
         if let Some(arrays) = self.accumulation_queue.flush() {
-            Some(self.make_encode_task(arrays))
+            Some(self.make_encode_task(arrays.0))
         } else {
             None
         }
@@ -1065,6 +1071,8 @@ impl ListOffsetsEncoder {
             bits_per_value: 64,
             data: LanceBuffer::reinterpret_vec(offsets),
             num_values: num_offsets,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
         });
         inner_encoder.encode(offsets_data, &DataType::UInt64, buffer_index)
     }
@@ -1156,6 +1164,8 @@ impl FieldEncoder for ListFieldEncoder {
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
     ) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
         // values array could be longer than what we need to encode and so we need
@@ -1186,7 +1196,9 @@ impl FieldEncoder for ListFieldEncoder {
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
             .unwrap_or_default();
-        let mut item_tasks = self.items_encoder.maybe_encode(items, external_buffers)?;
+        let mut item_tasks =
+            self.items_encoder
+                .maybe_encode(items, external_buffers, repdef, row_number)?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
             // a limitation in the current scheduler and could be addressed in the future.  As a result

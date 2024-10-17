@@ -29,26 +29,23 @@ use lance_table::format::Fragment;
 use log::debug;
 use snafu::{location, Location};
 
-use crate::dataset::fragment::{FileFragment, FragmentReader};
-use crate::dataset::scanner::{DEFAULT_FRAGMENT_READAHEAD, LEGACY_DEFAULT_FRAGMENT_READAHEAD};
+use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
+use crate::dataset::scanner::{
+    BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
+    LEGACY_DEFAULT_FRAGMENT_READAHEAD,
+};
 use crate::dataset::Dataset;
 use crate::datatypes::Schema;
 
 async fn open_file(
     file_fragment: FileFragment,
     projection: Arc<Schema>,
-    with_row_id: bool,
-    with_row_address: bool,
+    read_config: FragReadConfig,
     with_make_deletions_null: bool,
     scan_scheduler: Option<(Arc<ScanScheduler>, u64)>,
 ) -> Result<FragmentReader> {
     let mut reader = file_fragment
-        .open(
-            projection.as_ref(),
-            with_row_id,
-            with_row_address,
-            scan_scheduler,
-        )
+        .open(projection.as_ref(), read_config, scan_scheduler)
         .await?;
 
     if with_make_deletions_null {
@@ -69,9 +66,7 @@ pub struct LanceStream {
     /// Manifest of the dataset
     projection: Arc<Schema>,
 
-    with_row_id: bool,
-
-    with_row_address: bool,
+    config: LanceScanConfig,
 }
 
 impl LanceStream {
@@ -98,14 +93,7 @@ impl LanceStream {
         fragments: Arc<Vec<Fragment>>,
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
-        read_size: usize,
-        batch_readahead: usize,
-        fragment_readahead: Option<usize>,
-        io_buffer_size: u64,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_make_deletions_null: bool,
-        scan_in_order: bool,
+        config: LanceScanConfig,
     ) -> Result<Self> {
         let is_v2_scan = fragments
             .iter()
@@ -113,31 +101,9 @@ impl LanceStream {
             .next()
             .unwrap_or(false);
         if is_v2_scan {
-            Self::try_new_v2(
-                dataset,
-                fragments,
-                offsets,
-                projection,
-                read_size,
-                fragment_readahead,
-                with_row_id,
-                with_row_address,
-                with_make_deletions_null,
-                io_buffer_size,
-            )
+            Self::try_new_v2(dataset, fragments, offsets, projection, config)
         } else {
-            Self::try_new_v1(
-                dataset,
-                fragments,
-                projection,
-                read_size,
-                batch_readahead,
-                fragment_readahead.unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD),
-                with_row_id,
-                with_row_address,
-                with_make_deletions_null,
-                scan_in_order,
-            )
+            Self::try_new_v1(dataset, fragments, projection, config)
         }
     }
 
@@ -147,12 +113,7 @@ impl LanceStream {
         fragments: Arc<Vec<Fragment>>,
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
-        batch_size: usize,
-        fragment_parallelism: Option<usize>,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_make_deletions_null: bool,
-        io_buffer_size: u64,
+        config: LanceScanConfig,
     ) -> Result<Self> {
         let project_schema = projection.clone();
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -167,7 +128,8 @@ impl LanceStream {
         // As a result, we don't really need to worry too much about fragment readahead.  We also want this
         // to be pretty high.  While we are reading one set of fragments we should be scheduling the next set
         // this should help ensure that we don't have breaks in I/O
-        let frag_parallelism = fragment_parallelism
+        let frag_parallelism = config
+            .fragment_readahead
             .unwrap_or((*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
             // fragment_readhead=0 doesn't make sense so we just bump it to 1
             .max(1);
@@ -233,7 +195,7 @@ impl LanceStream {
         let scan_scheduler = ScanScheduler::new(
             dataset.object_store.clone(),
             SchedulerConfig {
-                io_buffer_size_bytes: io_buffer_size,
+                io_buffer_size_bytes: config.io_buffer_size,
             },
         );
 
@@ -248,16 +210,17 @@ impl LanceStream {
                     let reader = open_file(
                         file_fragment.fragment,
                         project_schema,
-                        with_row_id,
-                        with_row_address,
-                        with_make_deletions_null,
+                        FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address),
+                        config.with_make_deletions_null,
                         Some((scan_scheduler, priority as u64)),
                     )
                     .await?;
                     let batch_stream = if let Some(range) = file_fragment.range {
-                        reader.read_range(range, batch_size as u32)?.boxed()
+                        reader.read_range(range, config.batch_size as u32)?.boxed()
                     } else {
-                        reader.read_all(batch_size as u32)?.boxed()
+                        reader.read_all(config.batch_size as u32)?.boxed()
                     };
                     let batch_stream: BoxStream<Result<BoxFuture<Result<RecordBatch>>>> =
                         batch_stream
@@ -294,8 +257,7 @@ impl LanceStream {
         Ok(Self {
             inner_stream: batches,
             projection,
-            with_row_id,
-            with_row_address,
+            config,
         })
     }
 
@@ -304,18 +266,15 @@ impl LanceStream {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
-        read_size: usize,
-        batch_readahead: usize,
-        fragment_readahead: usize,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_make_deletions_null: bool,
-        scan_in_order: bool,
+        config: LanceScanConfig,
     ) -> Result<Self> {
         let project_schema = projection.clone();
+        let fragment_readahead = config
+            .fragment_readahead
+            .unwrap_or(LEGACY_DEFAULT_FRAGMENT_READAHEAD);
         debug!(
             "Scanning v1 dataset with frag_readahead={} and batch_readahead={}",
-            fragment_readahead, batch_readahead
+            fragment_readahead, config.batch_readahead
         );
 
         let file_fragments = fragments
@@ -323,15 +282,16 @@ impl LanceStream {
             .map(|fragment| FileFragment::new(dataset.clone(), fragment.clone()))
             .collect::<Vec<_>>();
 
-        let inner_stream = if scan_in_order {
+        let inner_stream = if config.ordered_output {
             let readers = stream::iter(file_fragments)
                 .map(move |file_fragment| {
                     Ok(open_file(
                         file_fragment,
                         project_schema.clone(),
-                        with_row_id,
-                        with_row_address,
-                        with_make_deletions_null,
+                        FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address),
+                        config.with_make_deletions_null,
                         None,
                     ))
                 })
@@ -339,7 +299,7 @@ impl LanceStream {
             let tasks = readers.and_then(move |reader| {
                 std::future::ready(
                     reader
-                        .read_all(read_size as u32)
+                        .read_all(config.batch_size as u32)
                         .map(|task_stream| task_stream.map(Ok))
                         .map_err(DataFusionError::from),
                 )
@@ -348,7 +308,7 @@ impl LanceStream {
                 // We must be waiting to finish a file before moving onto thenext. That's an issue.
                 .try_flatten()
                 // We buffer up to `batch_readahead` batches across all streams.
-                .try_buffered(batch_readahead)
+                .try_buffered(config.batch_readahead)
                 .stream_in_current_span()
                 .boxed()
         } else {
@@ -357,9 +317,10 @@ impl LanceStream {
                     Ok(open_file(
                         file_fragment,
                         project_schema.clone(),
-                        with_row_id,
-                        with_row_address,
-                        with_make_deletions_null,
+                        FragReadConfig::default()
+                            .with_row_id(config.with_row_id)
+                            .with_row_address(config.with_row_address),
+                        config.with_make_deletions_null,
                         None,
                     ))
                 })
@@ -367,7 +328,7 @@ impl LanceStream {
             let tasks = readers.and_then(move |reader| {
                 std::future::ready(
                     reader
-                        .read_all(read_size as u32)
+                        .read_all(config.batch_size as u32)
                         .map(|task_stream| task_stream.map(Ok))
                         .map_err(DataFusionError::from),
                 )
@@ -375,9 +336,9 @@ impl LanceStream {
             // When we flatten the streams (one stream per fragment), we allow
             // `fragment_readahead` stream to be read concurrently.
             tasks
-                .try_flatten_unordered(fragment_readahead)
+                .try_flatten_unordered(config.fragment_readahead)
                 // We buffer up to `batch_readahead` batches across all streams.
-                .try_buffer_unordered(batch_readahead)
+                .try_buffer_unordered(config.batch_readahead)
                 .stream_in_current_span()
                 .boxed()
         };
@@ -389,8 +350,7 @@ impl LanceStream {
         Ok(Self {
             inner_stream,
             projection,
-            with_row_id,
-            with_row_address,
+            config,
         })
     }
 }
@@ -399,8 +359,8 @@ impl core::fmt::Debug for LanceStream {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LanceStream")
             .field("projection", &self.projection)
-            .field("with_row_id", &self.with_row_id)
-            .field("with_row_address", &self.with_row_address)
+            .field("with_row_id", &self.config.with_row_id)
+            .field("with_row_address", &self.config.with_row_address)
             .finish()
     }
 }
@@ -408,10 +368,10 @@ impl core::fmt::Debug for LanceStream {
 impl RecordBatchStream for LanceStream {
     fn schema(&self) -> SchemaRef {
         let mut schema: ArrowSchema = self.projection.as_ref().into();
-        if self.with_row_id {
+        if self.config.with_row_id {
             schema = schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
-        if self.with_row_address {
+        if self.config.with_row_address {
             schema = schema.try_with_column(ROW_ADDR_FIELD.clone()).unwrap();
         }
         Arc::new(schema)
@@ -426,6 +386,35 @@ impl Stream for LanceStream {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct LanceScanConfig {
+    pub batch_size: usize,
+    pub batch_readahead: usize,
+    pub fragment_readahead: Option<usize>,
+    pub io_buffer_size: u64,
+    pub with_row_id: bool,
+    pub with_row_address: bool,
+    pub with_make_deletions_null: bool,
+    pub ordered_output: bool,
+}
+
+// This is mostly for testing purposes, end users are unlikely to create this
+// on their own.
+impl Default for LanceScanConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: BATCH_SIZE_FALLBACK,
+            batch_readahead: get_num_compute_intensive_cpus(),
+            fragment_readahead: None,
+            io_buffer_size: *DEFAULT_IO_BUFFER_SIZE,
+            with_row_id: false,
+            with_row_address: false,
+            with_make_deletions_null: false,
+            ordered_output: false,
+        }
+    }
+}
+
 /// DataFusion [ExecutionPlan] for scanning one Lance dataset
 #[derive(Debug)]
 pub struct LanceScanExec {
@@ -433,16 +422,9 @@ pub struct LanceScanExec {
     fragments: Arc<Vec<Fragment>>,
     range: Option<Range<u64>>,
     projection: Arc<Schema>,
-    read_size: usize,
-    batch_readahead: usize,
-    fragment_readahead: Option<usize>,
-    io_buffer_size: u64,
-    with_row_id: bool,
-    with_row_address: bool,
-    with_make_deletions_null: bool,
-    ordered_output: bool,
     output_schema: Arc<ArrowSchema>,
     properties: PlanProperties,
+    config: LanceScanConfig,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -461,9 +443,9 @@ impl DisplayAs for LanceScanExec {
                     "LanceScan: uri={}, projection=[{}], row_id={}, row_addr={}, ordered={}",
                     self.dataset.data_dir(),
                     columns,
-                    self.with_row_id,
-                    self.with_row_address,
-                    self.ordered_output
+                    self.config.with_row_id,
+                    self.config.with_row_address,
+                    self.config.ordered_output
                 )
             }
         }
@@ -477,21 +459,14 @@ impl LanceScanExec {
         fragments: Arc<Vec<Fragment>>,
         range: Option<Range<u64>>,
         projection: Arc<Schema>,
-        read_size: usize,
-        batch_readahead: usize,
-        fragment_readahead: Option<usize>,
-        io_buffer_size: u64,
-        with_row_id: bool,
-        with_row_address: bool,
-        with_make_deletions_null: bool,
-        ordered_ouput: bool,
+        config: LanceScanConfig,
     ) -> Self {
         let mut output_schema: ArrowSchema = projection.as_ref().into();
 
-        if with_row_id {
+        if config.with_row_id {
             output_schema = output_schema.try_with_column(ROW_ID_FIELD.clone()).unwrap();
         }
-        if with_row_address {
+        if config.with_row_address {
             output_schema = output_schema
                 .try_with_column(ROW_ADDR_FIELD.clone())
                 .unwrap();
@@ -508,16 +483,9 @@ impl LanceScanExec {
             fragments,
             range,
             projection,
-            read_size,
-            batch_readahead,
-            fragment_readahead,
-            io_buffer_size,
-            with_row_id,
-            with_row_address,
-            with_make_deletions_null,
-            ordered_output: ordered_ouput,
             output_schema,
             properties,
+            config,
         }
     }
 }
@@ -563,14 +531,7 @@ impl ExecutionPlan for LanceScanExec {
             self.fragments.clone(),
             self.range.clone(),
             self.projection.clone(),
-            self.read_size,
-            self.batch_readahead,
-            self.fragment_readahead,
-            self.io_buffer_size,
-            self.with_row_id,
-            self.with_row_address,
-            self.with_make_deletions_null,
-            self.ordered_output,
+            self.config.clone(),
         )?))
     }
 

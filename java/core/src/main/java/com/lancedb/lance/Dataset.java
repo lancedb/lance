@@ -17,6 +17,7 @@ import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import java.io.Closeable;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -68,7 +69,8 @@ public class Dataset implements Closeable {
       Data.exportSchema(allocator, schema, null, arrowSchema);
       Dataset dataset =
           createWithFfiSchema(arrowSchema.memoryAddress(), path, params.getMaxRowsPerFile(),
-              params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode());
+              params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode(),
+              params.getStorageOptions());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -90,18 +92,19 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
     Dataset dataset = createWithFfiStream(stream.memoryAddress(), path, params.getMaxRowsPerFile(),
-        params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode());
+        params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode(),
+        params.getStorageOptions());
     dataset.allocator = allocator;
     return dataset;
   }
 
   private static native Dataset createWithFfiSchema(long arrowSchemaMemoryAddress, String path,
       Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode);
+      Optional<Long> maxBytesPerFile, Optional<String> mode, Map<String, String> storageOptions);
 
   private static native Dataset createWithFfiStream(long arrowStreamMemoryAddress, String path,
       Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode);
+      Optional<Long> maxBytesPerFile, Optional<String> mode, Map<String, String> storageOptions);
 
   /**
    * Open a dataset from the specified path.
@@ -181,18 +184,23 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
   public static Dataset commit(BufferAllocator allocator, String path, FragmentOperation operation,
-      Optional<Long> readVersion) {
+                               Optional<Long> readVersion) {
+    return commit(allocator, path, operation, readVersion, new HashMap<>());
+  }
+
+  public static Dataset commit(BufferAllocator allocator, String path, FragmentOperation operation,
+      Optional<Long> readVersion, Map<String, String> storageOptions) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(operation);
     Preconditions.checkNotNull(readVersion);
-    Dataset dataset = operation.commit(allocator, path, readVersion);
+    Dataset dataset = operation.commit(allocator, path, readVersion, storageOptions);
     dataset.allocator = allocator;
     return dataset;
   }
 
   public static native Dataset commitAppend(String path, Optional<Long> readVersion,
-      List<String> fragmentsMetadata);
+      List<String> fragmentsMetadata, Map<String, String> storageOptions);
 
   /**
    * Create a new Dataset Scanner.

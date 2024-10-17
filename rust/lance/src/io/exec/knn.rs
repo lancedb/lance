@@ -70,6 +70,8 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
 /// Preconditions:
 /// - `input` schema must contains `query.column`,
 /// - The column must be a vector column.
+///
+/// WARNING: Internal API with no stability guarantees.
 #[derive(Debug)]
 pub struct KNNVectorDistanceExec {
     /// Inner input node.
@@ -274,15 +276,15 @@ pub fn new_knn_exec(
 /// ```
 #[derive(Debug)]
 pub struct ANNIvfPartitionExec {
-    dataset: Arc<Dataset>,
+    pub dataset: Arc<Dataset>,
 
     /// The vector query to execute.
-    query: Query,
+    pub query: Query,
 
     /// The UUIDs of the indices to search.
-    index_uuids: Vec<String>,
+    pub index_uuids: Vec<String>,
 
-    properties: PlanProperties,
+    pub properties: PlanProperties,
 }
 
 impl ANNIvfPartitionExec {

@@ -14,7 +14,7 @@ members = [
     "rust/lance-table",
     "rust/lance-test-macros",
     "rust/lance-testing",
-    "rust/lance-encoding/compression-algo/fsst",
+    "rust/lance-encoding/src/compression_algo/fsst",
 ]
 exclude = ["python"]
 # Python package needs to be built by maturin.
@@ -111,7 +111,7 @@ datafusion-physical-expr = { version = "41.0", features = [
 ] }
 deepsize = "0.2.0"
 either = "1.0"
-fsst = { version = "=0.18.4", path = "./rust/lance-encoding/compression-algo/fsst" }
+fsst = { version = "=0.18.4", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "0.2.9"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }

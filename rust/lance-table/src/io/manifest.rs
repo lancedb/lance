@@ -243,6 +243,10 @@ mod test {
         let arrow_schema =
             ArrowSchema::new(vec![ArrowField::new(long_name, DataType::Int64, false)]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
+
+        let mut config = HashMap::new();
+        config.insert("key".to_string(), "value".to_string());
+
         let mut manifest = Manifest::new(schema, Arc::new(vec![]), DataStorageFormat::default());
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await

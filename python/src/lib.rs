@@ -29,6 +29,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::blob::LanceBlobFile;
 use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -116,6 +117,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<MergeInsertBuilder>()?;
+    m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileMetadata>()?;
