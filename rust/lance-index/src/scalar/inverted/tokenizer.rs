@@ -12,6 +12,7 @@ pub struct TokenizerConfig {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    ///
     /// `simple` is recommended for most cases and the default value
     base_tokenizer: String,
 
