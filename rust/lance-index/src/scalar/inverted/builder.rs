@@ -135,7 +135,7 @@ impl InvertedIndexBuilder {
             let inverted_list = self.inverted_list.clone();
             let mut worker = IndexWorker::new(token_map, self.params.with_position).await?;
 
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(*CHANNEL_SIZE);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(buffer_size);
             senders.push(sender);
             result_futs.push(tokio::spawn({
                 async move {
@@ -159,7 +159,6 @@ impl InvertedIndexBuilder {
             .map(move |batch| {
                 let senders = senders.clone();
                 let tokenizer_pool = tokenizer_pool.clone();
-                let token_buffers_pool = token_buffers_pool.clone();
                 CPU_RUNTIME.spawn_blocking(move || {
                     let batch = batch?;
                     let doc_iter = iter_str_array(batch.column(0));
