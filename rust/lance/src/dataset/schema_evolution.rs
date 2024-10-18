@@ -6,11 +6,13 @@ use std::{collections::HashSet, sync::Arc};
 use crate::io::commit::commit_transaction;
 use crate::{io::exec::Planner, Error, Result};
 use arrow::compute::CastOptions;
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_datafusion::utils::reader_to_stream;
 use lance_table::format::Fragment;
 use snafu::{location, Location};
 
@@ -53,6 +55,10 @@ pub enum NewColumnTransform {
     BatchUDF(BatchUDF),
     /// A set of SQL expressions that define new columns.
     SqlExpressions(Vec<(String, String)>),
+    /// A stream of RecordBatches that define new columns.
+    Stream(SendableRecordBatchStream),
+    /// An iterator of RecordBatches that define new columns.
+    Reader(Box<dyn RecordBatchReader + Send>),
 }
 
 /// Definition of a change to a column in a dataset
@@ -122,18 +128,37 @@ pub(super) async fn add_columns(
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
 ) -> Result<()> {
-    // We just transform the SQL expression into a UDF backed by DataFusion
-    // physical expressions.
-    let (
-        BatchUDF {
-            mapper,
-            output_schema,
-            result_checkpoint,
-        },
-        read_columns,
-    ) = match transforms {
-        NewColumnTransform::BatchUDF(udf) => (udf, read_columns),
+    // Check names early (before calling add_columns_impl) to avoid extra work if
+    // the names are wrong.
+    let check_names = |output_schema: &ArrowSchema| {
+        let new_names = output_schema.field_names();
+        for field in &dataset.schema().fields {
+            if new_names.contains(&&field.name) {
+                return Err(Error::invalid_input(
+                    format!("Column {} already exists in the dataset", field.name),
+                    location!(),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    let (output_schema, fragments) = match transforms {
+        NewColumnTransform::BatchUDF(udf) => {
+            check_names(udf.output_schema.as_ref())?;
+            let fragments = add_columns_impl(
+                dataset,
+                read_columns,
+                udf.mapper,
+                udf.result_checkpoint,
+                None,
+            )
+            .await?;
+            Result::Ok((udf.output_schema, fragments))
+        }
         NewColumnTransform::SqlExpressions(expressions) => {
+            // We just transform the SQL expression into a UDF backed by DataFusion
+            // physical expressions.
             let arrow_schema = Arc::new(ArrowSchema::from(dataset.schema()));
             let planner = Planner::new(arrow_schema);
             let exprs = expressions
@@ -176,6 +201,7 @@ pub(super) async fn add_columns(
                     })
                     .collect::<Result<Vec<_>>>()?,
             ));
+            check_names(output_schema.as_ref())?;
 
             let schema_ref = output_schema.clone();
             let mapper = move |batch: &RecordBatch| {
@@ -191,34 +217,27 @@ pub(super) async fn add_columns(
             let mapper = Box::new(mapper);
 
             let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
-            (
-                BatchUDF {
-                    mapper,
-                    output_schema,
-                    result_checkpoint: None,
-                },
-                read_columns,
-            )
+            let fragments = add_columns_impl(dataset, read_columns, mapper, None, None).await?;
+            Ok((output_schema, fragments))
         }
-    };
-
-    {
-        let new_names = output_schema.field_names();
-        for field in &dataset.schema().fields {
-            if new_names.contains(&&field.name) {
-                return Err(Error::invalid_input(
-                    format!("Column {} already exists in the dataset", field.name),
-                    location!(),
-                ));
-            }
+        NewColumnTransform::Stream(stream) => {
+            let output_schema = stream.schema();
+            check_names(output_schema.as_ref())?;
+            let fragments = add_columns_from_stream(dataset, stream, None, None).await?;
+            Ok((output_schema, fragments))
         }
-    }
+        NewColumnTransform::Reader(reader) => {
+            let output_schema = reader.schema();
+            check_names(output_schema.as_ref())?;
+            let stream = reader_to_stream(reader);
+            let fragments = add_columns_from_stream(dataset, stream, None, None).await?;
+            Ok((output_schema, fragments))
+        }
+    }?;
 
     let mut schema = dataset.schema().merge(output_schema.as_ref())?;
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
-    let fragments =
-        add_columns_impl(dataset, read_columns, mapper, result_checkpoint, None).await?;
     let operation = Operation::Merge { fragments, schema };
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
     let new_manifest = commit_transaction(
@@ -301,6 +320,69 @@ async fn add_columns_impl(
         .try_collect::<Vec<_>>()
         .await?;
     Ok(fragments)
+}
+
+async fn add_columns_from_stream(
+    dataset: &Dataset,
+    mut stream: SendableRecordBatchStream,
+    schemas: Option<(Schema, Schema)>,
+    batch_size: Option<u32>,
+) -> Result<Vec<Fragment>> {
+    let fragments = dataset.get_fragments();
+    let mut new_fragments = Vec::with_capacity(fragments.len());
+    let mut last_seen_batch: Option<RecordBatch> = None;
+    for fragment in fragments {
+        let mut updater = fragment
+            .updater::<String>(Some(&[]), schemas.clone(), batch_size)
+            .await?;
+        while let Some(batch) = updater.next().await? {
+            debug_assert_eq!(batch.num_columns(), 1);
+            let mut rows_remaining = batch.num_rows();
+
+            let mut batches = Vec::new();
+
+            while rows_remaining > 0 {
+                let next_batch = if let Some(last_seen_batch) = last_seen_batch {
+                    last_seen_batch
+                } else {
+                    stream.next().await.ok_or_else(|| {
+                        Error::invalid_input(
+                            "Stream ended before producing values for all rows in dataset",
+                            location!(),
+                        )
+                    })??
+                };
+                let num_rows = next_batch.num_rows();
+                if num_rows > rows_remaining {
+                    let new_batch = next_batch.slice(0, rows_remaining);
+                    batches.push(new_batch);
+                    last_seen_batch =
+                        Some(next_batch.slice(rows_remaining, num_rows - rows_remaining));
+                    rows_remaining = 0;
+                } else {
+                    batches.push(next_batch);
+                    rows_remaining -= num_rows;
+                    last_seen_batch = None;
+                }
+            }
+
+            let new_batch =
+                arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+
+            updater.update(new_batch).await?;
+        }
+        new_fragments.push(updater.finish().await?);
+    }
+
+    // Ensure the stream is fully consumed
+    if last_seen_batch.is_some() || stream.next().await.is_some() {
+        return Err(Error::InvalidInput {
+            source: "Stream produced more values than expected for dataset".into(),
+            location: location!(),
+        });
+    }
+
+    Ok(new_fragments)
 }
 
 /// Modify columns in the dataset, changing their name, type, or nullability.

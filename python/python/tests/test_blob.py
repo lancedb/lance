@@ -93,6 +93,22 @@ def test_blob_file_seek(tmp_path, dataset_with_blobs):
         assert f.read(1) == b"a"
 
 
+def test_blob_file_read_middle(tmp_path, dataset_with_blobs):
+    # This regresses an issue where we were not setting the cursor
+    # correctly after a call to `read` when the blob was not the
+    # first thing in the file.
+    row_ids = (
+        dataset_with_blobs.to_table(columns=[], with_row_id=True)
+        .column("_rowid")
+        .to_pylist()
+    )
+    blobs = dataset_with_blobs.take_blobs(row_ids, "blobs")
+    with blobs[1] as f:
+        assert f.read(1) == b"b"
+        assert f.read(1) == b"a"
+        assert f.read(1) == b"r"
+
+
 def test_take_deleted_blob(tmp_path, dataset_with_blobs):
     row_ids = (
         dataset_with_blobs.to_table(columns=[], with_row_id=True)
