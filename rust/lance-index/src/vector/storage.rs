@@ -90,7 +90,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
-    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 

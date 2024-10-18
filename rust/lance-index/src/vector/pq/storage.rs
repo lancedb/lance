@@ -101,9 +101,9 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
 
 /// Product Quantization Storage
 ///
-/// It stores PQ code, as well as the row ID to the orignal vectors.
+/// It stores PQ code, as well as the row ID to the original vectors.
 ///
-/// It is possible to store additonal metadata to accelerate filtering later.
+/// It is possible to store additional metadata to accelerate filtering later.
 ///
 /// TODO: support f16/f64 later.
 #[derive(Clone, Debug)]

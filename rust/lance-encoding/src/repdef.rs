@@ -9,7 +9,7 @@
 //! is irrelevant.
 //!
 //! Note: the concept of repetition & definition levels comes from the Dremel paper and has
-//! been implemented in Apache Parquet.  However, the implementation here is not neccesarily
+//! been implemented in Apache Parquet.  However, the implementation here is not necessarily 
 //! compatible with Parquet.  For example, we use 0 to represent the "inner-most" item and
 //! Parquet uses 0 to represent the "outer-most" item.
 //!
@@ -434,7 +434,7 @@ impl RepDefBuilder {
 /// Starts with serialized repetition and definition levels and unravels
 /// them into validity buffers and offsets buffers
 ///
-/// This is used during decoding to create the neccesary arrow structures
+/// This is used during decoding to create the necessary arrow structures
 #[derive(Debug)]
 pub struct RepDefUnraveler {
     rep_levels: Option<LevelBuffer>,

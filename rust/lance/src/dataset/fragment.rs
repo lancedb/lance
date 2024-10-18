@@ -446,7 +446,7 @@ impl FileFragment {
         if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
             return Err(Error::io(
                 format!(
-                    "File version mismatch. Dataset verison: {:?} Fragment version: {:?}",
+                    "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
                     dataset.manifest.data_storage_format.lance_file_version()?,
                     file_version
                 ),
@@ -1683,7 +1683,7 @@ impl FragmentReader {
         if !params.valid_given_len(total_num_rows as usize) {
             return Err(Error::invalid_input(
                 format!(
-                    "Invalid read params {} for fragment with {} addressible rows",
+                    "Invalid read params {} for fragment with {} addressable rows",
                     params, total_num_rows
                 ),
                 location!(),
@@ -2057,11 +2057,11 @@ mod tests {
         let mut dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         // Delete last 20 rows in first fragment
         dataset.delete("i >= 20").await.unwrap();
-        // Last fragment has 20 rows but 40 addressible rows
+        // Last fragment has 20 rows but 40 addressable rows
         let fragment = &dataset.get_fragments()[0];
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
 
-        // Test with take_range (all rows addressible)
+        // Test with take_range (all rows addressable)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(
@@ -2085,7 +2085,7 @@ mod tests {
             }
         }
 
-        // Test with read_range (only non-deleted rows addressible)
+        // Test with read_range (only non-deleted rows addressable)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(

@@ -53,7 +53,7 @@ pub async fn read_manifest(object_store: &ObjectStore, path: &Path) -> Result<Ma
     let manifest_len = file_size - manifest_pos;
 
     let buf: Bytes = if manifest_len <= buf.len() {
-        // The prefetch catpured the entire manifest. We just need to trim the buffer.
+        // The prefetch captured the entire manifest. We just need to trim the buffer.
         buf.slice(buf.len() - manifest_len..buf.len())
     } else {
         // The prefetch only captured part of the manifest. We need to make an

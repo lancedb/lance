@@ -163,7 +163,7 @@ def test_train_ivf(test_large_dataset, benchmark, num_partitions):
     )
 
 
-# Pre-computing partition assigment only makes sense on CUDA and so this benchmark runs
+# Pre-computing partition assignment only makes sense on CUDA and so this benchmark runs
 # only on CUDA.
 @pytest.mark.benchmark(group="assign_partitions")
 @pytest.mark.parametrize("num_partitions", [100, 300])

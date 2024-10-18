@@ -125,7 +125,7 @@ impl Cosine for f16 {
 mod f32 {
     use super::*;
 
-    // TODO: how can we explicity infer N?
+    // TODO: how can we explicitly infer N?
     #[inline]
     pub(super) fn cosine_once<S: SIMD<f32, N>, const N: usize>(
         x: &[f32],

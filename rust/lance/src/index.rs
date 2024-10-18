@@ -281,7 +281,7 @@ impl DatasetIndexExt for Dataset {
                     .expect("already checked")
                     .clone()
                     .to_vector()
-                    // this should never happen beause we control the registration
+                    // this should never happen because we control the registration
                     // if this fails, the registration logic has a bug
                     .ok_or(Error::Internal {
                         message: "unable to cast index extension to vector".to_string(),
@@ -451,7 +451,7 @@ impl DatasetIndexExt for Dataset {
                 new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
             }
 
-            let last_idx = deltas.last().expect("Delte indices should not be empty");
+            let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
                 uuid: new_id,
                 name: last_idx.name.clone(), // Keep the same name

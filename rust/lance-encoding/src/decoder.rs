@@ -73,7 +73,7 @@
 //!        - values: Value (physical encoding)
 //!  - items: Primitive (logical encoding)
 //!    - column: Basic (physical encoding)
-//!      - values: Value (phsyical encoding)
+//!      - values: Value (physical encoding)
 //!
 //! Note that, in this example, root.items.column does not have a validity because there were
 //! no nulls in the page.
@@ -433,7 +433,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         &self.io
     }
 
-    /// Delegates responsibilty to the next encoder in the chain
+    /// Delegates responsibility to the next encoder in the chain
     ///
     /// Field schedulers should call this method when:
     ///
@@ -616,7 +616,7 @@ impl<'a> ColumnInfoIter<'a> {
 pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
     /// Called to create a field scheduler for a field
     ///
-    /// Stratgies can examine:
+    /// Strategies can examine:
     /// * The target field
     /// * The column metadata (potentially consuming multiple columns)
     ///
@@ -1297,7 +1297,7 @@ impl BatchDecodeStream {
     ///
     /// * `scheduled` - an incoming stream of decode tasks from a
     ///   [`crate::decode::DecodeBatchScheduler`]
-    /// * `schema` - the scheam of the data to create
+    /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
     /// * `num_columns` the total number of columns in the file
@@ -1889,8 +1889,8 @@ impl FilterExpression {
 /// cover many columns of child data.  In fact, the entire file is treated as one
 /// top-level struct field.
 ///
-/// The scheduler is responsible for calculating the neccesary I/O.  One schedule_range
-/// request could trigger mulitple batches of I/O across multiple columns.  The scheduler
+/// The scheduler is responsible for calculating the necessary I/O.  One schedule_range
+/// request could trigger multiple batches of I/O across multiple columns.  The scheduler
 /// should emit decoders into the sink as quickly as possible.
 ///
 /// As soon as the scheduler encounters a batch of data that can decoded then the scheduler

@@ -292,7 +292,7 @@ mod test {
             },
         );
 
-        // u16 version, it can start beyong the u16 range, but the
+        // u16 version, it can start beyond the u16 range, but the
         // relative values must be within u16 range.
         let relative_values = [42, 0, 43, u16::MAX as u64, 99];
         let values = relative_values.map(|v| v + 2 * u16::MAX as u64).to_vec();

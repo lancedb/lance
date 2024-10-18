@@ -12,7 +12,7 @@ use crate::Result;
 /// Clustering Trait.
 pub trait Clustering<T: Num> {
     /// The dimension of the vectors.
-    fn deminsion(&self) -> u32;
+    fn dimension(&self) -> u32;
 
     /// The number of clusters.
     fn num_clusters(&self) -> u32;

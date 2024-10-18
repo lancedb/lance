@@ -91,12 +91,12 @@ where
 /// PK: base_uri -- string
 /// SK: version -- number
 /// path -- string
-/// commiter -- string
+/// committer -- string
 ///
 /// Consistency: This store is expected to have read-after-write consistency
 /// consistent_read should always be set to true
 ///
-/// Transaction Safty: This store uses DynamoDB conditional write to ensure
+/// Transaction Safety: This store uses DynamoDB conditional write to ensure
 /// only one writer can win per version.
 #[derive(Debug)]
 pub struct DynamoDBExternalManifestStore {
