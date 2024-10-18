@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from pathlib import Path
 from typing import Dict, Optional, Union
 
 import pyarrow as pa
@@ -69,6 +70,8 @@ class LanceFileReader:
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         """
+        if isinstance(path, Path):
+            path = str(path)
         self._reader = _LanceFileReader(path, storage_options=storage_options)
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
@@ -202,6 +205,8 @@ class LanceFileWriter:
             Extra options to be used for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
         """
+        if isinstance(path, Path):
+            path = str(path)
         self._writer = _LanceFileWriter(
             path,
             schema,
