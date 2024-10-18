@@ -64,7 +64,6 @@ pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
 pub(crate) mod tracing;
-pub(crate) mod updater;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
