@@ -27,6 +27,7 @@ from .dependencies import pandas as pd
 from .lance import _Fragment, _write_fragments
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
+from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
@@ -361,9 +362,13 @@ class LanceFragment(pa.dataset.Fragment):
 
     def merge_columns(
         self,
-        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
+        value_func: Dict[str, str]
+        | BatchUDF
+        | ReaderLike
+        | Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
         batch_size: Optional[int] = None,
+        reader_schema: Optional[pa.Schema] = None,
     ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
@@ -371,13 +376,12 @@ class LanceFragment(pa.dataset.Fragment):
 
             Internal API. This method is not intended to be used by end users.
 
-        Parameters
-        ----------
-        value_func: Callable.
-            A function that takes a RecordBatch as input and returns a RecordBatch.
-        columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the
-            value_func. Otherwise, all columns will be passed to the value_func.
+        The parameters and their interpretation are the same as in the
+        :meth:`lance.dataset.LanceDataset.add_columns` operation.
+
+        The only difference is that, instead of modifying the dataset, a new
+        fragment is created.  The new schema of the fragment is returned as well.
+        These can be used in a later operation to commit the changes to the dataset.
 
         See Also
         --------
@@ -390,63 +394,21 @@ class LanceFragment(pa.dataset.Fragment):
         Tuple[FragmentMetadata, LanceSchema]
             A new fragment with the added column(s) and the final schema.
         """
-        updater = self._fragment.updater(columns, batch_size)
+        transforms = normalize_transform(value_func, self, columns, reader_schema)
+        if isinstance(transforms, pa.RecordBatchReader):
+            metadata, schema = self._fragment.add_columns_from_reader(
+                transforms, batch_size
+            )
+        else:
+            metadata, schema = self._fragment.add_columns(
+                transforms, columns, batch_size
+            )
 
-        while True:
-            batch = updater.next()
-            if batch is None:
-                break
-            new_value = value_func(batch)
-            if not isinstance(new_value, pa.RecordBatch):
-                raise ValueError(
-                    f"value_func must return a Pyarrow RecordBatch, "
-                    f"got {type(new_value)}"
-                )
+            if isinstance(transforms, BatchUDF):
+                if transforms.cache is not None:
+                    transforms.cache.cleanup()
 
-            updater.update(new_value)
-        metadata = updater.finish()
-        schema = updater.schema()
         return FragmentMetadata.from_metadata(metadata), schema
-
-    def add_columns(
-        self,
-        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
-        columns: Optional[list[str]] = None,
-    ) -> FragmentMetadata:
-        """Add columns to this Fragment.
-
-        .. deprecated:: 0.10.14
-            Use :meth:`merge_columns` instead.
-
-        .. warning::
-
-            Internal API. This method is not intended to be used by end users.
-
-        Parameters
-        ----------
-        value_func: Callable.
-            A function that takes a RecordBatch as input and returns a RecordBatch.
-        columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the
-            value_func. Otherwise, all columns will be passed to the value_func.
-
-        See Also
-        --------
-        lance.dataset.LanceOperation.Merge :
-            The operation used to commit these changes to the dataset. See the
-            doc page for an example of using this API.
-
-        Returns
-        -------
-        FragmentMetadata
-            A new fragment with the added column(s).
-        """
-        warnings.warn(
-            "LanceFragment.add_columns is deprecated, use LanceFragment.merge_columns "
-            "instead",
-            DeprecationWarning,
-        )
-        return self.merge_columns(value_func, columns)[0]
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
