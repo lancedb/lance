@@ -490,19 +490,30 @@ impl ArrayEncoder for BinaryEncoder {
             self.indices_encoder
                 .encode(indices, &DataType::UInt64, buffer_index)?;
 
-        let encoded_indices_data = encoded_indices.data.as_fixed_width().unwrap();
-
-        assert!(encoded_indices_data.bits_per_value <= 64);
-
         if let Some(buffer_compressor) = &self.buffer_compressor {
             let mut compressed_data = Vec::with_capacity(data.data.len());
             buffer_compressor.compress(&data.data, &mut compressed_data)?;
             data.data = LanceBuffer::Owned(compressed_data);
         }
 
+        let (bits_per_offset, offsets) = match encoded_indices.data {
+            DataBlock::FixedWidth(fixed_width) => {
+                let bits_per_value = fixed_width.bits_per_value as u8;
+                let offsets = fixed_width.data;
+                (bits_per_value, offsets)
+            }
+            DataBlock::Opaque(mut opaque) => {
+                let bits_per_offset = (opaque.buffers[0].len() as u64 / opaque.num_values) as u8;
+                let offsets = opaque.buffers[0].borrow_and_clone();
+                (bits_per_offset, offsets)
+            }
+            _ => panic!("Expected fixed width or opaque data block for indices"),
+        };
+        assert!(bits_per_offset <= 64);
+
         let data = DataBlock::VariableWidth(VariableWidthBlock {
-            bits_per_offset: encoded_indices_data.bits_per_value as u8,
-            offsets: encoded_indices_data.data,
+            bits_per_offset,
+            offsets,
             data: data.data,
             num_values: data.num_values,
             block_info: BlockInfo::new(),
@@ -527,7 +538,6 @@ impl ArrayEncoder for BinaryEncoder {
 
 #[cfg(test)]
 pub mod tests {
-
     use arrow_array::{
         builder::{LargeStringBuilder, StringBuilder},
         ArrayRef, StringArray,
