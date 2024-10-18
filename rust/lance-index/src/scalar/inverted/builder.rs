@@ -10,9 +10,9 @@ use std::sync::Arc;
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::scalar::{IndexReader, IndexStore, IndexWriter, InvertedIndexParams};
 use crate::vector::graph::OrderedFloat;
-use arrow::array::AsArray;
+use arrow::array::{ArrayBuilder, AsArray, Int32Builder, StringBuilder};
 use arrow::datatypes;
-use arrow_array::RecordBatch;
+use arrow_array::{Int32Array, RecordBatch, StringArray};
 use arrow_schema::SchemaRef;
 use crossbeam_queue::ArrayQueue;
 use datafusion::execution::SendableRecordBatchStream;
@@ -139,8 +139,8 @@ impl InvertedIndexBuilder {
             senders.push(sender);
             result_futs.push(tokio::spawn({
                 async move {
-                    while let Some((row_id, tokens)) = receiver.recv().await {
-                        worker.add(row_id, tokens).await?;
+                    while let Some((row_id, tokens, positions)) = receiver.recv().await {
+                        worker.add(row_id, tokens, positions).await?;
                     }
                     let reader = worker.into_reader(inverted_list).await?;
                     Result::Ok(reader)
@@ -151,18 +151,14 @@ impl InvertedIndexBuilder {
         let start = std::time::Instant::now();
         let senders = Arc::new(senders);
         let tokenizer_pool = Arc::new(ArrayQueue::new(num_shards));
-        let token_buffers_pool = Arc::new(ArrayQueue::new(num_shards));
+        let tokenizer = self.params.tokenizer_config.build()?;
         for _ in 0..num_shards {
-            let _ = tokenizer_pool.push(TOKENIZER.clone());
-            token_buffers_pool
-                .push(vec![Vec::new(); num_shards])
-                .unwrap();
+            let _ = tokenizer_pool.push(tokenizer.clone());
         }
         let mut stream = stream
             .map(move |batch| {
                 let senders = senders.clone();
                 let tokenizer_pool = tokenizer_pool.clone();
-                let token_buffers_pool = token_buffers_pool.clone();
                 CPU_RUNTIME.spawn_blocking(move || {
                     let batch = batch?;
                     let doc_iter = iter_str_array(batch.column(0));
@@ -172,11 +168,22 @@ impl InvertedIndexBuilder {
                         .filter_map(|(doc, row_id)| doc.map(|doc| (doc, *row_id)));
 
                     let mut tokenizer = tokenizer_pool.pop().unwrap();
-                    let mut token_buffers = token_buffers_pool.pop().unwrap();
 
                     let num_tokens = docs
                         .map(|(doc, row_id)| {
                             // tokenize the document
+                            let predicted_num_tokens = doc.len() / 5 / num_shards;
+                            let mut token_buffers = std::iter::repeat_with(|| {
+                                (
+                                    StringBuilder::with_capacity(
+                                        predicted_num_tokens,
+                                        doc.len() / num_shards,
+                                    ),
+                                    Int32Builder::with_capacity(predicted_num_tokens),
+                                )
+                            })
+                            .take(num_shards)
+                            .collect_vec();
                             let mut num_tokens = 0;
                             let mut token_stream = tokenizer.token_stream(doc);
                             while token_stream.advance() {
@@ -184,17 +191,25 @@ impl InvertedIndexBuilder {
                                 let mut hasher = DefaultHasher::new();
                                 hasher.write(token.text.as_bytes());
                                 let shard = hasher.finish() as usize % num_shards;
-                                token_buffers[shard]
-                                    .push((std::mem::take(&mut token.text), token.position as i32));
+                                let (ref mut token_builder, ref mut position_builder) =
+                                    &mut token_buffers[shard];
+                                token_builder.append_value(&token.text);
+                                position_builder.append_value(token.position as i32);
                                 num_tokens += 1;
                             }
 
-                            for (shard, buffer) in token_buffers.iter_mut().enumerate() {
-                                if buffer.is_empty() {
+                            for (shard, (token_builder, position_builder)) in
+                                token_buffers.iter_mut().enumerate()
+                            {
+                                if token_builder.is_empty() {
                                     continue;
                                 }
-                                let buffer = std::mem::take(buffer);
-                                senders[shard].blocking_send((row_id, buffer)).unwrap();
+
+                                let tokens = token_builder.finish();
+                                let positions = position_builder.finish();
+                                senders[shard]
+                                    .blocking_send((row_id, tokens, positions))
+                                    .unwrap();
                             }
 
                             (row_id, num_tokens)
@@ -202,7 +217,6 @@ impl InvertedIndexBuilder {
                         .collect_vec();
 
                     let _ = tokenizer_pool.push(tokenizer);
-                    token_buffers_pool.push(token_buffers).unwrap();
                     Result::Ok(num_tokens)
                 })
             })
@@ -350,7 +364,10 @@ impl InvertedIndexBuilder {
             ("max_scores".to_owned(), serde_json::to_string(&max_scores)?),
         ]);
         writer.finish_with_metadata(metadata).await?;
-        log::info!("finished writing posting lists");
+        log::info!(
+            "finished writing posting lists, elapsed: {:?}",
+            start.elapsed()
+        );
 
         Ok(())
     }
@@ -363,7 +380,10 @@ impl InvertedIndexBuilder {
         let batch = tokens.to_batch()?;
         let mut writer = store.new_index_file(TOKENS_FILE, batch.schema()).await?;
         writer.write_record_batch(batch).await?;
-        writer.finish().await?;
+
+        let tokenizer = serde_json::to_string(&self.params.tokenizer_config)?;
+        let metadata = HashMap::from_iter(vec![("tokenizer".to_owned(), tokenizer)]);
+        writer.finish_with_metadata(metadata).await?;
 
         log::info!("finished writing tokens");
         Ok(())
@@ -429,13 +449,18 @@ impl IndexWorker {
         self.schema.column_with_name(POSITION_COL).is_some()
     }
 
-    async fn add(&mut self, row_id: u64, tokens: Vec<(String, i32)>) -> Result<()> {
+    async fn add(&mut self, row_id: u64, tokens: StringArray, positions: Int32Array) -> Result<()> {
         let mut token_occurrences = HashMap::new();
-        for (token, position) in tokens {
+        for (token, position) in tokens.iter().zip(positions.values().into_iter()) {
+            let token = if let Some(token) = token {
+                token
+            } else {
+                continue;
+            };
             token_occurrences
                 .entry(token)
                 .or_insert_with(Vec::new)
-                .push(position);
+                .push(*position);
         }
         let with_position = self.has_position();
         token_occurrences
@@ -443,7 +468,7 @@ impl IndexWorker {
             .for_each(|(token, term_positions)| {
                 let posting_list = self
                     .posting_lists
-                    .entry(token.clone())
+                    .entry(token.to_owned())
                     .or_insert_with(|| PostingListBuilder::empty(with_position));
 
                 let old_size = if posting_list.is_empty() {
@@ -499,6 +524,7 @@ impl IndexWorker {
         Ok(())
     }
 
+    #[instrument(level = "debug", skip_all)]
     async fn flush_posting_list(&mut self, token: String) -> Result<usize> {
         if let Some(posting_list) = self.posting_lists.remove(&token) {
             let size = posting_list.size();
@@ -710,6 +736,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
 
+    use crate::scalar::inverted::TokenizerConfig;
     use crate::scalar::lance_format::LanceIndexStore;
     use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
 
@@ -717,13 +744,15 @@ mod tests {
 
     async fn create_index<Offset: arrow::array::OffsetSizeTrait>(
         with_position: bool,
+        tokenizer: TokenizerConfig,
     ) -> Arc<InvertedIndex> {
         let tempdir = tempfile::tempdir().unwrap();
         let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
         let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
         let store = LanceIndexStore::new(ObjectStore::local(), index_dir, cache);
 
-        let params = super::InvertedIndexParams::default().with_position(with_position);
+        let mut params = super::InvertedIndexParams::default().with_position(with_position);
+        params.tokenizer_config = tokenizer;
         let mut invert_index = super::InvertedIndexBuilder::new(params);
         let doc_col = GenericStringArray::<Offset>::from(vec![
             "lance database the search",
@@ -732,6 +761,7 @@ mod tests {
             "database search",
             "unrelated doc",
             "unrelated",
+            "mots accentués",
         ]);
         let row_id_col = UInt64Array::from(Vec::from_iter(0..doc_col.len() as u64));
         let batch = RecordBatch::try_new(
@@ -758,7 +788,7 @@ mod tests {
     }
 
     async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
-        let invert_index = create_index::<Offset>(false).await;
+        let invert_index = create_index::<Offset>(false, TokenizerConfig::default()).await;
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
@@ -808,7 +838,7 @@ mod tests {
         assert!(results.unwrap_err().to_string().contains("position is not found but required for phrase queries, try recreating the index with position"));
 
         // recreate the index with position
-        let invert_index = create_index::<Offset>(true).await;
+        let invert_index = create_index::<Offset>(true, TokenizerConfig::default()).await;
         let row_ids = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
@@ -864,5 +894,44 @@ mod tests {
     #[tokio::test]
     async fn test_inverted_index_with_large_string() {
         test_inverted_index::<i64>().await;
+    }
+
+    #[tokio::test]
+    async fn test_accented_chars() {
+        let invert_index = create_index::<i32>(false, TokenizerConfig::default()).await;
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(1));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(0));
+
+        // with ascii folding enabled, the search should be accent-insensitive
+        let invert_index =
+            create_index::<i32>(true, TokenizerConfig::default().ascii_folding(true)).await;
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(1));
+
+        let row_ids = invert_index
+            .search(&SargableQuery::FullTextSearch(
+                FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(row_ids.len(), Some(1));
     }
 }

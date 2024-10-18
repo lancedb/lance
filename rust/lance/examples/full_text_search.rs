@@ -58,9 +58,7 @@ async fn main() {
         let mut dataset = Dataset::write(batches, dataset_dir.as_ref(), None)
             .await
             .unwrap();
-        let params = InvertedIndexParams {
-            with_position: true,
-        };
+        let params = InvertedIndexParams::default();
         let start = std::time::Instant::now();
         dataset
             .create_index(
