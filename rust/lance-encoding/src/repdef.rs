@@ -9,7 +9,7 @@
 //! is irrelevant.
 //!
 //! Note: the concept of repetition & definition levels comes from the Dremel paper and has
-//! been implemented in Apache Parquet.  However, the implementation here is not necessarily 
+//! been implemented in Apache Parquet.  However, the implementation here is not necessarily
 //! compatible with Parquet.  For example, we use 0 to represent the "inner-most" item and
 //! Parquet uses 0 to represent the "outer-most" item.
 //!
