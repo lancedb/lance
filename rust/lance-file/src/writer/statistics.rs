@@ -1424,7 +1424,7 @@ mod tests {
                         ),
                     },
                 },
-                // Sting is not incremented if it's exact lenght of the limit
+                // Sting is not incremented if it's exact length of the limit
                 TestCase {
                     source_arrays: vec![Arc::new(StringArray::from(vec![format!(
                         "{}{}",
@@ -1472,7 +1472,7 @@ mod tests {
                         ))),
                     },
                 },
-                // Sting is not incremented if it's exact lenght of the limit
+                // Sting is not incremented if it's exact length of the limit
                 TestCase {
                     source_arrays: vec![Arc::new(LargeStringArray::from(vec![format!(
                         "{}{}",

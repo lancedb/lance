@@ -574,7 +574,7 @@ impl FieldScheduler for ListFieldScheduler {
 /// complete.
 ///
 /// Once the indirect I/O is finished we pull items out of `unawaited`, wait them
-/// (this wait should return immedately) and then push them into `item_decoders`.
+/// (this wait should return immediately) and then push them into `item_decoders`.
 ///
 /// We then drain from `item_decoders`, popping item pages off as we finish with
 /// them.
@@ -1204,7 +1204,7 @@ impl FieldEncoder for ListFieldEncoder {
             // a limitation in the current scheduler and could be addressed in the future.  As a result
             // we always need to encode the items page if we encode the offsets page.
             //
-            // In practice this isn't usually too bad unless we are targetting very small pages.
+            // In practice this isn't usually too bad unless we are targeting very small pages.
             item_tasks = self.items_encoder.flush(external_buffers)?;
         }
         Self::combine_tasks(offsets_tasks, item_tasks)

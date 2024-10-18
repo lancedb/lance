@@ -32,7 +32,7 @@ use crate::vector::PART_ID_COLUMN;
 pub trait ShuffleReader: Send + Sync {
     /// Read a partition by partition_id
     /// will return Ok(None) if partition_size is 0
-    /// check reader.partiton_size(partition_id) before calling this function
+    /// check reader.partition_size(partition_id) before calling this function
     async fn read_partition(
         &self,
         partition_id: usize,

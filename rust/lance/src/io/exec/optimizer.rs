@@ -70,7 +70,7 @@ impl PhysicalOptimizerRule for SimplifyProjection {
                     // TODO: we could try to coalesce consecutive projections, something for later
                     // For now, we just keep things simple and only remove NoOp projections
 
-                    // output has differnet schema, projection needed
+                    // output has different schema, projection needed
                     if input.schema() != proj.schema() {
                         return Ok(Transformed::no(plan));
                     }

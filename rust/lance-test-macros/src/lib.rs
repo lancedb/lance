@@ -123,7 +123,7 @@ fn expand_wrapper(wrapped_attr: Tokens, wrappee: ItemFn) -> Tokens {
 /// ```
 ///
 /// By default this wrapper will do nothing.  To then get tracing output, set the
-/// LANCE_TRACING enviornment variable to your desired level (e.g. "debug").
+/// LANCE_TRACING environment variable to your desired level (e.g. "debug").
 ///
 /// Example:
 ///

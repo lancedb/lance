@@ -347,7 +347,7 @@ pub trait ScalarIndexLoader: Send + Sync {
 
 /// This represents a lookup into one or more scalar indices
 ///
-/// This is a tree of operations beacause we may need to logically combine or
+/// This is a tree of operations because we may need to logically combine or
 /// modify the results of scalar lookups
 #[derive(Debug, Clone)]
 pub enum ScalarIndexExpr {

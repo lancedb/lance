@@ -470,9 +470,9 @@ impl ArrayGenerator for CycleVectorGenerator {
 }
 
 #[derive(Default)]
-pub struct PseduoUuidGenerator {}
+pub struct PseudoUuidGenerator {}
 
-impl ArrayGenerator for PseduoUuidGenerator {
+impl ArrayGenerator for PseudoUuidGenerator {
     fn generate(
         &mut self,
         length: RowCount,
@@ -497,9 +497,9 @@ impl ArrayGenerator for PseduoUuidGenerator {
 }
 
 #[derive(Default)]
-pub struct PseduoUuidHexGenerator {}
+pub struct PseudoUuidHexGenerator {}
 
-impl ArrayGenerator for PseduoUuidHexGenerator {
+impl ArrayGenerator for PseudoUuidHexGenerator {
     fn generate(
         &mut self,
         length: RowCount,
@@ -1581,8 +1581,8 @@ pub mod array {
     /// Note, these are "pseudo UUIDs".  They are 16-byte randomish values but they
     /// are not guaranteed to be unique.  We use a simplistic RNG that trades uniqueness
     /// for speed.
-    pub fn rand_pseduo_uuid() -> Box<dyn ArrayGenerator> {
-        Box::<PseduoUuidGenerator>::default()
+    pub fn rand_pseudo_uuid() -> Box<dyn ArrayGenerator> {
+        Box::<PseudoUuidGenerator>::default()
     }
 
     /// Create a generator of random UUIDs, stored as 32-character strings (hex encoding
@@ -1591,8 +1591,8 @@ pub mod array {
     /// Note, these are "pseudo UUIDs".  They are 16-byte randomish values but they
     /// are not guaranteed to be unique.  We use a simplistic RNG that trades uniqueness
     /// for speed.
-    pub fn rand_pseduo_uuid_hex() -> Box<dyn ArrayGenerator> {
-        Box::<PseduoUuidHexGenerator>::default()
+    pub fn rand_pseudo_uuid_hex() -> Box<dyn ArrayGenerator> {
+        Box::<PseudoUuidHexGenerator>::default()
     }
 
     pub fn rand_primitive<T: ArrowPrimitiveType + Send + Sync>(

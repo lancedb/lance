@@ -27,7 +27,7 @@ pub const RESIDUAL_COLUMN: &str = "__residual_vector";
 ///
 #[derive(Clone)]
 pub struct ResidualTransform {
-    /// Flattend centroids.
+    /// Flattened centroids.
     centroids: FixedSizeListArray,
 
     /// Partition Column

@@ -683,7 +683,7 @@ impl Transaction {
                 && matches!(self.operation, Operation::Overwrite { .. })
             {
                 // If this is an overwrite operation and the user has requested a specific version
-                // then ovewrite with that version.  Otherwise, if the user didn't request a specific
+                // then overwrite with that version.  Otherwise, if the user didn't request a specific
                 // version, then overwrite with whatever version we had before.
                 prev_manifest.data_storage_format =
                     DataStorageFormat::new(user_requested_version.unwrap());

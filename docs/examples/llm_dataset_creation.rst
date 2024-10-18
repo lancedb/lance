@@ -3,7 +3,7 @@ Creating text dataset for LLM training using Lance
 
 Lance can be used for creating and caching a text (or code) dataset for pre-training / fine-tuning of Large Language Models.
 The need for this arises when one needs to train a model on a subset of data or process the data in chunks without downloading
-all of it on the disk at once. This becomes a considerable problem when you just want a subset of a Terrabyte or Petabyte-scale dataset.
+all of it on the disk at once. This becomes a considerable problem when you just want a subset of a Terabyte or Petabyte-scale dataset.
 
 In this example, we will be bypassing this problem by downloading a text dataset in parts, tokenizing it and saving it as a Lance dataset. 
 This can be done for as many or as few data samples as you wish with average memory consumption approximately 3-4 GBs!
@@ -41,7 +41,7 @@ Now we will define a function to help us with tokenizing our samples, one-by-one
     def tokenize(sample, field='text'):
         return tokenizer(sample[field])['input_ids']
 
-This function will recieve a sample from a huggingface dataset and tokenize the values in the `field` column. This is the main text you want 
+This function will receive a sample from a huggingface dataset and tokenize the values in the `field` column. This is the main text you want 
 to tokenize.
 
 Creating a Lance dataset
@@ -70,7 +70,7 @@ let's define the main function that takes in the dataset, number of samples and 
             )
 
 This function will be iterating over the huggingface dataset, one sample at a time, tokenizing the sample and yielding a pyarrow `RecordBatch`
-with all the tokens. We will do this untill we have reached the `num_samples` number of samples or the end of the dataset, whichever comes first.
+with all the tokens. We will do this until we have reached the `num_samples` number of samples or the end of the dataset, whichever comes first.
 
 Please note that by 'sample', we mean one example (row) in the original dataset. What one example exactly means will depend on the dataset itself as it could 
 be one line or an entire file of text. In this example, it's varies in length between a line and a paragraph of text.

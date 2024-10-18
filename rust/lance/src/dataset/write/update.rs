@@ -32,7 +32,7 @@ use crate::{Error, Result};
 /// Build an update operation.
 ///
 /// This operation is similar to SQL's UPDATE statement. It allows you to change
-/// the values of all or a subset of columns with SQL expresions.
+/// the values of all or a subset of columns with SQL expressions.
 ///
 /// Use the [UpdateBuilder] to construct an update job. For example:
 ///

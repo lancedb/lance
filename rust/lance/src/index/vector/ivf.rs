@@ -1073,7 +1073,7 @@ fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
 }
 
 fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
-    if ivf.precomputed_partitons_file.is_some() && ivf.centroids.is_none() {
+    if ivf.precomputed_partitions_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
             message: "precomputed_partitions_file requires centroids to be set".to_string(),
             location: location!(),
@@ -1087,10 +1087,10 @@ fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
         });
     }
 
-    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitons_file.is_some() {
+    if ivf.precomputed_shuffle_buffers.is_some() && ivf.precomputed_partitions_file.is_some() {
         return Err(Error::Index {
             message:
-                "precomputed_shuffle_buffers and precomputed_partitons_file are mutually exclusive"
+                "precomputed_shuffle_buffers and precomputed_partitions_file are mutually exclusive"
                     .to_string(),
             location: location!(),
         });
@@ -1233,7 +1233,7 @@ async fn scan_index_field_stream(
 async fn load_precomputed_partitions_if_available(
     ivf_params: &IvfBuildParams,
 ) -> Result<Option<HashMap<u64, u32>>> {
-    match &ivf_params.precomputed_partitons_file {
+    match &ivf_params.precomputed_partitions_file {
         Some(file) => {
             info!("Loading precomputed partitions from file: {}", file);
             let mut builder = DatasetBuilder::from_uri(file);

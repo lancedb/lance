@@ -57,7 +57,7 @@ pub struct ProxyObjectStorePolicy {
     /// be returned instead.
     before_policies: HashMap<String, PolicyFn>,
     /// Policies which run after calls that return ObjectMeta.  The policy can
-    /// tranform the returned ObjectMeta to mock out file listing results.
+    /// transform the returned ObjectMeta to mock out file listing results.
     object_meta_policies: HashMap<String, ObjectMetaPolicyFn>,
 }
 

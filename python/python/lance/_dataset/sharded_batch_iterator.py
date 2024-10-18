@@ -21,7 +21,7 @@ __all__ = ["ShardedBatchIterator"]
 class ShardedBatchIterator:
     """An iterator of RecordBatches, over the sharded dataset.
 
-    Parmeters
+    Parameters
     ---------
     uri: str or Path
         Dataset base URI

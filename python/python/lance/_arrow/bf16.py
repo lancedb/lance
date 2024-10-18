@@ -105,12 +105,12 @@ class BFloat16Type(pa.ExtensionType):
         pa.ExtensionType.__init__(self, pa.binary(2), "lance.bfloat16")
 
     def __arrow_ext_serialize__(self):
-        # TODO: encode endianess
+        # TODO: encode endianness
         return b""
 
     @classmethod
     def __arrow_ext_deserialize__(self, storage_type, serialized):
-        # TODO: decode endianess
+        # TODO: decode endianness
         return BFloat16Type()
 
     def __arrow_ext_class__(self):

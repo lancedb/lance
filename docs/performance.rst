@@ -7,7 +7,7 @@ Threading Model
 ---------------
 
 Lance is designed to be thread-safe and performant.  Lance APIs can be called concurrently unless
-explicity stated otherwise.  Users may create multiple tables and share tables between threads.
+explicitly stated otherwise.  Users may create multiple tables and share tables between threads.
 Operations may run in parallel on the same table, but some operations may lead to conflicts.  For
 details see :ref:`conflict_resolution`.
 
@@ -80,4 +80,4 @@ with 1024 rows per batch is more appropriate.
 
 In summary, scans could use up to ``(2 * io_buffer_size) + (batch_size * num_compute_threads)`` bytes of memory.
 Keep in mind that ``io_buffer_size`` is a soft limit (e.g. we cannot read less than one page at a time right now)
-and so it is not neccesarily a bug if you see memory usage exceed this limit by a small margin.
+and so it is not necessarily a bug if you see memory usage exceed this limit by a small margin.

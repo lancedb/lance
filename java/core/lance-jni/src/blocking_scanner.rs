@@ -121,7 +121,7 @@ fn inner_create_scanner<'local>(
 
     let mut scanner = dataset_guard.inner.scan();
 
-    // handle frament_ids
+    // handle fragment_ids
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {

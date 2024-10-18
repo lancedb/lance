@@ -1601,7 +1601,7 @@ mod tests {
         let data = lance_datagen::gen()
             .with_seed(Seed::from(1))
             .col("value", array::step::<UInt32Type>())
-            .col("key", array::rand_pseduo_uuid_hex());
+            .col("key", array::rand_pseudo_uuid_hex());
         let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(32));
         let schema = data.schema();
 
@@ -1616,7 +1616,7 @@ mod tests {
         let data = lance_datagen::gen()
             .with_seed(Seed::from(2))
             .col("value", array::step::<UInt32Type>())
-            .col("key", array::rand_pseduo_uuid_hex());
+            .col("key", array::rand_pseudo_uuid_hex());
         let data = data.into_reader_rows(RowCount::from(1024), BatchCount::from(8));
         let ds = Dataset::write(
             data,
@@ -1732,7 +1732,7 @@ mod tests {
                 .with_seed(Seed::from(1))
                 .col("other", array::rand_utf8(4.into(), false))
                 .col("value", array::step::<UInt32Type>())
-                .col("key", array::rand_pseduo_uuid_hex());
+                .col("key", array::rand_pseudo_uuid_hex());
             let batch = data.into_batch_rows(RowCount::from(1024)).unwrap();
             let batch1 = batch.slice(0, 512);
             let batch2 = batch.slice(512, 512);

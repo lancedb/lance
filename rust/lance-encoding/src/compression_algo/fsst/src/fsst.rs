@@ -387,7 +387,7 @@ impl SymbolTable {
 
     // rationale for finalize:
     // - during symbol table construction, we may create more than 256 codes, but bring it down to max 255 in the last makeTable()
-    //   consequently we needed more than 8 bits during symbol table contruction, but can simplify the codes to single bytes in finalize()
+    //   consequently we needed more than 8 bits during symbol table construction, but can simplify the codes to single bytes in finalize()
     //   (this feature is in fact lo longer used, but could still be exploited: symbol construction creates no more than 255 symbols in each pass)
     // - we not only reduce the amount of codes to <255, but also *reorder* the symbols and renumber their codes, for higher compression perf.
     //   we renumber codes so they are grouped by length, to allow optimized scalar string compression (byteLim and suffixLim optimizations).

@@ -350,7 +350,7 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
 
     // When DF parses the above plan it turns column references into qualified references
     // into `dummy` (e.g. we get `WHERE dummy.x < 0` instead of `WHERE x < 0`)  We want
-    // these to be unqualified references instead and so we need a quick trasnformation pass
+    // these to be unqualified references instead and so we need a quick transformation pass
 
     let expr = expr.transform(&|node| match node {
         Expr::Column(column) => {

@@ -831,7 +831,7 @@ impl PrimitiveStructuralEncoder {
 
         // TODO: Parquet sparsely encodes values here.  We could do the same but
         // then we won't have log2 values per chunk.  This means more metadata
-        // and potentially more decoder assymetry.  However, it may be worth
+        // and potentially more decoder asymmetry.  However, it may be worth
         // investigating at some point
 
         let data = DataBlock::from_arrays(&arrays, num_values);

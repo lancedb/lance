@@ -287,7 +287,7 @@ pub mod tests {
 
     #[test]
     fn test_resolve_in_expr() {
-        // Type coersion should apply for `A IN (0)` or `A NOT IN (0)`
+        // Type coercion should apply for `A IN (0)` or `A NOT IN (0)`
         let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float32, false)]);
         let expr = Expr::in_list(
             Expr::Column("a".to_string().into()),

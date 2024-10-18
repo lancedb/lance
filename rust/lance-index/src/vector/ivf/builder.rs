@@ -32,10 +32,10 @@ pub struct IvfBuildParams {
 
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
-    pub precomputed_partitons_file: Option<String>,
+    pub precomputed_partitions_file: Option<String>,
 
     /// Precomputed shuffle buffers (row_id -> partition_id, pq_code)
-    /// mutually exclusive with `precomputed_partitons_file`
+    /// mutually exclusive with `precomputed_partitions_file`
     /// requires `centroids` to be set
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
@@ -59,7 +59,7 @@ impl Default for IvfBuildParams {
             max_iters: 50,
             centroids: None,
             sample_rate: 256, // See faiss
-            precomputed_partitons_file: None,
+            precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,

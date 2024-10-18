@@ -18,7 +18,7 @@ use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
 use prost::Message;
 use snafu::{location, Location};
-use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADTA_KEY};
+use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADATA_KEY};
 use tracing::instrument;
 
 pub mod builder;
@@ -374,7 +374,7 @@ impl Quantization for ProductQuantizer {
     }
 
     fn metadata_key() -> &'static str {
-        PQ_METADTA_KEY
+        PQ_METADATA_KEY
     }
 
     fn quantization_type() -> QuantizationType {

@@ -163,7 +163,7 @@ impl Index for PQIndex {
             Ok(RoaringBitmap::from_sorted_iter(frag_ids).unwrap())
         } else {
             Err(Error::Index {
-                message: "PQIndex::caclulate_included_frags: PQ is not initialized".to_string(),
+                message: "PQIndex::calculate_included_frags: PQ is not initialized".to_string(),
                 location: location!(),
             })
         }

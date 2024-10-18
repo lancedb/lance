@@ -49,7 +49,7 @@ import "google/protobuf/empty.proto";
 //       
 //       If direct I/O is required then most (but not all) fields described
 //       below must be sector aligned.  We have marked these fields with an
-//       asterick for clarity.  Readers should assume there will be optional
+//       asterisk for clarity.  Readers should assume there will be optional
 //       padding inserted before these fields.
 //
 //       All footer fields are unsigned integers written with  little endian
@@ -96,7 +96,7 @@ import "google/protobuf/empty.proto";
 //
 // ## Data Pages
 //
-// A lot of flexiblity is provided in how data is stored.  Note that the file
+// A lot of flexibility is provided in how data is stored.  Note that the file
 // layout has no explicit notion of a page (however, it is a part of the column
 // metadata).  A page's buffers do not strictly need to be contiguous on the
 // disk.  However, it is recommended that buffers within a page be grouped

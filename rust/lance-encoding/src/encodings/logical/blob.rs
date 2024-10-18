@@ -29,7 +29,7 @@ use crate::{
 
 /// A field scheduler for large binary data
 ///
-/// Large binary data (1MiB+) can be inefficient if we store as a regular primtive.  We
+/// Large binary data (1MiB+) can be inefficient if we store as a regular primitive.  We
 /// essentially end up with 1 page per row (or a few rows) and the overhead of the
 /// metadata can be significant.
 ///

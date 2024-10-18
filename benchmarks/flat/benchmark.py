@@ -30,9 +30,9 @@ def benchmark(
     dim: int,
     metric: str,
 ):
-    querys = [np.random.random((dim,)).reshape(-1) for _ in range(32)]
+    queries = [np.random.random((dim,)).reshape(-1) for _ in range(32)]
     # warmup
-    for query in querys:
+    for query in queries:
         ds.to_table(
             nearest={"column": "vector", "k": 10, "q": query, "use_index": False}
         )
@@ -40,7 +40,7 @@ def benchmark(
     latency = []
 
     for _ in range(10):
-        for query in querys:
+        for query in queries:
             start = time.perf_counter()
             ds.to_table(
                 nearest={

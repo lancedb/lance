@@ -192,7 +192,7 @@ impl ArrayEncoder for PackedStructEncoder {
             encoded_fields.push(encoder.encode(child, child_type.data_type(), &mut 0)?);
         }
 
-        let (encoded_datas, child_encodings): (Vec<_>, Vec<_>) = encoded_fields
+        let (encoded_data_vec, child_encodings): (Vec<_>, Vec<_>) = encoded_fields
             .into_iter()
             .map(|field| (field.data, field.encoding))
             .unzip();
@@ -202,7 +202,7 @@ impl ArrayEncoder for PackedStructEncoder {
         // We can currently encode both FixedWidth and FixedSizeList.  In order
         // to encode the latter we "flatten" it converting a FixedSizeList into
         // a FixedWidth with very wide items.
-        let fixed_fields = encoded_datas
+        let fixed_fields = encoded_data_vec
             .into_iter()
             .map(|child| match child {
                 DataBlock::FixedWidth(fixed) => Ok(fixed),
