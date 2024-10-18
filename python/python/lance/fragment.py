@@ -395,6 +395,15 @@ class LanceFragment(pa.dataset.Fragment):
             A new fragment with the added column(s) and the final schema.
         """
         transforms = normalize_transform(value_func, self, columns, reader_schema)
+
+        if isinstance(transforms, BatchUDF):
+            if transforms.cache is not None:
+                raise ValueError(
+                    "A checkpoint file cannot be used when applying a UDF with "
+                    "LanceFragment.merge_columns.  You must apply your own "
+                    "checkpointing for fragment-level operations."
+                )
+
         if isinstance(transforms, pa.RecordBatchReader):
             metadata, schema = self._fragment.add_columns_from_reader(
                 transforms, batch_size
@@ -403,10 +412,6 @@ class LanceFragment(pa.dataset.Fragment):
             metadata, schema = self._fragment.add_columns(
                 transforms, columns, batch_size
             )
-
-            if isinstance(transforms, BatchUDF):
-                if transforms.cache is not None:
-                    transforms.cache.cleanup()
 
         return FragmentMetadata.from_metadata(metadata), schema
 

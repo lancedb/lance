@@ -493,3 +493,22 @@ def test_add_cols_batch_size(tmp_path: Path):
         tbl = dataset.to_table()
         expected = pa.table({"a": range(1000), "b": range(1000)})
         assert tbl == expected
+
+
+def test_no_checkpoint_merge_columns(tmp_path: Path):
+    tab = pa.table(
+        {
+            "a": range(100),
+            "b": range(100),
+        }
+    )
+    dataset = lance.write_dataset(tab, tmp_path, max_rows_per_file=20)
+
+    @lance.batch_udf(checkpoint_file=tmp_path / "cache.sqlite")
+    def some_udf(batch):
+        return batch
+
+    frag = dataset.get_fragments()[0]
+
+    with pytest.raises(ValueError, match="A checkpoint file cannot be used"):
+        frag.merge_columns(some_udf, columns=["a"])
