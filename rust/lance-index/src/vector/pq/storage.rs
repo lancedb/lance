@@ -48,7 +48,7 @@ use crate::{
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
-pub const PQ_METADTA_KEY: &str = "lance:pq";
+pub const PQ_METADATA_KEY: &str = "lance:pq";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
@@ -79,11 +79,11 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
         let metadata = reader
             .schema()
             .metadata
-            .get(PQ_METADTA_KEY)
+            .get(PQ_METADATA_KEY)
             .ok_or(Error::Index {
                 message: format!(
                     "Reading PQ storage: metadata key {} not found",
-                    PQ_METADTA_KEY
+                    PQ_METADATA_KEY
                 ),
                 location: location!(),
             })?;
@@ -336,7 +336,7 @@ impl ProductQuantizationStorage {
 
         let mut schema_metadata = HashMap::new();
         schema_metadata.insert(
-            PQ_METADTA_KEY.to_string(),
+            PQ_METADATA_KEY.to_string(),
             serde_json::to_string(&metadata)?,
         );
         schema_metadata.insert(

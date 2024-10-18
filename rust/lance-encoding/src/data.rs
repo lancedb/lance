@@ -891,9 +891,9 @@ fn arrow_binary_to_data_block(
     num_values: u64,
     bits_per_offset: u8,
 ) -> DataBlock {
-    let datas = arrays.iter().map(|arr| arr.to_data()).collect::<Vec<_>>();
+    let data_vec = arrays.iter().map(|arr| arr.to_data()).collect::<Vec<_>>();
     let bytes_per_offset = bits_per_offset as usize / 8;
-    let offsets = datas
+    let offsets = data_vec
         .iter()
         .map(|d| {
             LanceBuffer::Borrowed(
@@ -908,7 +908,7 @@ fn arrow_binary_to_data_block(
     } else {
         stitch_offsets::<i64>(offsets)
     };
-    let data = datas
+    let data = data_vec
         .iter()
         .zip(data_ranges)
         .map(|(d, byte_range)| {
@@ -1222,11 +1222,11 @@ impl DataBlock {
                 let structs = arrays.iter().map(|arr| arr.as_struct()).collect::<Vec<_>>();
                 let mut children = Vec::with_capacity(fields.len());
                 for child_idx in 0..fields.len() {
-                    let childs = structs
+                    let child_vec = structs
                         .iter()
                         .map(|s| s.column(child_idx).clone())
                         .collect::<Vec<_>>();
-                    children.push(Self::from_arrays(&childs, num_values));
+                    children.push(Self::from_arrays(&child_vec, num_values));
                 }
                 Self::Struct(StructDataBlock { children })
             }

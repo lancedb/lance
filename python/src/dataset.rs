@@ -1632,7 +1632,7 @@ fn prepare_vector_index_params(
         };
 
         if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
-            ivf_params.precomputed_partitons_file = Some(f.to_string());
+            ivf_params.precomputed_partitions_file = Some(f.to_string());
         };
 
         if let Some(storage_options) = storage_options {

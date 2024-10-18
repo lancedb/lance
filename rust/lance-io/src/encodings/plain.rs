@@ -767,7 +767,7 @@ mod tests {
         );
     }
 
-    // Re-eanble the following tests once the Lance FileReader / FileWrite is migrated.
+    // Re-enable the following tests once the Lance FileReader / FileWrite is migrated.
 
     // #[tokio::test]
     // async fn test_boolean_slice() {
