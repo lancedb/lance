@@ -47,6 +47,7 @@ seq-macro = "0.3.5"
 lance-testing.workspace = true
 lance-datagen.workspace = true
 rand.workspace = true
+rstest.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 criterion = { workspace = true }

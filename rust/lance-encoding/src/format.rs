@@ -19,8 +19,9 @@ use pb::{
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Dictionary, FixedSizeBinary,
-    FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct, PageLayout,
+    AllNullLayout, ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Dictionary,
+    FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct,
+    PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionScheme;
@@ -196,7 +197,7 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn miniblock(
+    pub fn miniblock_layout(
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
@@ -207,6 +208,12 @@ impl ProtobufUtils {
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
             })),
+        }
+    }
+
+    pub fn all_null_layout() -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::AllNullLayout(AllNullLayout {})),
         }
     }
 }
