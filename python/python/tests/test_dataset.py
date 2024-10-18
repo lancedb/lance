@@ -706,36 +706,6 @@ def test_pickle_fragment(tmp_path: Path):
     assert fragment.to_table() == unpickled.to_table()
 
 
-def test_add_columns(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-    base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
-
-    dataset = lance.dataset(base_dir)
-    fragments = dataset.get_fragments()
-
-    fragment = fragments[0]
-
-    def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
-        c_array = pa.compute.multiply(batch.column(0), 2)
-        return pa.RecordBatch.from_arrays([c_array], names=["c"])
-
-    fragment_metadata, schema = fragment.merge_columns(adder, columns=["a"])
-
-    operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
-    assert dataset.schema == schema.to_pyarrow()
-
-    tbl = dataset.to_table()
-    assert tbl == pa.Table.from_pydict(
-        {
-            "a": range(100),
-            "b": range(100),
-            "c": pa.array(range(0, 200, 2), pa.int64()),
-        }
-    )
-
-
 def test_cleanup_old_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -921,12 +891,9 @@ def test_merge_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     fragment = lance.dataset(base_dir).get_fragments()[0]
-    # add_columns is deprecated, but we can make sure it still works
-    # for now.
-    with pytest.deprecated_call():
-        merged = fragment.add_columns(
-            lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
-        )
+    merged = fragment.merge_columns(
+        lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
+    )[0]
 
     expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
 
@@ -938,33 +905,6 @@ def test_merge_with_commit(tmp_path: Path):
     tbl = dataset.to_table()
 
     assert tbl == expected
-
-
-def test_merge_batch_size(tmp_path: Path):
-    # Create dataset with 10 fragments with 100 rows each
-    table = pa.table({"a": range(1000)})
-    for batch_size in [1, 10, 100, 1000]:
-        ds_path = str(tmp_path / str(batch_size))
-        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
-        fragments = []
-
-        def mutate(batch):
-            assert batch.num_rows <= batch_size
-            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
-
-        for frag in dataset.get_fragments():
-            merged, schema = frag.merge_columns(mutate, batch_size=batch_size)
-            fragments.append(merged)
-
-        merge = lance.LanceOperation.Merge(fragments, schema)
-        dataset = lance.LanceDataset.commit(
-            ds_path, merge, read_version=dataset.version
-        )
-
-        dataset.validate()
-        tbl = dataset.to_table()
-        expected = pa.table({"a": range(1000), "b": range(1000)})
-        assert tbl == expected
 
 
 def test_merge_with_schema_holes(tmp_path: Path):

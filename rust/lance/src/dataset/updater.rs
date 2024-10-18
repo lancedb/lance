@@ -72,9 +72,9 @@ impl Updater {
 
         let batch_size = match (&legacy_batch_size, batch_size) {
             // If this is a v1 dataset we must use the row group size of the file
-            (Some(num_rows), _) => *num_rows,
+            (Some(legacy_batch_size), _) => *legacy_batch_size,
             // If this is a v2 dataset, let the user pick the batch size
-            (None, Some(legacy_batch_size)) => legacy_batch_size,
+            (None, Some(user_specified_batch_size)) => user_specified_batch_size,
             // Otherwise, default to 1024 if the user didn't specify anything
             (None, None) => get_default_batch_size().unwrap_or(1024) as u32,
         };

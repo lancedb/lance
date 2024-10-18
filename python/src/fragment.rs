@@ -21,13 +21,15 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::NewColumnTransform;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
 
-use crate::dataset::get_write_params;
-use crate::updater::Updater;
+use crate::dataset::{get_write_params, transforms_from_python};
+use crate::error::PythonErrorExt;
+use crate::schema::LanceSchema;
 use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
@@ -210,14 +212,43 @@ impl FileFragment {
         Ok(Scanner::new(scn))
     }
 
-    fn updater(&self, columns: Option<Vec<String>>, batch_size: Option<u32>) -> PyResult<Updater> {
-        let cols = columns.as_deref();
-        let inner = RT
-            .block_on(None, async {
-                self.fragment.updater(cols, None, batch_size).await
+    fn add_columns_from_reader(
+        &mut self,
+        reader: &Bound<PyAny>,
+        batch_size: Option<u32>,
+    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
+
+        let transforms = NewColumnTransform::Reader(Box::new(batches));
+
+        let fragment = self.fragment.clone();
+        let (fragment, schema) = RT
+            .spawn(None, async move {
+                fragment.add_columns(transforms, None, batch_size).await
             })?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?;
-        Ok(Updater::new(inner))
+            .infer_error()?;
+
+        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
+    }
+
+    fn add_columns(
+        &mut self,
+        transforms: &PyAny,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+        let transforms = transforms_from_python(transforms)?;
+
+        let fragment = self.fragment.clone();
+        let (fragment, schema) = RT
+            .spawn(None, async move {
+                fragment
+                    .add_columns(transforms, read_columns, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+
+        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {

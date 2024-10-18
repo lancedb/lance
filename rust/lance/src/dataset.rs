@@ -1393,8 +1393,9 @@ impl Dataset {
         &mut self,
         transforms: NewColumnTransform,
         read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
     ) -> Result<()> {
-        schema_evolution::add_columns(self, transforms, read_columns).await
+        schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
