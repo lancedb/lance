@@ -220,7 +220,7 @@ def l2_distance(
     A tuple of Tensors, for centroids id, and distance to the centroids.
     """
     split = _suggest_batch_size(centroids)
-    while split >= 256:
+    while split >= 128:
         try:
             return _l2_distance(vectors, centroids, split_size=split, y2=y2)
         except RuntimeError as e:  # noqa: PERF203
