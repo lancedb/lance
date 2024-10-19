@@ -1344,9 +1344,18 @@ impl Scanner {
             .into_iter()
             .collect();
 
-        let query = query.clone().columns(Some(columns)).limit(self.limit);
+        let query = query
+            .clone()
+            .columns(Some(columns.clone()))
+            .limit(self.limit);
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-        let fts_plan = FtsExec::new(self.dataset.clone(), index_uuids, query, prefilter_source);
+
+        let mut fts_plan = Arc::new(FtsExec::new(
+            self.dataset.clone(),
+            index_uuids,
+            query.clone(),
+            prefilter_source,
+        )) as Arc<dyn ExecutionPlan>;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
             options: SortOptions {
@@ -1355,13 +1364,41 @@ impl Scanner {
             },
         };
 
+        // search unindexed fragments
+        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+        let schema = Arc::new(self.dataset.schema().project(&[column]).unwrap());
+        if !unindexed_fragments.is_empty() {
+            let mut scan_node = self.scan_fragments(
+                true,
+                false,
+                true,
+                schema,
+                Arc::new(unindexed_fragments),
+                None,
+                false,
+            );
+
+            if let Some(expr) = filter_plan.full_expr.as_ref() {
+                // If there is a prefilter we need to manually apply it to the new data
+                let planner = Planner::new(scan_node.schema());
+                let physical_refine_expr = planner.create_physical_expr(expr)?;
+                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+            }
+
+            let flat_fts = self.flat_fts(scan_node, &query)?;
+            fts_plan = Arc::new(UnionExec::new(vec![fts_plan, flat_fts]));
+        }
+
         Ok(Arc::new(
-            SortExec::new(
-                vec![sort_expr],
-                Arc::new(fts_plan) as Arc<dyn ExecutionPlan>,
-            )
-            .with_fetch(self.limit.map(|l| l as usize)),
+            SortExec::new(vec![sort_expr], fts_plan).with_fetch(self.limit.map(|l| l as usize)),
         ))
+    }
+
+    fn flat_fts(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        query: &FullTextSearchQuery,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
     }
 
     // ANN/KNN search execution node with optional prefilter

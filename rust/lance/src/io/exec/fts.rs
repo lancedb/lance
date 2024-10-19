@@ -17,7 +17,7 @@ use futures::stream::{self};
 use futures::StreamExt;
 use lance_core::ROW_ID_FIELD;
 use lance_index::prefilter::{FilterLoader, PreFilter};
-use lance_index::scalar::inverted::{InvertedIndex, SCORE_FIELD};
+use lance_index::scalar::inverted::{flat_full_text_search, InvertedIndex, SCORE_FIELD};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_table::format::Index;
 use tracing::instrument;
@@ -157,7 +157,6 @@ impl ExecutionPlan for FtsExec {
                                     uuid,
                                 ))
                             })?;
-
                     pre_filter.wait_for_ready().await?;
                     let results = index.full_text_search(&query, pre_filter).await?;
 
@@ -179,6 +178,94 @@ impl ExecutionPlan for FtsExec {
                 }
             })
             .buffered(self.indices.len());
+        let schema = self.schema();
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
+    }
+
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        Ok(Statistics::new_unknown(&FTS_SCHEMA))
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+}
+
+#[derive(Debug)]
+pub struct FlatFtsExec {
+    input: Arc<dyn ExecutionPlan>,
+    column: String,
+    query: FullTextSearchQuery,
+    properties: PlanProperties,
+}
+
+impl FlatFtsExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, column: String, query: FullTextSearchQuery) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
+        Self {
+            input,
+            column,
+            query,
+            properties,
+        }
+    }
+}
+
+impl ExecutionPlan for FlatFtsExec {
+    fn name(&self) -> &str {
+        "FlatFtsExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        FTS_SCHEMA.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    #[instrument(name = "flat_fts_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let column = self.column.clone();
+        let query = self.query.clone();
+        let input_stream = self.input.execute(partition, context)?;
+
+        let stream = input_stream.map(move |batch| {
+            let batch = flat_full_text_search(&[batch], &column, &query.query)?;
+
+            let batch = RecordBatch::try_new(
+                FTS_SCHEMA.clone(),
+                vec![
+                    Arc::new(UInt64Array::from(row_ids)),
+                    Arc::new(Float32Array::from(scores)),
+                ],
+            )?;
+
+            Ok::<_, DataFusionError>(batch)
+        });
+
         let schema = self.schema();
         Ok(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))

@@ -943,6 +943,13 @@ pub fn flat_full_text_search(
         return Ok(Vec::new());
     }
 
+    if is_phrase_query(query) {
+        return Err(Error::invalid_input(
+            "phrase query is not supported for flat full text search, try using FTS index",
+            location!(),
+        ));
+    }
+
     match batches[0][doc_col].data_type() {
         DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query),
         DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query),
