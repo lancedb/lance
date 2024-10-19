@@ -159,6 +159,11 @@ impl IndexReader for v2::reader::FileReader {
         range: std::ops::Range<usize>,
         projection: Option<&[&str]>,
     ) -> Result<RecordBatch> {
+        if range.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(
+                self.schema().as_ref().into(),
+            )));
+        }
         let projection = if let Some(projection) = projection {
             v2::reader::ReaderProjection::from_column_names(self.schema(), projection)?
         } else {
