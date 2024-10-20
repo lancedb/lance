@@ -1318,35 +1318,29 @@ impl Scanner {
             query.columns.clone()
         };
 
-        // Now the full text search supports only one column
-        if columns.len() != 1 {
-            return Err(Error::invalid_input(
-                format!(
-                    "Full text search supports only one column right now, but got {} columns",
-                    columns.len()
-                ),
-                location!(),
-            ));
+        // load indices
+        let mut indices = HashMap::with_capacity(columns.len());
+        for column in &columns {
+            let index = self
+                .dataset
+                .load_scalar_index_for_column(column)
+                .await?
+                .ok_or(Error::invalid_input(
+                    format!("Column {} has no inverted index", column),
+                    location!(),
+                ))?;
+            let index_uuids = self
+                .dataset
+                .load_indices_by_name(&index.name)
+                .await?
+                .into_iter()
+                .collect();
+            indices.insert(column.clone(), index_uuids);
         }
-        let column = &columns[0];
-        let index = self
-            .dataset
-            .load_scalar_index_for_column(column)
-            .await?
-            .ok_or(Error::invalid_input(
-                format!("Column {} has no inverted index", column),
-                location!(),
-            ))?;
-        let index_uuids = self
-            .dataset
-            .load_indices_by_name(&index.name)
-            .await?
-            .into_iter()
-            .collect();
 
         let query = query.clone().columns(Some(columns)).limit(self.limit);
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-        let fts_plan = FtsExec::new(self.dataset.clone(), index_uuids, query, prefilter_source);
+        let fts_plan = FtsExec::new(self.dataset.clone(), indices, query, prefilter_source);
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
             options: SortOptions {

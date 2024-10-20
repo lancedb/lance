@@ -1691,15 +1691,21 @@ mod tests {
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
         Int8DictionaryArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
+    use arrow_array::{
+        Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
+        StructArray, UInt64Array,
+    };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_core::ROW_ID_FIELD;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
+    use lance_io::stream::RecordBatchStreamAdapter;
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
     use lance_table::format::WriterVersion;
@@ -4251,6 +4257,72 @@ mod tests {
             ds2.latest_version_id().await.unwrap(),
             dataset.latest_version_id().await.unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_fts_on_multiple_columns() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let params = InvertedIndexParams::default();
+        let title_col =
+            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
+        let content_col = GenericStringArray::<i32>::from(vec![
+            "content world",
+            "content database",
+            "content common",
+        ]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
+                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, tempdir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["title"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["content"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("content".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("common".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 2);
     }
 
     #[tokio::test]
