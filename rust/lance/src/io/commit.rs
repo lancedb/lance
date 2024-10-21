@@ -27,11 +27,12 @@ use std::sync::Arc;
 
 use lance_file::version::LanceFileVersion;
 use lance_table::format::{
-    pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest, WriterVersion,
+    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
+    WriterVersion, DETACHED_VERSION_MASK,
 };
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use snafu::{location, Location};
 
 use futures::future::Either;
@@ -418,6 +419,100 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     Ok(())
 }
 
+pub(crate) async fn commit_detached_transaction(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+) -> Result<Manifest> {
+    // We don't stricly need a transaction file but we go ahead and create one for
+    // record-keeping if nothing else.
+    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+
+    // We still do a loop since we may have conflicts in the random version we pick
+    for attempt_i in 0..commit_config.num_retries {
+        // Pick a random u64 with the higest bit set to indicate it is detached
+        let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
+
+        let (mut manifest, mut indices) = match transaction.operation {
+            Operation::Restore { version } => {
+                Transaction::restore_old_manifest(
+                    object_store,
+                    commit_handler,
+                    &dataset.base,
+                    version,
+                    write_config,
+                    &transaction_file,
+                )
+                .await?
+            }
+            _ => transaction.build_manifest(
+                Some(dataset.manifest.as_ref()),
+                dataset.load_indices().await?.as_ref().clone(),
+                &transaction_file,
+                write_config,
+            )?,
+        };
+
+        manifest.version = random_version;
+
+        // recompute_stats is always false so far because detached manifests are newer than
+        // the old stats bug.
+        migrate_manifest(&dataset, &mut manifest, /*recompute_stats=*/ false).await?;
+        // fix_schema and check_storage_version are just for sanity-checking and consistency
+        fix_schema(&mut manifest)?;
+        check_storage_version(&mut manifest)?;
+        migrate_indices(&dataset, &mut indices).await?;
+
+        // Try to commit the manifest
+        let result = write_manifest_file(
+            object_store,
+            commit_handler,
+            &dataset.base,
+            &mut manifest,
+            if indices.is_empty() {
+                None
+            } else {
+                Some(indices.clone())
+            },
+            write_config,
+            ManifestNamingScheme::V2,
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                return Ok(manifest);
+            }
+            Err(CommitError::CommitConflict) => {
+                // We pick a random u64 for the version, so it's possible (though extremely unlikely)
+                // that we have a conflict. In that case, we just try again.
+
+                let backoff_time = backoff_time(attempt_i);
+                tokio::time::sleep(backoff_time).await;
+            }
+            Err(CommitError::OtherError(err)) => {
+                // If other error, return
+                return Err(err);
+            }
+        }
+    }
+
+    // This should be extremely unlikely.  There should not be *that* many detached commits.  If
+    // this happens then it seems more likely there is a bug in our random u64 generation.
+    Err(crate::Error::CommitConflict {
+        version: 0,
+        source: format!(
+            "Failed find unused random u64 after {} retries.",
+            commit_config.num_retries
+        )
+        .into(),
+        location: location!(),
+    })
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
@@ -458,6 +553,10 @@ pub(crate) async fn commit_transaction(
     }
 
     let mut target_version = version;
+
+    if is_detached_version(target_version) {
+        return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
+    }
 
     // If any of them conflict with the transaction, return an error
     for (version_offset, other_transaction) in other_transactions.iter().enumerate() {

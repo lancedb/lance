@@ -2594,3 +2594,54 @@ def test_default_storage_version(tmp_path: Path):
     sample_file = frag.to_json()["files"][0]
     assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
     assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+
+def test_no_detached_v1(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    with pytest.raises(OSError, match="v1 manifest paths"):
+        dataset.commit(dataset.uri, op, read_version=dataset.version, detached=True)
+
+
+def test_detached_commits(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path, enable_v2_manifest_paths=True)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    detached = dataset.commit(
+        dataset.uri, op, read_version=dataset.version, detached=True
+    )
+    assert (detached.version & 0x8000000000000000) != 0
+
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+    # Detached commit should not show up in the dataset
+    dataset = lance.dataset(tmp_path)
+    assert dataset.to_table() == pa.table({"x": [0]})
+
+    # We can make more commits to dataset and they don't affect attached
+    table = pa.table({"x": [2]})
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert dataset.to_table() == pa.table({"x": [0, 2]})
+
+    # We can check out the detached commit
+    detached = dataset.checkout_version(detached.version)
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+
+    # Detached commit can use detached commit as read version
+    table = pa.table({"x": [3]})
+    frag = lance.LanceFragment.create(detached.uri, table)
+    op = lance.LanceOperation.Append([frag])
+
+    detached2 = dataset.commit(
+        dataset.uri, op, read_version=detached.version, detached=True
+    )
+
+    assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
