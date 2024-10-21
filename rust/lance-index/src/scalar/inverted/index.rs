@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -27,11 +28,10 @@ use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
-use tantivy::tokenizer::Language;
 use tracing::instrument;
 
 use super::builder::inverted_list_schema;
-use super::{wand::*, InvertedIndexBuilder};
+use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex,
@@ -57,24 +57,28 @@ pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
 
 lazy_static! {
-    pub static ref TOKENIZER: tantivy::tokenizer::TextAnalyzer = {
-        tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
-            .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
-            .filter(tantivy::tokenizer::LowerCaser)
-            .filter(tantivy::tokenizer::Stemmer::new(Language::English))
-            .build()
-    };
     static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InvertedIndex {
+    tokenizer: tantivy::tokenizer::TextAnalyzer,
     tokens: TokenSet,
     inverted_list: Arc<InvertedListReader>,
     docs: DocSet,
+}
+
+impl Debug for InvertedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvertedIndex")
+            .field("tokens", &self.tokens)
+            .field("inverted_list", &self.inverted_list)
+            .field("docs", &self.docs)
+            .finish()
+    }
 }
 
 impl DeepSizeOf for InvertedIndex {
@@ -102,7 +106,8 @@ impl InvertedIndex {
         query: &FullTextSearchQuery,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
-        let tokens = collect_tokens(&query.query);
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(&query.query, &mut tokenizer);
         let token_ids = self.map(&tokens).into_iter();
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
@@ -239,8 +244,16 @@ impl ScalarIndex for InvertedIndex {
             let store = store.clone();
             async move {
                 let token_reader = store.open_index_file(TOKENS_FILE).await?;
+                let tokenizer = token_reader
+                    .schema()
+                    .metadata
+                    .get("tokenizer")
+                    .map(|s| serde_json::from_str::<TokenizerConfig>(s))
+                    .transpose()?
+                    .unwrap_or_default()
+                    .build()?;
                 let tokens = TokenSet::load(token_reader).await?;
-                Result::Ok(tokens)
+                Result::Ok((tokenizer, tokens))
             }
         });
         let invert_list_fut = tokio::spawn({
@@ -260,11 +273,12 @@ impl ScalarIndex for InvertedIndex {
             }
         });
 
-        let tokens = tokens_fut.await??;
+        let (tokenizer, tokens) = tokens_fut.await??;
         let inverted_list = invert_list_fut.await??;
         let docs = docs_fut.await??;
 
         Ok(Arc::new(Self {
+            tokenizer,
             tokens,
             inverted_list,
             docs,
@@ -959,13 +973,16 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     query: &str,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
-    let query_tokens = collect_tokens(query).into_iter().collect::<HashSet<_>>();
+    let mut tokenizer = TokenizerConfig::default().build()?;
+    let query_tokens = collect_tokens(query, &mut tokenizer)
+        .into_iter()
+        .collect::<HashSet<_>>();
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_tokens(doc);
+            let doc_tokens = collect_tokens(doc, &mut tokenizer);
             if doc_tokens.iter().any(|token| query_tokens.contains(token)) {
                 results.push(row_id_array.value(i));
                 assert!(doc.contains(query));
@@ -976,8 +993,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     Ok(results)
 }
 
-pub fn collect_tokens(text: &str) -> Vec<String> {
-    let mut tokenizer = TOKENIZER.clone();
+pub fn collect_tokens(text: &str, tokenizer: &mut tantivy::tokenizer::TextAnalyzer) -> Vec<String> {
     let mut stream = tokenizer.token_stream(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
