@@ -2797,6 +2797,76 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn test_create_fts_index_with_empty_table() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let batches: Vec<RecordBatch> = vec![];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None)
+            .await
+            .expect("write dataset");
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let batch = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_fts_index_with_empty_strings() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["", "", ""]))],
+        )
+        .unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None)
+            .await
+            .expect("write dataset");
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let batch = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_bad_field_name(
