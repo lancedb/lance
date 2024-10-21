@@ -9,6 +9,8 @@ import pyarrow as pa
 from pyarrow import RecordBatch
 
 from . import dataset
+from .dependencies import _check_for_pandas
+from .dependencies import pandas as pd
 
 if TYPE_CHECKING:
     ReaderLike = Union[
@@ -19,9 +21,6 @@ if TYPE_CHECKING:
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]
-
-from .dependencies import _check_for_pandas
-from .dependencies import pandas as pd
 
 
 def _casting_recordbatch_iter(
