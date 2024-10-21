@@ -1318,6 +1318,13 @@ impl Scanner {
             query.columns.clone()
         };
 
+        if columns.is_empty() {
+            return Err(Error::invalid_input(
+                "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
+                location!(),
+            ));
+        }
+
         // Now the full text search supports only one column
         if columns.len() != 1 {
             return Err(Error::invalid_input(
