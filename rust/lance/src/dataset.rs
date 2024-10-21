@@ -852,6 +852,7 @@ impl Dataset {
         .boxed()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn do_commit(
         base_uri: &str,
         operation: Operation,

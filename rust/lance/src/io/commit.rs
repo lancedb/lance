@@ -460,11 +460,11 @@ pub(crate) async fn commit_detached_transaction(
 
         // recompute_stats is always false so far because detached manifests are newer than
         // the old stats bug.
-        migrate_manifest(&dataset, &mut manifest, /*recompute_stats=*/ false).await?;
+        migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
         // fix_schema and check_storage_version are just for sanity-checking and consistency
         fix_schema(&mut manifest)?;
         check_storage_version(&mut manifest)?;
-        migrate_indices(&dataset, &mut indices).await?;
+        migrate_indices(dataset, &mut indices).await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
