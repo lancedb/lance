@@ -362,6 +362,50 @@ impl Operation {
     }
 }
 
+pub fn transforms_from_python(transforms: &PyAny) -> PyResult<NewColumnTransform> {
+    if let Ok(transforms) = transforms.extract::<&PyDict>() {
+        let expressions = transforms
+            .iter()
+            .map(|(k, v)| {
+                let col = k.extract::<String>()?;
+                let expr = v.extract::<String>()?;
+                Ok((col, expr))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(NewColumnTransform::SqlExpressions(expressions))
+    } else {
+        let append_schema: PyArrowType<ArrowSchema> =
+            transforms.getattr("output_schema")?.extract()?;
+        let output_schema = Arc::new(append_schema.0);
+
+        let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
+        let result_checkpoint = result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
+
+        let udf_obj = transforms.to_object(transforms.py());
+        let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
+            Python::with_gil(|py| {
+                let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
+                let result = udf_obj
+                    .call_method1(py, "_call", (py_batch,))
+                    .map_err(|err| {
+                        lance::Error::io(format_python_error(err, py).unwrap(), location!())
+                    })?;
+                let result_batch: PyArrowType<RecordBatch> = result
+                    .extract(py)
+                    .map_err(|err| lance::Error::io(err.to_string(), location!()))?;
+                Ok(result_batch.0)
+            })
+        };
+
+        Ok(NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: result_checkpoint
+                .map(|c| Arc::new(c) as Arc<dyn UDFCheckpointStore>),
+        }))
+    }
+}
+
 /// Lance Dataset that will be wrapped by another class in Python
 #[pyclass(name = "_Dataset", module = "_lib")]
 #[derive(Clone)]
@@ -1381,7 +1425,11 @@ impl Dataset {
         Ok(())
     }
 
-    fn add_columns_from_reader(&mut self, reader: &Bound<PyAny>) -> PyResult<()> {
+    fn add_columns_from_reader(
+        &mut self,
+        reader: &Bound<PyAny>,
+        batch_size: Option<u32>,
+    ) -> PyResult<()> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
@@ -1389,7 +1437,7 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let new_self = RT
             .spawn(None, async move {
-                new_self.add_columns(transforms, None).await?;
+                new_self.add_columns(transforms, None, batch_size).await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -1402,55 +1450,16 @@ impl Dataset {
         &mut self,
         transforms: &PyAny,
         read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
     ) -> PyResult<()> {
-        println!("add_columns");
-        let transforms = if let Ok(transforms) = transforms.extract::<&PyDict>() {
-            let expressions = transforms
-                .iter()
-                .map(|(k, v)| {
-                    let col = k.extract::<String>()?;
-                    let expr = v.extract::<String>()?;
-                    Ok((col, expr))
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            NewColumnTransform::SqlExpressions(expressions)
-        } else {
-            let append_schema: PyArrowType<ArrowSchema> =
-                transforms.getattr("output_schema")?.extract()?;
-            let output_schema = Arc::new(append_schema.0);
-
-            let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
-            let result_checkpoint =
-                result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
-
-            let udf_obj = transforms.to_object(transforms.py());
-            let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
-                Python::with_gil(|py| {
-                    let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
-                    let result = udf_obj
-                        .call_method1(py, "_call", (py_batch,))
-                        .map_err(|err| {
-                            lance::Error::io(format_python_error(err, py).unwrap(), location!())
-                        })?;
-                    let result_batch: PyArrowType<RecordBatch> = result
-                        .extract(py)
-                        .map_err(|err| lance::Error::io(err.to_string(), location!()))?;
-                    Ok(result_batch.0)
-                })
-            };
-
-            NewColumnTransform::BatchUDF(BatchUDF {
-                mapper: Box::new(mapper),
-                output_schema,
-                result_checkpoint: result_checkpoint
-                    .map(|c| Arc::new(c) as Arc<dyn UDFCheckpointStore>),
-            })
-        };
+        let transforms = transforms_from_python(transforms)?;
 
         let mut new_self = self.ds.as_ref().clone();
         let new_self = RT
             .spawn(None, async move {
-                new_self.add_columns(transforms, read_columns).await?;
+                new_self
+                    .add_columns(transforms, read_columns, batch_size)
+                    .await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
