@@ -202,6 +202,16 @@ pub struct FlatFtsExec {
     properties: PlanProperties,
 }
 
+impl DisplayAs for FlatFtsExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "FlatFts: query={}", self.query.query)
+            }
+        }
+    }
+}
+
 impl FlatFtsExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, column: String, query: FullTextSearchQuery) -> Self {
         let properties = PlanProperties::new(
@@ -253,7 +263,8 @@ impl ExecutionPlan for FlatFtsExec {
         let input_stream = self.input.execute(partition, context)?;
 
         let stream = input_stream.map(move |batch| {
-            let batch = flat_full_text_search(&[batch], &column, &query.query)?;
+            let batch = batch?;
+            let batch = flat_full_text_search(&[&batch], &column, &query.query)?;
 
             let batch = RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
