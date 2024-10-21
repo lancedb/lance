@@ -1,5 +1,7 @@
 # Python bindings for Lance Data Format
 
+DO NOT MERGE THIS
+
 > :warning: **Under heavy development**
 
 <div align="center">
