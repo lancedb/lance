@@ -7,9 +7,7 @@ import copy
 import json
 import logging
 import os
-import pickle
 import random
-import sqlite3
 import time
 import warnings
 from abc import ABC, abstractmethod
@@ -24,7 +22,6 @@ from typing import (
     Iterator,
     List,
     Literal,
-    NamedTuple,
     Optional,
     Set,
     TypedDict,
@@ -39,7 +36,6 @@ from .blob import BlobFile
 from .dependencies import (
     _check_for_hugging_face,
     _check_for_numpy,
-    _check_for_pandas,
     torch,
 )
 from .dependencies import numpy as np
@@ -60,6 +56,10 @@ from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .optimize import Compaction
 from .schema import LanceSchema
+from .types import _coerce_reader
+from .udf import BatchUDF, normalize_transform
+from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
+from .udf import batch_udf as batch_udf
 from .util import td_to_micros
 
 if TYPE_CHECKING:
@@ -67,15 +67,7 @@ if TYPE_CHECKING:
 
     from .commit import CommitLock
     from .progress import FragmentWriteProgress
-
-    ReaderLike = Union[
-        pd.Timestamp,
-        pa.Table,
-        pa.dataset.Dataset,
-        pa.dataset.Scanner,
-        Iterable[RecordBatch],
-        pa.RecordBatchReader,
-    ]
+    from .types import ReaderLike
 
     QueryVectorLike = Union[
         pd.Series,
@@ -917,6 +909,7 @@ class LanceDataset(pa.dataset.Dataset):
         transforms: Dict[str, str] | BatchUDF | ReaderLike,
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
+        batch_size: Optional[int] = None,
     ):
         """
         Add new columns with defined values.
@@ -948,6 +941,9 @@ class LanceDataset(pa.dataset.Dataset):
         reader_schema: pa.Schema, optional
             Only valid if transforms is a `ReaderLike` object.  This will be used to
             determine the schema of the reader.
+        batch_size: int, optional
+            The number of rows to read at a time from the source dataset when applying
+            the transform.  This is ignored if the dataset is a v1 dataset.
 
         Examples
         --------
@@ -977,42 +973,16 @@ class LanceDataset(pa.dataset.Dataset):
         LanceDataset.merge :
             Merge a pre-computed set of columns into the dataset.
         """
-        if isinstance(transforms, BatchUDF):
-            if transforms.output_schema is None:
-                # Infer the schema based on the first batch
-                sample_batch = transforms(
-                    next(iter(self.to_batches(limit=1, columns=read_columns)))
-                )
-                if isinstance(sample_batch, pd.DataFrame):
-                    sample_batch = pa.RecordBatch.from_pandas(sample_batch)
-                transforms.output_schema = sample_batch.schema
-                del sample_batch
-        elif isinstance(transforms, dict):
-            for k, v in transforms.items():
-                if not isinstance(k, str):
-                    raise TypeError(f"Column names must be a string. Got {type(k)}")
-                if not isinstance(v, str):
-                    raise TypeError(
-                        f"Column expressions must be a string. Got {type(k)}"
-                    )
+        transforms = normalize_transform(transforms, self, read_columns, reader_schema)
+        if isinstance(transforms, pa.RecordBatchReader):
+            self._ds.add_columns_from_reader(transforms, batch_size)
+            return
         else:
-            try:
-                reader = _coerce_reader(transforms, reader_schema)
-                self._ds.add_columns_from_reader(reader)
-                return
+            self._ds.add_columns(transforms, read_columns, batch_size)
 
-            except TypeError as inner_err:
-                raise TypeError(
-                    "transforms must be a dict, AddColumnsUDF, or a ReaderLike value.  "
-                    f"Received {type(transforms)}.  Could not coerce to a "
-                    f"reader: {inner_err}"
-                )
-
-        self._ds.add_columns(transforms, read_columns)
-
-        if isinstance(transforms, BatchUDF):
-            if transforms.cache is not None:
-                transforms.cache.cleanup()
+            if isinstance(transforms, BatchUDF):
+                if transforms.cache is not None:
+                    transforms.cache.cleanup()
 
     def drop_columns(self, columns: List[str]):
         """Drop one or more columns from the dataset
@@ -1379,6 +1349,31 @@ class LanceDataset(pa.dataset.Dataset):
             query. This will significantly increase the index size.
             It won't impact the performance of non-phrase queries even if it is set to
             True.
+        base_tokenizer: str, default "simple"
+            This is for the ``INVERTED`` index. The base tokenizer to use. The value
+            can be:
+            * "simple": splits tokens on whitespace and punctuation.
+            * "whitespace": splits tokens on whitespace.
+            * "raw": no tokenization.
+        language: str, default "English"
+            This is for the ``INVERTED`` index. The language for stemming
+            and stop words. This is only used when `stem` or `remove_stop_words` is true
+        max_token_length: Optional[int], default 40
+            This is for the ``INVERTED`` index. The maximum token length.
+            Any token longer than this will be removed.
+        lower_case: bool, default True
+            This is for the ``INVERTED`` index. If True, the index will convert all
+            text to lowercase.
+        stem: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will stem the
+            tokens.
+        remove_stop_words: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will remove
+            stop words.
+        ascii_folding: bool, default False
+            This is for the ``INVERTED`` index. If True, the index will convert
+            non-ascii characters to ascii characters if possible.
+            This would remove accents like "é" -> "e".
 
         Examples
         --------
@@ -3240,46 +3235,6 @@ def write_dataset(
     return ds
 
 
-def _coerce_reader(
-    data_obj: ReaderLike, schema: Optional[pa.Schema] = None
-) -> pa.RecordBatchReader:
-    if _check_for_pandas(data_obj) and isinstance(data_obj, pd.DataFrame):
-        return pa.Table.from_pandas(data_obj, schema=schema).to_reader()
-    elif isinstance(data_obj, pa.Table):
-        return data_obj.to_reader()
-    elif isinstance(data_obj, pa.RecordBatch):
-        return pa.Table.from_batches([data_obj]).to_reader()
-    elif isinstance(data_obj, LanceDataset):
-        return data_obj.scanner().to_reader()
-    elif isinstance(data_obj, pa.dataset.Dataset):
-        return pa.dataset.Scanner.from_dataset(data_obj).to_reader()
-    elif isinstance(data_obj, pa.dataset.Scanner):
-        return data_obj.to_reader()
-    elif isinstance(data_obj, pa.RecordBatchReader):
-        return data_obj
-    elif (
-        type(data_obj).__module__.startswith("polars")
-        and data_obj.__class__.__name__ == "DataFrame"
-    ):
-        return data_obj.to_arrow().to_reader()
-    # for other iterables, assume they are of type Iterable[RecordBatch]
-    elif isinstance(data_obj, Iterable):
-        if schema is not None:
-            data = _casting_recordbatch_iter(data_obj, schema)
-            return pa.RecordBatchReader.from_batches(schema, data)
-        else:
-            raise ValueError(
-                "Must provide schema to write dataset from RecordBatch iterable"
-            )
-    else:
-        raise TypeError(
-            f"Unknown data type {type(data_obj)}. "
-            "Please check "
-            "https://lancedb.github.io/lance/read_and_write.html "
-            "to see supported types."
-        )
-
-
 def _coerce_query_vector(query: QueryVectorLike):
     if isinstance(query, pa.Scalar):
         if isinstance(query, pa.ExtensionScalar):
@@ -3341,175 +3296,3 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
-
-
-def _casting_recordbatch_iter(
-    input_iter: Iterable[pa.RecordBatch], schema: pa.Schema
-) -> Iterable[pa.RecordBatch]:
-    """
-    Wrapper around an iterator of record batches. If the batches don't match the
-    schema, try to cast them to the schema. If that fails, raise an error.
-
-    This is helpful for users who might have written the iterator with default
-    data types in PyArrow, but specified more specific types in the schema. For
-    example, PyArrow defaults to float64 for floating point types, but Lance
-    uses float32 for vectors.
-    """
-    for batch in input_iter:
-        if not isinstance(batch, pa.RecordBatch):
-            raise TypeError(f"Expected RecordBatch, got {type(batch)}")
-        if batch.schema != schema:
-            try:
-                # RecordBatch doesn't have a cast method, but table does.
-                batch = pa.Table.from_batches([batch]).cast(schema).to_batches()[0]
-            except pa.lib.ArrowInvalid:
-                raise ValueError(
-                    f"Input RecordBatch iterator yielded a batch with schema that "
-                    f"does not match the expected schema.\nExpected:\n{schema}\n"
-                    f"Got:\n{batch.schema}"
-                )
-        yield batch
-
-
-class BatchUDF:
-    """A user-defined function that can be passed to :meth:`LanceDataset.add_columns`.
-
-    Use :func:`lance.add_columns_udf` decorator to wrap a function with this class.
-    """
-
-    def __init__(self, func, output_schema=None, checkpoint_file=None):
-        self.func = func
-        self.output_schema = output_schema
-        if checkpoint_file is not None:
-            self.cache = BatchUDFCheckpoint(checkpoint_file)
-        else:
-            self.cache = None
-
-    def __call__(self, batch: pa.RecordBatch):
-        # Directly call inner function. This is to allow the user to test the
-        # function and have it behave exactly as it was written.
-        return self.func(batch)
-
-    def _call(self, batch: pa.RecordBatch):
-        if self.output_schema is None:
-            raise ValueError(
-                "output_schema must be provided when using a function that "
-                "returns a RecordBatch"
-            )
-        result = self.func(batch)
-
-        if _check_for_pandas(result):
-            if isinstance(result, pd.DataFrame):
-                result = pa.RecordBatch.from_pandas(result)
-        assert result.schema == self.output_schema, (
-            f"Output schema of function does not match the expected schema. "
-            f"Expected:\n{self.output_schema}\nGot:\n{result.schema}"
-        )
-        return result
-
-
-def batch_udf(output_schema=None, checkpoint_file=None):
-    """
-    Create a user defined function (UDF) that adds columns to a dataset.
-
-    This function is used to add columns to a dataset. It takes a function that
-    takes a single argument, a RecordBatch, and returns a RecordBatch. The
-    function is called once for each batch in the dataset. The function should
-    not modify the input batch, but instead create a new batch with the new
-    columns added.
-
-    Parameters
-    ----------
-    output_schema : Schema, optional
-        The schema of the output RecordBatch. This is used to validate the
-        output of the function. If not provided, the schema of the first output
-        RecordBatch will be used.
-    checkpoint_file : str or Path, optional
-        If specified, this file will be used as a cache for unsaved results of
-        this UDF. If the process fails, and you call add_columns again with this
-        same file, it will resume from the last saved state. This is useful for
-        long running processes that may fail and need to be resumed. This file
-        may get very large. It will hold up to an entire data files' worth of
-        results on disk, which can be multiple gigabytes of data.
-
-    Returns
-    -------
-    AddColumnsUDF
-    """
-
-    def inner(func):
-        return BatchUDF(func, output_schema, checkpoint_file)
-
-    return inner
-
-
-class BatchUDFCheckpoint:
-    """A cache for BatchUDF results to avoid recomputation.
-
-    This is backed by a SQLite database.
-    """
-
-    class BatchInfo(NamedTuple):
-        fragment_id: int
-        batch_index: int
-
-    def __init__(self, path):
-        self.path = path
-        # We don't re-use the connection because it's not thread safe
-        conn = sqlite3.connect(path)
-        # One table to store the results for each batch.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS batches
-            (fragment_id INT, batch_index INT, result BLOB)
-            """
-        )
-        # One table to store fully written (but not committed) fragments.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS fragments (fragment_id INT, data BLOB)"
-        )
-        conn.commit()
-
-    def cleanup(self):
-        os.remove(self.path)
-
-    def get_batch(self, info: BatchInfo) -> Optional[pa.RecordBatch]:
-        conn = sqlite3.connect(self.path)
-        cursor = conn.execute(
-            "SELECT result FROM batches WHERE fragment_id = ? AND batch_index = ?",
-            (info.fragment_id, info.batch_index),
-        )
-        row = cursor.fetchone()
-        if row is not None:
-            return pickle.loads(row[0])
-        return None
-
-    def insert_batch(self, info: BatchInfo, batch: pa.RecordBatch):
-        conn = sqlite3.connect(self.path)
-        conn.execute(
-            "INSERT INTO batches (fragment_id, batch_index, result) VALUES (?, ?, ?)",
-            (info.fragment_id, info.batch_index, pickle.dumps(batch)),
-        )
-        conn.commit()
-
-    def get_fragment(self, fragment_id: int) -> Optional[str]:
-        """Retrieves a fragment as a JSON string."""
-        conn = sqlite3.connect(self.path)
-        cursor = conn.execute(
-            "SELECT data FROM fragments WHERE fragment_id = ?", (fragment_id,)
-        )
-        row = cursor.fetchone()
-        if row is not None:
-            return row[0]
-        return None
-
-    def insert_fragment(self, fragment_id: int, fragment: str):
-        """Save a JSON string of a fragment to the cache."""
-        # Clear all batches for the fragment
-        conn = sqlite3.connect(self.path)
-        conn.execute(
-            "INSERT INTO fragments (fragment_id, data) VALUES (?, ?)",
-            (fragment_id, fragment),
-        )
-        conn.execute("DELETE FROM batches WHERE fragment_id = ?", (fragment_id,))
-        conn.commit()

@@ -46,7 +46,7 @@ use super::hash_joiner::HashJoiner;
 use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
 use super::updater::Updater;
-use super::WriteParams;
+use super::{schema_evolution, NewColumnTransform, WriteParams};
 use crate::arrow::*;
 use crate::dataset::Dataset;
 
@@ -1154,7 +1154,12 @@ impl FileFragment {
     /// and the full schema (the target schema after the update). If the write
     /// schema is None, it is inferred from the first batch of results. The full
     /// schema is inferred by appending the write schema to the existing schema.
-    pub async fn updater<T: AsRef<str>>(
+    ///
+    /// The `batch_size` parameter can be used to influence how much data is processed
+    /// at a time. This can be useful to control memory usage when processing very large
+    /// fields. The batch_size will only be used if the dataset is a v2 dataset.  It will
+    /// be ignored for v1 datasets.
+    pub(crate) async fn updater<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
         schemas: Option<(Schema, Schema)>,
@@ -1205,6 +1210,27 @@ impl FileFragment {
         self.metadata = updater.finish().await?;
 
         Ok(self)
+    }
+
+    /// Append new columns to the fragment
+    ///
+    /// This is the fragment-level version of [`Dataset::add_columns`].
+    pub async fn add_columns(
+        &self,
+        transforms: NewColumnTransform,
+        read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
+    ) -> Result<(Fragment, Schema)> {
+        let (fragments, schema) = schema_evolution::add_columns_to_fragments(
+            self.dataset.as_ref(),
+            transforms,
+            read_columns,
+            &[self.clone()],
+            batch_size,
+        )
+        .await?;
+        assert_eq!(fragments.len(), 1);
+        Ok((fragments.into_iter().next().unwrap(), schema))
     }
 
     /// Delete rows from the fragment.
