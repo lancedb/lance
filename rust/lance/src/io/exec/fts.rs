@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Float32Array, RecordBatch, UInt64Array};
@@ -15,6 +16,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::StreamExt;
+use itertools::Itertools;
 use lance_core::ROW_ID_FIELD;
 use lance_index::prefilter::{FilterLoader, PreFilter};
 use lance_index::scalar::inverted::{InvertedIndex, SCORE_FIELD};
@@ -40,7 +42,8 @@ lazy_static::lazy_static! {
 #[derive(Debug)]
 pub struct FtsExec {
     dataset: Arc<Dataset>,
-    indices: Vec<Index>,
+    // column -> indices
+    indices: HashMap<String, Vec<Index>>,
     query: FullTextSearchQuery,
     /// Prefiltering input
     prefilter_source: PreFilterSource,
@@ -60,7 +63,7 @@ impl DisplayAs for FtsExec {
 impl FtsExec {
     pub fn new(
         dataset: Arc<Dataset>,
-        indices: Vec<Index>,
+        indices: HashMap<String, Vec<Index>>,
         query: FullTextSearchQuery,
         prefilter_source: PreFilterSource,
     ) -> Self {
@@ -117,7 +120,8 @@ impl ExecutionPlan for FtsExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
 
-        let stream = stream::iter(self.indices.clone())
+        let indices = self.indices.values().flatten().cloned().collect_vec();
+        let stream = stream::iter(indices)
             .map(move |index_meta| {
                 let uuid = index_meta.uuid.to_string();
                 let query = query.clone();
