@@ -16,7 +16,26 @@ use crate::{
     format::ProtobufUtils,
 };
 
-pub const COMPRESSION_META_KEY: &str = "lance:compression";
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompressionConfig {
+    pub(crate) scheme: CompressionScheme,
+    pub(crate) level: Option<i32>,
+}
+
+impl CompressionConfig {
+    pub(crate) fn new(scheme: CompressionScheme, level: Option<i32>) -> CompressionConfig {
+        CompressionConfig { scheme, level }
+    }
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            scheme: CompressionScheme::Zstd,
+            level: Some(0),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompressionScheme {
@@ -55,11 +74,19 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug, Default)]
-pub struct ZstdBufferCompressor {}
+pub struct ZstdBufferCompressor {
+    compression_level: i32,
+}
+
+impl ZstdBufferCompressor {
+    pub fn new(compression_level: i32) -> Self {
+        Self { compression_level }
+    }
+}
 
 impl BufferCompressor for ZstdBufferCompressor {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
-        let mut encoder = zstd::Encoder::new(output_buf, 0)?;
+        let mut encoder = zstd::Encoder::new(output_buf, self.compression_level)?;
         encoder.write_all(input_buf)?;
         match encoder.finish() {
             Ok(_) => Ok(()),
@@ -74,14 +101,30 @@ impl BufferCompressor for ZstdBufferCompressor {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct NoopBufferCompressor {}
+
+impl BufferCompressor for NoopBufferCompressor {
+    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        output_buf.extend_from_slice(input_buf);
+        Ok(())
+    }
+
+    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        output_buf.extend_from_slice(input_buf);
+        Ok(())
+    }
+}
+
 pub struct GeneralBufferCompressor {}
 
 impl GeneralBufferCompressor {
-    pub fn get_compressor(compression_type: &str) -> Box<dyn BufferCompressor> {
-        match compression_type {
-            "" => Box::<ZstdBufferCompressor>::default(),
-            "zstd" => Box::<ZstdBufferCompressor>::default(),
-            _ => panic!("Unsupported compression type: {}", compression_type),
+    pub fn get_compressor(compression_config: CompressionConfig) -> Box<dyn BufferCompressor> {
+        match compression_config.scheme {
+            CompressionScheme::Zstd => Box::new(ZstdBufferCompressor::new(
+                compression_config.level.unwrap_or(0),
+            )),
+            CompressionScheme::None => Box::new(NoopBufferCompressor {}),
         }
     }
 }
@@ -95,14 +138,17 @@ pub struct CompressedBufferEncoder {
 impl Default for CompressedBufferEncoder {
     fn default() -> Self {
         Self {
-            compressor: GeneralBufferCompressor::get_compressor("zstd"),
+            compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
+                scheme: CompressionScheme::Zstd,
+                level: Some(0),
+            }),
         }
     }
 }
 
 impl CompressedBufferEncoder {
-    pub fn new(compression_type: &str) -> Self {
-        let compressor = GeneralBufferCompressor::get_compressor(compression_type);
+    pub fn new(compression_config: CompressionConfig) -> Self {
+        let compressor = GeneralBufferCompressor::get_compressor(compression_config);
         Self { compressor }
     }
 }
@@ -133,12 +179,59 @@ impl ArrayEncoder for CompressedBufferEncoder {
         let encoding = ProtobufUtils::flat_encoding(
             uncompressed_data.bits_per_value,
             comp_buf_index,
-            Some(CompressionScheme::Zstd),
+            Some(CompressionConfig::new(CompressionScheme::Zstd, None)),
         );
 
         Ok(EncodedArray {
             data: compressed_data,
             encoding,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::LanceBuffer;
+    use crate::data::FixedWidthDataBlock;
+    use arrow_schema::DataType;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_compression_scheme_from_str() {
+        assert_eq!(
+            CompressionScheme::from_str("none").unwrap(),
+            CompressionScheme::None
+        );
+        assert_eq!(
+            CompressionScheme::from_str("zstd").unwrap(),
+            CompressionScheme::Zstd
+        );
+    }
+
+    #[test]
+    fn test_compression_scheme_from_str_invalid() {
+        assert!(CompressionScheme::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_compressed_buffer_encoder() {
+        let encoder = CompressedBufferEncoder::default();
+        let data = DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: 64,
+            data: LanceBuffer::reinterpret_vec(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            num_values: 8,
+            block_info: BlockInfo::new(),
+            used_encoding: UsedEncoding::new(),
+        });
+
+        let mut buffer_index = 0;
+        let encoded_array_result = encoder.encode(data, &DataType::Int64, &mut buffer_index);
+        assert!(encoded_array_result.is_ok(), "{:?}", encoded_array_result);
+        let encoded_array = encoded_array_result.unwrap();
+        assert_eq!(encoded_array.data.num_values(), 8);
+        let buffers = encoded_array.data.into_buffers();
+        assert_eq!(buffers.len(), 1);
+        assert!(buffers[0].len() < 64 * 8);
     }
 }
