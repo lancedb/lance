@@ -2,20 +2,20 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
-use block_compress::CompressionScheme;
+use block_compress::CompressionConfig;
 use fsst::FsstPageScheduler;
 use lance_arrow::DataTypeExt;
 use packed_struct::PackedStructPageScheduler;
-
-use crate::{
-    decoder::PageScheduler,
-    format::pb::{self, PackedStruct},
-};
 
 use self::{
     basic::BasicPageScheduler, binary::BinaryPageScheduler, bitmap::DenseBitmapScheduler,
     dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
     value::ValuePageScheduler,
+};
+use crate::encodings::physical::block_compress::CompressionScheme;
+use crate::{
+    decoder::PageScheduler,
+    format::pb::{self, PackedStruct},
 };
 
 pub mod basic;
@@ -68,17 +68,14 @@ fn get_buffer(buffer_desc: &pb::Buffer, buffers: &PageBuffers) -> (u64, u64) {
 /// Convert a protobuf buffer encoding into a physical page scheduler
 fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn PageScheduler> {
     let (buffer_offset, buffer_size) = get_buffer(encoding.buffer.as_ref().unwrap(), buffers);
-    let compression_scheme: CompressionScheme = if encoding.compression.is_none() {
-        CompressionScheme::None
+    let compression_config: CompressionConfig = if encoding.compression.is_none() {
+        CompressionConfig::new(CompressionScheme::None, None)
     } else {
-        encoding
-            .compression
-            .as_ref()
-            .unwrap()
-            .scheme
-            .as_str()
-            .parse()
-            .unwrap()
+        let compression = encoding.compression.as_ref().unwrap();
+        CompressionConfig::new(
+            compression.scheme.as_str().parse().unwrap(),
+            compression.level,
+        )
     };
     match encoding.bits_per_value {
         1 => Box::new(DenseBitmapScheduler::new(buffer_offset)),
@@ -93,7 +90,7 @@ fn get_buffer_decoder(encoding: &pb::Flat, buffers: &PageBuffers) -> Box<dyn Pag
                 bits_per_value / 8,
                 buffer_offset,
                 buffer_size,
-                compression_scheme,
+                compression_config,
             ))
         }
     }
@@ -286,5 +283,38 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::Struct(_) => unreachable!(),
         // 2.1 only
         pb::array_encoding::ArrayEncoding::Constant(_) => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::encodings::physical::{get_buffer_decoder, ColumnBuffers, FileBuffers, PageBuffers};
+    use crate::format::pb;
+
+    #[test]
+    fn test_get_buffer_decoder_for_compressed_buffer() {
+        let page_scheduler = get_buffer_decoder(
+            &pb::Flat {
+                buffer: Some(pb::Buffer {
+                    buffer_index: 0,
+                    buffer_type: pb::buffer::BufferType::File as i32,
+                }),
+                bits_per_value: 8,
+                compression: Some(pb::Compression {
+                    scheme: "zstd".to_string(),
+                    level: Some(0),
+                }),
+            },
+            &PageBuffers {
+                column_buffers: ColumnBuffers {
+                    file_buffers: FileBuffers {
+                        positions_and_sizes: &[(0, 100)],
+                    },
+                    positions_and_sizes: &[],
+                },
+                positions_and_sizes: &[],
+            },
+        );
+        assert_eq!(format!("{:?}", page_scheduler).as_str(), "ValuePageScheduler { bytes_per_value: 1, buffer_offset: 0, buffer_size: 100, compression_config: CompressionConfig { scheme: Zstd, level: Some(0) } }");
     }
 }
