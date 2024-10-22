@@ -89,21 +89,26 @@ impl GeneralBufferCompressor {
 // An encoder which uses generic compression, such as zstd/lz4 to encode buffers
 #[derive(Debug)]
 pub struct CompressedBufferEncoder {
+    compression_scheme: CompressionScheme,
     compressor: Box<dyn BufferCompressor>,
 }
 
 impl Default for CompressedBufferEncoder {
     fn default() -> Self {
         Self {
+            compression_scheme: CompressionScheme::Zstd,
             compressor: GeneralBufferCompressor::get_compressor("zstd"),
         }
     }
 }
 
 impl CompressedBufferEncoder {
-    pub fn new(compression_type: &str) -> Self {
-        let compressor = GeneralBufferCompressor::get_compressor(compression_type);
-        Self { compressor }
+    pub fn new(compression_scheme: CompressionScheme) -> Self {
+        let compressor = GeneralBufferCompressor::get_compressor(&compression_scheme.to_string());
+        Self {
+            compression_scheme,
+            compressor,
+        }
     }
 }
 
@@ -133,7 +138,7 @@ impl ArrayEncoder for CompressedBufferEncoder {
         let encoding = ProtobufUtils::flat_encoding(
             uncompressed_data.bits_per_value,
             comp_buf_index,
-            Some(CompressionScheme::Zstd),
+            Some(self.compression_scheme),
         );
 
         Ok(EncodedArray {
