@@ -1318,41 +1318,41 @@ impl Scanner {
             query.columns.clone()
         };
 
-        // Now the full text search supports only one column
-        if columns.len() != 1 {
+        if columns.is_empty() {
             return Err(Error::invalid_input(
-                format!(
-                    "Full text search supports only one column right now, but got {} columns",
-                    columns.len()
-                ),
+                "Cannot perform full text search unless an INVERTED index has been created on at least one column".to_string(),
                 location!(),
             ));
         }
-        let column = &columns[0];
-        let index = self
-            .dataset
-            .load_scalar_index_for_column(column)
-            .await?
-            .ok_or(Error::invalid_input(
-                format!("Column {} has no inverted index", column),
-                location!(),
-            ))?;
-        let index_uuids = self
-            .dataset
-            .load_indices_by_name(&index.name)
-            .await?
-            .into_iter()
-            .collect();
+
+        // load indices
+        let mut indices = HashMap::with_capacity(columns.len());
+        for column in &columns {
+            let index = self
+                .dataset
+                .load_scalar_index_for_column(column)
+                .await?
+                .ok_or(Error::invalid_input(
+                    format!("Column {} has no inverted index", column),
+                    location!(),
+                ))?;
+            let index_uuids = self
+                .dataset
+                .load_indices_by_name(&index.name)
+                .await?
+                .into_iter()
+                .collect();
+            indices.insert(column.clone(), index_uuids);
+        }
 
         let query = query
             .clone()
             .columns(Some(columns.clone()))
             .limit(self.limit);
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-
-        let mut fts_plan = Arc::new(FtsExec::new(
+        let fts_plan = Arc::new(FtsExec::new(
             self.dataset.clone(),
-            index_uuids,
+            indices,
             query.clone(),
             prefilter_source,
         )) as Arc<dyn ExecutionPlan>;

@@ -1393,8 +1393,9 @@ impl Dataset {
         &mut self,
         transforms: NewColumnTransform,
         read_columns: Option<Vec<String>>,
+        batch_size: Option<u32>,
     ) -> Result<()> {
-        schema_evolution::add_columns(self, transforms, read_columns).await
+        schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.
@@ -1691,7 +1692,10 @@ mod tests {
         ArrayRef, DictionaryArray, Float32Array, Int32Array, Int64Array, Int8Array,
         Int8DictionaryArray, RecordBatchIterator, StringArray, UInt16Array, UInt32Array,
     };
-    use arrow_array::{FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
+    use arrow_array::{
+        Array, FixedSizeListArray, GenericStringArray, Int16Array, Int16DictionaryArray,
+        StructArray,
+    };
     use arrow_ord::sort::sort_to_indices;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
@@ -1699,6 +1703,7 @@ mod tests {
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
+    use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
     use lance_index::{scalar::ScalarIndexParams, vector::DIST_COL, DatasetIndexExt, IndexType};
     use lance_linalg::distance::MetricType;
     use lance_table::feature_flags;
@@ -2791,6 +2796,76 @@ mod tests {
             }),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn test_create_fts_index_with_empty_table() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let batches: Vec<RecordBatch> = vec![];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None)
+            .await
+            .expect("write dataset");
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let batch = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_create_fts_index_with_empty_strings() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "text",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let batches: Vec<RecordBatch> = vec![RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["", "", ""]))],
+        )
+        .unwrap()];
+        let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(reader, test_uri, None)
+            .await
+            .expect("write dataset");
+
+        let params = InvertedIndexParams::default();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let batch = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("lance".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 0);
     }
 
     #[rstest]
@@ -4251,6 +4326,72 @@ mod tests {
             ds2.latest_version_id().await.unwrap(),
             dataset.latest_version_id().await.unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn test_fts_on_multiple_columns() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let params = InvertedIndexParams::default();
+        let title_col =
+            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
+        let content_col = GenericStringArray::<i32>::from(vec![
+            "content world",
+            "content database",
+            "content common",
+        ]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
+                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, tempdir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["title"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["content"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("content".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("common".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 2);
     }
 
     #[tokio::test]
