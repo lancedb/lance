@@ -265,6 +265,7 @@ pub fn get_index_params(
         Some(VectorIndexParams {
             metric_type: distance_type,
             stages,
+            force_use_new_index_format: None,
         })
     } else {
         None

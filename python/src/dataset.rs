@@ -1650,6 +1650,7 @@ fn prepare_vector_index_params(
     let mut hnsw_params = HnswBuildParams::default();
     let mut pq_params = PQBuildParams::default();
     let mut sq_params = SQBuildParams::default();
+    let mut use_new_vector_index_format = false;
 
     if let Some(kwargs) = kwargs {
         // Parse metric type
@@ -1708,6 +1709,10 @@ fn prepare_vector_index_params(
         if let Some(storage_options) = storage_options {
             ivf_params.storage_options = Some(storage_options);
         }
+
+        if let Some(use_new_format) = kwargs.get_item("use_new_vector_index_format")? {
+            use_new_vector_index_format = use_new_format.extract::<bool>()?;
+        };
 
         match (
                 kwargs.get_item("precomputed_shuffle_buffers")?,
@@ -1769,9 +1774,17 @@ fn prepare_vector_index_params(
     }
 
     match index_type {
-        "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
-            m_type, ivf_params, pq_params,
-        ))),
+        "IVF_PQ" => {
+            if use_new_vector_index_format {
+                Ok(Box::new(VectorIndexParams::with_ivf_pq_params_v3(
+                    m_type, ivf_params, pq_params,
+                )))
+            } else {
+                Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
+                    m_type, ivf_params, pq_params,
+                )))
+            }
+        }
 
         "IVF_HNSW_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_hnsw_pq_params(
             m_type,
