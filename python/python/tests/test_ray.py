@@ -17,7 +17,7 @@ from lance.ray.sink import (  # noqa: E402
     _register_hooks,
 )
 
-# Use this hook until we have offical DataSink in Ray.
+# Use this hook until we have official DataSink in Ray.
 _register_hooks()
 
 ray.init()

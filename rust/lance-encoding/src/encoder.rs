@@ -286,7 +286,7 @@ impl Default for EncodedColumn {
 /// As a result, most encoders should not need to use this structure.
 ///
 /// In some cases (currently only the large binary encoding) there is a need to access
-/// buffers that are not in the page (becuase storing the position / offset of every page
+/// buffers that are not in the page (because storing the position / offset of every page
 /// in the page metadata would be too expensive).
 ///
 /// To do this you can add a buffer with `add_buffer` and then use the returned position

@@ -261,7 +261,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         Ok(())
     }
 
-    // shuffle the unindexed data and exsiting indices
+    // shuffle the unindexed data and existing indices
     // data must be with schema | ROW_ID | vector_column |
     // the shuffled data will be with schema | ROW_ID | PART_ID | code_column |
     pub async fn shuffle_data(

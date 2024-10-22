@@ -1,0 +1,10 @@
+[default.extend-words]
+DNE = "DNE"
+arange = "arange"
+nd = "nd"
+terrestial = "terrestial"
+abd = "abd"
+afe = "afe"
+
+[files]
+extend-exclude = ["notebooks/*.ipynb"]

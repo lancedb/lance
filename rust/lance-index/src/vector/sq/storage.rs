@@ -70,7 +70,7 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
     }
 }
 
-/// An immutable chunk of SclarQuantizationStorage.
+/// An immutable chunk of ScalarQuantizationStorage.
 #[derive(Debug, Clone)]
 struct SQStorageChunk {
     batch: RecordBatch,
@@ -354,7 +354,7 @@ impl VectorStore for ScalarQuantizationStorage {
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
-    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
         SQDistCalculator::new(query, self, self.quantizer.bounds.clone())

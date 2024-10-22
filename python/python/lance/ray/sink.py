@@ -351,7 +351,7 @@ class LanceFragmentWriter:
 
 
 class LanceCommitter(_BaseLanceDatasink):
-    """Lance Commiter as Ray Datasink.
+    """Lance Committer as Ray Datasink.
 
     This is used with `LanceFragmentWriter` to write large-than-memory data to
     lance file.
@@ -362,7 +362,7 @@ class LanceCommitter(_BaseLanceDatasink):
         return 1
 
     def get_name(self) -> str:
-        return f"LanceCommiter({self.mode})"
+        return f"LanceCommitter({self.mode})"
 
     def write(
         self,

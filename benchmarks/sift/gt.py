@@ -34,7 +34,7 @@ def generate_gt(args):
     col = args.col or infer_vector_column(ds)
     if col is None:
         raise ValueError(
-            "Can not infer vector column, please specifiy the column explicitly"
+            "Can not infer vector column, please specify the column explicitly"
         )
 
     samples = ds.sample(args.samples, columns=[col])[col]

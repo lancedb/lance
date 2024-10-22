@@ -302,8 +302,8 @@ fn attach_native_dataset<'local>(
 }
 
 fn create_java_dataset_object<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-    let objet = env.new_object("com/lancedb/lance/Dataset", "()V", &[])?;
-    Ok(objet)
+    let object = env.new_object("com/lancedb/lance/Dataset", "()V", &[])?;
+    Ok(object)
 }
 
 #[no_mangle]

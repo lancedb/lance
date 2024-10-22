@@ -723,7 +723,7 @@ impl IvfShuffler {
                             continue;
                         }
 
-                        // the currnet part doesn't overlap with the current batch
+                        // the current part doesn't overlap with the current batch
                         if start >= cur_end {
                             continue;
                         }

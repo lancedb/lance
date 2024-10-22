@@ -283,8 +283,8 @@ mod tests {
         assert_eq!(argmin(u.values().iter().copied()), Some(2));
 
         let empty_vec: Vec<i16> = vec![];
-        let emtpy = Int16Array::from(empty_vec);
-        assert_eq!(argmin_opt(emtpy.iter()), None)
+        let empty = Int16Array::from(empty_vec);
+        assert_eq!(argmin_opt(empty.iter()), None)
     }
 
     #[test]
