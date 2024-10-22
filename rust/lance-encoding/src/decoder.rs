@@ -73,7 +73,7 @@
 //!        - values: Value (physical encoding)
 //!  - items: Primitive (logical encoding)
 //!    - column: Basic (physical encoding)
-//!      - values: Value (phsyical encoding)
+//!      - values: Value (physical encoding)
 //!
 //! Note that, in this example, root.items.column does not have a validity because there were
 //! no nulls in the page.
@@ -433,7 +433,7 @@ impl<'a> DecoderMiddlewareChainCursor<'a> {
         &self.io
     }
 
-    /// Delegates responsibilty to the next encoder in the chain
+    /// Delegates responsibility to the next encoder in the chain
     ///
     /// Field schedulers should call this method when:
     ///
@@ -616,7 +616,7 @@ impl<'a> ColumnInfoIter<'a> {
 pub trait FieldDecoderStrategy: Send + Sync + std::fmt::Debug {
     /// Called to create a field scheduler for a field
     ///
-    /// Stratgies can examine:
+    /// Strategies can examine:
     /// * The target field
     /// * The column metadata (potentially consuming multiple columns)
     ///
@@ -1286,7 +1286,7 @@ pub struct BatchDecodeStream {
     rows_per_batch: u32,
     rows_scheduled: u64,
     rows_drained: u64,
-    scheduler_exhuasted: bool,
+    scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
 }
 
@@ -1297,7 +1297,7 @@ impl BatchDecodeStream {
     ///
     /// * `scheduled` - an incoming stream of decode tasks from a
     ///   [`crate::decode::DecodeBatchScheduler`]
-    /// * `schema` - the scheam of the data to create
+    /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
     /// * `num_columns` the total number of columns in the file
@@ -1314,7 +1314,7 @@ impl BatchDecodeStream {
             rows_per_batch,
             rows_scheduled: 0,
             rows_drained: 0,
-            scheduler_exhuasted: false,
+            scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
         }
     }
@@ -1329,7 +1329,7 @@ impl BatchDecodeStream {
     }
 
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
-        if self.scheduler_exhuasted {
+        if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
         }
         while self.rows_scheduled < scheduled_need {
@@ -1346,7 +1346,7 @@ impl BatchDecodeStream {
                     // Schedule ended before we got all the data we expected.  This probably
                     // means some kind of pushdown filter was applied and we didn't load as
                     // much data as we thought we would.
-                    self.scheduler_exhuasted = true;
+                    self.scheduler_exhausted = true;
                     return Ok(self.rows_scheduled);
                 }
             }
@@ -1889,8 +1889,8 @@ impl FilterExpression {
 /// cover many columns of child data.  In fact, the entire file is treated as one
 /// top-level struct field.
 ///
-/// The scheduler is responsible for calculating the neccesary I/O.  One schedule_range
-/// request could trigger mulitple batches of I/O across multiple columns.  The scheduler
+/// The scheduler is responsible for calculating the necessary I/O.  One schedule_range
+/// request could trigger multiple batches of I/O across multiple columns.  The scheduler
 /// should emit decoders into the sink as quickly as possible.
 ///
 /// As soon as the scheduler encounters a batch of data that can decoded then the scheduler

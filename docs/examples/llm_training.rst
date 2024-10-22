@@ -9,7 +9,7 @@ In this example, we will be training an LLM using 🤗 transformers on the token
 
 Imports and Setup
 ~~~~~~~~~~~~~~~~~
-Let's setup our enviornment by doing all the necessary imports and defining a few basic things.
+Let's setup our environment by doing all the necessary imports and defining a few basic things.
 
 .. code-block:: python
 

@@ -898,7 +898,7 @@ impl FileReader {
     ///   2^31 bytes of string data (which is the maximum size of a string column
     ///   in Arrow).  In this case smaller batches may be emitted.
     /// * `batch_readahead` - The number of batches to read ahead.  This controls the
-    ///   amount of CPU parallelism of the read.  In other words it controlls how many
+    ///   amount of CPU parallelism of the read.  In other words it controls how many
     ///   batches will be decoded in parallel.  It has no effect on the I/O parallelism
     ///   of the read (how many I/O requests are in flight at once).
     ///

@@ -130,7 +130,7 @@ def test_compact_with_write(tmp_path: Path):
     # This test creates a dataset with a manifest containing fragments
     # that are not in sorted order (by id)
     #
-    # We do this by runnign compaction concurrently with append
+    # We do this by running compaction concurrently with append
     #
     # This is because compaction first reserves a fragment id.  Then the
     # concurrent writes grab later ids and commit them.  Then the compaction

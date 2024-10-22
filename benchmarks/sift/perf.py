@@ -77,9 +77,9 @@ class Benchmark:
         series = []
         for k, v in self._configs.items():
             timer = self._timers[k]
-            config_ser = pd.Series(v)
-            time_ser = timer.summary()
-            series.append(pd.concat([config_ser, time_ser]))
+            config_series = pd.Series(v)
+            time_series = timer.summary()
+            series.append(pd.concat([config_series, time_series]))
         return pd.DataFrame(series)
 
 

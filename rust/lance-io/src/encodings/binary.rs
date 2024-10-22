@@ -556,7 +556,7 @@ mod tests {
         let path = temp_dir.path().join("foo");
         let mut object_writer = tokio::fs::File::create(&path).await.unwrap();
 
-        // Write some gabage to reset "tell()".
+        // Write some garbage to reset "tell()".
         object_writer.write_all(b"1234").await.unwrap();
         let mut encoder = BinaryEncoder::new(&mut object_writer);
         let pos = encoder.encode(&[&data]).await.unwrap();

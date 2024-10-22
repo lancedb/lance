@@ -98,7 +98,7 @@ impl BasicPageScheduler {
     ///
     /// It may seem strange we need `values_decoder` here but Arrow requires that value
     /// buffers still be allocated / sized even if everything is null.  So we need the value
-    /// decoder to calculate the capcity of the garbage buffer.
+    /// decoder to calculate the capacity of the garbage buffer.
     pub fn new_all_null() -> Self {
         Self {
             mode: SchedulerNullStatus::All,

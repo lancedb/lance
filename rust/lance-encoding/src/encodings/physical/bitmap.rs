@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// A physical scheduler for bitmap buffers encoded densely as 1 bit per value
-/// with bit-endianess (e.g. what Arrow uses for validity bitmaps and boolean arrays)
+/// with bit-endianness(e.g. what Arrow uses for validity bitmaps and boolean arrays)
 ///
 /// This decoder decodes from one buffer of disk data into one buffer of memory data
 #[derive(Debug, Clone, Copy)]

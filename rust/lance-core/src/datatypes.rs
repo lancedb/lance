@@ -262,7 +262,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "dict" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupport dictionary type: {}", lt),
+                            message: format!("Unsupported dictionary type: {}", lt),
                             location: location!(),
                         })
                     } else {
@@ -274,7 +274,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "decimal" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupport decimal type: {}", lt),
+                            message: format!("Unsupported decimal type: {}", lt),
                             location: location!(),
                         })
                     } else {

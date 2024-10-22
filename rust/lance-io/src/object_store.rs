@@ -146,7 +146,7 @@ const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 pub struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
 
-    // RefCell can't be shared accross threads, so we use HashMap
+    // RefCell can't be shared across threads, so we use HashMap
     cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
 
     // The amount of time before expiry to refresh credentials
