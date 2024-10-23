@@ -14,13 +14,15 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.8'  # Specify the Python version
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
           pip install boto3
+          pip install pyarrow
+          pip install maturin
 
       - name: Download file from S3
         env:
@@ -31,3 +33,10 @@ jobs:
 
       - name: List files
         run: ls -la
+
+      - name: test lance write read round trip
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.LANCEDB_S3_READER_SECRET }}
+        run: |
+          python test_write_read.py
