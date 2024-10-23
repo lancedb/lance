@@ -20,6 +20,7 @@ jobs:
           pip install boto3
           pip install pyarrow
           pip install maturin
+          maturin develop --release
 
       - name: Download file from S3
         working-directory: ./.github/workflows/file_read_write_round_trip_verification
