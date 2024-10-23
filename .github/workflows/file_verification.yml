@@ -15,6 +15,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Build Requirements
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+
       - name: Test Lance File
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
