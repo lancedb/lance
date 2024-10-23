@@ -1089,7 +1089,7 @@ pub fn flat_bm25_search_stream(
         .into_iter()
         .dedup()
         .map(|token| {
-            let token_id = index.tokens.get(&token).clone();
+            let token_id = index.tokens.get(&token);
             (token, token_id)
         })
         .collect::<HashMap<_, _>>();
