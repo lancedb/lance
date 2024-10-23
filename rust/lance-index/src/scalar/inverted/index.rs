@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -11,31 +11,34 @@ use arrow::array::{
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use super::builder::inverted_list_schema;
+use super::builder::{inverted_list_schema, OrderedDoc};
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex,
 };
+use crate::vector::graph::OrderedFloat;
 use crate::Index;
 
 pub const TOKENS_FILE: &str = "tokens.lance";
@@ -50,6 +53,8 @@ pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 lazy_static! {
     pub static ref SCORE_FIELD: Field = Field::new(SCORE_COL, DataType::Float32, true);
+    pub static ref FTS_SCHEMA: SchemaRef =
+        Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()]));
 }
 
 // BM25 parameters
@@ -61,6 +66,13 @@ lazy_static! {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchParams {
+    pub unindexed_rows: usize,
+    pub unindexed_length: u64, // the number of tokens in the unindexed rows
+    pub unindexed_token_occurrences: HashMap<u32, u32>, // token id -> number of occurrences in the unindexed rows
 }
 
 #[derive(Clone)]
@@ -952,9 +964,10 @@ pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
+    index: Option<&InvertedIndex>,
 ) -> Result<Vec<u64>> {
     if batches.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![]);
     }
 
     if is_phrase_query(query) {
@@ -965,8 +978,8 @@ pub fn flat_full_text_search(
     }
 
     match batches[0][doc_col].data_type() {
-        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query),
-        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query),
+        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, index),
+        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, index),
         data_type => Err(Error::invalid_input(
             format!("unsupported data type {} for inverted index", data_type),
             location!(),
@@ -978,12 +991,17 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
+    index: Option<&InvertedIndex>,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
-    let mut tokenizer = TokenizerConfig::default().build()?;
+    let mut tokenizer = match index.as_ref().map(|index| index.tokenizer.clone()) {
+        Some(tokenizer) => tokenizer,
+        None => TokenizerConfig::default().build()?,
+    };
     let query_tokens = collect_tokens(query, &mut tokenizer)
         .into_iter()
         .collect::<HashSet<_>>();
+
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
@@ -998,6 +1016,134 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     }
 
     Ok(results)
+}
+
+pub fn flat_bm25_search<Offset: OffsetSizeTrait>(
+    batches: &[&RecordBatch],
+    doc_col: &str,
+    query: FullTextSearchQuery,
+    index: &InvertedIndex,
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    let mut tokenizer = index.tokenizer.clone();
+    let query_tokens = collect_tokens(&query.query, &mut tokenizer)
+        .into_iter()
+        .dedup()
+        .sorted_unstable()
+        .collect::<Vec<_>>();
+    let limit = query.limit.unwrap_or(1024) as usize;
+    let mut results = BinaryHeap::with_capacity(limit);
+
+    for batch in batches {
+        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let doc_array = batch[doc_col].as_string::<Offset>();
+        for i in 0..row_id_array.len() {
+            let doc = doc_array.value(i);
+            let doc_tokens = collect_tokens(doc, &mut tokenizer);
+            let doc_norm =
+                K1 * (1.0 - B + B * doc_tokens.len() as f32 / index.docs.average_length());
+            let mut doc_token_count = HashMap::new();
+            for token in doc_tokens {
+                doc_token_count
+                    .entry(token)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+            let mut score = 0.0;
+            for token in &query_tokens {
+                if let Some(token_id) = index.tokens.get(token) {
+                    let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
+                    let idf = idf(index.inverted_list.posting_len(token_id), index.docs.len());
+                    score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+                }
+            }
+
+            if results.len() < limit {
+                results.push(OrderedDoc::new(row_id_array.value(i), score));
+            } else if let Some(mut min) = results.peek_mut() {
+                let score = OrderedFloat(score);
+                if score > min.score {
+                    min.score = score;
+                    min.row_id = row_id_array.value(i);
+                }
+            }
+        }
+    }
+
+    let mut results = results.into_sorted_vec();
+    results.reverse();
+    let (row_ids, scores): (Vec<_>, Vec<_>) = results
+        .into_iter()
+        .map(|doc| (doc.row_id, doc.score.0))
+        .unzip();
+    Ok((row_ids, scores))
+}
+
+pub fn flat_bm25_search_stream(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: FullTextSearchQuery,
+    index: &InvertedIndex,
+) -> SendableRecordBatchStream {
+    let mut tokenizer = index.tokenizer.clone();
+    let query_tokens = collect_tokens(&query.query, &mut tokenizer)
+        .into_iter()
+        .dedup()
+        .map(|token| {
+            let token_id = index.tokens.get(&token).clone();
+            (token, token_id)
+        })
+        .collect::<HashMap<_, _>>();
+    let inverted_list = index.inverted_list.clone();
+    let num_docs = index.docs.len();
+    let avgdl = index.docs.average_length();
+
+    let stream = input.map(move |batch| {
+        let batch = batch?;
+        let doc_iter = iter_str_array(&batch[&doc_col]);
+        let mut scores = Vec::with_capacity(batch.num_rows());
+        for doc in doc_iter {
+            let doc = match doc {
+                Some(doc) => doc,
+                None => {
+                    scores.push(0.0);
+                    continue;
+                }
+            };
+            let doc_tokens = collect_tokens(doc, &mut tokenizer);
+            let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
+            let mut doc_token_count = HashMap::new();
+            for token in doc_tokens {
+                doc_token_count
+                    .entry(token)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+            let mut score = 0.0;
+            for (token, token_id) in query_tokens.iter() {
+                let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
+
+                let idf = if let Some(token_id) = token_id {
+                    // for known token, we just use the index's metadata to calculate the score
+                    // it's not accurate but it's good enough for ranking
+                    idf(inverted_list.posting_len(*token_id), num_docs)
+                } else {
+                    // for unknown token, we set the idf to a very high value
+                    // so that the new token will significantly effect the score
+                    idf(1, num_docs)
+                };
+                score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+            }
+            scores.push(score);
+        }
+
+        let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
+        let batch = batch
+            .drop_column(&doc_col)?
+            .try_with_column(SCORE_FIELD.clone(), score_col)?;
+        Ok(batch)
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
 }
 
 pub fn collect_tokens(text: &str, tokenizer: &mut tantivy::tokenizer::TextAnalyzer) -> Vec<String> {

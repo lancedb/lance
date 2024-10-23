@@ -15,6 +15,7 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -41,7 +42,7 @@ use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::PlannerIndexExt;
-use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -1325,12 +1326,18 @@ impl Scanner {
             ));
         }
 
+        // rewrite the query to be with the columns and limit
+        let query = query
+            .clone()
+            .columns(Some(columns.clone()))
+            .limit(self.limit);
+
         // load indices
         let mut indices = HashMap::with_capacity(columns.len());
-        for column in &columns {
+        for column in columns {
             let index = self
                 .dataset
-                .load_scalar_index_for_column(column)
+                .load_scalar_index_for_column(&column)
                 .await?
                 .ok_or(Error::invalid_input(
                     format!("Column {} has no inverted index", column),
@@ -1342,18 +1349,40 @@ impl Scanner {
                 .await?
                 .into_iter()
                 .collect();
-            indices.insert(column.clone(), index_uuids);
+
+            let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+            let unindexed_scan_node = if unindexed_fragments.is_empty() {
+                Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+            } else {
+                let schema = Arc::new(self.dataset.schema().project(&[&column]).unwrap());
+                let mut scan_node = self.scan_fragments(
+                    true,
+                    false,
+                    true,
+                    schema,
+                    Arc::new(unindexed_fragments),
+                    None,
+                    false,
+                );
+
+                if let Some(expr) = filter_plan.full_expr.as_ref() {
+                    // If there is a prefilter we need to manually apply it to the new data
+                    let planner = Planner::new(scan_node.schema());
+                    let physical_refine_expr = planner.create_physical_expr(expr)?;
+                    scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                }
+
+                scan_node
+            };
+
+            indices.insert(column.clone(), (index_uuids, unindexed_scan_node));
         }
 
-        let query = query
-            .clone()
-            .columns(Some(columns.clone()))
-            .limit(self.limit);
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let fts_plan = Arc::new(FtsExec::new(
             self.dataset.clone(),
             indices,
-            query.clone(),
+            query,
             prefilter_source,
         )) as Arc<dyn ExecutionPlan>;
         let sort_expr = PhysicalSortExpr {
@@ -1364,42 +1393,21 @@ impl Scanner {
             },
         };
 
-        // search unindexed fragments
-        let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
-        let schema = Arc::new(self.dataset.schema().project(&[column]).unwrap());
-        if !unindexed_fragments.is_empty() {
-            let mut scan_node = self.scan_fragments(
-                true,
-                false,
-                true,
-                schema,
-                Arc::new(unindexed_fragments),
-                None,
-                false,
-            );
-
-            if let Some(expr) = filter_plan.full_expr.as_ref() {
-                // If there is a prefilter we need to manually apply it to the new data
-                let planner = Planner::new(scan_node.schema());
-                let physical_refine_expr = planner.create_physical_expr(expr)?;
-                scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
-            }
-
-            let flat_fts = self.flat_fts(scan_node, &query)?;
-            fts_plan = Arc::new(UnionExec::new(vec![fts_plan, flat_fts]));
-        }
-
         Ok(Arc::new(
             SortExec::new(vec![sort_expr], fts_plan).with_fetch(self.limit.map(|l| l as usize)),
         ))
     }
 
-    fn flat_fts(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-        query: &FullTextSearchQuery,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-    }
+    // fn flat_fts(
+    //     &self,
+    //     input: Arc<dyn ExecutionPlan>,
+    //     column: String,
+    //     index: Index,
+    //     query: FullTextSearchQuery,
+    // ) -> Result<Arc<dyn ExecutionPlan>> {
+    //     let flat_fts_plan = FlatFtsExec::new(input, column, index, query);
+    //     Ok(Arc::new(flat_fts_plan))
+    // }
 
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
