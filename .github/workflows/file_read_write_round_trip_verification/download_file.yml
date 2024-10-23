@@ -1,0 +1,33 @@
+name: Download S3 File
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8'  # Specify the Python version
+
+      - name: Install dependencies
+        run: |
+          pip install boto3
+
+      - name: Download file from S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.LANCEDB_S3_READER_SECRET }}
+        run: |
+          python download_s3_file.py
+
+      - name: List files
+        run: ls -la
