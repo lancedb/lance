@@ -27,7 +27,7 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.LANCEDB_S3_READER_SECRET }}
         run: |
-          python download_s3_file.py
+          python download_file.py
 
       - name: List files
         working-directory: ./.github/workflows/file_read_write_round_trip_verification
