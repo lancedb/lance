@@ -15,11 +15,21 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Switch to Python Virtual Environment
+        working-directory: ./python
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+
       - name: Install dependencies
         run: |
           pip install boto3
           pip install pyarrow
           pip install maturin
+
+      - name: Build Lance
+        working-directory: ./python
+        run: |
           maturin develop --release
 
       - name: Download file from S3
