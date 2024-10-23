@@ -1,9 +1,5 @@
-name: Download S3 File
-
-on:
-  push:
-    branches:
-      - main
+name: Lance File Write Read Round Trip Verification
+on: [pull_request]
 
 jobs:
   download:

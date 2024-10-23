@@ -32,5 +32,7 @@ try:
 
     assert tab_lance == parquet_table
 
+    assert 1 == 0
+
 except Exception as e:
     print(f"Error reading Parquet file: {e}")
