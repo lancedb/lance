@@ -508,10 +508,11 @@ impl PrimitiveFieldEncoder {
             .create_array_encoder(&arrays, &self.field)?;
         let column_idx = self.column_index;
         let data_type = self.field.data_type();
+        let arrow_field = arrow_schema::Field::from(&self.field);
 
         Ok(tokio::task::spawn(async move {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
-            let data = DataBlock::from_arrays(&arrays, num_values);
+            let data = DataBlock::from_arrays(&arrays, num_values, &arrow_field);
             let mut buffer_index = 0;
             let array = encoder.encode(data, &data_type, &mut buffer_index)?;
             let (data, description) = array.into_buffers();
@@ -834,7 +835,8 @@ impl PrimitiveStructuralEncoder {
         // and potentially more decoder asymmetry.  However, it may be worth
         // investigating at some point
 
-        let data = DataBlock::from_arrays(&arrays, num_values);
+        let arrow_field = arrow_schema::Field::from(field);
+        let data = DataBlock::from_arrays(&arrays, num_values, &arrow_field);
         let num_values = data.num_values();
         // The validity is encoded in repdef so we can remove it
         let data = data.remove_validity();
