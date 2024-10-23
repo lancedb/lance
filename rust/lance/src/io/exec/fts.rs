@@ -160,7 +160,7 @@ impl ExecutionPlan for FtsExec {
 
                     let unindexed_stream = input.execute(partition, context)?;
                     let unindexed_result_stream =
-                        flat_bm25_search_stream(unindexed_stream, column, query, &index);
+                        flat_bm25_search_stream(unindexed_stream, column, query, index);
 
                     let mut row_ids = Vec::new();
                     let mut scores = Vec::new();
