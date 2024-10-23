@@ -15,36 +15,25 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Switch to Python Virtual Environment
+      - name: Test Lance File
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.LANCEDB_S3_READER_SECRET }}
         working-directory: ./python
         run: |
           python -m venv venv
           source venv/bin/activate
 
-      - name: Install dependencies
-        run: |
           pip install boto3
           pip install pyarrow
           pip install maturin
 
-      - name: Build Lance
-        working-directory: ./python
-        run: |
           maturin develop --release
 
-      - name: Download file from S3
-        working-directory: ./.github/workflows/file_read_write_round_trip_verification
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.LANCEDB_S3_READER_SECRET }}
-        run: |
+          cd ../.github/workflows/file_read_write_round_trip_verification
           python download_file.py
+          python test_write_read.py
 
       - name: List files
         working-directory: ./.github/workflows/file_read_write_round_trip_verification
         run: ls -la
-
-      - name: test lance write read round trip
-        working-directory: ./.github/workflows/file_read_write_round_trip_verification
-        run: |
-          python test_write_read.py
