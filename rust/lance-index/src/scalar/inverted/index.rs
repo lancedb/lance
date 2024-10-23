@@ -959,12 +959,11 @@ pub fn idf(nq: usize, num_docs: usize) -> f32 {
     ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
 }
 
-#[instrument(level = "debug", skip(batches))]
 pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
-    index: Option<&InvertedIndex>,
+    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
 ) -> Result<Vec<u64>> {
     if batches.is_empty() {
         return Ok(vec![]);
@@ -978,8 +977,8 @@ pub fn flat_full_text_search(
     }
 
     match batches[0][doc_col].data_type() {
-        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, index),
-        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, index),
+        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
+        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
         data_type => Err(Error::invalid_input(
             format!("unsupported data type {} for inverted index", data_type),
             location!(),
@@ -991,13 +990,10 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
-    index: Option<&InvertedIndex>,
+    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
-    let mut tokenizer = match index.as_ref().map(|index| index.tokenizer.clone()) {
-        Some(tokenizer) => tokenizer,
-        None => TokenizerConfig::default().build()?,
-    };
+    let mut tokenizer = tokenizer.unwrap_or_else(|| TokenizerConfig::default().build().unwrap());
     let query_tokens = collect_tokens(query, &mut tokenizer)
         .into_iter()
         .collect::<HashSet<_>>();

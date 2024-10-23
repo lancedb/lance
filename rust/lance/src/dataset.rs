@@ -4395,6 +4395,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fts_unindexed_data() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let params = InvertedIndexParams::default();
+        let title_col =
+            GenericStringArray::<i32>::from(vec!["title hello", "title lance", "title common"]);
+        let content_col = GenericStringArray::<i32>::from(vec![
+            "content world",
+            "content database",
+            "content common",
+        ]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
+                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, tempdir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["title"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+
+        // write new data
+        let title_col = GenericStringArray::<i32>::from(vec!["new title"]);
+        let content_col = GenericStringArray::<i32>::from(vec!["new content"]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("title", title_col.data_type().to_owned(), false),
+                arrow_schema::Field::new("content", title_col.data_type().to_owned(), false),
+            ])
+            .into(),
+            vec![
+                Arc::new(title_col) as ArrayRef,
+                Arc::new(content_col) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let dataset = Dataset::write(
+            batches,
+            tempdir.path().to_str().unwrap(),
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("title".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 4);
+
+        let results = dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("new".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_create() {
         async fn write(uri: &str) -> Result<()> {
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
