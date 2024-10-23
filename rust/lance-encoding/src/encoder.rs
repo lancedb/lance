@@ -5,7 +5,7 @@ use std::{collections::HashMap, env, sync::Arc};
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField};
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_core::datatypes::{
@@ -485,18 +485,18 @@ impl CoreArrayEncodingStrategy {
 
     fn default_binary_encoder(
         arrays: &[ArrayRef],
-        data_type: &DataType,
-        field_meta: Option<&HashMap<String, String>>,
+        field: &ArrowField,
         data_size: u64,
         version: LanceFileVersion,
     ) -> Result<Box<dyn ArrayEncoder>> {
+        let indices_field = ArrowField::new("", DataType::UInt64, false);
         let bin_indices_encoder =
-            Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
+            Self::choose_array_encoder(arrays, &indices_field, data_size, false, version)?;
 
-        let compression = field_meta.and_then(Self::get_field_compression);
+        let compression = Self::get_field_compression(field.metadata());
 
         let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, compression));
-        if compression.is_none() && Self::can_use_fsst(data_type, data_size, version) {
+        if compression.is_none() && Self::can_use_fsst(field.data_type(), data_size, version) {
             Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
         } else {
             Ok(bin_encoder)
@@ -505,60 +505,56 @@ impl CoreArrayEncodingStrategy {
 
     fn choose_array_encoder(
         arrays: &[ArrayRef],
-        data_type: &DataType,
+        field: &ArrowField,
         data_size: u64,
         use_dict_encoding: bool,
         version: LanceFileVersion,
-        field_meta: Option<&HashMap<String, String>>,
     ) -> Result<Box<dyn ArrayEncoder>> {
-        match data_type {
+        match field.data_type() {
             DataType::FixedSizeList(inner, dimension) => {
                 Ok(Box::new(BasicEncoder::new(Box::new(FslEncoder::new(
                     Self::choose_array_encoder(
                         arrays,
-                        inner.data_type(),
+                        inner.as_ref(),
                         data_size,
                         use_dict_encoding,
                         version,
-                        None,
                     )?,
                     *dimension as u32,
                 )))))
             }
             DataType::Dictionary(key_type, value_type) => {
+                let key_field = ArrowField::new("", key_type.as_ref().clone(), true);
+                // TODO: arrow-rs doesn't keep metadata for value type in dictionary
+                // We assume the metadata of the field applies to the values and not the dictionary itself
+                let value_field = ArrowField::new("", value_type.as_ref().clone(), true);
                 let key_encoder =
-                    Self::choose_array_encoder(arrays, key_type, data_size, false, version, None)?;
-                let value_encoder = Self::choose_array_encoder(
-                    arrays, value_type, data_size, false, version, None,
-                )?;
+                    Self::choose_array_encoder(arrays, &key_field, data_size, false, version)?;
+                let value_encoder =
+                    Self::choose_array_encoder(arrays, &value_field, data_size, false, version)?;
 
                 Ok(Box::new(AlreadyDictionaryEncoder::new(
                     key_encoder,
                     value_encoder,
+                    field.clone(),
                 )))
             }
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
                 if use_dict_encoding {
+                    let dict_indices_field = ArrowField::new("", DataType::UInt8, false);
                     let dict_indices_encoder = Self::choose_array_encoder(
                         // We need to pass arrays to this method to figure out what kind of compression to
                         // use but we haven't actually calculated the indices yet.  For now, we just assume
                         // worst case and use the full range.  In the future maybe we can pass in statistics
                         // instead of the actual data
                         &[Arc::new(UInt8Array::from_iter_values(0_u8..255_u8))],
-                        &DataType::UInt8,
+                        &dict_indices_field,
                         data_size,
                         false,
                         version,
-                        None,
                     )?;
-                    let dict_items_encoder = Self::choose_array_encoder(
-                        arrays,
-                        &DataType::Utf8,
-                        data_size,
-                        false,
-                        version,
-                        None,
-                    )?;
+                    let dict_items_encoder =
+                        Self::choose_array_encoder(arrays, &field, data_size, false, version)?;
 
                     Ok(Box::new(DictionaryEncoder::new(
                         dict_indices_encoder,
@@ -569,41 +565,36 @@ impl CoreArrayEncodingStrategy {
                 // The variable 'data_type' is passed through recursion so comparing with it would be incorrect
                 else if BINARY_DATATYPES.contains(arrays[0].data_type()) {
                     if let Some(byte_width) = check_fixed_size_encoding(arrays, version) {
+                        let bytes_field = ArrowField::new("", DataType::UInt8, false);
                         // use FixedSizeBinaryEncoder
                         let bytes_encoder = Self::choose_array_encoder(
                             arrays,
-                            &DataType::UInt8,
+                            &bytes_field,
                             data_size,
                             false,
                             version,
-                            None,
                         )?;
 
                         Ok(Box::new(BasicEncoder::new(Box::new(
                             FixedSizeBinaryEncoder::new(bytes_encoder, byte_width as usize),
                         ))))
                     } else {
-                        Self::default_binary_encoder(
-                            arrays, data_type, field_meta, data_size, version,
-                        )
+                        Self::default_binary_encoder(arrays, field, data_size, version)
                     }
                 } else {
-                    Self::default_binary_encoder(arrays, data_type, field_meta, data_size, version)
+                    Self::default_binary_encoder(arrays, field, data_size, version)
                 }
             }
             DataType::Struct(fields) => {
-                let num_fields = fields.len();
                 let mut inner_encoders = Vec::new();
 
-                for i in 0..num_fields {
-                    let inner_datatype = fields[i].data_type();
+                for field in fields {
                     let inner_encoder = Self::choose_array_encoder(
                         arrays,
-                        inner_datatype,
+                        field,
                         data_size,
                         use_dict_encoding,
                         version,
-                        None,
                     )?;
                     inner_encoders.push(inner_encoder);
                 }
@@ -611,11 +602,11 @@ impl CoreArrayEncodingStrategy {
                 Ok(Box::new(PackedStructEncoder::new(inner_encoders)))
             }
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == field.data_type() {
                     let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
                     Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
                         compressed_bit_width as usize,
-                        data_type.clone(),
+                        field.data_type().clone(),
                     )))
                 } else {
                     Ok(Box::new(BasicEncoder::new(Box::new(
@@ -628,11 +619,11 @@ impl CoreArrayEncodingStrategy {
             // then a bitpacked array for the narrow(bit-width) values, I need `BitpackedForNeg` to be merged first, I am
             // thinking about putting this sparse array in the metadata so bitpacking remain using one page buffer only.
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == data_type {
+                if version >= LanceFileVersion::V2_1 && arrays[0].data_type() == field.data_type() {
                     let compressed_bit_width = compute_compressed_bit_width_for_non_neg(arrays);
                     Ok(Box::new(BitpackedForNonNegArrayEncoder::new(
                         compressed_bit_width as usize,
-                        data_type.clone(),
+                        field.data_type().clone(),
                     )))
                 } else {
                     Ok(Box::new(BasicEncoder::new(Box::new(
@@ -768,18 +759,18 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
             .iter()
             .map(|arr| arr.get_buffer_memory_size() as u64)
             .sum::<u64>();
-        let data_type = arrays[0].data_type();
 
-        let use_dict_encoding = data_type == &DataType::Utf8
+        let use_dict_encoding = field.data_type() == DataType::Utf8
             && check_dict_encoding(arrays, get_dict_encoding_threshold());
+
+        let arrow_field = ArrowField::from(field);
 
         Self::choose_array_encoder(
             arrays,
-            data_type,
+            &arrow_field,
             data_size,
             use_dict_encoding,
             self.version,
-            Some(&field.metadata),
         )
     }
 }

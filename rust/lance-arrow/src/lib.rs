@@ -19,6 +19,7 @@ use arrow_select::{interleave::interleave, take::take};
 use rand::prelude::*;
 
 pub mod deepcopy;
+pub mod dict_enum;
 pub mod schema;
 pub use schema::*;
 pub mod bfloat16;

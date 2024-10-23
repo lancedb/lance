@@ -331,7 +331,7 @@ mod tests {
             .unwrap();
         let fixed_size_binary_array = FixedSizeBinaryArray::from(array_data);
         let arrays = vec![Arc::new(fixed_size_binary_array) as ArrayRef];
-        let fixed_width_data_block = DataBlock::from_arrays(&arrays, num_values);
+        let fixed_width_data_block = DataBlock::from_arrays(&arrays, num_values, None);
         assert_eq!(fixed_width_data_block.name(), "FixedWidth");
 
         let bytes_decoder = FixedWidthCloningPageDecoder {

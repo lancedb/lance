@@ -435,3 +435,106 @@ def test_blob(tmp_path):
     reader = LanceFileReader(str(path))
     assert len(reader.metadata().columns[0].pages) == 1
     assert reader.read_all().to_table() == pa.table({"val": vals})
+
+
+def test_enum_vs_categorical(tmp_path):
+    # Helper method to make two dict arrays, with same dictionary values
+    # but different indices
+    def make_tbls(values, indices1, indices2):
+        # Need to make two separate dictionaries here or else arrow-rs won't concat
+        d1 = pa.array(values, pa.string())
+        d2 = pa.array(values, pa.string())
+        i1 = pa.array(indices1, pa.int16())
+        i2 = pa.array(indices2, pa.int16())
+
+        dict1 = pa.DictionaryArray.from_arrays(i1, d1)
+        dict2 = pa.DictionaryArray.from_arrays(i2, d2)
+        tab1 = pa.table({"dictionary": dict1})
+        tab2 = pa.table({"dictionary": dict2})
+        return tab1, tab2
+
+    # Helper method to round trip two tables through lance and return the decoded
+    # dictionary array
+    def round_trip_dict(tab1: pa.Table, tab2: pa.Table) -> pa.DictionaryArray:
+        with LanceFileWriter(tmp_path / "categorical.lance") as writer:
+            writer.write_batch(tab1)
+            writer.write_batch(tab2)
+
+        reader = LanceFileReader(tmp_path / "categorical.lance")
+        round_tripped = reader.read_all().to_table()
+
+        arr2 = round_tripped.column("dictionary").chunk(0).dictionary
+        return arr2
+
+    # Helper method to convert a table with dictionary array into a table with
+    # enum array
+    def enumify(tbl) -> pa.Table:
+        categories = ",".join(tbl.column(0).chunk(0).dictionary.to_pylist())
+        enum_schema = pa.schema(
+            [
+                pa.field(
+                    "dictionary",
+                    pa.dictionary(pa.int16(), pa.string()),
+                    metadata={
+                        "ARROW:extension:name": "polars.enum",
+                        "ARROW:extension:metadata": '{"categories": ['
+                        + categories
+                        + "]}",
+                    },
+                )
+            ]
+        )
+        return pa.table([tbl.column(0)], schema=enum_schema)
+
+    tab1, tab2 = make_tbls(
+        ["blue", "red", "green", "yellow"],
+        [0, 1, 0, 1, 0, 1],
+        [1, 2, 1, 2, 1, 2],
+    )
+
+    round_trip = round_trip_dict(tab1, tab2)
+
+    # Sometimes array concatenation will just concatenate the dictionaries
+    assert round_trip.to_pylist() == [
+        "blue",
+        "red",
+        "green",
+        "yellow",
+        "blue",
+        "red",
+        "green",
+        "yellow",
+    ]
+
+    tab1 = enumify(tab1)
+    tab2 = enumify(tab2)
+
+    round_trip = round_trip_dict(tab1, tab2)
+
+    # However, there should be no concatenation with the enum type
+    assert round_trip.to_pylist() == [
+        "blue",
+        "red",
+        "green",
+        "yellow",
+    ]
+
+    tab1, tab2 = make_tbls(
+        [str(i) for i in range(1000)],
+        list(range(500)),
+        list(range(500, 900)),
+    )
+
+    round_trip = round_trip_dict(tab1, tab2)
+
+    # Other times array concatenation will combine the
+    # dictionaries and remove unused items
+    assert round_trip.to_pylist() == [str(i) for i in range(900)]
+
+    # Again, no concatenation with enum type
+    tab1 = enumify(tab1)
+    tab2 = enumify(tab2)
+
+    round_trip = round_trip_dict(tab1, tab2)
+
+    assert round_trip.to_pylist() == [str(i) for i in range(1000)]
