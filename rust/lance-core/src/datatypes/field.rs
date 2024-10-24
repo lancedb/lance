@@ -5,7 +5,7 @@
 
 use std::{
     cmp::max,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt::{self, Display},
     str::FromStr,
     sync::Arc,
@@ -23,7 +23,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
 use snafu::{location, Location};
 
-use super::{Dictionary, LogicalType};
+use super::{schema::explain_fields_difference, Dictionary, LogicalType};
 use crate::{Error, Result};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
@@ -49,6 +49,10 @@ pub struct SchemaCompareOptions {
     pub compare_field_ids: bool,
     /// Should nullability be compared (default Strict)
     pub compare_nullability: NullabilityComparison,
+    /// Allow fields to be missing if they are nullable (default false)
+    pub allow_missing_if_nullable: bool,
+    /// Allow out of order fields (default false)
+    pub ignore_field_order: bool,
 }
 /// Encoding enum.
 #[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
@@ -151,7 +155,7 @@ impl Field {
         self.storage_class
     }
 
-    fn explain_differences(
+    pub(crate) fn explain_differences(
         &self,
         expected: &Self,
         options: &SchemaCompareOptions,
@@ -210,61 +214,19 @@ impl Field {
                 self_name
             ));
         }
-        if self.children.len() != expected.children.len()
-            || !self
-                .children
-                .iter()
-                .zip(expected.children.iter())
-                .all(|(child, expected)| child.name == expected.name)
-        {
-            let self_children = self
-                .children
-                .iter()
-                .map(|child| child.name.clone())
-                .collect::<HashSet<_>>();
-            let expected_children = expected
-                .children
-                .iter()
-                .map(|child| child.name.clone())
-                .collect::<HashSet<_>>();
-            let missing = expected_children
-                .difference(&self_children)
-                .cloned()
-                .collect::<Vec<_>>();
-            let unexpected = self_children
-                .difference(&expected_children)
-                .cloned()
-                .collect::<Vec<_>>();
-            if missing.is_empty() && unexpected.is_empty() {
-                differences.push(format!(
-                    "`{}` field order mismatch, expected [{}] but was [{}]",
-                    self_name,
-                    expected
-                        .children
-                        .iter()
-                        .map(|child| child.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    self.children
-                        .iter()
-                        .map(|child| child.name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ));
-            } else {
-                differences.push(format!(
-                    "`{}` had mismatched children, missing=[{}] unexpected=[{}]",
-                    self_name,
-                    missing.join(", "),
-                    unexpected.join(", ")
-                ));
-            }
-        } else {
-            differences.extend(self.children.iter().zip(expected.children.iter()).flat_map(
-                |(child, expected_child)| {
-                    child.explain_differences(expected_child, options, Some(&self_name))
-                },
-            ));
+        let children_differences = explain_fields_difference(
+            &self.children,
+            &expected.children,
+            options,
+            Some(&self_name),
+        );
+        if !children_differences.is_empty() {
+            let children_differences = format!(
+                "`{}` had mismatched children: {}",
+                self_name,
+                children_differences.join(", ")
+            );
+            differences.push(children_differences);
         }
         differences
     }
@@ -1177,7 +1139,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             wrong_child.explain_difference(&expected, &opts),
-            Some("`a.b` should have nullable=true but nullable=false".to_string())
+            Some(
+                "`a` had mismatched children: `a.b` should have nullable=true but nullable=false"
+                    .to_string()
+            )
         );
 
         let mismatched_children: Field = ArrowField::new(
@@ -1192,13 +1157,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             mismatched_children.explain_difference(&expected, &opts),
-            Some("`a` had mismatched children, missing=[c] unexpected=[d]".to_string())
+            Some("`a` had mismatched children: fields did not match, missing=[a.c], unexpected=[a.d]".to_string())
         );
 
         let reordered_children: Field = ArrowField::new(
             "a",
             DataType::Struct(Fields::from(vec![
-                ArrowField::new("c", DataType::Int32, false),
+                ArrowField::new("c", DataType::Int32, true),
                 ArrowField::new("b", DataType::Int32, true),
             ])),
             true,
@@ -1207,7 +1172,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reordered_children.explain_difference(&expected, &opts),
-            Some("`a` field order mismatch, expected [b, c] but was [c, b]".to_string())
+            Some("`a` had mismatched children: fields in different order, expected: [b, c], actual: [c, b]".to_string())
         );
 
         let multiple_wrongs: Field = ArrowField::new(
@@ -1223,7 +1188,7 @@ mod tests {
         assert_eq!(
             multiple_wrongs.explain_difference(&expected, &opts),
             Some(
-                "expected name 'a' but name was 'c', `c.c` should have type int32 but type was float"
+                "expected name 'a' but name was 'c', `c` had mismatched children: `c.c` should have type int32 but type was float"
                     .to_string()
             )
         );

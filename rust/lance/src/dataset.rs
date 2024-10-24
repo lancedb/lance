@@ -4876,4 +4876,94 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_insert_subschema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let mut dataset = Dataset::write(empty_reader, "memory://", None)
+            .await
+            .unwrap();
+
+        // If missing columns that aren't nullable, will return an error
+        // TODO: provide alternative default than null.
+        let just_b = Arc::new(schema.project(&[1]).unwrap());
+        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
+        let res = dataset.append(reader, None).await;
+        assert!(
+            matches!(res, Err(Error::SchemaMismatch { .. })),
+            "Expected Error::SchemaMismatch, got {:?}",
+            res
+        );
+
+        // If missing columns that are nullable, the write succeeds.
+        let just_a = Arc::new(schema.project(&[0]).unwrap());
+        let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
+        dataset.append(reader, None).await.unwrap();
+        // TODO: do we also need to check the write() path, since it seems separate?
+
+        // Looking at the fragments, there is no data file with the missing field
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+
+        // When reading back, columns that are missing are null
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+
+        // Can still insert all columns
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![3])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(reader, None).await.unwrap();
+
+        // When reading back, only missing data is null, otherwise is filled in
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![None, Some(3)])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+
+        // Can run compaction. All files should now have all fields.
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 1]);
+
+        // Can scan and get expected data.
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(data, expected);
+    }
+
+    // TODO: test nested fields and subschemas
 }
