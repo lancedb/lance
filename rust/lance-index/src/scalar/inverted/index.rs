@@ -1007,6 +1007,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn flat_bm25_search(
     batch: RecordBatch,
     doc_col: &str,
@@ -1017,7 +1018,7 @@ pub fn flat_bm25_search(
     avgdl: f32,
     num_docs: usize,
 ) -> std::result::Result<RecordBatch, DataFusionError> {
-    let doc_iter = iter_str_array(&batch[&doc_col]);
+    let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
     for doc in doc_iter {
         let doc = match doc {
@@ -1057,7 +1058,7 @@ pub fn flat_bm25_search(
 
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
-        .drop_column(&doc_col)?
+        .drop_column(doc_col)?
         .try_with_column(SCORE_FIELD.clone(), score_col)?;
     Ok(batch)
 }
