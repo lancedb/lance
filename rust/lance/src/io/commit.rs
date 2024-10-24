@@ -427,13 +427,13 @@ pub(crate) async fn commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<Manifest> {
-    // We don't stricly need a transaction file but we go ahead and create one for
+    // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
     // We still do a loop since we may have conflicts in the random version we pick
     for attempt_i in 0..commit_config.num_retries {
-        // Pick a random u64 with the higest bit set to indicate it is detached
+        // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
 
         let (mut manifest, mut indices) = match transaction.operation {
