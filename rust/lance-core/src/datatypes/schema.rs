@@ -60,15 +60,8 @@ impl<'a> Iterator for SchemaFieldIterPreOrder<'a> {
 
 impl Schema {
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
-        if self.fields.len() != expected.fields.len() {
-            false
-        } else {
-            self.fields
-                .iter()
-                .zip(&expected.fields)
-                .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
-                && (!options.compare_metadata || self.metadata == expected.metadata)
-        }
+        compare_fields(&self.fields, &expected.fields, options)
+            && (!options.compare_metadata || self.metadata == expected.metadata)
     }
 
     pub fn explain_difference(
@@ -581,6 +574,55 @@ impl TryFrom<&Self> for Schema {
 
     fn try_from(schema: &Self) -> Result<Self> {
         Ok(schema.clone())
+    }
+}
+
+pub fn compare_fields(
+    fields: &[Field],
+    expected: &[Field],
+    options: &SchemaCompareOptions,
+) -> bool {
+    if options.allow_missing_if_nullable || options.ignore_field_order {
+        let expected_names = expected
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<HashSet<_>>();
+        for field in fields {
+            if !expected_names.contains(field.name.as_str()) {
+                // Extra field
+                return false;
+            }
+        }
+
+        let field_mapping = fields
+            .iter()
+            .enumerate()
+            .map(|(pos, f)| (f.name.as_str(), (f, pos)))
+            .collect::<HashMap<_, _>>();
+        let mut cumulative_position = 0;
+        for expected_field in expected {
+            if let Some((field, pos)) = field_mapping.get(expected_field.name.as_str()) {
+                if !field.compare_with_options(expected_field, options) {
+                    return false;
+                }
+                if !options.ignore_field_order && *pos < cumulative_position {
+                    return false;
+                }
+                cumulative_position = *pos;
+            } else if options.allow_missing_if_nullable && expected_field.nullable {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        true
+    } else {
+        // Fast path: we can just zip
+        fields.len() == expected.len()
+            && fields
+                .iter()
+                .zip(expected.iter())
+                .all(|(lhs, rhs)| lhs.compare_with_options(rhs, options))
     }
 }
 
@@ -1196,6 +1238,7 @@ mod tests {
         ]);
         let subschema = Schema::try_from(&subschema).unwrap();
 
+        assert!(!subschema.compare_with_options(&expected, &SchemaCompareOptions::default()));
         assert_eq!(
             subschema.explain_difference(&expected, &SchemaCompareOptions::default()),
             Some(
@@ -1208,6 +1251,7 @@ mod tests {
             allow_missing_if_nullable: true,
             ..Default::default()
         };
+        assert!(subschema.compare_with_options(&expected, &options));
         let res = subschema.explain_difference(&expected, &options);
         assert!(res.is_none(), "Expected None, got {:?}", res);
 
@@ -1222,6 +1266,7 @@ mod tests {
             true,
         )]);
         let subschema = Schema::try_from(&subschema).unwrap();
+        assert!(!subschema.compare_with_options(&expected, &options));
         assert_eq!(
             subschema.explain_difference(&expected, &options),
             Some(
@@ -1230,5 +1275,37 @@ mod tests {
                     .to_string()
             )
         );
+
+        let out_of_order = ArrowSchema::new(vec![
+            ArrowField::new("c", DataType::Float64, true),
+            ArrowField::new(
+                "b",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f3", DataType::Float32, false),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                    ArrowField::new("f1", DataType::Utf8, true),
+                ])),
+                true,
+            ),
+            ArrowField::new("a", DataType::Int32, false),
+        ]);
+        let out_of_order = Schema::try_from(&out_of_order).unwrap();
+        assert!(!out_of_order.compare_with_options(&expected, &options));
+        assert_eq!(
+            subschema.explain_difference(&expected, &options),
+            Some(
+                "fields did not match, missing=[a], unexpected=[], `b` had mismatched \
+                 children: fields did not match, missing=[b.f3], unexpected=[]"
+                    .to_string()
+            )
+        );
+
+        let options = SchemaCompareOptions {
+            ignore_field_order: true,
+            ..Default::default()
+        };
+        assert!(out_of_order.compare_with_options(&expected, &options));
+        let res = out_of_order.explain_difference(&expected, &options);
+        assert!(res.is_none(), "Expected None, got {:?}", res);
     }
 }

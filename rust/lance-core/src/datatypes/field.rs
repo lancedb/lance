@@ -23,7 +23,10 @@ use deepsize::DeepSizeOf;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
 use snafu::{location, Location};
 
-use super::{schema::explain_fields_difference, Dictionary, LogicalType};
+use super::{
+    schema::{compare_fields, explain_fields_difference},
+    Dictionary, LogicalType,
+};
 use crate::{Error, Result};
 
 pub const LANCE_STORAGE_CLASS_SCHEMA_META_KEY: &str = "lance-schema:storage-class";
@@ -257,22 +260,13 @@ impl Field {
     }
 
     pub fn compare_with_options(&self, expected: &Self, options: &SchemaCompareOptions) -> bool {
-        if self.children.len() != expected.children.len() {
-            false
-        } else {
-            self.name == expected.name
-                && self.logical_type == expected.logical_type
-                && Self::compare_nullability(expected.nullable, self.nullable, options)
-                && self.children.len() == expected.children.len()
-                && self
-                    .children
-                    .iter()
-                    .zip(&expected.children)
-                    .all(|(left, right)| left.compare_with_options(right, options))
-                && (!options.compare_field_ids || self.id == expected.id)
-                && (!options.compare_dictionary || self.dictionary == expected.dictionary)
-                && (!options.compare_metadata || self.metadata == expected.metadata)
-        }
+        self.name == expected.name
+            && self.logical_type == expected.logical_type
+            && Self::compare_nullability(expected.nullable, self.nullable, options)
+            && compare_fields(&self.children, &expected.children, options)
+            && (!options.compare_field_ids || self.id == expected.id)
+            && (!options.compare_dictionary || self.dictionary == expected.dictionary)
+            && (!options.compare_metadata || self.metadata == expected.metadata)
     }
 
     pub fn extension_name(&self) -> Option<&str> {
