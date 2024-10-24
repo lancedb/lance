@@ -158,6 +158,7 @@ message FixedSizeList {
 
 message Compression {
   string scheme = 1;
+  optional int32 level = 2;
 }
 
 // Fixed width items placed contiguously in a buffer

@@ -9,8 +9,8 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{
-    Field, Schema, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_META_KEY,
-    PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
+    Field, Schema, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_LEVEL_META_KEY,
+    COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
 };
 use lance_core::{Error, Result};
 use snafu::{location, Location};
@@ -24,7 +24,7 @@ use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
 use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
-use crate::encodings::physical::block_compress::CompressionScheme;
+use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
@@ -454,9 +454,18 @@ impl CoreArrayEncodingStrategy {
             && data_size > 4 * 1024 * 1024
     }
 
-    fn get_field_compression(field_meta: &HashMap<String, String>) -> Option<CompressionScheme> {
+    fn get_field_compression(field_meta: &HashMap<String, String>) -> Option<CompressionConfig> {
         let compression = field_meta.get(COMPRESSION_META_KEY)?;
-        Some(compression.parse::<CompressionScheme>().unwrap())
+        let compression_scheme = compression.parse::<CompressionScheme>();
+        match compression_scheme {
+            Ok(compression_scheme) => Some(CompressionConfig::new(
+                compression_scheme,
+                field_meta
+                    .get(COMPRESSION_LEVEL_META_KEY)
+                    .and_then(|level| level.parse().ok()),
+            )),
+            Err(_) => None,
+        }
     }
 
     fn default_binary_encoder(
@@ -1327,13 +1336,15 @@ pub async fn encode_batch(
 
 #[cfg(test)]
 pub mod tests {
+    use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, StringArray};
+    use arrow_schema::Field;
+    use lance_core::datatypes::{COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY};
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::version::LanceFileVersion;
-
-    use super::check_dict_encoding;
     use super::check_fixed_size_encoding;
+    use super::{check_dict_encoding, ArrayEncodingStrategy, CoreArrayEncodingStrategy};
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
         let arr = StringArray::from(arr);
@@ -1453,5 +1464,42 @@ pub mod tests {
             vec![vec![None, None], vec![None, None]],
             LanceFileVersion::V2_1
         ));
+    }
+
+    fn verify_array_encoder(
+        array: ArrayRef,
+        field_meta: Option<HashMap<String, String>>,
+        version: LanceFileVersion,
+        expected_encoder: &str,
+    ) {
+        let encoding_strategy = CoreArrayEncodingStrategy { version };
+        let mut field = Field::new("test_field", array.data_type().clone(), true);
+        if let Some(field_meta) = field_meta {
+            field.set_metadata(field_meta.clone());
+        }
+        let lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
+        let encoder_result = encoding_strategy.create_array_encoder(&[array], &lance_field);
+        assert!(encoder_result.is_ok());
+        let encoder = encoder_result.unwrap();
+        assert_eq!(format!("{:?}", encoder).as_str(), expected_encoder);
+    }
+
+    #[test]
+    fn test_choose_encoder_for_zstd_compressed_string_field() {
+        verify_array_encoder(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])),
+                             Some(HashMap::from([(COMPRESSION_META_KEY.to_string(), "zstd".to_string())])),
+                             LanceFileVersion::V2_1,
+                             "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: None }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 0 }) }");
+    }
+
+    #[test]
+    fn test_choose_encoder_for_zstd_compression_level() {
+        verify_array_encoder(Arc::new(StringArray::from(vec!["a", "bb", "ccc"])),
+                             Some(HashMap::from([
+                                 (COMPRESSION_META_KEY.to_string(), "zstd".to_string()),
+                                 (COMPRESSION_LEVEL_META_KEY.to_string(), "22".to_string())
+                             ])),
+                             LanceFileVersion::V2_1,
+                             "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: Some(22) }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 22 }) }");
     }
 }

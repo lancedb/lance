@@ -29,7 +29,7 @@ use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
 use lance_core::Result;
 
-use super::block_compress::{BufferCompressor, CompressionScheme, GeneralBufferCompressor};
+use super::block_compress::{BufferCompressor, CompressionConfig, GeneralBufferCompressor};
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -345,20 +345,19 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 #[derive(Debug)]
 pub struct BinaryEncoder {
     indices_encoder: Box<dyn ArrayEncoder>,
-    compression_scheme: Option<CompressionScheme>,
+    compression_config: Option<CompressionConfig>,
     buffer_compressor: Option<Box<dyn BufferCompressor>>,
 }
 
 impl BinaryEncoder {
     pub fn new(
         indices_encoder: Box<dyn ArrayEncoder>,
-        compression_scheme: Option<CompressionScheme>,
+        compression_config: Option<CompressionConfig>,
     ) -> Self {
-        let buffer_compressor = compression_scheme
-            .map(|scheme| GeneralBufferCompressor::get_compressor(&scheme.to_string()));
+        let buffer_compressor = compression_config.map(GeneralBufferCompressor::get_compressor);
         Self {
             indices_encoder,
-            compression_scheme,
+            compression_config,
             buffer_compressor,
         }
     }
@@ -515,7 +514,7 @@ impl ArrayEncoder for BinaryEncoder {
         let bytes_encoding = ProtobufUtils::flat_encoding(
             /*bits_per_value=*/ 8,
             bytes_buffer_index,
-            self.compression_scheme,
+            self.compression_config,
         );
 
         let encoding =
@@ -527,7 +526,6 @@ impl ArrayEncoder for BinaryEncoder {
 
 #[cfg(test)]
 pub mod tests {
-
     use arrow_array::{
         builder::{LargeStringBuilder, StringBuilder},
         ArrayRef, StringArray,

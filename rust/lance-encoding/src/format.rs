@@ -23,7 +23,7 @@ use pb::{
     FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct, PageLayout,
 };
 
-use crate::encodings::physical::block_compress::CompressionScheme;
+use crate::encodings::physical::block_compress::CompressionConfig;
 
 use self::pb::Constant;
 
@@ -72,7 +72,7 @@ impl ProtobufUtils {
     pub fn flat_encoding(
         bits_per_value: u64,
         buffer_index: u32,
-        compression: Option<CompressionScheme>,
+        compression: Option<CompressionConfig>,
     ) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Flat(Flat {
@@ -81,8 +81,9 @@ impl ProtobufUtils {
                     buffer_index,
                     buffer_type: BufferType::Page as i32,
                 }),
-                compression: compression.map(|compression_scheme| pb::Compression {
-                    scheme: compression_scheme.to_string(),
+                compression: compression.map(|compression_config| pb::Compression {
+                    scheme: compression_config.scheme.to_string(),
+                    level: compression_config.level,
                 }),
             })),
         }
