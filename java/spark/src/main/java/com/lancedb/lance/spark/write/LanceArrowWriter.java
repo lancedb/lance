@@ -55,7 +55,7 @@ public class LanceArrowWriter extends ArrowReader {
     Preconditions.checkNotNull(row);
     synchronized (monitor) {
       // TODO(lu) wait if too much elements in rowQueue
-      rowQueue.offer(row);
+      rowQueue.offer(row.copy());
       monitor.notify();
     }
   }
