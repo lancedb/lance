@@ -108,7 +108,7 @@ async fn main() {
         .try_into_batch()
         .await
         .unwrap();
-    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query)
+    let flat_results = flat_full_text_search(&[&batch], "doc", &query.query, None)
         .unwrap()
         .into_iter()
         .collect::<HashSet<_>>();

@@ -11,19 +11,22 @@ use arrow::array::{
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_common::DataFusionError;
 use deepsize::DeepSizeOf;
 use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_arrow::{iter_str_array, RecordBatchExt};
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
@@ -50,6 +53,8 @@ pub const NUM_TOKEN_COL: &str = "_num_tokens";
 pub const SCORE_COL: &str = "_score";
 lazy_static! {
     pub static ref SCORE_FIELD: Field = Field::new(SCORE_COL, DataType::Float32, true);
+    pub static ref FTS_SCHEMA: SchemaRef =
+        Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()]));
 }
 
 // BM25 parameters
@@ -107,7 +112,7 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(&query.query, &mut tokenizer);
+        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
         let token_ids = self.map(&tokens).into_iter();
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
@@ -948,19 +953,26 @@ pub fn idf(nq: usize, num_docs: usize) -> f32 {
     ((num_docs - nq as f32 + 0.5) / (nq as f32 + 0.5) + 1.0).ln()
 }
 
-#[instrument(level = "debug", skip(batches))]
 pub fn flat_full_text_search(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
+    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
 ) -> Result<Vec<u64>> {
     if batches.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![]);
+    }
+
+    if is_phrase_query(query) {
+        return Err(Error::invalid_input(
+            "phrase query is not supported for flat full text search, try using FTS index",
+            location!(),
+        ));
     }
 
     match batches[0][doc_col].data_type() {
-        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query),
-        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query),
+        DataType::Utf8 => do_flat_full_text_search::<i32>(batches, doc_col, query, tokenizer),
+        DataType::LargeUtf8 => do_flat_full_text_search::<i64>(batches, doc_col, query, tokenizer),
         data_type => Err(Error::invalid_input(
             format!("unsupported data type {} for inverted index", data_type),
             location!(),
@@ -972,19 +984,21 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     batches: &[&RecordBatch],
     doc_col: &str,
     query: &str,
+    tokenizer: Option<tantivy::tokenizer::TextAnalyzer>,
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
-    let mut tokenizer = TokenizerConfig::default().build()?;
-    let query_tokens = collect_tokens(query, &mut tokenizer)
+    let mut tokenizer = tokenizer.unwrap_or_else(|| TokenizerConfig::default().build().unwrap());
+    let query_tokens = collect_tokens(query, &mut tokenizer, None)
         .into_iter()
         .collect::<HashSet<_>>();
+
     for batch in batches {
         let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_tokens(doc, &mut tokenizer);
-            if doc_tokens.iter().any(|token| query_tokens.contains(token)) {
+            let doc_tokens = collect_tokens(doc, &mut tokenizer, Some(&query_tokens));
+            if !doc_tokens.is_empty() {
                 results.push(row_id_array.value(i));
                 assert!(doc.contains(query));
             }
@@ -994,10 +1008,112 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     Ok(results)
 }
 
-pub fn collect_tokens(text: &str, tokenizer: &mut tantivy::tokenizer::TextAnalyzer) -> Vec<String> {
+#[allow(clippy::too_many_arguments)]
+pub fn flat_bm25_search(
+    batch: RecordBatch,
+    doc_col: &str,
+    inverted_list: &InvertedListReader,
+    query_tokens: &HashSet<String>,
+    query_token_ids: &HashMap<String, Option<u32>>,
+    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    avgdl: f32,
+    num_docs: usize,
+) -> std::result::Result<RecordBatch, DataFusionError> {
+    let doc_iter = iter_str_array(&batch[doc_col]);
+    let mut scores = Vec::with_capacity(batch.num_rows());
+    for doc in doc_iter {
+        let doc = match doc {
+            Some(doc) => doc,
+            None => {
+                scores.push(0.0);
+                continue;
+            }
+        };
+
+        let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
+        let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
+        let mut doc_token_count = HashMap::new();
+        for token in doc_tokens {
+            doc_token_count
+                .entry(token)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+        }
+        let mut score = 0.0;
+        for (token, token_id) in query_token_ids.iter() {
+            let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
+
+            let idf = if let Some(token_id) = token_id {
+                // for known token, we just use the index's metadata to calculate the score
+                // it's not accurate but it's good enough for ranking
+                idf(inverted_list.posting_len(*token_id), num_docs)
+            } else {
+                // for unknown token, we set the idf to a very high value
+                // so that the new token will significantly effect the score
+                idf(1, num_docs)
+            };
+            score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+        }
+        scores.push(score);
+    }
+
+    let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
+    let batch = batch
+        .drop_column(doc_col)?
+        .try_with_column(SCORE_FIELD.clone(), score_col)?;
+    Ok(batch)
+}
+
+pub fn flat_bm25_search_stream(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: FullTextSearchQuery,
+    index: &InvertedIndex,
+) -> SendableRecordBatchStream {
+    let mut tokenizer = index.tokenizer.clone();
+    let query_token_ids = collect_tokens(&query.query, &mut tokenizer, None)
+        .into_iter()
+        .dedup()
+        .map(|token| {
+            let token_id = index.tokens.get(&token);
+            (token, token_id)
+        })
+        .collect::<HashMap<_, _>>();
+    let query_tokens = query_token_ids.keys().cloned().collect::<HashSet<_>>();
+    let inverted_list = index.inverted_list.clone();
+    let num_docs = index.docs.len();
+    let avgdl = index.docs.average_length();
+
+    let stream = input.map(move |batch| {
+        let batch = batch?;
+        flat_bm25_search(
+            batch,
+            &doc_col,
+            inverted_list.as_ref(),
+            &query_tokens,
+            &query_token_ids,
+            &mut tokenizer,
+            avgdl,
+            num_docs,
+        )
+    });
+
+    Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
+}
+
+pub fn collect_tokens(
+    text: &str,
+    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    inclusive: Option<&HashSet<String>>,
+) -> Vec<String> {
     let mut stream = tokenizer.token_stream(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
+        if let Some(inclusive) = inclusive {
+            if !inclusive.contains(&token.text) {
+                continue;
+            }
+        }
         tokens.push(token.text.to_owned());
     }
     tokens
