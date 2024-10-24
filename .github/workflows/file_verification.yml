@@ -20,6 +20,24 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler
 
+      - name: Check AWS_ACCESS_KEY_ID
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}" ]; then
+            echo "AWS_ACCESS_KEY_ID is not set"
+            exit 1
+          else
+            echo "AWS_ACCESS_KEY_ID is set"
+          fi
+
+      - name: Check AWS_SECRET_ACCESS_KEY
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_SECRET }}" ]; then
+            echo "AWS_SECRET_ACCESS_KEY is not set"
+            exit 1
+          else
+            echo "AWS_SECRET_ACCESS_KEY is set"
+          fi
+
       - name: Test Lance File
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
