@@ -16,8 +16,8 @@ import boto3
 import os
 
 # Your AWS credentials from environment variables
-ACCESS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
-SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+ACCESS_KEY = os.getenv('LANCEDB_S3_READER_ACCESS_KEY')
+SECRET_KEY = os.getenv('LANCEDB_S3_READER_SECRET')
 
 # Initialize the S3 client with your credentials
 s3 = boto3.client(
