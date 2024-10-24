@@ -56,10 +56,11 @@ use {
     std::time::{Duration, SystemTime},
 };
 
-use crate::format::{Index, Manifest};
+use crate::format::{is_detached_version, Index, Manifest};
 
 const VERSIONS_DIR: &str = "_versions";
 const MANIFEST_EXTENSION: &str = "manifest";
+const DETACHED_VERSION_PREFIX: &str = "d";
 
 /// How manifest files should be named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,11 +76,22 @@ pub enum ManifestNamingScheme {
 impl ManifestNamingScheme {
     pub fn manifest_path(&self, base: &Path, version: u64) -> Path {
         let directory = base.child(VERSIONS_DIR);
-        match self {
-            Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
-            Self::V2 => {
-                let inverted_version = u64::MAX - version;
-                directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
+        if is_detached_version(version) {
+            // Detached versions should never show up first in a list operation which
+            // means it needs to come lexicographically after all attached manifest
+            // files and so we add the prefix `d`.  There is no need to invert the
+            // version number since detached versions are not part of the version
+            let directory = base.child(VERSIONS_DIR);
+            directory.child(format!(
+                "{DETACHED_VERSION_PREFIX}{version}.{MANIFEST_EXTENSION}"
+            ))
+        } else {
+            match self {
+                Self::V1 => directory.child(format!("{version}.{MANIFEST_EXTENSION}")),
+                Self::V2 => {
+                    let inverted_version = u64::MAX - version;
+                    directory.child(format!("{inverted_version:020}.{MANIFEST_EXTENSION}"))
+                }
             }
         }
     }
@@ -87,6 +99,7 @@ impl ManifestNamingScheme {
     pub fn parse_version(&self, filename: &str) -> Option<u64> {
         let file_number = filename
             .split_once('.')
+            // Detached versions will fail the `parse` step, which is ok.
             .and_then(|(version_str, _)| version_str.parse::<u64>().ok());
         match self {
             Self::V1 => file_number,
@@ -95,6 +108,10 @@ impl ManifestNamingScheme {
     }
 
     pub fn detect_scheme(filename: &str) -> Option<Self> {
+        if filename.starts_with(DETACHED_VERSION_PREFIX) {
+            // Currently, detached versions must imply V2
+            return Some(Self::V2);
+        }
         if filename.ends_with(MANIFEST_EXTENSION) {
             const V2_LEN: usize = 20 + 1 + MANIFEST_EXTENSION.len();
             if filename.len() == V2_LEN {
@@ -108,6 +125,8 @@ impl ManifestNamingScheme {
     }
 
     pub fn detect_scheme_staging(filename: &str) -> Self {
+        // We shouldn't have to worry about detached versions here since there is no
+        // such thing as "detached" and "staged" at the same time.
         if filename.chars().nth(20) == Some('.') {
             Self::V2
         } else {
@@ -462,6 +481,18 @@ async fn default_resolve_version(
     version: u64,
     object_store: &dyn OSObjectStore,
 ) -> Result<ManifestLocation> {
+    if is_detached_version(version) {
+        return Ok(ManifestLocation {
+            version,
+            // Detached versions are not supported with V1 naming scheme.  If we need
+            // to support in the future we could use a different prefix (e.g. 'x' or something)
+            naming_scheme: ManifestNamingScheme::V2,
+            // Both V1 and V2 should give the same path for detached versions
+            path: ManifestNamingScheme::V2.manifest_path(base_path, version),
+            size: None,
+        });
+    }
+
     // try V2, fallback to V1.
     let scheme = ManifestNamingScheme::V2;
     let path = scheme.manifest_path(base_path, version);

@@ -83,6 +83,13 @@ pub struct Manifest {
     pub config: HashMap<String, String>,
 }
 
+// We use the most significant bit to indicate that a transaction is detached
+pub const DETACHED_VERSION_MASK: u64 = 0x8000_0000_0000_0000;
+
+pub fn is_detached_version(version: u64) -> bool {
+    version & DETACHED_VERSION_MASK != 0
+}
+
 fn compute_fragment_offsets(fragments: &[Fragment]) -> Vec<usize> {
     fragments
         .iter()
