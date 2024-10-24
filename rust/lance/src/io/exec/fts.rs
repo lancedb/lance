@@ -244,7 +244,10 @@ impl ExecutionPlan for FlatFtsExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        self.column_inputs
+            .values()
+            .map(|(_, input)| input)
+            .collect()
     }
 
     fn with_new_children(
@@ -254,7 +257,7 @@ impl ExecutionPlan for FlatFtsExec {
         todo!()
     }
 
-    #[instrument(name = "fts_exec", level = "debug", skip_all)]
+    #[instrument(name = "flat_fts_exec", level = "debug", skip_all)]
     fn execute(
         &self,
         partition: usize,
