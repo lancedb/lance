@@ -56,7 +56,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::fts::FtsExec;
+use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
@@ -1333,7 +1333,7 @@ impl Scanner {
             .limit(self.limit);
 
         // load indices
-        let mut indices = HashMap::with_capacity(columns.len());
+        let mut column_inputs = HashMap::with_capacity(columns.len());
         for column in columns {
             let index = self
                 .dataset
@@ -1343,7 +1343,7 @@ impl Scanner {
                     format!("Column {} has no inverted index", column),
                     location!(),
                 ))?;
-            let index_uuids = self
+            let index_uuids: Vec<_> = self
                 .dataset
                 .load_indices_by_name(&index.name)
                 .await?
@@ -1375,18 +1375,24 @@ impl Scanner {
                 scan_node
             };
 
-            indices.insert(column.clone(), (index_uuids, unindexed_scan_node));
+            column_inputs.insert(column.clone(), (index_uuids, unindexed_scan_node));
         }
 
+        let indices = column_inputs
+            .iter()
+            .map(|(col, (idx, _))| (col.clone(), idx.clone()))
+            .collect();
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let fts_plan = Arc::new(FtsExec::new(
             self.dataset.clone(),
             indices,
-            query,
+            query.clone(),
             prefilter_source,
         )) as Arc<dyn ExecutionPlan>;
+        let flat_fts_plan = Arc::new(FlatFtsExec::new(self.dataset.clone(), column_inputs, query));
+        let fts_node = Arc::new(UnionExec::new(vec![fts_plan, flat_fts_plan]));
         let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
+            expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
             options: SortOptions {
                 descending: true,
                 nulls_first: false,
@@ -1394,7 +1400,7 @@ impl Scanner {
         };
 
         Ok(Arc::new(
-            SortExec::new(vec![sort_expr], fts_plan).with_fetch(self.limit.map(|l| l as usize)),
+            SortExec::new(vec![sort_expr], fts_node).with_fetch(self.limit.map(|l| l as usize)),
         ))
     }
 

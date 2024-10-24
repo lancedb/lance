@@ -37,7 +37,7 @@ use super::PreFilterSource;
 pub struct FtsExec {
     dataset: Arc<Dataset>,
     // column -> (indices, unindexed input stream)
-    indices: HashMap<String, (Vec<Index>, Arc<dyn ExecutionPlan>)>,
+    indices: HashMap<String, Vec<Index>>,
     query: FullTextSearchQuery,
     /// Prefiltering input
     prefilter_source: PreFilterSource,
@@ -57,7 +57,7 @@ impl DisplayAs for FtsExec {
 impl FtsExec {
     pub fn new(
         dataset: Arc<Dataset>,
-        indices: HashMap<String, (Vec<Index>, Arc<dyn ExecutionPlan>)>,
+        indices: HashMap<String, Vec<Index>>,
         query: FullTextSearchQuery,
         prefilter_source: PreFilterSource,
     ) -> Self {
@@ -116,7 +116,7 @@ impl ExecutionPlan for FtsExec {
 
         let indices = self.indices.clone();
         let stream = stream::iter(indices)
-            .map(move |(column, (indices, input))| {
+            .map(move |(column, indices)| {
                 let index_meta = indices[0].clone();
                 let uuid = index_meta.uuid.to_string();
                 let query = query.clone();
@@ -158,16 +158,7 @@ impl ExecutionPlan for FtsExec {
                     pre_filter.wait_for_ready().await?;
                     let results = index.full_text_search(&query, pre_filter).await?;
 
-                    let unindexed_stream = input.execute(partition, context)?;
-                    let unindexed_result_stream =
-                        flat_bm25_search_stream(unindexed_stream, column, query, index);
-
-                    let mut row_ids = Vec::new();
-                    let mut scores = Vec::new();
-                    for (row_id, score) in results {
-                        row_ids.push(row_id);
-                        scores.push(score);
-                    }
+                    let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
                     let batch = RecordBatch::try_new(
                         FTS_SCHEMA.clone(),
                         vec![
@@ -175,11 +166,133 @@ impl ExecutionPlan for FtsExec {
                             Arc::new(Float32Array::from(scores)),
                         ],
                     )?;
-                    let indexed_stream = stream::iter(vec![Ok(batch)]);
-                    Ok::<_, DataFusionError>(indexed_stream.chain(unindexed_result_stream))
+                    Ok::<_, DataFusionError>(batch)
                 }
             })
-            .buffered(self.indices.len())
+            .buffered(self.indices.len());
+        let schema = self.schema();
+        Ok(
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
+                as SendableRecordBatchStream,
+        )
+    }
+
+    fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
+        Ok(Statistics::new_unknown(&FTS_SCHEMA))
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+}
+
+/// An execution node that performs full text search
+///
+/// This node would perform full text search with inverted index on the dataset.
+/// The result is a stream of record batches containing the row ids that match the search query,
+/// and scores of the matched rows.
+#[derive(Debug)]
+pub struct FlatFtsExec {
+    dataset: Arc<Dataset>,
+    // column -> (indices, unindexed input stream)
+    column_inputs: HashMap<String, (Vec<Index>, Arc<dyn ExecutionPlan>)>,
+    query: FullTextSearchQuery,
+    properties: PlanProperties,
+}
+
+impl DisplayAs for FlatFtsExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "FlatFts: query={}", self.query.query)
+            }
+        }
+    }
+}
+
+impl FlatFtsExec {
+    pub fn new(
+        dataset: Arc<Dataset>,
+        column_inputs: HashMap<String, (Vec<Index>, Arc<dyn ExecutionPlan>)>,
+        query: FullTextSearchQuery,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(FTS_SCHEMA.clone()),
+            Partitioning::RoundRobinBatch(1),
+            ExecutionMode::Bounded,
+        );
+        Self {
+            dataset,
+            column_inputs,
+            query,
+            properties,
+        }
+    }
+}
+
+impl ExecutionPlan for FlatFtsExec {
+    fn name(&self) -> &str {
+        "FlatFtsExec"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        FTS_SCHEMA.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        todo!()
+    }
+
+    #[instrument(name = "fts_exec", level = "debug", skip_all)]
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let query = self.query.clone();
+        let ds = self.dataset.clone();
+        let column_inputs = self.column_inputs.clone();
+
+        let stream = stream::iter(column_inputs)
+            .map(move |(column, (indices, input))| {
+                let index_meta = indices[0].clone();
+                let uuid = index_meta.uuid.to_string();
+                let query = query.clone();
+                let ds = ds.clone();
+                let context = context.clone();
+
+                async move {
+                    let index = ds.open_generic_index(&column, &uuid).await?;
+                    let index =
+                        index
+                            .as_any()
+                            .downcast_ref::<InvertedIndex>()
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "Index {} is not an inverted index",
+                                    uuid,
+                                ))
+                            })?;
+
+                    let unindexed_stream = input.execute(partition, context)?;
+                    let unindexed_result_stream =
+                        flat_bm25_search_stream(unindexed_stream, column, query, index);
+
+                    Ok::<_, DataFusionError>(unindexed_result_stream)
+                }
+            })
+            .buffered(self.column_inputs.len())
             .try_flatten();
         let schema = self.schema();
         Ok(

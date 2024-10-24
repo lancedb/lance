@@ -112,7 +112,7 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
         let mut tokenizer = self.tokenizer.clone();
-        let tokens = collect_tokens(&query.query, &mut tokenizer);
+        let tokens = collect_tokens(&query.query, &mut tokenizer, None);
         let token_ids = self.map(&tokens).into_iter();
         let token_ids = if !is_phrase_query(&query.query) {
             token_ids.sorted_unstable().dedup().collect()
@@ -987,7 +987,7 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
 ) -> Result<Vec<u64>> {
     let mut results = Vec::new();
     let mut tokenizer = tokenizer.unwrap_or_else(|| TokenizerConfig::default().build().unwrap());
-    let query_tokens = collect_tokens(query, &mut tokenizer)
+    let query_tokens = collect_tokens(query, &mut tokenizer, None)
         .into_iter()
         .collect::<HashSet<_>>();
 
@@ -996,8 +996,8 @@ fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
-            let doc_tokens = collect_tokens(doc, &mut tokenizer);
-            if doc_tokens.iter().any(|token| query_tokens.contains(token)) {
+            let doc_tokens = collect_tokens(doc, &mut tokenizer, Some(&query_tokens));
+            if !doc_tokens.is_empty() {
                 results.push(row_id_array.value(i));
                 assert!(doc.contains(query));
             }
@@ -1011,7 +1011,8 @@ pub fn flat_bm25_search(
     batch: RecordBatch,
     doc_col: &str,
     inverted_list: &InvertedListReader,
-    query_tokens: &HashMap<String, Option<u32>>,
+    query_tokens: &HashSet<String>,
+    query_token_ids: &HashMap<String, Option<u32>>,
     tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
     avgdl: f32,
     num_docs: usize,
@@ -1026,7 +1027,8 @@ pub fn flat_bm25_search(
                 continue;
             }
         };
-        let doc_tokens = collect_tokens(doc, tokenizer);
+
+        let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
         let mut doc_token_count = HashMap::new();
         for token in doc_tokens {
@@ -1036,7 +1038,7 @@ pub fn flat_bm25_search(
                 .or_insert(1);
         }
         let mut score = 0.0;
-        for (token, token_id) in query_tokens.iter() {
+        for (token, token_id) in query_token_ids.iter() {
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
 
             let idf = if let Some(token_id) = token_id {
@@ -1067,7 +1069,7 @@ pub fn flat_bm25_search_stream(
     index: &InvertedIndex,
 ) -> SendableRecordBatchStream {
     let mut tokenizer = index.tokenizer.clone();
-    let query_tokens = collect_tokens(&query.query, &mut tokenizer)
+    let query_token_ids = collect_tokens(&query.query, &mut tokenizer, None)
         .into_iter()
         .dedup()
         .map(|token| {
@@ -1075,6 +1077,7 @@ pub fn flat_bm25_search_stream(
             (token, token_id)
         })
         .collect::<HashMap<_, _>>();
+    let query_tokens = query_token_ids.keys().cloned().collect::<HashSet<_>>();
     let inverted_list = index.inverted_list.clone();
     let num_docs = index.docs.len();
     let avgdl = index.docs.average_length();
@@ -1086,6 +1089,7 @@ pub fn flat_bm25_search_stream(
             &doc_col,
             inverted_list.as_ref(),
             &query_tokens,
+            &query_token_ids,
             &mut tokenizer,
             avgdl,
             num_docs,
@@ -1095,10 +1099,19 @@ pub fn flat_bm25_search_stream(
     Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
 }
 
-pub fn collect_tokens(text: &str, tokenizer: &mut tantivy::tokenizer::TextAnalyzer) -> Vec<String> {
+pub fn collect_tokens(
+    text: &str,
+    tokenizer: &mut tantivy::tokenizer::TextAnalyzer,
+    inclusive: Option<&HashSet<String>>,
+) -> Vec<String> {
     let mut stream = tokenizer.token_stream(text);
     let mut tokens = Vec::new();
     while let Some(token) = stream.next() {
+        if let Some(inclusive) = inclusive {
+            if !inclusive.contains(&token.text) {
+                continue;
+            }
+        }
         tokens.push(token.text.to_owned());
     }
     tokens
