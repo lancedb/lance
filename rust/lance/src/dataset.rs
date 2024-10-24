@@ -734,10 +734,12 @@ impl Dataset {
         let stream = reader_to_stream(batches);
 
         // Return Error if append and input schema differ
-        self.manifest.schema.check_compatible(
-            &schema,
+        schema.check_compatible(
+            &self.manifest.schema,
             &SchemaCompareOptions {
                 compare_dictionary: true,
+                ignore_field_order: true,
+                allow_missing_if_nullable: true,
                 ..Default::default()
             },
         )?;
