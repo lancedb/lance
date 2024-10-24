@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -235,17 +237,23 @@ pub async fn write_fragments_internal(
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
-                schema.check_compatible(dataset.schema(), &Default::default())?;
-                // Use the schema from the dataset, because it has the correct
-                // field ids.  Use the storage version from the dataset, ignoring
-                // any version from the user.
-                (
+                schema.check_compatible(
                     dataset.schema(),
-                    dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?,
-                )
+                    &SchemaCompareOptions {
+                        allow_missing_if_nullable: true,
+                        ignore_field_order: true,
+                        compare_dictionary: true,
+                        ..Default::default()
+                    },
+                )?;
+                // Project from the dataset schema, because it has the correct field ids.
+                let write_schema = dataset.schema().project_by_schema(schema)?;
+                // Use the storage version from the dataset, ignoring any version from the user.
+                let data_storage_version = dataset
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_version()?;
+                (Cow::Owned(write_schema), data_storage_version)
             }
             WriteMode::Overwrite => {
                 // Overwrite, use the schema from the data.  If the user specified
@@ -257,13 +265,13 @@ pub async fn write_fragments_internal(
                         .data_storage_format
                         .lance_file_version()?,
                 );
-                (schema, data_storage_version)
+                (Cow::Borrowed(schema), data_storage_version)
             }
         }
     } else {
         // Brand new dataset, use the schema from the data and the storage version
         // from the user or the default.
-        (schema, params.storage_version_or_default())
+        (Cow::Borrowed(schema), params.storage_version_or_default())
     };
 
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
@@ -276,7 +284,7 @@ pub async fn write_fragments_internal(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    let writer_generator = WriterGenerator::new(object_store, base_dir, &schema, storage_version);
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();

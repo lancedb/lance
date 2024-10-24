@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
@@ -386,6 +388,101 @@ mod v2_adapter {
     }
 }
 
+/// A reader where all rows are null. Used when there are fields that have no
+/// data files in a fragment.
+#[derive(Debug, Clone)]
+struct NullReader {
+    schema: Arc<Schema>,
+    num_rows: u32,
+}
+
+impl NullReader {
+    fn new(schema: Arc<Schema>, num_rows: u32) -> Self {
+        Self { schema, num_rows }
+    }
+
+    fn batch(projection: Arc<ArrowSchema>, num_rows: usize) -> RecordBatch {
+        let columns = projection
+            .fields()
+            .iter()
+            .map(|f| new_null_array(f.data_type(), num_rows))
+            .collect::<Vec<_>>();
+        RecordBatch::try_new(projection, columns).unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl GenericFileReader for NullReader {
+    fn read_range_tasks(
+        &self,
+        range: Range<u64>,
+        batch_size: u32,
+        projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        let mut remaining_rows = range.end - range.start;
+        let projection: Arc<ArrowSchema> = Arc::new(projection.as_ref().into());
+
+        let task_iter = std::iter::from_fn(move || {
+            if remaining_rows == 0 {
+                return None;
+            }
+
+            let num_rows = remaining_rows.min(batch_size as u64) as usize;
+            remaining_rows -= num_rows as u64;
+            let batch = Self::batch(projection.clone(), num_rows);
+            let task = ReadBatchTask {
+                task: futures::future::ready(Ok(batch)).boxed(),
+                num_rows: num_rows as u32,
+            };
+            Some(task)
+        });
+
+        Ok(futures::stream::iter(task_iter).boxed())
+    }
+
+    fn read_all_tasks(
+        &self,
+        batch_size: u32,
+        projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        self.read_range_tasks(0..self.num_rows as u64, batch_size, projection)
+    }
+
+    fn take_all_tasks(
+        &self,
+        indices: &[u32],
+        batch_size: u32,
+        projection: Arc<Schema>,
+    ) -> Result<ReadBatchTaskStream> {
+        let num_rows = indices.len() as u64;
+        self.read_range_tasks(0..num_rows, batch_size, projection)
+    }
+
+    fn projection(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+
+    fn len(&self) -> u32 {
+        self.num_rows
+    }
+
+    fn clone_box(&self) -> Box<dyn GenericFileReader> {
+        Box::new(self.clone())
+    }
+
+    fn is_legacy(&self) -> bool {
+        false
+    }
+
+    fn as_legacy_opt(&self) -> Option<&FileReader> {
+        None
+    }
+
+    fn as_legacy_opt_mut(&mut self) -> Option<&mut FileReader> {
+        None
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FragReadConfig {
     // Add the row id column
@@ -704,6 +801,20 @@ impl FileFragment {
             {
                 opened_files.push(reader);
             }
+        }
+
+        // Check if there are any fields that are not in any data files
+        let field_ids_in_files = opened_files
+            .iter()
+            .flat_map(|r| r.projection().fields_pre_order().map(|f| f.id))
+            .filter(|id| *id >= 0)
+            .collect::<HashSet<_>>();
+        let mut missing_fields = projection.field_ids();
+        missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
+        if !missing_fields.is_empty() {
+            let missing_projection = projection.project_by_ids(&missing_fields);
+            let null_reader = NullReader::new(Arc::new(missing_projection), opened_files[0].len());
+            opened_files.push(Box::new(null_reader));
         }
 
         Ok(opened_files)
