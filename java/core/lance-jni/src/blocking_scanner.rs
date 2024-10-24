@@ -143,7 +143,7 @@ fn inner_create_scanner<'local>(
 
     let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait).await })?;
+        RT.block_on(async { scanner.filter_substrait(substrait) })?;
     }
 
     let filter_opt = env.get_string_opt(&filter_obj)?;
