@@ -1404,17 +1404,6 @@ impl Scanner {
         ))
     }
 
-    // fn flat_fts(
-    //     &self,
-    //     input: Arc<dyn ExecutionPlan>,
-    //     column: String,
-    //     index: Index,
-    //     query: FullTextSearchQuery,
-    // ) -> Result<Arc<dyn ExecutionPlan>> {
-    //     let flat_fts_plan = FlatFtsExec::new(input, column, index, query);
-    //     Ok(Arc::new(flat_fts_plan))
-    // }
-
     // ANN/KNN search execution node with optional prefilter
     async fn knn(&self, filter_plan: &FilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let Some(q) = self.nearest.as_ref() else {

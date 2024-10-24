@@ -186,9 +186,9 @@ impl ExecutionPlan for FtsExec {
     }
 }
 
-/// An execution node that performs full text search
+/// An execution node that performs flat full text search
 ///
-/// This node would perform full text search with inverted index on the dataset.
+/// This node would perform flat full text search on unindexed rows.
 /// The result is a stream of record batches containing the row ids that match the search query,
 /// and scores of the matched rows.
 #[derive(Debug)]
