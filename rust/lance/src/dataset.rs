@@ -4909,7 +4909,6 @@ mod tests {
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
         dataset.append(reader, None).await.unwrap();
-        // TODO: do we also need to check the write() path, since it seems separate?
 
         // Looking at the fragments, there is no data file with the missing field
         let fragments = dataset.get_fragments();
@@ -4967,5 +4966,130 @@ mod tests {
         assert_eq!(data, expected);
     }
 
-    // TODO: test nested fields and subschemas
+    #[tokio::test]
+    async fn test_insert_nested_subschemas() {
+        // Test subschemas at struct level
+        // Test different orders
+        // Test the Dataset::write() path
+        // Test Take across fragments with different field id sets
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let field_a = Arc::new(ArrowField::new("a", DataType::Int32, false));
+        let field_b = Arc::new(ArrowField::new("b", DataType::Int32, true));
+        let field_c = Arc::new(ArrowField::new("c", DataType::Int32, false));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_a.clone(), field_b.clone(), field_c.clone()].into()),
+            true,
+        )]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        Dataset::write(empty_reader, test_uri, None).await.unwrap();
+
+        let append_options = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        // Can insert b, a
+        let just_ba = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_a.clone(), field_b.clone()].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            just_ba.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_b.clone(),
+                    Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                ),
+                (field_a.clone(), Arc::new(Int32Array::from(vec![2]))),
+            ]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_ba.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
+            .await
+            .unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[2, 1]);
+
+        // Can insert c, b
+        let just_cb = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_b.clone(), field_c.clone()].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            just_cb.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_b.clone(),
+                    Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+                ),
+                (field_c.clone(), Arc::new(Int32Array::from(vec![4]))),
+            ]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_cb.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
+            .await
+            .unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].metadata.files.len(), 1);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[3, 2]);
+
+        // Can't insert a, c (b is non-nullable)
+        let just_ac = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_a.clone(), field_c.clone()].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            just_ac.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_a.clone(),
+                    Arc::new(Int32Array::from(vec![5])) as ArrayRef,
+                ),
+                (field_c.clone(), Arc::new(Int32Array::from(vec![6]))),
+            ]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_ac.clone());
+        let res = Dataset::write(reader, test_uri, Some(append_options)).await;
+        assert!(
+            matches!(res, Err(Error::SchemaMismatch { .. })),
+            "Expected Error::SchemaMismatch, got {:?}",
+            res
+        );
+
+        // Can call take and get rows from all three back in one batch
+        let result = dataset
+            .take(&[1, 2, 0], Arc::new(dataset.schema().clone()))
+            .await
+            .unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_a.clone(),
+                    Arc::new(Int32Array::from(vec![2, 1, 5])) as ArrayRef,
+                ),
+                (
+                    field_b.clone(),
+                    Arc::new(Int32Array::from(vec![Some(1), Some(3), None])),
+                ),
+                (
+                    field_c.clone(),
+                    Arc::new(Int32Array::from(vec![None, Some(4), Some(6)])),
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(result, expected);
+    }
 }
