@@ -243,15 +243,24 @@ impl UpdateJob {
             .manifest()
             .data_storage_format
             .lance_file_version()?;
-        let new_fragments = write_fragments_internal(
+        let written = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
-            self.dataset.schema(),
+            self.dataset.schema().clone(),
             Box::pin(stream),
             WriteParams::with_storage_version(version),
         )
         .await?;
+
+        if written.blob.is_some() {
+            return Err(Error::NotSupported {
+                source: "Updating blob columns".into(),
+                location: location!(),
+            });
+        }
+        let new_fragments = written.default.0;
+
         // Apply deletions
         let removed_row_ids = Arc::into_inner(removed_row_ids)
             .unwrap()
@@ -345,7 +354,12 @@ impl UpdateJob {
             updated_fragments,
             new_fragments,
         };
-        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        let transaction = Transaction::new(
+            self.dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
 
         let manifest = commit_transaction(
             self.dataset.as_ref(),

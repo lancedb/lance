@@ -201,6 +201,7 @@ impl ManifestProvider for ManifestDescribing {
             schema.clone(),
             Arc::new(vec![]),
             DataStorageFormat::new(LanceFileVersion::Legacy),
+            /*blob_dataset_version= */ None,
         );
         let pos = do_write_manifest(object_writer, &mut manifest, None).await?;
         Ok(Some(pos))
@@ -247,7 +248,12 @@ mod test {
         let mut config = HashMap::new();
         config.insert("key".to_string(), "value".to_string());
 
-        let mut manifest = Manifest::new(schema, Arc::new(vec![]), DataStorageFormat::default());
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+        );
         let pos = write_manifest(&mut writer, &mut manifest, None)
             .await
             .unwrap();

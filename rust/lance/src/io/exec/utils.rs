@@ -12,7 +12,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
-use lance_core::utils::futures::{Capacity, SharedStream, SharedStreamExt};
+use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{Result, ROW_ID};
 use lance_index::prefilter::FilterLoader;
@@ -139,7 +139,7 @@ impl DisplayAs for ReplayExec {
 // for that shared stream to be a SendableRecordBatchStream, it needs to be
 // using DataFusionError.  So we need to adapt the stream back to a
 // SendableRecordBatchStream.
-struct ShareableRecordBatchStream(SendableRecordBatchStream);
+pub struct ShareableRecordBatchStream(pub SendableRecordBatchStream);
 
 impl Stream for ShareableRecordBatchStream {
     type Item = CloneableResult<RecordBatch>;
@@ -158,12 +158,21 @@ impl Stream for ShareableRecordBatchStream {
     }
 }
 
-struct ShareableRecordBatchStreamAdapter {
+pub struct ShareableRecordBatchStreamAdapter<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin>
+{
     schema: SchemaRef,
-    stream: SharedStream<'static, CloneableResult<RecordBatch>>,
+    stream: S,
 }
 
-impl Stream for ShareableRecordBatchStreamAdapter {
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> ShareableRecordBatchStreamAdapter<S> {
+    pub fn new(schema: SchemaRef, stream: S) -> Self {
+        Self { schema, stream }
+    }
+}
+
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
+    for ShareableRecordBatchStreamAdapter<S>
+{
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(
@@ -181,7 +190,9 @@ impl Stream for ShareableRecordBatchStreamAdapter {
     }
 }
 
-impl RecordBatchStream for ShareableRecordBatchStreamAdapter {
+impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
+    for ShareableRecordBatchStreamAdapter<S>
+{
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

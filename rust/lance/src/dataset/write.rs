@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions};
+use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::Dataset;
 
+use super::blob::BlobStreamExt;
 use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
@@ -165,7 +166,7 @@ pub async fn write_fragments(
     dataset_uri: &str,
     data: impl RecordBatchReader + Send + 'static,
     params: WriteParams,
-) -> Result<Vec<Fragment>> {
+) -> Result<WrittenFragments> {
     let (dataset, object_store, base) = if matches!(params.mode, WriteMode::Append) {
         match DatasetBuilder::from_uri(dataset_uri)
             .with_write_params(params.clone())
@@ -204,78 +205,23 @@ pub async fn write_fragments(
         dataset.as_ref(),
         Arc::new(object_store),
         &base,
-        &schema,
+        schema,
         stream,
         params,
     )
     .await
 }
 
-/// Writes the given data to the dataset and returns fragments.
-///
-/// NOTE: the fragments have not yet been assigned an ID. That must be done
-/// by the caller. This is so this function can be called in parallel, and the
-/// IDs can be assigned after writing is complete.
-///
-/// This is a private variant that takes a `SendableRecordBatchStream` instead
-/// of a reader. We don't expose the stream at our interface because it is a
-/// DataFusion type.
-#[instrument(level = "debug", skip_all)]
-pub async fn write_fragments_internal(
-    dataset: Option<&Dataset>,
+pub async fn do_write_fragments(
     object_store: Arc<ObjectStore>,
     base_dir: &Path,
     schema: &Schema,
     data: SendableRecordBatchStream,
-    mut params: WriteParams,
+    params: WriteParams,
+    storage_version: LanceFileVersion,
 ) -> Result<Vec<Fragment>> {
-    // Make sure the max rows per group is not larger than the max rows per file
-    params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
-
-    let (schema, storage_version) = if let Some(dataset) = dataset {
-        match params.mode {
-            WriteMode::Append | WriteMode::Create => {
-                // Append mode, so we need to check compatibility
-                schema.check_compatible(
-                    dataset.schema(),
-                    // We don't if the user claims their data is nullable / non-nullable.  We will
-                    // verify against the actual data.
-                    &SchemaCompareOptions {
-                        compare_nullability: NullabilityComparison::Ignore,
-                        ..Default::default()
-                    },
-                )?;
-                // Use the schema from the dataset, because it has the correct
-                // field ids.  Use the storage version from the dataset, ignoring
-                // any version from the user.
-                (
-                    dataset.schema(),
-                    dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?,
-                )
-            }
-            WriteMode::Overwrite => {
-                // Overwrite, use the schema from the data.  If the user specified
-                // a storage version use that.  Otherwise use the version from the
-                // dataset.
-                let data_storage_version = params.data_storage_version.unwrap_or(
-                    dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?,
-                );
-                (schema, data_storage_version)
-            }
-        }
-    } else {
-        // Brand new dataset, use the schema from the data and the storage version
-        // from the user or the default.
-        (schema, params.storage_version_or_default())
-    };
-
     let mut buffered_reader = if storage_version == LanceFileVersion::Legacy {
+        // In v1 we split the stream into row group sized batches
         chunk_stream(data, params.max_rows_per_group)
     } else {
         // In v2 we don't care about group size but we do want to break
@@ -326,6 +272,126 @@ pub async fn write_fragments_internal(
     }
 
     Ok(fragments)
+}
+
+pub struct WrittenFragments {
+    /// The fragments written to the dataset (and the schema)
+    pub default: (Vec<Fragment>, Schema),
+    /// The fragments written to the blob dataset, if any
+    pub blob: Option<(Vec<Fragment>, Schema)>,
+}
+
+/// Writes the given data to the dataset and returns fragments.
+///
+/// NOTE: the fragments have not yet been assigned an ID. That must be done
+/// by the caller. This is so this function can be called in parallel, and the
+/// IDs can be assigned after writing is complete.
+///
+/// This is a private variant that takes a `SendableRecordBatchStream` instead
+/// of a reader. We don't expose the stream at our interface because it is a
+/// DataFusion type.
+#[instrument(level = "debug", skip_all)]
+pub async fn write_fragments_internal(
+    dataset: Option<&Dataset>,
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: Schema,
+    data: SendableRecordBatchStream,
+    mut params: WriteParams,
+) -> Result<WrittenFragments> {
+    // Make sure the max rows per group is not larger than the max rows per file
+    params.max_rows_per_group = std::cmp::min(params.max_rows_per_group, params.max_rows_per_file);
+
+    let (schema, storage_version) = if let Some(dataset) = dataset {
+        match params.mode {
+            WriteMode::Append | WriteMode::Create => {
+                // Append mode, so we need to check compatibility
+                schema.check_compatible(
+                    dataset.schema(),
+                    &SchemaCompareOptions {
+                        // We don't care if the user claims their data is nullable / non-nullable.
+                        // We will verify against the actual data in the writer.
+                        compare_nullability: NullabilityComparison::Ignore,
+                        ..Default::default()
+                    },
+                )?;
+                // Use the schema from the dataset, because it has the correct
+                // field ids.  Use the storage version from the dataset, ignoring
+                // any version from the user.
+                (
+                    dataset.schema().clone(),
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                )
+            }
+            WriteMode::Overwrite => {
+                // Overwrite, use the schema from the data.  If the user specified
+                // a storage version use that.  Otherwise use the version from the
+                // dataset.
+                let data_storage_version = params.data_storage_version.unwrap_or(
+                    dataset
+                        .manifest()
+                        .data_storage_format
+                        .lance_file_version()?,
+                );
+                (schema, data_storage_version)
+            }
+        }
+    } else {
+        // Brand new dataset, use the schema from the data and the storage version
+        // from the user or the default.
+        (schema, params.storage_version_or_default())
+    };
+
+    let (data, blob_data) = data.extract_blob_stream(&schema);
+
+    // Some params we borrow from the normal write, some we override
+    let blob_write_params = WriteParams {
+        store_params: params.store_params.clone(),
+        commit_handler: params.commit_handler.clone(),
+        data_storage_version: params.data_storage_version.clone(),
+        enable_move_stable_row_ids: true,
+        // This shouldn't really matter since all commits are detached
+        enable_v2_manifest_paths: true,
+        object_store_registry: params.object_store_registry.clone(),
+        max_bytes_per_file: params.max_bytes_per_file,
+        max_rows_per_file: params.max_rows_per_file,
+        ..Default::default()
+    };
+
+    let frag_schema = schema.retain_storage_class(StorageClass::Default);
+    let fragments_fut = do_write_fragments(
+        object_store.clone(),
+        base_dir,
+        &frag_schema,
+        data,
+        params,
+        storage_version,
+    );
+
+    let (default, blob) = if let Some(blob_data) = blob_data {
+        let blob_schema = dbg!(schema.retain_storage_class(StorageClass::Blob));
+        let blobs_path = base_dir.child("_blobs");
+        let blob_fut = do_write_fragments(
+            object_store,
+            &blobs_path,
+            &blob_schema,
+            blob_data,
+            blob_write_params,
+            storage_version,
+        );
+        let (fragments_res, blobs_res) = futures::join!(fragments_fut, blob_fut);
+        let fragments = fragments_res?;
+        let blobs = blobs_res?;
+        ((fragments, frag_schema), Some((blobs, blob_schema)))
+    } else {
+        let fragments = fragments_fut.await?;
+        ((fragments, frag_schema), None)
+    };
+
+    Ok(WrittenFragments { default, blob })
 }
 
 #[async_trait::async_trait]
@@ -598,7 +664,7 @@ mod tests {
                     None,
                     object_store,
                     &Path::from("test"),
-                    &schema,
+                    schema,
                     data_stream,
                     write_params,
                 )
@@ -618,7 +684,12 @@ mod tests {
                 .into_reader_rows(RowCount::from(10 * 1024), BatchCount::from(2)),
         );
 
-        assert_eq!(reader_to_frags(data_reader).await.unwrap().len(), 2);
+        let written = reader_to_frags(data_reader).await.unwrap();
+
+        assert!(written.blob.is_none());
+        let fragments = written.default.0;
+
+        assert_eq!(fragments.len(), 2);
     }
 
     #[tokio::test]
@@ -660,16 +731,20 @@ mod tests {
             let schema = Schema::try_from(schema.as_ref()).unwrap();
 
             let object_store = Arc::new(ObjectStore::memory());
-            let fragments = write_fragments_internal(
+            let written = write_fragments_internal(
                 None,
                 object_store,
                 &Path::from("test"),
-                &schema,
+                schema,
                 data_stream,
                 write_params,
             )
             .await
             .unwrap();
+
+            assert!(written.blob.is_none());
+            let fragments = written.default.0;
+
             assert_eq!(fragments.len(), 1);
             let fragment = &fragments[0];
             assert_eq!(fragment.files.len(), 1);
@@ -733,16 +808,19 @@ mod tests {
 
         let object_store = Arc::new(ObjectStore::memory());
         let base_path = Path::from("test");
-        let fragments = write_fragments_internal(
+        let written = write_fragments_internal(
             None,
             object_store.clone(),
             &base_path,
-            &schema,
+            schema.clone(),
             data_stream,
             write_params,
         )
         .await
         .unwrap();
+
+        assert!(written.blob.is_none());
+        let fragments = written.default.0;
 
         assert_eq!(fragments.len(), 1);
         let fragment = &fragments[0];

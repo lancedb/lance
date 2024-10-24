@@ -45,7 +45,7 @@ use prost::Message;
 use super::ObjectStore;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
 use crate::Dataset;
 
@@ -116,18 +116,21 @@ fn check_transaction(
     Ok(())
 }
 
-pub(crate) async fn commit_new_dataset(
+async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
+    blob_version: Option<u64>,
 ) -> Result<Manifest> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
-        transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+        transaction.build_manifest(None, vec![], &transaction_file, write_config, blob_version)?;
+
+    manifest.blob_dataset_version = blob_version;
 
     let result = write_manifest_file(
         object_store,
@@ -154,6 +157,44 @@ pub(crate) async fn commit_new_dataset(
         }),
         Err(CommitError::OtherError(err)) => Err(err),
     }
+}
+
+pub(crate) async fn commit_new_dataset(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
+) -> Result<Manifest> {
+    let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+        let blob_path = base_path.child(BLOB_DIR);
+        let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
+        let blob_manifest = do_commit_new_dataset(
+            object_store,
+            commit_handler,
+            &blob_path,
+            &blob_tx,
+            write_config,
+            manifest_naming_scheme,
+            None,
+        )
+        .await?;
+        Some(blob_manifest.version)
+    } else {
+        None
+    };
+
+    do_commit_new_dataset(
+        object_store,
+        commit_handler,
+        base_path,
+        transaction,
+        write_config,
+        manifest_naming_scheme,
+        blob_version,
+    )
+    .await
 }
 
 /// Internal function to check if a manifest could use some migration.
@@ -419,13 +460,14 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     Ok(())
 }
 
-pub(crate) async fn commit_detached_transaction(
+pub(crate) async fn do_commit_detached_transaction(
     dataset: &Dataset,
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
+    new_blob_version: Option<u64>,
 ) -> Result<Manifest> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
@@ -453,6 +495,7 @@ pub(crate) async fn commit_detached_transaction(
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
+                new_blob_version,
             )?,
         };
 
@@ -513,6 +556,45 @@ pub(crate) async fn commit_detached_transaction(
     })
 }
 
+pub(crate) async fn commit_detached_transaction(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+) -> Result<Manifest> {
+    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
+        let blobs_tx =
+            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
+        let blobs_manifest = do_commit_detached_transaction(
+            blobs_dataset.as_ref(),
+            object_store,
+            commit_handler,
+            &blobs_tx,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await?;
+        Some(blobs_manifest.version)
+    } else {
+        None
+    };
+
+    do_commit_detached_transaction(
+        dataset,
+        object_store,
+        commit_handler,
+        transaction,
+        write_config,
+        commit_config,
+        new_blob_version,
+    )
+    .await
+}
+
 /// Attempt to commit a transaction, with retries and conflict resolution.
 pub(crate) async fn commit_transaction(
     dataset: &Dataset,
@@ -523,6 +605,25 @@ pub(crate) async fn commit_transaction(
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<Manifest> {
+    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
+        let blobs_tx =
+            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
+        let blobs_manifest = do_commit_detached_transaction(
+            blobs_dataset.as_ref(),
+            object_store,
+            commit_handler,
+            &blobs_tx,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await?;
+        Some(blobs_manifest.version)
+    } else {
+        None
+    };
+
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
@@ -583,6 +684,7 @@ pub(crate) async fn commit_transaction(
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
+                new_blob_version,
             )?,
         };
 
@@ -832,6 +934,7 @@ mod tests {
         let transaction = Transaction::new(
             42,
             Operation::Append { fragments: vec![] },
+            /*blobs_op= */ None,
             Some("hello world".to_string()),
         );
 
@@ -1174,7 +1277,12 @@ mod tests {
             },
         ];
 
-        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version=*/ None,
+        );
 
         fix_schema(&mut manifest).unwrap();
 

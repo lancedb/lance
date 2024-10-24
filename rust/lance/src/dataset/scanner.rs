@@ -330,8 +330,9 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
+        // By default, we only scan the local schema
         let projection_plan = ProjectionPlan::new_empty(
-            Arc::new(dataset.schema().clone()),
+            Arc::new(dataset.local_schema().clone()),
             /*load_blobs= */ false,
         );
         Self {
@@ -1120,6 +1121,23 @@ impl Scanner {
                 location: location!(),
             });
         }
+        if let Some(first_blob_col) = self
+            .projection_plan
+            .physical_schema
+            .fields
+            .iter()
+            .find(|f| !f.is_default_storage())
+        {
+            return Err(Error::NotSupported {
+                source: format!(
+                    "Scanning blob columns such as \"{}\" is not yet supported",
+                    first_blob_col.name
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
 

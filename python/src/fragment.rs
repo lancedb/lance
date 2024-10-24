@@ -467,11 +467,17 @@ pub fn write_fragments(
         .transpose()?
         .unwrap_or_default();
 
-    let fragments = RT
+    let written = RT
         .block_on(Some(reader.py()), async {
             lance::dataset::write_fragments(dataset_uri, batches, params).await
         })?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+    assert!(
+        written.blob.is_none(),
+        "Blob writing is not yet supported by the python _write_fragments API"
+    );
+    let fragments = written.default.0;
 
     fragments
         .into_iter()

@@ -122,3 +122,68 @@ def test_take_deleted_blob(tmp_path, dataset_with_blobs):
         match="A take operation that includes row addresses must not target deleted",
     ):
         dataset_with_blobs.take_blobs(row_ids, "blobs")
+
+
+def test_blob_storage_class(tmp_path):
+    # 1 MiB per value
+    big_val = "0" * 1024 * 1024
+
+    # 16 batches of 8 rows = 128 rows
+    def datagen():
+        for batch_idx in range(16):
+            start = batch_idx * 8
+            end = start + 8
+            values = pa.array([big_val for _ in range(start, end)], pa.large_binary())
+            idx = pa.array(range(start, end), pa.uint64())
+            table = pa.record_batch(
+                [values, idx],
+                schema=pa.schema(
+                    [
+                        pa.field(
+                            "blobs",
+                            pa.large_binary(),
+                            metadata={
+                                "lance-schema:storage-class": "blob",
+                            },
+                        ),
+                        pa.field("idx", pa.uint64()),
+                    ]
+                ),
+            )
+            yield table
+
+    schema = next(iter(datagen())).schema
+    ds = lance.write_dataset(
+        datagen(),
+        tmp_path / "test_ds",
+        max_bytes_per_file=16 * 1024 * 1024,
+        schema=schema,
+    )
+
+    # 16 MiB per file, 128 total MiB, so we should have 8 files
+    blob_dir = tmp_path / "test_ds" / "_blobs" / "data"
+    assert len(list(blob_dir.iterdir())) == 8
+
+    # A read will only return non-blob columns
+    assert ds.to_table() == pa.table(
+        {
+            "idx": pa.array(range(128), pa.uint64()),
+        }
+    )
+
+    # Now verify we can append some data
+    ds = lance.write_dataset(
+        datagen(),
+        tmp_path / "test_ds",
+        max_bytes_per_file=32 * 1024 * 1024,
+        schema=schema,
+        mode="append",
+    )
+
+    assert len(list(blob_dir.iterdir())) == 12
+
+    assert ds.to_table() == pa.table(
+        {
+            "idx": pa.array(list(range(128)) + list(range(128)), pa.uint64()),
+        }
+    )

@@ -77,7 +77,20 @@ pub struct Transaction {
     pub read_version: u64,
     pub uuid: String,
     pub operation: Operation,
+    /// If the transaction modified the blobs dataset, this is the operation
+    /// to apply to the blobs dataset.
+    ///
+    /// If this is `None`, then the blobs dataset was not modified
+    pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlobsOperation {
+    /// The operation did not modify the blobs dataset
+    Unchanged,
+    /// The operation modified the blobs dataset, contains the new version of the blobs dataset
+    Updated(u64),
 }
 
 /// An operation on a dataset.
@@ -282,12 +295,18 @@ impl Operation {
 }
 
 impl Transaction {
-    pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
+    pub fn new(
+        read_version: u64,
+        operation: Operation,
+        blobs_op: Option<Operation>,
+        tag: Option<String>,
+    ) -> Self {
         let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
         Self {
             read_version,
             uuid,
             operation,
+            blobs_op,
             tag,
         }
     }
@@ -456,6 +475,7 @@ impl Transaction {
         current_indices: Vec<Index>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
+        new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
         if config.use_move_stable_row_ids
             && current_manifest
@@ -677,8 +697,12 @@ impl Transaction {
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            let mut prev_manifest =
-                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
+            let mut prev_manifest = Manifest::new_from_previous(
+                current_manifest,
+                schema,
+                Arc::new(final_fragments),
+                new_blob_version,
+            );
             if user_requested_version.is_some()
                 && matches!(self.operation, Operation::Overwrite { .. })
             {
@@ -692,7 +716,12 @@ impl Transaction {
         } else {
             let data_storage_format =
                 Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
-            Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
+            Manifest::new(
+                schema,
+                Arc::new(final_fragments),
+                data_storage_format,
+                new_blob_version,
+            )
         };
 
         manifest.tag.clone_from(&self.tag);
@@ -1053,10 +1082,45 @@ impl TryFrom<pb::Transaction> for Transaction {
                 });
             }
         };
+        let blobs_op = message
+            .blob_operation
+            .map(|blob_op| match blob_op {
+                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
+                    fragments,
+                }) => Result::Ok(Operation::Append {
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                }),
+                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
+                    fragments,
+                    schema,
+                    schema_metadata: _schema_metadata, // TODO: handle metadata
+                    config_upsert_values,
+                }) => {
+                    let config_upsert_option = if config_upsert_values.is_empty() {
+                        Some(config_upsert_values)
+                    } else {
+                        None
+                    };
+
+                    Ok(Operation::Overwrite {
+                        fragments: fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
+                        schema: Schema::from(&Fields(schema.clone())),
+                        config_upsert_values: config_upsert_option,
+                    })
+                }
+            })
+            .transpose()?;
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
+            blobs_op,
             tag: if message.tag.is_empty() {
                 None
             } else {
@@ -1210,10 +1274,34 @@ impl From<&Transaction> for pb::Transaction {
             }),
         };
 
+        let blob_operation = value.blobs_op.as_ref().map(|op| match op {
+            Operation::Append { fragments } => {
+                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                })
+            }
+            Operation::Overwrite {
+                fragments,
+                schema,
+                config_upsert_values,
+            } => {
+                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    schema: Fields::from(schema).0,
+                    schema_metadata: Default::default(), // TODO: handle metadata
+                    config_upsert_values: config_upsert_values
+                        .clone()
+                        .unwrap_or(Default::default()),
+                })
+            }
+            _ => panic!("Invalid blob operation: {:?}", value),
+        });
+
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
+            blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
         }
     }
@@ -1391,7 +1479,7 @@ mod tests {
         ];
         let other_transactions = other_operations
             .iter()
-            .map(|op| Transaction::new(0, op.clone(), None))
+            .map(|op| Transaction::new(0, op.clone(), None, None))
             .collect::<Vec<_>>();
 
         // Transactions and whether they are expected to conflict with each
@@ -1541,7 +1629,7 @@ mod tests {
         ];
 
         for (operation, expected_conflicts) in &cases {
-            let transaction = Transaction::new(0, operation.clone(), None);
+            let transaction = Transaction::new(0, operation.clone(), None, None);
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
                 assert_eq!(
                     transaction.conflicts_with(other),

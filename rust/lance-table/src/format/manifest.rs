@@ -19,7 +19,7 @@ use super::Fragment;
 use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::format::pb;
 use lance_core::cache::FileMetadataCache;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_struct;
@@ -35,6 +35,9 @@ use snafu::{location, Location};
 pub struct Manifest {
     /// Dataset schema.
     pub schema: Schema,
+
+    /// Local schema, only containing fields with the default storage class (not blobs)
+    pub local_schema: Schema,
 
     /// Dataset version
     pub version: u64,
@@ -81,6 +84,9 @@ pub struct Manifest {
 
     /// Table configuration.
     pub config: HashMap<String, String>,
+
+    /// Blob dataset version
+    pub blob_dataset_version: Option<u64>,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -108,11 +114,14 @@ impl Manifest {
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
         data_storage_format: DataStorageFormat,
+        blob_dataset_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let local_schema = schema.retain_storage_class(StorageClass::Default);
 
         Self {
             schema,
+            local_schema,
             version: 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -128,6 +137,7 @@ impl Manifest {
             next_row_id: 0,
             data_storage_format,
             config: HashMap::new(),
+            blob_dataset_version,
         }
     }
 
@@ -135,11 +145,16 @@ impl Manifest {
         previous: &Self,
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
+        new_blob_version: Option<u64>,
     ) -> Self {
         let fragment_offsets = compute_fragment_offsets(&fragments);
+        let local_schema = schema.retain_storage_class(StorageClass::Default);
+
+        let blob_dataset_version = new_blob_version.or(previous.blob_dataset_version);
 
         Self {
             schema,
+            local_schema,
             version: previous.version + 1,
             writer_version: Some(WriterVersion::default()),
             fragments,
@@ -155,6 +170,7 @@ impl Manifest {
             next_row_id: previous.next_row_id,
             data_storage_format: previous.data_storage_format.clone(),
             config: previous.config.clone(),
+            blob_dataset_version,
         }
     }
 
@@ -476,8 +492,12 @@ impl TryFrom<pb::Manifest> for Manifest {
             Some(format) => DataStorageFormat::from(format),
         };
 
+        let schema = Schema::from(fields_with_meta);
+        let local_schema = schema.retain_storage_class(StorageClass::Default);
+
         Ok(Self {
-            schema: Schema::from(fields_with_meta),
+            schema,
+            local_schema,
             version: p.version,
             writer_version,
             fragments,
@@ -497,6 +517,11 @@ impl TryFrom<pb::Manifest> for Manifest {
             next_row_id: p.next_row_id,
             data_storage_format,
             config: p.config,
+            blob_dataset_version: if p.blob_dataset_version == 0 {
+                None
+            } else {
+                Some(p.blob_dataset_version)
+            },
         })
     }
 }
@@ -540,6 +565,7 @@ impl From<&Manifest> for pb::Manifest {
                 version: m.data_storage_format.version.clone(),
             }),
             config: m.config.clone(),
+            blob_dataset_version: m.blob_dataset_version.unwrap_or_default(),
         }
     }
 }
@@ -653,7 +679,12 @@ mod tests {
             Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
             Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
-        let manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+        );
 
         let actual = manifest.fragments_by_offset_range(0..10);
         assert_eq!(actual.len(), 1);
@@ -715,7 +746,12 @@ mod tests {
             },
         ];
 
-        let manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+        let manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+        );
 
         assert_eq!(manifest.max_field_id(), 43);
     }
@@ -733,7 +769,12 @@ mod tests {
             Fragment::with_file_legacy(1, "path2", &schema, Some(15)),
             Fragment::with_file_legacy(2, "path3", &schema, Some(20)),
         ];
-        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version= */ None,
+        );
 
         let mut config = HashMap::new();
         config.insert("lance:test".to_string(), "value".to_string());
