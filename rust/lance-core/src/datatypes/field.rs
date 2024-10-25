@@ -44,8 +44,7 @@ pub struct SchemaCompareOptions {
     pub compare_dictionary: bool,
     /// Should the field ids be compared (default false)
     pub compare_field_ids: bool,
-    /// If the expected schema is nullable then is a non-nullable
-    /// version of the field allowed (default False)
+    /// Should nullability be compared (default Strict)
     pub compare_nullability: NullabilityComparison,
 }
 /// Encoding enum.

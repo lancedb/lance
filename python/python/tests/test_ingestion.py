@@ -5,8 +5,8 @@ import pyarrow as pa
 import pytest
 
 
-@pytest.mark.parametrize("use_legacy_format", [True, False])
-def test_nullability(tmp_path, use_legacy_format):
+@pytest.mark.parametrize("data_storage_version", ["legacy", "2.0"])
+def test_nullability(tmp_path, data_storage_version):
     nullable_schema = pa.schema([pa.field("a", pa.string(), nullable=True)])
     non_nullable_schema = pa.schema([pa.field("a", pa.string(), nullable=False)])
 
@@ -21,13 +21,13 @@ def test_nullability(tmp_path, use_legacy_format):
         [],
         str(tmp_path / "nullable.lance"),
         schema=nullable_schema,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
     )
     non_nullable_dataset = lance.write_dataset(
         [],
         str(tmp_path / "non_nullable.lance"),
         schema=non_nullable_schema,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
     )
 
     # Can write nullable data into nullable table
@@ -58,7 +58,7 @@ def test_nullability(tmp_path, use_legacy_format):
         [],
         str(tmp_path / "outer_struct_nullable.lance"),
         schema=outer_nullable,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
     )
     can_write({"point": [None]}, dataset, outer_nullable)
     cannot_write({"point": [{"x": None}]}, dataset, outer_nullable)
@@ -76,7 +76,7 @@ def test_nullability(tmp_path, use_legacy_format):
         [],
         str(tmp_path / "inner_struct_nullable.lance"),
         schema=inner_nullable,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
     )
     cannot_write({"point": [None]}, dataset, inner_nullable)
     can_write({"point": [{"x": None}]}, dataset, inner_nullable)
@@ -94,7 +94,7 @@ def test_nullability(tmp_path, use_legacy_format):
         [],
         str(tmp_path / "outer_list_nullable.lance"),
         schema=outer_nullable,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
     )
     can_write({"list": [None]}, dataset, outer_nullable)
     cannot_write({"list": [[None]]}, dataset, outer_nullable)
@@ -112,7 +112,7 @@ def test_nullability(tmp_path, use_legacy_format):
         [],
         str(tmp_path / "inner_list_nullable.lance"),
         schema=inner_nullable,
-        use_legacy_format=use_legacy_format,
+        data_storage_version=data_storage_version,
     )
     cannot_write({"list": [None]}, dataset, inner_nullable)
     can_write({"list": [[None]]}, dataset, inner_nullable)
