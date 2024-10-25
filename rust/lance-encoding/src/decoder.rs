@@ -1431,7 +1431,7 @@ pub struct StructuralBatchDecodeStream {
     rows_per_batch: u32,
     rows_scheduled: u64,
     rows_drained: u64,
-    scheduler_exhuasted: bool,
+    scheduler_exhausted: bool,
     emitted_batch_size_warning: Arc<Once>,
 }
 
@@ -1442,7 +1442,7 @@ impl StructuralBatchDecodeStream {
     ///
     /// * `scheduled` - an incoming stream of decode tasks from a
     ///   [`crate::decode::DecodeBatchScheduler`]
-    /// * `schema` - the scheam of the data to create
+    /// * `schema` - the schema of the data to create
     /// * `rows_per_batch` the number of rows to create before making a batch
     /// * `num_rows` the total number of rows scheduled
     /// * `num_columns` the total number of columns in the file
@@ -1459,13 +1459,13 @@ impl StructuralBatchDecodeStream {
             rows_per_batch,
             rows_scheduled: 0,
             rows_drained: 0,
-            scheduler_exhuasted: false,
+            scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
         }
     }
 
     async fn wait_for_scheduled(&mut self, scheduled_need: u64) -> Result<u64> {
-        if self.scheduler_exhuasted {
+        if self.scheduler_exhausted {
             return Ok(self.rows_scheduled);
         }
         while self.rows_scheduled < scheduled_need {
@@ -1484,7 +1484,7 @@ impl StructuralBatchDecodeStream {
                     // Schedule ended before we got all the data we expected.  This probably
                     // means some kind of pushdown filter was applied and we didn't load as
                     // much data as we thought we would.
-                    self.scheduler_exhuasted = true;
+                    self.scheduler_exhausted = true;
                     return Ok(self.rows_scheduled);
                 }
             }

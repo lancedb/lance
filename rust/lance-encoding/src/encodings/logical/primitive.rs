@@ -410,7 +410,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     to_skip -= range.end - range.start;
                     continue;
                 }
-                // Substract skip from start of range
+                // Subtract skip from start of range
                 let range = range.start + to_skip..range.end;
                 to_skip = 0;
 
