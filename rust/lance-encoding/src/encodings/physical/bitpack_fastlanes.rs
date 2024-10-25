@@ -597,966 +597,966 @@ fn bitpacked_for_non_neg_decode(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use arrow::array::{
-        Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
-        UInt8Array,
-    };
-    use arrow::datatypes::DataType;
-
-    #[test_log::test(tokio::test)]
-    async fn test_compute_compressed_bit_width_for_non_neg() {}
-
-    use std::collections::HashMap;
-
-    use lance_datagen::RowCount;
-
-    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
-    use crate::version::LanceFileVersion;
-
-    async fn check_round_trip_bitpacked(array: Arc<dyn Array>) {
-        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
-        check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_u8() {
-        let values: Vec<u8> = vec![5; 1024];
-        let array = UInt8Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u8> = vec![66; 1000];
-        let array = UInt8Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u8> = vec![77; 2000];
-        let array = UInt8Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u8> = vec![0; 10000];
-        let array = UInt8Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u8> = vec![88; 10000];
-        let array = UInt8Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_u16() {
-        let values: Vec<u16> = vec![5; 1024];
-        let array = UInt16Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u16> = vec![66; 1000];
-        let array = UInt16Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u16> = vec![77; 2000];
-        let array = UInt16Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u16> = vec![0; 10000];
-        let array = UInt16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u16> = vec![88; 10000];
-        let array = UInt16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u16> = vec![300; 100];
-        let array = UInt16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u16> = vec![800; 100];
-        let array = UInt16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_u32() {
-        let values: Vec<u32> = vec![5; 1024];
-        let array = UInt32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u32> = vec![7; 2000];
-        let array = UInt32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u32> = vec![66; 1000];
-        let array = UInt32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u32> = vec![666; 1000];
-        let array = UInt32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u32> = vec![77; 2000];
-        let array = UInt32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u32> = vec![0; 10000];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![1; 10000];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![88; 10000];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![300; 100];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![3000; 100];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![800; 100];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![8000; 100];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![65536; 100];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u32> = vec![655360; 100];
-        let array = UInt32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_u64() {
-        let values: Vec<u64> = vec![5; 1024];
-        let array = UInt64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u64> = vec![7; 2000];
-        let array = UInt64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u64> = vec![66; 1000];
-        let array = UInt64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u64> = vec![666; 1000];
-        let array = UInt64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u64> = vec![77; 2000];
-        let array = UInt64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<u64> = vec![0; 10000];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![1; 10000];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![88; 10000];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![300; 100];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![3000; 100];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![800; 100];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![8000; 100];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![65536; 100];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<u64> = vec![655360; 100];
-        let array = UInt64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_i8() {
-        let values: Vec<i8> = vec![-5; 1024];
-        let array = Int8Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i8> = vec![66; 1000];
-        let array = Int8Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i8> = vec![77; 2000];
-        let array = Int8Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i8> = vec![0; 10000];
-        let array = Int8Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i8> = vec![88; 10000];
-        let array = Int8Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i8> = vec![-88; 10000];
-        let array = Int8Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_i16() {
-        let values: Vec<i16> = vec![-5; 1024];
-        let array = Int16Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i16> = vec![66; 1000];
-        let array = Int16Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i16> = vec![77; 2000];
-        let array = Int16Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i16> = vec![0; 10000];
-        let array = Int16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i16> = vec![88; 10000];
-        let array = Int16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i16> = vec![300; 100];
-        let array = Int16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i16> = vec![800; 100];
-        let array = Int16Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_i32() {
-        let values: Vec<i32> = vec![-5; 1024];
-        let array = Int32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i32> = vec![66; 1000];
-        let array = Int32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i32> = vec![-66; 1000];
-        let array = Int32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i32> = vec![77; 2000];
-        let array = Int32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i32> = vec![-77; 2000];
-        let array = Int32Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i32> = vec![0; 10000];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![88; 10000];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![-88; 10000];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![300; 100];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![-300; 100];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![800; 100];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![-800; 100];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![65536; 100];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i32> = vec![-65536; 100];
-        let array = Int32Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
-
-    #[test_log::test(tokio::test)]
-    async fn test_bitpack_fastlanes_i64() {
-        let values: Vec<i64> = vec![-5; 1024];
-        let array = Int64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i64> = vec![66; 1000];
-        let array = Int64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i64> = vec![-66; 1000];
-        let array = Int64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i64> = vec![77; 2000];
-        let array = Int64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i64> = vec![-77; 2000];
-        let array = Int64Array::from(values);
-        let array: Arc<dyn arrow_array::Array> = Arc::new(array);
-        check_round_trip_bitpacked(array).await;
-
-        let values: Vec<i64> = vec![0; 10000];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![88; 10000];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![-88; 10000];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![300; 100];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![-300; 100];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![800; 100];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![-800; 100];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![65536; 100];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let values: Vec<i64> = vec![-65536; 100];
-        let array = Int64Array::from(values);
-        let arr = Arc::new(array) as ArrayRef;
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(1))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(20))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(50))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(100))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(1000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(1024))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(2000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-
-        let arr = lance_datagen::gen()
-            .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
-            .into_batch_rows(RowCount::from(3000))
-            .unwrap()
-            .column(0)
-            .clone();
-        check_round_trip_bitpacked(arr).await;
-    }
+    // use super::*;
+    // use arrow::array::{
+    //     Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
+    //     UInt8Array,
+    // };
+    // use arrow::datatypes::DataType;
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_compute_compressed_bit_width_for_non_neg() {}
+
+    // use std::collections::HashMap;
+
+    // use lance_datagen::RowCount;
+
+    // use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    // use crate::version::LanceFileVersion;
+
+    // async fn check_round_trip_bitpacked(array: Arc<dyn Array>) {
+    //     let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+    //     check_round_trip_encoding_of_data(vec![array], &test_cases, HashMap::new()).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_u8() {
+    //     let values: Vec<u8> = vec![5; 1024];
+    //     let array = UInt8Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u8> = vec![66; 1000];
+    //     let array = UInt8Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u8> = vec![77; 2000];
+    //     let array = UInt8Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u8> = vec![0; 10000];
+    //     let array = UInt8Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u8> = vec![88; 10000];
+    //     let array = UInt8Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt8))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_u16() {
+    //     let values: Vec<u16> = vec![5; 1024];
+    //     let array = UInt16Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u16> = vec![66; 1000];
+    //     let array = UInt16Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u16> = vec![77; 2000];
+    //     let array = UInt16Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u16> = vec![0; 10000];
+    //     let array = UInt16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u16> = vec![88; 10000];
+    //     let array = UInt16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u16> = vec![300; 100];
+    //     let array = UInt16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u16> = vec![800; 100];
+    //     let array = UInt16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt16))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_u32() {
+    //     let values: Vec<u32> = vec![5; 1024];
+    //     let array = UInt32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u32> = vec![7; 2000];
+    //     let array = UInt32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u32> = vec![66; 1000];
+    //     let array = UInt32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u32> = vec![666; 1000];
+    //     let array = UInt32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u32> = vec![77; 2000];
+    //     let array = UInt32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u32> = vec![0; 10000];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![1; 10000];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![88; 10000];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![300; 100];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![3000; 100];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![800; 100];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![8000; 100];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![65536; 100];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u32> = vec![655360; 100];
+    //     let array = UInt32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt32))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_u64() {
+    //     let values: Vec<u64> = vec![5; 1024];
+    //     let array = UInt64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u64> = vec![7; 2000];
+    //     let array = UInt64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u64> = vec![66; 1000];
+    //     let array = UInt64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u64> = vec![666; 1000];
+    //     let array = UInt64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u64> = vec![77; 2000];
+    //     let array = UInt64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<u64> = vec![0; 10000];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![1; 10000];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![88; 10000];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![300; 100];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![3000; 100];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![800; 100];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![8000; 100];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![65536; 100];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<u64> = vec![655360; 100];
+    //     let array = UInt64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::UInt64))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_i8() {
+    //     let values: Vec<i8> = vec![-5; 1024];
+    //     let array = Int8Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i8> = vec![66; 1000];
+    //     let array = Int8Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i8> = vec![77; 2000];
+    //     let array = Int8Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i8> = vec![0; 10000];
+    //     let array = Int8Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i8> = vec![88; 10000];
+    //     let array = Int8Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i8> = vec![-88; 10000];
+    //     let array = Int8Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int8))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_i16() {
+    //     let values: Vec<i16> = vec![-5; 1024];
+    //     let array = Int16Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i16> = vec![66; 1000];
+    //     let array = Int16Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i16> = vec![77; 2000];
+    //     let array = Int16Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i16> = vec![0; 10000];
+    //     let array = Int16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i16> = vec![88; 10000];
+    //     let array = Int16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i16> = vec![300; 100];
+    //     let array = Int16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i16> = vec![800; 100];
+    //     let array = Int16Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int16))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_i32() {
+    //     let values: Vec<i32> = vec![-5; 1024];
+    //     let array = Int32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i32> = vec![66; 1000];
+    //     let array = Int32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i32> = vec![-66; 1000];
+    //     let array = Int32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i32> = vec![77; 2000];
+    //     let array = Int32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i32> = vec![-77; 2000];
+    //     let array = Int32Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i32> = vec![0; 10000];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![88; 10000];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![-88; 10000];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![300; 100];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![-300; 100];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![800; 100];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![-800; 100];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![65536; 100];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i32> = vec![-65536; 100];
+    //     let array = Int32Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
+
+    // #[test_log::test(tokio::test)]
+    // async fn test_bitpack_fastlanes_i64() {
+    //     let values: Vec<i64> = vec![-5; 1024];
+    //     let array = Int64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i64> = vec![66; 1000];
+    //     let array = Int64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i64> = vec![-66; 1000];
+    //     let array = Int64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i64> = vec![77; 2000];
+    //     let array = Int64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i64> = vec![-77; 2000];
+    //     let array = Int64Array::from(values);
+    //     let array: Arc<dyn arrow_array::Array> = Arc::new(array);
+    //     check_round_trip_bitpacked(array).await;
+
+    //     let values: Vec<i64> = vec![0; 10000];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![88; 10000];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![-88; 10000];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![300; 100];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![-300; 100];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![800; 100];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![-800; 100];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![65536; 100];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let values: Vec<i64> = vec![-65536; 100];
+    //     let array = Int64Array::from(values);
+    //     let arr = Arc::new(array) as ArrayRef;
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(1))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(20))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(50))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(100))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(1000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(1024))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(2000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+
+    //     let arr = lance_datagen::gen()
+    //         .anon_col(lance_datagen::array::rand_type(&DataType::Int64))
+    //         .into_batch_rows(RowCount::from(3000))
+    //         .unwrap()
+    //         .column(0)
+    //         .clone();
+    //     check_round_trip_bitpacked(arr).await;
+    // }
 }

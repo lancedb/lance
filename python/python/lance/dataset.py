@@ -938,7 +938,7 @@ class LanceDataset(pa.dataset.Dataset):
             The names of the columns that the UDF will read. If None, then the
             UDF will read all columns. This is only used when transforms is a
             UDF. Otherwise, the read columns are inferred from the SQL expressions.
-        reader_scheam: pa.Schema, optional
+        reader_schema: pa.Schema, optional
             Only valid if transforms is a `ReaderLike` object.  This will be used to
             determine the schema of the reader.
         batch_size: int, optional
@@ -1992,6 +1992,7 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
+        detached: Optional[bool] = False,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -2037,6 +2038,13 @@ class LanceDataset(pa.dataset.Dataset):
             :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
             turning this on will make the dataset unreadable for older versions
             of Lance (prior to 0.17.0).
+        detached : bool, optional
+            If True, then the commit will not be part of the dataset lineage.  It will
+            never show up as the latest dataset and the only way to check it out in the
+            future will be to specifically check it out by version.  The version will be
+            a random version that is only unique amongst detached commits.  The caller
+            should store this somewhere as there will be no other way to obtain it in
+            the future.
 
         Returns
         -------
@@ -2074,15 +2082,18 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        _Dataset.commit(
+        new_ds = _Dataset.commit(
             base_uri,
             operation._to_inner(),
             read_version,
             commit_lock,
             storage_options=storage_options,
             enable_v2_manifest_paths=enable_v2_manifest_paths,
+            detached=detached,
         )
-        return LanceDataset(base_uri, storage_options=storage_options)
+        return LanceDataset(
+            base_uri, version=new_ds.version(), storage_options=storage_options
+        )
 
     def validate(self):
         """

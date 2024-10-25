@@ -5,7 +5,7 @@ Dataset URI: http://corpus-texmex.irisa.fr/
 The SIFT/GIST-1M benchmarks make use of the [LanceDB](https://github.com/lancedb/lancedb) API to index, manage and query the datasets. Ensure the dependencies are installed. LanceDB is built on top of Lance and stores everything as Lance datasets.
 
 ```sh
-# Pin the lancedb version to the latest one availale on your own benchmark
+# Pin the lancedb version to the latest one available on your own benchmark
 pip lancedb==0.3.6
 pip install pandas~=2.1.0
 pip duckdb~=0.9.0

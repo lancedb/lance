@@ -36,7 +36,7 @@ where
         ),location: location!()});
     }
 
-    // Ony sample sample_rate * num_clusters. See Faiss
+    // Only sample sample_rate * num_clusters. See Faiss
     let data = if num_rows > sample_rate * k {
         info!(
             "Sample {} out of {} to train kmeans of {} dim, {} clusters",

@@ -10,3 +10,8 @@ repos:
     rev: v1.0
     hooks:
     - id: fmt
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.26.0
+    hooks:
+    - id: typos

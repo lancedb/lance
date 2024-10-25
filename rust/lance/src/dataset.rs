@@ -66,7 +66,7 @@ use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::io::commit::{commit_new_dataset, commit_transaction};
+use crate::io::commit::{commit_detached_transaction, commit_new_dataset, commit_transaction};
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
@@ -852,6 +852,143 @@ impl Dataset {
         .boxed()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn do_commit(
+        base_uri: &str,
+        operation: Operation,
+        read_version: Option<u64>,
+        store_params: Option<ObjectStoreParams>,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
+        object_store_registry: Arc<ObjectStoreRegistry>,
+        enable_v2_manifest_paths: bool,
+        detached: bool,
+    ) -> Result<Self> {
+        let read_version = read_version.map_or_else(
+            || match operation {
+                Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
+                _ => Err(Error::invalid_input(
+                    "read_version must be specified for this operation",
+                    location!(),
+                )),
+            },
+            Ok,
+        )?;
+
+        let (object_store, base, commit_handler) = Self::params_from_uri(
+            base_uri,
+            &commit_handler,
+            &store_params,
+            object_store_registry.clone(),
+        )
+        .await?;
+
+        // Test if the dataset exists
+        let dataset_exists = match commit_handler
+            .resolve_latest_version(&base, &object_store)
+            .await
+        {
+            Ok(_) => true,
+            Err(Error::NotFound { .. }) => false,
+            Err(e) => return Err(e),
+        };
+
+        if !dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
+            return Err(Error::DatasetNotFound {
+                path: base.to_string(),
+                source: "The dataset must already exist unless the operation is Overwrite".into(),
+                location: location!(),
+            });
+        }
+
+        let dataset = if dataset_exists {
+            let mut builder = DatasetBuilder::from_uri(base_uri).with_read_params(ReadParams {
+                store_options: store_params.clone(),
+                object_store_registry: object_store_registry.clone(),
+                ..Default::default()
+            });
+            if detached {
+                // If we are making a detached commit then base the commit on the read_version.
+                //
+                // Otherwise, we want to use the latest version of the dataset
+                builder = builder.with_version(read_version);
+            }
+            Some(builder.load().await?)
+        } else {
+            None
+        };
+
+        let manifest_naming_scheme = if let Some(ds) = &dataset {
+            ds.manifest_naming_scheme
+        } else if enable_v2_manifest_paths {
+            ManifestNamingScheme::V2
+        } else {
+            ManifestNamingScheme::V1
+        };
+
+        let transaction = Transaction::new(read_version, operation, None);
+
+        let manifest = if let Some(dataset) = &dataset {
+            if detached {
+                if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
+                    return Err(Error::NotSupported {
+                        source: "detached commits cannot be used with v1 manifest paths".into(),
+                        location: location!(),
+                    });
+                }
+                commit_detached_transaction(
+                    dataset,
+                    &object_store,
+                    commit_handler.as_ref(),
+                    &transaction,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await?
+            } else {
+                commit_transaction(
+                    dataset,
+                    &object_store,
+                    commit_handler.as_ref(),
+                    &transaction,
+                    &Default::default(),
+                    &Default::default(),
+                    manifest_naming_scheme,
+                )
+                .await?
+            }
+        } else if !detached {
+            commit_new_dataset(
+                &object_store,
+                commit_handler.as_ref(),
+                &base,
+                &transaction,
+                &Default::default(),
+                manifest_naming_scheme,
+            )
+            .await?
+        } else {
+            // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
+            return Err(Error::NotSupported {
+                source: "detached commits cannot currently be used to create new datasets".into(),
+                location: location!(),
+            });
+        };
+
+        let object_store = Arc::new(object_store);
+        let tags = Tags::new(object_store.clone(), commit_handler.clone(), base.clone());
+
+        Ok(Self {
+            object_store,
+            base,
+            uri: base_uri.to_string(),
+            manifest: Arc::new(manifest.clone()),
+            session: Arc::new(Session::default()),
+            commit_handler,
+            tags,
+            manifest_naming_scheme,
+        })
+    }
+
     /// Commit changes to the dataset
     ///
     /// This operation is not needed if you are using append/write/delete to manipulate the dataset.
@@ -895,104 +1032,47 @@ impl Dataset {
         object_store_registry: Arc<ObjectStoreRegistry>,
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
-        let read_version = read_version.map_or_else(
-            || match operation {
-                Operation::Overwrite { .. } | Operation::Restore { .. } => Ok(0),
-                _ => Err(Error::invalid_input(
-                    "read_version must be specified for this operation",
-                    location!(),
-                )),
-            },
-            Ok,
-        )?;
-
-        let (object_store, base, commit_handler) = Self::params_from_uri(
+        Self::do_commit(
             base_uri,
-            &commit_handler,
-            &store_params,
-            object_store_registry.clone(),
-        )
-        .await?;
-
-        // Test if the dataset exists
-        let dataset_exists = match commit_handler
-            .resolve_latest_version(&base, &object_store)
-            .await
-        {
-            Ok(_) => true,
-            Err(Error::NotFound { .. }) => false,
-            Err(e) => return Err(e),
-        };
-
-        if !dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
-            return Err(Error::DatasetNotFound {
-                path: base.to_string(),
-                source: "The dataset must already exist unless the operation is Overwrite".into(),
-                location: location!(),
-            });
-        }
-
-        let dataset = if dataset_exists {
-            Some(
-                DatasetBuilder::from_uri(base_uri)
-                    .with_read_params(ReadParams {
-                        store_options: store_params.clone(),
-                        object_store_registry: object_store_registry.clone(),
-                        ..Default::default()
-                    })
-                    .load()
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        let manifest_naming_scheme = if let Some(ds) = &dataset {
-            ds.manifest_naming_scheme
-        } else if enable_v2_manifest_paths {
-            ManifestNamingScheme::V2
-        } else {
-            ManifestNamingScheme::V1
-        };
-
-        let transaction = Transaction::new(read_version, operation, None);
-
-        let manifest = if let Some(dataset) = &dataset {
-            commit_transaction(
-                dataset,
-                &object_store,
-                commit_handler.as_ref(),
-                &transaction,
-                &Default::default(),
-                &Default::default(),
-                manifest_naming_scheme,
-            )
-            .await?
-        } else {
-            commit_new_dataset(
-                &object_store,
-                commit_handler.as_ref(),
-                &base,
-                &transaction,
-                &Default::default(),
-                manifest_naming_scheme,
-            )
-            .await?
-        };
-
-        let object_store = Arc::new(object_store);
-        let tags = Tags::new(object_store.clone(), commit_handler.clone(), base.clone());
-
-        Ok(Self {
-            object_store,
-            base,
-            uri: base_uri.to_string(),
-            manifest: Arc::new(manifest.clone()),
-            session: Arc::new(Session::default()),
+            operation,
+            read_version,
+            store_params,
             commit_handler,
-            tags,
-            manifest_naming_scheme,
-        })
+            object_store_registry,
+            enable_v2_manifest_paths,
+            /*detached=*/ false,
+        )
+        .await
+    }
+
+    /// Commits changes exactly the same as [`Self::commit`] but the commit will
+    /// not be associated with the dataset lineage.
+    ///
+    /// The commit will not show up in the dataset's history and will never be
+    /// the latest version of the dataset.
+    ///
+    /// This can be used to stage changes or to handle "secondary" datasets whose
+    /// lineage is tracked elsewhere.
+    pub async fn commit_detached(
+        base_uri: &str,
+        operation: Operation,
+        read_version: Option<u64>,
+        store_params: Option<ObjectStoreParams>,
+        commit_handler: Option<Arc<dyn CommitHandler>>,
+        object_store_registry: Arc<ObjectStoreRegistry>,
+        enable_v2_manifest_paths: bool,
+    ) -> Result<Self> {
+        Self::do_commit(
+            base_uri,
+            operation,
+            read_version,
+            store_params,
+            commit_handler,
+            object_store_registry,
+            enable_v2_manifest_paths,
+            /*detached=*/ true,
+        )
+        .await
     }
 
     /// Create a Scanner to scan the dataset.

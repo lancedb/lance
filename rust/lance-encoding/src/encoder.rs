@@ -130,7 +130,7 @@ pub trait ArrayEncoder: std::fmt::Debug + Send + Sync {
     ) -> Result<EncodedArray>;
 }
 
-pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 4;
+pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
 pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
 
 /// Page data that has been compressed into a series of chunks put into
@@ -156,7 +156,7 @@ pub struct MiniBlockCompressed {
 pub struct MiniBlockChunk {
     // The number of bytes that make up the chunk
     //
-    // This value must be less than or equal to 8Ki - 4 (8188)
+    // This value must be less than or equal to 8Ki - 6 (8188)
     pub num_bytes: u16,
     // The log (base 2) of the number of values in the chunk.  If this is the final chunk
     // then this should be 0 (the number of values will be calculated by subtracting the
@@ -286,7 +286,7 @@ impl Default for EncodedColumn {
 /// As a result, most encoders should not need to use this structure.
 ///
 /// In some cases (currently only the large binary encoding) there is a need to access
-/// buffers that are not in the page (becuase storing the position / offset of every page
+/// buffers that are not in the page (because storing the position / offset of every page
 /// in the page metadata would be too expensive).
 ///
 /// To do this you can add a buffer with `add_buffer` and then use the returned position

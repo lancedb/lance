@@ -36,6 +36,7 @@ lazy_static::lazy_static! {
         ]);
     pub static ref BLOB_DESC_FIELD: ArrowField =
     ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), false);
+    pub static ref BLOB_DESC_LANCE_FIELD: Field = Field::try_from(&*BLOB_DESC_FIELD).unwrap();
 }
 
 /// LogicalType is a string presentation of arrow type.
@@ -262,7 +263,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "dict" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupport dictionary type: {}", lt),
+                            message: format!("Unsupported dictionary type: {}", lt),
                             location: location!(),
                         })
                     } else {
@@ -274,7 +275,7 @@ impl TryFrom<&LogicalType> for DataType {
                 "decimal" => {
                     if splits.len() != 4 {
                         Err(Error::Schema {
-                            message: format!("Unsupport decimal type: {}", lt),
+                            message: format!("Unsupported decimal type: {}", lt),
                             location: location!(),
                         })
                     } else {

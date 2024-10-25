@@ -610,8 +610,8 @@ impl PostingListBuilder {
     }
 
     pub fn size(&self) -> usize {
-        size_of::<u64>() * self.row_ids.len()
-            + size_of::<f32>() * self.frequencies.len()
+        std::mem::size_of::<u64>() * self.row_ids.len()
+            + std::mem::size_of::<f32>() * self.frequencies.len()
             + self
                 .positions
                 .as_ref()
@@ -793,7 +793,8 @@ impl PositionBuilder {
     }
 
     pub fn size(&self) -> usize {
-        size_of::<i32>() * self.positions.len() + size_of::<usize>() * self.offsets.len()
+        std::mem::size_of::<i32>() * self.positions.len()
+            + std::mem::size_of::<usize>() * self.offsets.len()
     }
 
     pub fn total_len(&self) -> usize {

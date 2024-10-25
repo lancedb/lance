@@ -23,9 +23,9 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
-use lance_encoding::decoder::DecoderMiddlewareChain;
+use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
-use lance_file::v2::reader::{CachedFileMetadata, ReaderProjection};
+use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
 use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
@@ -291,6 +291,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
+                self.reader.as_ref(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -299,7 +300,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::Range(range.start as usize..range.end as usize),
                     batch_size,
-                    projection,
+                    Some(projection),
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -315,6 +316,7 @@ mod v2_adapter {
             projection: Arc<Schema>,
         ) -> Result<ReadBatchTaskStream> {
             let projection = ReaderProjection::from_field_ids(
+                self.reader.as_ref(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -323,7 +325,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::RangeFull,
                     batch_size,
-                    projection,
+                    Some(projection),
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -341,6 +343,7 @@ mod v2_adapter {
         ) -> Result<ReadBatchTaskStream> {
             let indices = UInt32Array::from(indices.to_vec());
             let projection = ReaderProjection::from_field_ids(
+                self.reader.as_ref(),
                 projection.as_ref(),
                 self.field_id_to_column_idx.as_ref(),
             )?;
@@ -349,7 +352,7 @@ mod v2_adapter {
                 .read_tasks(
                     ReadBatchParams::Indices(indices),
                     batch_size,
-                    projection,
+                    Some(projection),
                     FilterExpression::no_filter(),
                 )?
                 .map(|v2_task| ReadBatchTask {
@@ -446,7 +449,7 @@ impl FileFragment {
         if file_version != dataset.manifest.data_storage_format.lance_file_version()? {
             return Err(Error::io(
                 format!(
-                    "File version mismatch. Dataset verison: {:?} Fragment version: {:?}",
+                    "File version mismatch. Dataset version: {:?} Fragment version: {:?}",
                     dataset.manifest.data_storage_format.lance_file_version()?,
                     file_version
                 ),
@@ -474,15 +477,19 @@ impl FileFragment {
             let reader = v2::reader::FileReader::try_open(
                 file_scheduler,
                 None,
-                Arc::<DecoderMiddlewareChain>::default(),
+                Arc::<DecoderPlugins>::default(),
                 &dataset.session.file_metadata_cache,
+                FileReaderOptions::default(),
             )
             .await?;
             // If the schemas are not compatible we can't calculate field id offsets
             reader
                 .schema()
                 .check_compatible(dataset.schema(), &SchemaCompareOptions::default())?;
-            let projection = v2::reader::ReaderProjection::from_whole_schema(dataset.schema());
+            let projection = v2::reader::ReaderProjection::from_whole_schema(
+                dataset.schema(),
+                reader.metadata().version(),
+            );
             let physical_rows = reader.metadata().num_rows as usize;
             frag.physical_rows = Some(physical_rows);
             frag.id = fragment_id as u64;
@@ -666,9 +673,10 @@ impl FileFragment {
                 v2::reader::FileReader::try_open_with_file_metadata(
                     file_scheduler,
                     None,
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
                     file_metadata,
                     &self.dataset.session.file_metadata_cache,
+                    FileReaderOptions::default(),
                 )
                 .await?,
             );
@@ -1709,7 +1717,7 @@ impl FragmentReader {
         if !params.valid_given_len(total_num_rows as usize) {
             return Err(Error::invalid_input(
                 format!(
-                    "Invalid read params {} for fragment with {} addressible rows",
+                    "Invalid read params {} for fragment with {} addressable rows",
                     params, total_num_rows
                 ),
                 location!(),
@@ -2083,11 +2091,11 @@ mod tests {
         let mut dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
         // Delete last 20 rows in first fragment
         dataset.delete("i >= 20").await.unwrap();
-        // Last fragment has 20 rows but 40 addressible rows
+        // Last fragment has 20 rows but 40 addressable rows
         let fragment = &dataset.get_fragments()[0];
         assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
 
-        // Test with take_range (all rows addressible)
+        // Test with take_range (all rows addressable)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(
@@ -2111,7 +2119,7 @@ mod tests {
             }
         }
 
-        // Test with read_range (only non-deleted rows addressible)
+        // Test with read_range (only non-deleted rows addressable)
         for with_row_id in [false, true] {
             let reader = fragment
                 .open(

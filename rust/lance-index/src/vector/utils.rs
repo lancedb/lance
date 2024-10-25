@@ -38,7 +38,7 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
         }
         _ => {
             return Err(Error::io(
-                format!("unsupport prefetch on {} type", array.data_type()),
+                format!("unsupported prefetch on {} type", array.data_type()),
                 location!(),
             ));
         }

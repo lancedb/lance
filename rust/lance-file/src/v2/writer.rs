@@ -14,8 +14,8 @@ use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
-    BatchEncoder, CoreArrayEncodingStrategy, CoreFieldEncodingStrategy, EncodeTask, EncodedBatch,
-    EncodedPage, EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
+    default_encoding_strategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
+    EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
@@ -219,10 +219,7 @@ impl FileWriter {
         let keep_original_array = self.options.keep_original_array.unwrap_or(false);
         let encoding_strategy = self.options.encoding_strategy.clone().unwrap_or_else(|| {
             let version = self.version();
-            Arc::new(CoreFieldEncodingStrategy {
-                array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
-                version,
-            })
+            default_encoding_strategy(version).into()
         });
 
         let encoding_options = EncodingOptions {

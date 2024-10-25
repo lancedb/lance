@@ -1388,6 +1388,7 @@ impl Dataset {
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1418,16 +1419,29 @@ impl Dataset {
                 let manifest = dataset.as_ref().map(|ds| ds.manifest());
                 validate_operation(manifest, &operation.0)?;
                 let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-                LanceDataset::commit(
-                    dataset_uri,
-                    operation.0,
-                    read_version,
-                    object_store_params,
-                    commit_handler,
-                    object_store_registry,
-                    enable_v2_manifest_paths.unwrap_or(false),
-                )
-                .await
+                if detached.unwrap_or(false) {
+                    LanceDataset::commit_detached(
+                        dataset_uri,
+                        operation.0,
+                        read_version,
+                        object_store_params,
+                        commit_handler,
+                        object_store_registry,
+                        enable_v2_manifest_paths.unwrap_or(false),
+                    )
+                    .await
+                } else {
+                    LanceDataset::commit(
+                        dataset_uri,
+                        operation.0,
+                        read_version,
+                        object_store_params,
+                        commit_handler,
+                        object_store_registry,
+                        enable_v2_manifest_paths.unwrap_or(false),
+                    )
+                    .await
+                }
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {
@@ -1702,7 +1716,7 @@ fn prepare_vector_index_params(
         };
 
         if let Some(f) = kwargs.get_item("precomputed_partitions_file")? {
-            ivf_params.precomputed_partitons_file = Some(f.to_string());
+            ivf_params.precomputed_partitions_file = Some(f.to_string());
         };
 
         if let Some(storage_options) = storage_options {

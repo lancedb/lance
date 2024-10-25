@@ -16,8 +16,11 @@ use lance_core::{
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
     Error, Result,
 };
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
-use lance_file::v2::{reader::FileReader, writer::FileWriter};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::{
+    reader::{FileReader, FileReaderOptions},
+    writer::FileWriter,
+};
 use lance_io::{
     object_store::ObjectStore,
     scheduler::{ScanScheduler, SchedulerConfig},
@@ -32,7 +35,7 @@ use crate::vector::PART_ID_COLUMN;
 pub trait ShuffleReader: Send + Sync {
     /// Read a partition by partition_id
     /// will return Ok(None) if partition_size is 0
-    /// check reader.partiton_size(partition_id) before calling this function
+    /// check reader.partition_size(partition_id) before calling this function
     async fn read_partition(
         &self,
         partition_id: usize,
@@ -248,8 +251,9 @@ impl ShuffleReader for IvfShufflerReader {
         let reader = FileReader::try_open(
             self.scheduler.open_file(&partition_path).await?,
             None,
-            Arc::<DecoderMiddlewareChain>::default(),
+            Arc::<DecoderPlugins>::default(),
             &FileMetadataCache::no_cache(),
+            FileReaderOptions::default(),
         )
         .await?;
         let schema = reader.schema().as_ref().into();

@@ -4130,7 +4130,7 @@ mod test {
             for use_projection in [false, true] {
                 for use_deleted_data in [false, true] {
                     for use_new_data in [false, true] {
-                        // Don't test compaction in conjuction with deletion and new data, it's too
+                        // Don't test compaction in conjunction with deletion and new data, it's too
                         // many combinations with no clear benefit.  Feel free to update if there is
                         // a need
                         // TODO: enable compaction for stable row id once supported.

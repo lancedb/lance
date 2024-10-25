@@ -108,7 +108,7 @@ The following values are supported:
       - 0.16.0
       - Any
       - Rework of the Lance file format that removed row groups and introduced null
-        support for lists, fixed size lists, and primtives
+        support for lists, fixed size lists, and primitives
     * - 2.1 (unstable)
       - None
       - Any

@@ -91,18 +91,18 @@ where
 /// PK: base_uri -- string
 /// SK: version -- number
 /// path -- string
-/// commiter -- string
+/// committer -- string
 ///
 /// Consistency: This store is expected to have read-after-write consistency
 /// consistent_read should always be set to true
 ///
-/// Transaction Safty: This store uses DynamoDB conditional write to ensure
+/// Transaction Safety: This store uses DynamoDB conditional write to ensure
 /// only one writer can win per version.
 #[derive(Debug)]
 pub struct DynamoDBExternalManifestStore {
     client: Arc<Client>,
     table_name: String,
-    commiter_name: String,
+    committer_name: String,
 }
 
 // these are in macro because I want to use them in a match statement
@@ -121,9 +121,9 @@ macro_rules! path {
         "path"
     };
 }
-macro_rules! commiter {
+macro_rules! committer {
     () => {
-        "commiter"
+        "committer"
     };
 }
 
@@ -131,7 +131,7 @@ impl DynamoDBExternalManifestStore {
     pub async fn new_external_store(
         client: Arc<Client>,
         table_name: &str,
-        commiter_name: &str,
+        committer_name: &str,
     ) -> Result<Arc<dyn ExternalManifestStore>> {
         lazy_static::lazy_static! {
             static ref SANITY_CHECK_CACHE: RwLock<HashSet<String>> = RwLock::new(HashSet::new());
@@ -140,7 +140,7 @@ impl DynamoDBExternalManifestStore {
         let store = Arc::new(Self {
             client: client.clone(),
             table_name: table_name.to_string(),
-            commiter_name: commiter_name.to_string(),
+            committer_name: committer_name.to_string(),
         });
 
         // already checked this table before, skip
@@ -170,7 +170,7 @@ impl DynamoDBExternalManifestStore {
             )
         })?;
 
-        let mut has_hask_key = false;
+        let mut has_hash_key = false;
         let mut has_range_key = false;
 
         // there should be two keys, HASH(base_uri) and RANGE(version)
@@ -183,7 +183,7 @@ impl DynamoDBExternalManifestStore {
             })?;
             match (key.key_type, key.attribute_name.as_str()) {
                 (KeyType::Hash, base_uri!()) => {
-                    has_hask_key = true;
+                    has_hash_key = true;
                 }
                 (KeyType::Range, version!()) => {
                     has_range_key = true;
@@ -201,7 +201,7 @@ impl DynamoDBExternalManifestStore {
         }
 
         // Both keys must be present
-        if !(has_hask_key && has_range_key) {
+        if !(has_hash_key && has_range_key) {
             return Err(
                 Error::io(
                     format!("dynamodb table: {} must have HASH and RANGE keys, named `{}` and `{}` respectively", table_name, base_uri!(), version!()),
@@ -292,7 +292,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 if items.len() > 1 {
                     return Err(Error::io(
                         format!(
-                            "dynamodb table: {} return unexpect number of items",
+                            "dynamodb table: {} return unexpected number of items",
                             self.table_name
                         ),
                         location!(),
@@ -300,7 +300,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 }
 
                 let item = items.pop().expect("length checked");
-                let version_attibute = item
+                let version_attribute = item
                 .get(version!())
                 .ok_or_else(||
                     Error::io(
@@ -318,7 +318,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                     )
                 )?;
 
-                match (version_attibute, path_attribute) {
+                match (version_attribute, path_attribute) {
                     (AttributeValue::N(version), AttributeValue::S(path)) => Ok(Some((
                         version.parse().map_err(|e| Error::io(
                             format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
@@ -342,7 +342,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
             .item(path!(), AttributeValue::S(path.to_string()))
-            .item(commiter!(), AttributeValue::S(self.commiter_name.clone()))
+            .item(committer!(), AttributeValue::S(self.committer_name.clone()))
             .condition_expression(format!(
                 "attribute_not_exists({}) AND attribute_not_exists({})",
                 base_uri!(),
@@ -361,7 +361,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
             .item(path!(), AttributeValue::S(path.to_string()))
-            .item(commiter!(), AttributeValue::S(self.commiter_name.clone()))
+            .item(committer!(), AttributeValue::S(self.committer_name.clone()))
             .condition_expression(format!(
                 "attribute_exists({}) AND attribute_exists({})",
                 base_uri!(),
