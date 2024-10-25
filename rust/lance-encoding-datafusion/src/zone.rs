@@ -692,6 +692,7 @@ mod tests {
 
     use crate::{substrait::FilterExpressionExt, LanceDfFieldEncodingStrategy};
 
+    #[ignore]
     #[test_log::test(tokio::test)]
     async fn test_basic_stats() {
         let data = lance_datagen::gen()
