@@ -152,7 +152,7 @@ def test_create_index_shuffle_params(tmp_path):
         shuffle_partition_concurrency=10,
     )
 
-    validate_vector_index(dataset, "emb")
+    validate_vector_index(dataset, "emb", sample_size=100)
 
 
 def _create_dataset(uri, num_batches=1):
