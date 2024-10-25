@@ -55,6 +55,7 @@ def dataset(
     commit_lock: Optional[CommitLock] = None,
     index_cache_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    default_scan_options: Optional[Dict[str, str]] = None,
 ) -> LanceDataset:
     """
     Opens the Lance dataset from the address specified.
@@ -88,6 +89,18 @@ def dataset(
     storage_options : optional, dict
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
+    default_scan_options : optional, dict
+        Default scan options that are used when scanning the dataset.  This accepts
+        the same arguments described in :py:meth:`lance.LanceDataset.scanner`.  The
+        arguments will be applied to any scan operation.
+
+        This can be useful to supply defaults for common parameters such as
+        ``batch_size``.
+
+        It can also be used to create a view of the dataset that includes meta
+        fields such as ``_rowid`` or ``_rowaddr``.  If ``default_scan_options`` is
+        provided then the schema returned by :py:meth:`lance.LanceDataset.schema` will
+        include these fields if the appropriate scan options are set.
     """
     ds = LanceDataset(
         uri,
@@ -96,6 +109,7 @@ def dataset(
         commit_lock=commit_lock,
         index_cache_size=index_cache_size,
         storage_options=storage_options,
+        default_scan_options=default_scan_options,
     )
     if version is None and asof is not None:
         ts_cutoff = sanitize_ts(asof)

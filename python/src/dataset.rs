@@ -658,9 +658,7 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
-            RT.runtime
-                .block_on(scanner.filter_substrait(f.as_slice()))
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            scanner.filter_substrait(f.as_slice()).infer_error()?;
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
