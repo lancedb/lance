@@ -1,0 +1,61 @@
+name: Lance File Write Read Round Trip Verification
+on: [pull_request]
+
+jobs:
+  run:
+    runs-on: "ubuntu-24.04"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Build Requirements
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+
+      - name: Check AWS_ACCESS_KEY_ID
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}" ]; then
+            echo "AWS_ACCESS_KEY_ID is not set"
+            exit 1
+          else
+            echo "AWS_ACCESS_KEY_ID is set"
+          fi
+
+      - name: Check AWS_SECRET_ACCESS_KEY
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_SECRET }}" ]; then
+            echo "AWS_SECRET_ACCESS_KEY is not set"
+            exit 1
+          else
+            echo "AWS_SECRET_ACCESS_KEY is set"
+          fi
+
+      - name: Test Lance File
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY}}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.LANCEDB_S3_READER_SECRET }}
+        working-directory: ./python
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+
+          pip install boto3
+          pip install pyarrow
+          pip install maturin
+
+          maturin develop --release
+
+          cd ../.github/workflows/file_read_write_round_trip_verification
+          python download_file.py
+          python test_write_read.py
+
+      - name: List files
+        working-directory: ./.github/workflows/file_read_write_round_trip_verification
+        run: ls -la
