@@ -51,13 +51,14 @@ jobs:
           aws s3 ls s3://$BUCKET_NAME
 
       - name: Download files from S3 bucket
-        working-directory: .github/workflows/file_read_write_round_trip_verification
+        working-directory: .github/workflows/write_read_roundtrip_test
         run: |
           BUCKET_NAME="lance-ci-bucket"
-          aws s3 cp s3://$BUCKET_NAME . --recursive
+          mkdir test_files
+          aws s3 cp s3://$BUCKET_NAME ./test_files --recursive
 
       - name: List files Downloaded
-        working-directory: .github/workflows/file_read_write_round_trip_verification
+        working-directory: .github/workflows/write_read_roundtrip_test/test_files
         run: |
           ls -l
 
@@ -72,6 +73,10 @@ jobs:
       - name: Test Lance File Write Read Round Trip
         run: |
           source python/venv/bin/activate
-          cd .github/workflows/file_read_write_round_trip_verification
-          pwd
+          cd .github/workflows/write_read_roundtrip_test
           python test_write_read.py
+      
+      - name: Cleanup
+        run: |
+          rm -rf ./.github/workflows/write_read_roundtrip_test/test_files
+          echo "Cleanup completed: Deleted downloaded files."

@@ -18,11 +18,11 @@ import pyarrow.parquet as pq
 from lance.file import LanceFileReader, LanceFileWriter
 
 if __name__ == "__main__":
-    # Get the current working directory
-    current_path = os.getcwd()
+        # Define the directory containing the Parquet files
+    parquet_dir = os.path.join(os.getcwd(), 'test_files')
 
-    # Find all Parquet files in the current directory
-    parquet_files = glob.glob(os.path.join(current_path, '*.parquet'))
+    # Find all Parquet files 
+    parquet_files = glob.glob(os.path.join(parquet_dir, '*.parquet'))
 
     # Fail if no Parquet files are available for testing
     if len(parquet_files) == 0:
