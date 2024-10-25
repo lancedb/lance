@@ -298,8 +298,13 @@ message MiniBlockLayout {
   ArrayEncoding value_compression = 3;
 }
 
+message AllNullLayout {
+
+}
+
 message PageLayout {
   oneof layout {
     MiniBlockLayout mini_block_layout = 1;
+    AllNullLayout all_null_layout = 2;
   }
 }
