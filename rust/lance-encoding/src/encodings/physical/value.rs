@@ -27,7 +27,7 @@ use crate::{
 
 use lance_core::{Error, Result};
 
-use super::block_compress::{CompressionScheme, GeneralBufferCompressor};
+use super::block_compress::{CompressionConfig, CompressionScheme, GeneralBufferCompressor};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -37,7 +37,7 @@ pub struct ValuePageScheduler {
     bytes_per_value: u64,
     buffer_offset: u64,
     buffer_size: u64,
-    compression_scheme: CompressionScheme,
+    compression_config: CompressionConfig,
 }
 
 impl ValuePageScheduler {
@@ -45,13 +45,13 @@ impl ValuePageScheduler {
         bytes_per_value: u64,
         buffer_offset: u64,
         buffer_size: u64,
-        compression_scheme: CompressionScheme,
+        compression_config: CompressionConfig,
     ) -> Self {
         Self {
             bytes_per_value,
             buffer_offset,
             buffer_size,
-            compression_scheme,
+            compression_config,
         }
     }
 }
@@ -64,7 +64,7 @@ impl PageScheduler for ValuePageScheduler {
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);
-        let byte_ranges = if self.compression_scheme == CompressionScheme::None {
+        let byte_ranges = if self.compression_config.scheme == CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
@@ -95,7 +95,7 @@ impl PageScheduler for ValuePageScheduler {
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
-        let range_offsets = if self.compression_scheme != CompressionScheme::None {
+        let range_offsets = if self.compression_config.scheme != CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
@@ -108,6 +108,7 @@ impl PageScheduler for ValuePageScheduler {
             vec![]
         };
 
+        let compression_config = self.compression_config;
         async move {
             let bytes = bytes.await?;
 
@@ -116,6 +117,7 @@ impl PageScheduler for ValuePageScheduler {
                 data: bytes,
                 uncompressed_data: Arc::new(Mutex::new(None)),
                 uncompressed_range_offsets: range_offsets,
+                compression_config,
             }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
@@ -127,13 +129,14 @@ struct ValuePageDecoder {
     data: Vec<Bytes>,
     uncompressed_data: Arc<Mutex<Option<Vec<Bytes>>>>,
     uncompressed_range_offsets: Vec<std::ops::Range<usize>>,
+    compression_config: CompressionConfig,
 }
 
 impl ValuePageDecoder {
     fn decompress(&self) -> Result<Vec<Bytes>> {
         // for compressed page, it is guaranteed that only one range is passed
         let bytes_u8: Vec<u8> = self.data[0].to_vec();
-        let buffer_compressor = GeneralBufferCompressor::get_compressor("");
+        let buffer_compressor = GeneralBufferCompressor::get_compressor(self.compression_config);
         let mut uncompressed_bytes: Vec<u8> = Vec::new();
         buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
 
@@ -451,7 +454,6 @@ impl FixedPerValueCompressor for ValueEncoder {
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
-
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{Array, Int32Array};
