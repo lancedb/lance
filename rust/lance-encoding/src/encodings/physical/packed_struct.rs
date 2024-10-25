@@ -265,8 +265,9 @@ pub mod tests {
     use arrow_schema::{DataType, Field, Fields};
     use std::{collections::HashMap, sync::Arc, vec};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     #[test_log::test(tokio::test)]
@@ -280,7 +281,7 @@ pub mod tests {
 
         let field = Field::new("", data_type, false).with_metadata(metadata);
 
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]

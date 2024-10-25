@@ -133,13 +133,14 @@ mod tests {
     use crate::decoder::PrimitivePageDecoder;
     use crate::encodings::physical::bitmap::BitmapData;
     use crate::testing::check_round_trip_encoding_random;
+    use crate::version::LanceFileVersion;
 
     use super::BitmapDecoder;
 
     #[test_log::test(tokio::test)]
     async fn test_bitmap_boolean() {
         let field = Field::new("", DataType::Boolean, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test]
