@@ -22,7 +22,7 @@ use lance_io::{
 
 fn bench_reader(c: &mut Criterion) {
     for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
-        let mut group = c.benchmark_group(&format!("reader_{}", version));
+        let mut group = c.benchmark_group(format!("reader_{}", version));
         let data = lance_datagen::gen()
             .anon_col(lance_datagen::array::rand_type(&DataType::Int32))
             .into_batch_rows(lance_datagen::RowCount::from(2 * 1024 * 1024))
@@ -99,7 +99,7 @@ fn bench_reader(c: &mut Criterion) {
                             .boxed()
                         })
                         .buffer_unordered(16);
-                    while let Some(_) = stream.next().await {}
+                    while (stream.next().await).is_some() {}
                     let stats = stats.lock().unwrap();
                     let row_count = stats.0;
                     let sum = stats.1;
