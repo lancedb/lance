@@ -537,6 +537,7 @@ pub mod tests {
         buffer::LanceBuffer,
         data::DataBlock,
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     use super::get_indices_from_string_arrays;
@@ -544,7 +545,7 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test]
@@ -581,19 +582,19 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]

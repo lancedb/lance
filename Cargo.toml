@@ -136,6 +136,7 @@ rand = { version = "0.8.3", features = ["small_rng"] }
 rangemap = { version = "1.0" }
 rayon = "1.10"
 roaring = "0.10.1"
+rstest = "0.19.0"
 rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }

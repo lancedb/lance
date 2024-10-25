@@ -23,8 +23,8 @@ use crate::{
     data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, NextDecodeTask, PageEncoding, PriorityRange, ScheduledScanLine,
-        SchedulerContext, SchedulingJob,
+        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
+        ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -357,14 +357,18 @@ async fn indirect_schedule_task(
         });
     }
     let item_ranges = item_ranges.into_iter().collect::<Vec<_>>();
+    let num_items = item_ranges.iter().map(|r| r.end - r.start).sum::<u64>();
 
     // Create a new root scheduler, which has one column, which is our items data
     let root_fields = Fields::from(vec![Field::new("item", items_type, true)]);
     let indirect_root_scheduler =
         SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
-    let mut indirect_scheduler =
-        DecodeBatchScheduler::from_scheduler(Arc::new(indirect_root_scheduler), root_fields, cache);
-    let mut root_decoder = indirect_scheduler.new_root_decoder_ranges(&item_ranges);
+    let mut indirect_scheduler = DecodeBatchScheduler::from_scheduler(
+        Arc::new(indirect_root_scheduler),
+        root_fields.clone(),
+        cache,
+    );
+    let mut root_decoder = SimpleStructDecoder::new(root_fields, num_items);
 
     let priority = Box::new(ListPriorityRange::new(priority, offsets.clone()));
 
@@ -378,6 +382,7 @@ async fn indirect_schedule_task(
 
     for message in indirect_messages {
         for decoder in message.decoders {
+            let decoder = decoder.into_legacy();
             if !decoder.path.is_empty() {
                 root_decoder.accept_child(decoder)?;
             }
@@ -424,7 +429,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         &mut self,
         context: &mut SchedulerContext,
         priority: &dyn PriorityRange,
-    ) -> Result<crate::decoder::ScheduledScanLine> {
+    ) -> Result<ScheduledScanLine> {
         let next_offsets = self.offsets.schedule_next(context, priority)?;
         let offsets_scheduled = next_offsets.rows_scheduled;
         let list_reqs = self.list_requests_iter.next(offsets_scheduled);
@@ -441,7 +446,13 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
             .all(|req| req.null_offset_adjustment == null_offset_adjustment));
         let num_rows = list_reqs.iter().map(|req| req.num_lists).sum::<u64>();
         // offsets is a uint64 which is guaranteed to create one decoder on each call to schedule_next
-        let next_offsets_decoder = next_offsets.decoders.into_iter().next().unwrap().decoder;
+        let next_offsets_decoder = next_offsets
+            .decoders
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_legacy()
+            .decoder;
 
         let items_scheduler = self.scheduler.items_scheduler.clone();
         let items_type = self.scheduler.items_field.data_type().clone();
@@ -475,7 +486,7 @@ impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
         });
         let decoder = context.locate_decoder(decoder);
         Ok(ScheduledScanLine {
-            decoders: vec![decoder],
+            decoders: vec![MessageType::DecoderReady(decoder)],
             rows_scheduled: num_rows,
         })
     }
@@ -1252,8 +1263,9 @@ mod tests {
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     fn make_list_type(inner_type: DataType) -> DataType {
@@ -1267,25 +1279,25 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list() {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_list() {
         let field = Field::new("", make_large_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_strings() {
         let field = Field::new("", make_list_type(DataType::Utf8), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_nested_list() {
         let field = Field::new("", make_list_type(make_list_type(DataType::Int32)), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1297,7 +1309,7 @@ mod tests {
         )]));
 
         let field = Field::new("", make_list_type(struct_type), true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
