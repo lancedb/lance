@@ -1,18 +1,18 @@
-name: Nightly Run Jobs
+# name: Nightly Run Jobs
 
-on:
-  schedule:
-    - cron: '0 0 * * *'  # Runs every day at midnight UTC
-  workflow_dispatch:
+# on:
+#   schedule:
+#     - cron: '0 0 * * *'  # Runs every day at midnight UTC
+#   workflow_dispatch:
 
-jobs:
-  trigger-file-verification:
-    runs-on: ubuntu-24.04
+# jobs:
+#   trigger-file-verification:
+#     runs-on: ubuntu-24.04
 
-    steps:
-      - name: Nightly Run File Verification Workflow
-        uses: benc-uk/workflow-dispatch@v1
-        with:
-          workflow: Lance File Write Read Round Trip Verification
-          ref: broccoli/file_verify
-          token: ${{ secrets.GITHUB_TOKEN }}
+#     steps:
+#       - name: Nightly Run File Verification Workflow
+#         uses: benc-uk/workflow-dispatch@v1
+#         with:
+#           workflow: Lance File Write Read Round Trip Verification
+#           ref: main
+#           token: ${{ secrets.GITHUB_TOKEN }}
