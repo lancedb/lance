@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchReader};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
@@ -235,7 +236,15 @@ pub async fn write_fragments_internal(
         match params.mode {
             WriteMode::Append | WriteMode::Create => {
                 // Append mode, so we need to check compatibility
-                schema.check_compatible(dataset.schema(), &Default::default())?;
+                schema.check_compatible(
+                    dataset.schema(),
+                    // We don't if the user claims their data is nullable / non-nullable.  We will
+                    // verify against the actual data.
+                    &SchemaCompareOptions {
+                        compare_nullability: NullabilityComparison::Ignore,
+                        ..Default::default()
+                    },
+                )?;
                 // Use the schema from the dataset, because it has the correct
                 // field ids.  Use the storage version from the dataset, ignoring
                 // any version from the user.

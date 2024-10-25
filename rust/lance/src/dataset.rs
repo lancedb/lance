@@ -11,6 +11,7 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use lance_core::datatypes::NullabilityComparison;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
@@ -554,6 +555,9 @@ impl Dataset {
                     &m.schema,
                     &SchemaCompareOptions {
                         compare_dictionary: true,
+                        // array nullability is checked later, using actual data instead
+                        // of the schema
+                        compare_nullability: NullabilityComparison::Ignore,
                         ..Default::default()
                     },
                 )?;

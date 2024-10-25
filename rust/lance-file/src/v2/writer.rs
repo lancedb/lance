@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 
+use arrow_data::ArrayData;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesOrdered;
 use futures::StreamExt;
-use lance_core::datatypes::Schema as LanceSchema;
+use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
@@ -205,6 +206,29 @@ impl FileWriter {
         Ok(())
     }
 
+    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+        }
+
+        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
+            Self::verify_field_nullability(child_arr, child_field)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
+        for (col, field) in batch
+            .columns()
+            .iter()
+            .zip(self.schema.as_ref().unwrap().fields.iter())
+        {
+            Self::verify_field_nullability(&col.to_data(), field)?;
+        }
+        Ok(())
+    }
+
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
             data_cache_bytes / schema.fields.len() as u64
@@ -292,6 +316,7 @@ impl FileWriter {
             batch.get_array_memory_size()
         );
         self.ensure_initialized(batch)?;
+        self.verify_nullability_constraints(batch)?;
         let num_rows = batch.num_rows() as u64;
         if num_rows == 0 {
             return Ok(());
