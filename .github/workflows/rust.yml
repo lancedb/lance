@@ -204,11 +204,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        msrv: ["1.78.0"]
+        msrv: ["1.78.0"] # This should match up with rust-version in Cargo.toml
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
       - name: Install ${{ matrix.msrv }}
         uses: dtolnay/rust-toolchain@master
         with:
