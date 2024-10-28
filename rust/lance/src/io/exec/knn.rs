@@ -8,7 +8,7 @@ use arrow::datatypes::UInt32Type;
 use arrow_array::{
     builder::{ListBuilder, UInt32Builder},
     cast::AsArray,
-    ArrayRef, RecordBatch, StringArray,
+    ArrayRef, RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::stats::Precision;
@@ -227,6 +227,7 @@ lazy_static::lazy_static! {
     pub static ref KNN_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
         Field::new(DIST_COL, DataType::Float32, true),
         ROW_ID_FIELD.clone(),
+        Field::new(PART_ID_COLUMN, DataType::UInt32, false),
     ]));
 
     static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
@@ -633,7 +634,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             query.key = key;
                         };
 
-                        index
+                        let batch = index
                             .search_in_partition(part_id as usize, &query, pre_filter)
                             .map_err(|e| {
                                 DataFusionError::Execution(format!(
@@ -641,7 +642,20 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                                     e
                                 ))
                             })
-                            .await
+                            .await?;
+
+                        // Add part ID
+                        // TODO -- we could maybe make this optional b/c it's only needed when using remote take 
+                        let mut fields = batch.schema().fields.clone().to_vec();
+                        fields.push(Arc::new(Field::new(PART_ID_COLUMN, DataType::UInt32, false)));
+                        let new_schema = Arc::new(Schema::new(fields));
+                        let mut columns = batch.columns().to_vec();
+                        let part_ids = (0..batch.num_rows()).map(|_| part_id);
+                        let part_id_array = UInt32Array::from_iter_values(part_ids);
+                        let part_ids_array_ref = Arc::new(part_id_array) as ArrayRef;
+                        columns.push(part_ids_array_ref);
+
+                        Ok(RecordBatch::try_new(new_schema, columns)?)
                     }
                 })
                 .buffered(get_num_compute_intensive_cpus())
