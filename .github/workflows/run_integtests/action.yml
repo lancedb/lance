@@ -8,7 +8,7 @@ runs:
     working-directory: python
     shell: bash
     run: |
-      pip3 install $(ls target/wheels/pylance-*.whl)[tests]
+      pip3 install $(ls target/wheels/pylance-*.whl)[tests,ray]
   - name: Run python tests
     shell: bash
     working-directory: python

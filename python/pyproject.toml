@@ -1,6 +1,6 @@
 [project]
 name = "pylance"
-dependencies = ["pyarrow>=12", "numpy>=1.22,<2"]
+dependencies = ["pyarrow>=12", "numpy>=1.22"]
 description = "python wrapper for Lance columnar format"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
@@ -62,7 +62,7 @@ benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 cuvs-cu11 = ["cuvs-cu11", "pylibraft-cu11"]
 cuvs-cu12 = ["cuvs-cu12", "pylibraft-cu12"]
-ray = ["ray[data]; python_version<'3.12'"]
+ray = ["ray[data]<2.38; python_version<'3.12'"]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]

@@ -29,7 +29,7 @@ use arrow_array::{PrimitiveArray, UInt64Array};
 use arrow_schema::DataType;
 use lance_core::Result;
 
-use super::block_compress::{BufferCompressor, CompressionScheme, GeneralBufferCompressor};
+use super::block_compress::{BufferCompressor, CompressionConfig, GeneralBufferCompressor};
 
 struct IndicesNormalizer {
     indices: Vec<u64>,
@@ -345,20 +345,19 @@ impl PrimitivePageDecoder for BinaryPageDecoder {
 #[derive(Debug)]
 pub struct BinaryEncoder {
     indices_encoder: Box<dyn ArrayEncoder>,
-    compression_scheme: Option<CompressionScheme>,
+    compression_config: Option<CompressionConfig>,
     buffer_compressor: Option<Box<dyn BufferCompressor>>,
 }
 
 impl BinaryEncoder {
     pub fn new(
         indices_encoder: Box<dyn ArrayEncoder>,
-        compression_scheme: Option<CompressionScheme>,
+        compression_config: Option<CompressionConfig>,
     ) -> Self {
-        let buffer_compressor = compression_scheme
-            .map(|scheme| GeneralBufferCompressor::get_compressor(&scheme.to_string()));
+        let buffer_compressor = compression_config.map(GeneralBufferCompressor::get_compressor);
         Self {
             indices_encoder,
-            compression_scheme,
+            compression_config,
             buffer_compressor,
         }
     }
@@ -515,7 +514,7 @@ impl ArrayEncoder for BinaryEncoder {
         let bytes_encoding = ProtobufUtils::flat_encoding(
             /*bits_per_value=*/ 8,
             bytes_buffer_index,
-            self.compression_scheme,
+            self.compression_config,
         );
 
         let encoding =
@@ -527,7 +526,6 @@ impl ArrayEncoder for BinaryEncoder {
 
 #[cfg(test)]
 pub mod tests {
-
     use arrow_array::{
         builder::{LargeStringBuilder, StringBuilder},
         ArrayRef, StringArray,
@@ -539,6 +537,7 @@ pub mod tests {
         buffer::LanceBuffer,
         data::DataBlock,
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     use super::get_indices_from_string_arrays;
@@ -546,7 +545,7 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test]
@@ -583,19 +582,19 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]

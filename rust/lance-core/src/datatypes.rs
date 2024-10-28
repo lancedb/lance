@@ -20,10 +20,12 @@ mod schema;
 use crate::{Error, Result};
 pub use field::Encoding;
 pub use field::Field;
+pub use field::NullabilityComparison;
 pub use field::SchemaCompareOptions;
 pub use schema::Schema;
 
 pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
+pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
 pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
 pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
@@ -36,6 +38,7 @@ lazy_static::lazy_static! {
         ]);
     pub static ref BLOB_DESC_FIELD: ArrowField =
     ArrowField::new("description", DataType::Struct(BLOB_DESC_FIELDS.clone()), false);
+    pub static ref BLOB_DESC_LANCE_FIELD: Field = Field::try_from(&*BLOB_DESC_FIELD).unwrap();
 }
 
 /// LogicalType is a string presentation of arrow type.

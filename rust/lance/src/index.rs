@@ -13,6 +13,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_file::reader::FileReader;
 use lance_file::v2;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
@@ -693,6 +694,7 @@ impl DatasetIndexInternalExt for Dataset {
                     None,
                     Default::default(),
                     &self.session.file_metadata_cache,
+                    FileReaderOptions::default(),
                 )
                 .await?;
                 let index_metadata = reader
@@ -853,24 +855,22 @@ impl DatasetIndexInternalExt for Dataset {
 
     async fn indexed_fragments(&self, name: &str) -> Result<Vec<Vec<Fragment>>> {
         let indices = self.load_indices_by_name(name).await?;
-        let mut res = vec![];
-        for idx in indices.iter() {
-            let mut total_fragment_bitmap = RoaringBitmap::new();
-            total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::Index {
-                message: "Please upgrade lance to 0.8+ to use this function".to_string(),
-                location: location!(),
-            })?;
-
-            res.push(
-                self.fragments()
-                    .iter()
-                    .filter(|f| total_fragment_bitmap.contains(f.id as u32))
-                    .cloned()
-                    .collect(),
-            );
-        }
-
-        Ok(res)
+        indices
+            .iter()
+            .map(|index| {
+                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::Index {
+                    message: "Please upgrade lance to 0.8+ to use this function".to_string(),
+                    location: location!(),
+                })?;
+                let mut indexed_frags = Vec::with_capacity(fragment_bitmap.len() as usize);
+                for frag in self.fragments().iter() {
+                    if fragment_bitmap.contains(frag.id as u32) {
+                        indexed_frags.push(frag.clone());
+                    }
+                }
+                Ok(indexed_frags)
+            })
+            .collect()
     }
 }
 

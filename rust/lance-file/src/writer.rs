@@ -11,11 +11,12 @@ use arrow_array::cast::{as_large_list_array, as_list_array, as_struct_array};
 use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::ArrowNativeType;
+use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use lance_arrow::*;
-use lance_core::datatypes::{Encoding, Field, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
 use lance_core::{Error, Result};
 use lance_io::encodings::{
     binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder, Encoder,
@@ -142,6 +143,25 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         &self.schema
     }
 
+    fn verify_field_nullability(arr: &ArrayData, field: &Field) -> Result<()> {
+        if !field.nullable && arr.null_count() > 0 {
+            return Err(Error::invalid_input(format!("The field `{}` contained null values even though the field is marked non-null in the schema", field.name), location!()));
+        }
+
+        for (child_field, child_arr) in field.children.iter().zip(arr.child_data()) {
+            Self::verify_field_nullability(child_arr, child_field)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_nullability_constraints(&self, batch: &RecordBatch) -> Result<()> {
+        for (col, field) in batch.columns().iter().zip(self.schema.fields.iter()) {
+            Self::verify_field_nullability(&col.to_data(), field)?;
+        }
+        Ok(())
+    }
+
     /// Write a [RecordBatch] to the open file.
     /// All RecordBatch will be treated as one RecordBatch on disk
     ///
@@ -155,7 +175,14 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
             // Compare, ignore metadata and dictionary
             //   dictionary should have been checked earlier and could be an expensive check
             let schema = Schema::try_from(batch.schema().as_ref())?;
-            schema.check_compatible(&self.schema, &SchemaCompareOptions::default())?;
+            schema.check_compatible(
+                &self.schema,
+                &SchemaCompareOptions {
+                    compare_nullability: NullabilityComparison::Ignore,
+                    ..Default::default()
+                },
+            )?;
+            self.verify_nullability_constraints(batch)?;
         }
 
         // If we are collecting stats for this column, collect them.

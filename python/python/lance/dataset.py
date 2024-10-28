@@ -160,6 +160,7 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         serialized_manifest: Optional[bytes] = None,
+        default_scan_options: Optional[Dict[str, Any]] = None,
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
@@ -173,29 +174,53 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options,
             serialized_manifest,
         )
+        self._default_scan_options = default_scan_options
 
     @classmethod
-    def __deserialize__(cls, uri: str, version: int, manifest: bytes):
-        return cls(uri, version, serialized_manifest=manifest)
+    def __deserialize__(
+        cls,
+        uri: str,
+        version: int,
+        manifest: bytes,
+        default_scan_options: Optional[Dict[str, Any]],
+    ):
+        return cls(
+            uri,
+            version,
+            serialized_manifest=manifest,
+            default_scan_options=default_scan_options,
+        )
 
     def __reduce__(self):
         return type(self).__deserialize__, (
             self.uri,
             self._ds.version(),
             self._ds.serialized_manifest(),
+            self._default_scan_options,
         )
 
     def __getstate__(self):
-        return self.uri, self._ds.version(), self._ds.serialized_manifest()
+        return (
+            self.uri,
+            self._ds.version(),
+            self._ds.serialized_manifest(),
+            self._default_scan_options,
+        )
 
     def __setstate__(self, state):
-        self._uri, version, manifest = state
-        self._ds = _Dataset(self._uri, version, manifest=manifest)
+        self._uri, version, manifest, default_scan_options = state
+        self._ds = _Dataset(
+            self._uri,
+            version,
+            manifest=manifest,
+            default_scan_options=default_scan_options,
+        )
 
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
         ds._uri = self._uri
         ds._ds = copy.copy(self._ds)
+        ds._default_scan_options = self._default_scan_options
         return ds
 
     def __len__(self):
@@ -227,6 +252,11 @@ class LanceDataset(pa.dataset.Dataset):
     def has_index(self):
         return len(self.list_indices()) > 0
 
+    def _apply_default_scan_options(self, builder: ScannerBuilder):
+        if self._default_scan_options:
+            builder.apply_defaults(self._default_scan_options)
+        return builder
+
     def scanner(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -237,15 +267,15 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = True,
+        scan_in_order: bool = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         *,
-        prefilter: bool = False,
-        with_row_id: bool = False,
-        with_row_address: bool = False,
-        use_stats: bool = True,
-        fast_search: bool = False,
+        prefilter: bool = None,
+        with_row_id: bool = None,
+        with_row_address: bool = None,
+        use_stats: bool = None,
+        fast_search: bool = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
@@ -359,26 +389,51 @@ class LanceDataset(pa.dataset.Dataset):
             }
 
         """
-        builder = (
-            ScannerBuilder(self)
-            .columns(columns)
-            .filter(filter)
-            .prefilter(prefilter)
-            .limit(limit)
-            .offset(offset)
-            .batch_size(batch_size)
-            .io_buffer_size(io_buffer_size)
-            .batch_readahead(batch_readahead)
-            .fragment_readahead(fragment_readahead)
-            .scan_in_order(scan_in_order)
-            .with_fragments(fragments)
-            .late_materialization(late_materialization)
-            .with_row_id(with_row_id)
-            .with_row_address(with_row_address)
-            .use_stats(use_stats)
-            .use_scalar_index(use_scalar_index)
-            .fast_search(fast_search)
-        )
+        builder = ScannerBuilder(self)
+        builder = self._apply_default_scan_options(builder)
+
+        # Calls the setter if the user provided a non-None value
+        # We need to avoid calling the setter with a None value so
+        # we don't override any defaults from _default_scan_options
+        def setopt(opt, val):
+            if val is not None:
+                opt(val)
+
+        setopt(builder.filter, filter)
+        setopt(builder.prefilter, prefilter)
+        setopt(builder.limit, limit)
+        setopt(builder.offset, offset)
+        setopt(builder.batch_size, batch_size)
+        setopt(builder.io_buffer_size, io_buffer_size)
+        setopt(builder.batch_readahead, batch_readahead)
+        setopt(builder.fragment_readahead, fragment_readahead)
+        setopt(builder.scan_in_order, scan_in_order)
+        setopt(builder.with_fragments, fragments)
+        setopt(builder.late_materialization, late_materialization)
+        setopt(builder.with_row_id, with_row_id)
+        setopt(builder.with_row_address, with_row_address)
+        setopt(builder.use_stats, use_stats)
+        setopt(builder.use_scalar_index, use_scalar_index)
+        setopt(builder.fast_search, fast_search)
+
+        # columns=None has a special meaning. we can't treat it as "user didn't specify"
+        if self._default_scan_options is None:
+            # No defaults, use user-provided, if any
+            builder = builder.columns(columns)
+        else:
+            default_columns = self._default_scan_options.get("columns", None)
+            if default_columns is None:
+                # No default_columns, use user-provided, if any
+                builder = builder.columns(columns)
+            else:
+                if columns is not None:
+                    # User supplied None, fallback to default (no way to override
+                    # default to None)
+                    builder = builder.columns(columns)
+                else:
+                    # User supplied non-None, use that
+                    builder = builder.columns(default_columns)
+
         if full_text_query is not None:
             if isinstance(full_text_query, str):
                 builder = builder.full_text_search(full_text_query)
@@ -393,7 +448,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         The pyarrow Schema for this dataset
         """
-        return self._ds.schema
+        if self._default_scan_options is None:
+            return self._ds.schema
+        else:
+            return self.scanner().projected_schema
 
     @property
     def lance_schema(self) -> "LanceSchema":
@@ -1992,6 +2050,7 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
+        detached: Optional[bool] = False,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -2037,6 +2096,13 @@ class LanceDataset(pa.dataset.Dataset):
             :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
             turning this on will make the dataset unreadable for older versions
             of Lance (prior to 0.17.0).
+        detached : bool, optional
+            If True, then the commit will not be part of the dataset lineage.  It will
+            never show up as the latest dataset and the only way to check it out in the
+            future will be to specifically check it out by version.  The version will be
+            a random version that is only unique amongst detached commits.  The caller
+            should store this somewhere as there will be no other way to obtain it in
+            the future.
 
         Returns
         -------
@@ -2074,15 +2140,18 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        _Dataset.commit(
+        new_ds = _Dataset.commit(
             base_uri,
             operation._to_inner(),
             read_version,
             commit_lock,
             storage_options=storage_options,
             enable_v2_manifest_paths=enable_v2_manifest_paths,
+            detached=detached,
         )
-        return LanceDataset(base_uri, storage_options=storage_options)
+        return LanceDataset(
+            base_uri, version=new_ds.version(), storage_options=storage_options
+        )
 
     def validate(self):
         """
@@ -2492,10 +2561,10 @@ class LanceOperation:
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
-        self._limit = 0
+        self._limit = None
         self._filter = None
         self._substrait_filter = None
-        self._prefilter = None
+        self._prefilter = False
         self._late_materialization = None
         self._offset = None
         self._columns = None
@@ -2510,9 +2579,16 @@ class ScannerBuilder:
         self._with_row_id = False
         self._with_row_address = False
         self._use_stats = True
-        self._fast_search = None
+        self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
+
+    def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
+        for key, value in default_opts.items():
+            setter = getattr(self, key, None)
+            if setter is None:
+                raise ValueError(f"Unknown option {key}")
+            setter(value)
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -3232,6 +3308,7 @@ def write_dataset(
     ds = LanceDataset.__new__(LanceDataset)
     ds._ds = inner_ds
     ds._uri = uri
+    ds._default_scan_options = None
     return ds
 
 

@@ -658,9 +658,7 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
         if let Some(f) = substrait_filter {
-            RT.runtime
-                .block_on(scanner.filter_substrait(f.as_slice()))
-                .map_err(|err| PyIOError::new_err(err.to_string()))?;
+            scanner.filter_substrait(f.as_slice()).infer_error()?;
         }
         if let Some(prefilter) = prefilter {
             scanner.prefilter(prefilter);
@@ -1388,6 +1386,7 @@ impl Dataset {
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1418,16 +1417,29 @@ impl Dataset {
                 let manifest = dataset.as_ref().map(|ds| ds.manifest());
                 validate_operation(manifest, &operation.0)?;
                 let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-                LanceDataset::commit(
-                    dataset_uri,
-                    operation.0,
-                    read_version,
-                    object_store_params,
-                    commit_handler,
-                    object_store_registry,
-                    enable_v2_manifest_paths.unwrap_or(false),
-                )
-                .await
+                if detached.unwrap_or(false) {
+                    LanceDataset::commit_detached(
+                        dataset_uri,
+                        operation.0,
+                        read_version,
+                        object_store_params,
+                        commit_handler,
+                        object_store_registry,
+                        enable_v2_manifest_paths.unwrap_or(false),
+                    )
+                    .await
+                } else {
+                    LanceDataset::commit(
+                        dataset_uri,
+                        operation.0,
+                        read_version,
+                        object_store_params,
+                        commit_handler,
+                        object_store_registry,
+                        enable_v2_manifest_paths.unwrap_or(false),
+                    )
+                    .await
+                }
             })?
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         Ok(Self {

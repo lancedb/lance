@@ -7,6 +7,20 @@ import pyarrow as pa
 import pytest
 
 
+@pytest.mark.skip(reason="Unsigned integers not available for pushdown yet")
+def test_duckdb_filter_on_rowid(tmp_path):
+    tab = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
+    ds = lance.write_dataset(tab, str(tmp_path))
+    ds = lance.dataset(str(tmp_path), default_scan_options={"with_row_id": True})
+    row_ids = ds.scanner(columns=[], with_row_id=True).to_table().column(0).to_pylist()
+    expected = tab.slice(1, 1)
+    actual = duckdb.query(
+        f"SELECT * FROM ds WHERE _rowid = {row_ids[1]}"
+    ).fetch_arrow_table()
+
+    assert actual.to_pydict() == expected.to_pydict()
+
+
 def test_duckdb_pushdown_extension_types(tmp_path):
     # large_binary is reported by pyarrow as a substrait extension type.  Datafusion
     # does not currently handle these extension types.  This should be ok as long

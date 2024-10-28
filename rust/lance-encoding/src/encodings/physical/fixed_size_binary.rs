@@ -84,7 +84,7 @@ impl PrimitivePageDecoder for FixedSizeBinaryDecoder {
         let num_bytes = num_rows * self.byte_width;
         let bytes = self.bytes_decoder.decode(rows_to_skip, num_bytes)?;
         let bytes = bytes.as_fixed_width().unwrap();
-        debug_assert_eq!(bytes.bits_per_value, 8);
+        debug_assert_eq!(bytes.bits_per_value, self.byte_width * 8);
 
         let offsets_buffer = match self.bytes_per_offset {
             8 => {
@@ -169,36 +169,42 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::array::LargeStringBuilder;
-    use arrow_array::{ArrayRef, LargeStringArray, StringArray};
+    use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, LargeStringArray, StringArray};
+    use arrow_buffer::Buffer;
+    use arrow_data::ArrayData;
     use arrow_schema::{DataType, Field};
 
-    use crate::testing::{
-        check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases,
+    use crate::data::{DataBlock, FixedWidthDataBlock};
+    use crate::decoder::PrimitivePageDecoder;
+    use crate::encodings::physical::fixed_size_binary::FixedSizeBinaryDecoder;
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
     };
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_utf8_binary() {
         let field = Field::new("", DataType::Utf8, false);
         // This test only generates fixed size binary arrays anyway
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_binary() {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_large_binary() {
         let field = Field::new("", DataType::LargeBinary, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_large_utf8() {
         let field = Field::new("", DataType::LargeUtf8, true);
-        check_round_trip_encoding_random(field).await;
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -294,5 +300,60 @@ mod tests {
         // // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
+    }
+
+    struct FixedWidthCloningPageDecoder {
+        data_block: FixedWidthDataBlock,
+    }
+
+    impl PrimitivePageDecoder for FixedWidthCloningPageDecoder {
+        // clone the given data block as decoded data block
+        fn decode(
+            &self,
+            _rows_to_skip: u64,
+            _num_rows: u64,
+        ) -> lance_core::error::Result<DataBlock> {
+            Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: self.data_block.data.deep_copy(),
+                bits_per_value: self.data_block.bits_per_value,
+                num_values: self.data_block.num_values,
+                block_info: self.data_block.block_info.clone(),
+                used_encoding: self.data_block.used_encoding.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn test_fixed_size_binary_decoder() {
+        let values: [u8; 6] = *b"aaabbb";
+        let num_values = 2u64;
+        let byte_width = 3;
+        let array_data = ArrayData::builder(DataType::FixedSizeBinary(byte_width))
+            .len(num_values as usize)
+            .add_buffer(Buffer::from(&values[..]))
+            .build()
+            .unwrap();
+        let fixed_size_binary_array = FixedSizeBinaryArray::from(array_data);
+        let arrays = vec![Arc::new(fixed_size_binary_array) as ArrayRef];
+        let fixed_width_data_block = DataBlock::from_arrays(&arrays, num_values);
+        assert_eq!(fixed_width_data_block.name(), "FixedWidth");
+
+        let bytes_decoder = FixedWidthCloningPageDecoder {
+            data_block: fixed_width_data_block.as_fixed_width().unwrap(),
+        };
+        let decoder = FixedSizeBinaryDecoder {
+            bytes_decoder: Box::new(bytes_decoder),
+            byte_width: byte_width as u64,
+            bytes_per_offset: 4, // 32-bits offset binary
+        };
+
+        let decoded_binary = decoder.decode(0, num_values).unwrap();
+        let maybe_data = decoded_binary.into_arrow(DataType::Utf8, true);
+        assert!(maybe_data.is_ok());
+        let data = maybe_data.unwrap();
+        let string_array = StringArray::from(data);
+        assert_eq!(string_array.len(), num_values as usize);
+        assert_eq!(string_array.value(0), "aaa");
+        assert_eq!(string_array.value(1), "bbb");
     }
 }

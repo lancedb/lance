@@ -7,8 +7,9 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use arrow_select::take::take;
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_encoding::{
-    decoder::{DecoderMiddlewareChain, FilterExpression},
-    encoder::{encode_batch, CoreFieldEncodingStrategy, EncodingOptions},
+    decoder::{DecoderPlugins, FilterExpression},
+    encoder::{default_encoding_strategy, encode_batch, EncodingOptions},
+    version::LanceFileVersion,
 };
 
 use rand::Rng;
@@ -72,12 +73,12 @@ fn bench_decode(c: &mut Criterion) {
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
         let input_bytes = data.get_array_memory_size();
         group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
         let encoded = rt
             .block_on(encode_batch(
                 &data,
                 lance_schema,
-                &encoding_strategy,
+                encoding_strategy.as_ref(),
                 &ENCODING_OPTIONS,
             ))
             .unwrap();
@@ -88,7 +89,8 @@ fn bench_decode(c: &mut Criterion) {
                     .block_on(lance_encoding::decoder::decode_batch(
                         &encoded,
                         &FilterExpression::no_filter(),
-                        Arc::<DecoderMiddlewareChain>::default(),
+                        Arc::<DecoderPlugins>::default(),
+                        false,
                     ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
@@ -112,12 +114,12 @@ fn bench_decode_fsl(c: &mut Criterion) {
             Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
         let input_bytes = data.get_array_memory_size();
         group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
-        let encoding_strategy = CoreFieldEncodingStrategy::default();
+        let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
         let encoded = rt
             .block_on(encode_batch(
                 &data,
                 lance_schema,
-                &encoding_strategy,
+                encoding_strategy.as_ref(),
                 &ENCODING_OPTIONS,
             ))
             .unwrap();
@@ -128,7 +130,8 @@ fn bench_decode_fsl(c: &mut Criterion) {
                     .block_on(lance_encoding::decoder::decode_batch(
                         &encoded,
                         &FilterExpression::no_filter(),
-                        Arc::<DecoderMiddlewareChain>::default(),
+                        Arc::<DecoderPlugins>::default(),
+                        false,
                     ))
                     .unwrap();
                 assert_eq!(data.num_rows(), batch.num_rows());
@@ -168,12 +171,12 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
         Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
     let input_bytes = data.get_array_memory_size();
     group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
-    let encoding_strategy = CoreFieldEncodingStrategy::default();
+    let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
     let encoded = rt
         .block_on(encode_batch(
             &data,
             lance_schema,
-            &encoding_strategy,
+            encoding_strategy.as_ref(),
             &ENCODING_OPTIONS,
         ))
         .unwrap();
@@ -184,7 +187,8 @@ fn bench_decode_str_with_dict_encoding(c: &mut Criterion) {
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
                     &FilterExpression::no_filter(),
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -236,12 +240,12 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     let lance_schema = Arc::new(lance_core::datatypes::Schema::try_from(&new_schema).unwrap());
     let input_bytes = data.get_array_memory_size();
     group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
-    let encoding_strategy = CoreFieldEncodingStrategy::default();
+    let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
     let encoded = rt
         .block_on(encode_batch(
             &data,
             lance_schema,
-            &encoding_strategy,
+            encoding_strategy.as_ref(),
             &ENCODING_OPTIONS,
         ))
         .unwrap();
@@ -253,7 +257,8 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
                     &FilterExpression::no_filter(),
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());
@@ -285,12 +290,12 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
         Arc::new(lance_core::datatypes::Schema::try_from(data.schema().as_ref()).unwrap());
     let input_bytes = data.get_array_memory_size();
     group.throughput(criterion::Throughput::Bytes(input_bytes as u64));
-    let encoding_strategy = CoreFieldEncodingStrategy::default();
+    let encoding_strategy = default_encoding_strategy(LanceFileVersion::default());
     let encoded = rt
         .block_on(encode_batch(
             &data,
             lance_schema,
-            &encoding_strategy,
+            encoding_strategy.as_ref(),
             &ENCODING_OPTIONS,
         ))
         .unwrap();
@@ -301,7 +306,8 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
                 .block_on(lance_encoding::decoder::decode_batch(
                     &encoded,
                     &FilterExpression::no_filter(),
-                    Arc::<DecoderMiddlewareChain>::default(),
+                    Arc::<DecoderPlugins>::default(),
+                    false,
                 ))
                 .unwrap();
             assert_eq!(data.num_rows(), batch.num_rows());

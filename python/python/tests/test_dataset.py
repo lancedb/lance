@@ -6,6 +6,7 @@ import contextlib
 import os
 import pickle
 import platform
+import random
 import re
 import time
 import uuid
@@ -412,6 +413,24 @@ def test_filter(tmp_path: Path):
     dataset = lance.dataset(base_dir)
     actual_tab = dataset.to_table(columns=["a"], filter=(pa.compute.field("b") > 50))
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
+
+
+def test_filter_meta_columns(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+
+    rowids = ds.to_table(with_row_id=True, columns=[])
+    some_row_id = random.sample(rowids.column(0).to_pylist(), 1)[0]
+    filtered = ds.to_table(filter=f"_rowid = {some_row_id}", with_row_id=True)
+
+    assert len(filtered) == 1
+
+    rowaddrs = ds.to_table(with_row_address=True, columns=[])
+    some_row_addr = random.sample(rowaddrs.column(0).to_pylist(), 1)[0]
+    filtered = ds.to_table(filter=f"_rowaddr = {some_row_addr}", with_row_address=True)
+
+    assert len(filtered) == 1
 
 
 @pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
@@ -2108,6 +2127,26 @@ def test_metadata(tmp_path: Path):
     lance.write_dataset(data, tmp_path)
 
 
+def test_default_scan_options(tmp_path: Path):
+    data = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    assert dataset.schema.names == ["a", "b"]
+
+    dataset = lance.dataset(tmp_path)
+    assert dataset.schema.names == ["a", "b"]
+
+    dataset = lance.dataset(
+        tmp_path,
+        default_scan_options={
+            "with_row_id": True,
+        },
+    )
+    assert dataset.schema.names == ["a", "b", "_rowid"]
+
+    dataset = lance.dataset(tmp_path, default_scan_options={"with_row_address": True})
+    assert dataset.schema.names == ["a", "b", "_rowaddr"]
+
+
 def test_scan_with_row_ids(tmp_path: Path):
     """Test expose physical row ids in the scanner."""
     data = pa.table({"a": range(1000)})
@@ -2594,3 +2633,54 @@ def test_default_storage_version(tmp_path: Path):
     sample_file = frag.to_json()["files"][0]
     assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
     assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+
+def test_no_detached_v1(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    with pytest.raises(OSError, match="v1 manifest paths"):
+        dataset.commit(dataset.uri, op, read_version=dataset.version, detached=True)
+
+
+def test_detached_commits(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path, enable_v2_manifest_paths=True)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    detached = dataset.commit(
+        dataset.uri, op, read_version=dataset.version, detached=True
+    )
+    assert (detached.version & 0x8000000000000000) != 0
+
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+    # Detached commit should not show up in the dataset
+    dataset = lance.dataset(tmp_path)
+    assert dataset.to_table() == pa.table({"x": [0]})
+
+    # We can make more commits to dataset and they don't affect attached
+    table = pa.table({"x": [2]})
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert dataset.to_table() == pa.table({"x": [0, 2]})
+
+    # We can check out the detached commit
+    detached = dataset.checkout_version(detached.version)
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+
+    # Detached commit can use detached commit as read version
+    table = pa.table({"x": [3]})
+    frag = lance.LanceFragment.create(detached.uri, table)
+    op = lance.LanceOperation.Append([frag])
+
+    detached2 = dataset.commit(
+        dataset.uri, op, read_version=detached.version, detached=True
+    )
+
+    assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
