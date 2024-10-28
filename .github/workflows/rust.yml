@@ -205,6 +205,10 @@ jobs:
     strategy:
       matrix:
         msrv: ["1.78.0"] # This should match up with rust-version in Cargo.toml
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang-18
+      CXX: clang-18
     steps:
       - uses: actions/checkout@v4
         with:
