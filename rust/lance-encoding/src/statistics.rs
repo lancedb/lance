@@ -169,34 +169,50 @@ impl FixedWidthDataBlock {
     }
 
     fn max_bit_width(&mut self) -> Arc<dyn Array> {
+        assert!(self.num_values > 0);
+
+        let chunk_size = 1024;
+        let mut max_bit_widths = vec![];
         match self.bits_per_value {
             8 => {
                 let u8_slice_ref = self.data.borrow_to_typed_slice::<u8>();
                 let u8_slice = u8_slice_ref.as_ref();
-                let max_value = u8_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u8_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             16 => {
                 let u16_slice_ref = self.data.borrow_to_typed_slice::<u16>();
                 let u16_slice = u16_slice_ref.as_ref();
-                let max_value = u16_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u16_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             32 => {
                 let u32_slice_ref = self.data.borrow_to_typed_slice::<u32>();
                 let u32_slice = u32_slice_ref.as_ref();
-                let max_value = u32_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u32_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             64 => {
                 let u64_slice_ref = self.data.borrow_to_typed_slice::<u64>();
                 let u64_slice = u64_slice_ref.as_ref();
-                let max_value = u64_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u64_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             // when self.bits_per_value is not (8, 16, 32, 64), it is already bit-packed or we don't
             // bit-pack them(Decimal128, Decimal256), so we return `self.bit_per_value` as their `max_bit_width`
@@ -1009,6 +1025,91 @@ mod tests {
             "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
             expected_bit_width,
             uint64_array
+        );
+    }
+
+    #[test]
+    fn test_bit_width_stat_more_than_1024() {
+        let int8_array1 = Int8Array::from(vec![3; 1024]);
+        let int8_array2 = Int8Array::from(vec![8; 10]);
+
+        let array1_ref: ArrayRef = Arc::new(int8_array1);
+        let array2_ref: ArrayRef = Arc::new(int8_array2);
+        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref()];
+        let concatenated = concat(&arrays).unwrap();
+        let mut block = DataBlock::from_array(concatenated.clone());
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4])) as ArrayRef;
+        let actual_bit_widths = block.get_stat(Stat::BitWidth);
+        assert_eq!(
+            actual_bit_widths,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            concatenated
+        );
+
+        let int16_array1 = Int16Array::from(vec![3; 1024]);
+        let int16_array2 = Int16Array::from(vec![8; 1024]);
+        let int16_array3 = Int16Array::from(vec![-1; 10]);
+
+        let array1_ref: ArrayRef = Arc::new(int16_array1);
+        let array2_ref: ArrayRef = Arc::new(int16_array2);
+        let array3_ref: ArrayRef = Arc::new(int16_array3);
+        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref(), array3_ref.as_ref()];
+        let concatenated = concat(&arrays).unwrap();
+        let mut block = DataBlock::from_array(concatenated.clone());
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4, 16])) as ArrayRef;
+        let actual_bit_widths = block.get_stat(Stat::BitWidth);
+        assert_eq!(
+            actual_bit_widths,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            concatenated
+        );
+
+        let int32_array1 = Int32Array::from(vec![3; 1024]);
+        let int32_array2 = Int32Array::from(vec![8; 1024]);
+        let int32_array3 = Int32Array::from(vec![-1; 10]);
+
+        let array1_ref: ArrayRef = Arc::new(int32_array1);
+        let array2_ref: ArrayRef = Arc::new(int32_array2);
+        let array3_ref: ArrayRef = Arc::new(int32_array3);
+        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref(), array3_ref.as_ref()];
+        let concatenated = concat(&arrays).unwrap();
+        let mut block = DataBlock::from_array(concatenated.clone());
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4, 32])) as ArrayRef;
+        let actual_bit_widths = block.get_stat(Stat::BitWidth);
+        assert_eq!(
+            actual_bit_widths,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            concatenated
+        );
+
+        let int64_array1 = Int64Array::from(vec![3; 1024]);
+        let int64_array2 = Int64Array::from(vec![8; 1024]);
+        let int64_array3 = Int64Array::from(vec![-1; 10]);
+
+        let array1_ref: ArrayRef = Arc::new(int64_array1);
+        let array2_ref: ArrayRef = Arc::new(int64_array2);
+        let array3_ref: ArrayRef = Arc::new(int64_array3);
+        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref(), array3_ref.as_ref()];
+        let concatenated = concat(&arrays).unwrap();
+        let mut block = DataBlock::from_array(concatenated.clone());
+
+        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4, 64])) as ArrayRef;
+        let actual_bit_widths = block.get_stat(Stat::BitWidth);
+        assert_eq!(
+            actual_bit_widths,
+            Some(expected_bit_width.clone()),
+            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
+            expected_bit_width,
+            concatenated
         );
     }
 
