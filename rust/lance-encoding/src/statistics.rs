@@ -1056,7 +1056,11 @@ mod tests {
         let array1_ref: ArrayRef = Arc::new(int16_array1);
         let array2_ref: ArrayRef = Arc::new(int16_array2);
         let array3_ref: ArrayRef = Arc::new(int16_array3);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref(), array3_ref.as_ref()];
+        let arrays: Vec<&dyn arrow::array::Array> = vec![
+            array1_ref.as_ref(),
+            array2_ref.as_ref(),
+            array3_ref.as_ref(),
+        ];
         let concatenated = concat(&arrays).unwrap();
         let mut block = DataBlock::from_array(concatenated.clone());
 
@@ -1077,7 +1081,11 @@ mod tests {
         let array1_ref: ArrayRef = Arc::new(int32_array1);
         let array2_ref: ArrayRef = Arc::new(int32_array2);
         let array3_ref: ArrayRef = Arc::new(int32_array3);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref(), array3_ref.as_ref()];
+        let arrays: Vec<&dyn arrow::array::Array> = vec![
+            array1_ref.as_ref(),
+            array2_ref.as_ref(),
+            array3_ref.as_ref(),
+        ];
         let concatenated = concat(&arrays).unwrap();
         let mut block = DataBlock::from_array(concatenated.clone());
 
@@ -1098,7 +1106,11 @@ mod tests {
         let array1_ref: ArrayRef = Arc::new(int64_array1);
         let array2_ref: ArrayRef = Arc::new(int64_array2);
         let array3_ref: ArrayRef = Arc::new(int64_array3);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref(), array3_ref.as_ref()];
+        let arrays: Vec<&dyn arrow::array::Array> = vec![
+            array1_ref.as_ref(),
+            array2_ref.as_ref(),
+            array3_ref.as_ref(),
+        ];
         let concatenated = concat(&arrays).unwrap();
         let mut block = DataBlock::from_array(concatenated.clone());
 
