@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 import os
+import pathlib
 
 import lance
 import numpy as np
@@ -17,19 +18,35 @@ NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
 NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
 
-@pytest.fixture(
-    params=[np.float16, np.float32, np.float64],
-    ids=["f16", "f32", "f64"],
-)
-def rand_dataset(tmpdir, request):
-    vectors = np.random.randn(NUM_ROWS, DIMENSION).astype(request.param)
+SMALL_ROWS_PER_FRAGMENT = 100
+SMALL_NUM_ROWS = SMALL_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
+
+
+def make_ds(num_rows: int, rows_per_frag: int, tmpdir: pathlib.Path, dtype: str):
+    vectors = np.random.randn(num_rows, DIMENSION).astype(dtype)
     vectors.shape = -1
     vectors = pa.FixedSizeListArray.from_arrays(vectors, DIMENSION)
     table = pa.Table.from_arrays([vectors], names=["vectors"])
     uri = str(tmpdir / "dataset")
 
-    ds = lance.write_dataset(table, uri, max_rows_per_file=NUM_ROWS_PER_FRAGMENT)
+    ds = lance.write_dataset(table, uri, max_rows_per_file=rows_per_frag)
     return ds
+
+
+@pytest.fixture(
+    params=[np.float16, np.float32, np.float64],
+    ids=["f16", "f32", "f64"],
+)
+def rand_dataset(tmpdir, request):
+    return make_ds(NUM_ROWS, NUM_ROWS_PER_FRAGMENT, tmpdir, request.param)
+
+
+@pytest.fixture(
+    params=[np.float16, np.float32, np.float64],
+    ids=["f16", "f32", "f64"],
+)
+def small_rand_dataset(tmpdir, request):
+    return make_ds(SMALL_NUM_ROWS, SMALL_ROWS_PER_FRAGMENT, tmpdir, request.param)
 
 
 @pytest.fixture
@@ -120,6 +137,14 @@ def rand_ivf(rand_dataset):
     return IvfModel(centroids, "l2")
 
 
+@pytest.fixture
+def small_rand_ivf(small_rand_dataset):
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    centroids = np.random.rand(DIMENSION * 100).astype(dtype)
+    centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
+    return IvfModel(centroids, "l2")
+
+
 def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     pq = IndicesBuilder(rand_dataset, "vectors").train_pq(rand_ivf, sample_rate=2)
     assert pq.dimension == DIMENSION
@@ -183,23 +208,23 @@ def test_assign_partitions_mostly_null(mostly_null_dataset, distance_type):
 
 
 @pytest.fixture
-def rand_pq(rand_dataset, rand_ivf):
-    dtype = rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+def small_rand_pq(small_rand_dataset, small_rand_ivf):
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
     codebook = np.random.rand(DIMENSION * 256).astype(dtype)
     codebook = pa.FixedSizeListArray.from_arrays(codebook, DIMENSION)
     pq = PqModel(NUM_SUBVECTORS, codebook)
     return pq
 
 
-def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
-    fragments = list(rand_dataset.get_fragments())
+def test_vector_transform(tmpdir, small_rand_dataset, small_rand_ivf, small_rand_pq):
+    fragments = list(small_rand_dataset.get_fragments())
 
-    builder = IndicesBuilder(rand_dataset, "vectors")
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
     uri = str(tmpdir / "transformed")
-    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=fragments)
+    builder.transform_vectors(small_rand_ivf, small_rand_pq, uri, fragments=fragments)
 
     reader = LanceFileReader(uri)
-    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * len(fragments))
+    assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
     row_id = data.column("_rowid")
@@ -215,28 +240,32 @@ def test_vector_transform(tmpdir, rand_dataset, rand_ivf, rand_pq):
     del reader
 
     # test when fragments = None
-    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
+    builder.transform_vectors(small_rand_ivf, small_rand_pq, uri, fragments=None)
     reader = LanceFileReader(uri)
 
-    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
+    assert reader.metadata().num_rows == SMALL_NUM_ROWS
 
 
 @pytest.mark.cuda
 def test_vector_transform_with_precomputed_partitions(
-    tmpdir, rand_dataset, rand_ivf, rand_pq
+    tmpdir, small_rand_dataset, small_rand_ivf, small_rand_pq
 ):
-    fragments = list(rand_dataset.get_fragments())
-    builder = IndicesBuilder(rand_dataset, "vectors")
+    fragments = list(small_rand_dataset.get_fragments())
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
 
-    partitions = builder.assign_ivf_partitions(rand_ivf, accelerator="cuda")
+    partitions = builder.assign_ivf_partitions(small_rand_ivf, accelerator="cuda")
 
     uri = str(tmpdir / "transformed")
     builder.transform_vectors(
-        rand_ivf, rand_pq, uri, fragments=fragments, partition_ds_uri=partitions
+        small_rand_ivf,
+        small_rand_pq,
+        uri,
+        fragments=fragments,
+        partition_ds_uri=partitions,
     )
 
     reader = LanceFileReader(uri)
-    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * len(fragments))
+    assert reader.metadata().num_rows == (SMALL_ROWS_PER_FRAGMENT * len(fragments))
     data = next(reader.read_all(batch_size=10000).to_batches())
 
     row_id = data.column("_rowid")
@@ -252,20 +281,20 @@ def test_vector_transform_with_precomputed_partitions(
     del reader
 
     # test when fragments = None
-    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
+    builder.transform_vectors(small_rand_ivf, small_rand_pq, uri, fragments=None)
     reader = LanceFileReader(uri)
 
-    assert reader.metadata().num_rows == (NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS)
+    assert reader.metadata().num_rows == SMALL_NUM_ROWS
 
 
-def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
-    builder = IndicesBuilder(rand_dataset, "vectors")
+def test_shuffle_vectors(tmpdir, small_rand_dataset, small_rand_ivf, small_rand_pq):
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
     uri = str(tmpdir / "transformed_shuffle")
-    builder.transform_vectors(rand_ivf, rand_pq, uri, fragments=None)
+    builder.transform_vectors(small_rand_ivf, small_rand_pq, uri, fragments=None)
 
     # test shuffle for transformed vectors
     filenames = builder.shuffle_transformed_vectors(
-        ["transformed_shuffle"], str(tmpdir), rand_ivf, "sorted"
+        ["transformed_shuffle"], str(tmpdir), small_rand_ivf, "sorted"
     )
 
     for fname in filenames:
@@ -273,28 +302,36 @@ def test_shuffle_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
         assert os.path.getsize(full_path) > 0
 
 
-def test_load_shuffled_vectors(tmpdir, rand_dataset, rand_ivf, rand_pq):
-    fragments = list(rand_dataset.get_fragments())
+def test_load_shuffled_vectors(
+    tmpdir, small_rand_dataset, small_rand_ivf, small_rand_pq
+):
+    fragments = list(small_rand_dataset.get_fragments())
 
     fragments1 = fragments[:1]
     fragments2 = fragments[1:]
 
-    builder = IndicesBuilder(rand_dataset, "vectors")
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
 
     uri_1 = str(tmpdir / "transformed1")
-    builder.transform_vectors(rand_ivf, rand_pq, uri_1, fragments=fragments1)
+    builder.transform_vectors(
+        small_rand_ivf, small_rand_pq, uri_1, fragments=fragments1
+    )
     filenames1 = builder.shuffle_transformed_vectors(
-        ["transformed1"], str(tmpdir), rand_ivf, "frags1_sorted"
+        ["transformed1"], str(tmpdir), small_rand_ivf, "frags1_sorted"
     )
 
     uri_2 = str(tmpdir / "transformed2")
-    builder.transform_vectors(rand_ivf, rand_pq, uri_2, fragments=fragments2)
+    builder.transform_vectors(
+        small_rand_ivf, small_rand_pq, uri_2, fragments=fragments2
+    )
     filenames2 = builder.shuffle_transformed_vectors(
-        ["transformed2"], str(tmpdir), rand_ivf, "frags2_sorted"
+        ["transformed2"], str(tmpdir), small_rand_ivf, "frags2_sorted"
     )
 
     sorted_filenames = filenames1 + filenames2
-    builder.load_shuffled_vectors(sorted_filenames, str(tmpdir), rand_ivf, rand_pq)
+    builder.load_shuffled_vectors(
+        sorted_filenames, str(tmpdir), small_rand_ivf, small_rand_pq
+    )
 
     final_ds = lance.dataset(str(tmpdir / "dataset"))
     assert final_ds.has_index

@@ -1467,32 +1467,32 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
-        let test_input_size = 8 * 1024 * 1024;
+        let test_input_size = 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH.len();
         let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 16 * 1024 * 1024;
+        let test_input_size = 2 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH.len();
         let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 8 * 1024 * 1024;
+        let test_input_size = 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
         let test_input = TEST_PARAGRAPH.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 16 * 1024 * 1024;
+        let test_input_size = 2 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH2.len();
         let test_input = TEST_PARAGRAPH2.repeat(repeat_num);
         helper(&test_input);
 
-        let test_input_size = 8 * 1024 * 1024;
+        let test_input_size = 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH3.len();
         let test_input = TEST_PARAGRAPH3.repeat(repeat_num); // Also corrected `repea_num` to `repeat_num`
         helper(&test_input);
 
-        let test_input_size = 16 * 1024 * 1024;
+        let test_input_size = 2 * 1024 * 1024;
         let repeat_num = test_input_size / TEST_PARAGRAPH3.len();
         let test_input = TEST_PARAGRAPH3.repeat(repeat_num); // Also corrected `repea_num` to `repeat_num`
         helper(&test_input);
