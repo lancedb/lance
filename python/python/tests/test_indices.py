@@ -16,7 +16,7 @@ DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
 NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
-NUM_PARTITIONS = math.ceil(np.sqrt(NUM_ROWS))
+NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
 
 
 SMALL_ROWS_PER_FRAGMENT = 100
@@ -94,7 +94,9 @@ def test_ivf_centroids_cuda(rand_dataset):
     )
 
     assert ivf.distance_type == "l2"
-    assert len(ivf.centroids) == NUM_PARTITIONS
+    # Can't use NUM_PARTITIONS here because
+    # CUDA uses math.ceil and CPU uses round to calc. num_partitions
+    assert len(ivf.centroids) == math.ceil(np.sqrt(NUM_ROWS))
 
 
 @pytest.mark.cuda
