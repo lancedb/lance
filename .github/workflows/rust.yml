@@ -137,7 +137,9 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run clippy
-        run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
+        run: |
+          cargo clippy --version
+          cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
       - name: Build benchmarks
         run: cargo build --benches
   mac-build:
@@ -196,3 +198,20 @@ jobs:
         run: |
           cargo build --tests --benches --all-features --workspace
           cargo test
+  msrv:
+    # Check the minimum supported Rust version
+    name: MSRV Check - Rust v${{ matrix.msrv }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        msrv: ["1.78.0"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install ${{ matrix.msrv }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.msrv }}
+      - name: cargo +${{ matrix.msrv }} check
+        run: cargo check --workspace --tests --benches --all-features
