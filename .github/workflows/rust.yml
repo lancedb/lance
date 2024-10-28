@@ -38,8 +38,8 @@ jobs:
           - nightly
     env:
       # Need up-to-date compilers for kernels
-      CC: clang-18
-      CXX: clang-18
+      CC: clang
+      CXX: clang
     steps:
       - uses: actions/checkout@v4
       # pin the toolchain version to avoid surprises
@@ -81,7 +81,7 @@ jobs:
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
-          cargo llvm-cov --workspace --codecov --output-path coverage.codecov --features dynamodb,tensorflow,dynamodb_tests,cli
+          cargo llvm-cov --workspace --codecov --output-path coverage.codecov --all-features
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
@@ -127,6 +127,10 @@ jobs:
   clippy_and_benchmark:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang
+      CXX: clang
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -139,7 +143,7 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --version
-          cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
+          cargo clippy --all-features --tests --benches -- -D warnings
       - name: Build benchmarks
         run: cargo build --benches
   mac-build:
@@ -201,14 +205,14 @@ jobs:
   msrv:
     # Check the minimum supported Rust version
     name: MSRV Check - Rust v${{ matrix.msrv }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         msrv: ["1.78.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
-      CC: clang-18
-      CXX: clang-18
+      CC: clang
+      CXX: clang
     steps:
       - uses: actions/checkout@v4
         with:
