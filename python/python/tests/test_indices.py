@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import math
 import os
 import pathlib
 
@@ -15,7 +16,7 @@ DIMENSION = 128
 NUM_SUBVECTORS = 8
 NUM_FRAGMENTS = 3
 NUM_ROWS = NUM_ROWS_PER_FRAGMENT * NUM_FRAGMENTS
-NUM_PARTITIONS = round(np.sqrt(NUM_ROWS))
+NUM_PARTITIONS = math.ceil(np.sqrt(NUM_ROWS))
 
 
 SMALL_ROWS_PER_FRAGMENT = 100
