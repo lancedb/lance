@@ -156,6 +156,16 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     assert pq.codebook == reloaded.codebook
 
 
+def test_pq_invalid_sub_vectors(tmpdir, rand_dataset, rand_ivf):
+    with pytest.raises(
+        ValueError,
+        match="must be divisible by num_subvectors .* without remainder",
+    ):
+        IndicesBuilder(rand_dataset, "vectors").train_pq(
+            rand_ivf, sample_rate=2, num_subvectors=5
+        )
+
+
 def test_gen_pq_mostly_null(mostly_null_dataset):
     centroids = np.random.rand(DIMENSION * 100).astype(np.float32)
     centroids = pa.FixedSizeListArray.from_arrays(centroids, DIMENSION)
