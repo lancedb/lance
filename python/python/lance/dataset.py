@@ -1696,17 +1696,25 @@ class LanceDataset(pa.dataset.Dataset):
             if c not in self.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.schema.field(c)
-            if not (
-                pa.types.is_fixed_size_list(field.type)
-                or (
-                    isinstance(field.type, pa.FixedShapeTensorType)
-                    and len(field.type.shape) == 1
-                )
+            if pa.types.is_fixed_size_list(field.type):
+                dimension = field.type.list_size
+            elif (
+                isinstance(field.type, pa.FixedShapeTensorType)
+                and len(field.type.shape) == 1
             ):
+                dimension = field.type.shape[0]
+            else:
                 raise TypeError(
                     f"Vector column {c} must be FixedSizeListArray "
                     f"1-dimensional FixedShapeTensorArray, got {field.type}"
                 )
+
+            if num_sub_vectors is not None and dimension % num_sub_vectors != 0:
+                raise ValueError(
+                    f"dimension ({dimension}) must be divisible by num_sub_vectors"
+                    f" ({num_sub_vectors})"
+                )
+
             if not pa.types.is_floating(field.type.value_type):
                 raise TypeError(
                     f"Vector column {c} must have floating value type, "

@@ -135,6 +135,35 @@ def test_ann_append(tmp_path):
     run(dataset, q=np.array(q), assert_func=func)
 
 
+def test_invalid_subvectors(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    with pytest.raises(
+        ValueError,
+        match="dimension .* must be divisible by num_sub_vectors",
+    ):
+        dataset.create_index(
+            "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=15
+        )
+
+
+@pytest.mark.cuda
+def test_invalid_subvectors_cuda(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    with pytest.raises(
+        ValueError,
+        match="dimension .* must be divisible by num_sub_vectors",
+    ):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=15,
+            accelerator="cuda",
+        )
+
+
 def test_index_with_nans(tmp_path):
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)

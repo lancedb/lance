@@ -545,8 +545,8 @@ class IndicesBuilder:
             )
         if dimension % num_subvectors != 0:
             raise ValueError(
-                "dimension ({dimension}) must be divisible by num_subvectors"
-                " ({num_subvectors}) without remainder"
+                f"dimension ({dimension}) must be divisible by num_subvectors"
+                f" ({num_subvectors}) without remainder"
             )
         return num_subvectors
 

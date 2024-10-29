@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import math
 import os
 import pathlib
 
@@ -93,7 +94,9 @@ def test_ivf_centroids_cuda(rand_dataset):
     )
 
     assert ivf.distance_type == "l2"
-    assert len(ivf.centroids) == NUM_PARTITIONS
+    # Can't use NUM_PARTITIONS here because
+    # CUDA uses math.ceil and CPU uses round to calc. num_partitions
+    assert len(ivf.centroids) == math.ceil(np.sqrt(NUM_ROWS))
 
 
 @pytest.mark.cuda
@@ -154,6 +157,16 @@ def test_gen_pq(tmpdir, rand_dataset, rand_ivf):
     reloaded = PqModel.load(str(tmpdir / "pq"))
     assert pq.dimension == reloaded.dimension
     assert pq.codebook == reloaded.codebook
+
+
+def test_pq_invalid_sub_vectors(tmpdir, rand_dataset, rand_ivf):
+    with pytest.raises(
+        ValueError,
+        match="must be divisible by num_subvectors .* without remainder",
+    ):
+        IndicesBuilder(rand_dataset, "vectors").train_pq(
+            rand_ivf, sample_rate=2, num_subvectors=5
+        )
 
 
 def test_gen_pq_mostly_null(mostly_null_dataset):
