@@ -1,0 +1,63 @@
+name: Lance File Write Read Round Trip Verification
+
+on:
+  workflow_dispatch:  # This is required for the workflow to be triggerable
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Build Requirements
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+
+      - name: Validate AWS Credentials
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}" ] || [ -z "${{ secrets.LANCEDB_S3_READER_SECRET }}" ]; then
+            echo "ERROR: AWS credentials are not properly set"
+            exit 1
+          fi
+          echo "AWS credentials validation successful"
+
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.LANCEDB_S3_READER_SECRET }}
+          aws-region: us-east-2
+
+      - name: Prepare Test Environment
+        run: |
+          BUCKET_NAME="lance-ci-bucket"
+          mkdir -p .github/workflows/write_read_roundtrip_test/test_files
+          aws s3 ls s3://$BUCKET_NAME
+          aws s3 cp s3://$BUCKET_NAME .github/workflows/write_read_roundtrip_test/test_files --recursive
+          ls -l .github/workflows/write_read_roundtrip_test/test_files
+
+      - name: Build Lance
+        working-directory: ./python
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install pyarrow maturin
+          maturin develop --release
+
+      - name: Run Lance Tests
+        working-directory: .github/workflows/write_read_roundtrip_test
+        run: |
+          source ../../python/venv/bin/activate
+          python test_write_read.py
+
+      - name: Cleanup
+        run: |
+          rm -rf .github/workflows/write_read_roundtrip_test/test_files
+          echo "Cleanup completed: Test files removed"
