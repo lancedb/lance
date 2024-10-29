@@ -1,0 +1,82 @@
+name: Lance File Write Read Round Trip Verification
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: "ubuntu-24.04"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Build Requirements
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+
+      - name: Check AWS_ACCESS_KEY_ID
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}" ]; then
+            echo "AWS_ACCESS_KEY_ID is not set"
+            exit 1
+          else
+            echo "AWS_ACCESS_KEY_ID is set"
+          fi
+
+      - name: Check AWS_SECRET_ACCESS_KEY
+        run: |
+          if [ -z "${{ secrets.LANCEDB_S3_READER_SECRET }}" ]; then
+            echo "AWS_SECRET_ACCESS_KEY is not set"
+            exit 1
+          else
+            echo "AWS_SECRET_ACCESS_KEY is set"
+          fi
+
+      - name: Set up AWS CLI
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.LANCEDB_S3_READER_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.LANCEDB_S3_READER_SECRET }}
+          aws-region: us-east-2
+
+      - name: List files in S3 bucket
+        run: |
+          BUCKET_NAME="lance-ci-bucket"
+          aws s3 ls s3://$BUCKET_NAME
+
+      - name: Download files from S3 bucket
+        working-directory: .github/workflows/write_read_roundtrip_test
+        run: |
+          BUCKET_NAME="lance-ci-bucket"
+          mkdir test_files
+          aws s3 cp s3://$BUCKET_NAME ./test_files --recursive
+
+      - name: List files Downloaded
+        working-directory: .github/workflows/write_read_roundtrip_test/test_files
+        run: |
+          ls -l
+
+      - name: Build Lance
+        working-directory: ./python
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          pip install pyarrow maturin
+          maturin develop --release
+
+      - name: Test Lance File Write Read Round Trip
+        run: |
+          source python/venv/bin/activate
+          cd .github/workflows/write_read_roundtrip_test
+          python test_write_read.py
+      
+      - name: Cleanup
+        run: |
+          rm -rf ./.github/workflows/write_read_roundtrip_test/test_files
+          echo "Cleanup completed: Deleted downloaded files."
