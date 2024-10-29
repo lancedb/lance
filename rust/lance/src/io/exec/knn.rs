@@ -231,7 +231,7 @@ lazy_static::lazy_static! {
         ROW_ID_FIELD.clone(),
     ]));
 
-    static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
+    pub static ref KNN_PARTITION_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![
         Field::new(PART_ID_COLUMN, DataType::List(Field::new("item", DataType::UInt32, false).into()), false),
         Field::new(INDEX_UUID_COLUMN, DataType::Utf8, false),
     ]));

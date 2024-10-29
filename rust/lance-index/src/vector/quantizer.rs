@@ -77,7 +77,7 @@ impl std::fmt::Display for QuantizationType {
     }
 }
 
-pub trait QuantizerBuildParams {
+pub trait QuantizerBuildParams: Send + Sync {
     fn sample_size(&self) -> usize;
     fn use_residual(_: DistanceType) -> bool {
         false
