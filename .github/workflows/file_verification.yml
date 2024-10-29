@@ -1,7 +1,7 @@
 name: Lance File Write Read Round Trip Verification
 
-on:
-  workflow_dispatch:  # This is required for the workflow to be triggerable
+on: 
+  workflow_dispatch:
 
 jobs:
   run:
