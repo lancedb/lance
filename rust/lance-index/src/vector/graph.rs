@@ -54,6 +54,7 @@ impl<I> From<I> for GraphNode<I> {
 pub struct OrderedFloat(pub f32);
 
 impl PartialOrd for OrderedFloat {
+    #[inline(always)]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -62,8 +63,9 @@ impl PartialOrd for OrderedFloat {
 impl Eq for OrderedFloat {}
 
 impl Ord for OrderedFloat {
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap()
+        self.0.total_cmp(&other.0)
     }
 }
 
