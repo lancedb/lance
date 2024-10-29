@@ -169,34 +169,50 @@ impl FixedWidthDataBlock {
     }
 
     fn max_bit_width(&mut self) -> Arc<dyn Array> {
+        assert!(self.num_values > 0);
+
+        let chunk_size = 1024;
+        let mut max_bit_widths = vec![];
         match self.bits_per_value {
             8 => {
                 let u8_slice_ref = self.data.borrow_to_typed_slice::<u8>();
                 let u8_slice = u8_slice_ref.as_ref();
-                let max_value = u8_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u8_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             16 => {
                 let u16_slice_ref = self.data.borrow_to_typed_slice::<u16>();
                 let u16_slice = u16_slice_ref.as_ref();
-                let max_value = u16_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u16_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             32 => {
                 let u32_slice_ref = self.data.borrow_to_typed_slice::<u32>();
                 let u32_slice = u32_slice_ref.as_ref();
-                let max_value = u32_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u32_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             64 => {
                 let u64_slice_ref = self.data.borrow_to_typed_slice::<u64>();
                 let u64_slice = u64_slice_ref.as_ref();
-                let max_value = u64_slice.iter().fold(0, |acc, &x| acc | x);
-                let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
-                Arc::new(UInt64Array::from(vec![max_bit_width]))
+                for chunk in u64_slice.chunks(chunk_size) {
+                    let max_value = chunk.iter().fold(0, |acc, &x| acc | x);
+                    let max_bit_width = self.bits_per_value - max_value.leading_zeros() as u64;
+                    max_bit_widths.push(max_bit_width);
+                }
+                Arc::new(UInt64Array::from(max_bit_widths))
             }
             // when self.bits_per_value is not (8, 16, 32, 64), it is already bit-packed or we don't
             // bit-pack them(Decimal128, Decimal256), so we return `self.bit_per_value` as their `max_bit_width`
@@ -290,12 +306,12 @@ impl GetStat for StructDataBlock {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int32Type;
     use arrow_array::{
         ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
         UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
+    use lance_arrow::DataTypeExt;
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
@@ -303,7 +319,7 @@ mod tests {
 
     use super::DataBlock;
 
-    use arrow::compute::concat;
+    use arrow::{compute::concat, datatypes::Int32Type};
     use arrow_array::Array;
     #[test]
     fn test_data_size_stat() {
@@ -1010,6 +1026,42 @@ mod tests {
             expected_bit_width,
             uint64_array
         );
+    }
+
+    #[test]
+    fn test_bit_width_stat_more_than_1024() {
+        for data_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            let array1 = Int64Array::from(vec![3; 1024]);
+            let array2 = Int64Array::from(vec![8; 1024]);
+            let array3 = Int64Array::from(vec![-1; 10]);
+            let array1 = arrow_cast::cast(&array1, &data_type).unwrap();
+            let array2 = arrow_cast::cast(&array2, &data_type).unwrap();
+            let array3 = arrow_cast::cast(&array3, &data_type).unwrap();
+
+            let arrays: Vec<&dyn arrow::array::Array> =
+                vec![array1.as_ref(), array2.as_ref(), array3.as_ref()];
+            let concatenated = concat(&arrays).unwrap();
+            let mut block = DataBlock::from_array(concatenated.clone());
+
+            let expected_bit_width = Arc::new(UInt64Array::from(vec![
+                2,
+                4,
+                (data_type.byte_width() * 8) as u64,
+            ])) as ArrayRef;
+            let actual_bit_widths = block.get_stat(Stat::BitWidth);
+            assert_eq!(
+                actual_bit_widths,
+                Some(expected_bit_width.clone()),
+                "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
+                expected_bit_width,
+                concatenated
+            );
+        }
     }
 
     #[test]
