@@ -14,5 +14,4 @@ jobs:
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: file_verification.yml
-          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
