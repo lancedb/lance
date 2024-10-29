@@ -14,4 +14,5 @@ jobs:
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: file_verification.yml
+          ref: broccoli/enable_nightly
           token: ${{ secrets.GITHUB_TOKEN }}
