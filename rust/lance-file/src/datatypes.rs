@@ -15,6 +15,7 @@ use snafu::{location, Location};
 
 use crate::format::pb;
 
+#[allow(clippy::fallible_impl_from)]
 impl From<&pb::Field> for Field {
     fn from(field: &pb::Field) -> Self {
         let mut lance_metadata: HashMap<String, String> = field

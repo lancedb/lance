@@ -76,8 +76,8 @@ pub enum StorageClass {
 impl Display for StorageClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StorageClass::Default => write!(f, "default"),
-            StorageClass::Blob => write!(f, "blob"),
+            Self::Default => write!(f, "default"),
+            Self::Blob => write!(f, "blob"),
         }
     }
 }
@@ -87,8 +87,8 @@ impl FromStr for StorageClass {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
-            "default" | "" => Ok(StorageClass::Default),
-            "blob" => Ok(StorageClass::Blob),
+            "default" | "" => Ok(Self::Default),
+            "blob" => Ok(Self::Blob),
             _ => Err(Error::Schema {
                 message: format!("Unknown storage class: {}", s),
                 location: location!(),
@@ -417,7 +417,7 @@ impl Field {
             nullable: self.nullable,
             children: vec![],
             dictionary: self.dictionary.clone(),
-            storage_class: self.storage_class.clone(),
+            storage_class: self.storage_class,
         };
         if path_components.is_empty() {
             // Project stops here, copy all the remaining children.
@@ -609,7 +609,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class.clone(),
+                storage_class: self.storage_class,
             };
             return Ok(f);
         }
@@ -672,7 +672,7 @@ impl Field {
                 nullable: self.nullable,
                 children,
                 dictionary: self.dictionary.clone(),
-                storage_class: self.storage_class.clone(),
+                storage_class: self.storage_class,
             })
         }
     }

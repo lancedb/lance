@@ -351,7 +351,7 @@ pub async fn write_fragments_internal(
     let blob_write_params = WriteParams {
         store_params: params.store_params.clone(),
         commit_handler: params.commit_handler.clone(),
-        data_storage_version: params.data_storage_version.clone(),
+        data_storage_version: params.data_storage_version,
         enable_move_stable_row_ids: true,
         // This shouldn't really matter since all commits are detached
         enable_v2_manifest_paths: true,
@@ -372,7 +372,7 @@ pub async fn write_fragments_internal(
     );
 
     let (default, blob) = if let Some(blob_data) = blob_data {
-        let blob_schema = dbg!(schema.retain_storage_class(StorageClass::Blob));
+        let blob_schema = schema.retain_storage_class(StorageClass::Blob);
         let blobs_path = base_dir.child("_blobs");
         let blob_fut = do_write_fragments(
             object_store,

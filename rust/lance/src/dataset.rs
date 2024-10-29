@@ -605,7 +605,7 @@ impl Dataset {
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
                 // Use the full schema, not the written schema
-                schema: schema,
+                schema,
                 fragments: written_frags.default.0,
                 config_upsert_values: None,
             },
