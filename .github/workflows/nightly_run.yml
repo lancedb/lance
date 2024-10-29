@@ -13,6 +13,6 @@ jobs:
       - name: Nightly Run File Verification Workflow
         uses: benc-uk/workflow-dispatch@v1
         with:
-          workflow: "Lance File Write Read Round Trip Verification"  # Use the workflow name from action.yml
+          workflow: file_verification.yml
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
