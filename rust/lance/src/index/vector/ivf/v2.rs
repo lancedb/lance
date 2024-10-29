@@ -22,7 +22,7 @@ use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};
@@ -436,14 +436,17 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
         pre_filter.wait_for_ready().await?;
-
         let query = self.preprocess_query(partition_id, query)?;
-        let param = (&query).into();
-        let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-        let k = query.k * refine_factor;
-        part_entry
-            .index
-            .search(query.key, k, param, &part_entry.storage, pre_filter)
+
+        spawn_cpu(move || {
+            let param = (&query).into();
+            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+            let k = query.k * refine_factor;
+            part_entry
+                .index
+                .search(query.key, k, param, &part_entry.storage, pre_filter)
+        })
+        .await
     }
 
     fn is_loadable(&self) -> bool {
