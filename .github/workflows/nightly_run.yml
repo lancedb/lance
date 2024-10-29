@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  trigger-file-verification:
+  run:
     runs-on: ubuntu-24.04
 
     steps:
