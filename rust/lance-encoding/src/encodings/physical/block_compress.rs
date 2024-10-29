@@ -23,8 +23,8 @@ pub struct CompressionConfig {
 }
 
 impl CompressionConfig {
-    pub(crate) fn new(scheme: CompressionScheme, level: Option<i32>) -> CompressionConfig {
-        CompressionConfig { scheme, level }
+    pub(crate) fn new(scheme: CompressionScheme, level: Option<i32>) -> Self {
+        Self { scheme, level }
     }
 }
 

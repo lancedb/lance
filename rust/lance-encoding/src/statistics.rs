@@ -306,12 +306,12 @@ impl GetStat for StructDataBlock {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::Int32Type;
     use arrow_array::{
         ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
         UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
+    use lance_arrow::DataTypeExt;
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
@@ -319,7 +319,7 @@ mod tests {
 
     use super::DataBlock;
 
-    use arrow::compute::concat;
+    use arrow::{compute::concat, datatypes::Int32Type};
     use arrow_array::Array;
     #[test]
     fn test_data_size_stat() {
@@ -1030,99 +1030,38 @@ mod tests {
 
     #[test]
     fn test_bit_width_stat_more_than_1024() {
-        let int8_array1 = Int8Array::from(vec![3; 1024]);
-        let int8_array2 = Int8Array::from(vec![8; 10]);
+        for data_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ] {
+            let array1 = Int64Array::from(vec![3; 1024]);
+            let array2 = Int64Array::from(vec![8; 1024]);
+            let array3 = Int64Array::from(vec![-1; 10]);
+            let array1 = arrow_cast::cast(&array1, &data_type).unwrap();
+            let array2 = arrow_cast::cast(&array2, &data_type).unwrap();
+            let array3 = arrow_cast::cast(&array3, &data_type).unwrap();
 
-        let array1_ref: ArrayRef = Arc::new(int8_array1);
-        let array2_ref: ArrayRef = Arc::new(int8_array2);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![array1_ref.as_ref(), array2_ref.as_ref()];
-        let concatenated = concat(&arrays).unwrap();
-        let mut block = DataBlock::from_array(concatenated.clone());
+            let arrays: Vec<&dyn arrow::array::Array> =
+                vec![array1.as_ref(), array2.as_ref(), array3.as_ref()];
+            let concatenated = concat(&arrays).unwrap();
+            let mut block = DataBlock::from_array(concatenated.clone());
 
-        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4])) as ArrayRef;
-        let actual_bit_widths = block.get_stat(Stat::BitWidth);
-        assert_eq!(
-            actual_bit_widths,
-            Some(expected_bit_width.clone()),
-            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
-            expected_bit_width,
-            concatenated
-        );
-
-        let int16_array1 = Int16Array::from(vec![3; 1024]);
-        let int16_array2 = Int16Array::from(vec![8; 1024]);
-        let int16_array3 = Int16Array::from(vec![-1; 10]);
-
-        let array1_ref: ArrayRef = Arc::new(int16_array1);
-        let array2_ref: ArrayRef = Arc::new(int16_array2);
-        let array3_ref: ArrayRef = Arc::new(int16_array3);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![
-            array1_ref.as_ref(),
-            array2_ref.as_ref(),
-            array3_ref.as_ref(),
-        ];
-        let concatenated = concat(&arrays).unwrap();
-        let mut block = DataBlock::from_array(concatenated.clone());
-
-        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4, 16])) as ArrayRef;
-        let actual_bit_widths = block.get_stat(Stat::BitWidth);
-        assert_eq!(
-            actual_bit_widths,
-            Some(expected_bit_width.clone()),
-            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
-            expected_bit_width,
-            concatenated
-        );
-
-        let int32_array1 = Int32Array::from(vec![3; 1024]);
-        let int32_array2 = Int32Array::from(vec![8; 1024]);
-        let int32_array3 = Int32Array::from(vec![-1; 10]);
-
-        let array1_ref: ArrayRef = Arc::new(int32_array1);
-        let array2_ref: ArrayRef = Arc::new(int32_array2);
-        let array3_ref: ArrayRef = Arc::new(int32_array3);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![
-            array1_ref.as_ref(),
-            array2_ref.as_ref(),
-            array3_ref.as_ref(),
-        ];
-        let concatenated = concat(&arrays).unwrap();
-        let mut block = DataBlock::from_array(concatenated.clone());
-
-        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4, 32])) as ArrayRef;
-        let actual_bit_widths = block.get_stat(Stat::BitWidth);
-        assert_eq!(
-            actual_bit_widths,
-            Some(expected_bit_width.clone()),
-            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
-            expected_bit_width,
-            concatenated
-        );
-
-        let int64_array1 = Int64Array::from(vec![3; 1024]);
-        let int64_array2 = Int64Array::from(vec![8; 1024]);
-        let int64_array3 = Int64Array::from(vec![-1; 10]);
-
-        let array1_ref: ArrayRef = Arc::new(int64_array1);
-        let array2_ref: ArrayRef = Arc::new(int64_array2);
-        let array3_ref: ArrayRef = Arc::new(int64_array3);
-        let arrays: Vec<&dyn arrow::array::Array> = vec![
-            array1_ref.as_ref(),
-            array2_ref.as_ref(),
-            array3_ref.as_ref(),
-        ];
-        let concatenated = concat(&arrays).unwrap();
-        let mut block = DataBlock::from_array(concatenated.clone());
-
-        let expected_bit_width = Arc::new(UInt64Array::from(vec![2, 4, 64])) as ArrayRef;
-        let actual_bit_widths = block.get_stat(Stat::BitWidth);
-        assert_eq!(
-            actual_bit_widths,
-            Some(expected_bit_width.clone()),
-            "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
-            expected_bit_width,
-            concatenated
-        );
+            let expected_bit_width = Arc::new(UInt64Array::from(vec![
+                2,
+                4,
+                (data_type.byte_width() * 8) as u64,
+            ])) as ArrayRef;
+            let actual_bit_widths = block.get_stat(Stat::BitWidth);
+            assert_eq!(
+                actual_bit_widths,
+                Some(expected_bit_width.clone()),
+                "Expected Stat::BitWidth to be {:?} for data block generated from array: {:?}",
+                expected_bit_width,
+                concatenated
+            );
+        }
     }
 
     #[test]
