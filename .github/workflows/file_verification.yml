@@ -51,11 +51,12 @@ jobs:
           pip install pyarrow maturin
           maturin develop --release
 
-      - name: Run Lance Tests
-        working-directory: .github/workflows/write_read_roundtrip_test
+      - name: Test Lance File Write Read Round Trip
         run: |
-          source ../../python/venv/bin/activate
+          source python/venv/bin/activate
+          cd .github/workflows/write_read_roundtrip_test
           python test_write_read.py
+
 
       - name: Cleanup
         run: |
