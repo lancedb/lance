@@ -9,11 +9,10 @@ on:
 jobs:
   run:
     runs-on: ubuntu-24.04
-
     steps:
       - name: Nightly Run File Verification Workflow
         uses: benc-uk/workflow-dispatch@v1
         with:
-          workflow: Lance File Write Read Round Trip Verification
+          workflow: write_read_roundtrip_test/action.yml
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
