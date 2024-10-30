@@ -1762,9 +1762,61 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
     }
 }
 
+#[cfg(test)]
 mod test {
-    #[test]
-    fn hello() {
-        println!("hello");
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow::datatypes::{Int16Type, Int32Type, Int8Type};
+    use arrow_array::{
+        ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
+        StringArray, UInt8Array,
+    };
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
+
+    use arrow_schema::DataType;
+    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
+    use rand::SeedableRng;
+
+    use crate::buffer::LanceBuffer;
+
+    use super::DataBlock;
+
+    use arrow::compute::concat;
+    use arrow_array::Array;
+
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, TestCases},
+        version::LanceFileVersion,
+    };
+
+    #[test_log::test(tokio::test)]
+    async fn test_miniblock_bitpack() {
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+
+        let mut arrays = vec![];
+        arrays.push(Arc::new(Int8Array::from(vec![100; 1024])) as Arc<dyn Array>);
+        arrays.push(Arc::new(Int8Array::from(vec![1; 1024])) as Arc<dyn Array>);
+        arrays.push(Arc::new(Int8Array::from(vec![16; 1024])) as Arc<dyn Array>);
+        arrays.push(Arc::new(Int8Array::from(vec![-1; 1024])) as Arc<dyn Array>);
+        arrays.push(Arc::new(Int8Array::from(vec![5; 1])) as Arc<dyn Array>);
+        check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
+
+        for data_type in [DataType::Int16, DataType::Int32, DataType::Int64] {
+            let mut int64_arrays = vec![];
+            int64_arrays.push(Int64Array::from(vec![3; 1024]));
+            int64_arrays.push(Int64Array::from(vec![8; 1024]));
+            int64_arrays.push(Int64Array::from(vec![16; 1024]));
+            int64_arrays.push(Int64Array::from(vec![100; 1024]));
+            int64_arrays.push(Int64Array::from(vec![512; 1024]));
+            int64_arrays.push(Int64Array::from(vec![1000; 1024]));
+            int64_arrays.push(Int64Array::from(vec![2000; 1024]));
+            int64_arrays.push(Int64Array::from(vec![-1; 10]));
+
+            let mut arrays = vec![];
+            for int64_array in int64_arrays {
+                arrays.push(arrow_cast::cast(&int64_array, &data_type).unwrap());
+            }
+            check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
+        }
     }
 }
