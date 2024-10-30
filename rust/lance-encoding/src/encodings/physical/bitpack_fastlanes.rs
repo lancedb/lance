@@ -1565,9 +1565,11 @@ mod tests {
     // }
 }
 
-// This macro chunks the FixedWidth DataBlock, bitpacks them,
-// put the bit-width parameter in front of each chunk,
-// the bit-width parameter has the same bit-width as the uncompressed DataBlock
+// This macro chunks the FixedWidth DataBlock, bitpacks them with 1024 values per chunk,
+// it puts the bit-width parameter in front of each chunk,
+// and the bit-width parameter has the same bit-width as the uncompressed DataBlock
+// for example, if the input DataBlock has `bits_per_value` of `16`, there will be 2 bytes(16 bits)
+// in front of each chunk storing the `bit-width` parameter.
 macro_rules! chunk_data_impl {
     ($data:expr, $data_type:ty) => {{
         let data_buffer = $data.data.borrow_to_typed_slice::<$data_type>();
@@ -1719,9 +1721,10 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
         assert!(data.len() >= 8);
         assert!(num_values <= ELEMS_PER_CHUNK);
 
-        macro_rules! decompress_case {
+        // This macro decompresses a chunk(1024 values) of bitpacked values.
+        macro_rules! decompress_impl {
             ($type:ty) => {{
-                let bit_width = std::mem::size_of::<$type>() * 8;
+                let uncompressed_bit_width = std::mem::size_of::<$type>() * 8;
                 let mut decompressed = vec![0 as $type; ELEMS_PER_CHUNK as usize];
 
                 // Copy for memory alignment
@@ -1744,7 +1747,7 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
                 decompressed.shrink_to(num_values as usize);
                 Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
                     data: LanceBuffer::reinterpret_vec(decompressed),
-                    bits_per_value: bit_width as u64,
+                    bits_per_value: uncompressed_bit_width as u64,
                     num_values,
                     block_info: BlockInfo::new(),
                     used_encoding: UsedEncoding::new(),
@@ -1753,10 +1756,10 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
         }
 
         match self.uncompressed_bit_width {
-            8 => decompress_case!(u8),
-            16 => decompress_case!(u16),
-            32 => decompress_case!(u32),
-            64 => decompress_case!(u64),
+            8 => decompress_impl!(u8),
+            16 => decompress_impl!(u16),
+            32 => decompress_impl!(u32),
+            64 => decompress_impl!(u64),
             _ => todo!(),
         }
     }
@@ -1766,22 +1769,10 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
 mod test {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::datatypes::{Int16Type, Int32Type, Int8Type};
-    use arrow_array::{
-        ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-        StringArray, UInt8Array,
-    };
-    use arrow_buffer::{BooleanBuffer, NullBuffer};
+    use arrow_array::{Int64Array, Int8Array};
 
     use arrow_schema::DataType;
-    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
-    use rand::SeedableRng;
 
-    use crate::buffer::LanceBuffer;
-
-    use super::DataBlock;
-
-    use arrow::compute::concat;
     use arrow_array::Array;
 
     use crate::{
