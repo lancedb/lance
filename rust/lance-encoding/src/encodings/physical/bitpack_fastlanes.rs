@@ -1659,7 +1659,6 @@ macro_rules! chunk_data_impl {
     }};
 }
 
-/// A compression strategy that writes fixed-width data as-is (no compression)
 #[derive(Debug, Default)]
 pub struct BitpackMiniBlockEncoder {}
 
@@ -1684,7 +1683,7 @@ impl MiniBlockCompressor for BitpackMiniBlockEncoder {
         &self,
         chunk: DataBlock,
     ) -> Result<(
-        crate::encoder::MiniBlockCompressed,
+        MiniBlockCompressed,
         crate::format::pb::ArrayEncoding,
     )> {
         match chunk {
