@@ -139,6 +139,8 @@ def _filtered_efficient_sample(
         elif filter is not None:
             raise NotImplementedError(f"Can't yet run filter <{filter}> in-memory")
         if table.num_rows > 0:
+            if table.num_rows > remaining_rows:
+                table = table.slice(0, remaining_rows)
             tables.append(table)
             remaining_rows -= table.num_rows
             remaining_in_batch = remaining_in_batch - table.num_rows
