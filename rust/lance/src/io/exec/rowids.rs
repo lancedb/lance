@@ -203,7 +203,7 @@ impl ExecutionPlan for AddRowAddrExec {
             })
             .clone();
 
-        let input_stream = self.input.execute(partition, context.clone())?;
+        let input_stream = self.input.execute(partition, context)?;
 
         let rowid_pos = self.rowid_pos;
         let rowaddr_pos = self.rowaddr_pos;

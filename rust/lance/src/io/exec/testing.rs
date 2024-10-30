@@ -27,7 +27,7 @@ pub struct TestingExec {
 impl TestingExec {
     pub(crate) fn new(batches: Vec<RecordBatch>) -> Self {
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(batches[0].schema().clone()),
+            EquivalenceProperties::new(batches[0].schema()),
             Partitioning::RoundRobinBatch(1),
             ExecutionMode::Bounded,
         );

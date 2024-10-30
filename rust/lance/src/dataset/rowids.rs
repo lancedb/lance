@@ -117,11 +117,7 @@ mod test {
             DataType::Int32,
             false,
         )]));
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(values))],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
     }
 
     #[tokio::test]

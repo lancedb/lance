@@ -452,9 +452,7 @@ impl IndexWorker {
     async fn add(&mut self, row_id: u64, tokens: StringArray, positions: Int32Array) -> Result<()> {
         let mut token_occurrences = HashMap::new();
         for (token, position) in tokens.iter().zip(positions.values().into_iter()) {
-            let token = if let Some(token) = token {
-                token
-            } else {
+            let Some(token) = token else {
                 continue;
             };
             token_occurrences
@@ -561,7 +559,7 @@ impl IndexWorker {
     }
 }
 
-pub(crate) struct PostingReader {
+pub struct PostingReader {
     tmpdir: Option<TempDir>,
     existing_tokens: HashMap<String, u32>,
     inverted_list_reader: Option<Arc<InvertedListReader>>,
@@ -705,7 +703,7 @@ impl Ord for OrderedDoc {
     }
 }
 
-pub(crate) fn inverted_list_schema(with_position: bool) -> SchemaRef {
+pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
     let mut fields = vec![
         arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
         arrow_schema::Field::new(FREQUENCY_COL, arrow_schema::DataType::Float32, false),

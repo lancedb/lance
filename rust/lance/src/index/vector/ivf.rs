@@ -1913,8 +1913,8 @@ mod tests {
             let array = Arc::new(
                 FixedSizeListArray::try_new_from_values(vectors_array.clone(), dim as i32).unwrap(),
             );
-            let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
-            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone())
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema)
         }
 
         async fn generate_dataset(&mut self, test_uri: &str) -> Result<Dataset> {

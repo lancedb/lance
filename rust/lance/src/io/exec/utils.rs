@@ -225,7 +225,7 @@ impl ExecutionPlan for ReplayExec {
             Ok(cached)
         } else {
             let input = self.input.execute(partition, context)?;
-            let schema = input.schema().clone();
+            let schema = input.schema();
             let input = ShareableRecordBatchStream(input);
             let (to_return, to_cache) = input.boxed().share(self.capacity);
             inner_state.cached = Some(Box::pin(ShareableRecordBatchStreamAdapter {
@@ -270,7 +270,7 @@ mod tests {
         let data = lance_datagen::gen()
             .col("x", array::step::<UInt32Type>())
             .into_reader_rows(RowCount::from(1024), BatchCount::from(16));
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let data = Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(data).map_err(datafusion::error::DataFusionError::from),
