@@ -283,6 +283,7 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::Struct(_) => unreachable!(),
         // 2.1 only
         pb::array_encoding::ArrayEncoding::Constant(_) => unreachable!(),
+        pb::array_encoding::ArrayEncoding::Bitpack2(_) => unreachable!(),
     }
 }
 

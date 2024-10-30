@@ -211,6 +211,14 @@ message BitpackedForNonNeg {
   Buffer buffer = 3;
 }
 
+message Bitpack2 {
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+
+  // The items in the list
+  Buffer buffer = 3;
+}
+
 // An array encoding for shredded structs that will never be null
 //
 // There is no actual data in this column.
@@ -263,6 +271,7 @@ message ArrayEncoding {
         FixedSizeBinary fixed_size_binary = 11;
         BitpackedForNonNeg bitpacked_for_non_neg = 12;
         Constant constant = 13;
+        Bitpack2 bitpack2 = 14;
     }
 }
 
