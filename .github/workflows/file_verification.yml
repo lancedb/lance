@@ -38,10 +38,10 @@ jobs:
       - name: Prepare Test Environment
         run: |
           BUCKET_NAME="lance-ci-bucket"
-          mkdir -p .github/workflows/write_read_roundtrip_test/test_files
+          mkdir -p .github/workflows/file_veification/test_files
           aws s3 ls s3://$BUCKET_NAME
-          aws s3 cp s3://$BUCKET_NAME .github/workflows/write_read_roundtrip_test/test_files --recursive
-          ls -l .github/workflows/write_read_roundtrip_test/test_files
+          aws s3 cp s3://$BUCKET_NAME .github/workflows/file_verification/test_files --recursive
+          ls -l .github/workflows/file_verification/test_files
 
       - name: Build Lance
         working-directory: ./python
@@ -54,11 +54,11 @@ jobs:
       - name: Test Lance File Write Read Round Trip
         run: |
           source python/venv/bin/activate
-          cd .github/workflows/write_read_roundtrip_test
+          cd .github/workflows/file_verification
           python test_write_read.py
 
 
       - name: Cleanup
         run: |
-          rm -rf .github/workflows/write_read_roundtrip_test/test_files
+          rm -rf .github/workflows/file_verification/test_files
           echo "Cleanup completed: Test files removed"
