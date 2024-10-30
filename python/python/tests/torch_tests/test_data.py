@@ -185,6 +185,32 @@ def test_sample_batches(tmp_path: Path):
     assert all_ids == [i for i in range(2000) if i // 25 % 2 == 1]
 
 
+def test_filtered_sampling_odd_batch_size(tmp_path: Path):
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": pa.array(
+                [[1.0, 2.0, 3.0] for _ in range(10000)], pa.list_(pa.float32(), 3)
+            ),
+            "filterme": [i % 2 for i in range(10000)],
+        }
+    )
+
+    lance.write_dataset(tbl, tmp_path, max_rows_per_file=200)
+
+    ds = LanceDataset(
+        tmp_path,
+        batch_size=38,
+        columns=["vector"],
+        samples=38 * 256,
+        filter="vector is not null",
+    )
+
+    x = next(iter(ds))
+
+    assert x.shape[0] == 38
+    assert x.shape[1] == 3
+
+
 def test_sample_batches_with_filter(tmp_path: Path):
     NUM_ROWS = 10000
     tbl = pa.Table.from_pydict(

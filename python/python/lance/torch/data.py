@@ -31,6 +31,19 @@ from .dist import get_global_rank, get_global_world_size
 __all__ = ["LanceDataset"]
 
 
+# Convert an Arrow FSL array into a 2D torch tensor
+def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
+    # Note: FixedSizeListArray.values does not take offset/len into account and
+    # so may we need to slice here
+    values = arr.values
+    start = arr.offset * dimension
+    num_vals = len(arr) * dimension
+    values = values.slice(start, num_vals)
+    # Convert to numpy
+    nparr = values.to_numpy(zero_copy_only=True).reshape(-1, dimension)
+    return torch.from_numpy(nparr)
+
+
 def _to_tensor(
     batch: pa.RecordBatch,
     *,
@@ -54,11 +67,7 @@ def _to_tensor(
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
-            np_tensor = arr.values.to_numpy(zero_copy_only=True).reshape(
-                -1, arr.type.list_size
-            )
-            tensor = torch.from_numpy(np_tensor)
-            del np_tensor
+            tensor = _fsl_to_tensor(arr, arr.type.list_size)
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
