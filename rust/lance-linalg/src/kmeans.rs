@@ -29,7 +29,7 @@ use rand::prelude::*;
 use rayon::prelude::*;
 
 use crate::distance::hamming::hamming;
-use crate::distance::{dot_distance_batch, DistanceType};
+use crate::distance::{cosine_distance_batch, dot_distance_batch, Cosine, DistanceType};
 use crate::kernels::{argmax, argmin_value_float};
 use crate::{
     distance::{
@@ -676,7 +676,7 @@ pub fn compute_partitions_arrow_array(
 /// Compute partition ID of each vector in the KMeans.
 ///
 /// If returns `None`, means the vector is not valid, i.e., all `NaN`.
-pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
+pub fn compute_partitions<T: Float + L2 + Dot + Cosine + Sync>(
     centroids: &[T],
     vectors: &[T],
     dimension: impl AsPrimitive<usize>,
@@ -690,7 +690,7 @@ pub fn compute_partitions<T: Float + L2 + Dot + Sync>(
 }
 
 #[inline]
-pub fn compute_partition<T: Float + L2 + Dot>(
+pub fn compute_partition<T: Float + L2 + Dot + Cosine>(
     centroids: &[T],
     vector: &[T],
     distance_type: DistanceType,
@@ -701,6 +701,9 @@ pub fn compute_partition<T: Float + L2 + Dot>(
         }
         DistanceType::Dot => {
             argmin_value_float(dot_distance_batch(vector, centroids, vector.len())).map(|c| c.0)
+        }
+        DistanceType::Cosine => {
+            argmin_value_float(cosine_distance_batch(vector, centroids, vector.len())).map(|c| c.0)
         }
         _ => {
             panic!(
