@@ -1475,7 +1475,7 @@ pub mod tests {
         let encoding_strategy = CoreArrayEncodingStrategy { version };
         let mut field = Field::new("test_field", array.data_type().clone(), true);
         if let Some(field_meta) = field_meta {
-            field.set_metadata(field_meta.clone());
+            field.set_metadata(field_meta);
         }
         let lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
         let encoder_result = encoding_strategy.create_array_encoder(&[array], &lance_field);

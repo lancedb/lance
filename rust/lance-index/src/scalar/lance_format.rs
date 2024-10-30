@@ -332,11 +332,7 @@ mod tests {
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
         let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
-        Arc::new(LanceIndexStore::new(
-            object_store,
-            test_path.to_owned(),
-            cache,
-        ))
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
     fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
@@ -344,10 +340,7 @@ mod tests {
         let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(
-            LanceIndexStore::new(object_store, test_path.to_owned(), cache)
-                .with_legacy_format(true),
-        )
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache).with_legacy_format(true))
     }
 
     struct MockTrainingSource {

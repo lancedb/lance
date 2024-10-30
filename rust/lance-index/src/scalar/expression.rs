@@ -1089,8 +1089,8 @@ mod tests {
             &index_info,
             "(aisle = 10 OR color = 'blue') AND size > 30",
             Some(IndexedExpression {
-                scalar_query: Some(ScalarIndexExpr::Or(left, right.clone())),
-                refine_expr: Some(refine.clone()),
+                scalar_query: Some(ScalarIndexExpr::Or(left, right)),
+                refine_expr: Some(refine),
             }),
         );
         // Examples of things that are not yet supported but should be supportable someday

@@ -129,7 +129,7 @@ impl IvfTransformer {
             dt,
             vector_column,
         ));
-        transforms.push(ivf_transform.clone());
+        transforms.push(ivf_transform);
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -170,7 +170,7 @@ impl IvfTransformer {
             mt,
             vector_column,
         ));
-        transforms.push(partition_transform.clone());
+        transforms.push(partition_transform);
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -188,7 +188,7 @@ impl IvfTransformer {
         }
         if with_pq_code {
             transforms.push(Arc::new(PQTransformer::new(
-                pq.clone(),
+                pq,
                 vector_column,
                 PQ_CODE_COLUMN,
             )));
@@ -222,7 +222,7 @@ impl IvfTransformer {
             mt,
             vector_column,
         ));
-        transforms.push(partition_transformer.clone());
+        transforms.push(partition_transformer);
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
