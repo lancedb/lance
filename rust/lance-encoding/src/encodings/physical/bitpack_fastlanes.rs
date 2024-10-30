@@ -1794,15 +1794,16 @@ mod test {
         check_round_trip_encoding_of_data(arrays, &test_cases, HashMap::new()).await;
 
         for data_type in [DataType::Int16, DataType::Int32, DataType::Int64] {
-            let mut int64_arrays = vec![];
-            int64_arrays.push(Int64Array::from(vec![3; 1024]));
-            int64_arrays.push(Int64Array::from(vec![8; 1024]));
-            int64_arrays.push(Int64Array::from(vec![16; 1024]));
-            int64_arrays.push(Int64Array::from(vec![100; 1024]));
-            int64_arrays.push(Int64Array::from(vec![512; 1024]));
-            int64_arrays.push(Int64Array::from(vec![1000; 1024]));
-            int64_arrays.push(Int64Array::from(vec![2000; 1024]));
-            int64_arrays.push(Int64Array::from(vec![-1; 10]));
+            let int64_arrays = vec![
+                Int64Array::from(vec![3; 1024]),
+                Int64Array::from(vec![8; 1024]),
+                Int64Array::from(vec![16; 1024]),
+                Int64Array::from(vec![100; 1024]),
+                Int64Array::from(vec![512; 1024]),
+                Int64Array::from(vec![1000; 1024]),
+                Int64Array::from(vec![2000; 1024]),
+                Int64Array::from(vec![-1; 10]),
+            ];
 
             let mut arrays = vec![];
             for int64_array in int64_arrays {
