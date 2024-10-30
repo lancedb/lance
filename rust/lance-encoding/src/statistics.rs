@@ -1183,7 +1183,7 @@ mod tests {
         let int16_array = Int16Array::from_iter(-100..100);
         let int16_array2 = Int16Array::from_iter(-10..10);
         let array_ref1: ArrayRef = Arc::new(int16_array.clone());
-        let array_ref2: ArrayRef = Arc::new(int16_array2.clone());
+        let array_ref2: ArrayRef = Arc::new(int16_array2);
         let mut block = DataBlock::from_arrays(
             &[array_ref1, array_ref2],
             (int16_array.len() + int8_array2.len()) as u64,

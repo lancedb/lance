@@ -37,3 +37,6 @@ lance-datagen.workspace = true
 
 [features]
 substrait = ["dep:datafusion-substrait"]
+
+[lints]
+workspace = true

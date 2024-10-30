@@ -1270,7 +1270,7 @@ mod tests {
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
-        let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone());
+        let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
         // This is probably enough data that we can be assured each tag is used at least once
         train_tag(&index_store, batch_reader).await;

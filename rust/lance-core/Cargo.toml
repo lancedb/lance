@@ -54,3 +54,6 @@ proptest.workspace = true
 
 [features]
 datafusion = ["datafusion-common", "datafusion-sql"]
+
+[lints]
+workspace = true

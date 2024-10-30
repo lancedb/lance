@@ -65,3 +65,6 @@ dynamodb_tests = ["dynamodb"]
 [[bench]]
 name = "row_id_index"
 harness = false
+
+[lints]
+workspace = true

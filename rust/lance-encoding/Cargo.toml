@@ -66,3 +66,6 @@ harness = false
 [[bench]]
 name = "buffer"
 harness = false
+
+[lints]
+workspace = true

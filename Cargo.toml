@@ -163,3 +163,21 @@ zstd = "0.13.1"
 opt-level = 3
 debug = true
 strip = false
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+fallible_impl_from = "deny"
+manual_let_else = "deny"
+redundant_pub_crate = "deny"
+string_add_assign = "deny"
+string_add = "deny"
+string_lit_as_bytes = "deny"
+string_to_string = "deny"
+use_self = "deny"
+dbg_macro = "deny"
+trait_duplication_in_bounds = "deny"
+redundant_clone = "deny"
+# not too much we can do to avoid multiple crate versions
+multiple-crate-versions = "allow"

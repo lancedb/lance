@@ -90,8 +90,7 @@ impl ScalarQueryParser for SargableQueryParser {
         low: ScalarValue,
         high: ScalarValue,
     ) -> Option<IndexedExpression> {
-        let query =
-            SargableQuery::Range(Bound::Included(low.clone()), Bound::Included(high.clone()));
+        let query = SargableQuery::Range(Bound::Included(low), Bound::Included(high));
         Some(IndexedExpression::index_query(
             column.to_string(),
             Arc::new(query),
@@ -1090,7 +1089,7 @@ mod tests {
             &index_info,
             "(aisle = 10 OR color = 'blue') AND size > 30",
             Some(IndexedExpression {
-                scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
+                scalar_query: Some(ScalarIndexExpr::Or(left, right.clone())),
                 refine_expr: Some(refine.clone()),
             }),
         );

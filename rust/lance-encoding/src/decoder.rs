@@ -791,7 +791,7 @@ impl CoreFieldDecoderStrategy {
                     )?;
                     let binary_scheduler = Box::new(BinaryFieldScheduler::new(
                         list_scheduler.into(),
-                        field.data_type().clone(),
+                        field.data_type(),
                     ));
                     return Ok(binary_scheduler);
                 } else {
@@ -1210,7 +1210,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        self.schedule_ranges(&[range.clone()], filter, sink, scheduler)
+        self.schedule_ranges(&[range], filter, sink, scheduler)
     }
 
     /// Schedules the load of selected rows

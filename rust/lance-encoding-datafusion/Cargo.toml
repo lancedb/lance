@@ -45,3 +45,6 @@ prost-build.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof = { workspace = true }
+
+[lints]
+workspace = true

@@ -1126,7 +1126,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
                 .unwrap_or(0),
             page_table,
             top_level_columns: projection.column_indices,
-            schema: Arc::new(schema.clone()),
+            schema: Arc::new(schema),
         })
     }
 }

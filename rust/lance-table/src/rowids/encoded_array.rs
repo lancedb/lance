@@ -276,7 +276,7 @@ mod test {
                 assert_eq!(Some(*v), encoded.get(i));
             }
 
-            let encoded2 = values.clone().into_iter().collect::<EncodedU64Array>();
+            let encoded2 = values.into_iter().collect::<EncodedU64Array>();
             assert_eq!(&encoded2, expected);
         }
 
@@ -394,7 +394,7 @@ mod test {
 
         // Empty one
         let range = 42..42;
-        let encoded = EncodedU64Array::from(range.clone());
+        let encoded = EncodedU64Array::from(range);
         assert_eq!(encoded.len(), 0);
     }
 }

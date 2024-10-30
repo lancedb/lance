@@ -131,3 +131,6 @@ harness = false
 [[bench]]
 name = "take"
 harness = false
+
+[lints]
+workspace = true

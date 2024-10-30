@@ -107,7 +107,7 @@ impl U64Segment {
         existing: impl IntoIterator<Item = u64> + 'a,
     ) -> impl Iterator<Item = u64> + 'a {
         let mut existing = existing.into_iter().peekable();
-        range.clone().filter(move |val| {
+        range.filter(move |val| {
             if let Some(&existing_val) = existing.peek() {
                 if existing_val == *val {
                     existing.next();

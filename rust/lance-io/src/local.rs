@@ -106,7 +106,7 @@ impl LocalObjectReader {
                 file: Arc::new(file),
                 block_size,
                 size,
-                path: path.clone(),
+                path,
             }) as Box<dyn Reader>)
         })
         .await?
