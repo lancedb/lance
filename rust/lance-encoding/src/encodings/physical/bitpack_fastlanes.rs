@@ -1682,10 +1682,7 @@ impl MiniBlockCompressor for BitpackMiniBlockEncoder {
     fn compress(
         &self,
         chunk: DataBlock,
-    ) -> Result<(
-        MiniBlockCompressed,
-        crate::format::pb::ArrayEncoding,
-    )> {
+    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
             _ => Err(Error::InvalidInput {
