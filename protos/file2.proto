@@ -8,7 +8,7 @@ package lance.file.v2;
 import "google/protobuf/any.proto";
 import "google/protobuf/empty.proto";
 
-// # Lance v0.2 File Format
+// # Lance v2.X File Format
 //
 // The Lance file format is a barebones format for serializing columnar data
 // into a file.
