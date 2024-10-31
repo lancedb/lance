@@ -561,7 +561,7 @@ impl IndexWorker {
     }
 }
 
-pub struct PostingReader {
+pub(crate) struct PostingReader {
     tmpdir: Option<TempDir>,
     existing_tokens: HashMap<String, u32>,
     inverted_list_reader: Option<Arc<InvertedListReader>>,
@@ -705,7 +705,7 @@ impl Ord for OrderedDoc {
     }
 }
 
-pub fn inverted_list_schema(with_position: bool) -> SchemaRef {
+pub(crate) fn inverted_list_schema(with_position: bool) -> SchemaRef {
     let mut fields = vec![
         arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
         arrow_schema::Field::new(FREQUENCY_COL, arrow_schema::DataType::Float32, false),
