@@ -30,6 +30,7 @@ use crate::statistics::{GetStat, Stat};
 use arrow::array::ArrayRef;
 use bytemuck::cast_slice;
 const ELEMS_PER_CHUNK: u64 = 1024;
+const LOG_ELEMS_PER_CHUNK: u8 = 10;
 
 // Compute the compressed_bit_width for a given array of integers
 // todo: compute all statistics before encoding
@@ -1578,7 +1579,6 @@ macro_rules! chunk_data_impl {
         let bit_widths = $data
             .get_stat(Stat::BitWidth)
             .expect("FixedWidthDataBlock should have valid bit width statistics");
-        println!("bit_widths statistics got");
         let bit_widths_array = bit_widths
             .as_any()
             .downcast_ref::<PrimitiveArray<UInt64Type>>()
@@ -1617,7 +1617,7 @@ macro_rules! chunk_data_impl {
             }
             chunks.push(MiniBlockChunk {
                 num_bytes: ((1 + packed_chunk_sizes[i]) * std::mem::size_of::<$data_type>()) as u16,
-                log_num_values: 10,
+                log_num_values: LOG_ELEMS_PER_CHUNK,
             });
         }
 
@@ -1654,7 +1654,7 @@ macro_rules! chunk_data_impl {
                 chunks,
                 num_values: $data.num_values,
             },
-            ProtobufUtils::bitpack2($data.bits_per_value, 0),
+            ProtobufUtils::bitpack2($data.bits_per_value),
         )
     }};
 }
@@ -1687,7 +1687,7 @@ impl MiniBlockCompressor for BitpackMiniBlockEncoder {
             DataBlock::FixedWidth(fixed_width) => Ok(self.chunk_data(fixed_width)),
             _ => Err(Error::InvalidInput {
                 source: format!(
-                    "Cannot compress a data block of type {} with ValueEncoder",
+                    "Cannot compress a data block of type {} with BitpackMiniBlockEncoder",
                     chunk.name()
                 )
                 .into(),

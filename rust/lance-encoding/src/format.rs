@@ -125,13 +125,9 @@ impl ProtobufUtils {
             })),
         }
     }
-    pub fn bitpack2(uncompressed_bits_per_value: u64, buffer_index: u32) -> ArrayEncoding {
+    pub fn bitpack2(uncompressed_bits_per_value: u64) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Bitpack2(Bitpack2 {
-                buffer: Some(pb::Buffer {
-                    buffer_index,
-                    buffer_type: BufferType::Page as i32,
-                }),
                 uncompressed_bits_per_value,
             })),
         }

@@ -779,7 +779,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         assert!(field.data_type().byte_width() > 0);
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
-            if fixed_width_data.bits_per_value <= 64 {
+            if fixed_width_data.bits_per_value == 8 || fixed_width_data.bits_per_value == 16 || fixed_width_data.bits_per_value == 32 || fixed_width_data.bits_per_value == 64 {
                 return Ok(Box::new(BitpackMiniBlockEncoder::default()));
             }
         }
