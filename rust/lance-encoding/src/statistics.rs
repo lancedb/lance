@@ -1083,10 +1083,6 @@ mod tests {
         let int8_array = Int8Array::from(vec![1, 2, 3]);
         let array_ref: ArrayRef = Arc::new(int8_array.clone());
         let mut block = DataBlock::from_array(array_ref);
-        println!(
-            "block.get_stat(Stat::Cardinality): {:?}",
-            block.get_stat(Stat::Cardinality)
-        );
 
         let expected_bit_width = Arc::new(UInt64Array::from(vec![3])) as ArrayRef;
         let actual_bit_width = block.get_stat(Stat::Cardinality);
@@ -1102,10 +1098,6 @@ mod tests {
         let int8_array = Int8Array::from(vec![1, 1, 1]);
         let array_ref: ArrayRef = Arc::new(int8_array.clone());
         let mut block = DataBlock::from_array(array_ref);
-        println!(
-            "block.get_stat(Stat::Cardinality): {:?}",
-            block.get_stat(Stat::Cardinality)
-        );
 
         let expected_bit_width = Arc::new(UInt64Array::from(vec![1])) as ArrayRef;
         let actual_bit_width = block.get_stat(Stat::Cardinality);
@@ -1121,10 +1113,6 @@ mod tests {
         let int8_array = Int8Array::from_iter(0..10);
         let array_ref: ArrayRef = Arc::new(int8_array.clone());
         let mut block = DataBlock::from_array(array_ref);
-        println!(
-            "block.get_stat(Stat::Cardinality): {:?}",
-            block.get_stat(Stat::Cardinality)
-        );
 
         let expected_bit_width = Arc::new(UInt64Array::from(vec![10])) as ArrayRef;
         let actual_bit_width = block.get_stat(Stat::Cardinality);
@@ -1140,10 +1128,6 @@ mod tests {
         let int8_array = Int8Array::from_iter(-10..10);
         let array_ref: ArrayRef = Arc::new(int8_array.clone());
         let mut block = DataBlock::from_array(array_ref);
-        println!(
-            "block.get_stat(Stat::Cardinality): {:?}",
-            block.get_stat(Stat::Cardinality)
-        );
 
         let expected_bit_width = Arc::new(UInt64Array::from(vec![20])) as ArrayRef;
         let actual_bit_width = block.get_stat(Stat::Cardinality);
@@ -1164,10 +1148,6 @@ mod tests {
             &[array_ref1, array_ref2],
             (int8_array.len() + int8_array2.len()) as u64,
         );
-        println!(
-            "block.get_stat(Stat::Cardinality): {:?}",
-            block.get_stat(Stat::Cardinality)
-        );
 
         let expected_bit_width = Arc::new(UInt64Array::from(vec![200])) as ArrayRef;
         let actual_bit_width = block.get_stat(Stat::Cardinality);
@@ -1187,10 +1167,6 @@ mod tests {
         let mut block = DataBlock::from_arrays(
             &[array_ref1, array_ref2],
             (int16_array.len() + int8_array2.len()) as u64,
-        );
-        println!(
-            "block.get_stat(Stat::Cardinality): {:?}",
-            block.get_stat(Stat::Cardinality)
         );
 
         let expected_bit_width = Arc::new(UInt64Array::from(vec![200])) as ArrayRef;

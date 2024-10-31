@@ -924,8 +924,7 @@ impl StatisticsBuilder {
             DataType::LargeUtf8 => self.string_statistics_appender::<i64>(row),
             // Dictionary type is not needed here. We collected stats for values.
             _ => {
-                println!("Stats collection for {} is not supported yet", self.dt);
-                todo!()
+                todo!("Stats collection for {} is not supported yet", self.dt);
             }
         }
     }
