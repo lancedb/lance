@@ -421,10 +421,11 @@ pub fn take_scan(
         })
         .buffered(batch_readahead);
 
-    DatasetRecordBatchStream::new(Box::pin(RecordBatchStreamAdapter::new(
-        arrow_schema,
-        batch_stream,
-    )))
+    DatasetRecordBatchStream::new(
+        Box::pin(RecordBatchStreamAdapter::new(arrow_schema, batch_stream)),
+        /*stats_handler=*/ None, // TODO: might want to allow custom handlers
+        /*plan=*/ None,
+    )
 }
 
 struct RowAddressStats {

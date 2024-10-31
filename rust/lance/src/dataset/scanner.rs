@@ -55,6 +55,7 @@ use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, Index};
 use roaring::RoaringBitmap;
+use stats::{ScanStatisticsHandler, ScannerStatsCollector, DEFAULT_STATS_HANDLER};
 use tracing::{info_span, instrument, Span};
 
 use super::Dataset;
@@ -74,6 +75,8 @@ use snafu::{location, Location};
 
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
+
+pub mod stats;
 
 pub(crate) const BATCH_SIZE_FALLBACK: usize = 8192;
 // For backwards compatibility / historical reasons we re-calculate the default batch size
@@ -327,6 +330,9 @@ pub struct Scanner {
     /// This is essentially a weak consistency search. Users can run index or optimize index
     /// to make the index catch up with the latest data.
     fast_search: bool,
+
+    /// How should scan statistics be handled
+    statistics_handler: ScanStatisticsHandler,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -365,6 +371,7 @@ impl Scanner {
             fragments: None,
             fast_search: false,
             use_scalar_index: true,
+            statistics_handler: DEFAULT_STATS_HANDLER.clone(),
         }
     }
 
@@ -606,6 +613,17 @@ impl Scanner {
     /// This option allows users to disable scalar indices for a query.
     pub fn use_scalar_index(&mut self, use_scalar_index: bool) -> &mut Self {
         self.use_scalar_index = use_scalar_index;
+        self
+    }
+
+    /// Set how to handle scan statistics.
+    ///
+    /// By default, statistics are not reported.
+    ///
+    /// Scan statistics are collected during the scan and will be provided at the end.  This
+    /// can be useful for debugging and profiling scan performance.
+    pub fn stats_handler(&mut self, stats_handler: ScanStatisticsHandler) -> &mut Self {
+        self.statistics_handler = stats_handler;
         self
     }
 
@@ -1004,10 +1022,21 @@ impl Scanner {
         async move {
             let plan = self.create_plan().await?;
 
-            Ok(DatasetRecordBatchStream::new(execute_plan(
-                plan,
-                LanceExecutionOptions::default(),
-            )?))
+            let stats_handler = self.statistics_handler.clone();
+            let plan_str = if matches!(
+                stats_handler,
+                ScanStatisticsHandler::DoNotReport | ScanStatisticsHandler::LogBrief
+            ) {
+                None
+            } else {
+                Some(Self::plan_to_string(plan.as_ref(), /*verbose=*/ true))
+            };
+
+            Ok(DatasetRecordBatchStream::new(
+                execute_plan(plan, LanceExecutionOptions::default())?,
+                Some(stats_handler),
+                plan_str,
+            ))
         }
         .boxed()
     }
@@ -2286,12 +2315,15 @@ impl Scanner {
         ))
     }
 
+    fn plan_to_string(plan: &dyn ExecutionPlan, verbose: bool) -> String {
+        let display = DisplayableExecutionPlan::new(plan);
+        format!("{}", display.indent(verbose))
+    }
+
     #[instrument(level = "info", skip(self))]
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
         let plan = self.create_plan().await?;
-        let display = DisplayableExecutionPlan::new(plan.as_ref());
-
-        Ok(format!("{}", display.indent(verbose)))
+        Ok(Self::plan_to_string(plan.as_ref(), verbose))
     }
 }
 
@@ -2303,12 +2335,23 @@ pub struct DatasetRecordBatchStream {
     #[pin]
     exec_node: SendableRecordBatchStream,
     span: Span,
+    stats_collector: Option<ScannerStatsCollector>,
 }
 
 impl DatasetRecordBatchStream {
-    pub fn new(exec_node: SendableRecordBatchStream) -> Self {
+    pub fn new(
+        exec_node: SendableRecordBatchStream,
+        stats_handler: Option<ScanStatisticsHandler>,
+        plan: Option<String>,
+    ) -> Self {
+        let stats_handler = stats_handler.unwrap_or_else(|| DEFAULT_STATS_HANDLER.clone());
+        let stats_collector = ScannerStatsCollector::new(stats_handler, plan);
         let span = info_span!("DatasetRecordBatchStream");
-        Self { exec_node, span }
+        Self {
+            exec_node,
+            span,
+            stats_collector: Some(stats_collector),
+        }
     }
 }
 
@@ -2326,6 +2369,20 @@ impl Stream for DatasetRecordBatchStream {
         let _guard = this.span.enter();
         match this.exec_node.poll_next_unpin(cx) {
             Poll::Ready(result) => {
+                match &result {
+                    Some(Ok(batch)) => {
+                        if let Some(stats_collector) = this.stats_collector.as_mut() {
+                            stats_collector.observe_batch(batch);
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        if let Some(stats_collector) = this.stats_collector.take() {
+                            if let Err(err) = stats_collector.finish() {
+                                return Poll::Ready(Some(Err(err)));
+                            }
+                        }
+                    }
+                }
                 Poll::Ready(result.map(|r| r.map_err(|e| Error::io(e.to_string(), location!()))))
             }
             Poll::Pending => Poll::Pending,

@@ -31,6 +31,7 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
+use lance::dataset::scanner::stats::ScanStatisticsHandler;
 use lance::dataset::scanner::MaterializationStyle;
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
@@ -67,7 +68,7 @@ use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
@@ -78,7 +79,8 @@ use snafu::{location, Location};
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
-use crate::fragment::FileFragment;
+use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::scanner::LanceScanStats;
 use crate::schema::LanceSchema;
 use crate::session::Session;
 use crate::utils::PyLance;
@@ -509,6 +511,7 @@ impl Dataset {
         full_text_query: Option<&Bound<'_, PyDict>>,
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
+        stats_handler: Option<Bound<PyAny>>,
     ) -> PyResult<Scanner> {
         let mut scanner: LanceScanner = self_.ds.scan();
         match (columns, columns_with_transform) {
@@ -587,6 +590,37 @@ impl Dataset {
 
         if let Some(fragment_readahead) = fragment_readahead {
             scanner.fragment_readahead(fragment_readahead);
+        }
+
+        if let Some(stats_handler) = stats_handler {
+            if stats_handler.downcast::<PyString>().is_ok() {
+                let stats_handler = stats_handler.extract::<String>()?;
+                scanner.stats_handler(
+                    stats_handler
+                        .parse::<ScanStatisticsHandler>()
+                        .infer_error()?,
+                );
+            } else if stats_handler.is_callable() {
+                let stats_handler = stats_handler.unbind();
+                let stats_handler = ScanStatisticsHandler::Custom(Arc::new(move |stats| {
+                    let wrapped_stats = LanceScanStats::new(stats);
+                    let stats_handler = stats_handler.clone();
+                    Python::with_gil(move |py| {
+                        let args = PyTuple::new(py, vec![wrapped_stats.into_py(py)]);
+                        stats_handler.call1(py, args)
+                    })
+                    .map_err(|err| lance_core::Error::Wrapped {
+                        error: err.into(),
+                        location: location!(),
+                    })?;
+                    Ok(())
+                }));
+                scanner.stats_handler(stats_handler);
+            } else {
+                return Err(PyValueError::new_err(
+                    "stats_handler must be a string or a callable",
+                ));
+            }
         }
 
         scanner.scan_in_order(scan_in_order.unwrap_or(true));
