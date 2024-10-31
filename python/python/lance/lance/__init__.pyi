@@ -93,3 +93,12 @@ class LanceBlobFile:
     def size(self) -> int: ...
     def readall(self) -> bytes: ...
     def readinto(self, b: bytearray) -> int: ...
+
+class LanceScanStats:
+    start: int
+    end: int
+    wall_clock_duration: float
+    wall_clock_throughput: float
+    output_rows: int
+    estimated_output_bytes: int
+    plan: Optional[str]

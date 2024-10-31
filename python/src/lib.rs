@@ -44,6 +44,7 @@ use futures::StreamExt;
 use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use scanner::LanceScanStats;
 use session::Session;
 
 #[macro_use]
@@ -123,6 +124,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<LanceColumnMetadata>()?;
     m.add_class::<LancePageMetadata>()?;
     m.add_class::<LanceBufferDescriptor>()?;
+    m.add_class::<LanceScanStats>()?;
     m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
