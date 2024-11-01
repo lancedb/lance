@@ -4980,9 +4980,9 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let field_a = Arc::new(ArrowField::new("a", DataType::Int32, false));
-        let field_b = Arc::new(ArrowField::new("b", DataType::Int32, true));
-        let field_c = Arc::new(ArrowField::new("c", DataType::Int32, false));
+        let field_a = Arc::new(ArrowField::new("a", DataType::Int32, true));
+        let field_b = Arc::new(ArrowField::new("b", DataType::Int32, false));
+        let field_c = Arc::new(ArrowField::new("c", DataType::Int32, true));
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![field_a.clone(), field_b.clone(), field_c.clone()].into()),
@@ -4998,7 +4998,7 @@ mod tests {
         // Can insert b, a
         let just_ba = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
-            DataType::Struct(vec![field_a.clone(), field_b.clone()].into()),
+            DataType::Struct(vec![field_b.clone(), field_a.clone()].into()),
             true,
         )]));
         let batch = RecordBatch::try_new(
@@ -5019,22 +5019,22 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].metadata.files.len(), 1);
-        assert_eq!(&fragments[0].metadata.files[0].fields, &[2, 1]);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 2, 1]);
 
         // Can insert c, b
         let just_cb = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
-            DataType::Struct(vec![field_b.clone(), field_c.clone()].into()),
+            DataType::Struct(vec![field_c.clone(), field_b.clone()].into()),
             true,
         )]));
         let batch = RecordBatch::try_new(
             just_cb.clone(),
             vec![Arc::new(StructArray::from(vec![
                 (
-                    field_b.clone(),
-                    Arc::new(Int32Array::from(vec![3])) as ArrayRef,
+                    field_c.clone(),
+                    Arc::new(Int32Array::from(vec![4])) as ArrayRef,
                 ),
-                (field_c.clone(), Arc::new(Int32Array::from(vec![4]))),
+                (field_b.clone(), Arc::new(Int32Array::from(vec![3]))),
             ]))],
         )
         .unwrap();
@@ -5045,7 +5045,7 @@ mod tests {
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[1].metadata.files.len(), 1);
-        assert_eq!(&fragments[1].metadata.files[0].fields, &[3, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[0, 3, 2]);
 
         // Can't insert a, c (b is non-nullable)
         let just_ac = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -5074,7 +5074,7 @@ mod tests {
 
         // Can call take and get rows from all three back in one batch
         let result = dataset
-            .take(&[1, 2, 0], Arc::new(dataset.schema().clone()))
+            .take(&[1, 0], Arc::new(dataset.schema().clone()))
             .await
             .unwrap();
         let expected = RecordBatch::try_new(
@@ -5082,15 +5082,15 @@ mod tests {
             vec![Arc::new(StructArray::from(vec![
                 (
                     field_a.clone(),
-                    Arc::new(Int32Array::from(vec![2, 1, 5])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![None, Some(2)])) as ArrayRef,
                 ),
                 (
                     field_b.clone(),
-                    Arc::new(Int32Array::from(vec![Some(1), Some(3), None])),
+                    Arc::new(Int32Array::from(vec![Some(3), Some(1)])),
                 ),
                 (
                     field_c.clone(),
-                    Arc::new(Int32Array::from(vec![None, Some(4), Some(6)])),
+                    Arc::new(Int32Array::from(vec![Some(4), None])),
                 ),
             ]))],
         )
