@@ -88,6 +88,7 @@ pub use write::{write_fragments, WriteMode, WriteParams};
 const INDICES_DIR: &str = "_indices";
 
 pub const DATA_DIR: &str = "data";
+pub const BLOB_DIR: &str = "_blobs";
 pub(crate) const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 pub(crate) const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
 
@@ -591,11 +592,11 @@ impl Dataset {
         }
 
         let object_store = Arc::new(object_store);
-        let fragments = write_fragments_internal(
+        let written_frags = write_fragments_internal(
             dataset.as_ref(),
             object_store.clone(),
             &base,
-            &schema,
+            schema.clone(),
             stream,
             params.clone(),
         )
@@ -603,16 +604,29 @@ impl Dataset {
 
         let operation = match params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                // Use the full schema, not the written schema
                 schema,
-                fragments,
+                fragments: written_frags.default.0,
                 config_upsert_values: None,
             },
-            WriteMode::Append => Operation::Append { fragments },
+            WriteMode::Append => Operation::Append {
+                fragments: written_frags.default.0,
+            },
         };
+
+        let blobs_op = written_frags.blob.map(|blob| match params.mode {
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema: blob.1,
+                fragments: blob.0,
+                config_upsert_values: None,
+            },
+            WriteMode::Append => Operation::Append { fragments: blob.0 },
+        });
 
         let transaction = Transaction::new(
             dataset.as_ref().map(|ds| ds.manifest.version).unwrap_or(0),
             operation,
+            blobs_op,
             None,
         );
 
@@ -705,18 +719,28 @@ impl Dataset {
             },
         )?;
 
-        let fragments = write_fragments_internal(
+        let written_frags = write_fragments_internal(
             Some(self),
             self.object_store.clone(),
             &self.base,
-            &schema,
+            schema,
             stream,
             params.clone(),
         )
         .await?;
 
-        let transaction =
-            Transaction::new(self.manifest.version, Operation::Append { fragments }, None);
+        let blobs_op = written_frags
+            .blob
+            .map(|blobs| Operation::Append { fragments: blobs.0 });
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::Append {
+                fragments: written_frags.default.0,
+            },
+            blobs_op,
+            None,
+        );
 
         let new_manifest = commit_transaction(
             self,
@@ -756,6 +780,31 @@ impl Dataset {
     /// Get the full manifest of the dataset version.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    // TODO: Cache this
+    pub async fn blobs_dataset(&self) -> Result<Option<Arc<Self>>> {
+        if let Some(blobs_version) = self.manifest.blob_dataset_version {
+            let blobs_path = self.base.child(BLOB_DIR);
+            let blob_manifest_location = self
+                .commit_handler
+                .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
+                .await?;
+            let manifest = read_manifest(&self.object_store, &blob_manifest_location.path).await?;
+            let blobs_dataset = Self::checkout_manifest(
+                self.object_store.clone(),
+                blobs_path,
+                format!("{}/{}", self.uri, BLOB_DIR),
+                manifest,
+                self.session.clone(),
+                self.commit_handler.clone(),
+                ManifestNamingScheme::V2,
+            )
+            .await?;
+            Ok(Some(Arc::new(blobs_dataset)))
+        } else {
+            Ok(None)
+        }
     }
 
     pub(crate) fn is_legacy_storage(&self) -> bool {
@@ -801,6 +850,7 @@ impl Dataset {
             Operation::Restore {
                 version: self.manifest.version,
             },
+            /*blobs_op=*/ None,
             None,
         );
 
@@ -860,6 +910,7 @@ impl Dataset {
     async fn do_commit(
         base_uri: &str,
         operation: Operation,
+        blobs_op: Option<Operation>,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
         commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -929,7 +980,7 @@ impl Dataset {
             ManifestNamingScheme::V1
         };
 
-        let transaction = Transaction::new(read_version, operation, None);
+        let transaction = Transaction::new(read_version, operation, blobs_op, None);
 
         let manifest = if let Some(dataset) = &dataset {
             if detached {
@@ -1039,6 +1090,9 @@ impl Dataset {
         Self::do_commit(
             base_uri,
             operation,
+            // TODO: Allow blob operations to be specified? (breaking change?)
+            /*blobs_op=*/
+            None,
             read_version,
             store_params,
             commit_handler,
@@ -1069,6 +1123,9 @@ impl Dataset {
         Self::do_commit(
             base_uri,
             operation,
+            // TODO: Allow blob operations to be specified? (breaking change?)
+            /*blobs_op=*/
+            None,
             read_version,
             store_params,
             commit_handler,
@@ -1239,6 +1296,10 @@ impl Dataset {
                 deleted_fragment_ids,
                 predicate: predicate.to_string(),
             },
+            // No change is needed to the blobs dataset.  The blobs are implicitly deleted since the
+            // rows that reference them are deleted.
+            /*blobs_op=*/
+            None,
             None,
         );
 
@@ -1340,8 +1401,14 @@ impl Dataset {
         self.manifest.fragments.len()
     }
 
+    /// Get the schema of the dataset
     pub fn schema(&self) -> &Schema {
         &self.manifest.schema
+    }
+
+    /// Similar to [Self::schema], but only returns fields with the default storage class
+    pub fn local_schema(&self) -> &Schema {
+        &self.manifest.local_schema
     }
 
     /// Get fragments.
@@ -1577,6 +1644,9 @@ impl Dataset {
                 fragments: updated_fragments,
                 schema: new_schema,
             },
+            // It is not possible to add blob columns using merge
+            /*blobs_op=*/
+            None,
             None,
         );
 
@@ -1628,6 +1698,7 @@ impl Dataset {
                 upsert_values: Some(HashMap::from_iter(upsert_values)),
                 delete_keys: None,
             },
+            /*blobs_op=*/ None,
             None,
         );
 
@@ -1655,6 +1726,7 @@ impl Dataset {
                 upsert_values: None,
                 delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
             },
+            /*blob_op=*/ None,
             None,
         );
 

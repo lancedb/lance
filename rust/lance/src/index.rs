@@ -315,6 +315,7 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
+            /*blobs_op= */ None,
             None,
         );
 
@@ -385,6 +386,7 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
+            /*blobs_op= */ None,
             None,
         );
 
@@ -481,6 +483,7 @@ impl DatasetIndexExt for Dataset {
                 new_indices,
                 removed_indices,
             },
+            /*blobs_op= */ None,
             None,
         );
 

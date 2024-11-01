@@ -179,4 +179,10 @@ message Transaction {
     Project project = 109;
     UpdateConfig update_config = 110;
   }
+
+  // An operation to apply to the blob dataset
+  oneof blob_operation {
+    Append blob_append = 200;
+    Overwrite blob_overwrite = 202;
+  }  
 }
