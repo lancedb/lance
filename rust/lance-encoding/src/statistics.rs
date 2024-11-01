@@ -167,12 +167,11 @@ impl FixedWidthDataBlock {
         info.insert(Stat::BitWidth, max_bit_widths);
     }
 
-
     fn max_bit_widths(&mut self) -> Arc<dyn Array> {
         assert!(self.num_values > 0);
-    
+
         const CHUNK_SIZE: usize = 1024;
-    
+
         fn calculate_max_bit_width<T: PrimInt>(slice: &[T], bits_per_value: u64) -> Vec<u64> {
             slice
                 .chunks(CHUNK_SIZE)
@@ -182,27 +181,39 @@ impl FixedWidthDataBlock {
                 })
                 .collect()
         }
-    
+
         match self.bits_per_value {
             8 => {
                 let u8_slice = self.data.borrow_to_typed_slice::<u8>();
                 let u8_slice = u8_slice.as_ref();
-                Arc::new(UInt64Array::from(calculate_max_bit_width(u8_slice, self.bits_per_value)))
+                Arc::new(UInt64Array::from(calculate_max_bit_width(
+                    u8_slice,
+                    self.bits_per_value,
+                )))
             }
             16 => {
                 let u16_slice = self.data.borrow_to_typed_slice::<u16>();
                 let u16_slice = u16_slice.as_ref();
-                Arc::new(UInt64Array::from(calculate_max_bit_width(u16_slice, self.bits_per_value)))
+                Arc::new(UInt64Array::from(calculate_max_bit_width(
+                    u16_slice,
+                    self.bits_per_value,
+                )))
             }
             32 => {
                 let u32_slice = self.data.borrow_to_typed_slice::<u32>();
                 let u32_slice = u32_slice.as_ref();
-                Arc::new(UInt64Array::from(calculate_max_bit_width(u32_slice, self.bits_per_value)))
+                Arc::new(UInt64Array::from(calculate_max_bit_width(
+                    u32_slice,
+                    self.bits_per_value,
+                )))
             }
             64 => {
                 let u64_slice = self.data.borrow_to_typed_slice::<u64>();
                 let u64_slice = u64_slice.as_ref();
-                Arc::new(UInt64Array::from(calculate_max_bit_width(u64_slice, self.bits_per_value)))
+                Arc::new(UInt64Array::from(calculate_max_bit_width(
+                    u64_slice,
+                    self.bits_per_value,
+                )))
             }
             _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
         }
