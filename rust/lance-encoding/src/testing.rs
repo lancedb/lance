@@ -463,7 +463,7 @@ impl SimulatedWriter {
         let page_info = PageInfo {
             num_rows: encoded_page.num_rows,
             encoding: page_encoding,
-            buffer_offsets_and_sizes: Arc::from(buffer_offsets_and_sizes.clone()),
+            buffer_offsets_and_sizes: Arc::from(buffer_offsets_and_sizes),
             priority: encoded_page.row_number,
         };
 

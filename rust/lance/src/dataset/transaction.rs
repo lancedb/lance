@@ -922,8 +922,8 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                deleted_fragment_ids: deleted_fragment_ids.clone(),
-                predicate: predicate.clone(),
+                deleted_fragment_ids,
+                predicate,
             },
             Some(pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                 fragments,
@@ -942,7 +942,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                         .into_iter()
                         .map(Fragment::try_from)
                         .collect::<Result<Vec<_>>>()?,
-                    schema: Schema::from(&Fields(schema.clone())),
+                    schema: Schema::from(&Fields(schema)),
                     config_upsert_values: config_upsert_option,
                 }
             }
@@ -1004,7 +1004,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                schema: Schema::from(&Fields(schema.clone())),
+                schema: Schema::from(&Fields(schema)),
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -1014,7 +1014,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
             })) => Operation::Update {
-                removed_fragment_ids: removed_fragment_ids.clone(),
+                removed_fragment_ids,
                 updated_fragments: updated_fragments
                     .into_iter()
                     .map(Fragment::try_from)
@@ -1026,7 +1026,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
-                    schema: Schema::from(&Fields(schema.clone())),
+                    schema: Schema::from(&Fields(schema)),
                 }
             }
             Some(pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
@@ -1436,7 +1436,7 @@ mod tests {
             (
                 Operation::CreateIndex {
                     new_indices: vec![index0.clone()],
-                    removed_indices: vec![index0.clone()],
+                    removed_indices: vec![index0],
                 },
                 // Will only conflict with operations that modify row ids.
                 [false, false, false, false, true, true, false, false, false],
@@ -1445,7 +1445,7 @@ mod tests {
                 // Rewrite that affects different fragments
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
-                        old_fragments: vec![fragment1.clone()],
+                        old_fragments: vec![fragment1],
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
@@ -1479,9 +1479,9 @@ mod tests {
             (
                 Operation::Update {
                     // Update that affects same fragments as other transactions
-                    updated_fragments: vec![fragment0.clone()],
+                    updated_fragments: vec![fragment0],
                     removed_fragment_ids: vec![],
-                    new_fragments: vec![fragment2.clone()],
+                    new_fragments: vec![fragment2],
                 },
                 [false, false, true, true, true, true, false, true, false],
             ),
@@ -1563,7 +1563,7 @@ mod tests {
     fn test_rewrite_fragments() {
         let existing_fragments: Vec<Fragment> = (0..10).map(Fragment::new).collect();
 
-        let mut final_fragments = existing_fragments.clone();
+        let mut final_fragments = existing_fragments;
         let rewrite_groups = vec![
             // Since these are contiguous, they will be put in the same location
             // as 1 and 2.

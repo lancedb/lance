@@ -481,7 +481,7 @@ mod test {
             vec![
                 Arc::new(Int32Array::from_iter_values(i_range.clone())),
                 Arc::new(StringArray::from_iter_values(
-                    i_range.clone().map(|i| format!("str-{}", i)),
+                    i_range.map(|i| format!("str-{}", i)),
                 )),
             ],
         )

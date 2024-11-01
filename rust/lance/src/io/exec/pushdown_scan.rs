@@ -1068,7 +1068,7 @@ mod test {
 
     async fn test_dataset() -> Dataset {
         let data = test_data();
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let reader = RecordBatchIterator::new(vec![Ok(data)], schema);
         let params = WriteParams {
             max_rows_per_group: 3,

@@ -600,7 +600,7 @@ impl CoreFieldDecoderStrategy {
         };
         Ok(Box::new(PrimitiveFieldScheduler::new(
             column.index,
-            field.data_type().clone(),
+            field.data_type(),
             column.page_infos.clone(),
             column_buffers,
             self.validate_data,
@@ -795,7 +795,7 @@ impl CoreFieldDecoderStrategy {
                     )?;
                     let binary_scheduler = Box::new(BinaryFieldScheduler::new(
                         list_scheduler.into(),
-                        field.data_type().clone(),
+                        field.data_type(),
                     ));
                     return Ok(binary_scheduler);
                 } else {
@@ -1214,7 +1214,7 @@ impl DecodeBatchScheduler {
         sink: mpsc::UnboundedSender<Result<DecoderMessage>>,
         scheduler: Arc<dyn EncodingsIo>,
     ) {
-        self.schedule_ranges(&[range.clone()], filter, sink, scheduler)
+        self.schedule_ranges(&[range], filter, sink, scheduler)
     }
 
     /// Schedules the load of selected rows
@@ -1649,12 +1649,11 @@ pub fn create_decode_stream(
 ) -> BoxStream<'static, ReadBatchTask> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
-        let structural_decoder =
-            StructuralStructDecoder::new(arrow_schema.fields.clone(), should_validate);
+        let structural_decoder = StructuralStructDecoder::new(arrow_schema.fields, should_validate);
         StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder).into_stream()
     } else {
         let arrow_schema = ArrowSchema::from(schema);
-        let root_fields = arrow_schema.fields.clone();
+        let root_fields = arrow_schema.fields;
 
         let simple_struct_decoder = SimpleStructDecoder::new(root_fields, num_rows);
         BatchDecodeStream::new(rx, batch_size, num_rows, simple_struct_decoder).into_stream()

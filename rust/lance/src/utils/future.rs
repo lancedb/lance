@@ -24,7 +24,6 @@ impl<T: Clone> SharedPrerequisite<T> {
         self.0
             .get()
             .await
-            .clone()
             .map_err(|err| crate::Error::PrerequisiteFailed {
                 message: err,
                 location: location!(),

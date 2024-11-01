@@ -608,7 +608,7 @@ impl Planner {
                             ))?;
                         }
                     }
-                    Field::new("item", data_type.clone(), true)
+                    Field::new("item", data_type, true)
                 } else {
                     Field::new("item", ArrowDataType::Null, true)
                 };
@@ -825,7 +825,7 @@ impl Planner {
         let simplifier =
             datafusion::optimizer::simplify_expressions::ExprSimplifier::new(simplify_context);
 
-        let expr = simplifier.simplify(expr.clone())?;
+        let expr = simplifier.simplify(expr)?;
         let expr = simplifier.coerce(expr, &df_schema)?;
 
         Ok(expr)
@@ -1009,7 +1009,7 @@ mod tests {
             ),
         ]));
 
-        let planner = Planner::new(schema.clone());
+        let planner = Planner::new(schema);
 
         fn assert_column_eq(planner: &Planner, expr: &str, expected: &Expr) {
             let expr = planner.parse_filter(&format!("{expr} = 'val'")).unwrap();
@@ -1082,7 +1082,7 @@ mod tests {
             true,
         )]));
 
-        let planner = Planner::new(schema.clone());
+        let planner = Planner::new(schema);
 
         let expected = array_element(col("l"), lit(0_i64));
         let expr = planner.parse_expr("l[0]").unwrap();
@@ -1132,7 +1132,7 @@ mod tests {
     fn test_negative_array_expressions() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
 
-        let planner = Planner::new(schema.clone());
+        let planner = Planner::new(schema);
 
         let expected = Expr::Literal(ScalarValue::List(Arc::new(
             ListArray::from_iter_primitive::<Float64Type, _, _>(vec![Some(

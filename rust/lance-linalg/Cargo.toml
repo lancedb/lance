@@ -77,3 +77,6 @@ harness = false
 [[bench]]
 name = "compute_partition"
 harness = false
+
+[lints]
+workspace = true

@@ -274,10 +274,9 @@ impl UpdateJob {
     }
 
     fn apply_updates(
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     ) -> DFResult<RecordBatch> {
-        let mut batch = batch.clone();
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
@@ -421,7 +420,7 @@ mod tests {
     async fn test_update_validation() {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy).await;
 
-        let builder = UpdateBuilder::new(dataset.clone());
+        let builder = UpdateBuilder::new(dataset);
 
         assert!(
             matches!(
@@ -448,7 +447,7 @@ mod tests {
         );
 
         assert!(
-            matches!(builder.clone().build(), Err(Error::InvalidInput { .. })),
+            matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
     }

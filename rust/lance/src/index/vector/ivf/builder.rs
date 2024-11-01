@@ -167,7 +167,7 @@ fn add_precomputed_partitions(
             }),
     );
     let batch = batch
-        .try_with_column(part_id_field.clone(), Arc::new(part_ids.clone()))
+        .try_with_column(part_id_field.clone(), Arc::new(part_ids))
         .expect("failed to add part id column");
     Ok(batch)
 }

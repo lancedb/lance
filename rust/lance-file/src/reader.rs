@@ -407,7 +407,7 @@ pub fn batches_stream(
     let total_batches = reader.num_batches() as i32;
     let batches = (0..total_batches).filter(predicate);
     // Make another copy of self so we can clone it and pass between threads.
-    let this = Arc::new(reader.clone());
+    let this = Arc::new(reader);
     let inner = stream::iter(batches)
         .zip(stream::repeat_with(move || {
             (this.clone(), projection.clone())

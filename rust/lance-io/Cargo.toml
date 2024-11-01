@@ -65,3 +65,6 @@ harness = false
 
 [features]
 gcs-test = []
+
+[lints]
+workspace = true

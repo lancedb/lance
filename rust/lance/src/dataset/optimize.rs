@@ -682,7 +682,7 @@ async fn rewrite_files(
     };
 
     let mut rows_read = 0;
-    let schema = reader.schema().clone();
+    let schema = reader.schema();
     let reader = reader.inspect_ok(move |batch| {
         rows_read += batch.num_rows();
         log::info!(
@@ -969,7 +969,7 @@ mod tests {
         assert!(!single_bin.is_noop());
 
         let big_bin = CandidateBin {
-            fragments: std::iter::repeat(fragment.clone()).take(8).collect(),
+            fragments: std::iter::repeat(fragment).take(8).collect(),
             pos_range: 0..8,
             candidacy: std::iter::repeat(CompactionCandidacy::CompactItself)
                 .take(8)

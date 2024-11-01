@@ -475,7 +475,7 @@ mod tests {
         });
 
         let proto = pb::DataFragment::from(&fragment);
-        let fragment2 = Fragment::try_from(proto.clone()).unwrap();
+        let fragment2 = Fragment::try_from(proto).unwrap();
         assert_eq!(fragment, fragment2);
 
         fragment.deletion_file = None;

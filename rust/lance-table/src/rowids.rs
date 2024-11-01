@@ -638,7 +638,7 @@ mod test {
 
         // Large pieces to smaller ones
         assert_rechunked(
-            fewer_segments.clone(),
+            fewer_segments,
             many_segments.iter().map(|seq| seq.len()).collect(),
             many_segments.clone(),
         );
@@ -655,7 +655,7 @@ mod test {
         assert!(result.is_err());
 
         // Too many segments -> error
-        let result = rechunk_sequences(many_segments.clone(), vec![5]);
+        let result = rechunk_sequences(many_segments, vec![5]);
         assert!(result.is_err());
     }
 

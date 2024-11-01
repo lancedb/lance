@@ -32,7 +32,6 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     + Clone
     + Sized
     + for<'a> From<&'a [T]>
-    + for<'a> From<&'a [T; N]>
 {
     const LANES: usize = N;
 

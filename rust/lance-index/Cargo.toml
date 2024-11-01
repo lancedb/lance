@@ -97,3 +97,6 @@ harness = false
 [[bench]]
 name = "inverted"
 harness = false
+
+[lints]
+workspace = true

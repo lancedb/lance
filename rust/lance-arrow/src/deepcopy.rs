@@ -56,5 +56,5 @@ pub fn deep_copy_batch(batch: &RecordBatch) -> crate::Result<RecordBatch> {
         .iter()
         .map(|array| deep_copy_array(array))
         .collect::<Vec<_>>();
-    RecordBatch::try_new(batch.schema().clone(), arrays)
+    RecordBatch::try_new(batch.schema(), arrays)
 }

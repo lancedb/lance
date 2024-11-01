@@ -933,7 +933,7 @@ mod test {
                 )
             });
 
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let shuffler = IvfShuffler::try_new(100, None, true, None).unwrap();
 
@@ -1133,7 +1133,7 @@ mod test {
             Ok(RecordBatch::try_new(schema2.clone(), vec![row_ids, part_id, pq_codes]).unwrap())
         });
 
-        let stream = RecordBatchStreamAdapter::new(schema.clone(), stream);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
 
         let shuffler = IvfShuffler::try_new(num_partitions, None, true, None).unwrap();
 

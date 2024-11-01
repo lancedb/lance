@@ -1204,7 +1204,7 @@ impl Merger {
                             // All rows matched, go ahead and replace the whole batch
                         } else {
                             // Nothing matched, replace nothing
-                            matched = RecordBatch::new_empty(matched.schema().clone());
+                            matched = RecordBatch::new_empty(matched.schema());
                         }
                     }
                 }
@@ -1222,6 +1222,7 @@ impl Merger {
                     cols.push(row_addr_col);
                     cols
                 } else {
+                    #[allow(clippy::redundant_clone)]
                     left_cols.clone()
                 };
                 let matched = matched.project(&projection)?;
@@ -1773,7 +1774,7 @@ mod tests {
             let indices: Int64Array = (256..512).chain(600..612).chain([712, 715]).collect();
             let keys = arrow::compute::take(batch["key"].as_ref(), &indices, None).unwrap();
             let new_data = RecordBatch::try_new(
-                update_schema.clone(),
+                update_schema,
                 vec![
                     keys,
                     Arc::new((1000..(1000 + indices.len() as u32)).collect::<UInt32Array>()),

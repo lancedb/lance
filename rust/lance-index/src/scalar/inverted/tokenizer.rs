@@ -46,7 +46,7 @@ impl Default for TokenizerConfig {
 
 impl TokenizerConfig {
     pub fn new(base_tokenizer: String, language: tantivy::tokenizer::Language) -> Self {
-        TokenizerConfig {
+        Self {
             base_tokenizer,
             language,
             max_token_length: Some(40),

@@ -210,7 +210,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
-            .chain([dist_col_stats.clone()])
+            .chain([dist_col_stats])
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
@@ -579,7 +579,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             .try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
+            schema,
             per_index_stream
                 .and_then(move |(part_ids, index_uuid)| {
                     let ds = ds.clone();

@@ -805,7 +805,7 @@ impl<T: ByteArrayType> CycleBinaryGenerator<T> {
         Self {
             values,
             lengths,
-            data_type: T::DATA_TYPE.clone(),
+            data_type: T::DATA_TYPE,
             array_type: PhantomData,
             width,
             idx: 0,
@@ -863,7 +863,7 @@ impl<T: ByteArrayType> FixedBinaryGenerator<T> {
     pub fn new(value: Vec<u8>) -> Self {
         Self {
             value,
-            data_type: T::DATA_TYPE.clone(),
+            data_type: T::DATA_TYPE,
             array_type: PhantomData,
         }
     }
@@ -910,7 +910,7 @@ pub struct DictionaryGenerator<K: ArrowDictionaryKeyType> {
 
 impl<K: ArrowDictionaryKeyType> DictionaryGenerator<K> {
     fn new(generator: Box<dyn ArrayGenerator>) -> Self {
-        let key_type = Box::new(K::DATA_TYPE.clone());
+        let key_type = Box::new(K::DATA_TYPE);
         let key_width = key_type
             .primitive_width()
             .expect("dictionary key types should have a known width")
@@ -1352,7 +1352,7 @@ pub mod array {
         let mut values_idx = 0;
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
-                DataType::DATA_TYPE.clone(),
+                DataType::DATA_TYPE,
                 move |_| {
                     let y = values[values_idx];
                     values_idx = (values_idx + 1) % values.len();
@@ -1377,7 +1377,7 @@ pub mod array {
         let mut x = DataType::Native::default();
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
-                DataType::DATA_TYPE.clone(),
+                DataType::DATA_TYPE,
                 move |_| {
                     let y = x;
                     x += DataType::Native::ONE;
@@ -1411,7 +1411,7 @@ pub mod array {
         let mut x = start;
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
-                DataType::DATA_TYPE.clone(),
+                DataType::DATA_TYPE,
                 move |_| {
                     let y = x;
                     x += step;
@@ -1435,7 +1435,7 @@ pub mod array {
     {
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
-                DataType::DATA_TYPE.clone(),
+                DataType::DATA_TYPE,
                 move |_| value,
                 1,
                 DataType::DATA_TYPE
@@ -1470,7 +1470,7 @@ pub mod array {
     {
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
-                DataType::DATA_TYPE.clone(),
+                DataType::DATA_TYPE,
                 move |rng| rng.gen(),
                 1,
                 DataType::DATA_TYPE
@@ -1495,7 +1495,7 @@ pub mod array {
     {
         Box::new(
             FnGen::<DataType::Native, PrimitiveArray<DataType>, _>::new_known_size(
-                DataType::DATA_TYPE.clone(),
+                DataType::DATA_TYPE,
                 move |rng| rng.sample(dist.clone()),
                 1,
                 DataType::DATA_TYPE
@@ -1632,7 +1632,7 @@ pub mod array {
         let dist = Uniform::new(start_days, end_days);
 
         Box::new(FnGen::<i32, Date32Array, _>::new_known_size(
-            data_type.clone(),
+            data_type,
             move |rng| dist.sample(rng),
             1,
             DataType::Date32
@@ -1727,7 +1727,7 @@ pub mod array {
         let dist = Uniform::new(start_days, end_days);
 
         Box::new(FnGen::<i64, Date64Array, _>::new_known_size(
-            data_type.clone(),
+            data_type,
             move |rng| (dist.sample(rng)) * MS_PER_DAY,
             1,
             DataType::Date64
