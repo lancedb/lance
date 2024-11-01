@@ -148,13 +148,10 @@ pub async fn take(
 }
 
 /// Take rows by the internal ROW ids.
-async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
-    if builder.row_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(Arc::new(
-            builder.projection.output_schema()?,
-        )));
-    }
-
+async fn do_take_rows(
+    builder: TakeBuilder,
+    projection: Arc<ProjectionPlan>,
+) -> Result<RecordBatch> {
     let row_addrs = if let Some(row_id_index) = get_row_id_index(&builder.dataset).await? {
         let addresses = builder
             .row_ids
@@ -166,7 +163,13 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
         builder.row_ids
     };
 
-    let projection = Arc::new(builder.projection);
+    if row_addrs.is_empty() {
+        // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
+        return Ok(RecordBatch::new_empty(Arc::new(
+            builder.projection.output_schema()?,
+        )));
+    }
+
     let row_addr_stats = check_row_addrs(&row_addrs);
 
     // This method is mostly to annotate the send bound to avoid the
@@ -275,9 +278,9 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
         // Group ROW Ids by the fragment
         let mut row_addrs_per_fragment: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         sorted_row_addrs.iter().for_each(|row_addr| {
-            let row_addr = RowAddress::new_from_id(*row_addr);
+            let row_addr = RowAddress::from(*row_addr);
             let fragment_id = row_addr.fragment_id();
-            let offset = row_addr.row_id();
+            let offset = row_addr.row_offset();
             row_addrs_per_fragment
                 .entry(fragment_id)
                 .and_modify(|v| v.push(offset))
@@ -359,6 +362,77 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     }
 }
 
+async fn zip_takes(
+    local: RecordBatch,
+    remote: RecordBatch,
+    orig_projection_plan: &ProjectionPlan,
+) -> Result<RecordBatch> {
+    let mut all_cols = Vec::with_capacity(local.num_columns() + remote.num_columns());
+    all_cols.extend(local.columns().iter().cloned());
+    all_cols.extend(remote.columns().iter().cloned());
+
+    let mut all_fields = Vec::with_capacity(local.num_columns() + remote.num_columns());
+    all_fields.extend(local.schema().fields().iter().cloned());
+    all_fields.extend(remote.schema().fields().iter().cloned());
+
+    let all_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(all_fields)), all_cols).unwrap();
+
+    orig_projection_plan.project_batch(all_batch).await
+}
+
+async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
+    if builder.row_ids.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(
+            builder.projection.output_schema()?,
+        )));
+    }
+
+    let projection = builder.projection.clone();
+    let blobs_ds: Arc<Dataset>;
+
+    // If we have blob columns then we load those in parallel to the local
+    // columns and zip the results together.
+    let blob_take = if let Some(blob_schema) = projection.blob_schema.as_ref() {
+        let filtered_row_ids = builder.dataset.filter_deleted_ids(&builder.row_ids).await?;
+        if filtered_row_ids.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(
+                builder.projection.output_schema()?,
+            )));
+        }
+        blobs_ds = builder
+            .dataset
+            .blobs_dataset()
+            .await?
+            .ok_or_else(|| Error::Internal {
+                message: "schema referenced blob columns but there was no blob dataset".into(),
+                location: location!(),
+            })?;
+        let mut builder = builder.clone();
+        builder.dataset = blobs_ds;
+        builder.row_ids = filtered_row_ids;
+        let blobs_projection =
+            Arc::new(ProjectionPlan::inner_new(blob_schema.clone(), false, None));
+        Some(async move { do_take_rows(builder, blobs_projection).await })
+    } else {
+        None
+    };
+
+    if let Some(blob_take) = blob_take {
+        if projection.physical_schema.fields.is_empty() {
+            // Nothing we need from local dataset, just take from blob dataset
+            blob_take.await
+        } else {
+            // Need to take from both and zip together
+            let local_take = do_take_rows(builder, projection.clone());
+            let (local, blobs) = futures::join!(local_take, blob_take);
+
+            zip_takes(local?, blobs?, &projection).await
+        }
+    } else {
+        do_take_rows(builder, projection).await
+    }
+}
+
 /// Get a stream of batches based on iterator of ranges of row numbers.
 ///
 /// This is an experimental API. It may change at any time.
@@ -420,10 +494,11 @@ fn check_row_addrs(row_ids: &[u64]) -> RowAddressStats {
 }
 
 /// Builder for the `take` operation.
+#[derive(Clone, Debug)]
 pub struct TakeBuilder {
     dataset: Arc<Dataset>,
     row_ids: Vec<u64>,
-    projection: ProjectionPlan,
+    projection: Arc<ProjectionPlan>,
     with_row_address: bool,
 }
 
@@ -436,7 +511,7 @@ impl TakeBuilder {
     ) -> Result<Self> {
         Ok(Self {
             row_ids,
-            projection: projection.into_projection_plan(dataset.schema())?,
+            projection: Arc::new(projection.into_projection_plan(dataset.schema())?),
             dataset,
             with_row_address: false,
         })

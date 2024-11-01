@@ -579,6 +579,7 @@ impl FileFragment {
         let row_id_sequence = row_id_sequence?;
 
         if opened_files.is_empty() && !read_config.with_row_id && !read_config.with_row_address {
+            println!("{:#?}", std::backtrace::Backtrace::force_capture());
             return Err(Error::io(
                 format!(
                     "Did not find any data files for schema: {}\nfragment_id={}",

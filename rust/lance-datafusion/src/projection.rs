@@ -27,10 +27,14 @@ use crate::{
     planner::Planner,
 };
 
+#[derive(Debug)]
 pub struct ProjectionPlan {
     /// The physical schema (before dynamic projection) that must be loaded from the dataset
     pub physical_schema: Arc<Schema>,
     pub physical_df_schema: Arc<DFSchema>,
+
+    /// The schema of the blob fields that must be loaded
+    pub blob_schema: Option<Arc<Schema>>,
 
     /// The expressions for all the columns to be in the output
     /// Note: this doesn't include _distance, and _rowid
@@ -98,7 +102,9 @@ impl ProjectionPlan {
             output.insert(output_name.as_ref().to_string(), expr);
         }
 
-        let mut physical_schema = Arc::new(base_schema.project(&physical_cols)?);
+        let physical_schema = Arc::new(base_schema.project(&physical_cols)?);
+        let (physical_schema, remote_schema) = physical_schema.partition_by_storage_class();
+        let mut physical_schema = Arc::new(physical_schema);
         if !load_blobs {
             physical_schema = Self::unload_blobs(&physical_schema);
         }
@@ -112,22 +118,37 @@ impl ProjectionPlan {
         let physical_df_schema = Arc::new(DFSchema::try_from(physical_arrow_schema).unwrap());
         Ok(Self {
             physical_schema,
+            blob_schema: remote_schema.map(Arc::new),
             physical_df_schema,
             requested_output_expr,
         })
     }
 
     pub fn new_empty(base_schema: Arc<Schema>, load_blobs: bool) -> Self {
-        let base_schema = if !load_blobs {
+        let (physical_schema, remote_schema) = base_schema.partition_by_storage_class();
+        Self::inner_new(
+            Arc::new(physical_schema),
+            load_blobs,
+            remote_schema.map(Arc::new),
+        )
+    }
+
+    pub fn inner_new(
+        base_schema: Arc<Schema>,
+        load_blobs: bool,
+        remote_schema: Option<Arc<Schema>>,
+    ) -> Self {
+        let physical_schema = if !load_blobs {
             Self::unload_blobs(&base_schema)
         } else {
             base_schema
         };
 
-        let physical_arrow_schema = ArrowSchema::from(base_schema.as_ref());
+        let physical_arrow_schema = ArrowSchema::from(physical_schema.as_ref());
         let physical_df_schema = Arc::new(DFSchema::try_from(physical_arrow_schema).unwrap());
         Self {
-            physical_schema: base_schema,
+            physical_schema: physical_schema,
+            blob_schema: remote_schema,
             physical_df_schema,
             requested_output_expr: None,
         }

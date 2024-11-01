@@ -11,7 +11,9 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use itertools::Itertools;
 use lance_core::datatypes::NullabilityComparison;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
@@ -30,10 +32,12 @@ use lance_table::io::commit::{
     ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
-use log::warn;
+use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
+use rowids::get_row_id_index;
 use snafu::{location, Location};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::pin::Pin;
@@ -551,6 +555,16 @@ impl Dataset {
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
+                // If the dataset is already using (or not using) move stable row ids, we need to match
+                // and ignore whatever the user provided as input
+                if params.enable_move_stable_row_ids != d.manifest.uses_move_stable_row_ids() {
+                    info!(
+                        "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
+                        params.enable_move_stable_row_ids,
+                        d.manifest.uses_move_stable_row_ids()
+                    );
+                    params.enable_move_stable_row_ids = d.manifest.uses_move_stable_row_ids();
+                }
                 let m = d.manifest.as_ref();
                 schema.check_compatible(
                     &m.schema,
@@ -565,6 +579,15 @@ impl Dataset {
                 // If appending, always use existing storage version
                 storage_version = m.data_storage_format.lance_file_version()?;
             }
+        }
+
+        // If we are writing a dataset with non-default storage, we need to enable move stable row ids
+        if dataset.is_none()
+            && !params.enable_move_stable_row_ids
+            && schema.fields.iter().any(|f| !f.is_default_storage())
+        {
+            info!("Enabling move stable row ids because non-default storage is used");
+            params.enable_move_stable_row_ids = true;
         }
 
         let manifest_naming_scheme = if let Some(d) = dataset.as_ref() {
@@ -1435,6 +1458,160 @@ impl Dataset {
 
     pub(crate) fn fragments(&self) -> &Arc<Vec<Fragment>> {
         &self.manifest.fragments
+    }
+
+    fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+        let mut fragments = Vec::with_capacity(ordered_ids.len());
+        let mut id_iter = ordered_ids.iter();
+        let mut id = id_iter.next();
+        for frag in self.manifest.fragments.iter() {
+            let the_id = if let Some(id) = id { *id } else { break };
+            if the_id == frag.id as u32 {
+                fragments.push(Some(FileFragment::new(
+                    Arc::new(self.clone()),
+                    frag.clone(),
+                )));
+                id = id_iter.next();
+            } else if the_id < frag.id as u32 {
+                fragments.push(None);
+                id = id_iter.next();
+            }
+        }
+        fragments
+    }
+
+    // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
+    async fn filter_addr_or_ids(&self, addr_or_ids: &[u64], addrs: &[u64]) -> Result<Vec<u64>> {
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut perm = permutation::sort(&addrs);
+        // First we sort the addrs, then we transform from Vec<u64> to Vec<Option<u64>> and then
+        // we un-sort and use the None values to filter `addr_or_ids`
+        let sorted_addrs = perm.apply_slice(&addrs);
+
+        // Only collect deletion vectors for the fragments referenced by the given addrs
+        let referenced_frag_ids = sorted_addrs
+            .iter()
+            .map(|addr| RowAddress::from(*addr).fragment_id())
+            .dedup()
+            .collect::<Vec<_>>();
+        let frags = self.get_frags_from_ordered_ids(&referenced_frag_ids);
+        let dv_futs = frags
+            .iter()
+            .map(|frag| {
+                if let Some(frag) = frag {
+                    frag.get_deletion_vector().boxed()
+                } else {
+                    std::future::ready(Ok(None)).boxed()
+                }
+            })
+            .collect::<Vec<_>>();
+        let dvs = stream::iter(dv_futs)
+            .buffered(self.object_store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Iterate through the sorted addresses and sorted fragments (and sorted deletion vectors)
+        // and filter out addresses that have been deleted
+        let mut filtered_sorted_ids = Vec::with_capacity(sorted_addrs.len());
+        let mut sorted_addr_iter = sorted_addrs.into_iter().map(RowAddress::from);
+        let mut next_addr = sorted_addr_iter.next().unwrap();
+        let mut exhausted = false;
+
+        for frag_dv in frags.iter().zip(dvs).zip(referenced_frag_ids.iter()) {
+            let ((frag, dv), frag_id) = frag_dv;
+            if frag.is_some() {
+                // Frag exists
+                if let Some(dv) = dv.as_ref() {
+                    // Deletion vector exists, scan DV
+                    for deleted in dv.to_sorted_iter() {
+                        while next_addr.fragment_id() == *frag_id
+                            && next_addr.row_offset() < deleted
+                        {
+                            filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                            if let Some(next) = sorted_addr_iter.next() {
+                                next_addr = next;
+                            } else {
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                        if exhausted {
+                            break;
+                        }
+                        if next_addr.fragment_id() != *frag_id {
+                            break;
+                        }
+                        if next_addr.row_offset() == deleted {
+                            filtered_sorted_ids.push(None);
+                            if let Some(next) = sorted_addr_iter.next() {
+                                next_addr = next;
+                            } else {
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+                // Either no deletion vector, or we've exhausted it, keep everything else
+                // in this frag
+                while next_addr.fragment_id() == *frag_id {
+                    filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                    if let Some(next) = sorted_addr_iter.next() {
+                        next_addr = next;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // Frag doesn't exist (possibly deleted), delete all items
+                while next_addr.fragment_id() == *frag_id {
+                    filtered_sorted_ids.push(None);
+                    if let Some(next) = sorted_addr_iter.next() {
+                        next_addr = next;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // filtered_sorted_ids is now a Vec with the same size as sorted_addrs, but with None
+        // values where the corresponding address was deleted.  We now need to un-sort it and
+        // filter out the deleted addresses.
+        perm.apply_inv_slice_in_place(&mut filtered_sorted_ids);
+        Ok(addr_or_ids
+            .iter()
+            .zip(filtered_sorted_ids)
+            .filter_map(|(addr_or_id, maybe_addr)| maybe_addr.map(|_| *addr_or_id))
+            .collect())
+    }
+
+    // Leaving this here so it is more obvious to future readers that we can do this and
+    // someone doesn't go off and create a new function to do this.  Delete this comment
+    // if you use this method.
+    #[allow(unused)]
+    pub(crate) async fn filter_deleted_addresses(&self, addrs: &[u64]) -> Result<Vec<u64>> {
+        self.filter_addr_or_ids(addrs, addrs).await
+    }
+
+    pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
+        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
+            let addresses = ids
+                .iter()
+                .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                .collect::<Vec<_>>();
+            Cow::Owned(addresses)
+        } else {
+            Cow::Borrowed(ids)
+        };
+
+        self.filter_addr_or_ids(ids, &addresses).await
     }
 
     /// Gets the number of files that are so small they don't even have a full
