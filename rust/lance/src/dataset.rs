@@ -559,6 +559,8 @@ impl Dataset {
                         // array nullability is checked later, using actual data instead
                         // of the schema
                         compare_nullability: NullabilityComparison::Ignore,
+                        ignore_field_order: true,
+                        allow_missing_if_nullable: true,
                         ..Default::default()
                     },
                 )?;
@@ -715,6 +717,9 @@ impl Dataset {
             &self.manifest.schema,
             &SchemaCompareOptions {
                 compare_dictionary: true,
+                // array nullability is checked later, using actual data instead
+                // of the schema
+                compare_nullability: NullabilityComparison::Ignore,
                 ignore_field_order: true,
                 allow_missing_if_nullable: true,
                 ..Default::default()
