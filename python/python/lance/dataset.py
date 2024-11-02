@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -43,6 +44,7 @@ from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
+    LanceScanStats,
     _Dataset,
     _MergeInsertBuilder,
     _Operation,
@@ -279,6 +281,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        stats_handler: Optional[Union[Callable[[LanceScanStats], None], str]] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -367,6 +370,17 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
+        stats_handler: 'full', 'brief', or Callable, default None
+            If None then stats will not be collected.
+
+            If 'full' then detailed stats will be written to the log file (with DEBUG
+            level).  This includes the scan plan.
+
+            If 'brief' then brief stats (overall timing) will be written to the log
+            file.
+
+            If a callable, then the callable will be provided an instance of
+            LanceScanStats when the scan is complete.
 
         Notes
         -----
@@ -415,6 +429,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
+        setopt(builder.stats_handler, stats_handler)
 
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
@@ -488,6 +503,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        stats_handler: Optional[Union[Callable[[LanceScanStats], None], str]] = None,
     ) -> pa.Table:
         """Read the data into memory as a pyarrow Table.
 
@@ -555,6 +571,17 @@ class LanceDataset(pa.dataset.Dataset):
                 currently only supports a single column in the columns list.
             - query: str
                 The query string to search for.
+        stats_handler: 'full', 'brief', or Callable, default None
+            If None then stats will not be collected.
+
+            If 'full' then detailed stats will be written to the log file (with DEBUG
+            level).  This includes the scan plan.
+
+            If 'brief' then brief stats (overall timing) will be written to the log
+            file.
+
+            If a callable, then the callable will be provided an instance of
+            LanceScanStats when the scan is complete.
 
         Notes
         -----
@@ -581,6 +608,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             fast_search=fast_search,
             full_text_query=full_text_query,
+            stats_handler=stats_handler,
         ).to_table()
 
     @property
@@ -635,6 +663,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        stats_handler: Optional[Union[Callable[[LanceScanStats], None], str]] = None,
         **kwargs,
     ) -> Iterator[pa.RecordBatch]:
         """Read the dataset as materialized record batches.
@@ -666,6 +695,7 @@ class LanceDataset(pa.dataset.Dataset):
             with_row_address=with_row_address,
             use_stats=use_stats,
             full_text_query=full_text_query,
+            stats_handler=stats_handler,
         ).to_batches()
 
     def sample(
@@ -2590,6 +2620,7 @@ class ScannerBuilder:
         self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
+        self._stats_handler = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -2864,6 +2895,28 @@ class ScannerBuilder:
         self._full_text_query = {"query": query, "columns": columns}
         return self
 
+    def stats_handler(
+        self, handler: Union[Callable[[LanceScanStats], None], str]
+    ) -> ScannerBuilder:
+        """
+        Sets the handler for scan statistics
+
+        Scan statistics are gathered while the scan is run and, once the scan is
+        complete, these statistics are given to the handler.
+
+        If 'full' then full stats (including the plan) are collected and logged.
+
+        If 'brief' then only global scan timers are collected and logged.
+
+        If the handler is a callable then the stats will be provided to the callable.
+
+        Note: the format of the log message provided by 'full' and 'brief' is NOT
+        stable and subject to change.  Prefer using a callable instead of parsing the
+        log messages.
+        """
+        self._stats_handler = handler
+        return self
+
     def to_scanner(self) -> LanceScanner:
         scanner = self.ds._ds.scanner(
             self._columns,
@@ -2887,6 +2940,7 @@ class ScannerBuilder:
             self._full_text_query,
             self._late_materialization,
             self._use_scalar_index,
+            self._stats_handler,
         )
         return LanceScanner(scanner, self.ds)
 
