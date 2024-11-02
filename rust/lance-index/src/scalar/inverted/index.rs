@@ -1023,9 +1023,9 @@ pub fn flat_bm25_search(
     let mut scores = Vec::with_capacity(batch.num_rows());
     for doc in doc_iter {
         let Some(doc) = doc else {
-                scores.push(0.0);
-                continue;
-            };
+            scores.push(0.0);
+            continue;
+        };
 
         let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
         let doc_norm = K1 * (1.0 - B + B * doc_tokens.len() as f32 / avgdl);
