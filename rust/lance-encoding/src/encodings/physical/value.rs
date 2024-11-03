@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock, UsedEncoding};
+use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock};
 use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
     BlockCompressor, FixedPerValueCompressor, MiniBlockChunk, MiniBlockCompressed,
@@ -216,7 +216,6 @@ impl PrimitivePageDecoder for ValuePageDecoder {
             data: data_buffer,
             num_values: num_rows,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }
@@ -406,7 +405,6 @@ impl BlockDecompressor for ValueDecompressor {
             data,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }
@@ -420,7 +418,6 @@ impl MiniBlockDecompressor for ValueDecompressor {
             bits_per_value: self.bytes_per_value * 8,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }

@@ -11,7 +11,7 @@ use std::{
 use lance_core::{Error, Result};
 
 use crate::{
-    data::{BlockInfo, DataBlock, OpaqueBlock, UsedEncoding},
+    data::{BlockInfo, DataBlock, OpaqueBlock},
     encoder::{ArrayEncoder, EncodedArray},
     format::ProtobufUtils,
 };
@@ -170,7 +170,6 @@ impl ArrayEncoder for CompressedBufferEncoder {
             buffers: vec![compressed_buf.into()],
             num_values: uncompressed_data.num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
 
         let comp_buf_index = *buffer_index;
@@ -222,7 +221,6 @@ mod tests {
             data: LanceBuffer::reinterpret_vec(vec![0, 1, 2, 3, 4, 5, 6, 7]),
             num_values: 8,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
 
         let mut buffer_index = 0;

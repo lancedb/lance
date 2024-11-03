@@ -31,17 +31,6 @@ use lance_core::{Error, Result};
 
 use crate::{buffer::LanceBuffer, statistics::Stat};
 
-/// `Encoding` enum serves as a encoding registration center.
-///
-/// All the encodings added to Lance should register here, and
-/// these encodings can be dynamically selected during encoding,
-/// users can also specify the particular encoding they want to use in the field metadata.
-#[derive(Eq, Hash, PartialEq, Debug)]
-pub enum Encoding {
-    Bitpack,
-    Fsst,
-    FixedSizeBinary,
-}
 /// A data block with no buffers where everything is null
 ///
 /// Note: this data block should not be used for future work.  It will be deprecated
@@ -101,29 +90,6 @@ impl PartialEq for BlockInfo {
         *self_info == *other_info
     }
 }
-// `UsedEncoding` is used to record the encodings that has applied to a `DataBlock`
-#[derive(Debug, Clone)]
-pub struct UsedEncoding(Arc<RwLock<HashSet<Encoding>>>);
-
-impl Default for UsedEncoding {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl UsedEncoding {
-    pub fn new() -> Self {
-        Self(Arc::new(RwLock::new(HashSet::new())))
-    }
-}
-
-impl PartialEq for UsedEncoding {
-    fn eq(&self, other: &Self) -> bool {
-        let self_used = self.0.read().unwrap();
-        let other_used = other.0.read().unwrap();
-        *self_used == *other_used
-    }
-}
 
 /// Wraps a data block and adds nullability information to it
 ///
@@ -138,8 +104,6 @@ pub struct NullableDataBlock {
     pub nulls: LanceBuffer,
 
     pub block_info: BlockInfo,
-
-    pub used_encoding: UsedEncoding,
 }
 
 impl NullableDataBlock {
@@ -165,7 +129,6 @@ impl NullableDataBlock {
             data: Box::new(self.data.borrow_and_clone()),
             nulls: self.nulls.borrow_and_clone(),
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -174,7 +137,6 @@ impl NullableDataBlock {
             data: Box::new(self.data.try_clone()?),
             nulls: self.nulls.try_clone()?,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         })
     }
 
@@ -233,8 +195,6 @@ pub struct FixedWidthDataBlock {
     pub num_values: u64,
 
     pub block_info: BlockInfo,
-
-    pub used_encoding: UsedEncoding,
 }
 
 impl FixedWidthDataBlock {
@@ -271,7 +231,6 @@ impl FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -281,7 +240,6 @@ impl FixedWidthDataBlock {
             bits_per_value: self.bits_per_value,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         })
     }
 
@@ -323,7 +281,6 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         })
     }
 }
@@ -444,7 +401,6 @@ pub struct OpaqueBlock {
     pub buffers: Vec<LanceBuffer>,
     pub num_values: u64,
     pub block_info: BlockInfo,
-    pub used_encoding: UsedEncoding,
 }
 
 impl OpaqueBlock {
@@ -457,7 +413,6 @@ impl OpaqueBlock {
                 .collect(),
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         }
     }
 
@@ -470,7 +425,6 @@ impl OpaqueBlock {
                 .collect::<Result<_>>()?,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encoding: self.used_encoding.clone(),
         })
     }
 
@@ -494,8 +448,6 @@ pub struct VariableWidthBlock {
     pub num_values: u64,
 
     pub block_info: BlockInfo,
-
-    pub used_encodings: UsedEncoding,
 }
 
 impl VariableWidthBlock {
@@ -525,7 +477,6 @@ impl VariableWidthBlock {
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encodings: self.used_encodings.clone(),
         }
     }
 
@@ -536,7 +487,6 @@ impl VariableWidthBlock {
             bits_per_offset: self.bits_per_offset,
             num_values: self.num_values,
             block_info: self.block_info.clone(),
-            used_encodings: self.used_encodings.clone(),
         })
     }
 
@@ -989,7 +939,6 @@ fn arrow_binary_to_data_block(
         bits_per_offset,
         num_values,
         block_info: BlockInfo::new(),
-        used_encodings: UsedEncoding::new(),
     })
 }
 
@@ -1155,7 +1104,6 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             bits_per_value: bits_per_index,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }
     } else {
         FixedWidthDataBlock {
@@ -1163,7 +1111,6 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
             bits_per_value: indices.data_type().byte_width() as u64 * 8,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }
     };
 
@@ -1247,7 +1194,6 @@ impl DataBlock {
                     bits_per_value: 1,
                     num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 })
             }
             DataType::Date32
@@ -1277,7 +1223,6 @@ impl DataBlock {
                     bits_per_value: data_type.byte_width() as u64 * 8,
                     num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 })
             }
             DataType::Null => Self::AllNull(AllNullDataBlock { num_values }),
@@ -1325,7 +1270,6 @@ impl DataBlock {
                     data: Box::new(encoded),
                     nulls: LanceBuffer::Borrowed(nulls.into_inner().into_inner()),
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 }),
                 _ => unreachable!(),
             }

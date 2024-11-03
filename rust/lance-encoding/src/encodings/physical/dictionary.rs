@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use crate::buffer::LanceBuffer;
 use crate::data::{
     BlockInfo, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
-    UsedEncoding, VariableWidthBlock,
+    VariableWidthBlock,
 };
 use crate::decoder::LogicalPageDecoder;
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
@@ -196,14 +196,12 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
             offsets: LanceBuffer::from(offsets_buffer),
             num_values: num_rows,
             block_info: BlockInfo::new(),
-            used_encodings: UsedEncoding::new(),
         });
         if let Some(nulls) = null_buffer {
             Ok(DataBlock::Nullable(NullableDataBlock {
                 data: Box::new(string_data),
                 nulls: LanceBuffer::from(nulls),
                 block_info: BlockInfo::new(),
-                used_encoding: UsedEncoding::new(),
             }))
         } else {
             Ok(string_data)
@@ -257,7 +255,6 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                         data: LanceBuffer::Borrowed(indices.buffers()[0].clone()),
                         num_values: all_null.num_values,
                         block_info: BlockInfo::new(),
-                        used_encoding: UsedEncoding::new(),
                     },
                     dictionary: Box::new(DataBlock::from_array(values)),
                 }
