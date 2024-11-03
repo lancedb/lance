@@ -1022,12 +1022,9 @@ pub fn flat_bm25_search(
     let doc_iter = iter_str_array(&batch[doc_col]);
     let mut scores = Vec::with_capacity(batch.num_rows());
     for doc in doc_iter {
-        let doc = match doc {
-            Some(doc) => doc,
-            None => {
-                scores.push(0.0);
-                continue;
-            }
+        let Some(doc) = doc else {
+            scores.push(0.0);
+            continue;
         };
 
         let doc_tokens = collect_tokens(doc, tokenizer, Some(query_tokens));
