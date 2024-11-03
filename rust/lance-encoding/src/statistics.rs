@@ -1170,7 +1170,7 @@ mod tests {
         ]);
         let mut block = DataBlock::from_array(string_array.clone());
         let expected_max_length =
-            Arc::new(UInt64Array::from(vec![string_array.value(1).len() as u64])) as ArrayRef;
+            Arc::new(UInt64Array::from(vec![string_array.value_length(1) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
         assert_eq!(
@@ -1188,7 +1188,7 @@ mod tests {
         ]);
         let mut block = DataBlock::from_array(string_array.clone());
         let expected_max_length =
-            Arc::new(UInt64Array::from(vec![string_array.value(1).len() as u64])) as ArrayRef;
+            Arc::new(UInt64Array::from(vec![string_array.value_length(1) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
         assert_eq!(
@@ -1220,7 +1220,7 @@ mod tests {
         ]);
         let mut block = DataBlock::from_array(string_array.clone());
         let expected_max_length =
-            Arc::new(UInt64Array::from(vec![string_array.value(1).len() as u64])) as ArrayRef;
+            Arc::new(UInt64Array::from(vec![string_array.value_length(1) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
         assert_eq!(
