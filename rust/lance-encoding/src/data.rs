@@ -15,7 +15,6 @@
 //! and decoders easier (since they can rely on a normalized representation)
 
 use std::{
-    collections::HashSet,
     ops::Range,
     sync::{Arc, RwLock},
 };
