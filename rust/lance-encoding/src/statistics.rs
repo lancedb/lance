@@ -163,7 +163,7 @@ impl VariableWidthBlock {
                     .map(|pair| pair[1] - pair[0])
                     .max()
                     .unwrap_or(0);
-                Arc::new(UInt64Array::from(vec![max_len as u64]))
+                Arc::new(UInt64Array::from(vec![max_len]))
             }
             _ => {
                 unreachable!("the type of offsets in VariableWidth can only be u32 or u64");
