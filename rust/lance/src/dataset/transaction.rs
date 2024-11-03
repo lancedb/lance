@@ -1110,7 +1110,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                             .into_iter()
                             .map(Fragment::try_from)
                             .collect::<Result<Vec<_>>>()?,
-                        schema: Schema::from(&Fields(schema.clone())),
+                        schema: Schema::from(&Fields(schema)),
                         config_upsert_values: config_upsert_option,
                     })
                 }
