@@ -22,6 +22,7 @@ pub enum Stat {
     Cardinality,
     FixedSize,
     NullCount,
+    MaxLength,
 }
 
 impl fmt::Debug for Stat {
@@ -32,6 +33,7 @@ impl fmt::Debug for Stat {
             Self::Cardinality => write!(f, "Cardinality"),
             Self::FixedSize => write!(f, "FixedSize"),
             Self::NullCount => write!(f, "NullCount"),
+            Self::MaxLength => write!(f, "MaxLength"),
         }
     }
 }
@@ -89,9 +91,13 @@ impl VariableWidthBlock {
         let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
 
         let cardinality_array = self.cardinality();
+
+        let max_length_array = self.max_length();
+
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::Cardinality, cardinality_array);
+        info.insert(Stat::MaxLength, max_length_array);
     }
 
     // Caveat: the computation here assumes VariableWidthBlock.offsets maps directly to VariableWidthBlock.data
@@ -132,6 +138,34 @@ impl VariableWidthBlock {
             }
             _ => {
                 unreachable!("the bits_per_offset of VariableWidthBlock can only be 32 or 64")
+            }
+        }
+    }
+
+    fn max_length(&mut self) -> Arc<dyn Array> {
+        match self.bits_per_offset {
+            32 => {
+                let offsets = self.offsets.borrow_to_typed_slice::<u32>();
+                let offsets = offsets.as_ref();
+                let max_len = offsets
+                    .windows(2)
+                    .map(|pair| pair[1] - pair[0])
+                    .max()
+                    .unwrap_or(0);
+                Arc::new(UInt64Array::from(vec![max_len as u64]))
+            }
+            64 => {
+                let offsets = self.offsets.borrow_to_typed_slice::<u64>();
+                let offsets = offsets.as_ref();
+                let max_len = offsets
+                    .windows(2)
+                    .map(|pair| pair[1] - pair[0])
+                    .max()
+                    .unwrap_or(0);
+                Arc::new(UInt64Array::from(vec![max_len as u64]))
+            }
+            _ => {
+                unreachable!("the type of offsets in VariableWidth can only be u32 or u64");
             }
         }
     }
@@ -1298,6 +1332,90 @@ mod tests {
             Some(expected_cardinality.clone()),
             "Expected Stat::Cardinality to be {:?} for data block generated from array: {:?}",
             expected_cardinality,
+            string_array,
+        );
+    }
+
+    #[test]
+    fn test_max_length_variable_width_datablock() {
+        let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_max_length = Arc::new(UInt64Array::from(vec![5])) as ArrayRef;
+        let actual_max_length = block.get_stat(Stat::MaxLength);
+
+        assert_eq!(
+            actual_max_length,
+            Some(expected_max_length.clone()),
+            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
+            expected_max_length,
+            string_array,
+        );
+
+        let string_array = StringArray::from(vec![
+            Some("to be named by variables"),
+            Some("to be passed as arguments to procedures"), // string that has max length
+            Some("to be returned as values of procedures"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_max_length =
+            Arc::new(UInt64Array::from(vec![string_array.value(1).len() as u64])) as ArrayRef;
+        let actual_max_length = block.get_stat(Stat::MaxLength);
+
+        assert_eq!(
+            actual_max_length,
+            Some(expected_max_length.clone()),
+            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
+            expected_max_length,
+            string_array,
+        );
+
+        let string_array = StringArray::from(vec![
+            Some("Samuel Eilenberg"),
+            Some("Saunders Mac Lane"), // string that has max length
+            Some("Samuel Eilenberg"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_max_length =
+            Arc::new(UInt64Array::from(vec![string_array.value(1).len() as u64])) as ArrayRef;
+        let actual_max_length = block.get_stat(Stat::MaxLength);
+
+        assert_eq!(
+            actual_max_length,
+            Some(expected_max_length.clone()),
+            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
+            expected_max_length,
+            string_array,
+        );
+
+        let string_array = LargeStringArray::from(vec![Some("hello"), Some("world")]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_max_length =
+            Arc::new(UInt64Array::from(vec![string_array.value(0).len() as u64])) as ArrayRef;
+        let actual_max_length = block.get_stat(Stat::MaxLength);
+
+        assert_eq!(
+            actual_max_length,
+            Some(expected_max_length.clone()),
+            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
+            expected_max_length,
+            string_array,
+        );
+
+        let string_array = LargeStringArray::from(vec![
+            Some("to be named by variables"),
+            Some("to be passed as arguments to procedures"),
+            Some("to be returned as values of procedures"),
+        ]);
+        let mut block = DataBlock::from_array(string_array.clone());
+        let expected_max_length =
+            Arc::new(UInt64Array::from(vec![string_array.value(1).len() as u64])) as ArrayRef;
+        let actual_max_length = block.get_stat(Stat::MaxLength);
+
+        assert_eq!(
+            actual_max_length,
+            Some(expected_max_length.clone()),
+            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
+            expected_max_length,
             string_array,
         );
     }
