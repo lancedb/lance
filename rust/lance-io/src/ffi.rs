@@ -116,31 +116,29 @@ impl<S: RecordBatchStream + Unpin> Iterator for JniRecordBatchIteratorAdaptor<S>
     fn next(&mut self) -> Option<Self::Item> {
         self.handle
             .block_on(async { self.stream.next().await })
-            .map(|r| {
-                r.map(|batch| {
-                    match batch.schema().index_of(ROW_ID) {
-                        Ok(index) => {
-                            let mut new_columns = batch.columns().to_vec();
-                            let uint64_array = batch
-                                .column(index)
-                                .as_any()
-                                .downcast_ref::<UInt64Array>()
-                                .unwrap();
-                            // Create a new Int64Array
-                            let mut int_values: Vec<i64> = Vec::with_capacity(uint64_array.len());
-                            for i in 0..uint64_array.len() {
-                                // Convert UInt64 to Int64 (you may want to handle overflow here)
-                                int_values.push(uint64_array.value(i) as i64);
-                            }
-                            let int_array = Int64Array::from(int_values);
-                            new_columns[index] = Arc::new(int_array.clone()); // Replace the specified column
-                                                                              // Create a new RecordBatch with the updated columns
-                            RecordBatch::try_new(self.schema(), new_columns).unwrap()
+            .map(|r| match r {
+                Ok(batch) => match batch.schema().index_of(ROW_ID) {
+                    Ok(index) => {
+                        let mut new_columns = batch.columns().to_vec();
+                        let uint64_array = batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .unwrap();
+                        let mut int_values: Vec<i64> = Vec::with_capacity(uint64_array.len());
+                        for i in 0..uint64_array.len() {
+                            match uint64_array.value(i).try_into() {
+                                Ok(value) => int_values.push(value),
+                                Err(_err) => return Err(ArrowError::ExternalError(Box::new(_err))),
+                            };
                         }
-                        Err(_err) => batch,
+                        let int_array = Int64Array::from(int_values);
+                        new_columns[index] = Arc::new(int_array.clone());
+                        RecordBatch::try_new(self.schema(), new_columns)
                     }
-                })
-                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+                    Err(_err) => Ok(batch),
+                },
+                Err(_err) => Err(ArrowError::ExternalError(Box::new(_err))),
             })
     }
 }
