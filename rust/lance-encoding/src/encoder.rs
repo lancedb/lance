@@ -22,8 +22,10 @@ use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
-use crate::encodings::physical::bitpack_fastlanes::compute_compressed_bit_width_for_non_neg;
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
+use crate::encodings::physical::bitpack_fastlanes::{
+    compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
+};
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
@@ -773,9 +775,18 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
     fn create_miniblock_compressor(
         &self,
         field: &Field,
-        _data: &DataBlock,
+        data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         assert!(field.data_type().byte_width() > 0);
+        if let DataBlock::FixedWidth(ref fixed_width_data) = data {
+            if fixed_width_data.bits_per_value == 8
+                || fixed_width_data.bits_per_value == 16
+                || fixed_width_data.bits_per_value == 32
+                || fixed_width_data.bits_per_value == 64
+            {
+                return Ok(Box::new(BitpackMiniBlockEncoder::default()));
+            }
+        }
         Ok(Box::new(ValueEncoder::default()))
     }
 
@@ -1475,7 +1486,7 @@ pub mod tests {
         let encoding_strategy = CoreArrayEncodingStrategy { version };
         let mut field = Field::new("test_field", array.data_type().clone(), true);
         if let Some(field_meta) = field_meta {
-            field.set_metadata(field_meta.clone());
+            field.set_metadata(field_meta);
         }
         let lance_field = lance_core::datatypes::Field::try_from(field).unwrap();
         let encoder_result = encoding_strategy.create_array_encoder(&[array], &lance_field);

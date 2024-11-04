@@ -32,3 +32,6 @@ bench = false
 [[bench]]
 name = "array_gen"
 harness = false
+
+[lints]
+workspace = true

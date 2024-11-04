@@ -116,7 +116,7 @@ impl PQBuildParams {
                     num_centroids,
                     self.max_iters as u32,
                     self.kmeans_redos,
-                    rng.clone(),
+                    rng,
                     distance_type,
                     self.sample_rate,
                 )

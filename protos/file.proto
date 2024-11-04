@@ -173,4 +173,17 @@ message Field {
 
   // optional field metadata (e.g. extension type name/parameters)
   map<string, bytes> metadata = 10;
+
+  /// The storage class of the field
+  ///
+  /// This determines the rate at which the field is compacted.
+  ///
+  /// Currently, there are only two storage classes:
+  /// 
+  /// "" - The default storage class.
+  /// "blob" - The field is compacted into fewer rows per fragment.
+  ///
+  /// Fields that have non-default storage classes are stored in different
+  /// datasets (e.g. blob fields are stored in the nested "_blobs" dataset)
+  string storage_class = 11;
 }

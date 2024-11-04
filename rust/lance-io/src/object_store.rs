@@ -435,7 +435,7 @@ impl ObjectStore {
         // path_abs::PathAbs::new(".") returns an empty string.
         if let Some(s) = expanded_path.as_path().to_str() {
             if s.is_empty() {
-                expanded_path = std::env::current_dir()?.to_path_buf();
+                expanded_path = std::env::current_dir()?;
             }
         }
         Ok((

@@ -231,7 +231,7 @@ fn unnest_batch(
         .collect::<Vec<_>>();
 
     let remaining_batch = RecordBatch::try_new(
-        Arc::new(Schema::new(Fields::from(remaining_fields.clone()))),
+        Arc::new(Schema::new(Fields::from(remaining_fields))),
         remaining_cols,
     )?;
 
@@ -302,7 +302,7 @@ fn unnest_chunks(
     });
 
     Ok(Box::pin(RecordBatchStreamAdapter::new(
-        unnest_schema_copy.clone(),
+        unnest_schema_copy,
         source,
     )))
 }

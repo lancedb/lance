@@ -19,7 +19,7 @@ use pb::{
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Dictionary,
+    AllNullLayout, ArrayEncoding, Binary, Bitpack2, Bitpacked, BitpackedForNonNeg, Dictionary,
     FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct,
     PageLayout,
 };
@@ -121,6 +121,13 @@ impl ProtobufUtils {
                     buffer_index,
                     buffer_type: BufferType::Page as i32,
                 }),
+                uncompressed_bits_per_value,
+            })),
+        }
+    }
+    pub fn bitpack2(uncompressed_bits_per_value: u64) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::Bitpack2(Bitpack2 {
                 uncompressed_bits_per_value,
             })),
         }

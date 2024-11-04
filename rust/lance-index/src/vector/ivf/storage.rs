@@ -214,7 +214,7 @@ impl TryFrom<PbIvf> for IvfModel {
         Ok(Self {
             centroids,
             offsets,
-            lengths: proto.lengths.clone(),
+            lengths: proto.lengths,
         })
     }
 }

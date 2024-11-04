@@ -186,7 +186,7 @@ impl FieldEncodingStrategy for LanceDfFieldEncodingStrategy {
             )?;
             Ok(Box::new(ZoneMapsFieldEncoder::try_new(
                 inner_encoder,
-                data_type.clone(),
+                data_type,
                 self.rows_per_map,
             )?))
         } else {

@@ -901,7 +901,7 @@ mod tests {
             right_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
         ) {
             let mut left = RowIdTreeMap::default();
-            for fragment in left_full_fragments.clone() {
+            for fragment in left_full_fragments {
                 left.insert_fragment(fragment);
             }
             left.extend(left_rows.iter().copied());
@@ -925,7 +925,7 @@ mod tests {
             left_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
         ) {
             let mut left = RowIdTreeMap::default();
-            for fragment in left_full_fragments.clone() {
+            for fragment in left_full_fragments {
                 left.insert_fragment(fragment);
             }
             left.extend(left_rows.iter().copied());

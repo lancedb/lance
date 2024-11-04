@@ -660,7 +660,7 @@ impl StatisticsCollector {
         });
 
         let schema = Arc::new(ArrowSchema::new(fields));
-        let batch = RecordBatch::try_new(schema.clone(), arrays);
+        let batch = RecordBatch::try_new(schema, arrays);
         match batch {
             Ok(batch) => Ok(batch),
             _ => Err(ArrowError::SchemaError(
@@ -1573,7 +1573,7 @@ mod tests {
                         ),
                         max_value: ScalarValue::FixedSizeBinary(
                             BINARY_PREFIX_LENGTH.try_into().unwrap(),
-                            Some(min_binary_value.clone()),
+                            Some(min_binary_value),
                         ),
                     },
                 },
@@ -1638,7 +1638,7 @@ mod tests {
         let dictionary_array_1 =
             Arc::new(DictionaryArray::try_new(indices_1, dictionary.clone()).unwrap()) as ArrayRef;
         let dictionary_array_2 =
-            Arc::new(DictionaryArray::try_new(indices_2, dictionary.clone()).unwrap()) as ArrayRef;
+            Arc::new(DictionaryArray::try_new(indices_2, dictionary).unwrap()) as ArrayRef;
         let array_refs = vec![&dictionary_array_1, &dictionary_array_2];
         let stats = collect_statistics(&array_refs);
         assert_eq!(
@@ -2038,7 +2038,7 @@ mod tests {
             };
 
             assert_min_max_constant_property(value.clone(), false)?;
-            assert_min_max_constant_property(value.clone(), true)?;
+            assert_min_max_constant_property(value, true)?;
         }
     }
 

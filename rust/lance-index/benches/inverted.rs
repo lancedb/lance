@@ -60,7 +60,7 @@ fn bench_inverted(c: &mut Criterion) {
             arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
         ])
         .into(),
-        vec![doc_col.clone(), row_id_col.clone()],
+        vec![doc_col, row_id_col],
     )
     .unwrap();
     let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));

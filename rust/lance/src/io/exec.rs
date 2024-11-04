@@ -28,3 +28,4 @@ pub use rowids::AddRowAddrExec;
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;
 pub use utils::PreFilterSource;
+pub(crate) use utils::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};

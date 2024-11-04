@@ -963,9 +963,7 @@ fn arrow_binary_to_data_block(
         .iter()
         .map(|d| {
             LanceBuffer::Borrowed(
-                d.buffers()[0]
-                    .slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset)
-                    .clone(),
+                d.buffers()[0].slice_with_length(d.offset(), (d.len() + 1) * bytes_per_offset),
             )
         })
         .collect::<Vec<_>>();

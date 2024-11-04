@@ -37,7 +37,7 @@ fn bench_train(c: &mut Criterion) {
     });
 
     let values = generate_random_array(1024 * 64 * dimension as usize);
-    let query = FixedSizeListArray::try_new_from_values(values.clone(), dimension).unwrap();
+    let query = FixedSizeListArray::try_new_from_values(values, dimension).unwrap();
     c.bench_function("compute_membership_128d_65535", |b| {
         b.to_async(&rt)
             .iter(|| async { compute_partitions_arrow_array(&array, &query, DistanceType::L2) })

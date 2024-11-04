@@ -145,7 +145,7 @@ struct OneShotPartitionStream {
 
 impl OneShotPartitionStream {
     fn new(data: SendableRecordBatchStream) -> Self {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
             schema,
@@ -184,7 +184,7 @@ impl SessionContextExt for SessionContext {
         &self,
         data: SendableRecordBatchStream,
     ) -> datafusion::common::Result<DataFrame> {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))

@@ -593,6 +593,7 @@ async fn reserve_fragment_ids(
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
+        /*blob_op=*/ None,
         None,
     );
 
@@ -682,7 +683,7 @@ async fn rewrite_files(
     };
 
     let mut rows_read = 0;
-    let schema = reader.schema().clone();
+    let schema = reader.schema();
     let reader = reader.inspect_ok(move |batch| {
         rows_read += batch.num_rows();
         log::info!(
@@ -703,15 +704,19 @@ async fn rewrite_files(
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         params.max_bytes_per_file = max_bytes_per_file;
     }
-    let mut new_fragments = write_fragments_internal(
+    let new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
-        dataset.schema(),
+        dataset.schema().clone(),
         reader,
         params,
     )
     .await?;
+
+    // We should not be rewriting any blob data
+    assert!(new_fragments.blob.is_none());
+    let mut new_fragments = new_fragments.default.0;
 
     log::info!("Compaction task {}: file written", task_id);
 
@@ -887,6 +892,8 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
         },
+        // TODO: Add a blob compaction pass
+        /*blob_op= */ None,
         None,
     );
 
@@ -969,7 +976,7 @@ mod tests {
         assert!(!single_bin.is_noop());
 
         let big_bin = CandidateBin {
-            fragments: std::iter::repeat(fragment.clone()).take(8).collect(),
+            fragments: std::iter::repeat(fragment).take(8).collect(),
             pos_range: 0..8,
             candidacy: std::iter::repeat(CompactionCandidacy::CompactItself)
                 .take(8)

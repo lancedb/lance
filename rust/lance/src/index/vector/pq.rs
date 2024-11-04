@@ -443,7 +443,7 @@ pub(crate) fn build_pq_storage(
     ])?;
     let pq_store = ProductQuantizationStorage::new(
         pq.codebook.clone(),
-        pq_batch.clone(),
+        pq_batch,
         pq.num_bits,
         pq.code_dim(),
         pq.dimension,
@@ -511,7 +511,7 @@ mod tests {
         assert_eq!(pq.num_bits, 8);
         assert_eq!(pq.dimension, DIM);
 
-        let codebook = pq.codebook.clone();
+        let codebook = pq.codebook;
         assert_eq!(codebook.len(), 256);
         codebook
             .values()
@@ -550,6 +550,7 @@ mod tests {
         assert_eq!(pq.num_bits, 8);
         assert_eq!(pq.dimension, DIM);
 
+        #[allow(clippy::redundant_clone)]
         let codebook = pq.codebook.clone();
         assert_eq!(codebook.len(), 256);
         codebook

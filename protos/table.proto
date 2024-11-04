@@ -146,6 +146,14 @@ message Manifest {
   // libraries may wish to similarly prefix their configuration keys
   // appropriately.
   map<string, string> config = 16;
+
+  // The version of the blob dataset associated with this table.  Changes to
+  // blob fields will modify the blob dataset and update this version in the parent
+  // table.
+  //
+  // If this value is 0 then there are no blob fields.
+  uint64 blob_dataset_version = 17;
+
 } // Manifest
 
 // Auxiliary Data attached to a version.

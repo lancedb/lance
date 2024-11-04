@@ -125,7 +125,6 @@ fn ranges_to_tasks(
     stream::iter(ranges)
         .map(move |(batch_idx, range)| {
             let num_rows = range.end - range.start;
-            let range = range.clone();
             let reader = reader.clone();
             let projection = projection.clone();
             let task = tokio::task::spawn(async move {

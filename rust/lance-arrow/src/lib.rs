@@ -475,7 +475,7 @@ impl RecordBatchExt for RecordBatch {
             .position(|f| f.name() == name)
             .ok_or_else(|| ArrowError::SchemaError(format!("Field {} does not exist", name)))?;
         columns[field_i] = column;
-        Self::try_new(self.schema().clone(), columns)
+        Self::try_new(self.schema(), columns)
     }
 
     fn column_by_qualified_name(&self, name: &str) -> Option<&ArrayRef> {
@@ -637,7 +637,7 @@ pub fn interleave_batches(
     let first_batch = batches.first().ok_or_else(|| {
         ArrowError::InvalidArgumentError("Cannot interleave zero RecordBatches".to_string())
     })?;
-    let schema = first_batch.schema().clone();
+    let schema = first_batch.schema();
     let num_columns = first_batch.num_columns();
     let mut columns = Vec::with_capacity(num_columns);
     let mut chunks = Vec::with_capacity(batches.len());
@@ -785,7 +785,7 @@ mod tests {
             .with_metadata(metadata.clone().into()),
         );
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..20)),
                 Arc::new(StringArray::from_iter_values(
@@ -830,7 +830,7 @@ mod tests {
         // Sub schema
         let sub_schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let sub_projected = batch.project_by_schema(&sub_schema).unwrap();
-        let expected_schema = Arc::new(sub_schema.with_metadata(metadata.clone().into()));
+        let expected_schema = Arc::new(sub_schema.with_metadata(metadata.into()));
         assert_eq!(
             sub_projected,
             RecordBatch::try_new(

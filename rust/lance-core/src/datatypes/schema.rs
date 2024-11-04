@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::{location, Location};
 
-use super::field::{Field, SchemaCompareOptions};
+use super::field::{Field, SchemaCompareOptions, StorageClass};
 use crate::{Error, Result};
 
 /// Lance Schema.
@@ -139,6 +139,19 @@ impl Schema {
             } else {
                 Some(differences.join(", "))
             }
+        }
+    }
+
+    pub fn retain_storage_class(&self, storage_class: StorageClass) -> Self {
+        let fields = self
+            .fields
+            .iter()
+            .filter(|f| f.storage_class() == storage_class)
+            .cloned()
+            .collect();
+        Self {
+            fields,
+            metadata: self.metadata.clone(),
         }
     }
 

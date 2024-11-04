@@ -9,7 +9,7 @@ pub mod error;
 pub mod traits;
 pub mod utils;
 
-pub use error::{Error, Result};
+pub use error::{ArrowResult, Error, Result};
 
 /// Column name for the meta row ID.
 pub const ROW_ID: &str = "_rowid";

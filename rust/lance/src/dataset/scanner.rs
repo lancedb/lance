@@ -15,6 +15,7 @@ use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{lit, Expr};
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
@@ -30,7 +31,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::{Partitioning, PhysicalExpr};
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
@@ -41,7 +42,7 @@ use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
 use lance_datafusion::projection::ProjectionPlan;
 use lance_index::scalar::expression::PlannerIndexExt;
-use lance_index::scalar::inverted::SCORE_COL;
+use lance_index::scalar::inverted::{FTS_SCHEMA, SCORE_COL};
 use lance_index::scalar::{FullTextSearchQuery, ScalarIndexType};
 use lance_index::vector::{Query, DIST_COL};
 use lance_index::{scalar::expression::ScalarIndexExpr, DatasetIndexExt};
@@ -55,7 +56,7 @@ use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
 use crate::index::DatasetIndexInternalExt;
-use crate::io::exec::fts::FtsExec;
+use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
@@ -330,8 +331,9 @@ fn escape_column_name(name: &str) -> String {
 
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
+        // By default, we only scan the local schema
         let projection_plan = ProjectionPlan::new_empty(
-            Arc::new(dataset.schema().clone()),
+            Arc::new(dataset.local_schema().clone()),
             /*load_blobs= */ false,
         );
         Self {
@@ -954,7 +956,7 @@ impl Scanner {
             false,
             false,
         )?;
-        let plan_schema = plan.schema().clone();
+        let plan_schema = plan.schema();
         let count_plan = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(Vec::new()),
@@ -1120,6 +1122,23 @@ impl Scanner {
                 location: location!(),
             });
         }
+        if let Some(first_blob_col) = self
+            .projection_plan
+            .physical_schema
+            .fields
+            .iter()
+            .find(|f| !f.is_default_storage())
+        {
+            return Err(Error::NotSupported {
+                source: format!(
+                    "Scanning blob columns such as \"{}\" is not yet supported",
+                    first_blob_col.name
+                )
+                .into(),
+                location: location!(),
+            });
+        }
+
         // Scalar indices are only used when prefiltering
         let use_scalar_index = self.use_scalar_index && (self.prefilter || self.nearest.is_none());
 
@@ -1410,31 +1429,83 @@ impl Scanner {
             ));
         }
 
+        // rewrite the query to be with the columns and limit
+        let query = query
+            .clone()
+            .columns(Some(columns.clone()))
+            .limit(self.limit);
+
         // load indices
-        let mut indices = HashMap::with_capacity(columns.len());
-        for column in &columns {
+        let mut column_inputs = HashMap::with_capacity(columns.len());
+        for column in columns {
             let index = self
                 .dataset
-                .load_scalar_index_for_column(column)
+                .load_scalar_index_for_column(&column)
                 .await?
                 .ok_or(Error::invalid_input(
                     format!("Column {} has no inverted index", column),
                     location!(),
                 ))?;
-            let index_uuids = self
+            let index_uuids: Vec<_> = self
                 .dataset
                 .load_indices_by_name(&index.name)
                 .await?
                 .into_iter()
                 .collect();
-            indices.insert(column.clone(), index_uuids);
+
+            let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
+            let unindexed_scan_node = if unindexed_fragments.is_empty() {
+                Arc::new(EmptyExec::new(FTS_SCHEMA.clone()))
+            } else {
+                let mut columns = vec![column.clone()];
+                if let Some(expr) = filter_plan.full_expr.as_ref() {
+                    let filter_columns = Planner::column_names_in_expr(expr);
+                    columns.extend(filter_columns);
+                }
+                let flat_fts_scan_schema =
+                    Arc::new(self.dataset.schema().project(&columns).unwrap());
+                let mut scan_node = self.scan_fragments(
+                    true,
+                    false,
+                    true,
+                    flat_fts_scan_schema,
+                    Arc::new(unindexed_fragments),
+                    None,
+                    false,
+                );
+
+                if let Some(expr) = filter_plan.full_expr.as_ref() {
+                    // If there is a prefilter we need to manually apply it to the new data
+                    let planner = Planner::new(scan_node.schema());
+                    let physical_refine_expr = planner.create_physical_expr(expr)?;
+                    scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
+                }
+
+                scan_node
+            };
+
+            column_inputs.insert(column.clone(), (index_uuids, unindexed_scan_node));
         }
 
-        let query = query.clone().columns(Some(columns)).limit(self.limit);
+        let indices = column_inputs
+            .iter()
+            .map(|(col, (idx, _))| (col.clone(), idx.clone()))
+            .collect();
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-        let fts_plan = FtsExec::new(self.dataset.clone(), indices, query, prefilter_source);
+        let fts_plan = Arc::new(FtsExec::new(
+            self.dataset.clone(),
+            indices,
+            query.clone(),
+            prefilter_source,
+        )) as Arc<dyn ExecutionPlan>;
+        let flat_fts_plan = Arc::new(FlatFtsExec::new(self.dataset.clone(), column_inputs, query));
+        let fts_node = Arc::new(UnionExec::new(vec![fts_plan, flat_fts_plan]));
+        let fts_node = Arc::new(RepartitionExec::try_new(
+            fts_node,
+            Partitioning::RoundRobinBatch(1),
+        )?);
         let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, fts_plan.schema().as_ref())?,
+            expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
             options: SortOptions {
                 descending: true,
                 nulls_first: false,
@@ -1442,11 +1513,7 @@ impl Scanner {
         };
 
         Ok(Arc::new(
-            SortExec::new(
-                vec![sort_expr],
-                Arc::new(fts_plan) as Arc<dyn ExecutionPlan>,
-            )
-            .with_fetch(self.limit.map(|l| l as usize)),
+            SortExec::new(vec![sort_expr], fts_node).with_fetch(self.limit.map(|l| l as usize)),
         ))
     }
 
@@ -2037,6 +2104,7 @@ pub mod test_dataset {
     use arrow_array::{ArrayRef, FixedSizeListArray, Int32Array, RecordBatchIterator, StringArray};
     use arrow_schema::ArrowError;
     use lance_file::version::LanceFileVersion;
+    use lance_index::scalar::InvertedIndexParams;
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::{tempdir, TempDir};
 
@@ -2157,6 +2225,18 @@ pub mod test_dataset {
                     IndexType::Scalar,
                     None,
                     &ScalarIndexParams::default(),
+                    true,
+                )
+                .await
+        }
+
+        pub async fn make_fts_index(&mut self) -> Result<()> {
+            self.dataset
+                .create_index(
+                    &["s"],
+                    IndexType::Inverted,
+                    None,
+                    &InvertedIndexParams::default(),
                     true,
                 )
                 .await
@@ -3811,7 +3891,7 @@ mod test {
             let new_not_indexed =
                 arrow_arith::numeric::add(&data["indexed"], &Int32Array::new_scalar(1000)).unwrap();
             let append_data = RecordBatch::try_new(
-                data.schema().clone(),
+                data.schema(),
                 vec![data["vector"].clone(), new_indexed, new_not_indexed],
             )
             .unwrap();
@@ -4932,6 +5012,98 @@ mod test {
         ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
           FilterExec: i@1 > 10
             LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
+        )
+        .await?;
+
+        // FTS
+        // ---------------------------------------------------------------------
+        // All rows are indexed
+        dataset.make_fts_index().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+            FlatFts: query=hello
+              EmptyExec"#,
+        )
+        .await?;
+
+        // With prefilter
+        dataset.make_fts_index().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .filter("i > 10")?
+                    .prefilter(true)
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+              ScalarIndexQuery: query=i > 10
+            FlatFts: query=hello
+              EmptyExec"#,
+        )
+        .await?;
+
+        // With unindexed rows
+        dataset.append_new_data().await?;
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+            FlatFts: query=hello
+              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false"#,
+        )
+        .await?;
+
+        // With unindexed data & prefilter
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| {
+                scan.project(&["s"])?
+                    .with_row_id()
+                    .filter("i > 10")?
+                    .prefilter(true)
+                    .full_text_search(FullTextSearchQuery::new("hello".to_owned()))
+            },
+            r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
+  Take: columns="_rowid, _score, (s)"
+    CoalesceBatchesExec: target_batch_size=8192
+      SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+          UnionExec
+            Fts: query=hello
+              ScalarIndexQuery: query=i > 10
+            FlatFts: query=hello
+              FilterExec: i@1 > 10
+                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,
         )
         .await?;
 

@@ -243,15 +243,24 @@ impl UpdateJob {
             .manifest()
             .data_storage_format
             .lance_file_version()?;
-        let new_fragments = write_fragments_internal(
+        let written = write_fragments_internal(
             Some(&self.dataset),
             self.dataset.object_store.clone(),
             &self.dataset.base,
-            self.dataset.schema(),
+            self.dataset.schema().clone(),
             Box::pin(stream),
             WriteParams::with_storage_version(version),
         )
         .await?;
+
+        if written.blob.is_some() {
+            return Err(Error::NotSupported {
+                source: "Updating blob columns".into(),
+                location: location!(),
+            });
+        }
+        let new_fragments = written.default.0;
+
         // Apply deletions
         let removed_row_ids = Arc::into_inner(removed_row_ids)
             .unwrap()
@@ -274,10 +283,9 @@ impl UpdateJob {
     }
 
     fn apply_updates(
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         updates: Arc<HashMap<String, Arc<dyn PhysicalExpr>>>,
     ) -> DFResult<RecordBatch> {
-        let mut batch = batch.clone();
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
@@ -345,7 +353,12 @@ impl UpdateJob {
             updated_fragments,
             new_fragments,
         };
-        let transaction = Transaction::new(self.dataset.manifest.version, operation, None);
+        let transaction = Transaction::new(
+            self.dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
 
         let manifest = commit_transaction(
             self.dataset.as_ref(),
@@ -421,7 +434,7 @@ mod tests {
     async fn test_update_validation() {
         let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::Legacy).await;
 
-        let builder = UpdateBuilder::new(dataset.clone());
+        let builder = UpdateBuilder::new(dataset);
 
         assert!(
             matches!(
@@ -448,7 +461,7 @@ mod tests {
         );
 
         assert!(
-            matches!(builder.clone().build(), Err(Error::InvalidInput { .. })),
+            matches!(builder.build(), Err(Error::InvalidInput { .. })),
             "Should return error if no update expressions are provided"
         );
     }

@@ -69,7 +69,7 @@ impl DatasetPreFilter {
             });
         }
         let deleted_ids =
-            Self::create_deletion_mask(dataset.clone(), fragments).map(SharedPrerequisite::spawn);
+            Self::create_deletion_mask(dataset, fragments).map(SharedPrerequisite::spawn);
         let filtered_ids = filter
             .map(|filtered_ids| SharedPrerequisite::spawn(filtered_ids.load().in_current_span()));
         Self {

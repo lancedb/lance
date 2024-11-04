@@ -639,7 +639,7 @@ impl MergeInsertJob {
             ) -> Result<usize> {
                 // batches still have _rowaddr
                 let write_schema = batches[0].schema().as_ref().without_column(ROW_ADDR);
-                let write_schema = dataset.schema().project_by_schema(&write_schema)?;
+                let write_schema = dataset.local_schema().project_by_schema(&write_schema)?;
 
                 let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
                 if Some(updated_rows) == metadata.physical_rows {
@@ -861,7 +861,7 @@ impl MergeInsertJob {
     ) -> Result<(Arc<Dataset>, MergeStats)> {
         let schema = source.schema();
 
-        let full_schema = Schema::from(self.dataset.schema());
+        let full_schema = Schema::from(self.dataset.local_schema());
         let is_full_schema = &full_schema == schema.as_ref();
 
         let joined = self.create_joined_stream(source).await?;
@@ -897,15 +897,19 @@ impl MergeInsertJob {
 
             Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
-            let new_fragments = write_fragments_internal(
+            let written = write_fragments_internal(
                 Some(&self.dataset),
                 self.dataset.object_store.clone(),
                 &self.dataset.base,
-                self.dataset.schema(),
+                self.dataset.schema().clone(),
                 Box::pin(stream),
                 WriteParams::default(),
             )
             .await?;
+
+            assert!(written.blob.is_none());
+            let new_fragments = written.default.0;
+
             // Apply deletions
             let removed_row_ids = Arc::into_inner(deleted_rows).unwrap().into_inner().unwrap();
 
@@ -989,7 +993,12 @@ impl MergeInsertJob {
             updated_fragments,
             new_fragments,
         };
-        let transaction = Transaction::new(dataset.manifest.version, operation, None);
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
 
         let manifest = commit_transaction(
             dataset.as_ref(),
@@ -1204,7 +1213,7 @@ impl Merger {
                             // All rows matched, go ahead and replace the whole batch
                         } else {
                             // Nothing matched, replace nothing
-                            matched = RecordBatch::new_empty(matched.schema().clone());
+                            matched = RecordBatch::new_empty(matched.schema());
                         }
                     }
                 }
@@ -1222,6 +1231,7 @@ impl Merger {
                     cols.push(row_addr_col);
                     cols
                 } else {
+                    #[allow(clippy::redundant_clone)]
                     left_cols.clone()
                 };
                 let matched = matched.project(&projection)?;
@@ -1773,7 +1783,7 @@ mod tests {
             let indices: Int64Array = (256..512).chain(600..612).chain([712, 715]).collect();
             let keys = arrow::compute::take(batch["key"].as_ref(), &indices, None).unwrap();
             let new_data = RecordBatch::try_new(
-                update_schema.clone(),
+                update_schema,
                 vec![
                     keys,
                     Arc::new((1000..(1000 + indices.len() as u32)).collect::<UInt32Array>()),

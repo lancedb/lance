@@ -160,6 +160,9 @@ impl ToSnafuLocation for std::panic::Location<'static> {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type ArrowResult<T> = std::result::Result<T, ArrowError>;
+#[cfg(feature = "datafusion")]
+pub type DataFusionResult<T> = std::result::Result<T, datafusion_common::DataFusionError>;
 
 impl From<ArrowError> for Error {
     #[track_caller]

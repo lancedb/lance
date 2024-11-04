@@ -25,3 +25,6 @@ lance-datagen = { workspace = true }
 [[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"
+
+[lints]
+workspace = true

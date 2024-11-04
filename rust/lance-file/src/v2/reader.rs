@@ -518,10 +518,8 @@ impl FileReader {
             all_metadata_bytes.slice(column_metadata_start..column_metadata_end);
         let column_metadatas = Self::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
-        let footer_start = file_len - FOOTER_LEN as u64;
-        let num_data_bytes = footer.column_meta_start;
-        let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>()
-            + (footer_start - footer.global_buff_offsets_start);
+        let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>();
+        let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
 
         let file_version = LanceFileVersion::try_from_major_minor(
@@ -1126,7 +1124,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
                 .unwrap_or(0),
             page_table,
             top_level_columns: projection.column_indices,
-            schema: Arc::new(schema.clone()),
+            schema: Arc::new(schema),
         })
     }
 }

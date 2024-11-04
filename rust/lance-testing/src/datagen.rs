@@ -161,7 +161,7 @@ impl BatchGenerator {
             arrays.push(arr);
         }
         let schema = Arc::new(ArrowSchema::new(fields));
-        RecordBatch::try_new(schema.clone(), arrays).unwrap()
+        RecordBatch::try_new(schema, arrays).unwrap()
     }
 
     pub fn batch(&mut self, num_rows: i32) -> impl RecordBatchReader {
