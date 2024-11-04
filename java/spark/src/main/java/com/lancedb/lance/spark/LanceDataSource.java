@@ -31,8 +31,16 @@ public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegist
 
   @Override
   public StructType inferSchema(CaseInsensitiveStringMap options) {
-    Optional<StructType> schema = LanceDatasetAdapter.getSchema(LanceConfig.from(options));
-    return schema.isPresent() ? schema.get() : null;
+    LanceConfig config = LanceConfig.from(options);
+    Optional<StructType> schema = LanceDatasetAdapter.getSchema(config);
+    if (schema.isEmpty()) {
+      return null;
+    }
+    StructType actualSchema = schema.get();
+    if (SparkOptions.enableRowId(config)) {
+      actualSchema = actualSchema.add(LanceConstant.ROW_ID_SPARK_TYPE);
+    }
+    return actualSchema;
   }
 
   @Override

@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.*;
 import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.LanceConstant;
 import com.lancedb.lance.spark.read.LanceInputPartition;
 import com.lancedb.lance.spark.SparkOptions;
 import com.lancedb.lance.spark.utils.Optional;
@@ -33,15 +34,17 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class LanceDatasetAdapter {
-  private static final BufferAllocator allocator = new RootAllocator(
-      RootAllocator.configBuilder().from(RootAllocator.defaultConfig())
-          .maxAllocation(64 * 1024 * 1024).build());
+  private static final BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
 
   public static Optional<StructType> getSchema(LanceConfig config) {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
-      return Optional.of(ArrowUtils.fromArrowSchema(dataset.getSchema()));
+      StructType actualSchema = ArrowUtils.fromArrowSchema(dataset.getSchema());
+      if (SparkOptions.enableRowId(config)) {
+        actualSchema = actualSchema.add(LanceConstant.ROW_ID_SPARK_TYPE);
+      }
+      return Optional.of(actualSchema);
     } catch (IllegalArgumentException e) {
       // dataset not found
       return Optional.empty();

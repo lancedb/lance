@@ -91,7 +91,8 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
 
     @Override
     public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
-      LanceArrowWriter arrowWriter = LanceDatasetAdapter.getArrowWriter(schema, 1024);
+      int batch_size = SparkOptions.getBatchSize(config);
+      LanceArrowWriter arrowWriter = LanceDatasetAdapter.getArrowWriter(schema, batch_size);
       WriteParams params = SparkOptions.genWriteParamsFromConfig(config);
       Callable<FragmentMetadata> fragmentCreator
           = () -> LanceDatasetAdapter.createFragment(config.getDatasetUri(), arrowWriter, params);

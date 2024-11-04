@@ -18,12 +18,13 @@ use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
+use lance::dataset::ROW_ID;
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
-use lance_io::ffi::to_ffi_arrow_array_stream;
+use lance_io::ffi::to_ffi_jni_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
 use crate::{
@@ -53,7 +54,19 @@ impl BlockingScanner {
 
     pub fn schema(&self) -> Result<SchemaRef> {
         let res = RT.block_on(self.inner.schema())?;
-        Ok(res)
+        let mut new_fields = Vec::new();
+        for field in res.clone().fields() {
+            if field.name() == ROW_ID {
+                let new_field = match field.data_type() {
+                    DataType::UInt64 => Field::new(field.name().clone(), DataType::Int64, field.is_nullable()),
+                    _ => field.as_ref().clone()
+                };
+                new_fields.push(new_field);
+            } else {
+                new_fields.push(field.as_ref().clone());
+            }
+        }
+        Ok(Arc::new(Schema::new(new_fields)))
     }
 
     pub fn count_rows(&self) -> Result<u64> {
@@ -269,7 +282,7 @@ fn inner_open_stream(env: &mut JNIEnv, j_scanner: JObject, stream_addr: jlong) -
             unsafe { env.get_rust_field::<_, _, BlockingScanner>(j_scanner, NATIVE_SCANNER) }?;
         scanner_guard.open_stream()?
     };
-    let ffi_stream = to_ffi_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
+    let ffi_stream = to_ffi_jni_arrow_array_stream(record_batch_stream, RT.handle().clone())?;
     unsafe { std::ptr::write_unaligned(stream_addr as *mut FFI_ArrowArrayStream, ffi_stream) }
     Ok(())
 }
