@@ -1664,6 +1664,26 @@ impl Dataset {
             }
         }
 
+        // Fragments are sorted in increasing fragment id order
+        self.manifest
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .try_fold(0, |prev, id| {
+                if id < prev {
+                    Err(Error::corrupt_file(
+                        self.base.clone(),
+                        format!(
+                            "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
+                            id, prev, self.base
+                        ),
+                        location!(),
+                    ))
+                } else {
+                    Ok(id)
+                }
+            })?;
+
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
             .map(|f| async move { f.validate().await })
