@@ -46,6 +46,9 @@ pub struct Manifest {
     pub writer_version: Option<WriterVersion>,
 
     /// Fragments, the pieces to build the dataset.
+    ///
+    /// This list is stored in order, sorted by fragment id.  However, the fragment id
+    /// sequence may have gaps.
     pub fragments: Arc<Vec<Fragment>>,
 
     /// The file position of the version aux data.
