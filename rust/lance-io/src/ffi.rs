@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::{Array, Int64Array, RecordBatch, RecordBatchReader, UInt64Array};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use lance_core::{Result, ROW_ID};
+use std::sync::Arc;
 
 use crate::stream::RecordBatchStream;
 
@@ -90,16 +90,18 @@ impl<S: RecordBatchStream> JniRecordBatchIteratorAdaptor<S> {
     }
 }
 impl<S: RecordBatchStream + Unpin> arrow::record_batch::RecordBatchReader
-for JniRecordBatchIteratorAdaptor<S>
+    for JniRecordBatchIteratorAdaptor<S>
 {
     fn schema(&self) -> SchemaRef {
         let mut new_fields = Vec::new();
         for field in self.schema.clone().fields() {
             if field.name() == ROW_ID {
                 let new_field = match field.data_type() {
-                    DataType::UInt64 => Field::new(field.name().clone(), DataType::Int64, field.is_nullable()),
+                    DataType::UInt64 => {
+                        Field::new(field.name().clone(), DataType::Int64, field.is_nullable())
+                    }
                     // Add more conversions as needed
-                    _ => field.as_ref().clone() // Keep the original if no conversion is needed
+                    _ => field.as_ref().clone(), // Keep the original if no conversion is needed
                 };
                 new_fields.push(new_field);
             } else {
@@ -114,24 +116,31 @@ impl<S: RecordBatchStream + Unpin> Iterator for JniRecordBatchIteratorAdaptor<S>
     fn next(&mut self) -> Option<Self::Item> {
         self.handle
             .block_on(async { self.stream.next().await })
-            .map(|r| r.map(|batch| {
-                match batch.schema().index_of(ROW_ID) {
-                    Ok(index) => {
-                        let mut new_columns = batch.columns().to_vec();
-                        let uint64_array = batch.column(index).as_any().downcast_ref::<UInt64Array>().unwrap();
-                        // Create a new Int64Array
-                        let mut int_values: Vec<i64> = Vec::with_capacity(uint64_array.len());
-                        for i in 0..uint64_array.len() {
-                            // Convert UInt64 to Int64 (you may want to handle overflow here)
-                            int_values.push(uint64_array.value(i) as i64);
+            .map(|r| {
+                r.map(|batch| {
+                    match batch.schema().index_of(ROW_ID) {
+                        Ok(index) => {
+                            let mut new_columns = batch.columns().to_vec();
+                            let uint64_array = batch
+                                .column(index)
+                                .as_any()
+                                .downcast_ref::<UInt64Array>()
+                                .unwrap();
+                            // Create a new Int64Array
+                            let mut int_values: Vec<i64> = Vec::with_capacity(uint64_array.len());
+                            for i in 0..uint64_array.len() {
+                                // Convert UInt64 to Int64 (you may want to handle overflow here)
+                                int_values.push(uint64_array.value(i) as i64);
+                            }
+                            let int_array = Int64Array::from(int_values);
+                            new_columns[index] = Arc::new(int_array.clone()); // Replace the specified column
+                                                                              // Create a new RecordBatch with the updated columns
+                            RecordBatch::try_new(self.schema(), new_columns).unwrap()
                         }
-                        let int_array = Int64Array::from(int_values);
-                        new_columns[index] = Arc::new(int_array.clone()); // Replace the specified column
-                        // Create a new RecordBatch with the updated columns
-                        RecordBatch::try_new(self.schema(), new_columns).unwrap()
+                        Err(_err) => batch,
                     }
-                    Err(_err) => batch
-                }
-            }).map_err(|e| ArrowError::ExternalError(Box::new(e))))
+                })
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+            })
     }
 }

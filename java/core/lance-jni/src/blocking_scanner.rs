@@ -22,8 +22,8 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
-use lance::dataset::ROW_ID;
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
+use lance::dataset::ROW_ID;
 use lance_io::ffi::to_ffi_jni_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
@@ -58,8 +58,10 @@ impl BlockingScanner {
         for field in res.clone().fields() {
             if field.name() == ROW_ID {
                 let new_field = match field.data_type() {
-                    DataType::UInt64 => Field::new(field.name().clone(), DataType::Int64, field.is_nullable()),
-                    _ => field.as_ref().clone()
+                    DataType::UInt64 => {
+                        Field::new(field.name().clone(), DataType::Int64, field.is_nullable())
+                    }
+                    _ => field.as_ref().clone(),
                 };
                 new_fields.push(new_field);
             } else {
