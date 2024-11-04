@@ -118,7 +118,12 @@ def test_delete(balanced_dataset):
     assert len(balanced_dataset._take_rows(range(20, 80), columns=["blobs"])) == 20
 
 
-# TODO: Need partial append feature
+# TODO: Once https://github.com/lancedb/lance/pull/3041 merges we will
+#       want to test partial appends.  We need to make sure an append of
+#       non-blob data is supported.  In order to do this we need to make
+#       sure a blob tx is created that marks the row ids as used so that
+#       the two row id sequences stay in sync.
+#
 # def test_one_sided_append(balanced_dataset, tmp_path):
 #     # Write new data, but only to the idx column
 #     ds = lance.write_dataset(

@@ -362,18 +362,19 @@ async fn do_take_rows(
     }
 }
 
+// Given a local take and a sibling take this function zips the results together
 async fn zip_takes(
     local: RecordBatch,
-    remote: RecordBatch,
+    sibling: RecordBatch,
     orig_projection_plan: &ProjectionPlan,
 ) -> Result<RecordBatch> {
-    let mut all_cols = Vec::with_capacity(local.num_columns() + remote.num_columns());
+    let mut all_cols = Vec::with_capacity(local.num_columns() + sibling.num_columns());
     all_cols.extend(local.columns().iter().cloned());
-    all_cols.extend(remote.columns().iter().cloned());
+    all_cols.extend(sibling.columns().iter().cloned());
 
-    let mut all_fields = Vec::with_capacity(local.num_columns() + remote.num_columns());
+    let mut all_fields = Vec::with_capacity(local.num_columns() + sibling.num_columns());
     all_fields.extend(local.schema().fields().iter().cloned());
-    all_fields.extend(remote.schema().fields().iter().cloned());
+    all_fields.extend(sibling.schema().fields().iter().cloned());
 
     let all_batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(all_fields)), all_cols).unwrap();
 
@@ -388,43 +389,54 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     }
 
     let projection = builder.projection.clone();
-    let blobs_ds: Arc<Dataset>;
+    let sibling_ds: Arc<Dataset>;
 
-    // If we have blob columns then we load those in parallel to the local
+    // If we have sibling columns then we load those in parallel to the local
     // columns and zip the results together.
-    let blob_take = if let Some(blob_schema) = projection.blob_schema.as_ref() {
+    let sibling_take = if let Some(sibling_schema) = projection.sibling_schema.as_ref() {
         let filtered_row_ids = builder.dataset.filter_deleted_ids(&builder.row_ids).await?;
         if filtered_row_ids.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(
                 builder.projection.output_schema()?,
             )));
         }
-        blobs_ds = builder
+        sibling_ds = builder
             .dataset
             .blobs_dataset()
             .await?
             .ok_or_else(|| Error::Internal {
-                message: "schema referenced blob columns but there was no blob dataset".into(),
+                message: "schema referenced sibling columns but there was no blob dataset".into(),
                 location: location!(),
             })?;
+        // The sibling take only takes valid row ids and sibling columns
         let mut builder = builder.clone();
-        builder.dataset = blobs_ds;
+        builder.dataset = sibling_ds;
         builder.row_ids = filtered_row_ids;
-        let blobs_projection =
-            Arc::new(ProjectionPlan::inner_new(blob_schema.clone(), false, None));
+        let blobs_projection = Arc::new(ProjectionPlan::inner_new(
+            sibling_schema.clone(),
+            false,
+            None,
+        ));
         Some(async move { do_take_rows(builder, blobs_projection).await })
     } else {
         None
     };
 
-    if let Some(blob_take) = blob_take {
+    if let Some(sibling_take) = sibling_take {
         if projection.physical_schema.fields.is_empty() {
             // Nothing we need from local dataset, just take from blob dataset
-            blob_take.await
+            sibling_take.await
         } else {
             // Need to take from both and zip together
-            let local_take = do_take_rows(builder, projection.clone());
-            let (local, blobs) = futures::join!(local_take, blob_take);
+            let local_projection = ProjectionPlan {
+                physical_df_schema: projection.physical_df_schema.clone(),
+                physical_schema: projection.physical_schema.clone(),
+                sibling_schema: None,
+                // These will be applied in zip_takes
+                requested_output_expr: None,
+            };
+            let local_take = do_take_rows(builder, Arc::new(local_projection));
+            let (local, blobs) = futures::join!(local_take, sibling_take);
 
             zip_takes(local?, blobs?, &projection).await
         }

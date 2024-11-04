@@ -155,13 +155,16 @@ impl Schema {
         }
     }
 
+    /// Splits the schema into two schemas, one with default storage class fields and the other with blob storage class fields.
+    /// If there are no blob storage class fields, the second schema will be `None`.
+    /// The order of fields is preserved.
     pub fn partition_by_storage_class(&self) -> (Self, Option<Self>) {
         let mut local_fields = Vec::with_capacity(self.fields.len());
-        let mut remote_fields = Vec::with_capacity(self.fields.len());
+        let mut sibling_fields = Vec::with_capacity(self.fields.len());
         for field in self.fields.iter() {
             match field.storage_class() {
                 StorageClass::Default => local_fields.push(field.clone()),
-                StorageClass::Blob => remote_fields.push(field.clone()),
+                StorageClass::Blob => sibling_fields.push(field.clone()),
             }
         }
         (
@@ -169,11 +172,11 @@ impl Schema {
                 fields: local_fields,
                 metadata: self.metadata.clone(),
             },
-            if remote_fields.is_empty() {
+            if sibling_fields.is_empty() {
                 None
             } else {
                 Some(Self {
-                    fields: remote_fields,
+                    fields: sibling_fields,
                     metadata: self.metadata.clone(),
                 })
             },

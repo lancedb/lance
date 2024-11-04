@@ -1460,20 +1460,27 @@ impl Dataset {
         &self.manifest.fragments
     }
 
+    // Gets a filtered list of fragments from ids in O(N) time instead of using
+    // `get_fragment` which would require O(N^2) time.
     fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
         let mut fragments = Vec::with_capacity(ordered_ids.len());
         let mut id_iter = ordered_ids.iter();
         let mut id = id_iter.next();
+        // This field is just used to assert the ids are in order
+        let mut last_id: i64 = -1;
         for frag in self.manifest.fragments.iter() {
             let the_id = if let Some(id) = id { *id } else { break };
+            assert!(the_id as i64 > last_id);
             if the_id == frag.id as u32 {
                 fragments.push(Some(FileFragment::new(
                     Arc::new(self.clone()),
                     frag.clone(),
                 )));
+                last_id = the_id as i64;
                 id = id_iter.next();
             } else if the_id < frag.id as u32 {
                 fragments.push(None);
+                last_id = the_id as i64;
                 id = id_iter.next();
             }
         }
