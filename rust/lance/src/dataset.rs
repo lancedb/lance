@@ -4996,13 +4996,13 @@ mod tests {
             ..Default::default()
         };
         // Can insert b, a
-        let just_ba = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        let just_b_a = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![field_b.clone(), field_a.clone()].into()),
             true,
         )]));
         let batch = RecordBatch::try_new(
-            just_ba.clone(),
+            just_b_a.clone(),
             vec![Arc::new(StructArray::from(vec![
                 (
                     field_b.clone(),
@@ -5012,7 +5012,7 @@ mod tests {
             ]))],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_ba.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b_a.clone());
         let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
             .await
             .unwrap();
@@ -5020,15 +5020,16 @@ mod tests {
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].metadata.files.len(), 1);
         assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 2, 1]);
+        assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1, 2]);
 
         // Can insert c, b
-        let just_cb = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![field_c.clone(), field_b.clone()].into()),
             true,
         )]));
         let batch = RecordBatch::try_new(
-            just_cb.clone(),
+            just_c_b.clone(),
             vec![Arc::new(StructArray::from(vec![
                 (
                     field_c.clone(),
@@ -5038,7 +5039,7 @@ mod tests {
             ]))],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_cb.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_c_b.clone());
         let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
             .await
             .unwrap();
@@ -5046,15 +5047,16 @@ mod tests {
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[1].metadata.files.len(), 1);
         assert_eq!(&fragments[1].metadata.files[0].fields, &[0, 3, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1, 2]);
 
         // Can't insert a, c (b is non-nullable)
-        let just_ac = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "s",
             DataType::Struct(vec![field_a.clone(), field_c.clone()].into()),
             true,
         )]));
         let batch = RecordBatch::try_new(
-            just_ac.clone(),
+            just_a_c.clone(),
             vec![Arc::new(StructArray::from(vec![
                 (
                     field_a.clone(),
@@ -5064,13 +5066,35 @@ mod tests {
             ]))],
         )
         .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_ac.clone());
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a_c.clone());
         let res = Dataset::write(reader, test_uri, Some(append_options)).await;
         assert!(
             matches!(res, Err(Error::SchemaMismatch { .. })),
             "Expected Error::SchemaMismatch, got {:?}",
             res
         );
+
+        // Can scan and get all data
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_a.clone(),
+                    Arc::new(Int32Array::from(vec![2, 5])) as ArrayRef,
+                ),
+                (
+                    field_b.clone(),
+                    Arc::new(Int32Array::from(vec![Some(1), None])),
+                ),
+                (
+                    field_c.clone(),
+                    Arc::new(Int32Array::from(vec![None, Some(6)])),
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
 
         // Can call take and get rows from all three back in one batch
         let result = dataset
