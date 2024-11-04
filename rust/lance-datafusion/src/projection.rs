@@ -147,7 +147,7 @@ impl ProjectionPlan {
         let physical_arrow_schema = ArrowSchema::from(physical_schema.as_ref());
         let physical_df_schema = Arc::new(DFSchema::try_from(physical_arrow_schema).unwrap());
         Self {
-            physical_schema: physical_schema,
+            physical_schema,
             sibling_schema,
             physical_df_schema,
             requested_output_expr: None,

@@ -1469,17 +1469,23 @@ impl Dataset {
         // This field is just used to assert the ids are in order
         let mut last_id: i64 = -1;
         for frag in self.manifest.fragments.iter() {
-            let the_id = if let Some(id) = id { *id } else { break };
+            let mut the_id = if let Some(id) = id { *id } else { break };
+            // Assert the given ids are, in fact, in order
             assert!(the_id as i64 > last_id);
+            // For any IDs we've passed we can assume that no fragment exists any longer
+            // with that ID.
+            while the_id < frag.id as u32 {
+                fragments.push(None);
+                last_id = the_id as i64;
+                id = id_iter.next();
+                the_id = if let Some(id) = id { *id } else { break };
+            }
+
             if the_id == frag.id as u32 {
                 fragments.push(Some(FileFragment::new(
                     Arc::new(self.clone()),
                     frag.clone(),
                 )));
-                last_id = the_id as i64;
-                id = id_iter.next();
-            } else if the_id < frag.id as u32 {
-                fragments.push(None);
                 last_id = the_id as i64;
                 id = id_iter.next();
             }
@@ -1493,10 +1499,10 @@ impl Dataset {
             return Ok(Vec::new());
         }
 
-        let mut perm = permutation::sort(&addrs);
+        let mut perm = permutation::sort(addrs);
         // First we sort the addrs, then we transform from Vec<u64> to Vec<Option<u64>> and then
         // we un-sort and use the None values to filter `addr_or_ids`
-        let sorted_addrs = perm.apply_slice(&addrs);
+        let sorted_addrs = perm.apply_slice(addrs);
 
         // Only collect deletion vectors for the fragments referenced by the given addrs
         let referenced_frag_ids = sorted_addrs
