@@ -345,7 +345,9 @@ pub async fn write_fragments_internal(
         (schema, params.storage_version_or_default())
     };
 
-    let (data, blob_data) = data.extract_blob_stream(&schema);
+    let data_schema = schema.project_by_schema(data.schema().as_ref())?;
+
+    let (data, blob_data) = data.extract_blob_stream(&data_schema);
 
     // Some params we borrow from the normal write, some we override
     let blob_write_params = WriteParams {
