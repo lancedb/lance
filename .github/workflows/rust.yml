@@ -40,8 +40,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
@@ -69,15 +67,11 @@ jobs:
         if: ${{ matrix.toolchain == 'stable' }}
         with:
           toolchain: "stable"
-          cache-workspaces: "src/rust"
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         if: ${{ matrix.toolchain != 'stable' }}
         with:
           toolchain: "nightly"
-          cache-workspaces: "src/rust"
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
@@ -94,7 +88,7 @@ jobs:
         run: |
           cargo llvm-cov --workspace --codecov --output-path coverage.codecov --all-features
       - name: Build tests (nightly)
-        run: cargo build --tests --all-features --workspace
+        run: cargo test --all-features --workspace --no-run
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
@@ -114,12 +108,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "stable"
-          cache-workspaces: "src/rust"
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
@@ -146,8 +137,6 @@ jobs:
       - name: Remove Cargo.lock
         run: rm -f Cargo.lock
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
@@ -168,8 +157,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Select new xcode
         # Default XCode right now is 15.0.1, which contains a bug that causes
         # backtraces to not show properly. See:
@@ -193,8 +180,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
@@ -225,8 +210,6 @@ jobs:
         with:
           submodules: true
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
