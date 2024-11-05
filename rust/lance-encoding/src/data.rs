@@ -314,7 +314,8 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder1 {
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];
-        self.bytes.extend_from_slice(&block.data[start_offset as usize ..end_offset as usize]);
+        self.bytes
+            .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
         self.offsets.push(self.bytes.len() as u32);
     }
 
@@ -955,7 +956,11 @@ impl DataBlock {
     as_type_mut_ref!(as_all_null_mut_ref, AllNull, AllNullDataBlock);
     as_type_mut_ref!(as_nullable_mut_ref, Nullable, NullableDataBlock);
     as_type_mut_ref!(as_fixed_width_mut_ref, FixedWidth, FixedWidthDataBlock);
-    as_type_mut_ref!(as_fixed_size_list_mut_ref, FixedSizeList, FixedSizeListBlock);
+    as_type_mut_ref!(
+        as_fixed_size_list_mut_ref,
+        FixedSizeList,
+        FixedSizeListBlock
+    );
     as_type_mut_ref!(as_variable_width_mut_ref, VariableWidth, VariableWidthBlock);
     as_type_mut_ref!(as_struct_mut_ref, Struct, StructDataBlock);
     as_type_mut_ref!(as_dictionary_mut_ref, Dictionary, DictionaryDataBlock);
