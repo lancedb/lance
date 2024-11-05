@@ -435,11 +435,25 @@ mod tests {
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
-        assert!(
-            block.get_stat(Stat::DataSize).is_none(),
-            "Expected Stat::DataSize to be None for data block of type: {}",
-            block.name()
-        );
+        let data_size_array = block.get_stat(Stat::DataSize).unwrap_or_else(|| {
+            panic!(
+                "A data block of type: {} should have valid {} statistics",
+                block.name(),
+                Stat::DataSize
+            )
+        });
+        let data_size = data_size_array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        let total_buffer_size: usize = arr
+            .to_data()
+            .buffers()
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum();
+        assert!(data_size == total_buffer_size as u64);
     }
 
     #[test]
