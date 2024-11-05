@@ -349,7 +349,7 @@ impl FileReader {
                     }
                 }
             }
-            meta.schema.project_by_ids(&stats_field_ids)
+            meta.schema.project_by_ids(&stats_field_ids, true)
         })
     }
 

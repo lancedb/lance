@@ -819,7 +819,7 @@ impl FileFragment {
         let mut missing_fields = projection.field_ids();
         missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
         if !missing_fields.is_empty() {
-            let missing_projection = projection.project_by_ids(&missing_fields);
+            let missing_projection = projection.project_by_ids(&missing_fields, true);
             let null_reader = NullReader::new(Arc::new(missing_projection), opened_files[0].len());
             opened_files.push(Box::new(null_reader));
         }

@@ -121,7 +121,7 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         };
 
         let stats_collector = if !collect_stats_for_fields.is_empty() {
-            let stats_schema = schema.project_by_ids(&collect_stats_for_fields);
+            let stats_schema = schema.project_by_ids(&collect_stats_for_fields, true);
             statistics::StatisticsCollector::try_new(&stats_schema)
         } else {
             None
