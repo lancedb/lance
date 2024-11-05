@@ -299,21 +299,26 @@ impl DeepSizeOf for RowIdSelection {
 
 impl RowIdSelection {
     fn union_all(selections: &[&Self]) -> Self {
-        for selection in selections {
-            if matches!(selection, Self::Full) {
-                return Self::Full;
-            }
+        let mut is_full = false;
+
+        let res = Self::Partial(
+            selections
+                .iter()
+                .filter_map(|selection| match selection {
+                    Self::Full => {
+                        is_full = true;
+                        None
+                    }
+                    Self::Partial(bitmap) => Some(bitmap),
+                })
+                .union(),
+        );
+
+        if is_full {
+            Self::Full
+        } else {
+            res
         }
-
-        let bitmaps = selections
-            .iter()
-            .filter_map(|selection| match selection {
-                Self::Full => None,
-                Self::Partial(bitmap) => Some(bitmap),
-            })
-            .collect::<Vec<_>>();
-
-        Self::Partial(bitmaps.union())
     }
 }
 
@@ -554,6 +559,7 @@ impl RowIdTreeMap {
             for (fragment, selection) in &map.inner {
                 new_map
                     .entry(fragment)
+                    // I hate this allocation, but I can't think of a better way
                     .or_insert_with(|| Vec::with_capacity(maps.len()))
                     .push(selection);
             }
