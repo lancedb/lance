@@ -1197,7 +1197,7 @@ mod tests {
     fn test_max_length_variable_width_datablock() {
         let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
         let block = DataBlock::from_array(string_array.clone());
-      
+
         let expected_max_length =
             Arc::new(UInt64Array::from(vec![string_array.value_length(0) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
