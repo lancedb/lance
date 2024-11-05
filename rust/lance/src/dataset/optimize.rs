@@ -1025,8 +1025,8 @@ mod tests {
                 .map(|key| {
                     format!(
                         "{}:{:?}",
-                        RowAddress::new_from_id(*key),
-                        map[key].map(RowAddress::new_from_id)
+                        RowAddress::from(*key),
+                        map[key].map(RowAddress::from)
                     )
                 })
                 .collect::<Vec<_>>()

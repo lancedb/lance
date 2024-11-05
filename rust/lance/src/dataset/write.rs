@@ -361,6 +361,13 @@ pub async fn write_fragments_internal(
         ..Default::default()
     };
 
+    if blob_data.is_some() && !params.enable_move_stable_row_ids {
+        return Err(Error::invalid_input(
+            "The blob storage class requires move stable row ids",
+            location!(),
+        ));
+    }
+
     let frag_schema = schema.retain_storage_class(StorageClass::Default);
     let fragments_fut = do_write_fragments(
         object_store.clone(),

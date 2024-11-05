@@ -156,7 +156,7 @@ impl Index for PQIndex {
             let mut frag_ids = row_ids
                 .values()
                 .iter()
-                .map(|&row_id| RowAddress::new_from_id(row_id).fragment_id())
+                .map(|&row_id| RowAddress::from(row_id).fragment_id())
                 .collect::<Vec<_>>();
             frag_ids.sort();
             frag_ids.dedup();
