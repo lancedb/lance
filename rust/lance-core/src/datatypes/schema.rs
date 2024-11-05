@@ -280,11 +280,11 @@ impl Schema {
     /// Returns a new schema that only contains the fields in `column_ids`.
     ///
     /// This projection can filter out both top-level and nested fields
-    pub fn project_by_ids(&self, column_ids: &[i32]) -> Self {
+    pub fn project_by_ids(&self, column_ids: &[i32], include_all_children: bool) -> Self {
         let filtered_fields = self
             .fields
             .iter()
-            .filter_map(|f| f.project_by_ids(column_ids))
+            .filter_map(|f| f.project_by_ids(column_ids, include_all_children))
             .collect();
         Self {
             fields: filtered_fields,
@@ -792,7 +792,7 @@ mod tests {
         ]);
         let mut schema = Schema::try_from(&arrow_schema).unwrap();
         schema.set_field_id(None);
-        let projected = schema.project_by_ids(&[2, 4, 5]);
+        let projected = schema.project_by_ids(&[2, 4, 5], true);
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
@@ -807,7 +807,7 @@ mod tests {
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
 
-        let projected = schema.project_by_ids(&[2]);
+        let projected = schema.project_by_ids(&[2], true);
         let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "b",
             DataType::Struct(ArrowFields::from(vec![ArrowField::new(
@@ -819,7 +819,7 @@ mod tests {
         )]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
 
-        let projected = schema.project_by_ids(&[1]);
+        let projected = schema.project_by_ids(&[1], true);
         let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
             "b",
             DataType::Struct(ArrowFields::from(vec![
@@ -827,6 +827,18 @@ mod tests {
                 ArrowField::new("f2", DataType::Boolean, false),
                 ArrowField::new("f3", DataType::Float32, false),
             ])),
+            true,
+        )]);
+        assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        let projected = schema.project_by_ids(&[1, 2], false);
+        let expected_arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "b",
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "f1",
+                DataType::Utf8,
+                true,
+            )])),
             true,
         )]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);

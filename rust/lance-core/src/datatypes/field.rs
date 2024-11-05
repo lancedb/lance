@@ -432,13 +432,13 @@ impl Field {
     ///
     /// If the ids are `[2]`, then this will include the parent `0` and the
     /// child `3`.
-    pub(crate) fn project_by_ids(&self, ids: &[i32]) -> Option<Self> {
+    pub(crate) fn project_by_ids(&self, ids: &[i32], include_all_children: bool) -> Option<Self> {
         let children = self
             .children
             .iter()
-            .filter_map(|c| c.project_by_ids(ids))
+            .filter_map(|c| c.project_by_ids(ids, include_all_children))
             .collect::<Vec<_>>();
-        if ids.contains(&self.id) {
+        if ids.contains(&self.id) && (children.is_empty() || include_all_children) {
             Some(self.clone())
         } else if !children.is_empty() {
             Some(Self {

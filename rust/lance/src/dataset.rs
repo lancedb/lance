@@ -5081,15 +5081,12 @@ mod tests {
             vec![Arc::new(StructArray::from(vec![
                 (
                     field_a.clone(),
-                    Arc::new(Int32Array::from(vec![2, 5])) as ArrayRef,
+                    Arc::new(Int32Array::from(vec![Some(2), None])) as ArrayRef,
                 ),
-                (
-                    field_b.clone(),
-                    Arc::new(Int32Array::from(vec![Some(1), None])),
-                ),
+                (field_b.clone(), Arc::new(Int32Array::from(vec![1, 3]))),
                 (
                     field_c.clone(),
-                    Arc::new(Int32Array::from(vec![None, Some(6)])),
+                    Arc::new(Int32Array::from(vec![None, Some(4)])),
                 ),
             ]))],
         )
@@ -5108,10 +5105,7 @@ mod tests {
                     field_a.clone(),
                     Arc::new(Int32Array::from(vec![None, Some(2)])) as ArrayRef,
                 ),
-                (
-                    field_b.clone(),
-                    Arc::new(Int32Array::from(vec![Some(3), Some(1)])),
-                ),
+                (field_b.clone(), Arc::new(Int32Array::from(vec![3, 1]))),
                 (
                     field_c.clone(),
                     Arc::new(Int32Array::from(vec![Some(4), None])),
