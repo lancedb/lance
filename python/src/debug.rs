@@ -58,7 +58,7 @@ impl PrettyPrintableFragment {
             .files
             .iter()
             .map(|file| {
-                let schema = schema.project_by_ids(&file.fields);
+                let schema = schema.project_by_ids(&file.fields, false);
                 PrettyPrintableDataFile {
                     path: file.path.clone(),
                     fields: file.fields.clone(),
