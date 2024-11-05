@@ -107,10 +107,10 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "stable"
+      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
