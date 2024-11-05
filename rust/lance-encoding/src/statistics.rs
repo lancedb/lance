@@ -1152,13 +1152,11 @@ mod tests {
     fn test_max_length_variable_width_datablock() {
         let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
         let mut block = DataBlock::from_array(string_array.clone());
-        let expected_max_length = Arc::new(UInt64Array::from(vec![5])) as ArrayRef;
+        let expected_max_length =
+            Arc::new(UInt64Array::from(vec![string_array.value_length(0) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
-        assert_eq!(
-            actual_max_length,
-            Some(expected_max_length.clone()),
-        );
+        assert_eq!(actual_max_length, Some(expected_max_length.clone()),);
 
         let string_array = StringArray::from(vec![
             Some("to be named by variables"),
@@ -1170,10 +1168,7 @@ mod tests {
             Arc::new(UInt64Array::from(vec![string_array.value_length(1) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
-        assert_eq!(
-            actual_max_length,
-            Some(expected_max_length.clone()),
-        );
+        assert_eq!(actual_max_length, Some(expected_max_length));
 
         let string_array = StringArray::from(vec![
             Some("Samuel Eilenberg"),
@@ -1185,10 +1180,7 @@ mod tests {
             Arc::new(UInt64Array::from(vec![string_array.value_length(1) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
-        assert_eq!(
-            actual_max_length,
-            Some(expected_max_length.clone()),
-        );
+        assert_eq!(actual_max_length, Some(expected_max_length),);
 
         let string_array = LargeStringArray::from(vec![Some("hello"), Some("world")]);
         let mut block = DataBlock::from_array(string_array.clone());
@@ -1196,10 +1188,7 @@ mod tests {
             Arc::new(UInt64Array::from(vec![string_array.value(0).len() as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
-        assert_eq!(
-            actual_max_length,
-            Some(expected_max_length.clone()),
-        );
+        assert_eq!(actual_max_length, Some(expected_max_length),);
 
         let string_array = LargeStringArray::from(vec![
             Some("to be named by variables"),
@@ -1211,9 +1200,6 @@ mod tests {
             Arc::new(UInt64Array::from(vec![string_array.value_length(1) as u64])) as ArrayRef;
         let actual_max_length = block.get_stat(Stat::MaxLength);
 
-        assert_eq!(
-            actual_max_length,
-            Some(expected_max_length.clone()),
-        );
+        assert_eq!(actual_max_length, Some(expected_max_length));
     }
 }
