@@ -1537,6 +1537,7 @@ impl PrimitiveStructuralEncoder {
     //   data doesn't even fit in a mini-block and the block overhead gets
     //   too large and we prefer zipped.
     fn is_narrow(data_block: &DataBlock) -> bool {
+        println!("data_block.name(): {:?}, data_block.get_stat: {:?}", data_block.name(), data_block.get_stat(Stat::MaxLength));
         if let Some(max_len_array) = data_block.get_stat(Stat::MaxLength) {
             let max_len_array = max_len_array
                 .as_any()
@@ -1854,5 +1855,42 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         _external_buffers: &mut OutOfLineBuffers,
     ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
         std::future::ready(Ok(vec![EncodedColumn::default()])).boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{
+        ArrayRef, Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow_schema::{DataType, Field};
+    use lance_arrow::DataTypeExt;
+    use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
+    use rand::SeedableRng;
+
+    use crate::{encodings::logical::primitive::PrimitiveStructuralEncoder, statistics::{GetStat, Stat}};
+
+    use super::DataBlock;
+
+    use arrow::{compute::concat, datatypes::Int32Type};
+    use arrow_array::Array;
+    #[test]
+    fn test_is_narrow() {
+        let int8_array = Int8Array::from(vec![1, 2, 3]);
+        let array_ref: ArrayRef = Arc::new(int8_array.clone());
+        let block = DataBlock::from_array(array_ref);
+
+        assert_eq!(PrimitiveStructuralEncoder::is_narrow(&block), true);
+
+        let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
+        let block = DataBlock::from_array(string_array.clone());
+        assert_eq!(PrimitiveStructuralEncoder::is_narrow(&block), true);
+
+        let string_array = StringArray::from(vec![Some("hello world".repeat(100)), Some("world".to_string())]);
+        let block = DataBlock::from_array(string_array.clone());
+        assert_eq!(PrimitiveStructuralEncoder::is_narrow(&block), false);
     }
 }

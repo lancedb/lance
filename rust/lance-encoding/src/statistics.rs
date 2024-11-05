@@ -55,11 +55,9 @@ impl ComputeStat for DataBlock {
             Self::Empty() => {}
             Self::Constant(_) => {}
             Self::AllNull(_) => {}
-            Self::Nullable(_) => {}
+            Self::Nullable(data_block) => data_block.data.compute_stat(),
             Self::FixedWidth(data_block) => data_block.compute_stat(),
-            Self::FixedSizeList(_) => {
-                todo!("compute_stat for FixedSizeList is not implemented yet.")
-            }
+            Self::FixedSizeList(_) => {}
             Self::VariableWidth(data_block) => data_block.compute_stat(),
             Self::Opaque(data_block) => data_block.compute_stat(),
             Self::Struct(_) => {}
@@ -130,12 +128,11 @@ impl GetStat for DataBlock {
                 //  the statistics is not calculated here as this enum is going to deprecated soon anyway
                 None
             }
-            Self::Nullable(_) => {
-                //  the statistics is not calculated here as this enum is going to deprecated soon anyway
-                None
+            Self::Nullable(data_block) => {
+                data_block.data.get_stat(stat)
             }
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
-            Self::FixedSizeList(_) => todo!("get_stat for FixedSizeList is not implemented yet."),
+            Self::FixedSizeList(_) => None,
             Self::VariableWidth(data_block) => data_block.get_stat(stat),
             Self::Opaque(data_block) => data_block.get_stat(stat),
             Self::Struct(data_block) => data_block.get_stat(stat),
