@@ -67,14 +67,14 @@ jobs:
       - name: Lint Rust
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-features --tests -- -D warnings
+          cargo clippy --locked --all-features --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv
           source venv/bin/activate
           pip install torch tqdm --index-url https://download.pytorch.org/whl/cpu
           pip install maturin
-          maturin develop --extras tests,ray
+          maturin develop --locked --extras tests,ray
       - name: Run doctest
         run: |
           source venv/bin/activate
