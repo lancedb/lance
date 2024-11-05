@@ -133,7 +133,7 @@ impl<S: RecordBatchStream + Unpin> Iterator for JniRecordBatchIteratorAdaptor<S>
                             };
                         }
                         let int_array = Int64Array::from(int_values);
-                        new_columns[index] = Arc::new(int_array.clone());
+                        new_columns[index] = Arc::new(int_array);
                         RecordBatch::try_new(self.schema(), new_columns)
                     }
                     Err(_err) => Ok(batch),
