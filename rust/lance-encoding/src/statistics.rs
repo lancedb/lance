@@ -1158,9 +1158,6 @@ mod tests {
         assert_eq!(
             actual_max_length,
             Some(expected_max_length.clone()),
-            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
-            expected_max_length,
-            string_array,
         );
 
         let string_array = StringArray::from(vec![
@@ -1176,9 +1173,6 @@ mod tests {
         assert_eq!(
             actual_max_length,
             Some(expected_max_length.clone()),
-            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
-            expected_max_length,
-            string_array,
         );
 
         let string_array = StringArray::from(vec![
@@ -1194,9 +1188,6 @@ mod tests {
         assert_eq!(
             actual_max_length,
             Some(expected_max_length.clone()),
-            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
-            expected_max_length,
-            string_array,
         );
 
         let string_array = LargeStringArray::from(vec![Some("hello"), Some("world")]);
@@ -1208,14 +1199,11 @@ mod tests {
         assert_eq!(
             actual_max_length,
             Some(expected_max_length.clone()),
-            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
-            expected_max_length,
-            string_array,
         );
 
         let string_array = LargeStringArray::from(vec![
             Some("to be named by variables"),
-            Some("to be passed as arguments to procedures"),
+            Some("to be passed as arguments to procedures"), // string that has max length
             Some("to be returned as values of procedures"),
         ]);
         let mut block = DataBlock::from_array(string_array.clone());
@@ -1226,9 +1214,6 @@ mod tests {
         assert_eq!(
             actual_max_length,
             Some(expected_max_length.clone()),
-            "Expected Stat::MaxLength to be {:?} for data block generated from array: {:?}",
-            expected_max_length,
-            string_array,
         );
     }
 }
