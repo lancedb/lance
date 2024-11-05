@@ -128,6 +128,9 @@ jobs:
         run: |
           sudo apt -y -qq update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
+      - name: Build tests
+        run: |
+          cargo test --all-features --no-run
       - name: Start DynamoDB local for tests
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
@@ -181,11 +184,11 @@ jobs:
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - name: Run tests
+      - name: Build tests
         # Check all benches, even though we aren't going to run them.
-        run: |
-          cargo build --tests --benches --all-features --workspace
-          cargo test --all-features
+        run: cargo build --tests --benches --all-features --workspace
+      - name: Run tests
+        run: cargo test --all-features
   windows-build:
     runs-on: windows-latest
     defaults:
@@ -205,11 +208,11 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
-      - name: Run tests
+      - name: Build tests
         # Check all benches, even though we aren't going to run them.
-        run: |
-          cargo build --tests --benches --all-features --workspace
-          cargo test
+        run: cargo build --tests --benches --all-features --workspace
+      - name: Run tests
+        run: cargo test --all-features
   msrv:
     # Check the minimum supported Rust version
     name: MSRV Check - Rust v${{ matrix.msrv }}

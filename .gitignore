@@ -89,7 +89,6 @@ wheelhouse
 
 # Rust
 target
-Cargo.lock
 **/sccache.log
 
 # c++ lsp
