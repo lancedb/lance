@@ -10,7 +10,7 @@ use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use deepsize::DeepSizeOf;
-use roaring::RoaringBitmap;
+use roaring::{MultiOps, RoaringBitmap};
 
 use crate::Result;
 
@@ -297,6 +297,31 @@ impl DeepSizeOf for RowIdSelection {
     }
 }
 
+impl RowIdSelection {
+    fn union_all(selections: &[&Self]) -> Self {
+        let mut is_full = false;
+
+        let res = Self::Partial(
+            selections
+                .iter()
+                .filter_map(|selection| match selection {
+                    Self::Full => {
+                        is_full = true;
+                        None
+                    }
+                    Self::Partial(bitmap) => Some(bitmap),
+                })
+                .union(),
+        );
+
+        if is_full {
+            Self::Full
+        } else {
+            res
+        }
+    }
+}
+
 impl RowIdTreeMap {
     /// Create an empty set
     pub fn new() -> Self {
@@ -525,6 +550,27 @@ impl RowIdTreeMap {
             }
         }
         Ok(Self { inner })
+    }
+
+    pub fn union_all(maps: &[&Self]) -> Self {
+        let mut new_map = BTreeMap::new();
+
+        for map in maps {
+            for (fragment, selection) in &map.inner {
+                new_map
+                    .entry(fragment)
+                    // I hate this allocation, but I can't think of a better way
+                    .or_insert_with(|| Vec::with_capacity(maps.len()))
+                    .push(selection);
+            }
+        }
+
+        let new_map = new_map
+            .into_iter()
+            .map(|(&fragment, selections)| (fragment, RowIdSelection::union_all(&selections)))
+            .collect();
+
+        Self { inner: new_map }
     }
 }
 
