@@ -199,6 +199,80 @@ def test_compaction(tmp_path, big_val):
     )
 
 
+def test_schema(balanced_dataset):
+    # Schema should contain blob columns
+    assert balanced_dataset.schema == pa.schema(
+        [
+            pa.field(
+                "blobs",
+                pa.large_binary(),
+                metadata={
+                    "lance-schema:storage-class": "blob",
+                },
+            ),
+            pa.field("idx", pa.uint64()),
+        ]
+    )
+
+
+def test_sample(balanced_dataset):
+    assert balanced_dataset.sample(10, columns=["idx"]).num_rows == 10
+    # Not the most obvious error but hopefully not long lived
+    with pytest.raises(
+        OSError, match="Not supported.*mapping from row addresses to row ids"
+    ):
+        assert balanced_dataset.sample(10).num_rows == 10
+    with pytest.raises(
+        OSError, match="Not supported.*mapping from row addresses to row ids"
+    ):
+        assert balanced_dataset.sample(10, columns=["blobs"]).num_rows == 10
+
+
+def test_add_columns(tmp_path, balanced_dataset):
+    # Adding columns should be fine as long as we don't try to use the blob
+    # column in any way
+
+    balanced_dataset.add_columns(
+        {
+            "idx2": "idx * 2",
+        }
+    )
+
+    assert balanced_dataset.to_table() == pa.table(
+        {
+            "idx": pa.array(range(128), pa.uint64()),
+            "idx2": pa.array(range(0, 256, 2), pa.uint64()),
+        }
+    )
+
+    with pytest.raises(
+        OSError, match="Not supported.*adding columns.*scanning non-default storage"
+    ):
+        balanced_dataset.add_columns({"blobs2": "blobs"})
+
+
+def test_unsupported(balanced_dataset, big_val):
+    # The following operations are not yet supported and we need to make
+    # sure they fail with a useful error message
+
+    # Updates & merge-insert are not supported.  They add new rows and we
+    # will need to make sure the sibling datasets are kept in sync.
+
+    with pytest.raises(
+        ValueError, match="Not supported.*Updating.*non-default storage"
+    ):
+        balanced_dataset.update({"idx": "0"})
+
+    with pytest.raises(
+        # This error could be nicer but it's fine for now
+        OSError,
+        match="Not supported.*Scanning.*non-default storage",
+    ):
+        balanced_dataset.merge_insert("idx").when_not_matched_insert_all().execute(
+            make_table(0, 1, big_val)
+        )
+
+
 # TODO: Once https://github.com/lancedb/lance/pull/3041 merges we will
 #       want to test partial appends.  We need to make sure an append of
 #       non-blob data is supported.  In order to do this we need to make

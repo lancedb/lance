@@ -160,6 +160,19 @@ impl UpdateBuilder {
     // pub fn with_write_params(mut self, params: WriteParams) -> Self { ... }
 
     pub fn build(self) -> Result<UpdateJob> {
+        if self
+            .dataset
+            .schema()
+            .fields
+            .iter()
+            .any(|f| !f.is_default_storage())
+        {
+            return Err(Error::NotSupported {
+                source: "Updating datasets containing non-default storage columns".into(),
+                location: location!(),
+            });
+        }
+
         let mut updates = HashMap::new();
 
         let planner = Planner::new(Arc::new(self.dataset.schema().into()));

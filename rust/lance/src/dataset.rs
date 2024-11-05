@@ -1199,12 +1199,7 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(
-            self,
-            row_indices,
-            &projection.into().into_projection_plan(self.schema())?,
-        )
-        .await
+        take::take(self, row_indices, projection.into()).await
     }
 
     /// Take Rows by the internal ROW ids.
@@ -1605,10 +1600,6 @@ impl Dataset {
             .collect())
     }
 
-    // Leaving this here so it is more obvious to future readers that we can do this and
-    // someone doesn't go off and create a new function to do this.  Delete this comment
-    // if you use this method.
-    #[allow(unused)]
     pub(crate) async fn filter_deleted_addresses(&self, addrs: &[u64]) -> Result<Vec<u64>> {
         self.filter_addr_or_ids(addrs, addrs).await
     }

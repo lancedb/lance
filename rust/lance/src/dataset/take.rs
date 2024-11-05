@@ -8,9 +8,8 @@ use crate::dataset::rowids::get_row_id_index;
 use crate::{Error, Result};
 use arrow::{array::as_struct_array, compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
+use arrow_array::{RecordBatch, StructArray, UInt64Array};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
-use arrow_select::interleave::interleave;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
@@ -26,142 +25,70 @@ use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};
 
 pub async fn take(
     dataset: &Dataset,
-    row_indices: &[u64],
-    projection: &ProjectionPlan,
+    offsets: &[u64],
+    projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
-    if row_indices.is_empty() {
+    let projection = projection.into_projection_plan(dataset.schema())?;
+
+    if offsets.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(
             projection.output_schema()?,
         )));
     }
 
-    let mut sorted_indices: Vec<usize> = (0..row_indices.len()).collect();
-    sorted_indices.sort_by_key(|&i| row_indices[i]);
+    // First, convert the dataset offsets into row addresses
+    let fragments = dataset.get_fragments();
 
-    let fragments = dataset.get_fragments().into_iter().map(Arc::new);
+    let mut perm = permutation::sort(offsets);
+    let sorted_offsets = perm.apply_slice(offsets);
 
-    // We will split into sub-requests for each fragment.
-    let mut sub_requests: Vec<(Arc<FileFragment>, Range<usize>)> = Vec::new();
-    // We will remap the row indices to the original row indices, using a pair
-    // of (request position, position in request)
-    let mut remap_index: Vec<(usize, usize)> = vec![(0, 0); row_indices.len()];
-    let mut local_ids_buffer: Vec<u32> = Vec::with_capacity(row_indices.len());
+    let mut frag_iter = fragments.iter();
+    let mut cur_frag = frag_iter.next();
+    let mut cur_frag_rows = if let Some(cur_frag) = cur_frag {
+        cur_frag.count_rows().await? as u64
+    } else {
+        0
+    };
+    let mut frag_offset = 0;
 
-    let mut fragments_iter = fragments.into_iter();
-    let mut current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
-        source: "Called take on an empty dataset.".to_string().into(),
-        location: location!(),
-    })?;
-    let mut current_fragment_len = current_fragment.count_rows().await?;
-    let mut curr_fragment_offset: u64 = 0;
-    let mut current_fragment_end = current_fragment_len as u64;
-    let mut start = 0;
-    let mut end = 0;
-    // We want to keep track of the previous row_index to detect duplicates
-    // index takes. To start, we pick a value that is guaranteed to be different
-    // from the first row_index.
-    let mut previous_row_index: u64 = row_indices[sorted_indices[0]] + 1;
-    let mut previous_sorted_index: usize = 0;
-
-    for index in sorted_indices {
-        // Get the index
-        let row_index = row_indices[index];
-
-        if previous_row_index == row_index {
-            // If we have a duplicate index request we add a remap_index
-            // entry that points to the original index request.
-            remap_index[index] = remap_index[previous_sorted_index];
+    let mut addrs = Vec::with_capacity(sorted_offsets.len());
+    for sorted_offset in sorted_offsets.into_iter() {
+        while cur_frag.is_some() && sorted_offset >= frag_offset + cur_frag_rows {
+            frag_offset += cur_frag_rows;
+            cur_frag = frag_iter.next();
+            cur_frag_rows = if let Some(cur_frag) = cur_frag {
+                cur_frag.count_rows().await? as u64
+            } else {
+                0
+            };
+        }
+        let Some(cur_frag) = cur_frag else {
+            addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
-        } else {
-            previous_sorted_index = index;
-            previous_row_index = row_index;
-        }
-
-        // If the row index is beyond the current fragment, iterate
-        // until we find the fragment that contains it.
-        while row_index >= current_fragment_end {
-            // If we have a non-empty sub-request, add it to the list
-            if end - start > 0 {
-                // If we have a non-empty sub-request, add it to the list
-                sub_requests.push((current_fragment, start..end));
-            }
-
-            start = end;
-
-            current_fragment = fragments_iter.next().ok_or_else(|| Error::InvalidInput {
-                source: format!(
-                    "Row index {} is beyond the range of the dataset.",
-                    row_index
-                )
-                .into(),
-                location: location!(),
-            })?;
-            curr_fragment_offset += current_fragment_len as u64;
-            current_fragment_len = current_fragment.count_rows().await?;
-            current_fragment_end = curr_fragment_offset + current_fragment_len as u64;
-        }
-
-        // Note that we cast to u32 *after* subtracting the offset,
-        // since it is possible for the global index to be larger than
-        // u32::MAX.
-        let local_index = (row_index - curr_fragment_offset) as u32;
-        local_ids_buffer.push(local_index);
-
-        remap_index[index] = (sub_requests.len(), end - start);
-
-        end += 1;
+        };
+        let row_addr =
+            RowAddress::new_from_parts(cur_frag.id() as u32, (sorted_offset - frag_offset) as u32);
+        addrs.push(u64::from(row_addr));
     }
 
-    // flush last batch
-    if end - start > 0 {
-        sub_requests.push((current_fragment, start..end));
-    }
+    // Restore the original order
+    perm.apply_inv_slice_in_place(&mut addrs);
 
-    let local_ids_buffer = Arc::new(local_ids_buffer);
+    let builder = TakeBuilder::try_new_from_addresses(
+        Arc::new(dataset.clone()),
+        addrs,
+        Arc::new(projection),
+    )?;
 
-    let take_tasks = sub_requests
-        .into_iter()
-        .map(|(fragment, indices_range)| {
-            let local_ids_buffer = local_ids_buffer.clone();
-            let physical_schema = projection.physical_schema.clone();
-            async move {
-                let local_ids = &local_ids_buffer[indices_range];
-                fragment.take(local_ids, &physical_schema).await
-            }
-        })
-        .collect::<Vec<_>>();
-    let take_stream = futures::stream::iter(take_tasks)
-        .buffered(dataset.object_store.io_parallelism())
-        .map_err(|err| DataFusionError::External(err.into()))
-        .boxed();
-    let take_stream = Box::pin(RecordBatchStreamAdapter::new(
-        projection.arrow_schema_ref(),
-        take_stream,
-    ));
-    let take_stream = projection.project_stream(take_stream)?;
-    let batches = take_stream.try_collect::<Vec<RecordBatch>>().await?;
-
-    let struct_arrs: Vec<StructArray> = batches.into_iter().map(StructArray::from).collect();
-    let refs: Vec<_> = struct_arrs.iter().map(|x| x as &dyn Array).collect();
-    let reordered = interleave(&refs, &remap_index)?;
-    Ok(as_struct_array(&reordered).into())
+    take_rows(builder).await
 }
 
 /// Take rows by the internal ROW ids.
 async fn do_take_rows(
-    builder: TakeBuilder,
+    mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
 ) -> Result<RecordBatch> {
-    let row_addrs = if let Some(row_id_index) = get_row_id_index(&builder.dataset).await? {
-        let addresses = builder
-            .row_ids
-            .iter()
-            .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
-            .collect::<Vec<_>>();
-        addresses
-    } else {
-        builder.row_ids
-    };
+    let row_addrs = builder.get_row_addrs().await?.clone();
 
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
@@ -382,7 +309,7 @@ async fn zip_takes(
 }
 
 async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
-    if builder.row_ids.is_empty() {
+    if builder.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(
             builder.projection.output_schema()?,
         )));
@@ -394,7 +321,7 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
     // If we have sibling columns then we load those in parallel to the local
     // columns and zip the results together.
     let sibling_take = if let Some(sibling_schema) = projection.sibling_schema.as_ref() {
-        let filtered_row_ids = builder.dataset.filter_deleted_ids(&builder.row_ids).await?;
+        let filtered_row_ids = builder.get_filtered_ids().await?;
         if filtered_row_ids.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(
                 builder.projection.output_schema()?,
@@ -411,7 +338,8 @@ async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
         // The sibling take only takes valid row ids and sibling columns
         let mut builder = builder.clone();
         builder.dataset = sibling_ds;
-        builder.row_ids = filtered_row_ids;
+        builder.row_ids = Some(filtered_row_ids);
+        builder.row_addrs = None;
         let blobs_projection = Arc::new(ProjectionPlan::inner_new(
             sibling_schema.clone(),
             false,
@@ -509,7 +437,8 @@ fn check_row_addrs(row_ids: &[u64]) -> RowAddressStats {
 #[derive(Clone, Debug)]
 pub struct TakeBuilder {
     dataset: Arc<Dataset>,
-    row_ids: Vec<u64>,
+    row_ids: Option<Vec<u64>>,
+    row_addrs: Option<Vec<u64>>,
     projection: Arc<ProjectionPlan>,
     with_row_address: bool,
 }
@@ -522,8 +451,24 @@ impl TakeBuilder {
         projection: ProjectionRequest,
     ) -> Result<Self> {
         Ok(Self {
-            row_ids,
+            row_ids: Some(row_ids),
+            row_addrs: None,
             projection: Arc::new(projection.into_projection_plan(dataset.schema())?),
+            dataset,
+            with_row_address: false,
+        })
+    }
+
+    /// Create a new `TakeBuilder` for taking by address
+    pub fn try_new_from_addresses(
+        dataset: Arc<Dataset>,
+        addresses: Vec<u64>,
+        projection: Arc<ProjectionPlan>,
+    ) -> Result<Self> {
+        Ok(Self {
+            row_ids: None,
+            row_addrs: Some(addresses),
+            projection,
             dataset,
             with_row_address: false,
         })
@@ -538,6 +483,52 @@ impl TakeBuilder {
     /// Execute the take operation and return a single batch
     pub async fn execute(self) -> Result<RecordBatch> {
         take_rows(self).await
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
+            (Some(ids), _) => ids.is_empty(),
+            (_, Some(addrs)) => addrs.is_empty(),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn get_filtered_ids(&self) -> Result<Vec<u64>> {
+        match (self.row_ids.as_ref(), self.row_addrs.as_ref()) {
+            (Some(ids), _) => self.dataset.filter_deleted_ids(ids).await,
+            (_, Some(addrs)) => {
+                let _filtered_addresses = self.dataset.filter_deleted_addresses(addrs).await?;
+                // TODO: Create an inverse mapping from addresses to ids
+                // This path is currently encountered in the "take by dataset offsets" case.
+                // Another solution could be to translate dataset offsets into row ids instead
+                // of translating them into row addresses.
+                Err(Error::NotSupported {
+                    source: "mapping from row addresses to row ids".into(),
+                    location: location!(),
+                })
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    async fn get_row_addrs(&mut self) -> Result<&Vec<u64>> {
+        if self.row_addrs.is_none() {
+            let row_ids = self
+                .row_ids
+                .as_ref()
+                .expect("row_ids must be set if row_addrs is not");
+            let addrs = if let Some(row_id_index) = get_row_id_index(&self.dataset).await? {
+                let addresses = row_ids
+                    .iter()
+                    .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                    .collect::<Vec<_>>();
+                addresses
+            } else {
+                row_ids.clone()
+            };
+            self.row_addrs = Some(addrs);
+        }
+        Ok(self.row_addrs.as_ref().unwrap())
     }
 }
 

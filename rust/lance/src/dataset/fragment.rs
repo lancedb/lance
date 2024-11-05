@@ -1186,6 +1186,14 @@ impl FileFragment {
             }
             schema = schema.project(&projection)?;
         }
+
+        if schema.fields.iter().any(|f| !f.is_default_storage()) {
+            return Err(Error::NotSupported {
+                source: "adding columns whose value depends on scanning non-default storage".into(),
+                location: location!(),
+            });
+        }
+
         // If there is no projection, we at least need to read the row addresses
         with_row_addr |= schema.fields.is_empty();
 
