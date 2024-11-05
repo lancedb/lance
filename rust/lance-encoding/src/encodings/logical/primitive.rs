@@ -386,7 +386,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let def = buf.slice_with_length(6 + bytes_rep, bytes_def);
             let values = buf.slice_with_length(6 + bytes_rep + bytes_def, bytes_val);
 
-            let values = self
+            let mut values = self
                 .value_decompressor
                 .decompress(LanceBuffer::Borrowed(values), chunk.vals_in_chunk)?;
 
@@ -434,7 +434,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     &def,
                     level_offset,
                 );
-                data_builder.append(&values, range);
+                data_builder.append(&mut values, range);
                 remaining -= to_take;
                 offset += to_take;
                 level_offset += to_take as usize;
