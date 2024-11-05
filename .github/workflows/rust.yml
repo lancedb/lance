@@ -47,7 +47,7 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --version
-          cargo clippy --all-features --tests --benches -- -D warnings
+          cargo clippy --locked --all-features --tests --benches -- -D warnings
   linux-build:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 45
@@ -81,9 +81,9 @@ jobs:
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
-          cargo llvm-cov --workspace --codecov --output-path coverage.codecov --all-features
+          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --all-features
       - name: Build tests (nightly)
-        run: cargo test --all-features --workspace --no-run
+        run: cargo test --locked --all-features --workspace --no-run
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
@@ -113,13 +113,13 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
       - name: Build tests
         run: |
-          cargo test --all-features --no-run
+          cargo test --locked --all-features --no-run
       - name: Start DynamoDB local for tests
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
         run: |
-          cargo test --all-features
+          cargo test --locked --all-features
   build-no-lock:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -165,7 +165,7 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - name: Build tests
-        run: cargo test --all-features --no-run
+        run: cargo test --locked --all-features --no-run
       - name: Run tests
         run: cargo test --all-features
       - name: Check benchmarks
@@ -188,7 +188,7 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
       - name: Build tests
-        run: cargo test --no-run
+        run: cargo test --locked --no-run
       - name: Run tests
         run: cargo test
       - name: Check benchmarks
