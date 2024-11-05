@@ -4,19 +4,21 @@
 use std::{collections::VecDeque, fmt::Debug, iter, ops::Range, sync::Arc, vec};
 
 use arrow::array::AsArray;
-use arrow_array::{make_array, Array, ArrayRef};
+use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
 use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
-use lance_arrow::{deepcopy::deep_copy_array, DataTypeExt};
+use lance_arrow::deepcopy::deep_copy_array;
 use log::{debug, trace};
 use snafu::{location, Location};
 
+use crate::data::DataBlock;
+use crate::statistics::{GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlock, DataBlockBuilder, FixedWidthDataBlock, UsedEncoding},
+    data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, UsedEncoding},
     decoder::{
         BlockDecompressor, ColumnInfo, DecodeArrayTask, DecodePageTask, DecodedArray, DecodedPage,
         DecompressorStrategy, FieldScheduler, FilterExpression, LoadedPage, LogicalPageDecoder,
@@ -1534,9 +1536,17 @@ impl PrimitiveStructuralEncoder {
     // As data gets wide then the # of values per block shrinks (very wide)
     //   data doesn't even fit in a mini-block and the block overhead gets
     //   too large and we prefer zipped.
-    fn is_narrow(arrays: &[ArrayRef], data_type: &DataType) -> bool {
-        let avg_bytes_per_row = Self::get_avg_value_size(arrays, data_type);
-        avg_bytes_per_row < 128
+    fn is_narrow(data_block: &DataBlock) -> bool {
+        if let Some(max_len_array) = data_block.get_stat(Stat::MaxLength) {
+            let max_len_array = max_len_array
+                .as_any()
+                .downcast_ref::<PrimitiveArray<UInt64Type>>()
+                .unwrap();
+            if max_len_array.value(0) < 128 {
+                return true;
+            }
+        }
+        false
     }
 
     // Converts value data, repetition levels, and definition levels into a single
@@ -1695,9 +1705,8 @@ impl PrimitiveStructuralEncoder {
         column_idx: u32,
         field: &Field,
         compression_strategy: &dyn CompressionStrategy,
-        arrays: Vec<ArrayRef>,
+        data: DataBlock,
         repdefs: Vec<RepDefBuilder>,
-        num_values: u64,
         row_number: u64,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
@@ -1707,7 +1716,6 @@ impl PrimitiveStructuralEncoder {
         // and potentially more decoder asymmetry.  However, it may be worth
         // investigating at some point
 
-        let data = DataBlock::from_arrays(&arrays, num_values);
         let num_values = data.num_values();
         // The validity is encoded in repdef so we can remove it
         let data = data.remove_validity();
@@ -1743,17 +1751,6 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn get_avg_value_size(_arrays: &[ArrayRef], data_type: &DataType) -> u64 {
-        // Simple types, we can infer avg size without looking at value
-        let byte_width = data_type.byte_width_opt();
-        if let Some(byte_width) = byte_width {
-            return byte_width as u64;
-        }
-
-        // Other types, we need to inspect buffers
-        todo!()
-    }
-
     // Creates an encode task, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -1773,18 +1770,20 @@ impl PrimitiveStructuralEncoder {
 
             if num_values == num_nulls {
                 Self::encode_all_null(column_idx, num_values, row_number)
-            } else if Self::is_narrow(&arrays, &field.data_type()) {
-                Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    arrays,
-                    repdefs,
-                    num_values,
-                    row_number,
-                )
             } else {
-                todo!("Full zipped encoding")
+                let data_block = DataBlock::from_arrays(&arrays, num_values);
+                if Self::is_narrow(&data_block) {
+                    Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdefs,
+                        row_number,
+                    )
+                } else {
+                    todo!("Full zipped encoding")
+                }
             }
         })
         .boxed();

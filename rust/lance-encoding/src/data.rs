@@ -29,7 +29,10 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::{buffer::LanceBuffer, statistics::Stat};
+use crate::{
+    buffer::LanceBuffer,
+    statistics::{ComputeStat, Stat},
+};
 
 /// `Encoding` enum serves as a encoding registration center.
 ///
@@ -1232,7 +1235,7 @@ impl DataBlock {
             return Self::AllNull(AllNullDataBlock { num_values });
         }
 
-        let encoded = match data_type {
+        let mut encoded = match data_type {
             DataType::Binary | DataType::Utf8 => arrow_binary_to_data_block(arrays, num_values, 32),
             DataType::BinaryView | DataType::Utf8View => {
                 todo!()
@@ -1318,6 +1321,10 @@ impl DataBlock {
                 )
             }
         };
+
+        // compute statistics
+        encoded.compute_stat();
+
         if !matches!(data_type, DataType::Dictionary(_, _)) {
             match nulls {
                 Nullability::None => encoded,
