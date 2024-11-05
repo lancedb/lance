@@ -128,9 +128,7 @@ impl GetStat for DataBlock {
                 //  the statistics is not calculated here as this enum is going to deprecated soon anyway
                 None
             }
-            Self::Nullable(data_block) => {
-                data_block.data.get_stat(stat)
-            }
+            Self::Nullable(data_block) => data_block.data.get_stat(stat),
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
             Self::FixedSizeList(_) => None,
             Self::VariableWidth(data_block) => data_block.get_stat(stat),
