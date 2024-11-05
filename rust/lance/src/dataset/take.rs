@@ -202,6 +202,8 @@ async fn do_take_rows(
         // Slow case: need to re-map data into expected order
         let mut sorted_row_addrs = row_addrs.clone();
         sorted_row_addrs.sort();
+        // Go ahead and dedup, we will reinsert duplicates during the remapping
+        sorted_row_addrs.dedup();
         // Group ROW Ids by the fragment
         let mut row_addrs_per_fragment: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         sorted_row_addrs.iter().for_each(|row_addr| {
@@ -257,7 +259,9 @@ async fn do_take_rows(
             })
             .collect();
 
-        debug_assert_eq!(remapping_index.len(), one_batch.num_rows());
+        // remapping_index may be greater than the number of rows in one_batch
+        // if there are duplicates in the requested row ids. This is expected.
+        debug_assert!(remapping_index.len() >= one_batch.num_rows());
 
         // Remove the rowaddr column.
         let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
