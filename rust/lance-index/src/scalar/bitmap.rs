@@ -168,14 +168,13 @@ impl ScalarIndex for BitmapIndex {
                     Bound::Unbounded => Bound::Unbounded,
                 };
 
-                let range_iter = self.index_map.range((range_start, range_end));
-                let mut union_bitmap = RowIdTreeMap::default();
+                let maps = self
+                    .index_map
+                    .range((range_start, range_end))
+                    .map(|(_, v)| v)
+                    .collect::<Vec<_>>();
 
-                for (_, bitmap) in range_iter {
-                    union_bitmap |= bitmap.clone();
-                }
-
-                union_bitmap
+                RowIdTreeMap::union_all(&maps)
             }
             SargableQuery::IsIn(values) => {
                 let mut union_bitmap = RowIdTreeMap::default();
