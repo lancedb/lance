@@ -91,6 +91,10 @@ def test_duckdb_pushdown_extension_types(tmp_path):
     actual = duckdb.query("SELECT * FROM ds WHERE othercol = 4").fetch_arrow_table()
     assert actual.to_pydict() == expected.to_pydict()
 
+    expected = pa.table({"max(image)": [b"789"]})
+    actual = duckdb.query("SELECT MAX(image) FROM ds").fetch_arrow_table()
+    assert actual.to_pydict() == expected.to_pydict()
+
     # Not the best error message but hopefully this is short lived until datafusion
     # supports substrait extension types.
     with pytest.raises(
