@@ -1223,7 +1223,6 @@ impl FileFragment {
         projection: &Schema,
         with_row_address: bool,
     ) -> Result<RecordBatch> {
-        println!("Fragment take (offsets={:?}", row_offsets);
         let reader = self
             .open(
                 projection,

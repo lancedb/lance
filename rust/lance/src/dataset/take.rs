@@ -302,6 +302,7 @@ async fn zip_takes(
     let mut all_cols = Vec::with_capacity(local.num_columns() + sibling.num_columns());
     all_cols.extend(local.columns().iter().cloned());
     all_cols.extend(sibling.columns().iter().cloned());
+    dbg!(&all_cols);
 
     let mut all_fields = Vec::with_capacity(local.num_columns() + sibling.num_columns());
     all_fields.extend(local.schema().fields().iter().cloned());

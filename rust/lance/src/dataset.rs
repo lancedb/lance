@@ -5245,5 +5245,19 @@ mod tests {
         // )
         // .unwrap();
         // assert_eq!(result, expected);
+
+        let result = dataset
+            .take_rows(&[1, 2, 0], dataset.schema().clone())
+            .await
+            .unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(3), Some(1)])),
+                Arc::new(Int64Array::from(vec![Some(2), Some(4), None])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(result, expected);
     }
 }
