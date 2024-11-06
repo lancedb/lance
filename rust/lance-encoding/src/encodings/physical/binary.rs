@@ -479,7 +479,7 @@ fn search_next_offset_idx(offsets: &[u32], last_offset_idx: usize) -> usize {
         }
         if ((offsets[last_offset_idx + num_values] - offsets[last_offset_idx])
             + ((num_values + 1) * 4) as u32)
-            < AIM_MINICHUNK_SIZE as u32
+            <= AIM_MINICHUNK_SIZE as u32
         {
             num_values *= 2;
         } else {
@@ -490,6 +490,9 @@ fn search_next_offset_idx(offsets: &[u32], last_offset_idx: usize) -> usize {
 }
 
 impl BinaryMiniBlockEncoder {
+    // put binary data into chunks, every chunk is less than or equal to `AIM_MINICHUNK_SIZE`.
+    // In each chunk, offsets are put first then followed by binary bytes data, each chunk is padded to 8 bytes. 
+    // the offsets in the chunk points to the bytes offset in this chunk.
     fn chunk_data(
         &self,
         mut data: VariableWidthBlock,
