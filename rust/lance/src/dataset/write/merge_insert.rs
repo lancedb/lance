@@ -874,13 +874,6 @@ impl MergeInsertJob {
         let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
         let committed_ds = if !is_full_schema {
-            if self.params.insert_not_matched {
-                return Err(Error::NotSupported {
-                    source: "The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data".into(),
-                    location: location!(),
-            });
-            }
-
             if !matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -1745,9 +1738,10 @@ mod tests {
                 .col("other", array::rand_utf8(4.into(), false))
                 .col("value", array::step::<UInt32Type>())
                 .col("key", array::rand_pseudo_uuid_hex());
-            let batch = data.into_batch_rows(RowCount::from(1024)).unwrap();
+            let batch = data.into_batch_rows(RowCount::from(1024 + 2)).unwrap();
             let batch1 = batch.slice(0, 512);
             let batch2 = batch.slice(512, 512);
+            let batch3 = batch.slice(1024, 2);
             let schema = batch.schema();
 
             let reader = Box::new(RecordBatchIterator::new(
@@ -1770,7 +1764,7 @@ mod tests {
                     .unwrap();
             }
 
-            // Another two batches, not in the scalar index (if there is one)
+            // Another two files, not in the scalar index (if there is one)
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(batch2.clone())],
                 batch2.schema(),
@@ -1781,14 +1775,16 @@ mod tests {
 
             // New data with only a subset of columns
             let update_schema = Arc::new(schema.project(&[2, 1]).unwrap());
-            // Full second file and part of third file.
+            // Full second file and part of third file. Also two more new rows.
             let indices: Int64Array = (256..512).chain(600..612).chain([712, 715]).collect();
             let keys = arrow::compute::take(batch["key"].as_ref(), &indices, None).unwrap();
+            let keys = arrow::compute::concat(&[&keys, &batch3["key"]]).unwrap();
+            let num_rows = keys.len();
             let new_data = RecordBatch::try_new(
                 update_schema,
                 vec![
                     keys,
-                    Arc::new((1000..(1000 + indices.len() as u32)).collect::<UInt32Array>()),
+                    Arc::new((1024..(1024 + num_rows as u32)).collect::<UInt32Array>()),
                 ],
             )
             .unwrap();
@@ -1826,30 +1822,6 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_insert_not_supported() {
-            let Fixtures { ds, new_data } = setup(false).await;
-
-            let reader = Box::new(RecordBatchIterator::new(
-                [Ok(new_data.clone())],
-                new_data.schema(),
-            ));
-
-            // Should reject when_not_matched_insert_all as not yet supported
-            let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
-                .unwrap()
-                .when_not_matched(WhenNotMatched::InsertAll)
-                .when_matched(WhenMatched::UpdateAll)
-                .try_build()
-                .unwrap();
-            let res = job.execute_reader(reader).await;
-            assert!(matches!(
-                res,
-                Err(Error::NotSupported { source, .. })
-                    if source.to_string().contains("The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data")
-            ));
-        }
-
-        #[tokio::test]
         async fn test_errors_on_bad_schema() {
             let Fixtures { ds, new_data } = setup(false).await;
 
@@ -1884,7 +1856,10 @@ mod tests {
 
         #[rstest]
         #[tokio::test]
-        async fn test_merge_insert_subcols(#[values(false, true)] scalar_index: bool) {
+        async fn test_merge_insert_subcols(
+            #[values(false, true)] scalar_index: bool,
+            #[values(false, true)] insert: bool,
+        ) {
             let Fixtures { ds, new_data } = setup(scalar_index).await;
             let reader = Box::new(RecordBatchIterator::new(
                 [Ok(new_data.clone())],
@@ -1898,7 +1873,11 @@ mod tests {
             let job = MergeInsertBuilder::try_new(ds.clone(), vec!["key".to_string()])
                 .unwrap()
                 .when_matched(WhenMatched::UpdateAll)
-                .when_not_matched(WhenNotMatched::DoNothing)
+                .when_not_matched(if insert {
+                    WhenNotMatched::InsertAll
+                } else {
+                    WhenNotMatched::DoNothing
+                })
                 .try_build()
                 .unwrap();
 
@@ -1912,7 +1891,11 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(
                 fragments_before.iter().map(|f| f.id).collect::<Vec<_>>(),
-                fragments_after.iter().map(|f| f.id).collect::<Vec<_>>()
+                fragments_after
+                    .iter()
+                    .take(fragments_before.len())
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>()
             );
             // Only the second fragment should be different.
             assert_eq!(fragments_before[0], fragments_after[0]);
@@ -1931,8 +1914,15 @@ mod tests {
             has_added_files(&fragments_after[1]);
             has_added_files(&fragments_after[2]);
 
-            assert_eq!(stats.num_inserted_rows, 0);
-            assert_eq!(stats.num_updated_rows, new_data.num_rows() as u64);
+            if insert {
+                assert_eq!(fragments_after.len(), 5);
+                assert_eq!(stats.num_inserted_rows, 2);
+            } else {
+                assert_eq!(fragments_after.len(), 4);
+                assert_eq!(stats.num_inserted_rows, 0);
+            }
+
+            assert_eq!(stats.num_updated_rows, (new_data.num_rows() - 2) as u64);
             assert_eq!(stats.num_deleted_rows, 0);
 
             let data = ds
@@ -1941,7 +1931,7 @@ mod tests {
                 .try_into_batch()
                 .await
                 .unwrap();
-            assert_eq!(data.num_rows(), 1024);
+            assert_eq!(data.num_rows(), if insert { 1024 + 2 } else { 1024 });
             assert_eq!(data.num_columns(), 3);
 
             let values = data
@@ -1950,9 +1940,12 @@ mod tests {
                 .downcast_ref::<UInt32Array>()
                 .unwrap();
             assert_eq!(values.value(0), 0);
-            assert_eq!(values.value(256), 1_000);
+            assert_eq!(values.value(256), 1024);
             assert_eq!(values.value(512), 512);
-            assert_eq!(values.value(715), 1_000 + new_data.num_rows() as u32 - 1);
+            assert_eq!(values.value(715), 1024 + new_data.num_rows() as u32 - 3);
+            if insert {
+                assert_eq!(values.value(1024), 1024 + new_data.num_rows() as u32);
+            }
         }
     }
 }
