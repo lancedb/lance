@@ -719,7 +719,7 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<()> {
         // Force append mode
-        let params = WriteParams {
+        let mut params = WriteParams {
             mode: WriteMode::Append,
             ..params.unwrap_or_default()
         };
@@ -748,6 +748,17 @@ impl Dataset {
                 ..Default::default()
             },
         )?;
+
+        // If the dataset is already using (or not using) move stable row ids, we need to match
+        // and ignore whatever the user provided as input
+        if params.enable_move_stable_row_ids != self.manifest.uses_move_stable_row_ids() {
+            info!(
+                "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
+                params.enable_move_stable_row_ids,
+                self.manifest.uses_move_stable_row_ids()
+            );
+            params.enable_move_stable_row_ids = self.manifest.uses_move_stable_row_ids();
+        }
 
         let written_frags = write_fragments_internal(
             Some(self),
@@ -2065,6 +2076,7 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
@@ -5114,5 +5126,124 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_insert_balanced_subschemas() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let field_a = ArrowField::new("a", DataType::Int32, true);
+        let field_b = ArrowField::new("b", DataType::Int64, true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            field_a.clone(),
+            field_b.clone().with_metadata(
+                [(
+                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
+                    "blob".to_string(),
+                )]
+                .into(),
+            ),
+        ]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let options = WriteParams {
+            enable_move_stable_row_ids: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(empty_reader, test_uri, Some(options))
+            .await
+            .unwrap();
+
+        // Insert left side
+        let just_a = Arc::new(ArrowSchema::new(vec![field_a.clone()]));
+        let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
+        dataset.append(reader, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        let blob_dataset = Dataset::open(&format!("{}/_blobs", test_uri))
+            .await
+            .unwrap();
+        let blob_dataset = blob_dataset
+            .checkout_version(dataset.manifest.blob_dataset_version.unwrap())
+            .await
+            .unwrap();
+        let blob_fragments = blob_dataset.get_fragments();
+        assert_eq!(blob_fragments.len(), 0);
+
+        // Insert right side
+        let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
+        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
+        dataset.append(reader, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let blob_dataset = blob_dataset
+            .checkout_version(dataset.manifest.blob_dataset_version.unwrap())
+            .await
+            .unwrap();
+        let blob_fragments = blob_dataset.get_fragments();
+        assert_eq!(blob_fragments.len(), 1);
+
+        // insert both
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int64Array::from(vec![4])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(reader, None).await.unwrap();
+
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 3);
+        let blob_dataset = blob_dataset
+            .checkout_version(dataset.manifest.blob_dataset_version.unwrap())
+            .await
+            .unwrap();
+        let blob_fragments = blob_dataset.get_fragments();
+        assert_eq!(blob_fragments.len(), 2);
+
+        // Assert scan results is correct
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            just_a.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+
+        // TODO: Scanning columns with non-default storage class is not yet supported
+        // let data = dataset.scan().project(&["a", "b"]).unwrap().try_into_batch().await.unwrap();
+        // let expected = RecordBatch::try_new(
+        //     schema.clone(),
+        //     vec![
+        //         Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+        //         Arc::new(Int64Array::from(vec![None, Some(2), Some(4)])),
+        //     ],
+        // )
+        // .unwrap();
+        // assert_eq!(data, expected);
+
+        // TODO: mapping from row addresses to row ids
+        // let result = dataset
+        //     .take(&[1, 2, 0], dataset.schema().clone())
+        //     .await
+        //     .unwrap();
+        // let expected = RecordBatch::try_new(
+        //     schema.clone(),
+        //     vec![
+        //         Arc::new(Int32Array::from(vec![None, Some(3), Some(1)])),
+        //         Arc::new(Int64Array::from(vec![Some(2), Some(4), None])),
+        //     ],
+        // )
+        // .unwrap();
+        // assert_eq!(result, expected);
     }
 }

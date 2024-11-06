@@ -810,6 +810,9 @@ impl FileFragment {
             }
         }
 
+        // This should return immediately on modern datasets.
+        let num_rows = self.count_rows().await?;
+
         // Check if there are any fields that are not in any data files
         let field_ids_in_files = opened_files
             .iter()
@@ -820,7 +823,7 @@ impl FileFragment {
         missing_fields.retain(|f| !field_ids_in_files.contains(f) && *f >= 0);
         if !missing_fields.is_empty() {
             let missing_projection = projection.project_by_ids(&missing_fields, true);
-            let null_reader = NullReader::new(Arc::new(missing_projection), opened_files[0].len());
+            let null_reader = NullReader::new(Arc::new(missing_projection), num_rows as u32);
             opened_files.push(Box::new(null_reader));
         }
 
