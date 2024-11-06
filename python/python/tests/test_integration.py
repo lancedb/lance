@@ -36,34 +36,9 @@ class DuckDataset(pa.dataset.Dataset):
         fields = [f.remove_metadata() for f in fields]
         self.pruned_schema = pa.schema(fields)
 
-    @staticmethod
-    def _filter_field(field: pa.Field) -> bool:
-        # Filter metadata
-        UNSUPPORTED_METADATA = [
-            {
-                b"ARROW:extension:metadata": b"",
-                b"ARROW:extension:name": b"lance.arrow.encoded_image",
-            },
-            {
-                b"ARROW:extension:metadata": b"",
-                b"ARROW:extension:name": b"lance.arrow.image_uri",
-            },
-        ]
-        metadata_is_supported = all(field.metadata != m for m in UNSUPPORTED_METADATA)
-        type_is_supported = field.type not in {
-            pa.large_binary(),
-        }
-        return metadata_is_supported and type_is_supported
-
-    @property
-    def schema(self):
-        return self._schema
-
     def __getattribute__(self, attr):
         if attr == "schema":
             return object.__getattribute__(self, "pruned_schema")
-        elif attr == "_filter_field":
-            return object.__getattribute__(self, "_filter_field")
         else:
             ds = super().__getattribute__("_ds")
             return object.__getattribute__(ds, attr)
