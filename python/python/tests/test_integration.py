@@ -107,9 +107,6 @@ def test_duckdb_pushdown_extension_types(tmp_path):
     )
     ds = lance.write_dataset(tab, str(tmp_path))  # noqa: F841
     ds = DuckDataset(ds)
-    for field in ds.schema:
-        print(field)
-        print(field.metadata)
 
     expected = tab.slice(1, 1)
     actual = duckdb.query("SELECT * FROM ds WHERE filterme = 2").fetch_arrow_table()
