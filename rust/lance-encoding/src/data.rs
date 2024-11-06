@@ -322,7 +322,7 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder1 {
         self.bytes
             .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
 
-        for i in selection.start .. selection.end {
+        for i in selection.start..selection.end {
             let this_value_len = offsets[i as usize + 1] - offsets[i as usize];
             self.offsets.push(previous_len as u32 + this_value_len);
             previous_len += this_value_len as usize;

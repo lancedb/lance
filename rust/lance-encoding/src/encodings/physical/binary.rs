@@ -529,7 +529,7 @@ impl BinaryMiniBlockEncoder {
         let mut last_offset_in_orig_idx = 0;
         loop {
             let this_last_offset_in_orig_idx =
-                search_next_offset_idx(&offsets, last_offset_in_orig_idx);
+                search_next_offset_idx(offsets, last_offset_in_orig_idx);
 
             // case 1: last chunk
             if this_last_offset_in_orig_idx == offsets.len() - 1 {
@@ -547,7 +547,7 @@ impl BinaryMiniBlockEncoder {
                     chunk_start_offset_in_orig_idx: last_offset_in_orig_idx,
                     chunk_last_offset_in_orig_idx: this_last_offset_in_orig_idx,
                     bytes_start_offset: this_chunk_bytes_start_offset,
-                    padded_chunk_size: padded_chunk_size,
+                    padded_chunk_size,
                 });
                 chunks.push(MiniBlockChunk {
                     log_num_values: 0,
@@ -572,7 +572,7 @@ impl BinaryMiniBlockEncoder {
                     chunk_start_offset_in_orig_idx: last_offset_in_orig_idx,
                     chunk_last_offset_in_orig_idx: this_last_offset_in_orig_idx,
                     bytes_start_offset: this_chunk_bytes_start_offset,
-                    padded_chunk_size: padded_chunk_size,
+                    padded_chunk_size,
                 });
 
                 chunks.push(MiniBlockChunk {
@@ -643,14 +643,8 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BinaryMiniBlockDecompressor {}
-
-impl BinaryMiniBlockDecompressor {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
 
 impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
@@ -672,7 +666,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             ),
             offsets: LanceBuffer::reinterpret_vec(result_offsets),
             bits_per_offset: 32,
-            num_values: num_values,
+            num_values,
             block_info: BlockInfo::new(),
             used_encodings: UsedEncoding::new(),
         }))

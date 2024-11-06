@@ -496,7 +496,7 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
                 Ok(Box::new(BitpackMiniBlockDecompressor::new(description)))
             }
             pb::array_encoding::ArrayEncoding::BinaryMiniblock(_) => {
-                Ok(Box::new(BinaryMiniBlockDecompressor::new()))
+                Ok(Box::new(BinaryMiniBlockDecompressor::default()))
             }
             _ => todo!(),
         }
@@ -752,7 +752,7 @@ impl CoreFieldDecoderStrategy {
                     self.decompressor_strategy.as_ref(),
                 )?);
                 column_infos.next_top_level();
-                return Ok(scheduler);
+                Ok(scheduler)
             }
             _ => todo!(),
         }

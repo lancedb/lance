@@ -3,9 +3,9 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow::datatypes::UInt64Type;
 use arrow_array::PrimitiveArray;
+use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -23,8 +23,8 @@ use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
-use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
+use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
