@@ -230,6 +230,9 @@ message Binary {
   uint64 null_adjustment = 3;
 }
 
+message BinaryMiniBlock {
+}
+
 message Fsst {
   ArrayEncoding binary = 1;
   bytes symbol_table = 2;
@@ -269,6 +272,7 @@ message ArrayEncoding {
         BitpackedForNonNeg bitpacked_for_non_neg = 12;
         Constant constant = 13;
         Bitpack2 bitpack2 = 14;
+        BinaryMiniBlock binary_miniblock = 15;
     }
 }
 

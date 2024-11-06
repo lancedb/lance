@@ -4,6 +4,8 @@ use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
+use arrow::datatypes::UInt64Type;
+use arrow_array::PrimitiveArray;
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
@@ -21,6 +23,7 @@ use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
+use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
@@ -32,6 +35,7 @@ use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
+use crate::statistics::{GetStat, Stat};
 use crate::version::LanceFileVersion;
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -155,6 +159,7 @@ pub struct MiniBlockCompressed {
 /// 8KiB of compressed data.  This means that even in the extreme case
 /// where we have 4 bytes of rep/def then we will have at most 24KiB of
 /// data (values, repetition, and definition) per mini-block.
+#[derive(Debug)]
 pub struct MiniBlockChunk {
     // The number of bytes that make up the chunk
     //
@@ -774,10 +779,9 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
 impl CompressionStrategy for CoreArrayEncodingStrategy {
     fn create_miniblock_compressor(
         &self,
-        field: &Field,
+        _field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        assert!(field.data_type().byte_width() > 0);
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
             if fixed_width_data.bits_per_value == 8
                 || fixed_width_data.bits_per_value == 16
@@ -785,6 +789,20 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 || fixed_width_data.bits_per_value == 64
             {
                 return Ok(Box::new(BitpackMiniBlockEncoder::default()));
+            }
+        }
+        if let DataBlock::VariableWidth(ref variable_width_data) = data {
+            if variable_width_data.bits_per_offset == 32 {
+                let max_len = data
+                    .get_stat(Stat::MaxLength)
+                    .expect("VariableWidthDataBlock should have valid max length statistics");
+                let max_len = max_len
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<UInt64Type>>()
+                    .unwrap();
+                if max_len.value(0) < 128 {
+                    return Ok(Box::new(BinaryMiniBlockEncoder::default()));
+                }
             }
         }
         Ok(Box::new(ValueEncoder::default()))
