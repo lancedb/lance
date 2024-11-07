@@ -360,7 +360,12 @@ pub async fn write_fragments_internal(
             .any(|f| f.storage_class() == StorageClass::Blob)
     };
 
-    let (data, blob_data) = data.extract_blob_stream(&data_schema, has_blob);
+    let (data, blob_data) = if has_blob {
+        let (data, blob_data) = data.extract_blob_stream(&data_schema);
+        (data, Some(blob_data))
+    } else {
+        (data, None)
+    };
 
     // Some params we borrow from the normal write, some we override
     let blob_write_params = WriteParams {
