@@ -1672,8 +1672,6 @@ mod tests {
                 .project(&["i"])
                 .unwrap();
 
-            println!("{}", scanner.explain_plan(true).await.unwrap());
-
             scanner.try_into_batch().await.unwrap()
         }
 
