@@ -18,7 +18,10 @@ mod field;
 mod schema;
 
 use crate::{Error, Result};
-pub use field::{Encoding, Field, NullabilityComparison, SchemaCompareOptions, StorageClass};
+pub use field::{
+    Encoding, Field, NullabilityComparison, SchemaCompareOptions, StorageClass,
+    LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
+};
 pub use schema::Schema;
 
 pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";

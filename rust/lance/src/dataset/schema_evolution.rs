@@ -528,7 +528,7 @@ pub(super) async fn alter_columns(
             .map(|(_old, new)| new.id)
             .collect::<Vec<_>>();
         // This schema contains the exact field ids we want to write the new fields with.
-        let new_col_schema = new_schema.project_by_ids(&new_ids);
+        let new_col_schema = new_schema.project_by_ids(&new_ids, true);
 
         let mapper = move |batch: &RecordBatch| {
             let mut fields = Vec::with_capacity(cast_fields.len());

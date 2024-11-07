@@ -271,21 +271,3 @@ def test_unsupported(balanced_dataset, big_val):
         balanced_dataset.merge_insert("idx").when_not_matched_insert_all().execute(
             make_table(0, 1, big_val)
         )
-
-
-# TODO: Once https://github.com/lancedb/lance/pull/3041 merges we will
-#       want to test partial appends.  We need to make sure an append of
-#       non-blob data is supported.  In order to do this we need to make
-#       sure a blob tx is created that marks the row ids as used so that
-#       the two row id sequences stay in sync.
-#
-# def test_one_sided_append(balanced_dataset, tmp_path):
-#     # Write new data, but only to the idx column
-#     ds = lance.write_dataset(
-#         pa.table({"idx": pa.array(range(128, 256), pa.uint64())}),
-#         tmp_path / "test_ds",
-#         max_bytes_per_file=32 * 1024 * 1024,
-#         mode="append",
-#     )
-
-#     print(ds.to_table())

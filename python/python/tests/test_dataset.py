@@ -119,6 +119,13 @@ def test_dataset_append(tmp_path: Path):
     with pytest.raises(OSError):
         lance.write_dataset(table2, base_dir, mode="append")
 
+    # But we can append subschemas
+    table3 = pa.Table.from_pydict({"colA": [4, 5, 6]})
+    dataset = lance.write_dataset(table3, base_dir, mode="append")
+    assert dataset.to_table() == pa.table(
+        {"colA": [1, 2, 3, 4, 5, 6], "colB": [4, 5, 6, None, None, None]}
+    )
+
 
 def test_dataset_from_record_batch_iterable(tmp_path: Path):
     base_dir = tmp_path / "test"
