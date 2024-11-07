@@ -1580,7 +1580,7 @@ impl PrimitiveStructuralEncoder {
     // P1 - Up to 1 padding byte to ensure `def` is 2-byte aligned
     // P2 - Up to 7 padding bytes to ensure `values` is 8-byte aligned
     // P3 - Up to 7 padding bytes to ensure the chunk is a multiple of 8 bytes (this also ensures
-    //      that the next `rep` is 8-byte aligned)
+    //      that the next `chunk` is 8-byte aligned)
     //
     // rep is guaranteed to be 2-byte aligned
     // def is guaranteed to be 2-byte aligned
