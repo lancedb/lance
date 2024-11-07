@@ -495,7 +495,7 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::Bitpack2(description) => {
                 Ok(Box::new(BitpackMiniBlockDecompressor::new(description)))
             }
-            pb::array_encoding::ArrayEncoding::BinaryMiniblock(_) => {
+            pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => {
                 Ok(Box::new(BinaryMiniBlockDecompressor::default()))
             }
             _ => todo!(),
@@ -1323,6 +1323,7 @@ impl BatchDecodeStream {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for message in scan_line.decoders {
+                        println!("message: {:?}", message);
                         self.accept_decoder(message.into_legacy())?;
                     }
                 }
@@ -2209,6 +2210,7 @@ impl MessageType {
     }
 
     pub fn into_structural(self) -> UnloadedPage {
+        println!("inside MessageType::into_structural");
         match self {
             Self::UnloadedPage(unloaded) => unloaded,
             Self::DecoderReady(_) => {

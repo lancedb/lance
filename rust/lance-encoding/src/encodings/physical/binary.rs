@@ -497,6 +497,7 @@ impl BinaryMiniBlockEncoder {
         &self,
         mut data: VariableWidthBlock,
     ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
+        println!("inside BinaryMiniBlockEncoder::chunk_data");
         let max_len = data
             .get_stat(Stat::MaxLength)
             .expect("VariableWidthDataBlock should have valid max length statistics");
@@ -654,6 +655,7 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure `num_values` <= number of values in the chunk.
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        println!("inside BinaryMiniBlockDecompressor::decompress");
         assert!(data.len() >= 8);
         let data = data.to_vec();
         let offsets: &[u32] = cast_slice(&data);
@@ -750,6 +752,7 @@ pub mod tests {
         ArrayRef, StringArray,
     };
     use arrow_schema::{DataType, Field};
+    use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
     use crate::{
@@ -761,10 +764,13 @@ pub mod tests {
 
     use super::get_indices_from_string_arrays;
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_utf8_binary() {
+    async fn test_utf8_binary(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test]
@@ -798,10 +804,13 @@ pub mod tests {
         assert_eq!(null_adjustment, 7);
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_binary() {
+    async fn test_binary(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let field = Field::new("", DataType::Binary, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -816,15 +825,18 @@ pub mod tests {
         check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_utf8_binary() {
+    async fn test_simple_utf8_binary(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
 
         let test_cases = TestCases::default()
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![0, 1, 3, 4]);
+            .with_indices(vec![0, 1, 3, 4]).with_file_version(version);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
@@ -945,5 +957,11 @@ pub mod tests {
         // // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary_miniblock() {
+        let field = Field::new("", DataType::Utf8, false);
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
     }
 }

@@ -135,7 +135,7 @@ impl ProtobufUtils {
 
     pub fn binary_miniblock() -> ArrayEncoding {
         ArrayEncoding {
-            array_encoding: Some(ArrayEncodingEnum::BinaryMiniblock(BinaryMiniBlock {})),
+            array_encoding: Some(ArrayEncodingEnum::BinaryMiniBlock(BinaryMiniBlock {})),
         }
     }
 

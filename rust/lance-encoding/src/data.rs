@@ -293,12 +293,12 @@ impl FixedWidthDataBlock {
     }
 }
 
-pub struct VariableWidthDataBlockBuilder1 {
+pub struct VariableWidthDataBlockBuilder {
     offsets: Vec<u32>,
     bytes: Vec<u8>,
 }
 
-impl VariableWidthDataBlockBuilder1 {
+impl VariableWidthDataBlockBuilder {
     fn new(estimated_size_bytes: u64) -> Self {
         Self {
             offsets: vec![0u32],
@@ -307,7 +307,7 @@ impl VariableWidthDataBlockBuilder1 {
     }
 }
 
-impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder1 {
+impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
     fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
         let block = data_block.as_variable_width_mut_ref().unwrap();
         assert!(block.bits_per_offset == 32);
@@ -904,7 +904,7 @@ impl DataBlock {
             )),
             Self::VariableWidth(inner) => {
                 if inner.bits_per_offset == 32 {
-                    Box::new(VariableWidthDataBlockBuilder1::new(estimated_size_bytes))
+                    Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
                 } else {
                     todo!()
                 }

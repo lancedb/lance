@@ -272,7 +272,7 @@ message ArrayEncoding {
         BitpackedForNonNeg bitpacked_for_non_neg = 12;
         Constant constant = 13;
         Bitpack2 bitpack2 = 14;
-        BinaryMiniBlock binary_miniblock = 15;
+        BinaryMiniBlock binary_mini_block = 15;
     }
 }
 

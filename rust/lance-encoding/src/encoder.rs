@@ -678,7 +678,7 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
 }
 
 fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> Option<u64> {
-    if version < LanceFileVersion::V2_1 || arrays.is_empty() {
+    if version <= LanceFileVersion::V2_1 || arrays.is_empty() {
         return None;
     }
 
