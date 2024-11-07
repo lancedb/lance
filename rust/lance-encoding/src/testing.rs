@@ -25,9 +25,8 @@ use crate::{
         FilterExpression, PageInfo,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, CoreArrayEncodingStrategy,
-        CoreFieldEncodingStrategy, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
-        FieldEncodingStrategy, OutOfLineBuffers,
+        default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
+        EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
@@ -271,12 +270,6 @@ pub async fn check_round_trip_encoding_generated(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
-        /* 
-        let encoding_strategy = CoreFieldEncodingStrategy {
-            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
-            version,
-        };
-        */
         let encoding_strategy = default_encoding_strategy(version);
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
@@ -287,7 +280,7 @@ pub async fn check_round_trip_encoding_generated(
             };
             encoding_strategy
                 .create_field_encoder(
-                    &*encoding_strategy,
+                    encoding_strategy.as_ref(),
                     &lance_field,
                     &mut column_index_seq,
                     &encoding_options,
@@ -409,7 +402,6 @@ pub async fn check_round_trip_encoding_of_data(
     let mut field = Field::new("", example_data.data_type().clone(), true);
     field = field.with_metadata(metadata);
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
-    println!("inside check_round_trip_encoding_of_data, test_cases.file_version: {:?}", test_cases.file_version);
     for page_size in test_cases.page_sizes.iter() {
         let encoding_strategy = default_encoding_strategy(test_cases.file_version);
         let mut column_index_seq = ColumnIndexSequence::default();
@@ -557,7 +549,6 @@ async fn check_round_trip_encoding_inner(
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };
 
-    println!("inside check_round_trip_encoding_inner, test_cases.file_version: {:?}", test_cases.file_version);
     let is_structural_encoding = test_cases.file_version >= LanceFileVersion::V2_1;
 
     debug!("Testing full decode");
@@ -669,8 +660,7 @@ async fn check_round_trip_field_encoding_random(
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
     version: LanceFileVersion,
 ) {
-    println!("inside check_round_trip_encoding_random, test_cases.file_version: {:?}", version);
-    for null_rate in [None, Some(0.5)/*, Some(1.0)*/] {
+    for null_rate in [None, Some(0.5) /*, Some(1.0)*/] {
         for use_slicing in [false, true] {
             if null_rate != Some(1.0) && matches!(field.data_type(), DataType::Null) {
                 continue;
@@ -687,7 +677,6 @@ async fn check_round_trip_field_encoding_random(
 
             let test_cases = TestCases::default()
                 .with_file_version(version)
-                /* 
                 .with_range(0..500)
                 .with_range(100..1100)
                 .with_range(8000..8500)
@@ -697,10 +686,8 @@ async fn check_round_trip_field_encoding_random(
                 .with_indices(vec![100, 1100, 5000])
                 .with_indices(vec![1000, 2000, 3000])
                 .with_indices(vec![2000, 2001, 2002, 2003, 2004])
-                */
                 // Big take that spans multiple pages and generates multiple output batches
-                // .with_indices((100..500).map(|i| i * 3).collect::<Vec<_>>());
-                .with_indices((100..200).map(|i| i).collect::<Vec<_>>());
+                .with_indices((100..500).map(|i| i * 3).collect::<Vec<_>>());
 
             for num_ingest_batches in [1, 5, 10] {
                 let rows_per_batch = NUM_RANDOM_ROWS / num_ingest_batches;

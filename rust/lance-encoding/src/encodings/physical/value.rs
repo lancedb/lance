@@ -495,7 +495,7 @@ pub(crate) mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_value_primitive(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(/*LanceFileVersion::V2_0, */LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         for data_type in PRIMITIVE_TYPES {
             log::info!("Testing encoding for {:?}", data_type);

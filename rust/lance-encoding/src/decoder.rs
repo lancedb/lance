@@ -583,7 +583,11 @@ impl CoreFieldDecoderStrategy {
         } else {
             match data_type {
                 // DataType::is_primitive doesn't consider these primitive but we do
-                DataType::Boolean | DataType::Null | DataType::FixedSizeBinary(_) => true,
+                DataType::Boolean
+                | DataType::Null
+                | DataType::FixedSizeBinary(_)
+                | DataType::Binary
+                | DataType::Utf8 => true,
                 DataType::FixedSizeList(inner, _) => Self::is_primitive(inner.data_type()),
                 _ => false,
             }
@@ -744,15 +748,6 @@ impl CoreFieldDecoderStrategy {
                     Box::new(StructuralStructScheduler::new(child_schedulers, fields))
                         as Box<dyn StructuralFieldScheduler>,
                 )
-            }
-            DataType::Binary | DataType::Utf8 => {
-                let column_info = column_infos.expect_next()?;
-                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
-                    column_info.as_ref(),
-                    self.decompressor_strategy.as_ref(),
-                )?);
-                column_infos.next_top_level();
-                Ok(scheduler)
             }
             _ => todo!(),
         }

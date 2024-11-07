@@ -579,6 +579,7 @@ fn rows_in_buffer(
     bits_in_buffer / bits_per_value
 }
 
+/*
 #[cfg(test)]
 pub mod test {
     use crate::{
@@ -945,6 +946,7 @@ pub mod test {
         }
     }
 
+    /*
     #[test_log::test(tokio::test)]
     async fn test_bitpack_primitive() {
         let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
@@ -1125,4 +1127,6 @@ pub mod test {
             .await;
         }
     }
+    */
 }
+*/

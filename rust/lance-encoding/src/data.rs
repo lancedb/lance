@@ -322,11 +322,16 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
         self.bytes
             .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
 
-        for i in selection.start..selection.end {
-            let this_value_len = offsets[i as usize + 1] - offsets[i as usize];
-            self.offsets.push(previous_len as u32 + this_value_len);
-            previous_len += this_value_len as usize;
-        }
+        self.offsets.extend(
+            offsets[selection.start as usize..selection.end as usize]
+                .iter()
+                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
+                .map(|(&current, &next)| {
+                    let this_value_len = next - current;
+                    previous_len += this_value_len as usize;
+                    previous_len as u32
+                }),
+        );
     }
 
     fn finish(self: Box<Self>) -> DataBlock {

@@ -465,7 +465,7 @@ fn get_indices_from_string_arrays(
 #[derive(Debug, Default)]
 pub struct BinaryMiniBlockEncoder {}
 
-const AIM_MINICHUNK_SIZE: u64 = 4 * 1024;
+const AIM_MINICHUNK_SIZE: u32 = 4 * 1024;
 
 // search for the next offset index to cut the values into a chunk.
 // this function incrementally peek the number of values in a chunk,
@@ -473,25 +473,34 @@ const AIM_MINICHUNK_SIZE: u64 = 4 * 1024;
 // It returns the offset_idx in `offsets` that belongs to this chunk.
 fn search_next_offset_idx(offsets: &[u32], last_offset_idx: usize) -> usize {
     let mut num_values = 1;
+    let mut new_num_values = num_values * 2;
     loop {
-        if last_offset_idx + num_values >= offsets.len() {
-            return offsets.len() - 1;
+        if last_offset_idx + new_num_values >= offsets.len() {
+            if (offsets[offsets.len() - 1] - offsets[last_offset_idx])
+                + (offsets.len() - last_offset_idx) as u32 * 4
+                <= AIM_MINICHUNK_SIZE
+            {
+                return offsets.len() - 1;
+            } else {
+                return last_offset_idx + num_values;
+            }
         }
-        if ((offsets[last_offset_idx + num_values] - offsets[last_offset_idx])
-            + ((num_values + 1) * 4) as u32)
-            <= AIM_MINICHUNK_SIZE as u32
+        if ((offsets[last_offset_idx + new_num_values] - offsets[last_offset_idx])
+            + ((new_num_values + 1) * 4) as u32)
+            <= AIM_MINICHUNK_SIZE
         {
-            num_values *= 2;
+            num_values = new_num_values;
+            new_num_values *= 2;
         } else {
             break;
         }
     }
-    last_offset_idx + (num_values >> 1)
+    last_offset_idx + num_values
 }
 
 impl BinaryMiniBlockEncoder {
     // put binary data into chunks, every chunk is less than or equal to `AIM_MINICHUNK_SIZE`.
-    // In each chunk, offsets are put first then followed by binary bytes data, each chunk is padded to 8 bytes. 
+    // In each chunk, offsets are put first then followed by binary bytes data, each chunk is padded to 8 bytes.
     // the offsets in the chunk points to the bytes offset in this chunk.
     fn chunk_data(
         &self,
@@ -836,7 +845,8 @@ pub mod tests {
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![0, 1, 3, 4]).with_file_version(version);
+            .with_indices(vec![0, 1, 3, 4])
+            .with_file_version(version);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
@@ -845,15 +855,19 @@ pub mod tests {
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_sliced_utf8() {
+    async fn test_sliced_utf8(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let string_array = StringArray::from(vec![Some("abc"), Some("de"), None, Some("fgh")]);
         let string_array = string_array.slice(1, 3);
 
         let test_cases = TestCases::default()
             .with_range(0..1)
             .with_range(0..2)
-            .with_range(1..2);
+            .with_range(1..2)
+            .with_file_version(version);
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
@@ -898,8 +912,11 @@ pub mod tests {
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_empty_strings() {
+    async fn test_empty_strings(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         // Scenario 1: Some strings are empty
 
         let values = [Some("abc"), Some(""), None];
@@ -914,7 +931,8 @@ pub mod tests {
                 .with_indices(vec![1])
                 .with_indices(vec![0])
                 .with_indices(vec![2])
-                .with_indices(vec![0, 1]);
+                .with_indices(vec![0, 1])
+                .with_file_version(version);
             check_round_trip_encoding_of_data(
                 vec![string_array.clone()],
                 &test_cases,
@@ -959,9 +977,12 @@ pub mod tests {
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_binary_miniblock() {
+    async fn test_binary_miniblock(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_1).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 }
