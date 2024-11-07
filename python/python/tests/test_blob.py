@@ -41,7 +41,8 @@ def test_blob_descriptions(tmp_path):
         ),
     )
     ds = lance.write_dataset(table, tmp_path / "test_ds")
-    expected_positions = pa.array([0, 3, 6], pa.uint64())
+    # These positions may be surprising but lance pads buffers to 64-byte boundaries
+    expected_positions = pa.array([0, 64, 128], pa.uint64())
     expected_sizes = pa.array([3, 3, 3], pa.uint64())
     descriptions = ds.to_table().column("blobs").chunk(0)
 

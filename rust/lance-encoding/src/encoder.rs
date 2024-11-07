@@ -12,6 +12,7 @@ use lance_core::datatypes::{
     Field, Schema, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_LEVEL_META_KEY,
     COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
 };
+use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
 use snafu::{location, Location};
 
@@ -296,13 +297,15 @@ impl Default for EncodedColumn {
 /// data as a position / size array).
 pub struct OutOfLineBuffers {
     position: u64,
+    buffer_alignment: u64,
     buffers: Vec<LanceBuffer>,
 }
 
 impl OutOfLineBuffers {
-    pub fn new(base_position: u64) -> Self {
+    pub fn new(base_position: u64, buffer_alignment: u64) -> Self {
         Self {
             position: base_position,
+            buffer_alignment,
             buffers: Vec::new(),
         }
     }
@@ -310,6 +313,7 @@ impl OutOfLineBuffers {
     pub fn add_buffer(&mut self, buffer: LanceBuffer) -> u64 {
         let position = self.position;
         self.position += buffer.len() as u64;
+        self.position += pad_bytes_to(buffer.len(), self.buffer_alignment as usize) as u64;
         self.buffers.push(buffer);
         position
     }
@@ -859,6 +863,11 @@ pub struct EncodingOptions {
     /// be discarded safely and helps avoid writer accumulation.  However,
     /// there is an associated cost.
     pub keep_original_array: bool,
+    /// The alignment that the writer is applying to buffers
+    ///
+    /// The encoder needs to know this so it figures the position of out-of-line
+    /// buffers correctly
+    pub buffer_alignment: u64,
 }
 
 /// A trait to pick which kind of field encoding to use for a field
@@ -1271,6 +1280,13 @@ pub async fn encode_batch(
     encoding_strategy: &dyn FieldEncodingStrategy,
     options: &EncodingOptions,
 ) -> Result<EncodedBatch> {
+    if !is_pwr_two(options.buffer_alignment) || options.buffer_alignment < 8 {
+        return Err(Error::InvalidInput {
+            source: "buffer_alignment must be a power of two and at least 8".into(),
+            location: location!(),
+        });
+    }
+
     let mut data_buffer = BytesMut::new();
     let lance_schema = Schema::try_from(batch.schema().as_ref())?;
     let options = EncodingOptions {
@@ -1281,7 +1297,8 @@ pub async fn encode_batch(
     let mut page_table = Vec::new();
     let mut col_idx_offset = 0;
     for (arr, mut encoder) in batch.columns().iter().zip(batch_encoder.field_encoders) {
-        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
+        let mut external_buffers =
+            OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let repdef = RepDefBuilder::default();
         let encoder = encoder.as_mut();
         let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0)?;
@@ -1298,7 +1315,8 @@ pub async fn encode_batch(
                 .or_default()
                 .push(write_page_to_data_buffer(encoded_page, &mut data_buffer));
         }
-        let mut external_buffers = OutOfLineBuffers::new(data_buffer.len() as u64);
+        let mut external_buffers =
+            OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let encoded_columns = encoder.finish(&mut external_buffers).await?;
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);

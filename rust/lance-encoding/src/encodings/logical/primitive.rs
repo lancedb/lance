@@ -9,6 +9,7 @@ use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
 use lance_arrow::deepcopy::deep_copy_array;
+use lance_core::utils::bit::pad_bytes;
 use log::{debug, trace};
 use snafu::{location, Location};
 
@@ -376,17 +377,26 @@ impl DecodePageTask for DecodeMiniBlockTask {
         for chunk in self.chunks.into_iter() {
             // We always decode the entire chunk
             let buf = chunk.data.into_buffer();
-            // The first 4 bytes describe the size of the rep/def buffers
+            // The first 6 bytes describe the size of the remaining buffers
             let bytes_rep = u16::from_le_bytes([buf[0], buf[1]]) as usize;
             let bytes_def = u16::from_le_bytes([buf[2], buf[3]]) as usize;
             let bytes_val = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+
             debug_assert!(buf.len() >= bytes_rep + bytes_def + bytes_val + 6);
             debug_assert!(
-                buf.len() <= bytes_rep + bytes_def + bytes_val + 6 + MINIBLOCK_MAX_PADDING as usize
+                buf.len()
+                    <= bytes_rep
+                        + bytes_def
+                        + bytes_val
+                        + 6
+                        + 1 // P1
+                        + (2 * MINIBLOCK_MAX_PADDING) // P2/P3
             );
+            let p1 = bytes_rep % 2;
             let rep = buf.slice_with_length(6, bytes_rep);
-            let def = buf.slice_with_length(6 + bytes_rep, bytes_def);
-            let values = buf.slice_with_length(6 + bytes_rep + bytes_def, bytes_val);
+            let def = buf.slice_with_length(6 + bytes_rep + p1, bytes_def);
+            let p2 = pad_bytes::<MINIBLOCK_ALIGNMENT>(6 + bytes_rep + p1 + bytes_def);
+            let values = buf.slice_with_length(6 + bytes_rep + bytes_def + p2, bytes_val);
 
             let values = self
                 .value_decompressor
@@ -655,8 +665,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             for (word_idx, word) in words.iter().enumerate() {
                 let log_num_values = word & 0x0F;
                 let divided_bytes = word >> 4;
-                let num_bytes =
-                    divided_bytes as u64 * MINIBLOCK_SIZE_MULTIPLIER + MINIBLOCK_SIZE_MULTIPLIER;
+                let num_bytes = (divided_bytes as usize + 1) * MINIBLOCK_ALIGNMENT;
                 debug_assert!(num_bytes > 0);
                 let num_values = if word_idx < words.len() - 1 {
                     debug_assert!(log_num_values > 0);
@@ -669,7 +678,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 
                 self.chunk_meta.push(ChunkMeta {
                     num_values,
-                    chunk_size_bytes: num_bytes,
+                    chunk_size_bytes: num_bytes as u64,
                 });
             }
             Ok(())
@@ -1463,15 +1472,27 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     }
 }
 
-// If we just record the size in bytes with 12 bits we would be limited to
-// 4KiB which is too small.  As a compromise we divide the size by this
-// constant which gives us up to 24KiB be introduces some padding into each
-// miniblock.  We want 24KiB so we can handle even the worst case of
+// We align and pad mini-blocks to 8 byte boundaries for two reasons.  First,
+// to allow us to store a chunk size in 12 bits.
+//
+// If we directly record the size in bytes with 12 bits we would be limited to
+// 4KiB which is too small.  Since we know each mini-block consists of 8 byte
+// words we can store the # of words instead which gives us 32KiB.  We want
+// at least 24KiB so we can handle even the worst case of
 // - 4Ki values compressed into an 8186 byte buffer
 // - 4 bytes to describe rep & def lengths
-// - 16KiB of rep & def buffer (this will almost never happen)
-const MINIBLOCK_SIZE_MULTIPLIER: u64 = 6;
-const MINIBLOCK_MAX_PADDING: u64 = MINIBLOCK_SIZE_MULTIPLIER - 1;
+// - 16KiB of rep & def buffer (this will almost never happen but life is easier if we
+//   plan for it)
+//
+// Second, each chunk in a mini-block is aligned to 8 bytes.  This allows multi-byte
+// values like offsets to be stored in a mini-block and safely read back out.  It also
+// helps ensure zero-copy reads in cases where zero-copy is possible (e.g. no decoding
+// needed).
+//
+// Note: by "aligned to 8 bytes" we mean BOTH "aligned to 8 bytes from the start of
+// the page" and "aligned to 8 bytes from the start of the file."
+const MINIBLOCK_ALIGNMENT: usize = 8;
+const MINIBLOCK_MAX_PADDING: usize = MINIBLOCK_ALIGNMENT - 1;
 
 /// An encoder for primitive (leaf) arrays
 ///
@@ -1554,21 +1575,28 @@ impl PrimitiveStructuralEncoder {
     // which tells us the size of each block.
     //
     // Each chunk is serialized as:
-    // | rep_len (2 bytes) | def_len (2 bytes) | values_len (2 byte) | rep | def | values |
+    // | rep_len (2 bytes) | def_len (2 bytes) | values_len (2 bytes) | rep | P1 | def | P2 | values | P3 |
+    //
+    // P1 - Up to 1 padding byte to ensure `def` is 2-byte aligned
+    // P2 - Up to 7 padding bytes to ensure `values` is 8-byte aligned
+    // P3 - Up to 7 padding bytes to ensure the chunk is a multiple of 8 bytes (this also ensures
+    //      that the next `chunk` is 8-byte aligned)
+    //
+    // rep is guaranteed to be 2-byte aligned
+    // def is guaranteed to be 2-byte aligned
+    // values is guaranteed to be 8-byte aligned
+    // rep_len, def_len, and values_len are guaranteed to be 2-byte aligned but this shouldn't matter.
     //
     // Each block has a u16 word of metadata.  The upper 12 bits contain 1/6 the
     // # of bytes in the block (if the block does not have an even number of bytes
-    // then up to 5 bytes of padding are added).  The lower 4 bits describe the log_2
-    // number of value (e.g. if there are 1024 then the lower 4 bits will be
+    // then up to 7 bytes of padding are added).  The lower 4 bits describe the log_2
+    // number of values (e.g. if there are 1024 then the lower 4 bits will be
     // 0xA)  All blocks except the last must have power-of-two number of values.
     // This not only makes metadata smaller but it makes decoding easier since
     // batch sizes are typically a power of 2.  4 bits would allow us to express
     // up to 16Ki values but we restrict this further to 4Ki values.
     //
-    // This means blocks can have 1 to 4Ki values and 6 - 24Ki bytes.  E.g.
-    // the worst case will have 2 bytes each of repetition and definition
-    // which means a block would be limited to 1024 values (giving 4KiB for
-    // value data and 4KiB for rep/def)
+    // This means blocks can have 1 to 4Ki values and 8 - 32Ki bytes.
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
@@ -1579,32 +1607,22 @@ impl PrimitiveStructuralEncoder {
     ) -> (LanceBuffer, LanceBuffer) {
         let bytes_rep = rep.iter().map(|r| r.len()).sum::<usize>();
         let bytes_def = def.iter().map(|d| d.len()).sum::<usize>();
-        // Each chunk starts with the size of the rep buffer (2 bytes) and the size of
-        // the def buffer (2 bytes)
         let max_bytes_repdef_len = rep.len() * 4;
+        let max_padding = miniblocks.chunks.len() * (1 + (2 * MINIBLOCK_MAX_PADDING));
         let mut data_buffer = Vec::with_capacity(
-            miniblocks.data.len()
-                + bytes_rep
-                + bytes_def
-                + max_bytes_repdef_len
-                + MINIBLOCK_MAX_PADDING as usize,
+            miniblocks.data.len()      // `values`
+                + bytes_rep            // `rep_len * num_blocks`
+                + bytes_def            // `def_len * num_blocks`
+                + max_bytes_repdef_len // `rep` and `def`
+                + max_padding, // `P1`, `P2`, and `P3` for each block
         );
         let mut meta_buffer = Vec::with_capacity(miniblocks.data.len() * 2);
 
         let mut value_offset = 0;
         for ((chunk, rep), def) in miniblocks.chunks.into_iter().zip(rep).zip(def) {
-            let chunk_bytes = chunk.num_bytes as u64 + rep.len() as u64 + def.len() as u64 + 6;
-            assert!(chunk_bytes <= 16 * 1024);
-            assert!(chunk_bytes > 0);
-            // We subtract 1 here from chunk_bytes because we want to be able to express
-            // a size of 24KiB and not (24Ki - 6)B which is what we'd get otherwise with
-            // 0xFFF
-            let divided_bytes = chunk_bytes.div_ceil(MINIBLOCK_SIZE_MULTIPLIER);
-            let pad_bytes = (MINIBLOCK_SIZE_MULTIPLIER * divided_bytes) - chunk_bytes;
-            let divided_bytes_minus_one = divided_bytes - 1;
-
-            let metadata = ((divided_bytes_minus_one << 4) | chunk.log_num_values as u64) as u16;
-            meta_buffer.extend_from_slice(&metadata.to_le_bytes());
+            let start_len = data_buffer.len();
+            // Start of chunk should be aligned
+            debug_assert_eq!(start_len % MINIBLOCK_ALIGNMENT, 0);
 
             assert!(rep.len() < u16::MAX as usize);
             assert!(def.len() < u16::MAX as usize);
@@ -1612,21 +1630,44 @@ impl PrimitiveStructuralEncoder {
             let bytes_def = def.len() as u16;
             let bytes_val = chunk.num_bytes;
 
+            // Each chunk starts with the size of the rep buffer (2 bytes) the size of
+            // the def buffer (2 bytes) and the size of the values buffer (2 bytes)
             data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
             data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             data_buffer.extend_from_slice(&bytes_val.to_le_bytes());
 
             data_buffer.extend_from_slice(&rep);
+            // In theory we should insert P1 here.  However, since we do not have bit-packing of rep
+            // def levels yet we can skip this step.
+            debug_assert_eq!(data_buffer.len() % 2, 0);
             data_buffer.extend_from_slice(&def);
+
+            let p2 = pad_bytes::<MINIBLOCK_ALIGNMENT>(data_buffer.len());
+            // SAFETY: We ensured the data buffer would be large enough when we allocated
+            data_buffer.extend(iter::repeat(0).take(p2));
 
             let num_value_bytes = chunk.num_bytes as usize;
             let values =
                 &miniblocks.data[value_offset as usize..value_offset as usize + num_value_bytes];
+            debug_assert_eq!(data_buffer.len() % MINIBLOCK_ALIGNMENT, 0);
             data_buffer.extend_from_slice(values);
 
-            data_buffer.extend(iter::repeat(0).take(pad_bytes as usize));
-
+            let p3 = pad_bytes::<MINIBLOCK_ALIGNMENT>(data_buffer.len());
+            data_buffer.extend(iter::repeat(0).take(p3));
             value_offset += num_value_bytes as u64;
+
+            let chunk_bytes = data_buffer.len() - start_len;
+            assert!(chunk_bytes <= 16 * 1024);
+            assert!(chunk_bytes > 0);
+            assert_eq!(chunk_bytes % 8, 0);
+            // We subtract 1 here from chunk_bytes because we want to be able to express
+            // a size of 32KiB and not (32Ki - 8)B which is what we'd get otherwise with
+            // 0xFFF
+            let divided_bytes = chunk_bytes / MINIBLOCK_ALIGNMENT;
+            let divided_bytes_minus_one = (divided_bytes - 1) as u64;
+
+            let metadata = ((divided_bytes_minus_one << 4) | chunk.log_num_values as u64) as u16;
+            meta_buffer.extend_from_slice(&metadata.to_le_bytes());
         }
 
         (

@@ -59,6 +59,7 @@ const ENCODING_OPTIONS: EncodingOptions = EncodingOptions {
     cache_bytes_per_column: 1024 * 1024,
     max_page_bytes: 32 * 1024 * 1024,
     keep_original_array: true,
+    buffer_alignment: 64,
 };
 
 fn bench_decode(c: &mut Criterion) {
