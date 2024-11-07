@@ -12,6 +12,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
+use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
@@ -34,6 +35,10 @@ use crate::format::pb;
 use crate::format::pbfile;
 use crate::format::pbfile::DirectEncoding;
 use crate::format::MAGIC;
+
+/// Pages buffers are aligned to 64 bytes
+pub(crate) const PAGE_BUFFER_ALIGNMENT: usize = 64;
+const PAD_BUFFER: [u8; PAGE_BUFFER_ALIGNMENT] = [72; PAGE_BUFFER_ALIGNMENT];
 
 #[derive(Debug, Clone, Default)]
 pub struct FileWriterOptions {
@@ -138,6 +143,13 @@ impl FileWriter {
         }
     }
 
+    async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {
+        writer.write_all(buf).await?;
+        let pad_bytes = pad_bytes::<PAGE_BUFFER_ALIGNMENT>(buf.len());
+        writer.write_all(&PAD_BUFFER[..pad_bytes]).await?;
+        Ok(())
+    }
+
     /// Returns the format version that will be used when writing the file
     pub fn version(&self) -> LanceFileVersion {
         self.options.format_version.unwrap_or_default()
@@ -150,7 +162,7 @@ impl FileWriter {
         for buffer in buffers {
             buffer_offsets.push(self.writer.tell().await? as u64);
             buffer_sizes.push(buffer.len() as u64);
-            self.writer.write_all(&buffer).await?;
+            Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
         let encoded_encoding = match encoded_page.description {
             PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
@@ -333,7 +345,7 @@ impl FileWriter {
         let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
         // Next, write external buffers
         for external_buffer in external_buffers.take_buffers() {
-            self.writer.write_all(&external_buffer).await?;
+            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
         }
 
         let encoding_tasks = encoding_tasks
@@ -419,7 +431,7 @@ impl FileWriter {
     pub async fn add_global_buffer(&mut self, buffer: Bytes) -> Result<u32> {
         let position = self.writer.tell().await? as u64;
         let len = buffer.len() as u64;
-        self.writer.write_all(&buffer).await?;
+        Self::do_write_buffer(&mut self.writer, &buffer).await?;
         self.global_buffers.push((position, len));
         Ok(self.global_buffers.len() as u32)
     }
@@ -449,7 +461,7 @@ impl FileWriter {
                 for buffer in column.column_buffers {
                     column_metadata.buffer_offsets.push(buffer_pos);
                     let mut size = 0;
-                    self.writer.write_all(&buffer).await?;
+                    Self::do_write_buffer(&mut self.writer, &buffer).await?;
                     size += buffer.len() as u64;
                     buffer_pos += size;
                     column_metadata.buffer_sizes.push(size);
@@ -500,7 +512,7 @@ impl FileWriter {
             .map(|writer| writer.flush(&mut external_buffers))
             .collect::<Result<Vec<_>>>()?;
         for external_buffer in external_buffers.take_buffers() {
-            self.writer.write_all(&external_buffer).await?;
+            Self::do_write_buffer(&mut self.writer, &external_buffer).await?;
         }
         let encoding_tasks = encoding_tasks
             .into_iter()
