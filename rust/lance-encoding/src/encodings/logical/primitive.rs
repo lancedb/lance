@@ -472,11 +472,11 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         let mut chunks = Vec::new();
         let offset_into_first_chunk = self.offset_in_current_chunk;
         while remaining > 0 {
-            if remaining >= self.data.front().unwrap().vals_in_chunk - self.offset_in_current_chunk
+            if remaining >= self.data.front().unwrap().vals_targeted - self.offset_in_current_chunk
             {
                 // We are fully consuming the next chunk
                 let chunk = self.data.pop_front().unwrap();
-                remaining -= chunk.vals_in_chunk - self.offset_in_current_chunk;
+                remaining -= chunk.vals_targeted - self.offset_in_current_chunk;
                 chunks.push(chunk);
                 self.offset_in_current_chunk = 0;
             } else {
@@ -619,7 +619,11 @@ impl MiniBlockScheduler {
 #[derive(Debug)]
 struct ScheduledChunk {
     data: LanceBuffer,
+    // The total number of values in the chunk, not all values may be targeted
     vals_in_chunk: u64,
+    // The number of values that are targeted by the ranges.  This should be the
+    // same as the sum of `Self::ranges`
+    vals_targeted: u64,
     ranges: Vec<Range<u64>>,
 }
 
@@ -629,6 +633,7 @@ impl Clone for ScheduledChunk {
             data: self.data.try_clone().unwrap(),
             vals_in_chunk: self.vals_in_chunk,
             ranges: self.ranges.clone(),
+            vals_targeted: self.vals_targeted,
         }
     }
 }
@@ -695,6 +700,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             data: LanceBuffer::empty(),
             ranges: Vec::new(),
             vals_in_chunk: current_chunk.num_values,
+            vals_targeted: 0,
         };
 
         // There can be both multiple ranges per chunk and multiple chunks per range
@@ -728,6 +734,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                         data: LanceBuffer::empty(),
                         ranges: Vec::new(),
                         vals_in_chunk: current_chunk.num_values,
+                        vals_targeted: 0,
                     };
                 }
             }
@@ -745,6 +752,11 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
+
+        for scheduled_chunk in scheduled_chunks.iter_mut() {
+            scheduled_chunk.vals_targeted =
+                scheduled_chunk.ranges.iter().map(|r| r.end - r.start).sum();
+        }
 
         Ok(async move {
             let data = data.await?;
