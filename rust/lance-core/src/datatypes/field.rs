@@ -437,9 +437,6 @@ impl Field {
     /// If the ids are `[2]`, then this will include the parent `0` and the
     /// child `3`.
     pub(crate) fn project_by_ids(&self, ids: &[i32], include_all_children: bool) -> Option<Self> {
-        if !ids.contains(&self.id) {
-            return None;
-        }
         let children = self
             .children
             .iter()
