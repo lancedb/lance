@@ -13,7 +13,7 @@ use lance_core::utils::bit::pad_bytes;
 use log::{debug, trace};
 use snafu::{location, Location};
 
-use crate::data::DataBlock;
+use crate::data::{AllNullDataBlock, DataBlock};
 use crate::statistics::{GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
@@ -482,11 +482,11 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         let mut chunks = Vec::new();
         let offset_into_first_chunk = self.offset_in_current_chunk;
         while remaining > 0 {
-            if remaining >= self.data.front().unwrap().vals_in_chunk - self.offset_in_current_chunk
+            if remaining >= self.data.front().unwrap().vals_targeted - self.offset_in_current_chunk
             {
                 // We are fully consuming the next chunk
                 let chunk = self.data.pop_front().unwrap();
-                remaining -= chunk.vals_in_chunk - self.offset_in_current_chunk;
+                remaining -= chunk.vals_targeted - self.offset_in_current_chunk;
                 chunks.push(chunk);
                 self.offset_in_current_chunk = 0;
             } else {
@@ -513,50 +513,63 @@ impl StructuralPageDecoder for MiniBlockDecoder {
     }
 }
 
-/// A scheduler for all-null data
+/// A scheduler for simple all-null data
 ///
-/// Note that all-null data might still require buffers.  If there are definition levels
-/// then we need to distinguish between null structs and null values.  If there are repetition
-/// levels then we need to distinguish between null lists, lists of null, and empty lists.
+/// "simple" all-null data is data that is all null and only has a single level of definition and
+/// no repetition.  We don't need to read any data at all in this case.
 #[derive(Debug, Default)]
-pub struct AllNullScheduler {}
+pub struct SimpleAllNullScheduler {}
 
-impl StructuralPageScheduler for AllNullScheduler {
+impl StructuralPageScheduler for SimpleAllNullScheduler {
     fn initialize<'a>(&'a mut self, _io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
         std::future::ready(Ok(())).boxed()
     }
 
     fn schedule_ranges(
         &self,
-        _ranges: &[Range<u64>],
+        ranges: &[Range<u64>],
         _io: &dyn EncodingsIo,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         Ok(std::future::ready(Ok(
-            Box::new(AllNullPageDecoder {}) as Box<dyn StructuralPageDecoder>
+            Box::new(SimpleAllNullPageDecoder { num_rows }) as Box<dyn StructuralPageDecoder>
         ))
         .boxed())
     }
 }
 
+/// A page decode task for all-null data without any
+/// repetition and only a single level of definition
 #[derive(Debug)]
-struct AllNullDecodePageTask {}
-impl DecodePageTask for AllNullDecodePageTask {
+struct SimpleAllNullDecodePageTask {
+    num_values: u64,
+}
+impl DecodePageTask for SimpleAllNullDecodePageTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
-        // TODO: Not that trivial, we might have rep/def that we need to encode / decode still
-        todo!()
+        Ok(DecodedPage {
+            data: DataBlock::AllNull(AllNullDataBlock {
+                num_values: self.num_values,
+            }),
+            repetition: None,
+            definition: Some(vec![1; self.num_values as usize]),
+        })
     }
 }
 
 #[derive(Debug)]
-pub struct AllNullPageDecoder {}
+pub struct SimpleAllNullPageDecoder {
+    num_rows: u64,
+}
 
-impl StructuralPageDecoder for AllNullPageDecoder {
-    fn drain(&mut self, _num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
-        todo!()
+impl StructuralPageDecoder for SimpleAllNullPageDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        Ok(Box::new(SimpleAllNullDecodePageTask {
+            num_values: num_rows,
+        }))
     }
 
     fn num_rows(&self) -> u64 {
-        todo!()
+        self.num_rows
     }
 }
 
@@ -629,7 +642,11 @@ impl MiniBlockScheduler {
 #[derive(Debug)]
 struct ScheduledChunk {
     data: LanceBuffer,
+    // The total number of values in the chunk, not all values may be targeted
     vals_in_chunk: u64,
+    // The number of values that are targeted by the ranges.  This should be the
+    // same as the sum of `Self::ranges`
+    vals_targeted: u64,
     ranges: Vec<Range<u64>>,
 }
 
@@ -639,6 +656,7 @@ impl Clone for ScheduledChunk {
             data: self.data.try_clone().unwrap(),
             vals_in_chunk: self.vals_in_chunk,
             ranges: self.ranges.clone(),
+            vals_targeted: self.vals_targeted,
         }
     }
 }
@@ -704,6 +722,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             data: LanceBuffer::empty(),
             ranges: Vec::new(),
             vals_in_chunk: current_chunk.num_values,
+            vals_targeted: 0,
         };
 
         // There can be both multiple ranges per chunk and multiple chunks per range
@@ -737,6 +756,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                         data: LanceBuffer::empty(),
                         ranges: Vec::new(),
                         vals_in_chunk: current_chunk.num_values,
+                        vals_targeted: 0,
                     };
                 }
             }
@@ -754,6 +774,11 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
+
+        for scheduled_chunk in scheduled_chunks.iter_mut() {
+            scheduled_chunk.vals_targeted =
+                scheduled_chunk.ranges.iter().map(|r| r.end - r.start).sum();
+        }
 
         Ok(async move {
             let data = data.await?;
@@ -936,7 +961,7 @@ impl StructuralPrimitiveFieldScheduler {
                     )?)
                 }
                 Some(pb::page_layout::Layout::AllNullLayout(_)) => {
-                    Box::new(AllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
+                    Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
                 }
                 _ => todo!(),
             };
@@ -1191,7 +1216,12 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let mut repdef = RepDefUnraveler::new(all_rep, all_def);
 
         // The primitive array itself has a validity
-        let validity = repdef.unravel_validity();
+        let mut validity = repdef.unravel_validity();
+        if matches!(self.data_type, DataType::Null) {
+            // Null arrays don't have a validity but we still pretend they do for consistency's sake
+            // up until this point.  We need to remove it here.
+            validity = None;
+        }
         if let Some(validity) = validity.as_ref() {
             assert!(validity.len() == array.len());
         }
@@ -1731,8 +1761,12 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
-    fn encode_all_null(column_idx: u32, num_rows: u64, row_number: u64) -> Result<EncodedPage> {
-        let description = ProtobufUtils::all_null_layout();
+    fn encode_simple_all_null(
+        column_idx: u32,
+        num_rows: u64,
+        row_number: u64,
+    ) -> Result<EncodedPage> {
+        let description = ProtobufUtils::simple_all_null_layout();
         Ok(EncodedPage {
             column_idx,
             data: vec![],
@@ -1752,10 +1786,11 @@ impl PrimitiveStructuralEncoder {
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
 
-        // TODO: Parquet sparsely encodes values here.  We could do the same but
-        // then we won't have log2 values per chunk.  This means more metadata
-        // and potentially more decoder asymmetry.  However, it may be worth
-        // investigating at some point
+        if let DataBlock::AllNull(_null_block) = data {
+            // If we got here then all the data is null but we have rep/def information that
+            // we need to store.
+            todo!()
+        }
 
         let num_values = data.num_values();
         // The validity is encoded in repdef so we can remove it
@@ -1777,6 +1812,11 @@ impl PrimitiveStructuralEncoder {
             compression_strategy,
             &compressed_data.chunks,
         )?;
+
+        // TODO: Parquet sparsely encodes values here.  We could do the same but
+        // then we won't have log2 values per chunk.  This means more metadata
+        // and potentially more decoder asymmetry.  However, it may be worth
+        // investigating at some point
 
         let (block_value_buffer, block_meta_buffer) =
             Self::serialize_miniblocks(compressed_data, compressed_rep, compressed_def);
@@ -1809,10 +1849,20 @@ impl PrimitiveStructuralEncoder {
                 .map(|arr| arr.logical_nulls().map(|n| n.null_count()).unwrap_or(0) as u64)
                 .sum::<u64>();
 
-            if num_values == num_nulls {
-                Self::encode_all_null(column_idx, num_values, row_number)
+            if num_values == num_nulls && repdefs.iter().all(|rd| rd.is_simple_validity()) {
+                log::debug!(
+                    "Encoding column {} with {} rows using simple-null layout",
+                    column_idx,
+                    num_values
+                );
+                Self::encode_simple_all_null(column_idx, num_values, row_number)
             } else {
                 let data_block = DataBlock::from_arrays(&arrays, num_values);
+                log::debug!(
+                    "Encoding column {} with {} rows using mini-block layout",
+                    column_idx,
+                    num_values
+                );
                 if Self::is_narrow(&data_block) {
                     Self::encode_miniblock(
                         column_idx,

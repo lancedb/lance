@@ -1396,16 +1396,18 @@ mod tests {
 
     use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
-        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt8Array,
+        make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
+        StringArray, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
+    use arrow_schema::{DataType, Field, Fields};
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
     use crate::buffer::LanceBuffer;
 
-    use super::DataBlock;
+    use super::{AllNullDataBlock, DataBlock};
 
     use arrow::compute::concat;
     use arrow_array::Array;
@@ -1627,6 +1629,22 @@ mod tests {
             nullable_items.data.as_variable_width().unwrap().data.len(),
             32640
         );
+    }
+
+    #[test]
+    fn test_all_null() {
+        for data_type in [
+            DataType::UInt32,
+            DataType::FixedSizeBinary(2),
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::UInt32, true)])),
+        ] {
+            let block = DataBlock::AllNull(AllNullDataBlock { num_values: 10 });
+            let arr = block.into_arrow(data_type.clone(), true).unwrap();
+            let arr = make_array(arr);
+            let expected = new_null_array(&data_type, 10);
+            assert_eq!(&arr, &expected);
+        }
     }
 
     #[test]

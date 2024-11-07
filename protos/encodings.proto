@@ -296,6 +296,11 @@ message ColumnEncoding {
   }
 }
 
+/// A layout used for pages where the data is small
+///
+/// In this case we can fit many values into a single disk sector and transposing buffers is
+/// expensive.  As a result, we do not transpose the buffers but compress the data into small
+/// chunks (called mini blocks) which are roughly the size of a disk sector.
 message MiniBlockLayout {
   // Description of the compression of repetition levels (e.g. how many bits per rep)
   ArrayEncoding rep_compression = 1;
@@ -305,6 +310,11 @@ message MiniBlockLayout {
   ArrayEncoding value_compression = 3;
 }
 
+/// A layout used for pages where all values are null
+///
+/// In addition, there can be no repetition levels and only a single definition level
+///
+/// If the data is all-null but we have non-trivial rep-def then MiniBlockLayout is used
 message AllNullLayout {
 
 }
