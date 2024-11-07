@@ -297,6 +297,11 @@ impl RepDefBuilder {
             .all(|r| matches!(r, RawRepDef::NoNull(_)))
     }
 
+    /// Returns true if there is only a single layer of definition
+    pub fn is_simple_validity(&self) -> bool {
+        self.repdefs.len() == 1 && matches!(self.repdefs[0], RawRepDef::Validity(_))
+    }
+
     /// Return True if any layer has a validity bitmap
     ///
     /// Return False if all layers are non-null (the def levels can

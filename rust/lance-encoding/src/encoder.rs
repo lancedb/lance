@@ -3,6 +3,7 @@
 use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
+use arrow::datatypes::UInt64Type;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -33,6 +34,7 @@ use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
+use crate::statistics::{GetStat, Stat};
 use crate::version::LanceFileVersion;
 use crate::{
     decoder::{ColumnInfo, PageInfo},
@@ -782,11 +784,23 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         assert!(field.data_type().byte_width() > 0);
+        let bit_widths = data
+            .get_stat(Stat::BitWidth)
+            .expect("FixedWidthDataBlock should have valid bit width statistics");
+        // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
+        // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
+        let has_all_zeros = bit_widths
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .any(|v| *v == 0);
+
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
-            if fixed_width_data.bits_per_value == 8
-                || fixed_width_data.bits_per_value == 16
-                || fixed_width_data.bits_per_value == 32
-                || fixed_width_data.bits_per_value == 64
+            if !has_all_zeros
+                && (fixed_width_data.bits_per_value == 8
+                    || fixed_width_data.bits_per_value == 16
+                    || fixed_width_data.bits_per_value == 32
+                    || fixed_width_data.bits_per_value == 64)
             {
                 return Ok(Box::new(BitpackMiniBlockEncoder::default()));
             }

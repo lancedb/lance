@@ -25,9 +25,8 @@ use crate::{
         FilterExpression, PageInfo,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, CoreArrayEncodingStrategy,
-        CoreFieldEncodingStrategy, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
-        FieldEncodingStrategy, OutOfLineBuffers,
+        default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
+        EncodingOptions, FieldEncoder, OutOfLineBuffers,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
@@ -271,10 +270,7 @@ pub async fn check_round_trip_encoding_generated(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoding_strategy = CoreFieldEncodingStrategy {
-            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
-            version,
-        };
+        let encoding_strategy = default_encoding_strategy(version);
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
             let encoding_options = EncodingOptions {
@@ -285,7 +281,7 @@ pub async fn check_round_trip_encoding_generated(
             };
             encoding_strategy
                 .create_field_encoder(
-                    &encoding_strategy,
+                    encoding_strategy.as_ref(),
                     &lance_field,
                     &mut column_index_seq,
                     &encoding_options,
@@ -298,6 +294,7 @@ pub async fn check_round_trip_encoding_generated(
             encoder_factory,
             field.clone(),
             array_generator_provider.copy(),
+            version,
         )
         .await
     }
@@ -663,6 +660,7 @@ async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+    version: LanceFileVersion,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
@@ -680,6 +678,7 @@ async fn check_round_trip_field_encoding_random(
             };
 
             let test_cases = TestCases::default()
+                .with_file_version(version)
                 .with_range(0..500)
                 .with_range(100..1100)
                 .with_range(8000..8500)

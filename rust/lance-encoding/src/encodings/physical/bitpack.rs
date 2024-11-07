@@ -1036,7 +1036,6 @@ pub mod test {
                 DataType::UInt32,
                 Box::new(
                     DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always always give 16 bits
                         Uniform::new(0, 1),
                     ),
                 ),
