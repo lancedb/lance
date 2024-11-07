@@ -4906,6 +4906,7 @@ mod tests {
         let mut dataset = Dataset::write(empty_reader, "memory://", None)
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
 
         // If missing columns that aren't nullable, will return an error
         // TODO: provide alternative default than null.
@@ -4926,6 +4927,7 @@ mod tests {
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
         dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         // Looking at the fragments, there is no data file with the missing field
         let fragments = dataset.get_fragments();
@@ -4956,6 +4958,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         // When reading back, only missing data is null, otherwise is filled in
         let data = dataset.scan().try_into_batch().await.unwrap();
@@ -4973,6 +4976,7 @@ mod tests {
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].metadata.files.len(), 1);
@@ -5001,7 +5005,8 @@ mod tests {
             true,
         )]));
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
-        Dataset::write(empty_reader, test_uri, None).await.unwrap();
+        let dataset = Dataset::write(empty_reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         let append_options = WriteParams {
             mode: WriteMode::Append,
@@ -5028,6 +5033,7 @@ mod tests {
         let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].metadata.files.len(), 1);
@@ -5055,6 +5061,7 @@ mod tests {
         let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[1].metadata.files.len(), 1);
@@ -5154,6 +5161,7 @@ mod tests {
         let mut dataset = Dataset::write(empty_reader, test_uri, Some(options))
             .await
             .unwrap();
+        dataset.validate().await.unwrap();
 
         // Insert left side
         let just_a = Arc::new(ArrowSchema::new(vec![field_a.clone()]));
@@ -5161,6 +5169,7 @@ mod tests {
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
         dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 1);
@@ -5180,6 +5189,7 @@ mod tests {
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
         dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 2);
@@ -5201,6 +5211,7 @@ mod tests {
         .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
 
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
@@ -5260,5 +5271,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, expected);
+
+        // Make sure we can compact and still do those things
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_removed, 3);
+        assert_eq!(metrics.fragments_added, 1);
+        dataset.validate().await.unwrap();
     }
 }

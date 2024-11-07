@@ -985,24 +985,6 @@ impl FileFragment {
             ));
         }
 
-        for field in self.schema().fields_pre_order() {
-            if !seen_fields.contains(&field.id) {
-                return Err(Error::corrupt_file(
-                    self.dataset
-                        .data_dir()
-                        .child(self.metadata.files[0].path.as_str()),
-                    format!(
-                        "Field {} is missing in fragment {}\nField: {:#?}\nFragment: {:#?}",
-                        field.id,
-                        self.id(),
-                        field,
-                        self.metadata()
-                    ),
-                    location!(),
-                ));
-            }
-        }
-
         for data_file in &self.metadata.files {
             data_file.validate(&self.dataset.data_dir())?;
         }
