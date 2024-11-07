@@ -309,7 +309,7 @@ pub async fn write_fragments_internal(
                 schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
-                        // We don't if the user claims their data is nullable / non-nullable.  We will
+                        // We don't care if the user claims their data is nullable / non-nullable.  We will
                         // verify against the actual data.
                         compare_nullability: NullabilityComparison::Ignore,
                         allow_missing_if_nullable: true,
@@ -348,7 +348,19 @@ pub async fn write_fragments_internal(
 
     let data_schema = schema.project_by_schema(data.schema().as_ref())?;
 
-    let (data, blob_data) = data.extract_blob_stream(&data_schema);
+    let has_blob = {
+        let schema_to_check = if let Some(dataset) = dataset {
+            dataset.schema()
+        } else {
+            &data_schema
+        };
+        schema_to_check
+            .fields
+            .iter()
+            .any(|f| f.storage_class() == StorageClass::Blob)
+    };
+
+    let (data, blob_data) = data.extract_blob_stream(&data_schema, has_blob);
 
     // Some params we borrow from the normal write, some we override
     let blob_write_params = WriteParams {

@@ -239,11 +239,11 @@ pub trait BlobStreamExt: Sized {
     ///
     /// The second stream may be None (if there are no fields with the blob storage class)
     /// or it contains all fields with the blob storage class.
-    fn extract_blob_stream(self, schema: &Schema) -> (Self, Option<Self>);
+    fn extract_blob_stream(self, schema: &Schema, has_blob: bool) -> (Self, Option<Self>);
 }
 
 impl BlobStreamExt for SendableRecordBatchStream {
-    fn extract_blob_stream(self, schema: &Schema) -> (Self, Option<Self>) {
+    fn extract_blob_stream(self, schema: &Schema, has_blob: bool) -> (Self, Option<Self>) {
         let mut indices_with_blob = Vec::with_capacity(schema.fields.len());
         let mut indices_without_blob = Vec::with_capacity(schema.fields.len());
         for (idx, field) in schema.fields.iter().enumerate() {
@@ -253,7 +253,7 @@ impl BlobStreamExt for SendableRecordBatchStream {
                 indices_without_blob.push(idx);
             }
         }
-        if indices_with_blob.is_empty() {
+        if !has_blob {
             (self, None)
         } else {
             let left_schema = Arc::new(self.schema().project(&indices_without_blob).unwrap());

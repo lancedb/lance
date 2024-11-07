@@ -5148,6 +5148,7 @@ mod tests {
         let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
         let options = WriteParams {
             enable_move_stable_row_ids: true,
+            enable_v2_manifest_paths: true,
             ..Default::default()
         };
         let mut dataset = Dataset::write(empty_reader, test_uri, Some(options))
@@ -5171,7 +5172,7 @@ mod tests {
             .await
             .unwrap();
         let blob_fragments = blob_dataset.get_fragments();
-        assert_eq!(blob_fragments.len(), 0);
+        assert_eq!(blob_fragments.len(), 1);
 
         // Insert right side
         let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
@@ -5187,7 +5188,7 @@ mod tests {
             .await
             .unwrap();
         let blob_fragments = blob_dataset.get_fragments();
-        assert_eq!(blob_fragments.len(), 1);
+        assert_eq!(blob_fragments.len(), 2);
 
         // insert both
         let batch = RecordBatch::try_new(
@@ -5208,7 +5209,7 @@ mod tests {
             .await
             .unwrap();
         let blob_fragments = blob_dataset.get_fragments();
-        assert_eq!(blob_fragments.len(), 2);
+        assert_eq!(blob_fragments.len(), 3);
 
         // Assert scan results is correct
         let data = dataset.scan().try_into_batch().await.unwrap();
