@@ -786,18 +786,17 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         _field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        let bit_widths = data
-            .get_stat(Stat::BitWidth)
-            .expect("FixedWidthDataBlock should have valid bit width statistics");
-        // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
-        // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
-        let has_all_zeros = bit_widths
-            .as_primitive::<UInt64Type>()
-            .values()
-            .iter()
-            .any(|v| *v == 0);
-
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
+            let bit_widths = data
+                .get_stat(Stat::BitWidth)
+                .expect("FixedWidthDataBlock should have valid bit width statistics");
+            // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
+            // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
+            let has_all_zeros = bit_widths
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .any(|v| *v == 0);
             if !has_all_zeros
                 && (fixed_width_data.bits_per_value == 8
                     || fixed_width_data.bits_per_value == 16
