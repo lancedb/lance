@@ -52,7 +52,11 @@ pub struct SchemaCompareOptions {
     pub compare_field_ids: bool,
     /// Should nullability be compared (default Strict)
     pub compare_nullability: NullabilityComparison,
-    /// Allow fields to be missing if they are nullable (default false)
+    /// Allow fields in the expected schema to be missing from the schema being tested if  
+    /// they are nullable (default false)  
+    ///  
+    /// Fields in the schema being tested must always be present in the expected schema  
+    /// regardless of this flag.  
     pub allow_missing_if_nullable: bool,
     /// Allow out of order fields (default false)
     pub ignore_field_order: bool,
@@ -433,6 +437,9 @@ impl Field {
     /// If the ids are `[2]`, then this will include the parent `0` and the
     /// child `3`.
     pub(crate) fn project_by_ids(&self, ids: &[i32], include_all_children: bool) -> Option<Self> {
+        if !ids.contains(&self.id) {
+            return None;
+        }
         let children = self
             .children
             .iter()

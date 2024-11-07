@@ -280,6 +280,11 @@ impl Schema {
     /// Returns a new schema that only contains the fields in `column_ids`.
     ///
     /// This projection can filter out both top-level and nested fields
+    ///
+    /// If `include_all_children` is true, then if a parent field id is passed,
+    /// then all children of that field will be included in the projection
+    /// regardless of whether their ids were passed. If this is false, then
+    /// only the child fields with the passed ids will be included.
     pub fn project_by_ids(&self, column_ids: &[i32], include_all_children: bool) -> Self {
         let filtered_fields = self
             .fields
