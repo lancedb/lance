@@ -566,18 +566,20 @@ impl Dataset {
                     params.enable_move_stable_row_ids = d.manifest.uses_move_stable_row_ids();
                 }
                 let m = d.manifest.as_ref();
-                schema.check_compatible(
-                    &m.schema,
-                    &SchemaCompareOptions {
-                        compare_dictionary: true,
-                        // array nullability is checked later, using actual data instead
-                        // of the schema
-                        compare_nullability: NullabilityComparison::Ignore,
-                        ignore_field_order: true,
-                        allow_missing_if_nullable: true,
-                        ..Default::default()
-                    },
-                )?;
+                let mut schema_cmp_opts = SchemaCompareOptions {
+                    compare_dictionary: true,
+                    // array nullability is checked later, using actual data instead
+                    // of the schema
+                    compare_nullability: NullabilityComparison::Ignore,
+                    ..Default::default()
+                };
+                if m.blob_dataset_version.is_none() {
+                    // Balanced datasets don't yet support schema evolution
+                    schema_cmp_opts.ignore_field_order = true;
+                    schema_cmp_opts.allow_missing_if_nullable = true;
+                }
+
+                schema.check_compatible(&m.schema, &schema_cmp_opts)?;
                 // If appending, always use existing storage version
                 storage_version = m.data_storage_format.lance_file_version()?;
             }
@@ -736,18 +738,20 @@ impl Dataset {
         let stream = reader_to_stream(batches);
 
         // Return Error if append and input schema differ
-        schema.check_compatible(
-            &self.manifest.schema,
-            &SchemaCompareOptions {
-                compare_dictionary: true,
-                // array nullability is checked later, using actual data instead
-                // of the schema
-                compare_nullability: NullabilityComparison::Ignore,
-                ignore_field_order: true,
-                allow_missing_if_nullable: true,
-                ..Default::default()
-            },
-        )?;
+        let mut schema_cmp_opts = SchemaCompareOptions {
+            compare_dictionary: true,
+            // array nullability is checked later, using actual data instead
+            // of the schema
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        if self.manifest.blob_dataset_version.is_none() {
+            // Balanced datasets don't yet support schema evolution
+            schema_cmp_opts.ignore_field_order = true;
+            schema_cmp_opts.allow_missing_if_nullable = true;
+        }
+
+        schema.check_compatible(&self.manifest.schema, &schema_cmp_opts)?;
 
         // If the dataset is already using (or not using) move stable row ids, we need to match
         // and ignore whatever the user provided as input
@@ -5137,6 +5141,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_balanced_subschemas() {
+        // TODO: support this.
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -5168,116 +5173,17 @@ mod tests {
         let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
-        dataset.append(reader, None).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 1);
-        let blob_dataset = Dataset::open(&format!("{}/_blobs", test_uri))
-            .await
-            .unwrap();
-        let blob_dataset = blob_dataset
-            .checkout_version(dataset.manifest.blob_dataset_version.unwrap())
-            .await
-            .unwrap();
-        let blob_fragments = blob_dataset.get_fragments();
-        assert_eq!(blob_fragments.len(), 1);
+        let result = dataset.append(reader, None).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
 
         // Insert right side
         let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
         let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
             .unwrap();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
-        dataset.append(reader, None).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 2);
-        let blob_dataset = blob_dataset
-            .checkout_version(dataset.manifest.blob_dataset_version.unwrap())
-            .await
-            .unwrap();
-        let blob_fragments = blob_dataset.get_fragments();
-        assert_eq!(blob_fragments.len(), 2);
-
-        // insert both
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![3])),
-                Arc::new(Int64Array::from(vec![4])),
-            ],
-        )
-        .unwrap();
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-        dataset.append(reader, None).await.unwrap();
-        dataset.validate().await.unwrap();
-
-        let fragments = dataset.get_fragments();
-        assert_eq!(fragments.len(), 3);
-        let blob_dataset = blob_dataset
-            .checkout_version(dataset.manifest.blob_dataset_version.unwrap())
-            .await
-            .unwrap();
-        let blob_fragments = blob_dataset.get_fragments();
-        assert_eq!(blob_fragments.len(), 3);
-
-        // Assert scan results is correct
-        let data = dataset.scan().try_into_batch().await.unwrap();
-        let expected = RecordBatch::try_new(
-            just_a.clone(),
-            vec![Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))],
-        )
-        .unwrap();
-        assert_eq!(data, expected);
-
-        // TODO: Scanning columns with non-default storage class is not yet supported
-        // let data = dataset.scan().project(&["a", "b"]).unwrap().try_into_batch().await.unwrap();
-        // let expected = RecordBatch::try_new(
-        //     schema.clone(),
-        //     vec![
-        //         Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
-        //         Arc::new(Int64Array::from(vec![None, Some(2), Some(4)])),
-        //     ],
-        // )
-        // .unwrap();
-        // assert_eq!(data, expected);
-
-        // TODO: mapping from row addresses to row ids
-        // let result = dataset
-        //     .take(&[1, 2, 0], dataset.schema().clone())
-        //     .await
-        //     .unwrap();
-        // let expected = RecordBatch::try_new(
-        //     schema.clone(),
-        //     vec![
-        //         Arc::new(Int32Array::from(vec![None, Some(3), Some(1)])),
-        //         Arc::new(Int64Array::from(vec![Some(2), Some(4), None])),
-        //     ],
-        // )
-        // .unwrap();
-        // assert_eq!(result, expected);
-
-        let result = dataset
-            .take_rows(&[1, 2, 0], dataset.schema().clone())
-            .await
-            .unwrap();
-        let expected = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![None, Some(3), Some(1)])),
-                Arc::new(Int64Array::from(vec![Some(2), Some(4), None])),
-            ],
-        )
-        .unwrap();
-        assert_eq!(result, expected);
-
-        // Make sure we can compact and still do those things
-        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
-            .await
-            .unwrap();
-        assert_eq!(metrics.fragments_removed, 3);
-        assert_eq!(metrics.fragments_added, 1);
-        dataset.validate().await.unwrap();
+        let result = dataset.append(reader, None).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
     }
 }

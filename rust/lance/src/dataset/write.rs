@@ -348,24 +348,7 @@ pub async fn write_fragments_internal(
 
     let data_schema = schema.project_by_schema(data.schema().as_ref())?;
 
-    let has_blob = {
-        let schema_to_check = if let Some(dataset) = dataset {
-            dataset.schema()
-        } else {
-            &data_schema
-        };
-        schema_to_check
-            .fields
-            .iter()
-            .any(|f| f.storage_class() == StorageClass::Blob)
-    };
-
-    let (data, blob_data) = if has_blob {
-        let (data, blob_data) = data.extract_blob_stream(&data_schema);
-        (data, Some(blob_data))
-    } else {
-        (data, None)
-    };
+    let (data, blob_data) = data.extract_blob_stream(&data_schema);
 
     // Some params we borrow from the normal write, some we override
     let blob_write_params = WriteParams {
