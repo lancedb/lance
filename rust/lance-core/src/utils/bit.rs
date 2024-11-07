@@ -10,6 +10,11 @@ pub fn pad_bytes<const ALIGN: usize>(n: usize) -> usize {
     (ALIGN - (n & (ALIGN - 1))) & (ALIGN - 1)
 }
 
+pub fn pad_bytes_to(n: usize, align: usize) -> usize {
+    debug_assert!(is_pwr_two(align as u64));
+    (align - (n & (align - 1))) & (align - 1)
+}
+
 pub fn pad_bytes_u64<const ALIGN: u64>(n: u64) -> u64 {
     debug_assert!(is_pwr_two(ALIGN));
     (ALIGN - (n & (ALIGN - 1))) & (ALIGN - 1)

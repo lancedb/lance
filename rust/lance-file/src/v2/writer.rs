@@ -262,6 +262,7 @@ impl FileWriter {
             cache_bytes_per_column,
             max_page_bytes,
             keep_original_array,
+            buffer_alignment: PAGE_BUFFER_ALIGNMENT as u64,
         };
         let encoder =
             BatchEncoder::try_new(&schema, encoding_strategy.as_ref(), &encoding_options)?;
@@ -341,7 +342,8 @@ impl FileWriter {
         }
         // First we push each array into its column writer.  This may or may not generate enough
         // data to trigger an encoding task.  We collect any encoding tasks into a queue.
-        let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
+        let mut external_buffers =
+            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self.encode_batch(batch, &mut external_buffers)?;
         // Next, write external buffers
         for external_buffer in external_buffers.take_buffers() {
@@ -439,7 +441,8 @@ impl FileWriter {
     async fn finish_writers(&mut self) -> Result<()> {
         let mut col_idx = 0;
         for mut writer in std::mem::take(&mut self.column_writers) {
-            let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
+            let mut external_buffers =
+                OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
             let columns = writer.finish(&mut external_buffers).await?;
             for buffer in external_buffers.take_buffers() {
                 self.writer.write_all(&buffer).await?;
@@ -505,7 +508,8 @@ impl FileWriter {
     /// Returns the total number of rows written
     pub async fn finish(&mut self) -> Result<u64> {
         // 1. flush any remaining data and write out those pages
-        let mut external_buffers = OutOfLineBuffers::new(self.tell().await?);
+        let mut external_buffers =
+            OutOfLineBuffers::new(self.tell().await?, PAGE_BUFFER_ALIGNMENT as u64);
         let encoding_tasks = self
             .column_writers
             .iter_mut()

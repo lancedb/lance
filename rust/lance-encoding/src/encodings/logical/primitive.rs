@@ -1607,9 +1607,6 @@ impl PrimitiveStructuralEncoder {
     ) -> (LanceBuffer, LanceBuffer) {
         let bytes_rep = rep.iter().map(|r| r.len()).sum::<usize>();
         let bytes_def = def.iter().map(|d| d.len()).sum::<usize>();
-        // Each chunk ends with the size of the rep buffer (2 bytes) and the size of
-        // the def buffer (2 bytes).  These are put at the end so as to not disturb
-        // the alignment guarantees given to the compressor.
         let max_bytes_repdef_len = rep.len() * 4;
         let max_padding = miniblocks.chunks.len() * (1 + (2 * MINIBLOCK_MAX_PADDING));
         let mut data_buffer = Vec::with_capacity(
@@ -1633,6 +1630,8 @@ impl PrimitiveStructuralEncoder {
             let bytes_def = def.len() as u16;
             let bytes_val = chunk.num_bytes;
 
+            // Each chunk starts with the size of the rep buffer (2 bytes) the size of
+            // the def buffer (2 bytes) and the size of the values buffer (2 bytes)
             data_buffer.extend_from_slice(&bytes_rep.to_le_bytes());
             data_buffer.extend_from_slice(&bytes_def.to_le_bytes());
             data_buffer.extend_from_slice(&bytes_val.to_le_bytes());

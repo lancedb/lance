@@ -281,6 +281,7 @@ pub async fn check_round_trip_encoding_generated(
                 max_page_bytes: MAX_PAGE_BYTES,
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
+                buffer_alignment: 64,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -412,6 +413,7 @@ pub async fn check_round_trip_encoding_of_data(
             cache_bytes_per_column: *page_size,
             max_page_bytes: test_cases.get_max_page_size(),
             keep_original_array: true,
+            buffer_alignment: 64,
         };
         let encoder = encoding_strategy
             .create_field_encoder(
@@ -472,7 +474,7 @@ impl SimulatedWriter {
     }
 
     fn new_external_buffers(&self) -> OutOfLineBuffers {
-        OutOfLineBuffers::new(self.encoded_data.len() as u64)
+        OutOfLineBuffers::new(self.encoded_data.len() as u64, /*buffer_alignment=*/ 1)
     }
 }
 

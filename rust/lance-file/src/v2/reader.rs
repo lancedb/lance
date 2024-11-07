@@ -1294,6 +1294,7 @@ pub mod tests {
             cache_bytes_per_column: 4096,
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
+            buffer_alignment: 64,
         };
         let encoded_batch = encode_batch(
             &data,
