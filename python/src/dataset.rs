@@ -532,7 +532,7 @@ impl Dataset {
                 let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
 
-                let idx_schema = schema.project_by_ids(idx.fields.as_slice());
+                let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
 
                 let is_vector = idx_schema
                     .fields

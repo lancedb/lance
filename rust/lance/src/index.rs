@@ -800,7 +800,7 @@ impl DatasetIndexInternalExt for Dataset {
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
         for index in indices.iter().filter(|idx| {
-            let idx_schema = schema.project_by_ids(idx.fields.as_slice());
+            let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
             let is_vector_index = idx_schema
                 .fields
                 .iter()

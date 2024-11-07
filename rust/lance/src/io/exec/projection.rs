@@ -306,7 +306,7 @@ mod tests {
         ];
 
         for projection in projections {
-            let projected_schema = lance_schema.project_by_ids(projection);
+            let projected_schema = lance_schema.project_by_ids(projection, true);
             let projected_arrow_schema = (&projected_schema).into();
 
             let result = apply_to_batch(sample_data.clone(), &projected_arrow_schema)
