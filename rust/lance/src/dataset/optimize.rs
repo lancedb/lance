@@ -704,6 +704,11 @@ async fn rewrite_files(
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         params.max_bytes_per_file = max_bytes_per_file;
     }
+
+    if dataset.manifest.uses_move_stable_row_ids() {
+        params.enable_move_stable_row_ids = true;
+    }
+
     let new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),

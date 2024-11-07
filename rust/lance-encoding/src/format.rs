@@ -225,7 +225,7 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn all_null_layout() -> PageLayout {
+    pub fn simple_all_null_layout() -> PageLayout {
         PageLayout {
             layout: Some(Layout::AllNullLayout(AllNullLayout {})),
         }

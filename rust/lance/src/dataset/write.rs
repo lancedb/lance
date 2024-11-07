@@ -309,22 +309,23 @@ pub async fn write_fragments_internal(
                 schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
-                        // We don't care if the user claims their data is nullable / non-nullable.
-                        // We will verify against the actual data in the writer.
+                        // We don't care if the user claims their data is nullable / non-nullable.  We will
+                        // verify against the actual data.
                         compare_nullability: NullabilityComparison::Ignore,
+                        allow_missing_if_nullable: true,
+                        ignore_field_order: true,
+                        compare_dictionary: true,
                         ..Default::default()
                     },
                 )?;
-                // Use the schema from the dataset, because it has the correct
-                // field ids.  Use the storage version from the dataset, ignoring
-                // any version from the user.
-                (
-                    dataset.schema().clone(),
-                    dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?,
-                )
+                // Project from the dataset schema, because it has the correct field ids.
+                let write_schema = dataset.schema().project_by_schema(&schema)?;
+                // Use the storage version from the dataset, ignoring any version from the user.
+                let data_storage_version = dataset
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_version()?;
+                (write_schema, data_storage_version)
             }
             WriteMode::Overwrite => {
                 // Overwrite, use the schema from the data.  If the user specified

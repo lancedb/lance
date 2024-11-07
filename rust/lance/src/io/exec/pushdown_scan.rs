@@ -456,7 +456,8 @@ impl FragmentScanner {
                     .collect();
 
                 let remainder_batch = if !remaining_fields.is_empty() {
-                    let remaining_projection = self.projection.project_by_ids(&remaining_fields);
+                    let remaining_projection =
+                        self.projection.project_by_ids(&remaining_fields, true);
                     Some(
                         self.reader
                             .legacy_read_batch_projected(
@@ -859,7 +860,7 @@ mod test {
 
         let fragments = dataset.fragments().clone();
         // [x.b, y.a]
-        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4]));
+        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4], true));
 
         let predicate = col("x")
             .field_newstyle("a")
@@ -889,7 +890,7 @@ mod test {
         assert_eq!(results[0].schema().as_ref(), expected_schema.as_ref());
 
         // Also try where projection is same as filter columns
-        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[1, 5]));
+        let projection = Arc::new(dataset.schema().clone().project_by_ids(&[1, 5], true));
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
             fragments,
@@ -1182,7 +1183,12 @@ mod test {
         let scan = LancePushdownScanExec::try_new(
             dataset.clone(),
             dataset.fragments().clone(),
-            Arc::new(dataset.schema().clone().project_by_ids(&projection_indices)),
+            Arc::new(
+                dataset
+                    .schema()
+                    .clone()
+                    .project_by_ids(&projection_indices, true),
+            ),
             predicate,
             scan_config,
         )

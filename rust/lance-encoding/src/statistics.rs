@@ -12,8 +12,8 @@ use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
 use crate::data::{
-    DataBlock, DictionaryDataBlock, FixedWidthDataBlock, OpaqueBlock, StructDataBlock,
-    VariableWidthBlock,
+    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, OpaqueBlock,
+    StructDataBlock, VariableWidthBlock,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -124,10 +124,7 @@ impl GetStat for DataBlock {
         match self {
             Self::Empty() => None,
             Self::Constant(_) => None,
-            Self::AllNull(_) => {
-                //  the statistics is not calculated here as this enum is going to deprecated soon anyway
-                None
-            }
+            Self::AllNull(data_block) => data_block.get_stat(stat),
             Self::Nullable(data_block) => data_block.data.get_stat(stat),
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
             Self::FixedSizeList(_) => None,
@@ -222,6 +219,19 @@ impl VariableWidthBlock {
             _ => {
                 unreachable!("the type of offsets in VariableWidth can only be u32 or u64");
             }
+        }
+    }
+}
+
+impl GetStat for AllNullDataBlock {
+    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
+        match stat {
+            Stat::NullCount => {
+                let null_count = self.num_values;
+                Some(Arc::new(UInt64Array::from(vec![null_count])))
+            }
+            Stat::DataSize => Some(Arc::new(UInt64Array::from(vec![0]))),
+            _ => None,
         }
     }
 }
