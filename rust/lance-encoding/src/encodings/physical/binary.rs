@@ -481,8 +481,10 @@ fn search_next_offset_idx(offsets: &[u32], last_offset_idx: usize) -> usize {
                 + (offsets.len() - last_offset_idx) as u32 * 4
                 <= AIM_MINICHUNK_SIZE
             {
+                // case 1: can fit the rest of all data into a miniblock
                 return offsets.len() - 1;
             } else {
+                // case 2: can only fit the last tried `num_values` into a miniblock
                 return last_offset_idx + num_values;
             }
         }
