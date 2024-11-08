@@ -780,6 +780,8 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     }
 }
 
+const MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE: u64 = 256;
+
 impl CompressionStrategy for CoreArrayEncodingStrategy {
     fn create_miniblock_compressor(
         &self,
@@ -815,7 +817,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                     .as_any()
                     .downcast_ref::<PrimitiveArray<UInt64Type>>()
                     .unwrap();
-                if max_len.value(0) < 128 {
+                if max_len.value(0) < MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE {
                     return Ok(Box::new(BinaryMiniBlockEncoder::default()));
                 }
             }
