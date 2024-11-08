@@ -29,8 +29,8 @@ use crate::format::{pb, ProtobufUtils};
 use crate::statistics::{GetStat, Stat};
 use arrow::array::ArrayRef;
 use bytemuck::cast_slice;
-const ELEMS_PER_CHUNK: u64 = 1024;
 const LOG_ELEMS_PER_CHUNK: u8 = 10;
+const ELEMS_PER_CHUNK: u64 = 1 << LOG_ELEMS_PER_CHUNK;
 
 // Compute the compressed_bit_width for a given array of integers
 // todo: compute all statistics before encoding
