@@ -1654,7 +1654,6 @@ mod tests {
                 LanceBuffer::reinterpret_vec::<i8>(vec![3, 0, 1, 2, 3])
             );
         };
-        println!("Check one");
         check_common(data);
 
         // However, we can manually create a dictionary where nulls are in the dictionary
@@ -1664,7 +1663,6 @@ mod tests {
 
         let data = DataBlock::from_array(dict);
 
-        println!("Check two");
         check_common(data);
     }
 

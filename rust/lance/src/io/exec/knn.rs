@@ -789,7 +789,6 @@ mod tests {
             DistanceType::L2,
         )
         .unwrap();
-        println!("{:?}", idx);
         assert_eq!(
             idx.schema().as_ref(),
             &ArrowSchema::new(vec![
