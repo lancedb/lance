@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(clippy::print_stdout)]
+
 use std::sync::Arc;
 
 use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};

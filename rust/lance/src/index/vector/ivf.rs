@@ -2806,7 +2806,6 @@ mod tests {
                 .unwrap()
                 .as_primitive::<UInt64Type>()
                 .value(0);
-            println!("Row id: {} query_id: {}", row_id, query_id);
             if row_id == (query_id as u64) {
                 correct_times += 1;
             }
