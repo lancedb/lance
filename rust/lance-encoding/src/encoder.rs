@@ -1444,7 +1444,7 @@ pub mod tests {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
     }
 
-/*
+    /*
     fn is_fixed_size_encoding_applicable(
         arrays: Vec<Vec<Option<&str>>>,
         version: LanceFileVersion,
