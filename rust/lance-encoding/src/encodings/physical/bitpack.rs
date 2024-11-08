@@ -946,7 +946,6 @@ pub mod test {
         }
     }
 
-    /*
     #[test_log::test(tokio::test)]
     async fn test_bitpack_primitive() {
         let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
@@ -1126,6 +1125,5 @@ pub mod test {
             .await;
         }
     }
-    */
 }
 */

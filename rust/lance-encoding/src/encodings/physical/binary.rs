@@ -8,8 +8,9 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::ArrayRef;
 use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
-use bytemuck::cast_slice;
+use bytemuck::{cast_slice, try_cast_slice};
 use futures::TryFutureExt;
+use lance_core::utils::bit::pad_bytes;
 use snafu::{location, Location};
 
 use futures::{future::BoxFuture, FutureExt};
@@ -466,6 +467,7 @@ fn get_indices_from_string_arrays(
 pub struct BinaryMiniBlockEncoder {}
 
 const AIM_MINICHUNK_SIZE: u32 = 4 * 1024;
+const BINARY_MINIBLOCK_CHUNK_ALIGNMENT: usize = 4;
 
 // search for the next offset index to cut the values into a chunk.
 // this function incrementally peek the number of values in a chunk,
@@ -506,16 +508,6 @@ impl BinaryMiniBlockEncoder {
         &self,
         mut data: VariableWidthBlock,
     ) -> (MiniBlockCompressed, crate::format::pb::ArrayEncoding) {
-        println!("inside BinaryMiniBlockEncoder::chunk_data");
-        let max_len = data
-            .get_stat(Stat::MaxLength)
-            .expect("VariableWidthDataBlock should have valid max length statistics");
-        let max_len = max_len
-            .as_any()
-            .downcast_ref::<PrimitiveArray<UInt64Type>>()
-            .unwrap();
-
-        assert!(max_len.value(0) < 128);
         assert!(data.bits_per_offset == 32);
 
         let offsets = data.offsets.borrow_to_typed_slice::<u32>();
@@ -531,7 +523,6 @@ impl BinaryMiniBlockEncoder {
             bytes_start_offset: usize,
             // every chunk is padded to 8 bytes.
             // we need to interpret every chunk as &[u32] so we need it to padded at least to 4 bytes,
-            // 8 bytes are a more conservative behavior.
             // this field can actually be eliminated and I can use `num_bytes` in `MiniBlockChunk` to compute
             // the `output_total_bytes`.
             padded_chunk_size: usize,
@@ -552,7 +543,7 @@ impl BinaryMiniBlockEncoder {
                 let this_chunk_size = (num_values_in_this_chunk + 1) * 4
                     + (offsets[offsets.len() - 1] - offsets[last_offset_in_orig_idx]) as usize;
 
-                let padded_chunk_size = ((this_chunk_size + 7) / 8) * 8;
+                let padded_chunk_size = ((this_chunk_size + 3) / 4) * 4;
 
                 // the bytes are put after the offsets
                 let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * 4;
@@ -576,7 +567,7 @@ impl BinaryMiniBlockEncoder {
                     + (offsets[this_last_offset_in_orig_idx] - offsets[last_offset_in_orig_idx])
                         as usize;
 
-                let padded_chunk_size = ((this_chunk_size + 7) / 8) * 8;
+                let padded_chunk_size = ((this_chunk_size + 3) / 4) * 4;
 
                 // the bytes are put after the offsets
                 let this_chunk_bytes_start_offset = (num_values_in_this_chunk + 1) * 4;
@@ -620,9 +611,9 @@ impl BinaryMiniBlockEncoder {
 
             output.extend_from_slice(&data.data[start_in_orig as usize..end_in_orig as usize]);
 
-            // pad this chunk to make it align to 8 bytes.
-            while output.len() % 8 != 0 {
-                output.push(73u8);
+            // pad this chunk to make it align to 4 bytes.
+            for _ in 0..pad_bytes::<4usize>(output.len()) {
+                output.push(255u8);
             }
         }
 
@@ -664,10 +655,10 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure `num_values` <= number of values in the chunk.
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        println!("inside BinaryMiniBlockDecompressor::decompress");
         assert!(data.len() >= 8);
         let data = data.to_vec();
-        let offsets: &[u32] = cast_slice(&data);
+        let offsets: &[u32] = try_cast_slice(&data)
+            .expect("casting buffer failed during BinaryMiniBlock decompression");
 
         let result_offsets = offsets[0..(num_values + 1) as usize]
             .iter()

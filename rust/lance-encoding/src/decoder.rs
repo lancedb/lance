@@ -1318,7 +1318,6 @@ impl BatchDecodeStream {
                     let scan_line = scan_line?;
                     self.rows_scheduled = scan_line.scheduled_so_far;
                     for message in scan_line.decoders {
-                        println!("message: {:?}", message);
                         self.accept_decoder(message.into_legacy())?;
                     }
                 }
