@@ -475,6 +475,9 @@ impl IvfShuffler {
             location!(),
         ))?;
 
+        info!("Writing unsorted data to disk at {}", path);
+        info!("with schema: {:?}", schema);
+
         let mut file_writer = FileWriter::<ManifestDescribing>::with_object_writer(
             writer,
             Schema::try_from(schema.as_ref())?,
