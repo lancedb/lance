@@ -246,6 +246,7 @@ use crate::encodings::logical::primitive::{
 use crate::encodings::logical::r#struct::{
     SimpleStructDecoder, SimpleStructScheduler, StructuralStructDecoder, StructuralStructScheduler,
 };
+use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
@@ -494,6 +495,9 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::Bitpack2(description) => {
                 Ok(Box::new(BitpackMiniBlockDecompressor::new(description)))
             }
+            pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => {
+                Ok(Box::new(BinaryMiniBlockDecompressor::default()))
+            }
             _ => todo!(),
         }
     }
@@ -740,6 +744,15 @@ impl CoreFieldDecoderStrategy {
                     Box::new(StructuralStructScheduler::new(child_schedulers, fields))
                         as Box<dyn StructuralFieldScheduler>,
                 )
+            }
+            DataType::Binary | DataType::Utf8 => {
+                let column_info = column_infos.expect_next()?;
+                let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                    column_info.as_ref(),
+                    self.decompressor_strategy.as_ref(),
+                )?);
+                column_infos.next_top_level();
+                Ok(scheduler)
             }
             _ => todo!(),
         }

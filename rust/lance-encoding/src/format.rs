@@ -19,9 +19,9 @@ use pb::{
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, Bitpack2, Bitpacked, BitpackedForNonNeg, Dictionary,
-    FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct,
-    PageLayout,
+    AllNullLayout, ArrayEncoding, Binary, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg,
+    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable,
+    PackedStruct, PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionConfig;
@@ -130,6 +130,12 @@ impl ProtobufUtils {
             array_encoding: Some(ArrayEncodingEnum::Bitpack2(Bitpack2 {
                 uncompressed_bits_per_value,
             })),
+        }
+    }
+
+    pub fn binary_miniblock() -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::BinaryMiniBlock(BinaryMiniBlock {})),
         }
     }
 

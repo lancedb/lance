@@ -4,6 +4,7 @@ use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
+use arrow_array::PrimitiveArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -24,6 +25,7 @@ use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
+use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
@@ -158,6 +160,7 @@ pub struct MiniBlockCompressed {
 /// 8KiB of compressed data.  This means that even in the extreme case
 /// where we have 4 bytes of rep/def then we will have at most 24KiB of
 /// data (values, repetition, and definition) per mini-block.
+#[derive(Debug)]
 pub struct MiniBlockChunk {
     // The number of bytes that make up the chunk
     //
@@ -777,25 +780,25 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     }
 }
 
+const MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE: u64 = 256;
+
 impl CompressionStrategy for CoreArrayEncodingStrategy {
     fn create_miniblock_compressor(
         &self,
-        field: &Field,
+        _field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        assert!(field.data_type().byte_width() > 0);
-        let bit_widths = data
-            .get_stat(Stat::BitWidth)
-            .expect("FixedWidthDataBlock should have valid bit width statistics");
-        // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
-        // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
-        let has_all_zeros = bit_widths
-            .as_primitive::<UInt64Type>()
-            .values()
-            .iter()
-            .any(|v| *v == 0);
-
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
+            let bit_widths = data
+                .get_stat(Stat::BitWidth)
+                .expect("FixedWidthDataBlock should have valid bit width statistics");
+            // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
+            // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
+            let has_all_zeros = bit_widths
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .any(|v| *v == 0);
             if !has_all_zeros
                 && (fixed_width_data.bits_per_value == 8
                     || fixed_width_data.bits_per_value == 16
@@ -803,6 +806,20 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                     || fixed_width_data.bits_per_value == 64)
             {
                 return Ok(Box::new(BitpackMiniBlockEncoder::default()));
+            }
+        }
+        if let DataBlock::VariableWidth(ref variable_width_data) = data {
+            if variable_width_data.bits_per_offset == 32 {
+                let max_len = data
+                    .get_stat(Stat::MaxLength)
+                    .expect("VariableWidthDataBlock should have valid max length statistics");
+                let max_len = max_len
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<UInt64Type>>()
+                    .unwrap();
+                if max_len.value(0) < MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE {
+                    return Ok(Box::new(BinaryMiniBlockEncoder::default()));
+                }
             }
         }
         Ok(Box::new(ValueEncoder::default()))

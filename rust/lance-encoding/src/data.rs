@@ -293,6 +293,60 @@ impl FixedWidthDataBlock {
     }
 }
 
+pub struct VariableWidthDataBlockBuilder {
+    offsets: Vec<u32>,
+    bytes: Vec<u8>,
+}
+
+impl VariableWidthDataBlockBuilder {
+    fn new(estimated_size_bytes: u64) -> Self {
+        Self {
+            offsets: vec![0u32],
+            bytes: Vec::with_capacity(estimated_size_bytes as usize),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let block = data_block.as_variable_width_mut_ref().unwrap();
+        assert!(block.bits_per_offset == 32);
+
+        let offsets = block.offsets.borrow_to_typed_slice::<u32>();
+        let offsets = offsets.as_ref();
+
+        let start_offset = offsets[selection.start as usize];
+        let end_offset = offsets[selection.end as usize];
+        let mut previous_len = self.bytes.len();
+
+        self.bytes
+            .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
+
+        self.offsets.extend(
+            offsets[selection.start as usize..selection.end as usize]
+                .iter()
+                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
+                .map(|(&current, &next)| {
+                    let this_value_len = next - current;
+                    previous_len += this_value_len as usize;
+                    previous_len as u32
+                }),
+        );
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let num_values = (self.offsets.len() - 1) as u64;
+        DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(self.bytes),
+            offsets: LanceBuffer::reinterpret_vec(self.offsets),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
+        })
+    }
+}
+
 pub struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
@@ -311,7 +365,7 @@ impl FixedWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
         let block = data_block.as_fixed_width_ref().unwrap();
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
@@ -853,6 +907,13 @@ impl DataBlock {
                 inner.bits_per_value,
                 estimated_size_bytes,
             )),
+            Self::VariableWidth(inner) => {
+                if inner.bits_per_offset == 32 {
+                    Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
+                } else {
+                    todo!()
+                }
+            }
             _ => todo!(),
         }
     }
@@ -880,6 +941,17 @@ macro_rules! as_type_ref {
     };
 }
 
+macro_rules! as_type_ref_mut {
+    ($fn_name:ident, $inner:tt, $inner_type:ident) => {
+        pub fn $fn_name(&mut self) -> Option<&mut $inner_type> {
+            match self {
+                Self::$inner(inner) => Some(inner),
+                _ => None,
+            }
+        }
+    };
+}
+
 // Cast implementations
 impl DataBlock {
     as_type!(as_all_null, AllNull, AllNullDataBlock);
@@ -896,6 +968,17 @@ impl DataBlock {
     as_type_ref!(as_variable_width_ref, VariableWidth, VariableWidthBlock);
     as_type_ref!(as_struct_ref, Struct, StructDataBlock);
     as_type_ref!(as_dictionary_ref, Dictionary, DictionaryDataBlock);
+    as_type_ref_mut!(as_all_null_mut_ref, AllNull, AllNullDataBlock);
+    as_type_ref_mut!(as_nullable_mut_ref, Nullable, NullableDataBlock);
+    as_type_ref_mut!(as_fixed_width_mut_ref, FixedWidth, FixedWidthDataBlock);
+    as_type_ref_mut!(
+        as_fixed_size_list_mut_ref,
+        FixedSizeList,
+        FixedSizeListBlock
+    );
+    as_type_ref_mut!(as_variable_width_mut_ref, VariableWidth, VariableWidthBlock);
+    as_type_ref_mut!(as_struct_mut_ref, Struct, StructDataBlock);
+    as_type_ref_mut!(as_dictionary_mut_ref, Dictionary, DictionaryDataBlock);
 }
 
 // Methods to convert from Arrow -> DataBlock
@@ -1356,7 +1439,7 @@ impl From<ArrayRef> for DataBlock {
 }
 
 pub trait DataBlockBuilderImpl {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>);
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
@@ -1380,7 +1463,7 @@ impl DataBlockBuilder {
         self.builder.as_mut().unwrap().as_mut()
     }
 
-    pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    pub fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
         self.get_builder(data_block).append(data_block, selection);
     }
 
