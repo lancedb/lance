@@ -2204,7 +2204,6 @@ impl MessageType {
     }
 
     pub fn into_structural(self) -> UnloadedPage {
-        println!("inside MessageType::into_structural");
         match self {
             Self::UnloadedPage(unloaded) => unloaded,
             Self::DecoderReady(_) => {

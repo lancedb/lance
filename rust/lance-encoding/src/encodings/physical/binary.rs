@@ -24,7 +24,6 @@ use crate::data::{
     BlockInfo, DataBlock, FixedWidthDataBlock, NullableDataBlock, UsedEncoding, VariableWidthBlock,
 };
 use crate::format::ProtobufUtils;
-use crate::statistics::{GetStat, Stat};
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray},
@@ -531,6 +530,8 @@ impl BinaryMiniBlockEncoder {
         let mut chunks_info = vec![];
         let mut chunks = vec![];
         let mut last_offset_in_orig_idx = 0;
+        const CHUNK_PAD_BUFFER: [u8; BINARY_MINIBLOCK_CHUNK_ALIGNMENT] =
+            [72; BINARY_MINIBLOCK_CHUNK_ALIGNMENT];
         loop {
             let this_last_offset_in_orig_idx =
                 search_next_offset_idx(offsets, last_offset_in_orig_idx);
@@ -612,9 +613,9 @@ impl BinaryMiniBlockEncoder {
             output.extend_from_slice(&data.data[start_in_orig as usize..end_in_orig as usize]);
 
             // pad this chunk to make it align to 4 bytes.
-            for _ in 0..pad_bytes::<4usize>(output.len()) {
-                output.push(255u8);
-            }
+            output.extend_from_slice(
+                &CHUNK_PAD_BUFFER[..pad_bytes::<BINARY_MINIBLOCK_CHUNK_ALIGNMENT>(output.len())],
+            );
         }
 
         (
