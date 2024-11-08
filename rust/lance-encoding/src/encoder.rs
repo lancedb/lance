@@ -1392,7 +1392,6 @@ pub async fn encode_batch(
     })
 }
 
-/*
 #[cfg(test)]
 pub mod tests {
     use crate::version::LanceFileVersion;
@@ -1402,7 +1401,7 @@ pub mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use super::check_fixed_size_encoding;
+    // use super::check_fixed_size_encoding;
     use super::{check_dict_encoding, ArrayEncodingStrategy, CoreArrayEncodingStrategy};
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
@@ -1445,6 +1444,7 @@ pub mod tests {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
     }
 
+/*
     fn is_fixed_size_encoding_applicable(
         arrays: Vec<Vec<Option<&str>>>,
         version: LanceFileVersion,
@@ -1459,7 +1459,6 @@ pub mod tests {
         check_fixed_size_encoding(&final_arrays.clone(), version).is_some()
     }
 
-    /*
     #[test]
     fn test_fixed_size_binary_encoding_applicable() {
         assert!(!is_fixed_size_encoding_applicable(
@@ -1492,9 +1491,7 @@ pub mod tests {
             LanceFileVersion::V2_1
         ));
     }
-    */
 
-    /*
     #[test]
     fn test_fixed_size_binary_encoding_applicable_multiple_arrays() {
         assert!(is_fixed_size_encoding_applicable(
@@ -1566,4 +1563,3 @@ pub mod tests {
                              "BinaryEncoder { indices_encoder: BasicEncoder { values_encoder: ValueEncoder }, compression_config: Some(CompressionConfig { scheme: Zstd, level: Some(22) }), buffer_compressor: Some(ZstdBufferCompressor { compression_level: 22 }) }");
     }
 }
-*/
