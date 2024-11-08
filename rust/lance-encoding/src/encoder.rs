@@ -4,7 +4,6 @@ use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
-use arrow_array::PrimitiveArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
@@ -780,8 +779,6 @@ impl ArrayEncodingStrategy for CoreArrayEncodingStrategy {
     }
 }
 
-const MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE: u64 = 256;
-
 impl CompressionStrategy for CoreArrayEncodingStrategy {
     fn create_miniblock_compressor(
         &self,
@@ -810,16 +807,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         }
         if let DataBlock::VariableWidth(ref variable_width_data) = data {
             if variable_width_data.bits_per_offset == 32 {
-                let max_len = data
-                    .get_stat(Stat::MaxLength)
-                    .expect("VariableWidthDataBlock should have valid max length statistics");
-                let max_len = max_len
-                    .as_any()
-                    .downcast_ref::<PrimitiveArray<UInt64Type>>()
-                    .unwrap();
-                if max_len.value(0) < MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE {
-                    return Ok(Box::new(BinaryMiniBlockEncoder::default()));
-                }
+                return Ok(Box::new(BinaryMiniBlockEncoder::default()));
             }
         }
         Ok(Box::new(ValueEncoder::default()))
