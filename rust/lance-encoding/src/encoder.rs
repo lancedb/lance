@@ -682,7 +682,7 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
 }
 
 fn check_fixed_size_encoding(arrays: &[ArrayRef], version: LanceFileVersion) -> Option<u64> {
-    if version <= LanceFileVersion::V2_1 || arrays.is_empty() {
+    if version < LanceFileVersion::V2_1 || arrays.is_empty() {
         return None;
     }
 
@@ -1401,7 +1401,7 @@ pub mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    // use super::check_fixed_size_encoding;
+    use super::check_fixed_size_encoding;
     use super::{check_dict_encoding, ArrayEncodingStrategy, CoreArrayEncodingStrategy};
 
     fn is_dict_encoding_applicable(arr: Vec<Option<&str>>, threshold: u64) -> bool {
@@ -1444,7 +1444,6 @@ pub mod tests {
         assert!(!is_dict_encoding_applicable(vec![Some("a"), Some("a")], 3));
     }
 
-    /*
     fn is_fixed_size_encoding_applicable(
         arrays: Vec<Vec<Option<&str>>>,
         version: LanceFileVersion,
@@ -1524,7 +1523,6 @@ pub mod tests {
             LanceFileVersion::V2_1
         ));
     }
-    */
 
     fn verify_array_encoder(
         array: ArrayRef,

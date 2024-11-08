@@ -462,6 +462,73 @@ fn get_indices_from_string_arrays(
     (indices, null_adjustment)
 }
 
+impl ArrayEncoder for BinaryEncoder {
+    fn encode(
+        &self,
+        data: DataBlock,
+        data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
+        let (mut data, nulls) = match data {
+            DataBlock::Nullable(nullable) => {
+                let data = nullable.data.as_variable_width().unwrap();
+                (data, Some(nullable.nulls))
+            }
+            DataBlock::VariableWidth(variable) => (variable, None),
+            DataBlock::AllNull(all_null) => {
+                let data = Self::all_null_variable_width(data_type, all_null.num_values);
+                let validity =
+                    LanceBuffer::all_unset(bit_util::ceil(all_null.num_values as usize, 8));
+                (data, Some(validity))
+            }
+            _ => panic!("Expected variable width data block but got {}", data.name()),
+        };
+
+        let (indices, null_adjustment) = get_indices_from_string_arrays(
+            data.offsets,
+            data.bits_per_offset,
+            nulls,
+            data.num_values as usize,
+        );
+        let encoded_indices =
+            self.indices_encoder
+                .encode(indices, &DataType::UInt64, buffer_index)?;
+
+        let encoded_indices_data = encoded_indices.data.as_fixed_width().unwrap();
+
+        assert!(encoded_indices_data.bits_per_value <= 64);
+
+        if let Some(buffer_compressor) = &self.buffer_compressor {
+            let mut compressed_data = Vec::with_capacity(data.data.len());
+            buffer_compressor.compress(&data.data, &mut compressed_data)?;
+            data.data = LanceBuffer::Owned(compressed_data);
+        }
+
+        let data = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: encoded_indices_data.bits_per_value as u8,
+            offsets: encoded_indices_data.data,
+            data: data.data,
+            num_values: data.num_values,
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
+        });
+
+        let bytes_buffer_index = *buffer_index;
+        *buffer_index += 1;
+
+        let bytes_encoding = ProtobufUtils::flat_encoding(
+            /*bits_per_value=*/ 8,
+            bytes_buffer_index,
+            self.compression_config,
+        );
+
+        let encoding =
+            ProtobufUtils::binary(encoded_indices.encoding, bytes_encoding, null_adjustment);
+
+        Ok(EncodedArray { data, encoding })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BinaryMiniBlockEncoder {}
 
@@ -678,73 +745,6 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             block_info: BlockInfo::new(),
             used_encodings: UsedEncoding::new(),
         }))
-    }
-}
-
-impl ArrayEncoder for BinaryEncoder {
-    fn encode(
-        &self,
-        data: DataBlock,
-        data_type: &DataType,
-        buffer_index: &mut u32,
-    ) -> Result<EncodedArray> {
-        let (mut data, nulls) = match data {
-            DataBlock::Nullable(nullable) => {
-                let data = nullable.data.as_variable_width().unwrap();
-                (data, Some(nullable.nulls))
-            }
-            DataBlock::VariableWidth(variable) => (variable, None),
-            DataBlock::AllNull(all_null) => {
-                let data = Self::all_null_variable_width(data_type, all_null.num_values);
-                let validity =
-                    LanceBuffer::all_unset(bit_util::ceil(all_null.num_values as usize, 8));
-                (data, Some(validity))
-            }
-            _ => panic!("Expected variable width data block but got {}", data.name()),
-        };
-
-        let (indices, null_adjustment) = get_indices_from_string_arrays(
-            data.offsets,
-            data.bits_per_offset,
-            nulls,
-            data.num_values as usize,
-        );
-        let encoded_indices =
-            self.indices_encoder
-                .encode(indices, &DataType::UInt64, buffer_index)?;
-
-        let encoded_indices_data = encoded_indices.data.as_fixed_width().unwrap();
-
-        assert!(encoded_indices_data.bits_per_value <= 64);
-
-        if let Some(buffer_compressor) = &self.buffer_compressor {
-            let mut compressed_data = Vec::with_capacity(data.data.len());
-            buffer_compressor.compress(&data.data, &mut compressed_data)?;
-            data.data = LanceBuffer::Owned(compressed_data);
-        }
-
-        let data = DataBlock::VariableWidth(VariableWidthBlock {
-            bits_per_offset: encoded_indices_data.bits_per_value as u8,
-            offsets: encoded_indices_data.data,
-            data: data.data,
-            num_values: data.num_values,
-            block_info: BlockInfo::new(),
-            used_encodings: UsedEncoding::new(),
-        });
-
-        let bytes_buffer_index = *buffer_index;
-        *buffer_index += 1;
-
-        let bytes_encoding = ProtobufUtils::flat_encoding(
-            /*bits_per_value=*/ 8,
-            bytes_buffer_index,
-            self.compression_config,
-        );
-
-        let encoding =
-            ProtobufUtils::binary(encoded_indices.encoding, bytes_encoding, null_adjustment);
-
-        Ok(EncodedArray { data, encoding })
     }
 }
 

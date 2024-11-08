@@ -579,7 +579,6 @@ fn rows_in_buffer(
     bits_in_buffer / bits_per_value
 }
 
-/*
 #[cfg(test)]
 pub mod test {
     use crate::{
@@ -1126,4 +1125,3 @@ pub mod test {
         }
     }
 }
-*/
