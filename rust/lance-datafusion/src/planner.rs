@@ -953,7 +953,6 @@ mod tests {
             .unwrap();
 
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
-        println!("Physical expr: {:#?}", physical_expr);
 
         let batch = RecordBatch::try_new(
             schema,

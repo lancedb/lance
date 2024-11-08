@@ -179,5 +179,8 @@ use_self = "deny"
 dbg_macro = "deny"
 trait_duplication_in_bounds = "deny"
 redundant_clone = "deny"
+# We should always use log instead of println
+print_stdout = "deny"
+print_stderr = "deny"
 # not too much we can do to avoid multiple crate versions
 multiple-crate-versions = "allow"

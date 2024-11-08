@@ -2783,8 +2783,6 @@ mod test {
         scan.project(&["i", "vec"]).unwrap();
         scan.refine(5);
 
-        println!("{}", scan.explain_plan(true).await.unwrap());
-
         let results = scan
             .try_into_stream()
             .await
