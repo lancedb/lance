@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import tempfile
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Tuple, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
@@ -138,7 +138,7 @@ def train_pq_codebook_on_accelerator(
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
-) -> (np.ndarray, List[Any]):
+) -> Tuple[np.ndarray, List[Any]]:
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
     from .torch.data import LanceDataset as TorchDataset
@@ -210,7 +210,7 @@ def train_ivf_centroids_on_accelerator(
     sample_rate: int = 256,
     max_iters: int = 50,
     filter_nan: bool = True,
-) -> (np.ndarray, Any):
+) -> Tuple[np.ndarray, Any]:
     """Use accelerator (GPU or MPS) to train kmeans."""
 
     from .cuvs.kmeans import KMeans as KMeansCuVS
@@ -622,6 +622,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     pq_codebook, kmeans_list = train_pq_codebook_on_accelerator(
         dataset_residuals, metric_type, accelerator, num_sub_vectors, batch_size
     )
+    pq_codebook = pq_codebook.astype(dtype=centroids.dtype)
     return centroids, kmeans, pq_codebook, kmeans_list
 
 
@@ -691,6 +692,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
 
     def _partition_and_pq_codes_assignment() -> Iterable[pa.RecordBatch]:
         with torch.no_grad():
+            first_iter = True
             for batch in loader:
                 vecs = (
                     batch[column]
@@ -711,6 +713,15 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 vecs = vecs[mask_gpu]
 
                 residual_vecs = vecs - ivf_kmeans.centroids[partitions]
+                # cast centroids to the same dtype as vecs
+                if first_iter:
+                    first_iter = False
+                    logging.info("Residual shape: %s", residual_vecs.shape)
+                    for kmeans in pq_kmeans_list:
+                        cents: torch.Tensor = kmeans.centroids
+                        kmeans.centroids = cents.to(
+                            dtype=vecs.dtype, device=ivf_kmeans.device
+                        )
                 pq_codes = torch.stack(
                     [
                         pq_kmeans_list[i].transform(
