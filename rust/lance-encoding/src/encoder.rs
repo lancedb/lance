@@ -4,7 +4,6 @@ use std::{collections::HashMap, env, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::UInt64Type;
-use arrow_array::PrimitiveArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
