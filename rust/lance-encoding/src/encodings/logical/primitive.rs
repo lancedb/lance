@@ -1588,12 +1588,15 @@ impl PrimitiveStructuralEncoder {
     //   data doesn't even fit in a mini-block and the block overhead gets
     //   too large and we prefer zipped.
     fn is_narrow(data_block: &DataBlock) -> bool {
+
+        const MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE: u64 = 256;
+
         if let Some(max_len_array) = data_block.get_stat(Stat::MaxLength) {
             let max_len_array = max_len_array
                 .as_any()
                 .downcast_ref::<PrimitiveArray<UInt64Type>>()
                 .unwrap();
-            if max_len_array.value(0) < 128 {
+            if max_len_array.value(0) < MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE {
                 return true;
             }
         }
