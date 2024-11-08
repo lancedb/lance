@@ -1999,7 +1999,7 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                     values = pa.array(pq_codebook.reshape(-1))
                     pq_codebook = pa.FixedSizeListArray.from_arrays(
-                        values, num_sub_vectors * 256
+                        values, pq_codebook.shape[2]
                     )
                 pq_codebook_batch = pa.RecordBatch.from_arrays(
                     [pq_codebook], ["_pq_codebook"]
