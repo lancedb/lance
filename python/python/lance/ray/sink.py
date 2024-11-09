@@ -41,8 +41,9 @@ def _pd_to_arrow(
         return pa.Table.from_pydict(df, schema=schema)
     if _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
         tbl = pa.Table.from_pandas(df, schema=schema)
-        tbl.schema = tbl.schema.remove_metadata()
-        return tbl
+        new_schema = tbl.schema.remove_metadata()
+        new_table = tbl.replace_schema_metadata(new_schema.metadata)
+        return new_table
     return df
 
 
