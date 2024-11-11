@@ -53,6 +53,9 @@ use crate::{
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
 
+/// The minimum alignment for a page buffer.  Writers must respect this.
+pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
+
 /// An encoded array
 ///
 /// Maps to a single Arrow array
@@ -1299,9 +1302,14 @@ pub async fn encode_batch(
     encoding_strategy: &dyn FieldEncodingStrategy,
     options: &EncodingOptions,
 ) -> Result<EncodedBatch> {
-    if !is_pwr_two(options.buffer_alignment) || options.buffer_alignment < 8 {
+    if !is_pwr_two(options.buffer_alignment) || options.buffer_alignment < MIN_PAGE_BUFFER_ALIGNMENT
+    {
         return Err(Error::InvalidInput {
-            source: "buffer_alignment must be a power of two and at least 8".into(),
+            source: format!(
+                "buffer_alignment must be a power of two and at least {}",
+                MIN_PAGE_BUFFER_ALIGNMENT
+            )
+            .into(),
             location: location!(),
         });
     }

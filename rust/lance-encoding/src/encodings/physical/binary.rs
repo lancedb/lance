@@ -726,7 +726,6 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // it has so assertion can not be done here and the caller of `decompress` must ensure `num_values` <= number of values in the chunk.
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         assert!(data.len() >= 8);
-        let data = data.to_vec();
         let offsets: &[u32] = try_cast_slice(&data)
             .expect("casting buffer failed during BinaryMiniBlock decompression");
 
