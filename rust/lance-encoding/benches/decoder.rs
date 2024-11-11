@@ -305,6 +305,7 @@ fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
 
     const NUM_ROWS: u64 = 10000;
     // Randomly generated strings are always 12 characters (at the moment)
+    // Plus we need 4 bytes for the offset
     const NUM_BYTES: u64 = NUM_ROWS * 16;
     group.throughput(criterion::Throughput::Bytes(NUM_BYTES));
 
