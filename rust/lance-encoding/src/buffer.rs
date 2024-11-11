@@ -8,7 +8,10 @@ use std::{ops::Deref, ptr::NonNull, sync::Arc};
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use snafu::{location, Location};
 
-use lance_core::{utils::bit::is_pwr_two, Error, Result};
+use lance_core::{
+    utils::bit::{check_little_endian, is_pwr_two},
+    Error, Result,
+};
 
 /// A copy-on-write byte buffer
 ///
@@ -223,6 +226,7 @@ impl LanceBuffer {
     ///
     /// If the underlying buffer is not properly aligned, this will involve a copy of the data
     pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
+        check_little_endian();
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
         if self.len() % std::mem::size_of::<T>() != 0 {
