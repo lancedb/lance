@@ -59,15 +59,6 @@ pub fn log_2_ceil(val: u32) -> u32 {
     }
 }
 
-/// Asserts if the currently running system is not little_endian
-pub fn check_little_endian() {
-    assert_eq!(
-        1u16.to_le_bytes(),
-        [1, 0],
-        "This code is for little-endian systems only"
-    );
-}
-
 #[cfg(test)]
 
 pub mod tests {
