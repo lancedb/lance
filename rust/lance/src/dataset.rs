@@ -43,6 +43,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
+use write::{InsertBuilder, InsertDestination};
 
 mod blob;
 pub mod builder;
@@ -701,18 +702,21 @@ impl Dataset {
 
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
     ///
+    /// `dest` can be a `&str`, `object_store::path::Path` or `Arc<Dataset>`.
+    ///
     /// Returns the newly created [`Dataset`].
     /// Or Returns [Error] if the dataset already exists.
     ///
     pub async fn write(
         batches: impl RecordBatchReader + Send + 'static,
-        uri: &str,
+        dest: impl Into<InsertDestination<'_>>,
         params: Option<WriteParams>,
     ) -> Result<Self> {
-        // Box it so we don't monomorphize for every one. We take the generic
-        // parameter for API ergonomics.
-        let batches = Box::new(batches);
-        Self::write_impl(batches, uri, params).await
+        let mut builder = InsertBuilder::new(dest);
+        if let Some(params) = &params {
+            builder = builder.with_params(params);
+        }
+        builder.execute_stream(batches).await
     }
 
     async fn append_impl(

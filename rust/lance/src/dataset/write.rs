@@ -30,8 +30,12 @@ use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
 
+mod insert;
 pub mod merge_insert;
 pub mod update;
+
+pub use insert::InsertBuilder;
+pub use insert::InsertDestination;
 
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]
