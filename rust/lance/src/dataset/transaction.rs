@@ -43,6 +43,7 @@ use std::{
     sync::Arc,
 };
 
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_io::object_store::ObjectStore;
@@ -70,7 +71,7 @@ use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
@@ -94,7 +95,7 @@ pub enum BlobsOperation {
 }
 
 /// An operation on a dataset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
@@ -173,7 +174,13 @@ pub struct RewrittenIndex {
     pub new_id: Uuid,
 }
 
-#[derive(Debug, Clone)]
+impl DeepSizeOf for RewrittenIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,

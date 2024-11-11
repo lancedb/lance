@@ -36,7 +36,7 @@ use rand::{thread_rng, Rng};
 use snafu::{location, Location};
 
 use futures::future::Either;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
@@ -67,6 +67,39 @@ async fn read_transaction_file(
     transaction.try_into()
 }
 
+async fn read_dataset_transaction_file(
+    dataset: &Dataset,
+    version: u64,
+) -> Result<Arc<Transaction>> {
+    let cache_path = dataset
+        .base
+        .child("_transactions")
+        .child(format!("{}.txn", version));
+    dataset
+        .session
+        .file_metadata_cache
+        .get_or_insert(&cache_path, |_| async move {
+            let dataset_version = dataset.checkout_version(version).await?;
+            let object_store = dataset_version.object_store();
+            let path = dataset_version
+                .manifest
+                .transaction_file
+                .as_ref()
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "Dataset version {} does not have a transaction file",
+                        version
+                    ),
+                    location: location!(),
+                })?;
+            let transaction = read_transaction_file(object_store, &dataset.base, path)
+                .await
+                .unwrap();
+            Ok(transaction)
+        })
+        .await
+}
+
 /// Write a transaction to a file and return the relative path.
 async fn write_transaction_file(
     object_store: &ObjectStore,
@@ -86,7 +119,7 @@ async fn write_transaction_file(
 fn check_transaction(
     transaction: &Transaction,
     other_version: u64,
-    other_transaction: &Option<Transaction>,
+    other_transaction: Option<&Transaction>,
 ) -> Result<()> {
     if other_transaction.is_none() {
         return Err(crate::Error::Internal {
@@ -637,32 +670,25 @@ pub(crate) async fn commit_transaction(
     // has not necessarily. So for anything involving writing, use `object_store`.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
-    let mut dataset = dataset.clone();
     // First, get all transactions since read_version
-    let mut other_transactions = Vec::new();
     let mut version = transaction.read_version;
-    loop {
+    let other_transactions = std::iter::from_fn(|| {
         version += 1;
-        match dataset.checkout_version(version).await {
-            Ok(next_dataset) => {
-                let other_txn = if let Some(txn_file) = &next_dataset.manifest.transaction_file {
-                    Some(read_transaction_file(object_store, &next_dataset.base, txn_file).await?)
-                } else {
-                    None
-                };
-                other_transactions.push(other_txn);
-                dataset = next_dataset;
-            }
-            Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
-                break;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
+        Some(read_dataset_transaction_file(dataset, version))
+    });
+    let other_transactions = futures::stream::iter(other_transactions)
+        .buffered(10)
+        .take_while(|res| {
+            futures::future::ready(!matches!(
+                res,
+                Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. })
+            ))
+        })
+        .try_collect::<Vec<_>>()
+        .await?;
 
-    let mut target_version = version;
+    let mut target_version = transaction.read_version + other_transactions.len() as u64 + 1;
+    let mut dataset = dataset.checkout_version(target_version - 1).await?;
 
     if is_detached_version(target_version) {
         return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
@@ -671,7 +697,7 @@ pub(crate) async fn commit_transaction(
     // If any of them conflict with the transaction, return an error
     for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
         let other_version = transaction.read_version + version_offset as u64 + 1;
-        check_transaction(transaction, other_version, other_transaction)?;
+        check_transaction(transaction, other_version, Some(other_transaction.as_ref()))?;
     }
 
     for attempt_i in 0..commit_config.num_retries {
@@ -743,18 +769,24 @@ pub(crate) async fn commit_transaction(
                 let backoff_time = backoff_time(attempt_i);
                 tokio::time::sleep(backoff_time).await;
 
-                let latest_version = dataset.latest_version_id().await?;
-                for version in target_version..=latest_version {
-                    dataset = dataset.checkout_version(version).await?;
-                    let other_transaction = if let Some(txn_file) =
-                        dataset.manifest.transaction_file.as_ref()
-                    {
-                        Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
-                    } else {
-                        None
-                    };
-                    check_transaction(transaction, version, &other_transaction)?;
-                }
+                dataset.checkout_latest().await?;
+                let latest_version = dataset.manifest.version;
+                futures::stream::iter(target_version..=latest_version)
+                    .map(|version| {
+                        read_dataset_transaction_file(&dataset, version)
+                            .map(move |res| res.map(|tx| (version, tx)))
+                    })
+                    .buffer_unordered(10)
+                    .and_then(|(version, other_transaction)| {
+                        let res = check_transaction(
+                            transaction,
+                            version,
+                            Some(other_transaction.as_ref()),
+                        );
+                        futures::future::ready(res)
+                    })
+                    .try_all(|_| futures::future::ready(true))
+                    .await?;
                 target_version = latest_version + 1;
             }
             Err(CommitError::OtherError(err)) => {
@@ -1127,7 +1159,7 @@ mod tests {
         }
     }
 
-    async fn get_empty_dataset() -> Dataset {
+    async fn get_empty_dataset() -> (tempfile::TempDir, Dataset) {
         let test_dir = tempfile::tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
@@ -1137,18 +1169,19 @@ mod tests {
             false,
         )]));
 
-        Dataset::write(
+        let ds = Dataset::write(
             RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
             test_uri,
             None,
         )
         .await
-        .unwrap()
+        .unwrap();
+        (test_dir, ds)
     }
 
     #[tokio::test]
     async fn test_good_concurrent_config_writes() {
-        let dataset = get_empty_dataset().await;
+        let (_tmpdir, dataset) = get_empty_dataset().await;
 
         // Test successful concurrent insert config operations
         let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
@@ -1202,7 +1235,7 @@ mod tests {
     async fn test_bad_concurrent_config_writes() {
         // If two concurrent insert config operations occur for the same key, a
         // `CommitConflict` should be returned
-        let dataset = get_empty_dataset().await;
+        let (_tmpdir, dataset) = get_empty_dataset().await;
 
         let futures: Vec<_> = ["key1", "key1", "key2", "key3", "key4"]
             .iter()
@@ -1220,30 +1253,30 @@ mod tests {
 
         // Assert that either the first or the second operation fails
         let mut first_operation_failed = false;
-        let error_fragment = "Commit conflict for version";
         for (i, result) in results.into_iter().enumerate() {
+            let result = result.unwrap();
             match i {
                 0 => {
-                    if !matches!(result, Ok(Ok(_))) {
+                    if result.is_err() {
                         first_operation_failed = true;
-                        assert!(result
-                            .unwrap()
-                            .err()
-                            .unwrap()
-                            .to_string()
-                            .contains(error_fragment));
+                        assert!(
+                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            "{:?}",
+                            result,
+                        );
                     }
                 }
                 1 => match first_operation_failed {
-                    true => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
-                    false => assert!(result
-                        .unwrap()
-                        .err()
-                        .unwrap()
-                        .to_string()
-                        .contains(error_fragment)),
+                    true => assert!(result.is_ok(), "{:?}", result),
+                    false => {
+                        assert!(
+                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            "{:?}",
+                            result,
+                        );
+                    }
                 },
-                _ => assert!(matches!(result, Ok(Ok(_))), "{:?}", result),
+                _ => assert!(result.is_ok(), "{:?}", result),
             }
         }
     }
