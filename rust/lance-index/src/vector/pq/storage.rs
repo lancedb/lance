@@ -147,7 +147,7 @@ impl PartialEq for ProductQuantizationStorage {
 impl ProductQuantizationStorage {
     pub fn new(
         codebook: FixedSizeListArray,
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
@@ -175,15 +175,17 @@ impl ProductQuantizationStorage {
                 location: location!(),
             });
         };
-        let pq_codes = pq_col
+        let pq_code = pq_col
             .as_fixed_size_list()
             .values()
             .as_primitive::<UInt8Type>();
 
         let pq_code: Arc<UInt8Array> = if transposed {
-            pq_codes.clone().into()
+            pq_code.clone().into()
         } else {
-            transpose(pq_codes, num_sub_vectors, row_ids.len()).into()
+            let pq_code: Arc<_> = transpose(pq_code, num_sub_vectors, row_ids.len()).into();
+            batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code.clone())?;
+            pq_code
         };
 
         Ok(Self {
