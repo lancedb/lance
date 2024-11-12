@@ -31,7 +31,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::MaterializationStyle;
 use lance::dataset::transaction::{
-    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex,
+    RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex, Transaction,
 };
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -40,7 +40,9 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
-use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::dataset::{
+    BatchInfo, BatchUDF, CommitBuilder, InsertDestination, NewColumnTransform, UDFCheckpointStore,
+};
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
@@ -61,7 +63,7 @@ use lance_table::format::Fragment;
 use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::{PyStopIteration, PyTypeError};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
@@ -1383,13 +1385,14 @@ impl Dataset {
 
     #[staticmethod]
     fn commit(
-        dataset_uri: &str,
+        dest: &Bound<PyAny>,
         operation: Operation,
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
+        max_retries: Option<u32>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1403,51 +1406,38 @@ impl Dataset {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
                 as Arc<dyn CommitHandler>
         });
+
+        let dest = if dest.is_instance_of::<Dataset>() {
+            let dataset: Dataset = dest.extract()?;
+            InsertDestination::Dataset(dataset.ds.clone())
+        } else {
+            InsertDestination::Uri(dest.extract()?)
+        };
+
+        let transaction =
+            Transaction::new(read_version.unwrap_or_default(), operation.0, None, None);
+
+        let mut builder = CommitBuilder::new(dest)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
+            .with_detached(detached.unwrap_or(false))
+            .with_max_retries(max_retries.unwrap_or(20));
+
+        if let Some(store_params) = object_store_params {
+            builder = builder.with_store_params(store_params);
+        }
+
+        if let Some(commit_handler) = commit_handler {
+            builder = builder.with_commit_handler(commit_handler);
+        }
+
         let ds = RT
-            .block_on(commit_lock.map(|cl| cl.py()), async move {
-                let mut builder = DatasetBuilder::from_uri(dataset_uri);
-                if let Some(storage_options) = storage_options {
-                    builder = builder.with_storage_options(storage_options);
-                }
-                if let Some(read_version) = read_version {
-                    builder = builder.with_version(read_version);
-                }
-                let dataset = match builder.load().await {
-                    Ok(ds) => Some(ds),
-                    Err(lance::Error::DatasetNotFound { .. }) => None,
-                    Err(err) => return Err(err),
-                };
-                let manifest = dataset.as_ref().map(|ds| ds.manifest());
-                validate_operation(manifest, &operation.0)?;
-                let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-                if detached.unwrap_or(false) {
-                    LanceDataset::commit_detached(
-                        dataset_uri,
-                        operation.0,
-                        read_version,
-                        object_store_params,
-                        commit_handler,
-                        object_store_registry,
-                        enable_v2_manifest_paths.unwrap_or(false),
-                    )
-                    .await
-                } else {
-                    LanceDataset::commit(
-                        dataset_uri,
-                        operation.0,
-                        read_version,
-                        object_store_params,
-                        commit_handler,
-                        object_store_registry,
-                        enable_v2_manifest_paths.unwrap_or(false),
-                    )
-                    .await
-                }
-            })?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            .block_on(commit_lock.map(|cl| cl.py()), builder.execute(transaction))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
         Ok(Self {
             ds: Arc::new(ds),
-            uri: dataset_uri.to_string(),
+            uri,
         })
     }
 
@@ -1546,24 +1536,34 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &Bound<PyAny>, uri: String, options: &PyDict) -> PyResult<Dataset> {
+pub fn write_dataset(
+    reader: &Bound<PyAny>,
+    dest: &Bound<PyAny>,
+    options: &PyDict,
+) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
+    let dest = if dest.is_instance_of::<Dataset>() {
+        let dataset: Dataset = dest.extract()?;
+        InsertDestination::Dataset(dataset.ds.clone())
+    } else {
+        InsertDestination::Uri(dest.extract()?)
+    };
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
+        RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
+        RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
     Ok(Dataset {
-        uri,
+        uri: ds.uri().to_string(),
         ds: Arc::new(ds),
     })
 }

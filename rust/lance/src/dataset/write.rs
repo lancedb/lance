@@ -171,6 +171,10 @@ impl WriteParams {
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
+#[deprecated(
+    since = "0.20.0",
+    note = "Use [`InsertBuilder::write_uncommitted_stream`] instead"
+)]
 pub async fn write_fragments(
     dest: impl Into<InsertDestination<'_>>,
     data: impl RecordBatchReader + Send + 'static,
