@@ -19,7 +19,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::storage::ProductQuantizationStorage;
+use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -245,7 +245,7 @@ impl VectorIndex for PQIndex {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.code_dim() * length;
-        let pq_code = read_fixed_stride_array(
+        let pq_codes = read_fixed_stride_array(
             reader.as_ref(),
             &DataType::UInt8,
             offset,
@@ -264,8 +264,14 @@ impl VectorIndex for PQIndex {
         )
         .await?;
 
+        let pq_codes = transpose(
+            pq_codes.as_primitive(),
+            self.pq.num_sub_vectors,
+            row_ids.len(),
+        );
+
         Ok(Box::new(Self {
-            code: Some(Arc::new(pq_code.as_primitive().clone())),
+            code: Some(Arc::new(pq_codes)),
             row_ids: Some(Arc::new(row_ids.as_primitive().clone())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,

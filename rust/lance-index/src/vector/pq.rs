@@ -219,17 +219,19 @@ impl ProductQuantizer {
                 distance_table.extend(distances);
             });
 
-        // Compute distance from the pre-compute table.
-        Ok(Float32Array::from_iter_values(
-            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                c.iter()
-                    .enumerate()
-                    .map(|(sub_vec_idx, centroid)| {
-                        distance_table[sub_vec_idx * 256 + *centroid as usize]
-                    })
-                    .sum::<f32>()
-            }),
-        ))
+        let num_vectors = code.len() / self.num_sub_vectors;
+        let mut distances = vec![0.0; num_vectors];
+        let num_centroids = num_centroids(self.num_bits);
+        for (sub_vec_idx, vec_indices) in code.values().chunks_exact(num_vectors).enumerate() {
+            let dist_table = &distance_table[sub_vec_idx * num_centroids..];
+            vec_indices
+                .iter()
+                .zip(distances.iter_mut())
+                .for_each(|(&centroid_idx, sum)| {
+                    *sum += dist_table[centroid_idx as usize];
+                });
+        }
+        Ok(distances.into())
     }
 
     fn build_l2_distance_table(&self, key: &dyn Array) -> Result<Vec<f32>> {

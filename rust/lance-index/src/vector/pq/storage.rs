@@ -175,41 +175,15 @@ impl ProductQuantizationStorage {
                 location: location!(),
             });
         };
-        let pq_code_fsl = pq_col.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
-                pq_col.data_type()
-            ),
-            location: location!(),
-        })?;
+        let pq_codes = pq_col
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt8Type>();
 
         let pq_code: Arc<UInt8Array> = if transposed {
-            pq_code_fsl
-                .values()
-                .as_primitive_opt::<UInt8Type>()
-                .ok_or(Error::Index {
-                    message: format!(
-                        "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
-                        pq_col.data_type()
-                    ),
-                    location: location!(),
-                })?
-                .clone()
-                .into()
+            pq_codes.clone().into()
         } else {
-            let mut transposed_code = vec![0; pq_code_fsl.values().len()];
-            for (vec_idx, codes) in pq_code_fsl
-                .values()
-                .as_primitive::<UInt8Type>()
-                .values()
-                .chunks_exact(pq_code_fsl.value_length() as usize)
-                .enumerate()
-            {
-                for (sub_vec_idx, code) in codes.iter().enumerate() {
-                    transposed_code[sub_vec_idx * pq_code_fsl.len() + vec_idx] = *code;
-                }
-            }
-            Arc::new(UInt8Array::from(transposed_code))
+            transpose(pq_codes, num_sub_vectors, row_ids.len()).into()
         };
 
         Ok(Self {
@@ -366,6 +340,16 @@ impl ProductQuantizationStorage {
         writer.finish_with_metadata(&schema_metadata).await?;
         Ok(())
     }
+}
+
+pub fn transpose(pq_codes: &UInt8Array, num_sub_vectors: usize, num_vectors: usize) -> UInt8Array {
+    let mut transposed_codes = vec![0; pq_codes.len()];
+    for (vec_idx, codes) in pq_codes.values().chunks_exact(num_sub_vectors).enumerate() {
+        for (sub_vec_idx, code) in codes.iter().enumerate() {
+            transposed_codes[sub_vec_idx * num_vectors + vec_idx] = *code;
+        }
+    }
+    transposed_codes.into()
 }
 
 #[async_trait]
