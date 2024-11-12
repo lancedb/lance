@@ -21,11 +21,14 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
+use lance::dataset::transaction::Operation;
 use lance::dataset::NewColumnTransform;
+use lance::Error;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
+use snafu::{location, Location};
 
 use crate::dataset::{get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
@@ -474,10 +477,22 @@ pub fn write_fragments(
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
     assert!(
-        written.blob.is_none(),
+        written.blobs_op.is_none(),
         "Blob writing is not yet supported by the python _write_fragments API"
     );
-    let fragments = written.default.0;
+
+    let get_fragments = |operation| match operation {
+        Operation::Overwrite { fragments, .. } => Ok(fragments),
+        Operation::Append { fragments, .. } => Ok(fragments),
+        _ => {
+            return Err(Error::Internal {
+                message: "Unexpected operation".into(),
+                location: location!(),
+            })
+        }
+    };
+    let fragments =
+        get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
     fragments
         .into_iter()

@@ -152,12 +152,18 @@ impl<'a> CommitBuilder<'a> {
             InsertDestination::Dataset(dataset) => InsertDestination::Dataset(dataset.clone()),
             InsertDestination::Uri(uri) => {
                 // Check if it already exists.
-                let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
+                let mut builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: self.store_params.clone(),
                     commit_handler: self.commit_handler.clone(),
                     object_store_registry: self.object_store_registry.clone(),
                     ..Default::default()
                 });
+
+                // If read_version is zero, then it might not have originally been
+                // passed. We can assume the latest version.
+                if transaction.read_version > 0 {
+                    builder = builder.with_version(transaction.read_version)
+                }
 
                 match builder.load().await {
                     Ok(dataset) => InsertDestination::Dataset(Arc::new(dataset)),
@@ -194,6 +200,12 @@ impl<'a> CommitBuilder<'a> {
 
         let manifest = if let Some(dataset) = dest.dataset() {
             if self.detached {
+                if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
+                    return Err(Error::NotSupported {
+                        source: "detached commits cannot be used with v1 manifest paths".into(),
+                        location: location!(),
+                    });
+                }
                 commit_detached_transaction(
                     dataset,
                     object_store.as_ref(),

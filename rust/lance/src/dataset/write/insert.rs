@@ -254,6 +254,15 @@ impl<'a> InsertBuilder<'a> {
             }
         }
 
+        // If we are writing a dataset with non-default storage, we need to enable move stable row ids
+        if context.dest.dataset().is_none()
+            && !context.params.enable_move_stable_row_ids
+            && data_schema.fields.iter().any(|f| !f.is_default_storage())
+        {
+            log::info!("Enabling move stable row ids because non-default storage is used");
+            context.params.enable_move_stable_row_ids = true;
+        }
+
         // Feature flags
         if let InsertDestination::Dataset(dataset) = &context.dest {
             if !can_write_dataset(dataset.manifest.writer_feature_flags) {

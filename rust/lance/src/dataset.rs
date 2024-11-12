@@ -40,7 +40,6 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
-use write::{CommitBuilder, InsertBuilder, InsertDestination};
 
 mod blob;
 pub mod builder;
@@ -85,7 +84,9 @@ pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 pub use write::update::{UpdateBuilder, UpdateJob};
-pub use write::{write_fragments, WriteMode, WriteParams};
+pub use write::{
+    write_fragments, CommitBuilder, InsertBuilder, InsertDestination, WriteMode, WriteParams,
+};
 
 const INDICES_DIR: &str = "_indices";
 
