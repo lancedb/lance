@@ -202,11 +202,11 @@ impl ProductQuantizationStorage {
                 .values()
                 .as_primitive::<UInt8Type>()
                 .values()
-                .chunks_exact(pq_code_fsl.len())
+                .chunks_exact(pq_code_fsl.value_length() as usize)
                 .enumerate()
             {
-                for (cluster_idx, code) in codes.iter().enumerate() {
-                    transposed_code[cluster_idx * pq_code_fsl.len() + vec_idx] = *code;
+                for (sub_vec_idx, code) in codes.iter().enumerate() {
+                    transposed_code[sub_vec_idx * pq_code_fsl.len() + vec_idx] = *code;
                 }
             }
             Arc::new(UInt8Array::from(transposed_code))
