@@ -17,7 +17,6 @@ use lance_io::object_store::ObjectStoreRegistry;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::io::commit::commit_handler_from_url;
 use lance_table::io::commit::CommitHandler;
-use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
 use snafu::{location, Location};
 
@@ -118,7 +117,7 @@ impl<'a> InsertBuilder<'a> {
             .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
             .with_storage_format(context.storage_version)
             .with_object_store_registry(context.params.object_store_registry.clone())
-            .with_manifest_naming_scheme(context.manifest_naming_scheme)
+            .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
             .with_commit_handler(context.commit_handler.clone())
             .with_object_store(context.object_store.clone());
 
@@ -330,14 +329,6 @@ impl<'a> InsertBuilder<'a> {
             (_, InsertDestination::Uri(_)) => params.storage_version_or_default(),
         };
 
-        let manifest_naming_scheme = if let InsertDestination::Dataset(d) = &dest {
-            d.manifest_naming_scheme
-        } else if params.enable_v2_manifest_paths {
-            ManifestNamingScheme::V2
-        } else {
-            ManifestNamingScheme::V1
-        };
-
         Ok(WriteContext {
             params,
             dest,
@@ -345,7 +336,6 @@ impl<'a> InsertBuilder<'a> {
             base_path,
             commit_handler,
             storage_version,
-            manifest_naming_scheme,
         })
     }
 
@@ -399,5 +389,4 @@ struct WriteContext<'a> {
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,
     storage_version: LanceFileVersion,
-    manifest_naming_scheme: ManifestNamingScheme,
 }

@@ -30,7 +30,6 @@ use lance_table::io::commit::{
     ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
-use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
@@ -41,7 +40,7 @@ use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
-use write::{InsertBuilder, InsertDestination};
+use write::{CommitBuilder, InsertBuilder, InsertDestination};
 
 mod blob;
 pub mod builder;
@@ -77,7 +76,7 @@ use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-use lance_table::feature_flags::{apply_feature_flags, can_read_dataset, can_write_dataset};
+use lance_table::feature_flags::{apply_feature_flags, can_read_dataset};
 pub use schema_evolution::{
     BatchInfo, BatchUDF, ColumnAlteration, NewColumnTransform, UDFCheckpointStore,
 };
@@ -645,7 +644,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     async fn do_commit(
-        base_uri: &str,
+        base_uri: InsertDestination<'_>,
         operation: Operation,
         blobs_op: Option<Operation>,
         read_version: Option<u64>,
@@ -666,119 +665,22 @@ impl Dataset {
             Ok,
         )?;
 
-        let (object_store, base, commit_handler) = Self::params_from_uri(
-            base_uri,
-            &commit_handler,
-            &store_params,
-            object_store_registry.clone(),
-        )
-        .await?;
-
-        // Test if the dataset exists
-        let dataset_exists = match commit_handler
-            .resolve_latest_version(&base, &object_store)
-            .await
-        {
-            Ok(_) => true,
-            Err(Error::NotFound { .. }) => false,
-            Err(e) => return Err(e),
-        };
-
-        if !dataset_exists && !matches!(operation, Operation::Overwrite { .. }) {
-            return Err(Error::DatasetNotFound {
-                path: base.to_string(),
-                source: "The dataset must already exist unless the operation is Overwrite".into(),
-                location: location!(),
-            });
-        }
-
-        let dataset = if dataset_exists {
-            let mut builder = DatasetBuilder::from_uri(base_uri).with_read_params(ReadParams {
-                store_options: store_params.clone(),
-                object_store_registry: object_store_registry.clone(),
-                ..Default::default()
-            });
-            if detached {
-                // If we are making a detached commit then base the commit on the read_version.
-                //
-                // Otherwise, we want to use the latest version of the dataset
-                builder = builder.with_version(read_version);
-            }
-            Some(builder.load().await?)
-        } else {
-            None
-        };
-
-        let manifest_naming_scheme = if let Some(ds) = &dataset {
-            ds.manifest_naming_scheme
-        } else if enable_v2_manifest_paths {
-            ManifestNamingScheme::V2
-        } else {
-            ManifestNamingScheme::V1
-        };
-
         let transaction = Transaction::new(read_version, operation, blobs_op, None);
 
-        let manifest = if let Some(dataset) = &dataset {
-            if detached {
-                if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
-                    return Err(Error::NotSupported {
-                        source: "detached commits cannot be used with v1 manifest paths".into(),
-                        location: location!(),
-                    });
-                }
-                commit_detached_transaction(
-                    dataset,
-                    &object_store,
-                    commit_handler.as_ref(),
-                    &transaction,
-                    &Default::default(),
-                    &Default::default(),
-                )
-                .await?
-            } else {
-                commit_transaction(
-                    dataset,
-                    &object_store,
-                    commit_handler.as_ref(),
-                    &transaction,
-                    &Default::default(),
-                    &Default::default(),
-                    manifest_naming_scheme,
-                )
-                .await?
-            }
-        } else if !detached {
-            commit_new_dataset(
-                &object_store,
-                commit_handler.as_ref(),
-                &base,
-                &transaction,
-                &Default::default(),
-                manifest_naming_scheme,
-            )
-            .await?
-        } else {
-            // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
-            return Err(Error::NotSupported {
-                source: "detached commits cannot currently be used to create new datasets".into(),
-                location: location!(),
-            });
-        };
+        let mut builder = CommitBuilder::new(base_uri)
+            .with_object_store_registry(object_store_registry)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths)
+            .with_detached(detached);
 
-        let object_store = Arc::new(object_store);
-        let tags = Tags::new(object_store.clone(), commit_handler.clone(), base.clone());
+        if let Some(store_params) = store_params {
+            builder = builder.with_store_params(store_params);
+        }
 
-        Ok(Self {
-            object_store,
-            base,
-            uri: base_uri.to_string(),
-            manifest: Arc::new(manifest),
-            session: Arc::new(Session::default()),
-            commit_handler,
-            tags,
-            manifest_naming_scheme,
-        })
+        if let Some(commit_handler) = commit_handler {
+            builder = builder.with_commit_handler(commit_handler);
+        }
+
+        builder.execute(transaction).await
     }
 
     /// Commit changes to the dataset
@@ -816,7 +718,7 @@ impl Dataset {
     ///   this on will make the dataset unreadable for older versions of Lance
     ///   (prior to 0.17.0). Default is False.
     pub async fn commit(
-        base_uri: &str,
+        dest: impl Into<InsertDestination<'_>>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -825,7 +727,7 @@ impl Dataset {
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
-            base_uri,
+            dest.into(),
             operation,
             // TODO: Allow blob operations to be specified? (breaking change?)
             /*blobs_op=*/
@@ -849,7 +751,7 @@ impl Dataset {
     /// This can be used to stage changes or to handle "secondary" datasets whose
     /// lineage is tracked elsewhere.
     pub async fn commit_detached(
-        base_uri: &str,
+        dest: impl Into<InsertDestination<'_>>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -858,7 +760,7 @@ impl Dataset {
         enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         Self::do_commit(
-            base_uri,
+            dest.into(),
             operation,
             // TODO: Allow blob operations to be specified? (breaking change?)
             /*blobs_op=*/
