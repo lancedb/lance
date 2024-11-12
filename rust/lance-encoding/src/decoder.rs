@@ -248,6 +248,7 @@ use crate::encodings::logical::r#struct::{
 };
 use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
+use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
@@ -497,6 +498,9 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             }
             pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => {
                 Ok(Box::new(BinaryMiniBlockDecompressor::default()))
+            }
+            pb::array_encoding::ArrayEncoding::FsstMiniBlock(description) => {
+                Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
             }
             _ => todo!(),
         }
