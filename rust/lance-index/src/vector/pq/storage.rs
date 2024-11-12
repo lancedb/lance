@@ -10,7 +10,7 @@ use std::{cmp::min, collections::HashMap, sync::Arc};
 use arrow::datatypes::{self};
 use arrow_array::{
     cast::AsArray,
-    types::{Float32Type, UInt64Type, UInt8Type},
+    types::{Float32Type, UInt64Type},
     FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
 use arrow_array::{Array, ArrayRef};
@@ -169,24 +169,26 @@ impl ProductQuantizationStorage {
             .clone()
             .into();
 
-        let Some(pq_col) = batch.column_by_name(PQ_CODE_COLUMN) else {
-            return Err(Error::Index {
-                message: format!("{PQ_CODE_COLUMN} column not found from PQ storage"),
-                location: location!(),
-            });
-        };
-        let pq_code = pq_col
+        if !transposed {
+            let pq_col = batch[PQ_CODE_COLUMN].as_fixed_size_list();
+            let transposed_code = transpose(
+                pq_col.values().as_primitive(),
+                num_sub_vectors,
+                row_ids.len(),
+            );
+            let pq_code_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                transposed_code,
+                num_sub_vectors as i32,
+            )?);
+            batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code_fsl)?;
+        }
+
+        let pq_code = batch[PQ_CODE_COLUMN]
             .as_fixed_size_list()
             .values()
-            .as_primitive::<UInt8Type>();
-
-        let pq_code: Arc<UInt8Array> = if transposed {
-            pq_code.clone().into()
-        } else {
-            let pq_code: Arc<_> = transpose(pq_code, num_sub_vectors, row_ids.len()).into();
-            batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code.clone())?;
-            pq_code
-        };
+            .as_primitive()
+            .clone()
+            .into();
 
         Ok(Self {
             codebook,

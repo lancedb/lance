@@ -16,7 +16,9 @@ use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
 use lance_index::vector::flat::storage::FlatStorage;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::quantizer::{QuantizationType, QuantizerBuildParams};
+use lance_index::vector::quantizer::{
+    QuantizationMetadata, QuantizationType, QuantizerBuildParams,
+};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
@@ -573,7 +575,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         storage_writer.add_schema_metadata(IVF_METADATA_KEY, ivf_buffer_pos.to_string());
         // For now, each partition's metadata is just the quantizer,
         // it's all the same for now, so we just take the first one
-        let storage_partition_metadata = vec![quantizer.metadata(None)?.to_string()];
+        let storage_partition_metadata = vec![quantizer
+            .metadata(Some(QuantizationMetadata {
+                codebook_position: Some(0),
+                codebook: None,
+                transposed: true,
+            }))?
+            .to_string()];
         storage_writer.add_schema_metadata(
             STORAGE_METADATA_KEY,
             serde_json::to_string(&storage_partition_metadata)?,

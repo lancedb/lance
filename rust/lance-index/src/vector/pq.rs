@@ -384,7 +384,7 @@ impl Quantization for ProductQuantizer {
     }
 
     fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
-        let codebook_position = match args {
+        let codebook_position = match &args {
             Some(args) => args.codebook_position,
             None => Some(0),
         };
@@ -400,7 +400,7 @@ impl Quantization for ProductQuantizer {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: tensor.encode_to_vec(),
-            transposed: false,
+            transposed: args.map(|args| args.transposed).unwrap_or_default(),
         })?)
     }
 
