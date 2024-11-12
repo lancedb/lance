@@ -76,31 +76,48 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
+    // here `code` has been transposed,
+    // so code[i][j] is the code of i-th sub-vector of the j-th vector,
+    // and `code` is a flatten array of [num_sub_vectors, num_vectors] u8,
+    // so code[i * num_vectors + j] is the code of i-th sub-vector of the j-th vector.
+    let num_vectors = code.len() / num_sub_vectors;
+    let mut distances = vec![0.0_f32; num_vectors];
     let num_centroids = num_centroids(num_bits);
+    for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
+        let dist_table = &distance_table[sub_vec_idx * num_centroids..];
+        vec_indices
+            .iter()
+            .zip(distances.iter_mut())
+            .for_each(|(&centroid_idx, sum)| {
+                *sum += dist_table[centroid_idx as usize];
+            });
+    }
 
-    let iter = code.chunks_exact(num_sub_vectors * V);
-    let distances = iter.clone().flat_map(|c| {
-        let mut sums = [0.0_f32; V];
-        for i in (0..num_sub_vectors).step_by(C) {
-            for (vec_idx, sum) in sums.iter_mut().enumerate() {
-                let vec_start = vec_idx * num_sub_vectors;
-                let s = c[vec_start + i..]
-                    .iter()
-                    .take(min(C, num_sub_vectors - i))
-                    .enumerate()
-                    .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
-                    .sum::<f32>();
-                *sum += s;
-            }
-        }
-        sums.into_iter()
-    });
+    distances
+
+    // let iter = code.chunks_exact(num_sub_vectors * V);
+    // let distances = iter.clone().flat_map(|c| {
+    //     let mut sums = [0.0_f32; V];
+    //     for i in (0..num_sub_vectors).step_by(C) {
+    //         for (vec_idx, sum) in sums.iter_mut().enumerate() {
+    //             let vec_start = vec_idx * num_sub_vectors;
+    //             let s = c[vec_start + i..]
+    //                 .iter()
+    //                 .take(min(C, num_sub_vectors - i))
+    //                 .enumerate()
+    //                 .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
+    //                 .sum::<f32>();
+    //             *sum += s;
+    //         }
+    //     }
+    //     sums.into_iter()
+    // });
     // Remainder
-    let remainder = iter.remainder().chunks(num_sub_vectors).map(|c| {
-        c.iter()
-            .enumerate()
-            .map(|(sub_vec_idx, code)| distance_table[sub_vec_idx * num_centroids + *code as usize])
-            .sum::<f32>()
-    });
-    distances.chain(remainder).collect()
+    // let remainder = iter.remainder().chunks(num_sub_vectors).map(|c| {
+    //     c.iter()
+    //         .enumerate()
+    //         .map(|(sub_vec_idx, code)| distance_table[sub_vec_idx * num_centroids + *code as usize])
+    //         .sum::<f32>()
+    // });
+    // distances.chain(remainder).collect()
 }
