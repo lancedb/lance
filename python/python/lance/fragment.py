@@ -487,7 +487,7 @@ class LanceFragment(pa.dataset.Fragment):
 
 def write_fragments(
     data: ReaderLike,
-    dataset_uri: Union[str, Path],
+    dataset_uri: Union[str, Path, LanceDataset],
     schema: Optional[pa.Schema] = None,
     *,
     mode: str = "append",
@@ -511,8 +511,8 @@ def write_fragments(
     ----------
     data : pa.Table or pa.RecordBatchReader
         The data to be written to the fragment.
-    dataset_uri : str
-        The URI of the dataset.
+    dataset_uri : str, Path, or LanceDataset
+        The URI of the dataset or the dataset object.
     schema : pa.Schema, optional
         The schema of the data. If not specified, the schema will be inferred
         from the data.
@@ -552,6 +552,8 @@ def write_fragments(
         fragment ids are left as zero meaning they are not yet specified. They
         will be assigned when the fragments are committed to a dataset.
     """
+    from .dataset import LanceDataset
+
     if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
         reader = pa.Table.from_pandas(data, schema=schema).to_reader()
     elif isinstance(data, pa.Table):
@@ -565,6 +567,10 @@ def write_fragments(
 
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
+    elif isinstance(dataset_uri, LanceDataset):
+        dataset_uri = dataset_uri._ds
+    elif not isinstance(dataset_uri, str):
+        raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
 
     if use_legacy_format is not None:
         warnings.warn(

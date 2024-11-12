@@ -22,7 +22,7 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::transaction::Operation;
-use lance::dataset::NewColumnTransform;
+use lance::dataset::{InsertBuilder, InsertDestination, NewColumnTransform};
 use lance::Error;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
@@ -457,9 +457,9 @@ impl FragmentMetadata {
 }
 
 #[pyfunction(name = "_write_fragments")]
-#[pyo3(signature = (dataset_uri, reader, **kwargs))]
+#[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
-    dataset_uri: &str,
+    dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
 ) -> PyResult<Vec<FragmentMetadata>> {
@@ -470,10 +470,20 @@ pub fn write_fragments(
         .transpose()?
         .unwrap_or_default();
 
+    let dest = if dest.is_instance_of::<Dataset>() {
+        let dataset: Dataset = dest.extract()?;
+        InsertDestination::Dataset(dataset.ds.clone())
+    } else {
+        InsertDestination::Uri(dest.extract()?)
+    };
+
     let written = RT
-        .block_on(Some(reader.py()), async {
-            lance::dataset::write_fragments(dataset_uri, batches, params).await
-        })?
+        .block_on(
+            Some(reader.py()),
+            InsertBuilder::new(dest)
+                .with_params(&params)
+                .write_uncommitted_stream(batches),
+        )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
     assert!(
