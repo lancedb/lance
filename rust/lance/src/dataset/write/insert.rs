@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -23,10 +22,14 @@ use object_store::path::Path;
 use snafu::{location, Location};
 
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::Transaction;
+use crate::dataset::write::write_fragments_internal;
 use crate::dataset::ReadParams;
 use crate::Dataset;
 use crate::{Error, Result};
 
+use super::commit::CommitBuilder;
 use super::WriteMode;
 use super::WriteParams;
 
@@ -34,6 +37,15 @@ use super::WriteParams;
 pub enum InsertDestination<'a> {
     Dataset(Arc<Dataset>),
     Uri(&'a str),
+}
+
+impl InsertDestination<'_> {
+    pub fn dataset(&self) -> Option<&Dataset> {
+        match self {
+            InsertDestination::Dataset(dataset) => Some(dataset.as_ref()),
+            InsertDestination::Uri(_) => None,
+        }
+    }
 }
 
 impl From<Arc<Dataset>> for InsertDestination<'_> {
@@ -45,6 +57,12 @@ impl From<Arc<Dataset>> for InsertDestination<'_> {
 impl<'a> From<&'a str> for InsertDestination<'a> {
     fn from(uri: &'a str) -> Self {
         InsertDestination::Uri(uri)
+    }
+}
+
+impl<'a> From<&'a String> for InsertDestination<'a> {
+    fn from(uri: &'a String) -> Self {
+        InsertDestination::Uri(uri.as_str())
     }
 }
 
@@ -94,12 +112,97 @@ impl<'a> InsertBuilder<'a> {
         &self,
         stream: Box<dyn RecordBatchReader + Send + 'static>,
     ) -> Result<Dataset> {
-        let context = self.resolve_context().await?;
+        let (transaction, context) = self.write_uncommitted_stream_impl(stream).await?;
+
+        let mut commit_builder = CommitBuilder::new(context.dest.clone())
+            .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
+            .with_storage_format(context.storage_version)
+            .with_object_store_registry(context.params.object_store_registry.clone())
+            .with_manifest_naming_scheme(context.manifest_naming_scheme)
+            .with_commit_handler(context.commit_handler.clone())
+            .with_object_store(context.object_store.clone());
+
+        if let Some(params) = context.params.store_params.as_ref() {
+            commit_builder = commit_builder.with_store_params(params.clone());
+        }
+
+        if let Some(session) = context.params.session.as_ref() {
+            commit_builder = commit_builder.with_session(session.clone());
+        }
+
+        commit_builder.execute(transaction).await
+    }
+
+    /// Write data files, but don't commit the transaction yet.
+    ///
+    /// Use CommitBuilder to commit the transaction.
+    pub async fn write_uncommitted(&self, data: &[RecordBatch]) -> Result<Transaction> {
+        todo!()
+    }
+
+    /// Write but don't commit the transaction yet.
+    pub async fn write_uncommitted_stream(
+        &self,
+        stream: Box<dyn RecordBatchReader + Send + 'static>,
+    ) -> Result<Transaction> {
+        let (transaction, _) = self.write_uncommitted_stream_impl(stream).await?;
+        Ok(transaction)
+    }
+
+    async fn write_uncommitted_stream_impl(
+        &self,
+        stream: Box<dyn RecordBatchReader + Send + 'static>,
+    ) -> Result<(Transaction, WriteContext<'_>)> {
+        let mut context = self.resolve_context().await?;
 
         let (batches, schema) = peek_reader_schema(stream).await?;
         let stream = reader_to_stream(batches);
 
-        todo!()
+        self.validate_write(&mut context, &schema)?;
+
+        let written_frags = write_fragments_internal(
+            context.dest.dataset(),
+            context.object_store.clone(),
+            &context.base_path,
+            schema.clone(),
+            stream,
+            context.params.clone(),
+        )
+        .await?;
+
+        let operation = match context.params.mode {
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                // Use the full schema, not the written schema
+                schema,
+                fragments: written_frags.default.0,
+                config_upsert_values: None,
+            },
+            WriteMode::Append => Operation::Append {
+                fragments: written_frags.default.0,
+            },
+        };
+
+        let blobs_op = written_frags.blob.map(|blob| match context.params.mode {
+            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+                schema: blob.1,
+                fragments: blob.0,
+                config_upsert_values: None,
+            },
+            WriteMode::Append => Operation::Append { fragments: blob.0 },
+        });
+
+        let transaction = Transaction::new(
+            context
+                .dest
+                .dataset()
+                .map(|ds| ds.manifest.version)
+                .unwrap_or(0),
+            operation,
+            blobs_op,
+            None,
+        );
+
+        Ok((transaction, context))
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
@@ -113,8 +216,7 @@ impl<'a> InsertBuilder<'a> {
             }
             (WriteMode::Append | WriteMode::Overwrite, InsertDestination::Uri(uri)) => {
                 log::warn!("No existing dataset at {uri}, it will be created");
-                // TODO: do I need to add this back in?
-                // context.params.mode = WriteMode::Create;
+                context.params.mode = WriteMode::Create;
             }
             _ => {}
         }

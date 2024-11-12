@@ -12,12 +12,10 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
-use lance_core::datatypes::NullabilityComparison;
+use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
-use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
@@ -469,237 +467,6 @@ impl Dataset {
         })
     }
 
-    #[instrument(skip(batches, params))]
-    async fn write_impl(
-        batches: Box<dyn RecordBatchReader + Send>,
-        uri: &str,
-        params: Option<WriteParams>,
-    ) -> Result<Self> {
-        let mut params = params.unwrap_or_default();
-        let (object_store, base, commit_handler) = Self::params_from_uri(
-            uri,
-            &params.commit_handler,
-            &params.store_params,
-            params.object_store_registry.clone(),
-        )
-        .await?;
-
-        // Read expected manifest path for the dataset
-        let dataset_exists = match commit_handler
-            .resolve_latest_version(&base, &object_store)
-            .await
-        {
-            Ok(_) => true,
-            Err(Error::NotFound { .. }) => false,
-            Err(e) => return Err(e),
-        };
-
-        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
-        let stream = reader_to_stream(batches);
-
-        // Running checks for the different write modes
-        // create + dataset already exists = error
-        if dataset_exists && matches!(params.mode, WriteMode::Create) {
-            return Err(Error::DatasetAlreadyExists {
-                uri: uri.to_owned(),
-                location: location!(),
-            });
-        }
-
-        // append + dataset doesn't already exists = warn + switch to create mode
-        if !dataset_exists
-            && (matches!(params.mode, WriteMode::Append)
-                || matches!(params.mode, WriteMode::Overwrite))
-        {
-            warn!("No existing dataset at {uri}, it will be created");
-            params = WriteParams {
-                mode: WriteMode::Create,
-                ..params
-            };
-        }
-
-        let dataset = if matches!(params.mode, WriteMode::Create) {
-            None
-        } else {
-            // pull the store params from write params because there might be creds in there
-            Some(
-                DatasetBuilder::from_uri(uri)
-                    .with_read_params(ReadParams {
-                        store_options: params.store_params.clone(),
-                        commit_handler: params.commit_handler.clone(),
-                        object_store_registry: params.object_store_registry.clone(),
-                        ..Default::default()
-                    })
-                    .load()
-                    .await?,
-            )
-        };
-
-        let mut storage_version = match (params.mode, dataset.as_ref()) {
-            (WriteMode::Append, Some(dataset)) => {
-                // If appending to an existing dataset, always use the dataset version
-                let m = dataset.manifest.as_ref();
-                m.data_storage_format.lance_file_version()?
-            }
-            (WriteMode::Overwrite, Some(dataset)) => {
-                // If overwriting an existing dataset, allow the user to specify but use
-                // the existing version if they don't
-                params.data_storage_version.map(Ok).unwrap_or_else(|| {
-                    let m = dataset.manifest.as_ref();
-                    m.data_storage_format.lance_file_version()
-                })?
-            }
-            // Otherwise (no existing dataset) fallback to the default if the user didn't specify
-            _ => params.storage_version_or_default(),
-        };
-
-        // append + input schema different from existing schema = error
-        if matches!(params.mode, WriteMode::Append) {
-            if let Some(d) = dataset.as_ref() {
-                // If the dataset is already using (or not using) move stable row ids, we need to match
-                // and ignore whatever the user provided as input
-                if params.enable_move_stable_row_ids != d.manifest.uses_move_stable_row_ids() {
-                    info!(
-                        "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
-                        params.enable_move_stable_row_ids,
-                        d.manifest.uses_move_stable_row_ids()
-                    );
-                    params.enable_move_stable_row_ids = d.manifest.uses_move_stable_row_ids();
-                }
-                let m = d.manifest.as_ref();
-                let mut schema_cmp_opts = SchemaCompareOptions {
-                    compare_dictionary: true,
-                    // array nullability is checked later, using actual data instead
-                    // of the schema
-                    compare_nullability: NullabilityComparison::Ignore,
-                    ..Default::default()
-                };
-                if m.blob_dataset_version.is_none() {
-                    // Balanced datasets don't yet support schema evolution
-                    schema_cmp_opts.ignore_field_order = true;
-                    schema_cmp_opts.allow_missing_if_nullable = true;
-                }
-
-                schema.check_compatible(&m.schema, &schema_cmp_opts)?;
-                // If appending, always use existing storage version
-                storage_version = m.data_storage_format.lance_file_version()?;
-            }
-        }
-
-        // If we are writing a dataset with non-default storage, we need to enable move stable row ids
-        if dataset.is_none()
-            && !params.enable_move_stable_row_ids
-            && schema.fields.iter().any(|f| !f.is_default_storage())
-        {
-            info!("Enabling move stable row ids because non-default storage is used");
-            params.enable_move_stable_row_ids = true;
-        }
-
-        let manifest_naming_scheme = if let Some(d) = dataset.as_ref() {
-            d.manifest_naming_scheme
-        } else if params.enable_v2_manifest_paths {
-            ManifestNamingScheme::V2
-        } else {
-            ManifestNamingScheme::V1
-        };
-
-        let params = params; // discard mut
-
-        if let Some(d) = dataset.as_ref() {
-            if !can_write_dataset(d.manifest.writer_feature_flags) {
-                let message = format!(
-                    "This dataset cannot be written by this version of Lance. \
-                Please upgrade Lance to write to this dataset.\n Flags: {}",
-                    d.manifest.writer_feature_flags
-                );
-                return Err(Error::NotSupported {
-                    source: message.into(),
-                    location: location!(),
-                });
-            }
-        }
-
-        let object_store = Arc::new(object_store);
-        let written_frags = write_fragments_internal(
-            dataset.as_ref(),
-            object_store.clone(),
-            &base,
-            schema.clone(),
-            stream,
-            params.clone(),
-        )
-        .await?;
-
-        let operation = match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
-                // Use the full schema, not the written schema
-                schema,
-                fragments: written_frags.default.0,
-                config_upsert_values: None,
-            },
-            WriteMode::Append => Operation::Append {
-                fragments: written_frags.default.0,
-            },
-        };
-
-        let blobs_op = written_frags.blob.map(|blob| match params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
-                schema: blob.1,
-                fragments: blob.0,
-                config_upsert_values: None,
-            },
-            WriteMode::Append => Operation::Append { fragments: blob.0 },
-        });
-
-        let transaction = Transaction::new(
-            dataset.as_ref().map(|ds| ds.manifest.version).unwrap_or(0),
-            operation,
-            blobs_op,
-            None,
-        );
-
-        let manifest_config = ManifestWriteConfig {
-            use_move_stable_row_ids: params.enable_move_stable_row_ids,
-            storage_format: Some(DataStorageFormat::new(storage_version)),
-            ..Default::default()
-        };
-        let manifest = if let Some(dataset) = &dataset {
-            commit_transaction(
-                dataset,
-                &object_store,
-                commit_handler.as_ref(),
-                &transaction,
-                &manifest_config,
-                &Default::default(),
-                manifest_naming_scheme,
-            )
-            .await?
-        } else {
-            commit_new_dataset(
-                &object_store,
-                commit_handler.as_ref(),
-                &base,
-                &transaction,
-                &manifest_config,
-                manifest_naming_scheme,
-            )
-            .await?
-        };
-
-        let tags = Tags::new(object_store.clone(), commit_handler.clone(), base.clone());
-
-        Ok(Self {
-            object_store,
-            base,
-            uri: uri.to_string(),
-            manifest: Arc::new(manifest),
-            session: Arc::new(Session::default()),
-            commit_handler,
-            tags,
-            manifest_naming_scheme,
-        })
-    }
-
     /// Write to or Create a [Dataset] with a stream of [RecordBatch]s.
     ///
     /// `dest` can be a `&str`, `object_store::path::Path` or `Arc<Dataset>`.
@@ -719,94 +486,6 @@ impl Dataset {
         builder.execute_stream(batches).await
     }
 
-    async fn append_impl(
-        &mut self,
-        batches: Box<dyn RecordBatchReader + Send>,
-        params: Option<WriteParams>,
-    ) -> Result<()> {
-        // Force append mode
-        let mut params = WriteParams {
-            mode: WriteMode::Append,
-            ..params.unwrap_or_default()
-        };
-
-        if params.commit_handler.is_some() || params.store_params.is_some() {
-            return Err(Error::InvalidInput {
-                source: "commit_handler / store_params should not be specified when calling append"
-                    .into(),
-                location: location!(),
-            });
-        }
-
-        let (batches, schema) = peek_reader_schema(Box::new(batches)).await?;
-        let stream = reader_to_stream(batches);
-
-        // Return Error if append and input schema differ
-        let mut schema_cmp_opts = SchemaCompareOptions {
-            compare_dictionary: true,
-            // array nullability is checked later, using actual data instead
-            // of the schema
-            compare_nullability: NullabilityComparison::Ignore,
-            ..Default::default()
-        };
-        if self.manifest.blob_dataset_version.is_none() {
-            // Balanced datasets don't yet support schema evolution
-            schema_cmp_opts.ignore_field_order = true;
-            schema_cmp_opts.allow_missing_if_nullable = true;
-        }
-
-        schema.check_compatible(&self.manifest.schema, &schema_cmp_opts)?;
-
-        // If the dataset is already using (or not using) move stable row ids, we need to match
-        // and ignore whatever the user provided as input
-        if params.enable_move_stable_row_ids != self.manifest.uses_move_stable_row_ids() {
-            info!(
-                "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
-                params.enable_move_stable_row_ids,
-                self.manifest.uses_move_stable_row_ids()
-            );
-            params.enable_move_stable_row_ids = self.manifest.uses_move_stable_row_ids();
-        }
-
-        let written_frags = write_fragments_internal(
-            Some(self),
-            self.object_store.clone(),
-            &self.base,
-            schema,
-            stream,
-            params.clone(),
-        )
-        .await?;
-
-        let blobs_op = written_frags
-            .blob
-            .map(|blobs| Operation::Append { fragments: blobs.0 });
-
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::Append {
-                fragments: written_frags.default.0,
-            },
-            blobs_op,
-            None,
-        );
-
-        let new_manifest = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
-
-        self.manifest = Arc::new(new_manifest);
-
-        Ok(())
-    }
-
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
     ///
     /// Returns void result or Returns [Error]
@@ -815,10 +494,19 @@ impl Dataset {
         batches: impl RecordBatchReader + Send + 'static,
         params: Option<WriteParams>,
     ) -> Result<()> {
-        // Box it so we don't monomorphize for every one. We take the generic
-        // parameter for API ergonomics.
-        let batches = Box::new(batches);
-        self.append_impl(batches, params).await
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            ..params.unwrap_or_default()
+        };
+
+        let new_dataset = InsertBuilder::new(InsertDestination::Dataset(Arc::new(self.clone())))
+            .with_params(&write_params)
+            .execute_stream(batches)
+            .await?;
+
+        *self = new_dataset;
+
+        Ok(())
     }
 
     /// Get the fully qualified URI of this dataset.

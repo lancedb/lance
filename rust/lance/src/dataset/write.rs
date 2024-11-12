@@ -23,6 +23,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::session::Session;
 use crate::Dataset;
 
 use super::blob::BlobStreamExt;
@@ -30,6 +31,7 @@ use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
 use super::DATA_DIR;
 
+mod commit;
 mod insert;
 pub mod merge_insert;
 pub mod update;
@@ -124,6 +126,8 @@ pub struct WriteParams {
     pub enable_v2_manifest_paths: bool,
 
     pub object_store_registry: Arc<ObjectStoreRegistry>,
+
+    pub session: Option<Arc<Session>>,
 }
 
 impl Default for WriteParams {
@@ -142,6 +146,7 @@ impl Default for WriteParams {
             enable_move_stable_row_ids: false,
             enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
+            session: None,
         }
     }
 }
