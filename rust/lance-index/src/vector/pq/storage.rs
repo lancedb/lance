@@ -62,6 +62,7 @@ pub struct ProductQuantizationMetadata {
 
     // empty for old format
     pub codebook_tensor: Vec<u8>,
+    pub transposed: bool,
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
@@ -151,6 +152,7 @@ impl ProductQuantizationStorage {
         num_sub_vectors: usize,
         dimension: usize,
         distance_type: DistanceType,
+        transposed: bool,
     ) -> Result<Self> {
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
@@ -180,18 +182,35 @@ impl ProductQuantizationStorage {
             ),
             location: location!(),
         })?;
-        let pq_code: Arc<UInt8Array> = pq_code_fsl
-            .values()
-            .as_primitive_opt::<UInt8Type>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
-                    pq_col.data_type()
-                ),
-                location: location!(),
-            })?
-            .clone()
-            .into();
+
+        let pq_code: Arc<UInt8Array> = if transposed {
+            pq_code_fsl
+                .values()
+                .as_primitive_opt::<UInt8Type>()
+                .ok_or(Error::Index {
+                    message: format!(
+                        "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
+                        pq_col.data_type()
+                    ),
+                    location: location!(),
+                })?
+                .clone()
+                .into()
+        } else {
+            let mut transposed_code = vec![0; pq_code_fsl.values().len()];
+            for (vec_idx, codes) in pq_code_fsl
+                .values()
+                .as_primitive::<UInt8Type>()
+                .values()
+                .chunks_exact(pq_code_fsl.len())
+                .enumerate()
+            {
+                for (cluster_idx, code) in codes.iter().enumerate() {
+                    transposed_code[cluster_idx * pq_code_fsl.len() + vec_idx] = *code;
+                }
+            }
+            Arc::new(UInt8Array::from(transposed_code))
+        };
 
         Ok(Self {
             codebook,
@@ -231,7 +250,6 @@ impl ProductQuantizationStorage {
         let metric_type = quantizer.distance_type;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch)?;
-
         Self::new(
             codebook,
             batch,
@@ -239,6 +257,7 @@ impl ProductQuantizationStorage {
             num_sub_vectors,
             dimension,
             metric_type,
+            false,
         )
     }
 
@@ -327,6 +346,7 @@ impl ProductQuantizationStorage {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: Vec::new(),
+            transposed: true,
         };
 
         let index_metadata = IndexMetadata {
@@ -373,6 +393,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             .values()
             .as_primitive::<Float32Type>()
             .clone();
+
         let codebook =
             FixedSizeListArray::try_new_from_values(codebook, metadata.dimension as i32)?;
 
@@ -386,6 +407,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.num_sub_vectors,
             metadata.dimension,
             distance_type,
+            metadata.transposed,
         )
     }
 }
@@ -411,35 +433,15 @@ impl VectorStore for ProductQuantizationStorage {
         let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
         let codebook = FixedSizeListArray::try_from(&codebook_tensor)?;
 
-        let row_ids = batch
-            .column_by_name(ROW_ID)
-            .ok_or(Error::Index {
-                message: "Row IDs column not found in batch".to_string(),
-                location: location!(),
-            })?
-            .as_primitive::<UInt64Type>()
-            .clone();
-        let pq_code = batch
-            .column_by_name(PQ_CODE_COLUMN)
-            .ok_or(Error::Index {
-                message: "PQ code column not found in batch".to_string(),
-                location: location!(),
-            })?
-            .as_fixed_size_list()
-            .values()
-            .as_primitive::<UInt8Type>()
-            .clone();
-
-        Ok(Self {
+        Self::new(
             codebook,
             batch,
-            num_bits: metadata.num_bits,
-            num_sub_vectors: metadata.num_sub_vectors,
-            dimension: metadata.dimension,
+            metadata.num_bits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
             distance_type,
-            pq_code: Arc::new(pq_code),
-            row_ids: Arc::new(row_ids),
-        })
+            metadata.transposed,
+        )
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
@@ -451,6 +453,7 @@ impl VectorStore for ProductQuantizationStorage {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: codebook,
+            transposed: true, // we always transpose the pq codes for efficiency
         };
 
         let metadata_json = serde_json::to_string(&metadata)?;

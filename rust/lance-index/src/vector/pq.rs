@@ -398,6 +398,7 @@ impl Quantization for ProductQuantizer {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: tensor.encode_to_vec(),
+            transposed: false,
         })?)
     }
 

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::cmp::min;
-
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
@@ -80,6 +78,8 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
     // so code[i][j] is the code of i-th sub-vector of the j-th vector,
     // and `code` is a flatten array of [num_sub_vectors, num_vectors] u8,
     // so code[i * num_vectors + j] is the code of i-th sub-vector of the j-th vector.
+
+    // `distance_table` is a flatten array of [num_sub_vectors, num_centroids] f32,
     let num_vectors = code.len() / num_sub_vectors;
     let mut distances = vec![0.0_f32; num_vectors];
     let num_centroids = num_centroids(num_bits);

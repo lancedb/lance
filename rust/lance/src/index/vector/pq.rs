@@ -448,6 +448,7 @@ pub(crate) fn build_pq_storage(
         pq.code_dim(),
         pq.dimension,
         distance_type,
+        false,
     )?;
 
     Ok(pq_store)
