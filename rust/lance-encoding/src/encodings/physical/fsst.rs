@@ -288,9 +288,8 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         let binary_decompressor =
             Box::new(BinaryMiniBlockDecompressor::default()) as Box<dyn MiniBlockDecompressor>;
         let compressed_data_block = binary_decompressor.decompress(data, num_values)?;
-        let mut compressed_data_block = match compressed_data_block {
-            DataBlock::VariableWidth(variable) => variable,
-            _ => panic!("Received non-variable width data from BinaryMiniBlockDecompressor."),
+        let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
+            panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
         };
 
         // Step 2. FSST decompress
