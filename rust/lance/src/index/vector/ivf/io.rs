@@ -24,6 +24,7 @@ use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HnswMetadata};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{Quantization, Quantizer};
 use lance_index::vector::v3::subindex::IvfSubIndex;
@@ -199,9 +200,14 @@ pub(super) async fn write_pq_partitions(
                             location: location!(),
                         })?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
+                    let original_pq_codes = transpose(
+                        pq_code,
+                        pq_index.pq.num_sub_vectors,
+                        pq_code.len() / pq_index.pq.code_dim(),
+                    );
                     let fsl = Arc::new(
                         FixedSizeListArray::try_new_from_values(
-                            pq_code.as_ref().clone(),
+                            original_pq_codes,
                             pq_index.pq.code_dim() as i32,
                         )
                         .unwrap(),
