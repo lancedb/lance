@@ -94,30 +94,4 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
     }
 
     distances
-
-    // let iter = code.chunks_exact(num_sub_vectors * V);
-    // let distances = iter.clone().flat_map(|c| {
-    //     let mut sums = [0.0_f32; V];
-    //     for i in (0..num_sub_vectors).step_by(C) {
-    //         for (vec_idx, sum) in sums.iter_mut().enumerate() {
-    //             let vec_start = vec_idx * num_sub_vectors;
-    //             let s = c[vec_start + i..]
-    //                 .iter()
-    //                 .take(min(C, num_sub_vectors - i))
-    //                 .enumerate()
-    //                 .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
-    //                 .sum::<f32>();
-    //             *sum += s;
-    //         }
-    //     }
-    //     sums.into_iter()
-    // });
-    // Remainder
-    // let remainder = iter.remainder().chunks(num_sub_vectors).map(|c| {
-    //     c.iter()
-    //         .enumerate()
-    //         .map(|(sub_vec_idx, code)| distance_table[sub_vec_idx * num_centroids + *code as usize])
-    //         .sum::<f32>()
-    // });
-    // distances.chain(remainder).collect()
 }

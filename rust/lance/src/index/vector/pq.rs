@@ -114,15 +114,19 @@ impl PQIndex {
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
         let row_ids = Arc::new(as_primitive_array(&row_ids).clone());
 
-        let code = Arc::new(
-            indices_to_keep
-                .values()
-                .iter()
-                .flat_map(|&idx| Self::get_pq_codes(&code, idx as usize, num_vectors))
-                .collect(),
-        );
+        let code = code
+            .values()
+            .chunks_exact(num_vectors)
+            .flat_map(|c| {
+                let mut filtered = Vec::with_capacity(indices_to_keep.len());
+                for idx in indices_to_keep.values() {
+                    filtered.push(c[*idx as usize]);
+                }
+                filtered
+            })
+            .collect();
 
-        Ok((code, row_ids))
+        Ok((Arc::new(code), row_ids))
     }
 
     fn get_pq_codes(transposed_codes: &UInt8Array, vec_idx: usize, num_vectors: usize) -> Vec<u8> {
