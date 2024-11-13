@@ -248,8 +248,8 @@ use crate::encodings::logical::r#struct::{
 };
 use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
-use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
 use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
+use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};

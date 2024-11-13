@@ -30,8 +30,8 @@ use crate::encodings::physical::bitpack_fastlanes::{
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
-use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
+use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
@@ -822,7 +822,9 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 );
                 let max_len = max_len.as_primitive::<UInt64Type>().value(0);
 
-                if max_len >= FSST_LEAST_INPUT_MAX_LENGTH && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
+                if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                {
                     return Ok(Box::new(FsstMiniBlockEncoder::default()));
                 }
                 return Ok(Box::new(BinaryMiniBlockEncoder::default()));
