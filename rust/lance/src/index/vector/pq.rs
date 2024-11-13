@@ -105,21 +105,34 @@ impl PQIndex {
         pre_filter: &dyn PreFilter,
         code: Arc<UInt8Array>,
         row_ids: Arc<UInt64Array>,
-        num_sub_vectors: i32,
+        _num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
+        let num_vectors = row_ids.len();
         let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
         let row_ids = Arc::new(as_primitive_array(&row_ids).clone());
 
-        let code = FixedSizeListArray::try_new_from_values(code.as_ref().clone(), num_sub_vectors)
-            .unwrap();
-        let code = take(&code, &indices_to_keep, None)?;
-        let code = as_fixed_size_list_array(&code).values().clone();
-        let code = Arc::new(as_primitive_array(&code).clone());
+        let code = Arc::new(
+            indices_to_keep
+                .values()
+                .iter()
+                .flat_map(|&idx| Self::get_pq_codes(&code, idx as usize, num_vectors))
+                .collect(),
+        );
 
         Ok((code, row_ids))
+    }
+
+    fn get_pq_codes(transposed_codes: &UInt8Array, vec_idx: usize, num_vectors: usize) -> Vec<u8> {
+        transposed_codes
+            .values()
+            .iter()
+            .skip(vec_idx)
+            .step_by(num_vectors)
+            .cloned()
+            .collect()
     }
 }
 
@@ -266,8 +279,8 @@ impl VectorIndex for PQIndex {
 
         let pq_codes = transpose(
             pq_codes.as_primitive(),
-            self.pq.num_sub_vectors,
             row_ids.len(),
+            self.pq.num_sub_vectors,
         );
 
         Ok(Box::new(Self {
@@ -287,29 +300,36 @@ impl VectorIndex for PQIndex {
     }
 
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let code = self
-            .code
-            .as_ref()
-            .unwrap()
-            .values()
-            .chunks_exact(self.pq.code_dim());
+        let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
-            .zip(code)
-            .filter_map(|(old_row_id, code)| {
+            .enumerate()
+            .filter_map(|(vec_idx, old_row_id)| {
                 let new_row_id = mapping.get(old_row_id).cloned();
                 // If the row id is not in the mapping then this row is not remapped and we keep as is
                 let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
-                new_row_id.map(|new_row_id| (new_row_id, code))
+                new_row_id.map(|new_row_id| {
+                    (
+                        new_row_id,
+                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
+                    )
+                })
             })
             .collect::<Vec<_>>();
 
         self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
             remapped.iter().map(|(row_id, _)| *row_id),
         )));
-        self.code = Some(Arc::new(UInt8Array::from_iter_values(
-            remapped.into_iter().flat_map(|(_, code)| code).copied(),
-        )));
+
+        let pq_codes =
+            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
+        let transposed_codes = transpose(
+            &pq_codes,
+            self.row_ids.as_ref().unwrap().len(),
+            self.pq.num_sub_vectors,
+        );
+        self.code = Some(Arc::new(transposed_codes));
         Ok(())
     }
 

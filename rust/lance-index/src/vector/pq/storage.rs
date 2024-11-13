@@ -7,13 +7,13 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use arrow::datatypes::{self};
+use arrow::datatypes::{self, UInt8Type};
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type},
     FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
@@ -172,9 +172,9 @@ impl ProductQuantizationStorage {
         if !transposed {
             let pq_col = batch[PQ_CODE_COLUMN].as_fixed_size_list();
             let transposed_code = transpose(
-                pq_col.values().as_primitive(),
-                num_sub_vectors,
+                pq_col.values().as_primitive::<UInt8Type>(),
                 row_ids.len(),
+                num_sub_vectors,
             );
             let pq_code_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
                 transposed_code,
@@ -346,13 +346,21 @@ impl ProductQuantizationStorage {
     }
 }
 
-pub fn transpose(pq_codes: &UInt8Array, num_sub_vectors: usize, num_vectors: usize) -> UInt8Array {
-    let mut transposed_codes = vec![0; pq_codes.len()];
-    for (vec_idx, codes) in pq_codes.values().chunks_exact(num_sub_vectors).enumerate() {
+pub fn transpose<T: ArrowPrimitiveType>(
+    original: &PrimitiveArray<T>,
+    num_rows: usize,
+    num_columns: usize,
+) -> PrimitiveArray<T>
+where
+    PrimitiveArray<T>: From<Vec<T::Native>>,
+{
+    let mut transposed_codes = vec![T::default_value(); original.len()];
+    for (vec_idx, codes) in original.values().chunks_exact(num_columns).enumerate() {
         for (sub_vec_idx, code) in codes.iter().enumerate() {
-            transposed_codes[sub_vec_idx * num_vectors + vec_idx] = *code;
+            transposed_codes[sub_vec_idx * num_rows + vec_idx] = *code;
         }
     }
+
     transposed_codes.into()
 }
 
