@@ -14,6 +14,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{
     cache::{CapacityMode, FileMetadataCache},
+    utils::bit::pad_bytes,
     Result,
 };
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
@@ -26,7 +27,7 @@ use crate::{
     },
     encoder::{
         default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
-        EncodingOptions, FieldEncoder, OutOfLineBuffers,
+        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
@@ -34,6 +35,7 @@ use crate::{
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+const TEST_ALIGNMENT: usize = MIN_PAGE_BUFFER_ALIGNMENT as usize;
 
 #[derive(Debug)]
 pub(crate) struct SimulatedScheduler {
@@ -277,7 +279,7 @@ pub async fn check_round_trip_encoding_generated(
                 max_page_bytes: MAX_PAGE_BYTES,
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
-                buffer_alignment: 64,
+                buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -410,7 +412,7 @@ pub async fn check_round_trip_encoding_of_data(
             cache_bytes_per_column: *page_size,
             max_page_bytes: test_cases.get_max_page_size(),
             keep_original_array: true,
-            buffer_alignment: 64,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
         };
         let encoder = encoding_strategy
             .create_field_encoder(
@@ -443,11 +445,17 @@ impl SimulatedWriter {
         let offset = self.encoded_data.len() as u64;
         self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
+        let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
+        self.encoded_data
+            .extend(std::iter::repeat(0).take(pad_bytes));
         (offset, size)
     }
 
     fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
         self.encoded_data.extend_from_slice(&buffer);
+        let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
+        self.encoded_data
+            .extend(std::iter::repeat(0).take(pad_bytes));
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {
@@ -471,7 +479,7 @@ impl SimulatedWriter {
     }
 
     fn new_external_buffers(&self) -> OutOfLineBuffers {
-        OutOfLineBuffers::new(self.encoded_data.len() as u64, /*buffer_alignment=*/ 1)
+        OutOfLineBuffers::new(self.encoded_data.len() as u64, MIN_PAGE_BUFFER_ALIGNMENT)
     }
 }
 

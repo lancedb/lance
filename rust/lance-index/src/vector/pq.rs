@@ -141,7 +141,12 @@ impl ProductQuantizer {
         )?))
     }
 
+    // the code must be transposed
     pub fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        if code.is_empty() {
+            return Ok(Float32Array::from(Vec::<f32>::new()));
+        }
+
         match self.distance_type {
             DistanceType::L2 => self.l2_distances(query, code),
             DistanceType::Cosine => {
@@ -167,11 +172,11 @@ impl ProductQuantizer {
 
         #[cfg(target_feature = "avx512f")]
         {
-            Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()))
+            Ok(self.compute_l2_distance(&distance_table, code.values()))
         }
         #[cfg(not(target_feature = "avx512f"))]
         {
-            Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()))
+            Ok(self.compute_l2_distance(&distance_table, code.values()))
         }
     }
 
@@ -219,17 +224,19 @@ impl ProductQuantizer {
                 distance_table.extend(distances);
             });
 
-        // Compute distance from the pre-compute table.
-        Ok(Float32Array::from_iter_values(
-            code.values().chunks_exact(self.num_sub_vectors).map(|c| {
-                c.iter()
-                    .enumerate()
-                    .map(|(sub_vec_idx, centroid)| {
-                        distance_table[sub_vec_idx * 256 + *centroid as usize]
-                    })
-                    .sum::<f32>()
-            }),
-        ))
+        let num_vectors = code.len() / self.num_sub_vectors;
+        let mut distances = vec![0.0; num_vectors];
+        let num_centroids = num_centroids(self.num_bits);
+        for (sub_vec_idx, vec_indices) in code.values().chunks_exact(num_vectors).enumerate() {
+            let dist_table = &distance_table[sub_vec_idx * num_centroids..];
+            vec_indices
+                .iter()
+                .zip(distances.iter_mut())
+                .for_each(|(&centroid_idx, sum)| {
+                    *sum += dist_table[centroid_idx as usize];
+                });
+        }
+        Ok(distances.into())
     }
 
     fn build_l2_distance_table(&self, key: &dyn Array) -> Result<Vec<f32>> {
@@ -282,12 +289,8 @@ impl ProductQuantizer {
     /// -------
     ///  The squared L2 distance.
     #[inline]
-    fn compute_l2_distance<const C: usize, const V: usize>(
-        &self,
-        distance_table: &[f32],
-        code: &[u8],
-    ) -> Float32Array {
-        Float32Array::from(compute_l2_distance::<C, V>(
+    fn compute_l2_distance(&self, distance_table: &[f32], code: &[u8]) -> Float32Array {
+        Float32Array::from(compute_l2_distance(
             distance_table,
             self.num_bits,
             self.num_sub_vectors,
@@ -382,7 +385,7 @@ impl Quantization for ProductQuantizer {
     }
 
     fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
-        let codebook_position = match args {
+        let codebook_position = match &args {
             Some(args) => args.codebook_position,
             None => Some(0),
         };
@@ -398,6 +401,7 @@ impl Quantization for ProductQuantizer {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: tensor.encode_to_vec(),
+            transposed: args.map(|args| args.transposed).unwrap_or_default(),
         })?)
     }
 
@@ -461,6 +465,7 @@ mod tests {
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
+    use storage::transpose;
 
     #[test]
     fn test_f16_pq_to_protobuf() {
@@ -502,7 +507,8 @@ mod tests {
         let pq_code = UInt8Array::from_iter_values((0..16 * TOTAL).map(|v| v as u8));
         let query = generate_random_array(DIM);
 
-        let dists = pq.compute_distances(&query, &pq_code).unwrap();
+        let transposed_pq_codes = transpose(&pq_code, TOTAL, 16);
+        let dists = pq.compute_distances(&query, &transposed_pq_codes).unwrap();
 
         let sub_vec_len = DIM / 16;
         let expected = pq_code

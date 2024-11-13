@@ -347,7 +347,7 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
     }
 }
 
-pub struct FixedWidthDataBlockBuilder {
+struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
     values: Vec<u8>,
@@ -490,6 +490,33 @@ impl FixedSizeListBlock {
 
     fn data_size(&self) -> u64 {
         self.child.data_size()
+    }
+}
+
+struct FixedSizeListBlockBuilder {
+    inner: Box<dyn DataBlockBuilderImpl>,
+    dimension: u64,
+}
+
+impl FixedSizeListBlockBuilder {
+    fn new(inner: Box<dyn DataBlockBuilderImpl>, dimension: u64) -> Self {
+        Self { inner, dimension }
+    }
+}
+
+impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let selection = selection.start * self.dimension..selection.end * self.dimension;
+        let fsl = data_block.as_fixed_size_list_mut_ref().unwrap();
+        self.inner.append(fsl.child.as_mut(), selection);
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let inner_block = self.inner.finish();
+        DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(inner_block),
+            dimension: self.dimension,
+        })
     }
 }
 
@@ -913,6 +940,13 @@ impl DataBlock {
                 } else {
                     todo!()
                 }
+            }
+            Self::FixedSizeList(inner) => {
+                let inner_builder = inner.child.make_builder(estimated_size_bytes);
+                Box::new(FixedSizeListBlockBuilder::new(
+                    inner_builder,
+                    inner.dimension,
+                ))
             }
             _ => todo!(),
         }
