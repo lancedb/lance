@@ -575,9 +575,9 @@ impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let pq_code = self.get_pq_code(id);
         pq_code
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
+            .map(|(i, c)| self.distance_table[i * self.num_centroids + c])
             .sum()
     }
 }
