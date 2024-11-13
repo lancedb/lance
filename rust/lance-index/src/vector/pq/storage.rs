@@ -559,10 +559,15 @@ impl PQDistCalculator {
         }
     }
 
-    fn get_pq_code(&self, id: u32) -> &[u8] {
-        let start = id as usize * self.num_sub_vectors;
-        let end = start + self.num_sub_vectors;
-        &self.pq_code.values()[start..end]
+    fn get_pq_code(&self, id: u32) -> Vec<usize> {
+        let num_vectors = self.pq_code.len() / self.num_sub_vectors;
+        self.pq_code
+            .values()
+            .iter()
+            .skip(id as usize)
+            .step_by(num_vectors)
+            .map(|&c| c as usize)
+            .collect()
     }
 }
 
