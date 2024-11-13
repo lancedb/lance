@@ -7,16 +7,22 @@ use arrow_buffer::ScalarBuffer;
 use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 
-use lance_core::Result;
+use lance_core::{Error, Result};
+use snafu::{location, Location};
 
 use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, NullableDataBlock, UsedEncoding, VariableWidthBlock},
-    decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
-    format::ProtobufUtils,
+    decoder::{MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray, MiniBlockCompressed, MiniBlockCompressor},
+    format::{
+        pb::{self},
+        ProtobufUtils,
+    },
     EncodingsIo,
 };
+
+use super::binary::{BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder};
 
 #[derive(Debug)]
 pub struct FsstPageScheduler {
@@ -201,6 +207,121 @@ impl ArrayEncoder for FsstArrayEncoder {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct FsstMiniBlockEncoder {}
+
+impl MiniBlockCompressor for FsstMiniBlockEncoder {
+    fn compress(
+        &self,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+        match data {
+            DataBlock::VariableWidth(mut variable_width) => {
+                let offsets = variable_width.offsets.borrow_to_typed_slice::<i32>();
+                let offsets_slice = offsets.as_ref();
+                let bytes_data = variable_width.data.into_buffer();
+
+                // prepare compression output buffer
+                let mut dest_offsets = vec![0_i32; offsets_slice.len() * 2];
+                let mut dest_values = vec![0_u8; bytes_data.len() * 2];
+                let mut symbol_table = vec![0_u8; fsst::fsst::FSST_SYMBOL_TABLE_SIZE];
+
+                // fsst compression
+                fsst::fsst::compress(
+                    &mut symbol_table,
+                    bytes_data.as_slice(),
+                    offsets_slice,
+                    &mut dest_values,
+                    &mut dest_offsets,
+                )?;
+
+                // construct `DataBlock` for BinaryMiniBlockEncoder, we may want some `DataBlock` construct methods later
+                let data_block = DataBlock::VariableWidth(VariableWidthBlock {
+                    data: LanceBuffer::reinterpret_vec(dest_values),
+                    bits_per_offset: 32,
+                    offsets: LanceBuffer::reinterpret_vec(dest_offsets),
+                    num_values: variable_width.num_values,
+                    block_info: BlockInfo::new(),
+                    used_encodings: UsedEncoding::new(),
+                });
+
+                // compress the fsst compressed data using `BinaryMiniBlockEncoder`
+                let binary_compressor =
+                    Box::new(BinaryMiniBlockEncoder::default()) as Box<dyn MiniBlockCompressor>;
+
+                let (binary_miniblock_compressed, binary_array_encoding) =
+                    binary_compressor.compress(data_block)?;
+
+                Ok((
+                    binary_miniblock_compressed,
+                    ProtobufUtils::fsst_mini_block(binary_array_encoding, symbol_table),
+                ))
+            }
+            _ => Err(Error::InvalidInput {
+                source: format!(
+                    "Cannot compress a data block of type {} with BinaryMiniBlockEncoder",
+                    data.name()
+                )
+                .into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FsstMiniBlockDecompressor {
+    symbol_table: Vec<u8>,
+}
+
+impl FsstMiniBlockDecompressor {
+    pub fn new(description: &pb::FsstMiniBlock) -> Self {
+        Self {
+            symbol_table: description.symbol_table.clone(),
+        }
+    }
+}
+
+impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        // Step 1. decompress data use `BinaryMiniBlockDecompressor`
+        let binary_decompressor =
+            Box::new(BinaryMiniBlockDecompressor::default()) as Box<dyn MiniBlockDecompressor>;
+        let compressed_data_block = binary_decompressor.decompress(data, num_values)?;
+        let DataBlock::VariableWidth(mut compressed_data_block) = compressed_data_block else {
+            panic!("BinaryMiniBlockDecompressor should output VariableWidth DataBlock")
+        };
+
+        // Step 2. FSST decompress
+        let bytes = compressed_data_block.data.borrow_to_typed_slice::<u8>();
+        let bytes = bytes.as_ref();
+        let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
+        let offsets = offsets.as_ref();
+
+        // FSST decompression output buffer, the `MiniBlock` has a size limit of `4 KiB` and
+        // the FSST decompression algorithm output is at most `8 * input_size`
+        // Since `MiniBlock Size` <= 4 KiB and `offsets` are type `i32, it has number of `offsets` <= 1024.
+        let mut decompress_bytes_buf = vec![0u8; 4 * 1024 * 8];
+        let mut decompress_offset_buf = vec![0i32; 1024];
+        fsst::fsst::decompress(
+            &self.symbol_table,
+            bytes,
+            offsets,
+            &mut decompress_bytes_buf,
+            &mut decompress_offset_buf,
+        )?;
+
+        Ok(DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(decompress_bytes_buf),
+            offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+            used_encodings: UsedEncoding::new(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -208,7 +329,10 @@ mod tests {
 
     use lance_datagen::{ByteCount, RowCount};
 
-    use crate::testing::{check_round_trip_encoding_of_data, TestCases};
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, TestCases},
+        version::LanceFileVersion,
+    };
 
     #[test_log::test(tokio::test)]
     async fn test_fsst() {
@@ -218,6 +342,24 @@ mod tests {
             .unwrap()
             .column(0)
             .clone();
-        check_round_trip_encoding_of_data(vec![arr], &TestCases::default(), HashMap::new()).await;
+        check_round_trip_encoding_of_data(
+            vec![arr],
+            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
+
+        let arr = lance_datagen::gen()
+            .anon_col(lance_datagen::array::rand_utf8(ByteCount::from(64), false))
+            .into_batch_rows(RowCount::from(1_000_000))
+            .unwrap()
+            .column(0)
+            .clone();
+        check_round_trip_encoding_of_data(
+            vec![arr],
+            &TestCases::default().with_file_version(LanceFileVersion::V2_1),
+            HashMap::new(),
+        )
+        .await;
     }
 }

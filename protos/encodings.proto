@@ -233,6 +233,11 @@ message Binary {
 message BinaryMiniBlock {
 }
 
+message FsstMiniBlock {
+  ArrayEncoding BinaryMiniBlock = 1;
+  bytes symbol_table = 2;
+}
+
 message Fsst {
   ArrayEncoding binary = 1;
   bytes symbol_table = 2;
@@ -273,6 +278,7 @@ message ArrayEncoding {
         Constant constant = 13;
         Bitpack2 bitpack2 = 14;
         BinaryMiniBlock binary_mini_block = 15;
+        FsstMiniBlock fsst_mini_block = 16;
     }
 }
 

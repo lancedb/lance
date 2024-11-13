@@ -20,8 +20,8 @@ use pb::{
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
     AllNullLayout, ArrayEncoding, Binary, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg,
-    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable,
-    PackedStruct, PageLayout,
+    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock, MiniBlockLayout,
+    Nullable, PackedStruct, PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionConfig;
@@ -136,6 +136,18 @@ impl ProtobufUtils {
     pub fn binary_miniblock() -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::BinaryMiniBlock(BinaryMiniBlock {})),
+        }
+    }
+
+    // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually
+    // not used and `FsstMiniBlockDecompressor` constructs a `binary_mini_block` in a `hard-coded` fashion.
+    // This can be an optimization later.
+    pub fn fsst_mini_block(data: ArrayEncoding, symbol_table: Vec<u8>) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::FsstMiniBlock(Box::new(FsstMiniBlock {
+                binary_mini_block: Some(Box::new(data)),
+                symbol_table,
+            }))),
         }
     }
 
