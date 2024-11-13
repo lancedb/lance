@@ -284,29 +284,30 @@ impl FsstMiniBlockDecompressor {
 
 impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        // Step 1. decompress data use `BinaryMiniBlockDecompressor`
         let binary_decompressor =
             Box::new(BinaryMiniBlockDecompressor::default()) as Box<dyn MiniBlockDecompressor>;
-
         let compressed_data_block = binary_decompressor.decompress(data, num_values)?;
-
         let mut compressed_data_block = match compressed_data_block {
             DataBlock::VariableWidth(variable) => variable,
             _ => panic!("Received non-variable width data from BinaryMiniBlockDecompressor."),
         };
 
+        // Step 2. FSST decompress
         let bytes = compressed_data_block.data.borrow_to_typed_slice::<u8>();
         let bytes = bytes.as_ref();
-
         let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
         let offsets = offsets.as_ref();
 
+        // FSST decompression output buffer, the `MiniBlock` has a size limit of `4 KiB` and
+        // the FSST decompression algorithm output is at most `8 * input_size`
+        // Since `MiniBlock Size` <= 4 KiB and `offsets` are type `i32, it has number of `offsets` <= 1024.
         let mut decompress_bytes_buf = vec![0u8; 4 * 1024 * 8];
         let mut decompress_offset_buf = vec![0i32; 1024];
-
         fsst::fsst::decompress(
             &self.symbol_table,
-            &bytes,
-            &offsets,
+            bytes,
+            offsets,
             &mut decompress_bytes_buf,
             &mut decompress_offset_buf,
         )?;

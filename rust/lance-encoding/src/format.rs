@@ -139,7 +139,7 @@ impl ProtobufUtils {
         }
     }
 
-    // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually 
+    // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually
     // not used and `FsstMiniBlockDecompressor` constructs a `binary_mini_block` in a `hard-coded` fashion.
     // This can be an optimization later.
     pub fn fsst_mini_block(data: ArrayEncoding, symbol_table: Vec<u8>) -> ArrayEncoding {
