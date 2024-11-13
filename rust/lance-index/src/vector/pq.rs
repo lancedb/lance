@@ -142,6 +142,10 @@ impl ProductQuantizer {
     }
 
     pub fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
+        if code.is_empty() {
+            return Ok(Float32Array::from(Vec::<f32>::new()));
+        }
+
         match self.distance_type {
             DistanceType::L2 => self.l2_distances(query, code),
             DistanceType::Cosine => {
