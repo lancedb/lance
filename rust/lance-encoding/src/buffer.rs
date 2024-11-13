@@ -3,7 +3,7 @@
 
 //! Utilities for byte arrays
 
-use std::{ops::Deref, ptr::NonNull, sync::Arc};
+use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use snafu::{location, Location};
@@ -217,6 +217,20 @@ impl LanceBuffer {
     /// However, we can safely reinterpret Vec<T> into &[u8] which is what happens here.
     pub fn reinterpret_vec<T: ArrowNativeType>(vec: Vec<T>) -> Self {
         Self::Borrowed(Buffer::from_vec(vec))
+    }
+
+    /// Reinterprets Arc<[T]> as a LanceBuffer
+    ///
+    /// This is similar to [`Self::reinterpret_vec`] but for Arc<[T]> instead of Vec<T>
+    ///
+    /// The same alignment constraints apply
+    pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
+        let slice = arc.as_ref();
+        let data = NonNull::new(slice.as_ptr() as _).unwrap_or(NonNull::dangling());
+        let len = slice.len() * std::mem::size_of::<T>();
+        // SAFETY: the ptr will be valid for len items if the Arc<[T]> is valid
+        let buffer = unsafe { Buffer::from_custom_allocation(data, len, Arc::new(arc)) };
+        Self::Borrowed(buffer)
     }
 
     /// Reinterprets a LanceBuffer into a Vec<T>

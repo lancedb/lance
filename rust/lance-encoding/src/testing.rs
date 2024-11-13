@@ -208,6 +208,13 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
+            if expected.len() != actual.len() {
+                panic!(
+                    "Mismatch in length expected {} but got {}",
+                    expected.len(),
+                    actual.len()
+                );
+            }
             if &expected != actual {
                 if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
                 {

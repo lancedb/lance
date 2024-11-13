@@ -310,6 +310,23 @@ message ColumnEncoding {
   }
 }
 
+enum RepDefLayer {
+  // Should never be used, included for debugging purporses and general protobuf best practice
+  REPDEF_UNSPECIFIED = 0;
+  // All values are valid (can be primitive or struct)
+  REPDEF_ALL_VALID_ITEM = 1;
+  // All list values are valid
+  REPDEF_ALL_VALID_LIST = 2;
+  // There are one or more null items (can be primitive or struct)
+  REPDEF_NULLABLE_ITEM = 3;
+  // A list layer with null lists but no empty lists
+  REPDEF_NULLABLE_LIST = 4;
+  // A list layer with empty lists but no null lists
+  REPDEF_EMPTYABLE_LIST = 5;
+  // A list layer with both empty lists and null lists
+  REPDEF_NULL_AND_EMPTY_LIST = 6;
+}
+
 /// A layout used for pages where the data is small
 ///
 /// In this case we can fit many values into a single disk sector and transposing buffers is
@@ -322,7 +339,10 @@ message MiniBlockLayout {
   ArrayEncoding def_compression = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
+  // Dictionary data
   ArrayEncoding dictionary = 4;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 5;
 }
 
 /// A layout used for pages where the data is large
@@ -336,6 +356,8 @@ message FullZipLayout {
   uint32 bits_def = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 4;
 }
 
 /// A layout used for pages where all values are null

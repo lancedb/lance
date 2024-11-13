@@ -251,6 +251,7 @@ impl FixedWidthDataBlock {
     }
 }
 
+#[derive(Debug)]
 pub struct VariableWidthDataBlockBuilder {
     offsets: Vec<u32>,
     bytes: Vec<u8>,
@@ -304,6 +305,7 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
     }
 }
 
+#[derive(Debug)]
 struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
@@ -449,6 +451,7 @@ impl FixedSizeListBlock {
     }
 }
 
+#[derive(Debug)]
 struct FixedSizeListBlockBuilder {
     inner: Box<dyn DataBlockBuilderImpl>,
     dimension: u64,
@@ -1415,11 +1418,12 @@ impl From<ArrayRef> for DataBlock {
     }
 }
 
-pub trait DataBlockBuilderImpl {
+pub trait DataBlockBuilderImpl: std::fmt::Debug {
     fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
+#[derive(Debug)]
 pub struct DataBlockBuilder {
     estimated_size_bytes: u64,
     builder: Option<Box<dyn DataBlockBuilderImpl>>,
