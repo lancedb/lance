@@ -354,6 +354,10 @@ pub fn transpose<T: ArrowPrimitiveType>(
 where
     PrimitiveArray<T>: From<Vec<T::Native>>,
 {
+    if original.is_empty() {
+        return original.clone();
+    }
+
     let mut transposed_codes = vec![T::default_value(); original.len()];
     for (vec_idx, codes) in original.values().chunks_exact(num_columns).enumerate() {
         for (sub_vec_idx, code) in codes.iter().enumerate() {
