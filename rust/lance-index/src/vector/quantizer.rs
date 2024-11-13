@@ -161,6 +161,7 @@ pub struct QuantizationMetadata {
     // For PQ
     pub codebook_position: Option<usize>,
     pub codebook: Option<FixedSizeListArray>,
+    pub transposed: bool,
 }
 
 #[async_trait]
