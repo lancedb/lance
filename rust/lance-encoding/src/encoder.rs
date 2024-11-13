@@ -49,6 +49,7 @@ use crate::{
     },
     format::pb,
 };
+use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
@@ -820,7 +821,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 );
                 let max_len = max_len.as_primitive::<UInt64Type>().value(0);
 
-                if max_len > 4 && data_size >= 4 * 1024 * 1024 {
+                if max_len >= FSST_LEAST_INPUT_MAX_LENGTH && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
                     return Ok(Box::new(FsstMiniBlockEncoder::default()));
                 }
                 return Ok(Box::new(BinaryMiniBlockEncoder::default()));
