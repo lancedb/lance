@@ -141,6 +141,7 @@ impl ProductQuantizer {
         )?))
     }
 
+    // the code must be transposed
     pub fn compute_distances(&self, query: &dyn Array, code: &UInt8Array) -> Result<Float32Array> {
         if code.is_empty() {
             return Ok(Float32Array::from(Vec::<f32>::new()));
@@ -468,6 +469,7 @@ mod tests {
     use lance_linalg::kernels::argmin;
     use lance_testing::datagen::generate_random_array;
     use num_traits::Zero;
+    use storage::transpose;
 
     #[test]
     fn test_f16_pq_to_protobuf() {
@@ -509,7 +511,8 @@ mod tests {
         let pq_code = UInt8Array::from_iter_values((0..16 * TOTAL).map(|v| v as u8));
         let query = generate_random_array(DIM);
 
-        let dists = pq.compute_distances(&query, &pq_code).unwrap();
+        let transposed_pq_codes = transpose(&pq_code, TOTAL, 16);
+        let dists = pq.compute_distances(&query, &transposed_pq_codes).unwrap();
 
         let sub_vec_len = DIM / 16;
         let expected = pq_code
