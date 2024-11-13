@@ -52,6 +52,8 @@ pub struct PQIndex {
     pub pq: ProductQuantizer,
 
     /// PQ code
+    /// the PQ codes are stored in a transposed way,
+    /// call `Self::get_pq_codes` to get the PQ code for a specific vector.
     pub code: Option<Arc<UInt8Array>>,
 
     /// ROW Id used to refer to the actual row in dataset.

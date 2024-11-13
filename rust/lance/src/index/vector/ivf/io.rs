@@ -201,7 +201,7 @@ pub(super) async fn write_pq_partitions(
                         })?;
                 if let Some(pq_code) = pq_index.code.as_ref() {
                     let original_pq_codes = transpose(
-                        &pq_code,
+                        pq_code,
                         pq_index.pq.num_sub_vectors,
                         pq_code.len() / pq_index.pq.code_dim(),
                     );
