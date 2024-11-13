@@ -8,7 +8,6 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{
     Field, Schema, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_LEVEL_META_KEY,
     COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
@@ -31,6 +30,7 @@ use crate::encodings::physical::bitpack_fastlanes::{
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
+use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
 use crate::encodings::physical::fsst::FsstArrayEncoder;
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::format::ProtobufUtils;
@@ -209,20 +209,30 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)>;
 }
 
+/// Per-value compression must either:
+///
+/// A single buffer of fixed-width values
+/// A single buffer of value data and a buffer of offsets
+///
+/// TODO: In the future we may allow metadata buffers
+pub enum PerValueDataBlock {
+    Fixed(FixedWidthDataBlock),
+    Variable(VariableWidthBlock),
+}
+
 /// Trait for compression algorithms that are suitable for use in the zipped structural encoding
 ///
-/// Compared to [`VariablePerValueCompressor`], these compressors are capable of compressing the data
-/// so that every value has the exact same number of bits per value.  For example, this is useful
-/// for encoding vector embeddings where every value has a fixed size but the values themselves are
-/// too large to use mini-block.
+/// This compression must return either a FixedWidthDataBlock or a VariableWidthBlock.  This is because
+/// we need to zip the data and those are the only two blocks we know how to zip today.
 ///
-/// The advantage of a fixed-bytes-per-value is that we can do random access in 1 IOP instead of 2
-/// and do not need a repetition index.
-pub trait FixedPerValueCompressor: std::fmt::Debug + Send + Sync {
-    /// Compress the data into a single buffer where each value is encoded with the same number of bits
+/// In addition, the compressed data must be able to be decompressed in a random-access fashion.
+/// This means that the decompression algorithm must be able to decompress any value without
+/// decompressing all values before it.
+pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress the data into a single buffer
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
-    fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, pb::ArrayEncoding)>;
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)>;
 }
 
 /// Trait for compression algorithms that are suitable for use in the zipped structural encoding
@@ -407,11 +417,9 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
 /// There are several different kinds of compression.
 ///
 /// - Block compression is the most generic, but most difficult to use efficiently
-/// - Fixed-per-value compression results in a fixed number of bits for each value
-///     It is used for wide fixed-width types like vector embeddings.
-/// - Variable-per-value compression results in two buffers, one buffer of offsets
-///     and one buffer of data bytes.  It is used for wide variable-width types
-///     like strings, variable-length lists, binary, etc.
+/// - Per-value compression results in either a fixed width data block or a variable
+///   width data block.  In other words, there is some number of bits per value.
+///   In addition, each value should be independently decompressible.
 /// - Mini-block compression results in a small block of opaque data for chunks
 ///     of rows.  Each block is somewhere between 0 and 16KiB in size.  This is
 ///     used for narrow data types (both fixed and variable length) where we can
@@ -424,19 +432,12 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, pb::ArrayEncoding)>;
 
-    /// Create a fixed-per-value compressor for the given data
-    fn create_fixed_per_value(
+    /// Create a per-value compressor for the given data
+    fn create_per_value(
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<Box<dyn FixedPerValueCompressor>>;
-
-    /// Create a variable-per-value compressor for the given data
-    fn create_variable_per_value(
-        &self,
-        field: &Field,
-        data: &DataBlock,
-    ) -> Result<Box<dyn VariablePerValueCompressor>>;
+    ) -> Result<Box<dyn PerValueCompressor>>;
 
     /// Create a mini-block compressor for the given data
     fn create_miniblock_compressor(
@@ -816,23 +817,33 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         Ok(Box::new(ValueEncoder::default()))
     }
 
-    fn create_fixed_per_value(
+    fn create_per_value(
         &self,
         field: &Field,
-        _data: &DataBlock,
-    ) -> Result<Box<dyn FixedPerValueCompressor>> {
-        // Right now we only need block compressors for rep/def which is u16.  Will need to expand
-        // this if we need block compression of other types.
-        assert!(field.data_type().byte_width() > 0);
-        Ok(Box::new(ValueEncoder::default()))
-    }
-
-    fn create_variable_per_value(
-        &self,
-        _field: &Field,
-        _data: &DataBlock,
-    ) -> Result<Box<dyn VariablePerValueCompressor>> {
-        todo!()
+        data: &DataBlock,
+    ) -> Result<Box<dyn PerValueCompressor>> {
+        match data {
+            DataBlock::FixedWidth(_) => {
+                let encoder = Box::new(ValueEncoder::default());
+                Ok(encoder)
+            }
+            DataBlock::VariableWidth(_variable_width) => {
+                todo!()
+            }
+            DataBlock::FixedSizeList(fsl) => {
+                let DataType::FixedSizeList(inner_field, field_dim) = field.data_type() else {
+                    panic!("FSL data block without FSL field")
+                };
+                debug_assert_eq!(fsl.dimension, field_dim as u64);
+                let inner_compressor = self.create_per_value(
+                    &inner_field.as_ref().try_into().unwrap(),
+                    fsl.child.as_ref(),
+                )?;
+                let fsl_compressor = FslPerValueCompressor::new(inner_compressor, fsl.dimension);
+                Ok(Box::new(fsl_compressor))
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn create_block_compressor(
@@ -841,6 +852,8 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, pb::ArrayEncoding)> {
         match data {
+            // Right now we only need block compressors for rep/def which is u16.  Will need to expand
+            // this if we need block compression of other types.
             DataBlock::FixedWidth(fixed_width) => {
                 let encoder = Box::new(ValueEncoder::default());
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
