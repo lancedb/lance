@@ -172,11 +172,11 @@ impl ProductQuantizer {
 
         #[cfg(target_feature = "avx512f")]
         {
-            Ok(self.compute_l2_distance::<16, 64>(&distance_table, code.values()))
+            Ok(self.compute_l2_distance(&distance_table, code.values()))
         }
         #[cfg(not(target_feature = "avx512f"))]
         {
-            Ok(self.compute_l2_distance::<8, 64>(&distance_table, code.values()))
+            Ok(self.compute_l2_distance(&distance_table, code.values()))
         }
     }
 
@@ -289,12 +289,8 @@ impl ProductQuantizer {
     /// -------
     ///  The squared L2 distance.
     #[inline]
-    fn compute_l2_distance<const C: usize, const V: usize>(
-        &self,
-        distance_table: &[f32],
-        code: &[u8],
-    ) -> Float32Array {
-        Float32Array::from(compute_l2_distance::<C, V>(
+    fn compute_l2_distance(&self, distance_table: &[f32], code: &[u8]) -> Float32Array {
+        Float32Array::from(compute_l2_distance(
             distance_table,
             self.num_bits,
             self.num_sub_vectors,

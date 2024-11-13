@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cmp::min;
+
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
@@ -50,25 +52,20 @@ pub(super) fn build_distance_table_dot<T: Dot>(
 
 /// Compute L2 distance from the query to all code.
 ///
-/// Type parameters
-/// ---------------
-/// - C: the tile size of code-book to run at once.
-/// - V: the tile size of PQ code to run at once.
-///
 /// Parameters
 /// ----------
 /// - distance_table: the pre-computed L2 distance table.
 ///   It is a flatten array of [num_sub_vectors, num_centroids] f32.
 /// - num_bits: the number of bits used for PQ.
 /// - num_sub_vectors: the number of sub-vectors.
-/// - code: the PQ code to be used to compute the distances.
+/// - code: the transposed PQ code to be used to compute the distances.
 ///
 /// Returns
 /// -------
 ///  The squared L2 distance.
 ///
 #[inline]
-pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
+pub(super) fn compute_l2_distance(
     distance_table: &[f32],
     num_bits: u32,
     num_sub_vectors: usize,
@@ -94,4 +91,84 @@ pub(super) fn compute_l2_distance<const C: usize, const V: usize>(
     }
 
     distances
+}
+
+/// Compute L2 distance from the query to all code without transposing the code.
+/// for testing only
+///
+/// Type parameters
+/// ---------------
+/// - C: the tile size of code-book to run at once.
+/// - V: the tile size of PQ code to run at once.
+///
+#[allow(dead_code)]
+fn compute_l2_distance_without_transposing<const C: usize, const V: usize>(
+    distance_table: &[f32],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    code: &[u8],
+) -> Vec<f32> {
+    let num_centroids = num_centroids(num_bits);
+    let iter = code.chunks_exact(num_sub_vectors * V);
+    let distances = iter.clone().flat_map(|c| {
+        let mut sums = [0.0_f32; V];
+        for i in (0..num_sub_vectors).step_by(C) {
+            for (vec_idx, sum) in sums.iter_mut().enumerate() {
+                let vec_start = vec_idx * num_sub_vectors;
+                let s = c[vec_start + i..]
+                    .iter()
+                    .take(min(C, num_sub_vectors - i))
+                    .enumerate()
+                    .map(|(k, c)| distance_table[(i + k) * num_centroids + *c as usize])
+                    .sum::<f32>();
+                *sum += s;
+            }
+        }
+        sums.into_iter()
+    });
+    // Remainder
+    let remainder = iter.remainder().chunks(num_sub_vectors).map(|c| {
+        c.iter()
+            .enumerate()
+            .map(|(sub_vec_idx, code)| distance_table[sub_vec_idx * num_centroids + *code as usize])
+            .sum::<f32>()
+    });
+    distances.chain(remainder).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::vector::pq::storage::transpose;
+
+    use super::*;
+    use arrow_array::UInt8Array;
+
+    #[test]
+    fn test_compute_on_transposed_codes() {
+        let num_vectors = 100;
+        let num_sub_vectors = 4;
+        let num_bits = 8;
+        let dimension = 16;
+        let codebook =
+            Vec::from_iter((0..num_sub_vectors * num_vectors * dimension).map(|v| v as f32));
+        let query = Vec::from_iter((0..dimension).map(|v| v as f32));
+        let distance_table = build_distance_table_l2(&codebook, num_bits, num_sub_vectors, &query);
+
+        let pq_codes = Vec::from_iter((0..num_vectors * num_sub_vectors).map(|v| v as u8));
+        let pq_codes = UInt8Array::from_iter_values(pq_codes);
+        let transposed_codes = transpose(&pq_codes, num_vectors, num_sub_vectors);
+        let distances = compute_l2_distance(
+            &distance_table,
+            num_bits,
+            num_sub_vectors,
+            transposed_codes.values(),
+        );
+        let expected = compute_l2_distance_without_transposing::<4, 1>(
+            &distance_table,
+            num_bits,
+            num_sub_vectors,
+            pq_codes.values(),
+        );
+        assert_eq!(distances, expected);
+    }
 }
