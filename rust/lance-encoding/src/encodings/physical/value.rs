@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
 use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock, UsedEncoding};
-use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
+use crate::decoder::{BlockDecompressor, MiniBlockDecompressor, PerValueDecompressor};
 use crate::encoder::{
-    BlockCompressor, FixedPerValueCompressor, MiniBlockChunk, MiniBlockCompressed,
-    MiniBlockCompressor, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
+    BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
+    PerValueDataBlock, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
 };
 use crate::format::pb::{self, ArrayEncoding};
 use crate::format::ProtobufUtils;
@@ -425,7 +425,7 @@ impl MiniBlockDecompressor for ValueDecompressor {
     }
 }
 
-impl FixedPerValueDecompressor for ValueDecompressor {
+impl PerValueDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         MiniBlockDecompressor::decompress(self, data, num_values)
     }
@@ -435,12 +435,12 @@ impl FixedPerValueDecompressor for ValueDecompressor {
     }
 }
 
-impl FixedPerValueCompressor for ValueEncoder {
-    fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, ArrayEncoding)> {
+impl PerValueCompressor for ValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, ArrayEncoding)> {
         let (data, encoding) = match data {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
-                (fixed_width, encoding)
+                (PerValueDataBlock::Fixed(fixed_width), encoding)
             }
             _ => unimplemented!(
                 "Cannot compress block of type {} with ValueEncoder",
@@ -498,6 +498,25 @@ pub(crate) mod tests {
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
     ) {
         for data_type in PRIMITIVE_TYPES {
+            log::info!("Testing encoding for {:?}", data_type);
+            let field = Field::new("", data_type.clone(), false);
+            check_round_trip_encoding_random(field, version).await;
+        }
+    }
+
+    lazy_static::lazy_static! {
+        static ref LARGE_TYPES: Vec<DataType> = vec![DataType::FixedSizeList(
+            Arc::new(Field::new("", DataType::Int32, false)),
+            128,
+        )];
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_large_primitive(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
+        for data_type in LARGE_TYPES.iter() {
             log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_random(field, version).await;

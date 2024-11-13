@@ -249,6 +249,7 @@ use crate::encodings::logical::r#struct::{
 use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
 use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
+use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
@@ -455,8 +456,14 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
 }
 
-pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
+pub trait PerValueDecompressor: std::fmt::Debug + Send + Sync {
+    /// Decompress one or more values
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+    /// The number of bits in each value
+    ///
+    /// Returns 0 if the data type is variable-width
+    ///
+    /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
 }
 
@@ -470,10 +477,10 @@ pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
         description: &pb::ArrayEncoding,
     ) -> Result<Box<dyn MiniBlockDecompressor>>;
 
-    fn create_fixed_per_value_decompressor(
+    fn create_per_value_decompressor(
         &self,
         description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn FixedPerValueDecompressor>>;
+    ) -> Result<Box<dyn PerValueDecompressor>>;
 
     fn create_block_decompressor(
         &self,
@@ -506,13 +513,21 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
         }
     }
 
-    fn create_fixed_per_value_decompressor(
+    fn create_per_value_decompressor(
         &self,
         description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn FixedPerValueDecompressor>> {
+    ) -> Result<Box<dyn PerValueDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
                 Ok(Box::new(ValueDecompressor::new(flat)))
+            }
+            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
+                let items_decompressor =
+                    self.create_per_value_decompressor(fsl.items.as_ref().unwrap())?;
+                Ok(Box::new(FslPerValueDecompressor::new(
+                    items_decompressor,
+                    fsl.dimension as u64,
+                )))
             }
             _ => todo!(),
         }

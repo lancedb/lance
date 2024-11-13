@@ -205,10 +205,10 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn fixed_size_list(data: ArrayEncoding, dimension: u32) -> ArrayEncoding {
+    pub fn fixed_size_list(data: ArrayEncoding, dimension: u64) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
-                dimension,
+                dimension: dimension.try_into().unwrap(),
                 items: Some(Box::new(data)),
             }))),
         }
@@ -232,6 +232,20 @@ impl ProtobufUtils {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
+                value_compression: Some(value_encoding),
+            })),
+        }
+    }
+
+    pub fn full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        value_encoding: ArrayEncoding,
+    ) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
+                bits_rep: bits_rep as u32,
+                bits_def: bits_def as u32,
                 value_compression: Some(value_encoding),
             })),
         }
