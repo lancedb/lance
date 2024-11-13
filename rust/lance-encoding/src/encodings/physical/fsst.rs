@@ -245,7 +245,7 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
                     used_encodings: UsedEncoding::new(),
                 });
 
-                // compress the fsst compressed data using `BinaryMiniBlockEnocder`
+                // compress the fsst compressed data using `BinaryMiniBlockEncoder`
                 let binary_compressor =
                     Box::new(BinaryMiniBlockEncoder::default()) as Box<dyn MiniBlockCompressor>;
 
