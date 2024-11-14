@@ -13,7 +13,6 @@ use snafu::{location, Location};
 
 use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;
-use crate::data::UsedEncoding;
 use crate::format::ProtobufUtils;
 use crate::{
     buffer::LanceBuffer,
@@ -148,7 +147,6 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
                 bits_per_value: bytes_per_field as u64 * 8,
                 num_values: num_rows,
                 block_info: BlockInfo::new(),
-                used_encoding: UsedEncoding::new(),
             };
             let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
             children.push(child_block);
@@ -243,7 +241,6 @@ impl ArrayEncoder for PackedStructEncoder {
             bits_per_value: total_bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
 
         let encoding = ProtobufUtils::packed_struct(child_encodings, index);

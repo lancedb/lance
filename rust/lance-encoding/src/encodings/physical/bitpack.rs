@@ -20,7 +20,7 @@ use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding};
+use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock};
 use crate::decoder::{PageScheduler, PrimitivePageDecoder};
 use crate::encoder::{ArrayEncoder, EncodedArray};
 use crate::format::ProtobufUtils;
@@ -159,7 +159,6 @@ impl ArrayEncoder for BitpackedArrayEncoder {
             data: LanceBuffer::Owned(dst_buffer),
             num_values: unpacked.num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
 
         let bitpacked_buffer_index = *buffer_index;
@@ -489,7 +488,6 @@ impl PrimitivePageDecoder for BitpackedPageDecoder {
             bits_per_value: self.uncompressed_bits_per_value,
             num_values: num_rows,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }

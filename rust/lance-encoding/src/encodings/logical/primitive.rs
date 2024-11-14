@@ -22,7 +22,7 @@ use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock, UsedEncoding},
+    data::{BlockInfo, DataBlockBuilder, FixedWidthDataBlock},
     decoder::{
         BlockDecompressor, ColumnInfo, DecodeArrayTask, DecodePageTask, DecodedArray, DecodedPage,
         DecompressorStrategy, FieldScheduler, FilterExpression, LoadedPage, LogicalPageDecoder,
@@ -1958,7 +1958,6 @@ impl PrimitiveStructuralEncoder {
                 bits_per_value: 16,
                 num_values,
                 block_info: BlockInfo::new(),
-                used_encoding: UsedEncoding::new(),
             });
             let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
             // Pick a block compressor
@@ -1978,7 +1977,6 @@ impl PrimitiveStructuralEncoder {
                     bits_per_value: 16,
                     num_values: chunk_num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 });
                 let compressed_levels = compressor.compress(chunk_levels_block)?;
                 off += level_bytes;

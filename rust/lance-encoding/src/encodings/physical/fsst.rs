@@ -12,13 +12,12 @@ use snafu::{location, Location};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlock, NullableDataBlock, UsedEncoding, VariableWidthBlock},
+    data::{BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray, MiniBlockCompressed, MiniBlockCompressor},
-    format::{
-        pb::{self},
-        ProtobufUtils,
-    },
+    encoder::{ArrayEncoder, EncodedArray},
+    encoder::{MiniBlockCompressed, MiniBlockCompressor},
+    format::pb::{self},
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -112,7 +111,6 @@ impl PrimitivePageDecoder for FsstPageDecoder {
             num_values: num_rows,
             offsets: LanceBuffer::from(offsets_as_bytes_mut),
             block_info: BlockInfo::new(),
-            used_encodings: UsedEncoding::new(),
         });
 
         if let Some(nulls) = nulls {
@@ -120,7 +118,6 @@ impl PrimitivePageDecoder for FsstPageDecoder {
                 data: Box::new(new_string_data),
                 nulls,
                 block_info: BlockInfo::new(),
-                used_encoding: UsedEncoding::new(),
             }))
         } else {
             Ok(new_string_data)
@@ -180,7 +177,6 @@ impl ArrayEncoder for FsstArrayEncoder {
             num_values,
             offsets: dest_offset,
             block_info: BlockInfo::new(),
-            used_encodings: UsedEncoding::new(),
         });
 
         let data_block = if let Some(nulls) = nulls {
@@ -188,7 +184,6 @@ impl ArrayEncoder for FsstArrayEncoder {
                 data: Box::new(dest_data),
                 nulls,
                 block_info: BlockInfo::new(),
-                used_encoding: UsedEncoding::new(),
             })
         } else {
             dest_data
@@ -242,7 +237,6 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
                     offsets: LanceBuffer::reinterpret_vec(dest_offsets),
                     num_values: variable_width.num_values,
                     block_info: BlockInfo::new(),
-                    used_encodings: UsedEncoding::new(),
                 });
 
                 // compress the fsst compressed data using `BinaryMiniBlockEncoder`
@@ -317,7 +311,6 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
             bits_per_offset: 32,
             num_values,
             block_info: BlockInfo::new(),
-            used_encodings: UsedEncoding::new(),
         }))
     }
 }

@@ -20,7 +20,7 @@ use lance_core::{cache::FileMetadataCache, Error, Result};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{BlockInfo, DataBlock, FixedWidthDataBlock, UsedEncoding},
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
         DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
         LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
@@ -1083,7 +1083,6 @@ impl ListOffsetsEncoder {
             data: LanceBuffer::reinterpret_vec(offsets),
             num_values: num_offsets,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
         inner_encoder.encode(offsets_data, &DataType::UInt64, buffer_index)
     }
