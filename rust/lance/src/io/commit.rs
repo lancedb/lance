@@ -350,6 +350,10 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     for (old_field_id, new_field_id) in &old_field_id_mapping {
         let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
         field.id = *new_field_id;
+
+        if let Some(local_field) = manifest.local_schema.mut_field_by_id(*old_field_id) {
+            local_field.id = *new_field_id;
+        }
     }
 
     // Drop data files that are no longer in use.

@@ -139,7 +139,6 @@ impl ArrayEncoder for FixedSizeBinaryEncoder {
         buffer_index: &mut u32,
     ) -> Result<EncodedArray> {
         let bytes_data = data.as_variable_width().unwrap();
-
         let fixed_data = DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: 8 * self.byte_width as u64,
             data: bytes_data.data,

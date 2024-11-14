@@ -12,6 +12,8 @@
 //!
 //! TODO: Take parameterized input to specify dataset URI from command line.
 
+#![allow(clippy::print_stdout)]
+
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
     StringArray,

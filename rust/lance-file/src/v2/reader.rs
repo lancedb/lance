@@ -42,6 +42,7 @@ use lance_io::{
 use crate::{
     datatypes::{Fields, FieldsWithMeta},
     format::{pb, pbfile, MAGIC, MAJOR_VERSION, MINOR_VERSION},
+    v2::writer::PAGE_BUFFER_ALIGNMENT,
 };
 
 use super::io::LanceEncodingsIo;
@@ -426,12 +427,19 @@ impl FileReader {
         }
     }
 
-    fn do_decode_gbo_table(gbo_bytes: &Bytes, footer: &Footer) -> Result<Vec<BufferDescriptor>> {
+    fn do_decode_gbo_table(
+        gbo_bytes: &Bytes,
+        footer: &Footer,
+        version: LanceFileVersion,
+    ) -> Result<Vec<BufferDescriptor>> {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
         let mut global_buffers = Vec::with_capacity(footer.num_global_buffers as usize);
         for _ in 0..footer.num_global_buffers {
             let buf_pos = global_bufs_cursor.read_u64::<LittleEndian>()?;
+            assert!(
+                version < LanceFileVersion::V2_1 || buf_pos % PAGE_BUFFER_ALIGNMENT as u64 == 0
+            );
             let buf_size = global_bufs_cursor.read_u64::<LittleEndian>()?;
             global_buffers.push(BufferDescriptor {
                 position: buf_pos,
@@ -447,6 +455,7 @@ impl FileReader {
         file_len: u64,
         scheduler: &FileScheduler,
         footer: &Footer,
+        version: LanceFileVersion,
     ) -> Result<Vec<BufferDescriptor>> {
         // This could, in theory, trigger another IOP but the GBO table should never be large
         // enough for that to happen
@@ -457,7 +466,7 @@ impl FileReader {
             file_len,
         )
         .await?;
-        Self::do_decode_gbo_table(&gbo_bytes, footer)
+        Self::do_decode_gbo_table(&gbo_bytes, footer, version)
     }
 
     fn decode_schema(schema_bytes: Bytes) -> Result<(u64, lance_core::datatypes::Schema)> {
@@ -490,7 +499,13 @@ impl FileReader {
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let footer = Self::decode_footer(&tail_bytes)?;
 
-        let gbo_table = Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer).await?;
+        let file_version = LanceFileVersion::try_from_major_minor(
+            footer.major_version as u32,
+            footer.minor_version as u32,
+        )?;
+
+        let gbo_table =
+            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
         if gbo_table.is_empty() {
             return Err(Error::Internal {
                 message: "File did not contain any global buffers, schema expected".to_string(),
@@ -521,11 +536,6 @@ impl FileReader {
         let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>();
         let num_data_bytes = footer.column_meta_start - num_global_buffer_bytes;
         let num_column_metadata_bytes = footer.global_buff_offsets_start - footer.column_meta_start;
-
-        let file_version = LanceFileVersion::try_from_major_minor(
-            footer.major_version as u32,
-            footer.minor_version as u32,
-        )?;
 
         let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
 
@@ -586,7 +596,14 @@ impl FileReader {
                             page.buffer_offsets
                                 .iter()
                                 .zip(page.buffer_sizes.iter())
-                                .map(|(offset, size)| (*offset, *size))
+                                .map(|(offset, size)| {
+                                    // Starting with version 2.1 we can assert that page buffers are aligned
+                                    assert!(
+                                        file_version < LanceFileVersion::V2_1
+                                            || offset % PAGE_BUFFER_ALIGNMENT as u64 == 0
+                                    );
+                                    (*offset, *size)
+                                })
                                 .collect::<Vec<_>>(),
                         );
                         PageInfo {
@@ -1092,6 +1109,7 @@ impl EncodedBatchReaderExt for EncodedBatch {
         let gbo_table = FileReader::do_decode_gbo_table(
             &bytes.slice(footer.global_buff_offsets_start as usize..),
             &footer,
+            file_version,
         )?;
         if gbo_table.is_empty() {
             return Err(Error::Internal {
@@ -1276,6 +1294,7 @@ pub mod tests {
             cache_bytes_per_column: 4096,
             max_page_bytes: 32 * 1024 * 1024,
             keep_original_array: true,
+            buffer_alignment: 64,
         };
         let encoded_batch = encode_batch(
             &data,

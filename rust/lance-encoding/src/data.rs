@@ -28,7 +28,10 @@ use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 
-use crate::{buffer::LanceBuffer, statistics::Stat};
+use crate::{
+    buffer::LanceBuffer,
+    statistics::{ComputeStat, Stat},
+};
 
 /// A data block with no buffers where everything is null
 ///
@@ -247,7 +250,60 @@ impl FixedWidthDataBlock {
     }
 }
 
-pub struct FixedWidthDataBlockBuilder {
+pub struct VariableWidthDataBlockBuilder {
+    offsets: Vec<u32>,
+    bytes: Vec<u8>,
+}
+
+impl VariableWidthDataBlockBuilder {
+    fn new(estimated_size_bytes: u64) -> Self {
+        Self {
+            offsets: vec![0u32],
+            bytes: Vec::with_capacity(estimated_size_bytes as usize),
+        }
+    }
+}
+
+impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let block = data_block.as_variable_width_mut_ref().unwrap();
+        assert!(block.bits_per_offset == 32);
+
+        let offsets = block.offsets.borrow_to_typed_slice::<u32>();
+        let offsets = offsets.as_ref();
+
+        let start_offset = offsets[selection.start as usize];
+        let end_offset = offsets[selection.end as usize];
+        let mut previous_len = self.bytes.len();
+
+        self.bytes
+            .extend_from_slice(&block.data[start_offset as usize..end_offset as usize]);
+
+        self.offsets.extend(
+            offsets[selection.start as usize..selection.end as usize]
+                .iter()
+                .zip(&offsets[selection.start as usize + 1..=selection.end as usize])
+                .map(|(&current, &next)| {
+                    let this_value_len = next - current;
+                    previous_len += this_value_len as usize;
+                    previous_len as u32
+                }),
+        );
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let num_values = (self.offsets.len() - 1) as u64;
+        DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(self.bytes),
+            offsets: LanceBuffer::reinterpret_vec(self.offsets),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
+
+struct FixedWidthDataBlockBuilder {
     bits_per_value: u64,
     bytes_per_value: u64,
     values: Vec<u8>,
@@ -265,7 +321,7 @@ impl FixedWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
         let block = data_block.as_fixed_width_ref().unwrap();
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
@@ -389,6 +445,33 @@ impl FixedSizeListBlock {
 
     fn data_size(&self) -> u64 {
         self.child.data_size()
+    }
+}
+
+struct FixedSizeListBlockBuilder {
+    inner: Box<dyn DataBlockBuilderImpl>,
+    dimension: u64,
+}
+
+impl FixedSizeListBlockBuilder {
+    fn new(inner: Box<dyn DataBlockBuilderImpl>, dimension: u64) -> Self {
+        Self { inner, dimension }
+    }
+}
+
+impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+        let selection = selection.start * self.dimension..selection.end * self.dimension;
+        let fsl = data_block.as_fixed_size_list_mut_ref().unwrap();
+        self.inner.append(fsl.child.as_mut(), selection);
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let inner_block = self.inner.finish();
+        DataBlock::FixedSizeList(FixedSizeListBlock {
+            child: Box::new(inner_block),
+            dimension: self.dimension,
+        })
     }
 }
 
@@ -799,6 +882,20 @@ impl DataBlock {
                 inner.bits_per_value,
                 estimated_size_bytes,
             )),
+            Self::VariableWidth(inner) => {
+                if inner.bits_per_offset == 32 {
+                    Box::new(VariableWidthDataBlockBuilder::new(estimated_size_bytes))
+                } else {
+                    todo!()
+                }
+            }
+            Self::FixedSizeList(inner) => {
+                let inner_builder = inner.child.make_builder(estimated_size_bytes);
+                Box::new(FixedSizeListBlockBuilder::new(
+                    inner_builder,
+                    inner.dimension,
+                ))
+            }
             _ => todo!(),
         }
     }
@@ -826,6 +923,17 @@ macro_rules! as_type_ref {
     };
 }
 
+macro_rules! as_type_ref_mut {
+    ($fn_name:ident, $inner:tt, $inner_type:ident) => {
+        pub fn $fn_name(&mut self) -> Option<&mut $inner_type> {
+            match self {
+                Self::$inner(inner) => Some(inner),
+                _ => None,
+            }
+        }
+    };
+}
+
 // Cast implementations
 impl DataBlock {
     as_type!(as_all_null, AllNull, AllNullDataBlock);
@@ -842,6 +950,17 @@ impl DataBlock {
     as_type_ref!(as_variable_width_ref, VariableWidth, VariableWidthBlock);
     as_type_ref!(as_struct_ref, Struct, StructDataBlock);
     as_type_ref!(as_dictionary_ref, Dictionary, DictionaryDataBlock);
+    as_type_ref_mut!(as_all_null_mut_ref, AllNull, AllNullDataBlock);
+    as_type_ref_mut!(as_nullable_mut_ref, Nullable, NullableDataBlock);
+    as_type_ref_mut!(as_fixed_width_mut_ref, FixedWidth, FixedWidthDataBlock);
+    as_type_ref_mut!(
+        as_fixed_size_list_mut_ref,
+        FixedSizeList,
+        FixedSizeListBlock
+    );
+    as_type_ref_mut!(as_variable_width_mut_ref, VariableWidth, VariableWidthBlock);
+    as_type_ref_mut!(as_struct_mut_ref, Struct, StructDataBlock);
+    as_type_ref_mut!(as_dictionary_mut_ref, Dictionary, DictionaryDataBlock);
 }
 
 // Methods to convert from Arrow -> DataBlock
@@ -1178,7 +1297,7 @@ impl DataBlock {
             return Self::AllNull(AllNullDataBlock { num_values });
         }
 
-        let encoded = match data_type {
+        let mut encoded = match data_type {
             DataType::Binary | DataType::Utf8 => arrow_binary_to_data_block(arrays, num_values, 32),
             DataType::BinaryView | DataType::Utf8View => {
                 todo!()
@@ -1262,6 +1381,10 @@ impl DataBlock {
                 )
             }
         };
+
+        // compute statistics
+        encoded.compute_stat();
+
         if !matches!(data_type, DataType::Dictionary(_, _)) {
             match nulls {
                 Nullability::None => encoded,
@@ -1292,7 +1415,7 @@ impl From<ArrayRef> for DataBlock {
 }
 
 pub trait DataBlockBuilderImpl {
-    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
+    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>);
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
@@ -1316,7 +1439,7 @@ impl DataBlockBuilder {
         self.builder.as_mut().unwrap().as_mut()
     }
 
-    pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+    pub fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
         self.get_builder(data_block).append(data_block, selection);
     }
 
@@ -1332,16 +1455,18 @@ mod tests {
 
     use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
-        ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray, StringArray, UInt8Array,
+        make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
+        StringArray, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
+    use arrow_schema::{DataType, Field, Fields};
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
     use crate::buffer::LanceBuffer;
 
-    use super::DataBlock;
+    use super::{AllNullDataBlock, DataBlock};
 
     use arrow::compute::concat;
     use arrow_array::Array;
@@ -1505,7 +1630,6 @@ mod tests {
                 LanceBuffer::reinterpret_vec::<i8>(vec![3, 0, 1, 2, 3])
             );
         };
-        println!("Check one");
         check_common(data);
 
         // However, we can manually create a dictionary where nulls are in the dictionary
@@ -1515,7 +1639,6 @@ mod tests {
 
         let data = DataBlock::from_array(dict);
 
-        println!("Check two");
         check_common(data);
     }
 
@@ -1563,6 +1686,22 @@ mod tests {
             nullable_items.data.as_variable_width().unwrap().data.len(),
             32640
         );
+    }
+
+    #[test]
+    fn test_all_null() {
+        for data_type in [
+            DataType::UInt32,
+            DataType::FixedSizeBinary(2),
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+            DataType::Struct(Fields::from(vec![Field::new("a", DataType::UInt32, true)])),
+        ] {
+            let block = DataBlock::AllNull(AllNullDataBlock { num_values: 10 });
+            let arr = block.into_arrow(data_type.clone(), true).unwrap();
+            let arr = make_array(arr);
+            let expected = new_null_array(&data_type, 10);
+            assert_eq!(&arr, &expected);
+        }
     }
 
     #[test]

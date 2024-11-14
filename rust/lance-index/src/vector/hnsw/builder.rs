@@ -226,7 +226,7 @@ impl HNSW {
         match self.inner.visited_generator_queue.push(visited_generator) {
             Ok(_) => {}
             Err(_) => {
-                println!("visited_generator_queue is full");
+                log::warn!("visited_generator_queue is full");
             }
         }
 

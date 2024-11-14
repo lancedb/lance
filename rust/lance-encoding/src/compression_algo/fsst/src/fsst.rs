@@ -18,8 +18,11 @@ const FSST_CODE_MASK: u16 = FSST_CODE_MAX - 1;
 const FSST_SAMPLETARGET: usize = 1 << 14;
 const FSST_SAMPLEMAXSZ: usize = 2 * FSST_SAMPLETARGET;
 
-// the the input size is less than 4MB, we mark the file header and copy the input to the output as is
-const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+// if the input size is less than 4MB, we mark the file header and copy the input to the output as is
+pub const FSST_LEAST_INPUT_SIZE: usize = 4 * 1024 * 1024; // 4MB
+
+// if the max length of the input strings are less than `FSST_LEAST_INPUT_MAX_LENGTH`, we shouldn't use FSST.
+pub const FSST_LEAST_INPUT_MAX_LENGTH: u64 = 5;
 
 // we only use the lower 32 bits in icl, so we can use 1 << 32 to represent a free slot in the hash table
 const FSST_ICL_FREE: u64 = 1 << 32;

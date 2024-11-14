@@ -11,7 +11,9 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use itertools::Itertools;
 use lance_core::datatypes::NullabilityComparison;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::SchemaCompareOptions, traits::DatasetTakeRows};
 use lance_datafusion::projection::ProjectionPlan;
@@ -30,10 +32,12 @@ use lance_table::io::commit::{
     ManifestLocation, ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
-use log::warn;
+use log::{info, warn};
 use object_store::path::Path;
 use prost::Message;
+use rowids::get_row_id_index;
 use snafu::{location, Location};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::pin::Pin;
@@ -551,20 +555,43 @@ impl Dataset {
         // append + input schema different from existing schema = error
         if matches!(params.mode, WriteMode::Append) {
             if let Some(d) = dataset.as_ref() {
+                // If the dataset is already using (or not using) move stable row ids, we need to match
+                // and ignore whatever the user provided as input
+                if params.enable_move_stable_row_ids != d.manifest.uses_move_stable_row_ids() {
+                    info!(
+                        "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
+                        params.enable_move_stable_row_ids,
+                        d.manifest.uses_move_stable_row_ids()
+                    );
+                    params.enable_move_stable_row_ids = d.manifest.uses_move_stable_row_ids();
+                }
                 let m = d.manifest.as_ref();
-                schema.check_compatible(
-                    &m.schema,
-                    &SchemaCompareOptions {
-                        compare_dictionary: true,
-                        // array nullability is checked later, using actual data instead
-                        // of the schema
-                        compare_nullability: NullabilityComparison::Ignore,
-                        ..Default::default()
-                    },
-                )?;
+                let mut schema_cmp_opts = SchemaCompareOptions {
+                    compare_dictionary: true,
+                    // array nullability is checked later, using actual data instead
+                    // of the schema
+                    compare_nullability: NullabilityComparison::Ignore,
+                    ..Default::default()
+                };
+                if m.blob_dataset_version.is_none() {
+                    // Balanced datasets don't yet support schema evolution
+                    schema_cmp_opts.ignore_field_order = true;
+                    schema_cmp_opts.allow_missing_if_nullable = true;
+                }
+
+                schema.check_compatible(&m.schema, &schema_cmp_opts)?;
                 // If appending, always use existing storage version
                 storage_version = m.data_storage_format.lance_file_version()?;
             }
+        }
+
+        // If we are writing a dataset with non-default storage, we need to enable move stable row ids
+        if dataset.is_none()
+            && !params.enable_move_stable_row_ids
+            && schema.fields.iter().any(|f| !f.is_default_storage())
+        {
+            info!("Enabling move stable row ids because non-default storage is used");
+            params.enable_move_stable_row_ids = true;
         }
 
         let manifest_naming_scheme = if let Some(d) = dataset.as_ref() {
@@ -694,7 +721,7 @@ impl Dataset {
         params: Option<WriteParams>,
     ) -> Result<()> {
         // Force append mode
-        let params = WriteParams {
+        let mut params = WriteParams {
             mode: WriteMode::Append,
             ..params.unwrap_or_default()
         };
@@ -711,13 +738,31 @@ impl Dataset {
         let stream = reader_to_stream(batches);
 
         // Return Error if append and input schema differ
-        self.manifest.schema.check_compatible(
-            &schema,
-            &SchemaCompareOptions {
-                compare_dictionary: true,
-                ..Default::default()
-            },
-        )?;
+        let mut schema_cmp_opts = SchemaCompareOptions {
+            compare_dictionary: true,
+            // array nullability is checked later, using actual data instead
+            // of the schema
+            compare_nullability: NullabilityComparison::Ignore,
+            ..Default::default()
+        };
+        if self.manifest.blob_dataset_version.is_none() {
+            // Balanced datasets don't yet support schema evolution
+            schema_cmp_opts.ignore_field_order = true;
+            schema_cmp_opts.allow_missing_if_nullable = true;
+        }
+
+        schema.check_compatible(&self.manifest.schema, &schema_cmp_opts)?;
+
+        // If the dataset is already using (or not using) move stable row ids, we need to match
+        // and ignore whatever the user provided as input
+        if params.enable_move_stable_row_ids != self.manifest.uses_move_stable_row_ids() {
+            info!(
+                "Ignoring user provided move stable row ids setting of {}, dataset already has it set to {}",
+                params.enable_move_stable_row_ids,
+                self.manifest.uses_move_stable_row_ids()
+            );
+            params.enable_move_stable_row_ids = self.manifest.uses_move_stable_row_ids();
+        }
 
         let written_frags = write_fragments_internal(
             Some(self),
@@ -1176,12 +1221,7 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(
-            self,
-            row_indices,
-            &projection.into().into_projection_plan(self.schema())?,
-        )
-        .await
+        take::take(self, row_indices, projection.into()).await
     }
 
     /// Take Rows by the internal ROW ids.
@@ -1437,6 +1477,169 @@ impl Dataset {
         &self.manifest.fragments
     }
 
+    // Gets a filtered list of fragments from ids in O(N) time instead of using
+    // `get_fragment` which would require O(N^2) time.
+    fn get_frags_from_ordered_ids(&self, ordered_ids: &[u32]) -> Vec<Option<FileFragment>> {
+        let mut fragments = Vec::with_capacity(ordered_ids.len());
+        let mut id_iter = ordered_ids.iter();
+        let mut id = id_iter.next();
+        // This field is just used to assert the ids are in order
+        let mut last_id: i64 = -1;
+        for frag in self.manifest.fragments.iter() {
+            let mut the_id = if let Some(id) = id { *id } else { break };
+            // Assert the given ids are, in fact, in order
+            assert!(the_id as i64 > last_id);
+            // For any IDs we've passed we can assume that no fragment exists any longer
+            // with that ID.
+            while the_id < frag.id as u32 {
+                fragments.push(None);
+                last_id = the_id as i64;
+                id = id_iter.next();
+                the_id = if let Some(id) = id { *id } else { break };
+            }
+
+            if the_id == frag.id as u32 {
+                fragments.push(Some(FileFragment::new(
+                    Arc::new(self.clone()),
+                    frag.clone(),
+                )));
+                last_id = the_id as i64;
+                id = id_iter.next();
+            }
+        }
+        fragments
+    }
+
+    // This method filters deleted items from `addr_or_ids` using `addrs` as a reference
+    async fn filter_addr_or_ids(&self, addr_or_ids: &[u64], addrs: &[u64]) -> Result<Vec<u64>> {
+        if addrs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut perm = permutation::sort(addrs);
+        // First we sort the addrs, then we transform from Vec<u64> to Vec<Option<u64>> and then
+        // we un-sort and use the None values to filter `addr_or_ids`
+        let sorted_addrs = perm.apply_slice(addrs);
+
+        // Only collect deletion vectors for the fragments referenced by the given addrs
+        let referenced_frag_ids = sorted_addrs
+            .iter()
+            .map(|addr| RowAddress::from(*addr).fragment_id())
+            .dedup()
+            .collect::<Vec<_>>();
+        let frags = self.get_frags_from_ordered_ids(&referenced_frag_ids);
+        let dv_futs = frags
+            .iter()
+            .map(|frag| {
+                if let Some(frag) = frag {
+                    frag.get_deletion_vector().boxed()
+                } else {
+                    std::future::ready(Ok(None)).boxed()
+                }
+            })
+            .collect::<Vec<_>>();
+        let dvs = stream::iter(dv_futs)
+            .buffered(self.object_store.io_parallelism())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        // Iterate through the sorted addresses and sorted fragments (and sorted deletion vectors)
+        // and filter out addresses that have been deleted
+        let mut filtered_sorted_ids = Vec::with_capacity(sorted_addrs.len());
+        let mut sorted_addr_iter = sorted_addrs.into_iter().map(RowAddress::from);
+        let mut next_addr = sorted_addr_iter.next().unwrap();
+        let mut exhausted = false;
+
+        for frag_dv in frags.iter().zip(dvs).zip(referenced_frag_ids.iter()) {
+            let ((frag, dv), frag_id) = frag_dv;
+            if frag.is_some() {
+                // Frag exists
+                if let Some(dv) = dv.as_ref() {
+                    // Deletion vector exists, scan DV
+                    for deleted in dv.to_sorted_iter() {
+                        while next_addr.fragment_id() == *frag_id
+                            && next_addr.row_offset() < deleted
+                        {
+                            filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                            if let Some(next) = sorted_addr_iter.next() {
+                                next_addr = next;
+                            } else {
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                        if exhausted {
+                            break;
+                        }
+                        if next_addr.fragment_id() != *frag_id {
+                            break;
+                        }
+                        if next_addr.row_offset() == deleted {
+                            filtered_sorted_ids.push(None);
+                            if let Some(next) = sorted_addr_iter.next() {
+                                next_addr = next;
+                            } else {
+                                exhausted = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+                // Either no deletion vector, or we've exhausted it, keep everything else
+                // in this frag
+                while next_addr.fragment_id() == *frag_id {
+                    filtered_sorted_ids.push(Some(u64::from(next_addr)));
+                    if let Some(next) = sorted_addr_iter.next() {
+                        next_addr = next;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                // Frag doesn't exist (possibly deleted), delete all items
+                while next_addr.fragment_id() == *frag_id {
+                    filtered_sorted_ids.push(None);
+                    if let Some(next) = sorted_addr_iter.next() {
+                        next_addr = next;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // filtered_sorted_ids is now a Vec with the same size as sorted_addrs, but with None
+        // values where the corresponding address was deleted.  We now need to un-sort it and
+        // filter out the deleted addresses.
+        perm.apply_inv_slice_in_place(&mut filtered_sorted_ids);
+        Ok(addr_or_ids
+            .iter()
+            .zip(filtered_sorted_ids)
+            .filter_map(|(addr_or_id, maybe_addr)| maybe_addr.map(|_| *addr_or_id))
+            .collect())
+    }
+
+    pub(crate) async fn filter_deleted_addresses(&self, addrs: &[u64]) -> Result<Vec<u64>> {
+        self.filter_addr_or_ids(addrs, addrs).await
+    }
+
+    pub(crate) async fn filter_deleted_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
+        let addresses = if let Some(row_id_index) = get_row_id_index(self).await? {
+            let addresses = ids
+                .iter()
+                .filter_map(|id| row_id_index.get(*id).map(|address| address.into()))
+                .collect::<Vec<_>>();
+            Cow::Owned(addresses)
+        } else {
+            Cow::Borrowed(ids)
+        };
+
+        self.filter_addr_or_ids(ids, &addresses).await
+    }
+
     /// Gets the number of files that are so small they don't even have a full
     /// group. These are considered too small because reading many of them is
     /// much less efficient than reading a single file because the separate files
@@ -1473,6 +1676,26 @@ impl Dataset {
                 ));
             }
         }
+
+        // Fragments are sorted in increasing fragment id order
+        self.manifest
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .try_fold(0, |prev, id| {
+                if id < prev {
+                    Err(Error::corrupt_file(
+                        self.base.clone(),
+                        format!(
+                            "Fragment ids are not sorted in increasing fragment-id order. Found {} after {} in dataset {:?}",
+                            id, prev, self.base
+                        ),
+                        location!(),
+                    ))
+                } else {
+                    Ok(id)
+                }
+            })?;
 
         // All fragments have equal lengths
         futures::stream::iter(self.get_fragments())
@@ -1857,6 +2080,7 @@ mod tests {
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
     use lance_arrow::bfloat16::{self, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME};
+    use lance_core::datatypes::LANCE_STORAGE_CLASS_SCHEMA_META_KEY;
     use lance_datagen::{array, gen, BatchCount, Dimension, RowCount};
     use lance_file::version::LanceFileVersion;
     use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams};
@@ -4674,5 +4898,292 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_insert_subschema() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let mut dataset = Dataset::write(empty_reader, "memory://", None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        // If missing columns that aren't nullable, will return an error
+        // TODO: provide alternative default than null.
+        let just_b = Arc::new(schema.project(&[1]).unwrap());
+        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
+        let res = dataset.append(reader, None).await;
+        assert!(
+            matches!(res, Err(Error::SchemaMismatch { .. })),
+            "Expected Error::SchemaMismatch, got {:?}",
+            res
+        );
+
+        // If missing columns that are nullable, the write succeeds.
+        let just_a = Arc::new(schema.project(&[0]).unwrap());
+        let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // Looking at the fragments, there is no data file with the missing field
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0]);
+
+        // When reading back, columns that are missing are null
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![None])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+
+        // Can still insert all columns
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![3])),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(reader, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        // When reading back, only missing data is null, otherwise is filled in
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![None, Some(3)])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+
+        // Can run compaction. All files should now have all fields.
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 1]);
+
+        // Can scan and get expected data.
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(data, expected);
+    }
+
+    #[tokio::test]
+    async fn test_insert_nested_subschemas() {
+        // Test subschemas at struct level
+        // Test different orders
+        // Test the Dataset::write() path
+        // Test Take across fragments with different field id sets
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let field_a = Arc::new(ArrowField::new("a", DataType::Int32, true));
+        let field_b = Arc::new(ArrowField::new("b", DataType::Int32, false));
+        let field_c = Arc::new(ArrowField::new("c", DataType::Int32, true));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_a.clone(), field_b.clone(), field_c.clone()].into()),
+            true,
+        )]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let dataset = Dataset::write(empty_reader, test_uri, None).await.unwrap();
+        dataset.validate().await.unwrap();
+
+        let append_options = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        // Can insert b, a
+        let just_b_a = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_b.clone(), field_a.clone()].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            just_b_a.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_b.clone(),
+                    Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+                ),
+                (field_a.clone(), Arc::new(Int32Array::from(vec![2]))),
+            ]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b_a.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].metadata.files.len(), 1);
+        assert_eq!(&fragments[0].metadata.files[0].fields, &[0, 2, 1]);
+        assert_eq!(&fragments[0].metadata.files[0].column_indices, &[0, 1, 2]);
+
+        // Can insert c, b
+        let just_c_b = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_c.clone(), field_b.clone()].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            just_c_b.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_c.clone(),
+                    Arc::new(Int32Array::from(vec![4])) as ArrayRef,
+                ),
+                (field_b.clone(), Arc::new(Int32Array::from(vec![3]))),
+            ]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_c_b.clone());
+        let dataset = Dataset::write(reader, test_uri, Some(append_options.clone()))
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        assert_eq!(fragments[1].metadata.files.len(), 1);
+        assert_eq!(&fragments[1].metadata.files[0].fields, &[0, 3, 2]);
+        assert_eq!(&fragments[1].metadata.files[0].column_indices, &[0, 1, 2]);
+
+        // Can't insert a, c (b is non-nullable)
+        let just_a_c = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "s",
+            DataType::Struct(vec![field_a.clone(), field_c.clone()].into()),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            just_a_c.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_a.clone(),
+                    Arc::new(Int32Array::from(vec![5])) as ArrayRef,
+                ),
+                (field_c.clone(), Arc::new(Int32Array::from(vec![6]))),
+            ]))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a_c.clone());
+        let res = Dataset::write(reader, test_uri, Some(append_options)).await;
+        assert!(
+            matches!(res, Err(Error::SchemaMismatch { .. })),
+            "Expected Error::SchemaMismatch, got {:?}",
+            res
+        );
+
+        // Can scan and get all data
+        let data = dataset.scan().try_into_batch().await.unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_a.clone(),
+                    Arc::new(Int32Array::from(vec![Some(2), None])) as ArrayRef,
+                ),
+                (field_b.clone(), Arc::new(Int32Array::from(vec![1, 3]))),
+                (
+                    field_c.clone(),
+                    Arc::new(Int32Array::from(vec![None, Some(4)])),
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(data, expected);
+
+        // Can call take and get rows from all three back in one batch
+        let result = dataset
+            .take(&[1, 0], Arc::new(dataset.schema().clone()))
+            .await
+            .unwrap();
+        let expected = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StructArray::from(vec![
+                (
+                    field_a.clone(),
+                    Arc::new(Int32Array::from(vec![None, Some(2)])) as ArrayRef,
+                ),
+                (field_b.clone(), Arc::new(Int32Array::from(vec![3, 1]))),
+                (
+                    field_c.clone(),
+                    Arc::new(Int32Array::from(vec![Some(4), None])),
+                ),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn test_insert_balanced_subschemas() {
+        // TODO: support this.
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let field_a = ArrowField::new("a", DataType::Int32, true);
+        let field_b = ArrowField::new("b", DataType::Int64, true);
+        let schema = Arc::new(ArrowSchema::new(vec![
+            field_a.clone(),
+            field_b.clone().with_metadata(
+                [(
+                    LANCE_STORAGE_CLASS_SCHEMA_META_KEY.to_string(),
+                    "blob".to_string(),
+                )]
+                .into(),
+            ),
+        ]));
+        let empty_reader = RecordBatchIterator::new(vec![], schema.clone());
+        let options = WriteParams {
+            enable_move_stable_row_ids: true,
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(empty_reader, test_uri, Some(options))
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        // Insert left side
+        let just_a = Arc::new(ArrowSchema::new(vec![field_a.clone()]));
+        let batch = RecordBatch::try_new(just_a.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_a.clone());
+        let result = dataset.append(reader, None).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
+
+        // Insert right side
+        let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
+        let batch = RecordBatch::try_new(just_b.clone(), vec![Arc::new(Int64Array::from(vec![2]))])
+            .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], just_b.clone());
+        let result = dataset.append(reader, None).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(Error::SchemaMismatch { .. })));
     }
 }

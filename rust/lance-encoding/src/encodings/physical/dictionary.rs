@@ -240,7 +240,6 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
             panic!("Expected dictionary type");
         };
 
-        println!("Before");
         let dict_data = match data {
             DataBlock::Dictionary(dict_data) => dict_data,
             DataBlock::AllNull(all_null) => {
@@ -261,7 +260,6 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
             }
             _ => panic!("Expected dictionary data"),
         };
-        println!("After");
         let num_dictionary_items = dict_data.dictionary.num_values() as u32;
 
         let encoded_indices = self.indices_encoder.encode(

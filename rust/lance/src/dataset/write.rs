@@ -309,22 +309,23 @@ pub async fn write_fragments_internal(
                 schema.check_compatible(
                     dataset.schema(),
                     &SchemaCompareOptions {
-                        // We don't care if the user claims their data is nullable / non-nullable.
-                        // We will verify against the actual data in the writer.
+                        // We don't care if the user claims their data is nullable / non-nullable.  We will
+                        // verify against the actual data.
                         compare_nullability: NullabilityComparison::Ignore,
+                        allow_missing_if_nullable: true,
+                        ignore_field_order: true,
+                        compare_dictionary: true,
                         ..Default::default()
                     },
                 )?;
-                // Use the schema from the dataset, because it has the correct
-                // field ids.  Use the storage version from the dataset, ignoring
-                // any version from the user.
-                (
-                    dataset.schema().clone(),
-                    dataset
-                        .manifest()
-                        .data_storage_format
-                        .lance_file_version()?,
-                )
+                // Project from the dataset schema, because it has the correct field ids.
+                let write_schema = dataset.schema().project_by_schema(&schema)?;
+                // Use the storage version from the dataset, ignoring any version from the user.
+                let data_storage_version = dataset
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_version()?;
+                (write_schema, data_storage_version)
             }
             WriteMode::Overwrite => {
                 // Overwrite, use the schema from the data.  If the user specified
@@ -345,7 +346,9 @@ pub async fn write_fragments_internal(
         (schema, params.storage_version_or_default())
     };
 
-    let (data, blob_data) = data.extract_blob_stream(&schema);
+    let data_schema = schema.project_by_schema(data.schema().as_ref())?;
+
+    let (data, blob_data) = data.extract_blob_stream(&data_schema);
 
     // Some params we borrow from the normal write, some we override
     let blob_write_params = WriteParams {
@@ -360,6 +363,13 @@ pub async fn write_fragments_internal(
         max_rows_per_file: params.max_rows_per_file,
         ..Default::default()
     };
+
+    if blob_data.is_some() && !params.enable_move_stable_row_ids {
+        return Err(Error::invalid_input(
+            "The blob storage class requires move stable row ids",
+            location!(),
+        ));
+    }
 
     let frag_schema = schema.retain_storage_class(StorageClass::Default);
     let fragments_fut = do_write_fragments(

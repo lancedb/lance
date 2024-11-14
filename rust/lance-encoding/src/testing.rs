@@ -14,6 +14,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{
     cache::{CapacityMode, FileMetadataCache},
+    utils::bit::pad_bytes,
     Result,
 };
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
@@ -25,9 +26,8 @@ use crate::{
         FilterExpression, PageInfo,
     },
     encoder::{
-        default_encoding_strategy, ColumnIndexSequence, CoreArrayEncodingStrategy,
-        CoreFieldEncodingStrategy, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder,
-        FieldEncodingStrategy, OutOfLineBuffers,
+        default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
+        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
@@ -35,6 +35,7 @@ use crate::{
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+const TEST_ALIGNMENT: usize = MIN_PAGE_BUFFER_ALIGNMENT as usize;
 
 #[derive(Debug)]
 pub(crate) struct SimulatedScheduler {
@@ -271,20 +272,18 @@ pub async fn check_round_trip_encoding_generated(
     let lance_field = lance_core::datatypes::Field::try_from(&field).unwrap();
     for page_size in [4096, 1024 * 1024] {
         debug!("Testing random data with a page size of {}", page_size);
-        let encoding_strategy = CoreFieldEncodingStrategy {
-            array_encoding_strategy: Arc::new(CoreArrayEncodingStrategy { version }),
-            version,
-        };
+        let encoding_strategy = default_encoding_strategy(version);
         let encoder_factory = || {
             let mut column_index_seq = ColumnIndexSequence::default();
             let encoding_options = EncodingOptions {
                 max_page_bytes: MAX_PAGE_BYTES,
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
+                buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
             };
             encoding_strategy
                 .create_field_encoder(
-                    &encoding_strategy,
+                    encoding_strategy.as_ref(),
                     &lance_field,
                     &mut column_index_seq,
                     &encoding_options,
@@ -297,6 +296,7 @@ pub async fn check_round_trip_encoding_generated(
             encoder_factory,
             field.clone(),
             array_generator_provider.copy(),
+            version,
         )
         .await
     }
@@ -412,6 +412,7 @@ pub async fn check_round_trip_encoding_of_data(
             cache_bytes_per_column: *page_size,
             max_page_bytes: test_cases.get_max_page_size(),
             keep_original_array: true,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
         };
         let encoder = encoding_strategy
             .create_field_encoder(
@@ -444,11 +445,17 @@ impl SimulatedWriter {
         let offset = self.encoded_data.len() as u64;
         self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
+        let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
+        self.encoded_data
+            .extend(std::iter::repeat(0).take(pad_bytes));
         (offset, size)
     }
 
     fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
         self.encoded_data.extend_from_slice(&buffer);
+        let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
+        self.encoded_data
+            .extend(std::iter::repeat(0).take(pad_bytes));
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {
@@ -472,7 +479,7 @@ impl SimulatedWriter {
     }
 
     fn new_external_buffers(&self) -> OutOfLineBuffers {
-        OutOfLineBuffers::new(self.encoded_data.len() as u64)
+        OutOfLineBuffers::new(self.encoded_data.len() as u64, MIN_PAGE_BUFFER_ALIGNMENT)
     }
 }
 
@@ -661,6 +668,7 @@ async fn check_round_trip_field_encoding_random(
     encoder_factory: impl Fn() -> Box<dyn FieldEncoder>,
     field: Field,
     array_generator_provider: Box<dyn ArrayGeneratorProvider>,
+    version: LanceFileVersion,
 ) {
     for null_rate in [None, Some(0.5), Some(1.0)] {
         for use_slicing in [false, true] {
@@ -678,6 +686,7 @@ async fn check_round_trip_field_encoding_random(
             };
 
             let test_cases = TestCases::default()
+                .with_file_version(version)
                 .with_range(0..500)
                 .with_range(100..1100)
                 .with_range(8000..8500)

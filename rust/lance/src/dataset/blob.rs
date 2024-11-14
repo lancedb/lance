@@ -58,7 +58,7 @@ impl BlobFile {
         position: u64,
         size: u64,
     ) -> Self {
-        let frag_id = RowAddress::new_from_id(row_addr).fragment_id();
+        let frag_id = RowAddress::from(row_addr).fragment_id();
         let frag = dataset.get_fragment(frag_id as usize).unwrap();
         let data_file = frag.data_file_for_field(field_id).unwrap().path.clone();
         let data_file = dataset.data_dir().child(data_file);

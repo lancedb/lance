@@ -426,9 +426,16 @@ impl Scanner {
         &mut self,
         columns: &[(impl AsRef<str>, impl AsRef<str>)],
     ) -> Result<&mut Self> {
-        let physical_schema = self.scan_output_schema(true)?;
+        let base_schema = self.scan_output_schema(self.dataset.schema(), true)?;
         self.projection_plan =
-            ProjectionPlan::try_new(&physical_schema, columns, /*load_blobs=*/ false)?;
+            ProjectionPlan::try_new(&base_schema, columns, /*load_blobs=*/ false)?;
+        if self.projection_plan.sibling_schema.is_some() {
+            return Err(Error::NotSupported {
+                source: "Scanning columns with non-default storage class is not yet supported"
+                    .into(),
+                location: location!(),
+            });
+        }
         Ok(self)
     }
 
@@ -859,15 +866,17 @@ impl Scanner {
     ///
     /// This includes columns that are added by the scan but don't exist in the dataset
     /// schema (e.g. _distance, _rowid, _rowaddr)
-    pub(crate) fn scan_output_schema(&self, force_row_id: bool) -> Result<Arc<Schema>> {
+    pub(crate) fn scan_output_schema(
+        &self,
+        base_schema: &Schema,
+        force_row_id: bool,
+    ) -> Result<Arc<Schema>> {
         let extra_columns = self.get_extra_columns(force_row_id);
 
         let schema = if !extra_columns.is_empty() {
-            self.projection_plan
-                .physical_schema
-                .merge(&ArrowSchema::new(extra_columns))?
+            base_schema.merge(&ArrowSchema::new(extra_columns))?
         } else {
-            self.projection_plan.physical_schema.as_ref().clone()
+            base_schema.clone()
         };
 
         // drop metadata
@@ -888,7 +897,10 @@ impl Scanner {
         // Append the extra columns
         let mut output_expr = self.projection_plan.to_physical_exprs()?;
 
-        let physical_schema = ArrowSchema::from(self.scan_output_schema(false)?.as_ref());
+        let physical_schema = ArrowSchema::from(
+            self.scan_output_schema(&self.projection_plan.physical_schema, false)?
+                .as_ref(),
+        );
 
         // distance goes before the row_id column
         if self.nearest.is_some() && output_expr.iter().all(|(_, name)| name != DIST_COL) {
@@ -1043,6 +1055,12 @@ impl Scanner {
         // which do not exist in the dataset schema but are added by the scan.  We can ignore
         // those as eager columns.
         let filter_schema = self.dataset.schema().project_or_drop(&columns)?;
+        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
+            return Err(Error::NotSupported {
+                source: "non-default storage columns cannot be used as filters".into(),
+                location: location!(),
+            });
+        }
         let physical_schema = self.projection_plan.physical_schema.clone();
         let remaining_schema = physical_schema.exclude(&filter_schema)?;
 
@@ -1367,7 +1385,8 @@ impl Scanner {
         }
 
         // Stage 5: take remaining columns required for projection
-        let physical_schema = self.scan_output_schema(false)?;
+        let physical_schema =
+            self.scan_output_schema(&self.projection_plan.physical_schema, false)?;
         let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
         if !remaining_schema.fields.is_empty() {
             plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
@@ -2763,8 +2782,6 @@ mod test {
         scan.filter("i > 100").unwrap();
         scan.project(&["i", "vec"]).unwrap();
         scan.refine(5);
-
-        println!("{}", scan.explain_plan(true).await.unwrap());
 
         let results = scan
             .try_into_stream()

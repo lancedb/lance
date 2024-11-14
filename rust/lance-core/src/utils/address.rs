@@ -13,19 +13,19 @@ impl RowAddress {
     // A row id that will never be used
     pub const TOMBSTONE_ROW: u64 = 0xffffffffffffffff;
 
-    pub fn new_from_id(row_id: u64) -> Self {
-        Self(row_id)
+    pub fn new_from_u64(row_addr: u64) -> Self {
+        Self(row_addr)
     }
 
-    pub fn new_from_parts(fragment_id: u32, row_id: u32) -> Self {
-        Self(((fragment_id as u64) << 32) | row_id as u64)
+    pub fn new_from_parts(fragment_id: u32, row_offset: u32) -> Self {
+        Self(((fragment_id as u64) << 32) | row_offset as u64)
     }
 
     pub fn first_row(fragment_id: u32) -> Self {
         Self::new_from_parts(fragment_id, 0)
     }
 
-    pub fn fragment_range(fragment_id: u32) -> Range<u64> {
+    pub fn address_range(fragment_id: u32) -> Range<u64> {
         u64::from(Self::first_row(fragment_id))..u64::from(Self::first_row(fragment_id + 1))
     }
 
@@ -33,7 +33,7 @@ impl RowAddress {
         (self.0 >> 32) as u32
     }
 
-    pub fn row_id(&self) -> u32 {
+    pub fn row_offset(&self) -> u32 {
         self.0 as u32
     }
 }
@@ -41,6 +41,12 @@ impl RowAddress {
 impl From<RowAddress> for u64 {
     fn from(row_id: RowAddress) -> Self {
         row_id.0
+    }
+}
+
+impl From<u64> for RowAddress {
+    fn from(row_id: u64) -> Self {
+        Self(row_id)
     }
 }
 
@@ -52,6 +58,6 @@ impl std::fmt::Debug for RowAddress {
 
 impl std::fmt::Display for RowAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}, {})", self.fragment_id(), self.row_id())
+        write!(f, "({}, {})", self.fragment_id(), self.row_offset())
     }
 }

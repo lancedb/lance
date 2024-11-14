@@ -704,6 +704,11 @@ async fn rewrite_files(
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
         params.max_bytes_per_file = max_bytes_per_file;
     }
+
+    if dataset.manifest.uses_move_stable_row_ids() {
+        params.enable_move_stable_row_ids = true;
+    }
+
     let new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
@@ -1025,8 +1030,8 @@ mod tests {
                 .map(|key| {
                     format!(
                         "{}:{:?}",
-                        RowAddress::new_from_id(*key),
-                        map[key].map(RowAddress::new_from_id)
+                        RowAddress::from(*key),
+                        map[key].map(RowAddress::from)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1671,8 +1676,6 @@ mod tests {
                 .unwrap()
                 .project(&["i"])
                 .unwrap();
-
-            println!("{}", scanner.explain_plan(true).await.unwrap());
 
             scanner.try_into_batch().await.unwrap()
         }

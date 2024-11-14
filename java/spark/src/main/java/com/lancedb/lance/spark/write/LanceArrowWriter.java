@@ -25,6 +25,8 @@ import javax.annotation.concurrent.GuardedBy;
 import java.io.IOException;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -41,6 +43,9 @@ public class LanceArrowWriter extends ArrowReader {
 
   private final AtomicLong totalBytesRead = new AtomicLong();
   private ArrowWriter arrowWriter = null;
+  private final AtomicInteger count = new AtomicInteger(0);
+  private final Semaphore writeToken;
+  private final Semaphore loadToken;
 
   public LanceArrowWriter(BufferAllocator allocator, Schema schema, int batchSize) {
     super(allocator);
@@ -49,60 +54,63 @@ public class LanceArrowWriter extends ArrowReader {
     this.schema = schema;
     // TODO(lu) batch size as config?
     this.batchSize = batchSize;
+    this.writeToken = new Semaphore(0);
+    this.loadToken = new Semaphore(0);
   }
 
   void write(InternalRow row) {
     Preconditions.checkNotNull(row);
-    synchronized (monitor) {
-      // TODO(lu) wait if too much elements in rowQueue
-      rowQueue.offer(row);
-      monitor.notify();
+    try {
+      // wait util prepareLoadNextBatch to release write token,
+      writeToken.acquire();
+      arrowWriter.write(row);
+      if (count.incrementAndGet() == batchSize) {
+        // notify loadNextBatch to take the batch
+        loadToken.release();
+      }
+    } catch (InterruptedException e) {
+        throw new RuntimeException(e);
     }
   }
 
   void setFinished() {
-    synchronized (monitor) {
-      finished = true;
-      monitor.notify();
-    }
+    loadToken.release();
+    finished = true;
   }
 
   @Override
-  protected void prepareLoadNextBatch() throws IOException {
+  public void prepareLoadNextBatch() throws IOException {
     super.prepareLoadNextBatch();
-    // Do not use ArrowWriter.reset since it does not work well with Arrow JNI
     arrowWriter = ArrowWriter.create(this.getVectorSchemaRoot());
+    // release batch size token for write
+    writeToken.release(batchSize);
   }
 
   @Override
   public boolean loadNextBatch() throws IOException {
     prepareLoadNextBatch();
-    int rowCount = 0;
-    synchronized (monitor) {
-      while (rowCount < batchSize) {
-        while (rowQueue.isEmpty() && !finished) {
-          try {
-            monitor.wait();
-          } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while waiting for data", e);
-          }
-        }
-        if (rowQueue.isEmpty() && finished) {
-          break;
-        }
-        InternalRow row = rowQueue.poll();
-        if (row != null) {
-          arrowWriter.write(row);
-          rowCount++;
+    try {
+      if (finished && count.get() == 0) {
+        return false;
+      }
+      // wait util batch if full or finished
+      loadToken.acquire();
+      arrowWriter.finish();
+      if (!finished) {
+        count.set(0);
+        return true;
+      } else {
+        // true if it has some rows and return false if there is no record
+        if (count.get() > 0) {
+          count.set(0);
+          return true;
+        } else {
+          return false;
         }
       }
+    } catch (InterruptedException e) {
+        throw new RuntimeException(e);
     }
-    if (rowCount == 0) {
-      return false;
-    }
-    arrowWriter.finish();
-    return true;
   }
 
   @Override

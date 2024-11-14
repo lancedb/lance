@@ -19,7 +19,7 @@ use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::storage::ProductQuantizationStorage;
+use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
@@ -52,6 +52,8 @@ pub struct PQIndex {
     pub pq: ProductQuantizer,
 
     /// PQ code
+    /// the PQ codes are stored in a transposed way,
+    /// call `Self::get_pq_codes` to get the PQ code for a specific vector.
     pub code: Option<Arc<UInt8Array>>,
 
     /// ROW Id used to refer to the actual row in dataset.
@@ -105,21 +107,38 @@ impl PQIndex {
         pre_filter: &dyn PreFilter,
         code: Arc<UInt8Array>,
         row_ids: Arc<UInt64Array>,
-        num_sub_vectors: i32,
+        _num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
+        let num_vectors = row_ids.len();
         let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
         let row_ids = Arc::new(as_primitive_array(&row_ids).clone());
 
-        let code = FixedSizeListArray::try_new_from_values(code.as_ref().clone(), num_sub_vectors)
-            .unwrap();
-        let code = take(&code, &indices_to_keep, None)?;
-        let code = as_fixed_size_list_array(&code).values().clone();
-        let code = Arc::new(as_primitive_array(&code).clone());
+        let code = code
+            .values()
+            .chunks_exact(num_vectors)
+            .flat_map(|c| {
+                let mut filtered = Vec::with_capacity(indices_to_keep.len());
+                for idx in indices_to_keep.values() {
+                    filtered.push(c[*idx as usize]);
+                }
+                filtered
+            })
+            .collect();
 
-        Ok((code, row_ids))
+        Ok((Arc::new(code), row_ids))
+    }
+
+    fn get_pq_codes(transposed_codes: &UInt8Array, vec_idx: usize, num_vectors: usize) -> Vec<u8> {
+        transposed_codes
+            .values()
+            .iter()
+            .skip(vec_idx)
+            .step_by(num_vectors)
+            .cloned()
+            .collect()
     }
 }
 
@@ -156,7 +175,7 @@ impl Index for PQIndex {
             let mut frag_ids = row_ids
                 .values()
                 .iter()
-                .map(|&row_id| RowAddress::new_from_id(row_id).fragment_id())
+                .map(|&row_id| RowAddress::from(row_id).fragment_id())
                 .collect::<Vec<_>>();
             frag_ids.sort();
             frag_ids.dedup();
@@ -245,7 +264,7 @@ impl VectorIndex for PQIndex {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.code_dim() * length;
-        let pq_code = read_fixed_stride_array(
+        let pq_codes = read_fixed_stride_array(
             reader.as_ref(),
             &DataType::UInt8,
             offset,
@@ -264,8 +283,14 @@ impl VectorIndex for PQIndex {
         )
         .await?;
 
+        let pq_codes = transpose(
+            pq_codes.as_primitive(),
+            row_ids.len(),
+            self.pq.num_sub_vectors,
+        );
+
         Ok(Box::new(Self {
-            code: Some(Arc::new(pq_code.as_primitive().clone())),
+            code: Some(Arc::new(pq_codes)),
             row_ids: Some(Arc::new(row_ids.as_primitive().clone())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
@@ -281,29 +306,36 @@ impl VectorIndex for PQIndex {
     }
 
     fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let code = self
-            .code
-            .as_ref()
-            .unwrap()
-            .values()
-            .chunks_exact(self.pq.code_dim());
+        let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
-            .zip(code)
-            .filter_map(|(old_row_id, code)| {
+            .enumerate()
+            .filter_map(|(vec_idx, old_row_id)| {
                 let new_row_id = mapping.get(old_row_id).cloned();
                 // If the row id is not in the mapping then this row is not remapped and we keep as is
                 let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
-                new_row_id.map(|new_row_id| (new_row_id, code))
+                new_row_id.map(|new_row_id| {
+                    (
+                        new_row_id,
+                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
+                    )
+                })
             })
             .collect::<Vec<_>>();
 
         self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
             remapped.iter().map(|(row_id, _)| *row_id),
         )));
-        self.code = Some(Arc::new(UInt8Array::from_iter_values(
-            remapped.into_iter().flat_map(|(_, code)| code).copied(),
-        )));
+
+        let pq_codes =
+            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
+        let transposed_codes = transpose(
+            &pq_codes,
+            self.row_ids.as_ref().unwrap().len(),
+            self.pq.num_sub_vectors,
+        );
+        self.code = Some(Arc::new(transposed_codes));
         Ok(())
     }
 
@@ -448,6 +480,7 @@ pub(crate) fn build_pq_storage(
         pq.code_dim(),
         pq.dimension,
         distance_type,
+        false,
     )?;
 
     Ok(pq_store)

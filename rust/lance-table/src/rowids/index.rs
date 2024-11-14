@@ -56,7 +56,7 @@ impl RowIdIndex {
         let (row_id_segment, address_segment) = self.0.get(&row_id)?;
         let pos = row_id_segment.position(row_id)?;
         let address = address_segment.get(pos)?;
-        Some(RowAddress::new_from_id(address))
+        Some(RowAddress::from(address))
     }
 }
 

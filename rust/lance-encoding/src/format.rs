@@ -19,9 +19,9 @@ use pb::{
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, Bitpack2, Bitpacked, BitpackedForNonNeg, Dictionary,
-    FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct,
-    PageLayout,
+    AllNullLayout, ArrayEncoding, Binary, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg,
+    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock, MiniBlockLayout,
+    Nullable, PackedStruct, PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionConfig;
@@ -133,6 +133,24 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn binary_miniblock() -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::BinaryMiniBlock(BinaryMiniBlock {})),
+        }
+    }
+
+    // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually
+    // not used and `FsstMiniBlockDecompressor` constructs a `binary_mini_block` in a `hard-coded` fashion.
+    // This can be an optimization later.
+    pub fn fsst_mini_block(data: ArrayEncoding, symbol_table: Vec<u8>) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::FsstMiniBlock(Box::new(FsstMiniBlock {
+                binary_mini_block: Some(Box::new(data)),
+                symbol_table,
+            }))),
+        }
+    }
+
     pub fn packed_struct(
         child_encodings: Vec<ArrayEncoding>,
         packed_buffer_index: u32,
@@ -187,10 +205,10 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn fixed_size_list(data: ArrayEncoding, dimension: u32) -> ArrayEncoding {
+    pub fn fixed_size_list(data: ArrayEncoding, dimension: u64) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
-                dimension,
+                dimension: dimension.try_into().unwrap(),
                 items: Some(Box::new(data)),
             }))),
         }
@@ -219,7 +237,21 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn all_null_layout() -> PageLayout {
+    pub fn full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        value_encoding: ArrayEncoding,
+    ) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
+                bits_rep: bits_rep as u32,
+                bits_def: bits_def as u32,
+                value_compression: Some(value_encoding),
+            })),
+        }
+    }
+
+    pub fn simple_all_null_layout() -> PageLayout {
         PageLayout {
             layout: Some(Layout::AllNullLayout(AllNullLayout {})),
         }

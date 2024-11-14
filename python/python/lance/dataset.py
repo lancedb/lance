@@ -1999,7 +1999,7 @@ class LanceDataset(pa.dataset.Dataset):
                         )
                     values = pa.array(pq_codebook.reshape(-1))
                     pq_codebook = pa.FixedSizeListArray.from_arrays(
-                        values, num_sub_vectors * 256
+                        values, pq_codebook.shape[2]
                     )
                 pq_codebook_batch = pa.RecordBatch.from_arrays(
                     [pq_codebook], ["_pq_codebook"]
@@ -3040,6 +3040,9 @@ class DatasetOptimizer:
         max_rows_per_group: int, default 1024
             Max number of rows per group. This does not affect which fragments
             need compaction, but does affect how they are re-written if selected.
+
+            This setting only affects datasets using the legacy storage format.
+            The newer format does not require row groups.
         max_bytes_per_file: Optional[int], default None
             Max number of bytes in a single file.  This does not affect which
             fragments need compaction, but does affect how they are re-written if

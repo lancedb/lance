@@ -19,12 +19,13 @@ from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
 
-def create_table(nvec=1000, ndim=128, nans=0, nullify=False):
+def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
         nans_mat = np.empty((nans, ndim))
         nans_mat[:] = np.nan
         mat = np.concatenate((mat, nans_mat), axis=0)
+    mat = mat.astype(dtype)
     price = np.random.rand(nvec + nans) * 100
 
     def gen_str(n):
@@ -162,6 +163,21 @@ def test_invalid_subvectors_cuda(tmp_path):
             num_sub_vectors=15,
             accelerator="cuda",
         )
+
+
+@pytest.mark.cuda
+def test_f16_cuda(tmp_path):
+    tbl = create_table(dtype=np.float16)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator="cuda",
+        one_pass_ivfpq=True,
+    )
+    validate_vector_index(dataset, "vector")
 
 
 def test_index_with_nans(tmp_path):
