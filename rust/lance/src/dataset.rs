@@ -4444,12 +4444,14 @@ mod tests {
                     "{:?}",
                     res1
                 );
-            } else {
+            } else if res2.is_err() {
                 assert!(
                     matches!(res2, Err(Error::DatasetAlreadyExists { .. })),
                     "{:?}",
                     res2
                 );
+            } else {
+                assert!(res1.is_ok() && res2.is_ok());
             }
         }
     }

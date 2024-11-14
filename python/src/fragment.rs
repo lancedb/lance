@@ -494,12 +494,10 @@ pub fn write_fragments(
     let get_fragments = |operation| match operation {
         Operation::Overwrite { fragments, .. } => Ok(fragments),
         Operation::Append { fragments, .. } => Ok(fragments),
-        _ => {
-            return Err(Error::Internal {
-                message: "Unexpected operation".into(),
-                location: location!(),
-            })
-        }
+        _ => Err(Error::Internal {
+            message: "Unexpected operation".into(),
+            location: location!(),
+        }),
     };
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
