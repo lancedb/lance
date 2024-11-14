@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_array::RecordBatchIterator;
 use arrow_array::RecordBatchReader;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
@@ -12,10 +13,7 @@ use lance_datafusion::utils::peek_reader_schema;
 use lance_datafusion::utils::reader_to_stream;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
-use lance_io::object_store::ObjectStoreParams;
-use lance_io::object_store::ObjectStoreRegistry;
 use lance_table::feature_flags::can_write_dataset;
-use lance_table::io::commit::commit_handler_from_url;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -29,58 +27,31 @@ use crate::Dataset;
 use crate::{Error, Result};
 
 use super::commit::CommitBuilder;
+use super::resolve_commit_handler;
+use super::WriteDestination;
 use super::WriteMode;
 use super::WriteParams;
+use super::WrittenFragments;
 
-#[derive(Debug, Clone)]
-pub enum InsertDestination<'a> {
-    Dataset(Arc<Dataset>),
-    Uri(&'a str),
-}
-
-impl InsertDestination<'_> {
-    pub fn dataset(&self) -> Option<&Dataset> {
-        match self {
-            InsertDestination::Dataset(dataset) => Some(dataset.as_ref()),
-            InsertDestination::Uri(_) => None,
-        }
-    }
-}
-
-impl From<Arc<Dataset>> for InsertDestination<'_> {
-    fn from(dataset: Arc<Dataset>) -> Self {
-        InsertDestination::Dataset(dataset)
-    }
-}
-
-impl<'a> From<&'a str> for InsertDestination<'a> {
-    fn from(uri: &'a str) -> Self {
-        InsertDestination::Uri(uri)
-    }
-}
-
-impl<'a> From<&'a String> for InsertDestination<'a> {
-    fn from(uri: &'a String) -> Self {
-        InsertDestination::Uri(uri.as_str())
-    }
-}
-
-impl<'a> From<&'a Path> for InsertDestination<'a> {
-    fn from(path: &'a Path) -> Self {
-        InsertDestination::Uri(path.as_ref())
-    }
-}
-
+/// Insert or create a new dataset.
+///
+/// There are different variants of `execute()` methods. Those with the `_stream`
+/// suffix take an iterator of data so that larger than memory data can be written
+/// out. However, this eliminates optimizations that can be made when the full
+/// data is known up-front.
+///
+/// Those with the `_uncommitted` suffix write the data files but do not commit
+/// the transactions. These changes to the dataset will not be visible until
+/// they are passed to the [`CommitBuilder`].
 #[derive(Debug, Clone)]
 pub struct InsertBuilder<'a> {
-    dest: InsertDestination<'a>,
+    dest: WriteDestination<'a>,
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
-    // TODO: num_jobs
 }
 
 impl<'a> InsertBuilder<'a> {
-    pub fn new(dest: impl Into<InsertDestination<'a>>) -> Self {
+    pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
             params: None,
@@ -92,11 +63,13 @@ impl<'a> InsertBuilder<'a> {
         self
     }
 
-    pub async fn execute(&self, data: &[RecordBatch]) -> Result<Dataset> {
-        // TODO: validate schema is the same for all batches
-        todo!()
+    /// Execute the insert operation with the given data.
+    pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
+        let (transaction, context) = self.write_uncommitted_impl(data).await?;
+        Self::do_commit(&context, transaction).await
     }
 
+    /// Execute the insert operation with the given stream.
     pub async fn execute_stream(
         &self,
         stream: impl RecordBatchReader + Send + 'static,
@@ -112,7 +85,38 @@ impl<'a> InsertBuilder<'a> {
         stream: Box<dyn RecordBatchReader + Send + 'static>,
     ) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_stream_impl(stream).await?;
+        Self::do_commit(&context, transaction).await
+    }
 
+    /// Write data files, but don't commit the transaction yet.
+    ///
+    /// Use [`CommitBuilder`] to commit the transaction.
+    ///
+    /// # Example: Append data to a dataset
+    ///
+    /// ```rust
+    /// use lance::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+    ///
+    /// # use std::sync::Arc;
+    /// # use arrow_array::RecordBatch;
+    /// # use lance::Result;
+    /// # use lance::dataset::Dataset;
+    /// # async fn example(dataset: Arc<Dataset>, data: Vec<RecordBatch>) -> Result<()> {
+    /// let transaction = InsertBuilder::new(dataset.clone())
+    ///     .with_params(&WriteParams { mode: WriteMode::Append, ..Default::default() })
+    ///     .execute_uncommitted(data)
+    ///     .await?;
+    /// CommitBuilder::new(dataset)
+    ///     .execute(transaction)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn execute_uncommitted(&self, data: Vec<RecordBatch>) -> Result<Transaction> {
+        self.write_uncommitted_impl(data).await.map(|(t, _)| t)
+    }
+
+    async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
             .with_storage_format(context.storage_version)
@@ -132,15 +136,35 @@ impl<'a> InsertBuilder<'a> {
         commit_builder.execute(transaction).await
     }
 
-    /// Write data files, but don't commit the transaction yet.
-    ///
-    /// Use CommitBuilder to commit the transaction.
-    pub async fn write_uncommitted(&self, data: &[RecordBatch]) -> Result<Transaction> {
-        todo!()
+    async fn write_uncommitted_impl(
+        &self,
+        data: Vec<RecordBatch>,
+    ) -> Result<(Transaction, WriteContext<'_>)> {
+        // TODO: This should be able to split the data up based on max_rows_per_file
+        // and write in parallel. https://github.com/lancedb/lance/issues/1980
+        if data.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "No data to write".into(),
+                location: location!(),
+            });
+        }
+        let schema = data[0].schema();
+        for batch in data.iter().skip(1) {
+            if batch.schema() != schema {
+                return Err(Error::InvalidInput {
+                    source: "All record batches must have the same schema".into(),
+                    location: location!(),
+                });
+            }
+        }
+        let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
+        self.write_uncommitted_stream_impl(Box::new(reader)).await
     }
 
-    /// Write but don't commit the transaction yet.
-    pub async fn write_uncommitted_stream(
+    /// Write data files, but don't commit the transaction yet.
+    ///
+    /// Use [`CommitBuilder`] to commit the transaction.
+    pub async fn execute_uncommitted_stream(
         &self,
         stream: Box<dyn RecordBatchReader + Send + 'static>,
     ) -> Result<Transaction> {
@@ -169,6 +193,16 @@ impl<'a> InsertBuilder<'a> {
         )
         .await?;
 
+        let transaction = Self::build_transaction(schema, written_frags, &context)?;
+
+        Ok((transaction, context))
+    }
+
+    fn build_transaction(
+        schema: Schema,
+        written_frags: WrittenFragments,
+        context: &WriteContext<'_>,
+    ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
                 // Use the full schema, not the written schema
@@ -190,7 +224,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        let transaction = Transaction::new(
+        Ok(Transaction::new(
             context
                 .dest
                 .dataset()
@@ -199,21 +233,19 @@ impl<'a> InsertBuilder<'a> {
             operation,
             blobs_op,
             None,
-        );
-
-        Ok((transaction, context))
+        ))
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
         // Write mode
         match (&context.params.mode, &context.dest) {
-            (WriteMode::Create, InsertDestination::Dataset(_)) => {
+            (WriteMode::Create, WriteDestination::Dataset(_)) => {
                 return Err(Error::InvalidInput {
                     source: "Dataset already exists".into(),
                     location: location!(),
                 });
             }
-            (WriteMode::Append | WriteMode::Overwrite, InsertDestination::Uri(uri)) => {
+            (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
                 log::warn!("No existing dataset at {uri}, it will be created");
                 context.params.mode = WriteMode::Create;
             }
@@ -222,7 +254,7 @@ impl<'a> InsertBuilder<'a> {
 
         // Validate schema
         if matches!(context.params.mode, WriteMode::Append) {
-            if let InsertDestination::Dataset(dataset) = &context.dest {
+            if let WriteDestination::Dataset(dataset) = &context.dest {
                 // If the dataset is already using (or not using) move stable row ids, we need to match
                 // and ignore whatever the user provided as input
                 if context.params.enable_move_stable_row_ids
@@ -264,7 +296,7 @@ impl<'a> InsertBuilder<'a> {
         }
 
         // Feature flags
-        if let InsertDestination::Dataset(dataset) = &context.dest {
+        if let WriteDestination::Dataset(dataset) = &context.dest {
             if !can_write_dataset(dataset.manifest.writer_feature_flags) {
                 let message = format!(
                     "This dataset cannot be written by this version of Lance. \
@@ -284,24 +316,30 @@ impl<'a> InsertBuilder<'a> {
     async fn resolve_context(&self) -> Result<WriteContext<'a>> {
         let params = self.params.cloned().unwrap_or_default();
         let (object_store, base_path, commit_handler) = match &self.dest {
-            InsertDestination::Dataset(dataset) => (
+            WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
                 dataset.commit_handler.clone(),
             ),
-            InsertDestination::Uri(uri) => {
-                Self::params_from_uri(
-                    uri,
-                    &params.commit_handler,
-                    &params.store_params,
+            WriteDestination::Uri(uri) => {
+                let (object_store, base_path) = ObjectStore::from_uri_and_params(
                     params.object_store_registry.clone(),
+                    uri,
+                    &params.store_params.clone().unwrap_or_default(),
                 )
-                .await?
+                .await?;
+                let commit_handler = resolve_commit_handler(
+                    uri,
+                    params.commit_handler.clone(),
+                    &params.store_params,
+                )
+                .await?;
+                (Arc::new(object_store), base_path, commit_handler)
             }
         };
         let dest = match &self.dest {
-            InsertDestination::Dataset(dataset) => InsertDestination::Dataset(dataset.clone()),
-            InsertDestination::Uri(uri) => {
+            WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
+            WriteDestination::Uri(uri) => {
                 // Check if it already exists.
                 let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: params.store_params.clone(),
@@ -311,9 +349,9 @@ impl<'a> InsertBuilder<'a> {
                 });
 
                 match builder.load().await {
-                    Ok(dataset) => InsertDestination::Dataset(Arc::new(dataset)),
+                    Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        InsertDestination::Uri(uri)
+                        WriteDestination::Uri(uri)
                     }
                     Err(e) => return Err(e),
                 }
@@ -321,7 +359,7 @@ impl<'a> InsertBuilder<'a> {
         };
 
         let storage_version = match (&params.mode, &dest) {
-            (WriteMode::Overwrite, InsertDestination::Dataset(dataset)) => {
+            (WriteMode::Overwrite, WriteDestination::Dataset(dataset)) => {
                 // If overwriting an existing dataset, allow the user to specify but use
                 // the existing version if they don't
                 params.data_storage_version.map(Ok).unwrap_or_else(|| {
@@ -329,13 +367,13 @@ impl<'a> InsertBuilder<'a> {
                     m.data_storage_format.lance_file_version()
                 })?
             }
-            (_, InsertDestination::Dataset(dataset)) => {
+            (_, WriteDestination::Dataset(dataset)) => {
                 // If appending to an existing dataset, always use the dataset version
                 let m = dataset.manifest.as_ref();
                 m.data_storage_format.lance_file_version()?
             }
             // Otherwise (no existing dataset) fallback to the default if the user didn't specify
-            (_, InsertDestination::Uri(_)) => params.storage_version_or_default(),
+            (_, WriteDestination::Uri(_)) => params.storage_version_or_default(),
         };
 
         Ok(WriteContext {
@@ -347,53 +385,11 @@ impl<'a> InsertBuilder<'a> {
             storage_version,
         })
     }
-
-    async fn params_from_uri(
-        uri: &str,
-        commit_handler: &Option<Arc<dyn CommitHandler>>,
-        store_options: &Option<ObjectStoreParams>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
-        let (mut object_store, base_path) = match store_options.as_ref() {
-            Some(store_options) => {
-                ObjectStore::from_uri_and_params(object_store_registry, uri, store_options).await?
-            }
-            None => ObjectStore::from_uri(uri).await?,
-        };
-
-        if let Some(block_size) = store_options.as_ref().and_then(|opts| opts.block_size) {
-            object_store.set_block_size(block_size);
-        }
-
-        let commit_handler = match &commit_handler {
-            None => {
-                if store_options.is_some() && store_options.as_ref().unwrap().object_store.is_some()
-                {
-                    return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
-                }
-                commit_handler_from_url(uri, store_options).await?
-            }
-            Some(commit_handler) => {
-                if uri.starts_with("s3+ddb") {
-                    return Err(Error::InvalidInput {
-                        source:
-                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-                                .into(),
-                        location: location!(),
-                    });
-                } else {
-                    commit_handler.clone()
-                }
-            }
-        };
-
-        Ok((Arc::new(object_store), base_path, commit_handler))
-    }
 }
 
 struct WriteContext<'a> {
     params: WriteParams,
-    dest: InsertDestination<'a>,
+    dest: WriteDestination<'a>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,

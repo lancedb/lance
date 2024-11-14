@@ -15,7 +15,7 @@ use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{DataFile, Fragment};
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
@@ -37,7 +37,48 @@ pub mod update;
 
 pub use commit::CommitBuilder;
 pub use insert::InsertBuilder;
-pub use insert::InsertDestination;
+
+/// The destination to write data to.
+#[derive(Debug, Clone)]
+pub enum WriteDestination<'a> {
+    /// An existing dataset to write to.
+    Dataset(Arc<Dataset>),
+    /// A URI to write to.
+    Uri(&'a str),
+}
+
+impl WriteDestination<'_> {
+    pub fn dataset(&self) -> Option<&Dataset> {
+        match self {
+            WriteDestination::Dataset(dataset) => Some(dataset.as_ref()),
+            WriteDestination::Uri(_) => None,
+        }
+    }
+}
+
+impl From<Arc<Dataset>> for WriteDestination<'_> {
+    fn from(dataset: Arc<Dataset>) -> Self {
+        WriteDestination::Dataset(dataset)
+    }
+}
+
+impl<'a> From<&'a str> for WriteDestination<'a> {
+    fn from(uri: &'a str) -> Self {
+        WriteDestination::Uri(uri)
+    }
+}
+
+impl<'a> From<&'a String> for WriteDestination<'a> {
+    fn from(uri: &'a String) -> Self {
+        WriteDestination::Uri(uri.as_str())
+    }
+}
+
+impl<'a> From<&'a Path> for WriteDestination<'a> {
+    fn from(path: &'a Path) -> Self {
+        WriteDestination::Uri(path.as_ref())
+    }
+}
 
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]
@@ -176,13 +217,13 @@ impl WriteParams {
     note = "Use [`InsertBuilder::write_uncommitted_stream`] instead"
 )]
 pub async fn write_fragments(
-    dest: impl Into<InsertDestination<'_>>,
+    dest: impl Into<WriteDestination<'_>>,
     data: impl RecordBatchReader + Send + 'static,
     params: WriteParams,
 ) -> Result<Transaction> {
     InsertBuilder::new(dest.into())
         .with_params(&params)
-        .write_uncommitted_stream(Box::new(data))
+        .execute_uncommitted_stream(Box::new(data))
         .await
 }
 
@@ -525,6 +566,37 @@ impl WriterGenerator {
         .await?;
 
         Ok((writer, fragment))
+    }
+}
+
+// Given input options resolve what the commit handler should be.
+async fn resolve_commit_handler(
+    uri: &str,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+    store_options: &Option<ObjectStoreParams>,
+) -> Result<Arc<dyn CommitHandler>> {
+    match commit_handler {
+        None => {
+            if store_options
+                .as_ref()
+                .map(|opts| &opts.object_store)
+                .is_some()
+            {
+                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
+            }
+            commit_handler_from_url(uri, store_options).await
+        }
+        Some(commit_handler) => {
+            if uri.starts_with("s3+ddb") {
+                Err(Error::InvalidInput {
+                    source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+                        .into(),
+                    location: location!(),
+                })
+            } else {
+                Ok(commit_handler)
+            }
+        }
     }
 }
 

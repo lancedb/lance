@@ -26,8 +26,8 @@ use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
-    commit_handler_from_url, migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock,
-    ManifestLocation, ManifestNamingScheme,
+    migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock, ManifestLocation,
+    ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
 use object_store::path::Path;
@@ -84,8 +84,9 @@ pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
 };
 pub use write::update::{UpdateBuilder, UpdateJob};
+#[allow(deprecated)]
 pub use write::{
-    write_fragments, CommitBuilder, InsertBuilder, InsertDestination, WriteMode, WriteParams,
+    write_fragments, CommitBuilder, InsertBuilder, WriteDestination, WriteMode, WriteParams,
 };
 
 const INDICES_DIR: &str = "_indices";
@@ -294,48 +295,6 @@ impl Dataset {
         DatasetBuilder::from_uri(uri).load().await
     }
 
-    async fn params_from_uri(
-        uri: &str,
-        commit_handler: &Option<Arc<dyn CommitHandler>>,
-        store_options: &Option<ObjectStoreParams>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> Result<(ObjectStore, Path, Arc<dyn CommitHandler>)> {
-        let (mut object_store, base_path) = match store_options.as_ref() {
-            Some(store_options) => {
-                ObjectStore::from_uri_and_params(object_store_registry, uri, store_options).await?
-            }
-            None => ObjectStore::from_uri(uri).await?,
-        };
-
-        if let Some(block_size) = store_options.as_ref().and_then(|opts| opts.block_size) {
-            object_store.set_block_size(block_size);
-        }
-
-        let commit_handler = match &commit_handler {
-            None => {
-                if store_options.is_some() && store_options.as_ref().unwrap().object_store.is_some()
-                {
-                    return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
-                }
-                commit_handler_from_url(uri, store_options).await?
-            }
-            Some(commit_handler) => {
-                if uri.starts_with("s3+ddb") {
-                    return Err(Error::InvalidInput {
-                        source:
-                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-                                .into(),
-                        location: location!(),
-                    });
-                } else {
-                    commit_handler.clone()
-                }
-            }
-        };
-
-        Ok((object_store, base_path, commit_handler))
-    }
-
     /// Check out a dataset version with a ref
     pub async fn checkout_version(&self, version: impl Into<refs::Ref>) -> Result<Self> {
         let ref_: refs::Ref = version.into();
@@ -476,7 +435,7 @@ impl Dataset {
     ///
     pub async fn write(
         batches: impl RecordBatchReader + Send + 'static,
-        dest: impl Into<InsertDestination<'_>>,
+        dest: impl Into<WriteDestination<'_>>,
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut builder = InsertBuilder::new(dest);
@@ -499,7 +458,7 @@ impl Dataset {
             ..params.unwrap_or_default()
         };
 
-        let new_dataset = InsertBuilder::new(InsertDestination::Dataset(Arc::new(self.clone())))
+        let new_dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(self.clone())))
             .with_params(&write_params)
             .execute_stream(batches)
             .await?;
@@ -645,7 +604,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     async fn do_commit(
-        base_uri: InsertDestination<'_>,
+        base_uri: WriteDestination<'_>,
         operation: Operation,
         blobs_op: Option<Operation>,
         read_version: Option<u64>,
@@ -719,7 +678,7 @@ impl Dataset {
     ///   this on will make the dataset unreadable for older versions of Lance
     ///   (prior to 0.17.0). Default is False.
     pub async fn commit(
-        dest: impl Into<InsertDestination<'_>>,
+        dest: impl Into<WriteDestination<'_>>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -752,7 +711,7 @@ impl Dataset {
     /// This can be used to stage changes or to handle "secondary" datasets whose
     /// lineage is tracked elsewhere.
     pub async fn commit_detached(
-        dest: impl Into<InsertDestination<'_>>,
+        dest: impl Into<WriteDestination<'_>>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,

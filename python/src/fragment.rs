@@ -22,7 +22,7 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{InsertBuilder, InsertDestination, NewColumnTransform};
+use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
 use lance::Error;
 use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
 use lance_table::io::deletion::deletion_file_path;
@@ -472,9 +472,9 @@ pub fn write_fragments(
 
     let dest = if dest.is_instance_of::<Dataset>() {
         let dataset: Dataset = dest.extract()?;
-        InsertDestination::Dataset(dataset.ds.clone())
+        WriteDestination::Dataset(dataset.ds.clone())
     } else {
-        InsertDestination::Uri(dest.extract()?)
+        WriteDestination::Uri(dest.extract()?)
     };
 
     let written = RT
@@ -482,7 +482,7 @@ pub fn write_fragments(
             Some(reader.py()),
             InsertBuilder::new(dest)
                 .with_params(&params)
-                .write_uncommitted_stream(batches),
+                .execute_uncommitted_stream(batches),
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
 

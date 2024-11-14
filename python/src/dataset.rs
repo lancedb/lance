@@ -41,7 +41,7 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{
-    BatchInfo, BatchUDF, CommitBuilder, InsertDestination, NewColumnTransform, UDFCheckpointStore,
+    BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
@@ -63,7 +63,7 @@ use lance_table::format::Fragment;
 use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyTypeError};
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
@@ -1409,9 +1409,9 @@ impl Dataset {
 
         let dest = if dest.is_instance_of::<Dataset>() {
             let dataset: Dataset = dest.extract()?;
-            InsertDestination::Dataset(dataset.ds.clone())
+            WriteDestination::Dataset(dataset.ds.clone())
         } else {
-            InsertDestination::Uri(dest.extract()?)
+            WriteDestination::Uri(dest.extract()?)
         };
 
         let transaction =
@@ -1545,9 +1545,9 @@ pub fn write_dataset(
     let py = options.py();
     let dest = if dest.is_instance_of::<Dataset>() {
         let dataset: Dataset = dest.extract()?;
-        InsertDestination::Dataset(dataset.ds.clone())
+        WriteDestination::Dataset(dataset.ds.clone())
     } else {
-        InsertDestination::Uri(dest.extract()?)
+        WriteDestination::Uri(dest.extract()?)
     };
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;

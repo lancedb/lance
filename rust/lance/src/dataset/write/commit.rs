@@ -7,9 +7,8 @@ use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::{
     format::DataStorageFormat,
-    io::commit::{commit_handler_from_url, CommitConfig, CommitHandler, ManifestNamingScheme},
+    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
-use object_store::path::Path;
 use snafu::{location, Location};
 
 use crate::{
@@ -24,12 +23,15 @@ use crate::{
     Dataset, Error, Result,
 };
 
-use super::InsertDestination;
+use super::{resolve_commit_handler, WriteDestination};
 
+/// Create a new commit from a [`Transaction`].
+///
+/// Transactions can be created using a write method like [`super::InsertBuilder::execute_uncommitted`].
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
-    dest: InsertDestination<'a>,
-    use_move_stable_row_ids: bool,
+    dest: WriteDestination<'a>,
+    use_move_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
     commit_handler: Option<Arc<dyn CommitHandler>>,
@@ -42,10 +44,10 @@ pub struct CommitBuilder<'a> {
 }
 
 impl<'a> CommitBuilder<'a> {
-    pub fn new(dest: impl Into<InsertDestination<'a>>) -> Self {
+    pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
-            use_move_stable_row_ids: false,
+            use_move_stable_row_ids: None,
             enable_v2_manifest_paths: false,
             storage_format: None,
             commit_handler: None,
@@ -58,26 +60,53 @@ impl<'a> CommitBuilder<'a> {
         }
     }
 
+    /// Whether to use move-stable row ids. This makes the `_rowid` column stable
+    /// after compaction, but not updates.
+    ///
+    /// This is only used for new datasets. Existing datasets will use their
+    /// existing setting.
+    ///
+    /// **Default is false.**
     pub fn use_move_stable_row_ids(mut self, use_move_stable_row_ids: bool) -> Self {
-        self.use_move_stable_row_ids = use_move_stable_row_ids;
+        self.use_move_stable_row_ids = Some(use_move_stable_row_ids);
         self
     }
 
+    /// Pass the storage format to use for the dataset.
+    ///
+    /// This is only needed when creating a new empty table. If any data files are
+    /// passed, the storage format will be inferred from the data files.
+    ///
+    /// All data files must use the same storage format as the existing dataset.
+    /// If a different format is passed, an error will be returned.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
         self.storage_format = Some(storage_format);
         self
     }
 
+    /// Pass an object store to use.
+    pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
+        self.object_store = Some(object_store);
+        self
+    }
+
+    /// Pass a commit handler to use for the dataset.
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
         self.commit_handler = Some(commit_handler);
         self
     }
 
+    /// Pass store parameters to use for the dataset.
+    ///
+    /// If an object store is passed, these parameters will be ignored.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
         self.store_params = Some(store_params);
         self
     }
 
+    /// Pass an object store registry to use.
+    ///
+    /// If an object store is passed, this registry will be ignored.
     pub fn with_object_store_registry(
         mut self,
         object_store_registry: Arc<ObjectStoreRegistry>,
@@ -86,11 +115,14 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
-        self.object_store = Some(object_store);
-        self
-    }
-
+    /// Pass a session to use for the dataset.
+    ///
+    /// If a session is not passed, but a dataset is used as the destination,
+    /// then the dataset's session will be used.
+    ///
+    /// By passing a session or re-using a dataset, you can re-use the
+    /// file metadata and index caches, which can significantly improve
+    /// performance.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
         self.session = Some(session);
         self
@@ -99,9 +131,12 @@ impl<'a> CommitBuilder<'a> {
     ///  If set to true, and this is a new dataset, uses the new v2 manifest
     ///  paths. These allow constant-time lookups for the latest manifest on object storage.
     ///  This parameter has no effect on existing datasets. To migrate an existing
-    ///  dataset, use the [`Self::migrate_manifest_paths_v2`] method. WARNING: turning
-    ///  this on will make the dataset unreadable for older versions of Lance
-    ///  (prior to 0.17.0). Default is False.
+    ///  dataset, use the [`Dataset::migrate_manifest_paths_v2`] method. **Default is False.**
+    ///
+    /// <div class="warning">
+    ///  WARNING: turning this on will make the dataset unreadable for older
+    ///  versions of Lance (prior to 0.17.0).
+    /// </div>
     pub fn enable_v2_manifest_paths(mut self, enable: bool) -> Self {
         self.enable_v2_manifest_paths = enable;
         self
@@ -128,29 +163,32 @@ impl<'a> CommitBuilder<'a> {
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
         let (object_store, base_path, commit_handler) = match &self.dest {
-            InsertDestination::Dataset(dataset) => (
+            WriteDestination::Dataset(dataset) => (
                 dataset.object_store.clone(),
                 dataset.base.clone(),
                 dataset.commit_handler.clone(),
             ),
-            InsertDestination::Uri(uri) => {
-                let (mut object_store, base_path, commit_handler) = Self::params_from_uri(
-                    uri,
-                    &self.commit_handler,
-                    &self.store_params,
+            WriteDestination::Uri(uri) => {
+                let (object_store, base_path) = ObjectStore::from_uri_and_params(
                     self.object_store_registry.clone(),
+                    uri,
+                    &self.store_params.clone().unwrap_or_default(),
                 )
                 .await?;
+                let mut object_store = Arc::new(object_store);
+                let commit_handler =
+                    resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
+                        .await?;
                 if let Some(passed_store) = self.object_store {
-                    object_store = passed_store
+                    object_store = passed_store;
                 }
                 (object_store, base_path, commit_handler)
             }
         };
 
         let dest = match &self.dest {
-            InsertDestination::Dataset(dataset) => InsertDestination::Dataset(dataset.clone()),
-            InsertDestination::Uri(uri) => {
+            WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
+            WriteDestination::Uri(uri) => {
                 // Check if it already exists.
                 let mut builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
                     store_options: self.store_params.clone(),
@@ -166,9 +204,9 @@ impl<'a> CommitBuilder<'a> {
                 }
 
                 match builder.load().await {
-                    Ok(dataset) => InsertDestination::Dataset(Arc::new(dataset)),
+                    Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        InsertDestination::Uri(uri)
+                        WriteDestination::Uri(uri)
                     }
                     Err(e) => return Err(e),
                 }
@@ -192,8 +230,33 @@ impl<'a> CommitBuilder<'a> {
             ManifestNamingScheme::V1
         };
 
+        let use_move_stable_row_ids = if let Some(ds) = dest.dataset() {
+            ds.manifest.uses_move_stable_row_ids()
+        } else {
+            self.use_move_stable_row_ids.unwrap_or(false)
+        };
+
+        // Validate storage format matches existing dataset
+        if let Some(ds) = dest.dataset() {
+            if let Some(storage_format) = self.storage_format {
+                let passed_storage_format = DataStorageFormat::new(storage_format);
+                if ds.manifest.data_storage_format != passed_storage_format
+                    && !matches!(transaction.operation, Operation::Overwrite { .. })
+                {
+                    return Err(Error::InvalidInput {
+                        source: format!(
+                            "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
+                            ds.manifest.data_storage_format,
+                            passed_storage_format
+                        ).into(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+
         let manifest_config = ManifestWriteConfig {
-            use_move_stable_row_ids: self.use_move_stable_row_ids,
+            use_move_stable_row_ids,
             storage_format: self.storage_format.map(DataStorageFormat::new),
             ..Default::default()
         };
@@ -227,25 +290,22 @@ impl<'a> CommitBuilder<'a> {
                 )
                 .await?
             }
+        } else if self.detached {
+            // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
+            return Err(Error::NotSupported {
+                source: "detached commits cannot currently be used to create new datasets".into(),
+                location: location!(),
+            });
         } else {
-            if self.detached {
-                // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
-                return Err(Error::NotSupported {
-                    source: "detached commits cannot currently be used to create new datasets"
-                        .into(),
-                    location: location!(),
-                });
-            } else {
-                commit_new_dataset(
-                    &object_store.as_ref(),
-                    commit_handler.as_ref(),
-                    &base_path,
-                    &transaction,
-                    &manifest_config,
-                    manifest_naming_scheme,
-                )
-                .await?
-            }
+            commit_new_dataset(
+                object_store.as_ref(),
+                commit_handler.as_ref(),
+                &base_path,
+                &transaction,
+                &manifest_config,
+                manifest_naming_scheme,
+            )
+            .await?
         };
 
         let tags = Tags::new(
@@ -255,12 +315,12 @@ impl<'a> CommitBuilder<'a> {
         );
 
         match &self.dest {
-            InsertDestination::Dataset(dataset) => Ok(Dataset {
+            WriteDestination::Dataset(dataset) => Ok(Dataset {
                 manifest: Arc::new(manifest),
                 session: self.session.unwrap_or(dataset.session.clone()),
                 ..dataset.as_ref().clone()
             }),
-            InsertDestination::Uri(uri) => Ok(Dataset {
+            WriteDestination::Uri(uri) => Ok(Dataset {
                 object_store,
                 base: base_path,
                 uri: uri.to_string(),
@@ -271,47 +331,5 @@ impl<'a> CommitBuilder<'a> {
                 manifest_naming_scheme,
             }),
         }
-    }
-
-    async fn params_from_uri(
-        uri: &str,
-        commit_handler: &Option<Arc<dyn CommitHandler>>,
-        store_options: &Option<ObjectStoreParams>,
-        object_store_registry: Arc<ObjectStoreRegistry>,
-    ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
-        let (mut object_store, base_path) = match store_options.as_ref() {
-            Some(store_options) => {
-                ObjectStore::from_uri_and_params(object_store_registry, uri, store_options).await?
-            }
-            None => ObjectStore::from_uri(uri).await?,
-        };
-
-        if let Some(block_size) = store_options.as_ref().and_then(|opts| opts.block_size) {
-            object_store.set_block_size(block_size);
-        }
-
-        let commit_handler = match &commit_handler {
-            None => {
-                if store_options.is_some() && store_options.as_ref().unwrap().object_store.is_some()
-                {
-                    return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
-                }
-                commit_handler_from_url(uri, store_options).await?
-            }
-            Some(commit_handler) => {
-                if uri.starts_with("s3+ddb") {
-                    return Err(Error::InvalidInput {
-                        source:
-                            "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
-                                .into(),
-                        location: location!(),
-                    });
-                } else {
-                    commit_handler.clone()
-                }
-            }
-        };
-
-        Ok((Arc::new(object_store), base_path, commit_handler))
     }
 }
