@@ -19,7 +19,7 @@ use lance_core::{Error, Result};
 
 use crate::buffer::LanceBuffer;
 use crate::compression_algo::fastlanes::BitPacking;
-use crate::data::{BlockInfo, UsedEncoding};
+use crate::data::BlockInfo;
 use crate::data::{DataBlock, FixedWidthDataBlock, NullableDataBlock};
 use crate::decoder::{MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder};
 use crate::encoder::{
@@ -262,7 +262,6 @@ macro_rules! encode_fixed_width {
             data: LanceBuffer::reinterpret_vec(output),
             num_values: $unpacked.num_values,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         });
 
         Result::Ok(EncodedArray {
@@ -341,7 +340,6 @@ impl ArrayEncoder for BitpackedForNonNegArrayEncoder {
                     data: Box::new(encoded_values.data),
                     nulls: nullable.nulls,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 });
                 Ok(EncodedArray {
                     data: encoded,
@@ -486,7 +484,6 @@ impl PrimitivePageDecoder for BitpackedForNonNegPageDecoder {
             bits_per_value: self.uncompressed_bits_per_value,
             num_values: num_rows,
             block_info: BlockInfo::new(),
-            used_encoding: UsedEncoding::new(),
         }))
     }
 }
@@ -1744,7 +1741,6 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
                     bits_per_value: uncompressed_bit_width as u64,
                     num_values,
                     block_info: BlockInfo::new(),
-                    used_encoding: UsedEncoding::new(),
                 }))
             }};
         }

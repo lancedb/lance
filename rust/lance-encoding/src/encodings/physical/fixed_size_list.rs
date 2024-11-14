@@ -9,7 +9,7 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    data::{BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, UsedEncoding},
+    data::{BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock},
     decoder::{PageScheduler, PerValueDecompressor, PrimitivePageDecoder},
     encoder::{ArrayEncoder, EncodedArray, PerValueCompressor, PerValueDataBlock},
     format::{pb, ProtobufUtils},
@@ -169,7 +169,6 @@ impl PerValueCompressor for FslPerValueCompressor {
                 data: fixed_width.data.borrow_and_clone(),
                 block_info: BlockInfo::new(),
                 num_values: fixed_width.num_values / self.dimension,
-                used_encoding: UsedEncoding::new(),
             }),
             DataBlock::VariableWidth(_) => todo!("GH-3111: FSL with variable inner type"),
             DataBlock::Nullable(_) => todo!("GH-3112: FSL with nullable inner type"),
@@ -208,7 +207,6 @@ impl PerValueDecompressor for FslPerValueDecompressor {
                 data: fixed_width.data,
                 block_info: BlockInfo::new(),
                 num_values: fixed_width.num_values * self.dimension,
-                used_encoding: UsedEncoding::new(),
             }),
             _ => todo!(),
         };
