@@ -239,9 +239,9 @@ impl<'a> InsertBuilder<'a> {
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
         // Write mode
         match (&context.params.mode, &context.dest) {
-            (WriteMode::Create, WriteDestination::Dataset(_)) => {
-                return Err(Error::InvalidInput {
-                    source: "Dataset already exists".into(),
+            (WriteMode::Create, WriteDestination::Dataset(ds)) => {
+                return Err(Error::DatasetAlreadyExists {
+                    uri: ds.uri.clone(),
                     location: location!(),
                 });
             }
@@ -387,6 +387,7 @@ impl<'a> InsertBuilder<'a> {
     }
 }
 
+#[derive(Debug)]
 struct WriteContext<'a> {
     params: WriteParams,
     dest: WriteDestination<'a>,

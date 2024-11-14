@@ -176,9 +176,13 @@ impl<'a> CommitBuilder<'a> {
                 )
                 .await?;
                 let mut object_store = Arc::new(object_store);
-                let commit_handler =
+                let commit_handler = if self.commit_handler.is_some() && self.object_store.is_some()
+                {
+                    self.commit_handler.as_ref().unwrap().clone()
+                } else {
                     resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
-                        .await?;
+                        .await?
+                };
                 if let Some(passed_store) = self.object_store {
                     object_store = passed_store;
                 }

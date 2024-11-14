@@ -579,8 +579,8 @@ async fn resolve_commit_handler(
         None => {
             if store_options
                 .as_ref()
-                .map(|opts| &opts.object_store)
-                .is_some()
+                .map(|opts| opts.object_store.is_some())
+                .unwrap_or_default()
             {
                 return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
             }
