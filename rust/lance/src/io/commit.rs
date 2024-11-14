@@ -75,6 +75,7 @@ async fn read_dataset_transaction_file(
         .base
         .child("_transactions")
         .child(format!("{}.txn", version));
+    dbg!(&dataset.session.file_metadata_cache);
     dataset
         .session
         .file_metadata_cache
@@ -758,6 +759,8 @@ pub(crate) async fn commit_transaction(
 
         match result {
             Ok(()) => {
+                // TODO: insert in cache here.
+
                 return Ok(manifest);
             }
             Err(CommitError::CommitConflict) => {
