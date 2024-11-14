@@ -791,9 +791,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
-            let bit_widths = data
-                .get_stat(Stat::BitWidth)
-                .expect("FixedWidthDataBlock should have valid `Stat::BitWidth` statistics");
+            let bit_widths = data.expect_stat(Stat::BitWidth);
             // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
             // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
             let has_all_zeros = bit_widths
@@ -812,15 +810,9 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         }
         if let DataBlock::VariableWidth(ref variable_width_data) = data {
             if variable_width_data.bits_per_offset == 32 {
-                let data_size = variable_width_data.get_stat(Stat::DataSize).expect(
-                    "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                );
-                let data_size = data_size.as_primitive::<UInt64Type>().value(0);
-
-                let max_len = variable_width_data.get_stat(Stat::MaxLength).expect(
-                    "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                );
-                let max_len = max_len.as_primitive::<UInt64Type>().value(0);
+                let data_size =
+                    variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                let max_len = variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
                 if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
                     && data_size >= FSST_LEAST_INPUT_SIZE as u64
