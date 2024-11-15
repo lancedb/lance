@@ -5324,6 +5324,9 @@ mod test {
             .await
             .unwrap();
 
+        // First pass will need to perform some IOPs to determine what scalar indices are available
+        assert!(tracker.new_iops() > 0);
+
         // Second planning cycle should not perform any I/O
         dataset
             .scan()
