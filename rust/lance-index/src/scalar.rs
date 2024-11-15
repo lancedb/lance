@@ -35,7 +35,7 @@ pub mod lance_format;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,

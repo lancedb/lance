@@ -21,9 +21,11 @@ use lance_index::scalar::{
     lance_format::LanceIndexStore,
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
+use lance_table::format::Index;
 use snafu::{location, Location};
 use tracing::instrument;
 
+use crate::session::Session;
 use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
@@ -79,14 +81,93 @@ impl TrainingRequest {
     }
 }
 
-/// Build a Scalar Index
+/// A trait used by the planner to determine how it can use a scalar index
+//
+// This may go away at some point but the scanner is a weak spot if we want
+// to make index types "generic" and "pluggable".  We will need to create some
+// kind of core proto for scalar indices that the scanner can read to determine
+// how and when to use a scalar index.
+
+pub trait ScalarIndexDetails {
+    fn get_type(&self) -> ScalarIndexType;
+}
+
+fn bitmap_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::BitmapIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
+fn btree_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::BTreeIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
+fn label_list_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::LabelListIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
+pub(super) fn inverted_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::InvertedIndexDetails::default();
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
+impl ScalarIndexDetails for lance_table::format::pb::BitmapIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::Bitmap
+    }
+}
+
+impl ScalarIndexDetails for lance_table::format::pb::BTreeIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::BTree
+    }
+}
+
+impl ScalarIndexDetails for lance_table::format::pb::LabelListIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::LabelList
+    }
+}
+
+impl ScalarIndexDetails for lance_table::format::pb::InvertedIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::Inverted
+    }
+}
+
+fn get_scalar_index_details(
+    details: &prost_types::Any,
+) -> Result<Option<Box<dyn ScalarIndexDetails>>> {
+    if details.type_url.ends_with("BitmapIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::BitmapIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("BTreeIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::BTreeIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("LabelListIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::LabelListIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("InvertedIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::InvertedIndexDetails>()?,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Build a Scalar Index (returns details to store in the manifest)
 #[instrument(level = "debug", skip_all)]
 pub(super) async fn build_scalar_index(
     dataset: &Dataset,
     column: &str,
     uuid: &str,
     params: &ScalarIndexParams,
-) -> Result<()> {
+) -> Result<prost_types::Any> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
@@ -126,9 +207,13 @@ pub(super) async fn build_scalar_index(
     }
     let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     match params.force_index_type {
-        Some(ScalarIndexType::Bitmap) => train_bitmap_index(training_request, &index_store).await,
+        Some(ScalarIndexType::Bitmap) => {
+            train_bitmap_index(training_request, &index_store).await?;
+            Ok(bitmap_index_details())
+        }
         Some(ScalarIndexType::LabelList) => {
-            train_label_list_index(training_request, &index_store).await
+            train_label_list_index(training_request, &index_store).await?;
+            Ok(label_list_index_details())
         }
         Some(ScalarIndexType::Inverted) => {
             train_inverted_index(
@@ -136,14 +221,16 @@ pub(super) async fn build_scalar_index(
                 &index_store,
                 InvertedIndexParams::default(),
             )
-            .await
+            .await?;
+            Ok(inverted_index_details())
         }
         _ => {
             // The BTree index implementation leverages the legacy format's batch offset,
             // which has been removed from new format, so keep using the legacy format for now.
             let index_store = index_store.with_legacy_format(true);
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
-            train_btree_index(training_request, &flat_index_trainer, &index_store).await
+            train_btree_index(training_request, &flat_index_trainer, &index_store).await?;
+            Ok(btree_index_details())
         }
     }
 }
@@ -167,10 +254,11 @@ pub(super) async fn build_inverted_index(
 pub async fn open_scalar_index(
     dataset: &Dataset,
     column: &str,
-    uuid: &str,
+    index: &Index,
 ) -> Result<Arc<dyn ScalarIndex>> {
-    let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, uuid));
-    let index_type = detect_scalar_index_type(dataset, column, uuid).await?;
+    let uuid_str = index.uuid.to_string();
+    let index_store = Arc::new(LanceIndexStore::from_dataset(dataset, &uuid_str));
+    let index_type = detect_scalar_index_type(dataset, index, column, &dataset.session).await?;
     match index_type {
         ScalarIndexType::Bitmap => {
             let bitmap_index = BitmapIndex::load(index_store).await?;
@@ -191,12 +279,12 @@ pub async fn open_scalar_index(
     }
 }
 
-pub async fn detect_scalar_index_type(
+async fn infer_scalar_index_type(
     dataset: &Dataset,
-    column: &str,
     index_uuid: &str,
+    column: &str,
 ) -> Result<ScalarIndexType> {
-    let index_dir = dataset.indices_dir().child(index_uuid);
+    let index_dir = dataset.indices_dir().child(index_uuid.to_string());
     let col = dataset.schema().field(column).ok_or(Error::Internal {
         message: format!(
             "Index refers to column {} which does not exist in dataset schema",
@@ -218,4 +306,41 @@ pub async fn detect_scalar_index_type(
     };
 
     Ok(index_type)
+}
+
+/// Determines the scalar index type
+///
+/// If the index was created with Lance newer than 0.19.2 then this simply
+/// grabs the type from the index details.  If created with an older version
+/// then we may have to perform expensive object_store.exists checks to determine
+/// the index type.  To mitigate this we cache the result in the session cache.
+#[instrument(level = "debug", skip_all)]
+pub async fn detect_scalar_index_type(
+    dataset: &Dataset,
+    index: &Index,
+    column: &str,
+    session: &Session,
+) -> Result<ScalarIndexType> {
+    if let Some(details) = &index.index_details {
+        let details = get_scalar_index_details(details)?;
+        if let Some(details) = details {
+            return Ok(details.get_type());
+        } else {
+            return Err(Error::Internal {
+                message: format!(
+                    "Index details for index {} are not a recognized scalar index type",
+                    index.uuid
+                ),
+                location: location!(),
+            });
+        }
+    } else {
+        let uuid = index.uuid.to_string();
+        if let Some(index_type) = session.index_cache.get_type(&uuid) {
+            return Ok(index_type);
+        }
+        let index_type = infer_scalar_index_type(dataset, &index.uuid.to_string(), column).await?;
+        session.index_cache.insert_type(&uuid, index_type);
+        Ok(index_type)
+    }
 }

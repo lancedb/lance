@@ -1426,6 +1426,7 @@ mod tests {
             fields: vec![0],
             dataset_version: 1,
             fragment_bitmap: None,
+            index_details: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);

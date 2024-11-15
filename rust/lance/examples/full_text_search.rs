@@ -4,7 +4,7 @@
 //! Benchmark of HNSW graph.
 //!
 //!
-
+#![allow(clippy::print_stdout)]
 use std::collections::HashSet;
 use std::sync::Arc;
 

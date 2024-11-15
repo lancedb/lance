@@ -48,6 +48,7 @@ object_store = { workspace = true, features = ["aws", "gcp", "azure"] }
 aws-credential-types.workspace = true
 pin-project.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 roaring.workspace = true
 tokio.workspace = true
 url.workspace = true

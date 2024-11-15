@@ -459,6 +459,11 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
                 .await?;
             index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
         }
+        // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
+        // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
+        if index.index_details.is_none() {
+            log::debug!("the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.", index.uuid);
+        }
     }
 
     Ok(())
