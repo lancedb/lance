@@ -154,14 +154,12 @@ impl GetStat for DataBlock {
     }
 }
 
+// NullableDataBlock will be deprecated in Lance 2.1.
 impl GetStat for NullableDataBlock {
+    // This function simply returns the statistics of the inner `DataBlock` of `NullableDataBlock`,
+    // this is not accurate but `NullableDataBlock` is going to be deprecated in Lance 2.1 anyway.
     fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
-        let block_info = self.block_info.0.read().unwrap();
-
-        if block_info.is_empty() {
-            panic!("get_stat should be called after statistics are computed.");
-        }
-        block_info.get(&stat).cloned()
+        self.data.get_stat(stat)
     }
 }
 
