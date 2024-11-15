@@ -45,6 +45,7 @@ use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use session::Session;
+use sql::SqlQueryBuilder;
 
 #[macro_use]
 extern crate lazy_static;
@@ -63,6 +64,7 @@ pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
+pub(crate) mod sql;
 pub(crate) mod tracing;
 pub(crate) mod utils;
 
@@ -134,6 +136,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyRewriteResult>()?;
     m.add_class::<PyCompactionMetrics>()?;
     m.add_class::<Session>()?;
+    m.add_class::<SqlQueryBuilder>()?;
     m.add_class::<TraceGuard>()?;
     m.add_class::<schema::LanceSchema>()?;
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
