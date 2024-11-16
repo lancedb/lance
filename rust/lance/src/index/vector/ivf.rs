@@ -1762,6 +1762,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::index::prefilter::DatasetPreFilter;
+    use crate::index::vector_index_details;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
@@ -2139,6 +2140,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
+            index_details: Some(vector_index_details()),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));

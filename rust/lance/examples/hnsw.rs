@@ -4,7 +4,7 @@
 //! Run recall benchmarks for HNSW.
 //!
 //! run with `cargo run --release --example hnsw`
-
+#![allow(clippy::print_stdout)]
 use std::collections::HashSet;
 use std::sync::Arc;
 

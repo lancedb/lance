@@ -353,6 +353,9 @@ impl Operation {
             fields,
             dataset_version,
             fragment_bitmap: Some(fragment_ids.into_iter().collect()),
+            // TODO: we should use lance::dataset::Dataset::commit_existing_index once
+            // we have a way to determine index details from an existing index.
+            index_details: None,
         }];
         let op = LanceOperation::CreateIndex {
             new_indices,
