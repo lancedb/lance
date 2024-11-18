@@ -691,8 +691,11 @@ pub(crate) async fn commit_transaction(
     dataset.checkout_latest().await?;
     let latest_version = dataset.manifest.version;
     let other_transactions = futures::stream::iter((read_version + 1)..latest_version)
-        .map(|version| read_dataset_transaction_file(&dataset, version))
-        .buffered(10)
+        .map(|version| {
+            read_dataset_transaction_file(&dataset, version)
+                .map(move |res| res.map(|tx| (version, tx)))
+        })
+        .buffer_unordered(10)
         .take_while(|res| {
             futures::future::ready(!matches!(
                 res,
@@ -709,9 +712,12 @@ pub(crate) async fn commit_transaction(
     }
 
     // If any of them conflict with the transaction, return an error
-    for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
-        let other_version = transaction.read_version + version_offset as u64 + 1;
-        check_transaction(transaction, other_version, Some(other_transaction.as_ref()))?;
+    for (other_version, other_transaction) in other_transactions.iter() {
+        check_transaction(
+            transaction,
+            *other_version,
+            Some(other_transaction.as_ref()),
+        )?;
     }
 
     for attempt_i in 0..commit_config.num_retries {
