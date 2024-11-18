@@ -98,10 +98,21 @@ impl ComputeStat for FixedWidthDataBlock {
         let max_len = self.bits_per_value / 8;
         let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
 
+        let cardidinality_array = if self.bits_per_value == 128 {
+            Some(self.cardinality())
+        } else {
+            None
+        };
+
         let mut info = self.block_info.0.write().unwrap();
         info.insert(Stat::DataSize, data_size_array);
         info.insert(Stat::BitWidth, max_bit_widths);
         info.insert(Stat::MaxLength, max_len_array);
+        if let Some(cardinality_array) = cardidinality_array {
+            info.insert(Stat::Cardinality, cardinality_array);
+        }
+
+        // TODO(broccoliSpicy): We also need to consider FixedSizeList here
     }
 }
 
@@ -300,6 +311,25 @@ impl FixedWidthDataBlock {
                 )))
             }
             _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
+        }
+    }
+
+    fn cardinality(&mut self) -> Arc<dyn Array> {
+        match self.bits_per_value {
+            128 => {
+                let u128_slice_ref = self.data.borrow_to_typed_slice::<u128>();
+                let u128_slice = u128_slice_ref.as_ref();
+
+                const PRECISION: u8 = 4;
+                let mut hll: HyperLogLogPlus<u128, RandomState> =
+                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+                for val in u128_slice {
+                    hll.insert(val);
+                }
+                let cardinality = hll.count() as u64;
+                Arc::new(UInt64Array::from(vec![cardinality]))
+            }
+            _ => unreachable!(),
         }
     }
 }

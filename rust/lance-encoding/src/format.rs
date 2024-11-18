@@ -227,12 +227,14 @@ impl ProtobufUtils {
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
+        dictionary_encoding: Option<ArrayEncoding>,
     ) -> PageLayout {
         PageLayout {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
+                dictionary: dictionary_encoding,
             })),
         }
     }

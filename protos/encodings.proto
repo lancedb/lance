@@ -318,6 +318,7 @@ message MiniBlockLayout {
   ArrayEncoding def_compression = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
+  ArrayEncoding dictionary = 4;
 }
 
 /// A layout used for pages where the data is large
