@@ -190,22 +190,23 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
+        let session = self
+            .session
+            .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
+            .unwrap_or_default();
+
         let dest = match &self.dest {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
                 // Check if it already exists.
-                let mut builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
-                    store_options: self.store_params.clone(),
-                    commit_handler: self.commit_handler.clone(),
-                    object_store_registry: self.object_store_registry.clone(),
-                    ..Default::default()
-                });
-
-                // If read_version is zero, then it might not have originally been
-                // passed. We can assume the latest version.
-                if transaction.read_version > 0 {
-                    builder = builder.with_version(transaction.read_version)
-                }
+                let builder = DatasetBuilder::from_uri(uri)
+                    .with_read_params(ReadParams {
+                        store_options: self.store_params.clone(),
+                        commit_handler: self.commit_handler.clone(),
+                        object_store_registry: self.object_store_registry.clone(),
+                        ..Default::default()
+                    })
+                    .with_session(session.clone());
 
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
@@ -265,7 +266,7 @@ impl<'a> CommitBuilder<'a> {
             ..Default::default()
         };
 
-        let manifest = if let Some(dataset) = dest.dataset() {
+        let (manifest, manifest_file) = if let Some(dataset) = dest.dataset() {
             if self.detached {
                 if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
                     return Err(Error::NotSupported {
@@ -308,6 +309,7 @@ impl<'a> CommitBuilder<'a> {
                 &transaction,
                 &manifest_config,
                 manifest_naming_scheme,
+                &session,
             )
             .await?
         };
@@ -321,7 +323,8 @@ impl<'a> CommitBuilder<'a> {
         match &self.dest {
             WriteDestination::Dataset(dataset) => Ok(Dataset {
                 manifest: Arc::new(manifest),
-                session: self.session.unwrap_or(dataset.session.clone()),
+                manifest_file,
+                session,
                 ..dataset.as_ref().clone()
             }),
             WriteDestination::Uri(uri) => Ok(Dataset {
@@ -329,11 +332,145 @@ impl<'a> CommitBuilder<'a> {
                 base: base_path,
                 uri: uri.to_string(),
                 manifest: Arc::new(manifest),
-                session: self.session.unwrap_or_default(),
+                manifest_file,
+                session,
                 commit_handler,
                 tags,
                 manifest_naming_scheme,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_table::{
+        format::{DataFile, Fragment},
+        io::commit::RenameCommitHandler,
+    };
+    use url::Url;
+
+    use crate::dataset::{InsertBuilder, WriteParams};
+
+    use super::*;
+
+    fn sample_transaction(read_version: u64) -> Transaction {
+        Transaction {
+            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::Append {
+                fragments: vec![Fragment {
+                    id: 0,
+                    files: vec![DataFile {
+                        path: "file.lance".to_string(),
+                        fields: vec![0],
+                        column_indices: vec![0],
+                        file_major_version: 2,
+                        file_minor_version: 0,
+                    }],
+                    deletion_file: None,
+                    row_id_meta: None,
+                    physical_rows: Some(10),
+                }],
+            },
+            read_version,
+            blobs_op: None,
+            tag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reuse_session() {
+        // Need to use in-memory for accurate IOPS tracking.
+        use crate::utils::test::IoTrackingStore;
+
+        // Create new dataset
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let memory_store = Arc::new(object_store::memory::InMemory::new());
+        let (io_stats_wrapper, io_stats) = IoTrackingStore::new_wrapper();
+        let store_params = ObjectStoreParams {
+            object_store_wrapper: Some(io_stats_wrapper),
+            object_store: Some((memory_store.clone(), Url::parse("memory://test").unwrap())),
+            ..Default::default()
+        };
+        let dataset = InsertBuilder::new("memory://test")
+            .with_params(&WriteParams {
+                store_params: Some(store_params.clone()),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let mut dataset = Arc::new(dataset);
+
+        let reset_iops = || {
+            io_stats.lock().unwrap().read_iops = 0;
+            io_stats.lock().unwrap().write_iops = 0;
+        };
+        let get_new_iops = || {
+            let read_iops = io_stats.lock().unwrap().read_iops;
+            let write_iops = io_stats.lock().unwrap().write_iops;
+            reset_iops();
+            (read_iops, write_iops)
+        };
+
+        let (initial_reads, initial_writes) = get_new_iops();
+        assert!(initial_reads > 0);
+        assert!(initial_writes > 0);
+
+        // Commit transaction 5 times
+        for i in 0..5 {
+            let new_ds = CommitBuilder::new(dataset.clone())
+                .execute(sample_transaction(1))
+                .await
+                .unwrap();
+            dataset = Arc::new(new_ds);
+            assert_eq!(dataset.manifest().version, i + 2);
+
+            // Because we are writing transactions sequentially, and caching them,
+            // we shouldn't need to read anything from disk.
+            // We have the following read IOPs:
+            // 1. Find the latest version
+            // 2. Open that manifest
+            // 3. (If any indices exist,) read the indices off of that manifest
+            // TODO: can we cache the last two?
+            assert_eq!(get_new_iops().0, 2, "i = {}", i);
+        }
+
+        // Commit transaction with URI and session
+        let new_ds = CommitBuilder::new("memory://test")
+            .with_store_params(store_params.clone())
+            .with_commit_handler(Arc::new(RenameCommitHandler))
+            .with_session(dataset.session.clone())
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(new_ds.manifest().version, 7);
+        // Session should still be re-used
+        // However, the dataset needs to be loaded, so an additional two IOPs
+        // are needed.
+        assert_eq!(get_new_iops().0, 4);
+
+        // Commit transaction with URI and no session
+        let new_ds = CommitBuilder::new("memory://test")
+            .with_store_params(store_params)
+            .with_commit_handler(Arc::new(RenameCommitHandler))
+            .execute(sample_transaction(1))
+            .await
+            .unwrap();
+        assert_eq!(new_ds.manifest().version, 8);
+        // Now we have to load all previous transactions.
+        assert!(get_new_iops().0 > 20);
     }
 }

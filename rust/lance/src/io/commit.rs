@@ -47,6 +47,7 @@ use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
+use crate::session::Session;
 use crate::Dataset;
 
 #[cfg(all(feature = "dynamodb", test))]
@@ -67,15 +68,17 @@ async fn read_transaction_file(
     transaction.try_into()
 }
 
+fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
+    base_path
+        .child("_transactions")
+        .child(format!("{}.txn", version))
+}
+
 async fn read_dataset_transaction_file(
     dataset: &Dataset,
     version: u64,
 ) -> Result<Arc<Transaction>> {
-    let cache_path = dataset
-        .base
-        .child("_transactions")
-        .child(format!("{}.txn", version));
-    dbg!(&dataset.session.file_metadata_cache);
+    let cache_path = transaction_file_cache_path(&dataset.base, version);
     dataset
         .session
         .file_metadata_cache
@@ -150,6 +153,7 @@ fn check_transaction(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
@@ -158,7 +162,8 @@ async fn do_commit_new_dataset(
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
     blob_version: Option<u64>,
-) -> Result<Manifest> {
+    session: &Session,
+) -> Result<(Manifest, Path)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
@@ -184,7 +189,13 @@ async fn do_commit_new_dataset(
     // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
     // if there is a conflict.
     match result {
-        Ok(()) => Ok(manifest),
+        Ok(manifest_path) => {
+            session.file_metadata_cache.insert(
+                transaction_file_cache_path(base_path, manifest.version),
+                Arc::new(transaction.clone()),
+            );
+            Ok((manifest, manifest_path))
+        }
         Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
             uri: base_path.to_string(),
             location: location!(),
@@ -200,11 +211,12 @@ pub(crate) async fn commit_new_dataset(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-) -> Result<Manifest> {
+    session: &Session,
+) -> Result<(Manifest, Path)> {
     let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blob_path = base_path.child(BLOB_DIR);
         let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
-        let blob_manifest = do_commit_new_dataset(
+        let (blob_manifest, _) = do_commit_new_dataset(
             object_store,
             commit_handler,
             &blob_path,
@@ -212,6 +224,7 @@ pub(crate) async fn commit_new_dataset(
             write_config,
             manifest_naming_scheme,
             None,
+            session,
         )
         .await?;
         Some(blob_manifest.version)
@@ -227,6 +240,7 @@ pub(crate) async fn commit_new_dataset(
         write_config,
         manifest_naming_scheme,
         blob_version,
+        session,
     )
     .await
 }
@@ -511,7 +525,7 @@ pub(crate) async fn do_commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     new_blob_version: Option<u64>,
-) -> Result<Manifest> {
+) -> Result<(Manifest, Path)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
@@ -569,8 +583,8 @@ pub(crate) async fn do_commit_detached_transaction(
         .await;
 
         match result {
-            Ok(()) => {
-                return Ok(manifest);
+            Ok(path) => {
+                return Ok((manifest, path));
             }
             Err(CommitError::CommitConflict) => {
                 // We pick a random u64 for the version, so it's possible (though extremely unlikely)
@@ -606,12 +620,12 @@ pub(crate) async fn commit_detached_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-) -> Result<Manifest> {
+) -> Result<(Manifest, Path)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let blobs_manifest = do_commit_detached_transaction(
+        let (blobs_manifest, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -647,12 +661,12 @@ pub(crate) async fn commit_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
-) -> Result<Manifest> {
+) -> Result<(Manifest, Path)> {
     let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
         let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
         let blobs_tx =
             Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let blobs_manifest = do_commit_detached_transaction(
+        let (blobs_manifest, _) = do_commit_detached_transaction(
             blobs_dataset.as_ref(),
             object_store,
             commit_handler,
@@ -672,12 +686,12 @@ pub(crate) async fn commit_transaction(
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
     // First, get all transactions since read_version
-    let mut version = transaction.read_version;
-    let other_transactions = std::iter::from_fn(|| {
-        version += 1;
-        Some(read_dataset_transaction_file(dataset, version))
-    });
-    let other_transactions = futures::stream::iter(other_transactions)
+    let read_version = transaction.read_version;
+    let mut dataset = dataset.clone();
+    dataset.checkout_latest().await?;
+    let latest_version = dataset.manifest.version;
+    let other_transactions = futures::stream::iter((read_version + 1)..latest_version)
+        .map(|version| read_dataset_transaction_file(&dataset, version))
         .buffered(10)
         .take_while(|res| {
             futures::future::ready(!matches!(
@@ -688,8 +702,7 @@ pub(crate) async fn commit_transaction(
         .try_collect::<Vec<_>>()
         .await?;
 
-    let mut target_version = transaction.read_version + other_transactions.len() as u64 + 1;
-    let mut dataset = dataset.checkout_version(target_version - 1).await?;
+    let mut target_version = latest_version + 1;
 
     if is_detached_version(target_version) {
         return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
@@ -758,10 +771,14 @@ pub(crate) async fn commit_transaction(
         .await;
 
         match result {
-            Ok(()) => {
-                // TODO: insert in cache here.
+            Ok(manifest_path) => {
+                let cache_path = transaction_file_cache_path(&dataset.base, target_version);
+                dataset
+                    .session()
+                    .file_metadata_cache
+                    .insert(cache_path, Arc::new(transaction.clone()));
 
-                return Ok(manifest);
+                return Ok((manifest, manifest_path));
             }
             Err(CommitError::CommitConflict) => {
                 // See if we can retry the commit. Try to account for all

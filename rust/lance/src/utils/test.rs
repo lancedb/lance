@@ -17,7 +17,7 @@ use lance_table::format::Fragment;
 use object_store::path::Path;
 use object_store::{
     GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result as OSResult,
+    PutOptions, PutPayload, PutResult, Result as OSResult, UploadPart,
 };
 use rand::prelude::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -270,6 +270,8 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
 pub struct IoStats {
     pub read_iops: u64,
     pub read_bytes: u64,
+    pub write_iops: u64,
+    pub write_bytes: u64,
 }
 
 impl Display for IoStats {
@@ -313,20 +315,23 @@ impl IoTrackingStore {
         stats.read_iops += 1;
         stats.read_bytes += num_bytes;
     }
+
+    fn record_write(&self, num_bytes: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.write_iops += 1;
+        stats.write_bytes += num_bytes;
+    }
 }
 
 #[async_trait::async_trait]
 impl ObjectStore for IoTrackingStore {
-    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
-        self.target.put(location, bytes).await
-    }
-
     async fn put_opts(
         &self,
         location: &Path,
         bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
+        self.record_write(bytes.content_length() as u64);
         self.target.put_opts(location, bytes, opts).await
     }
 
@@ -335,7 +340,11 @@ impl ObjectStore for IoTrackingStore {
         location: &Path,
         opts: PutMultipartOpts,
     ) -> OSResult<Box<dyn MultipartUpload>> {
-        self.target.put_multipart_opts(location, opts).await
+        let target = self.target.put_multipart_opts(location, opts).await?;
+        Ok(Box::new(IoTrackingMultipartUpload {
+            target,
+            stats: self.stats.clone(),
+        }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -399,6 +408,32 @@ impl ObjectStore for IoTrackingStore {
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.target.copy_if_not_exists(from, to).await
+    }
+}
+
+#[derive(Debug)]
+struct IoTrackingMultipartUpload {
+    target: Box<dyn MultipartUpload>,
+    stats: Arc<Mutex<IoStats>>,
+}
+
+#[async_trait::async_trait]
+impl MultipartUpload for IoTrackingMultipartUpload {
+    async fn abort(&mut self) -> OSResult<()> {
+        self.target.abort().await
+    }
+
+    async fn complete(&mut self) -> OSResult<PutResult> {
+        self.target.complete().await
+    }
+
+    fn put_part(&mut self, payload: PutPayload) -> UploadPart {
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.write_iops += 1;
+            stats.write_bytes += payload.content_length() as u64;
+        }
+        self.target.put_part(payload)
     }
 }
 

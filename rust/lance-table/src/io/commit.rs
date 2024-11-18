@@ -473,7 +473,7 @@ pub trait CommitHandler: Debug + Send + Sync {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<(), CommitError>;
+    ) -> std::result::Result<Path, CommitError>;
 }
 
 async fn default_resolve_version(
@@ -723,7 +723,7 @@ impl CommitHandler for UnsafeCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> std::result::Result<Path, CommitError> {
         // Log a one-time warning
         if !WARNED_ON_UNSAFE_COMMIT.load(std::sync::atomic::Ordering::Relaxed) {
             WARNED_ON_UNSAFE_COMMIT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -737,7 +737,7 @@ impl CommitHandler for UnsafeCommitHandler {
         // Write the manifest naively
         manifest_writer(object_store, manifest, indices, &version_path).await?;
 
-        Ok(())
+        Ok(version_path)
     }
 }
 
@@ -783,7 +783,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> std::result::Result<Path, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
         // NOTE: once we have the lease we cannot use ? to return errors, since
         // we must release the lease before returning.
@@ -812,7 +812,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for T {
         // Release the lock
         lease.release(res.is_ok()).await?;
 
-        res.map_err(|err| err.into())
+        res.map_err(|err| err.into()).map(|_| path)
     }
 }
 
@@ -826,7 +826,7 @@ impl<T: CommitLock + Send + Sync> CommitHandler for Arc<T> {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> std::result::Result<Path, CommitError> {
         self.as_ref()
             .commit(
                 manifest,
@@ -855,7 +855,7 @@ impl CommitHandler for RenameCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> std::result::Result<Path, CommitError> {
         // Create a temporary object, then use `rename_if_not_exists` to commit.
         // If failed, clean up the temporary object.
 
@@ -870,7 +870,7 @@ impl CommitHandler for RenameCommitHandler {
             .rename_if_not_exists(&tmp_path, &path)
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(path),
             Err(ObjectStoreError::AlreadyExists { .. }) => {
                 // Another transaction has already been committed
                 // Attempt to clean up temporary object, but ignore errors if we can't

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use deepsize::{Context, DeepSizeOf};
 use futures::Future;
-use moka::sync::Cache;
+use moka::sync::{Cache, ConcurrentCacheExt};
 use object_store::path::Path;
 
 use crate::utils::path::LancePathExt;
@@ -114,6 +114,7 @@ impl FileMetadataCache {
 
     pub fn size(&self) -> usize {
         if let Some(cache) = self.cache.as_ref() {
+            cache.sync();
             cache.entry_count() as usize
         } else {
             0

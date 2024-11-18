@@ -463,13 +463,13 @@ impl Transaction {
         config: &ManifestWriteConfig,
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
-        let path = commit_handler
-            .resolve_version(base_path, version, &object_store.inner)
+        let location = commit_handler
+            .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
-        let mut manifest = read_manifest(object_store, &path).await?;
+        let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
-        let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
+        let indices = read_manifest_indexes(object_store, &location.path, &manifest).await?;
         Ok((manifest, indices))
     }
 

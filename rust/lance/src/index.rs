@@ -328,7 +328,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -340,6 +340,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -354,7 +355,7 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let manifest_file = self.manifest_file(self.version().version).await?;
+        let manifest_file = self.manifest_file().await?;
         let loaded_indices: Arc<Vec<IndexMetadata>> =
             read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest)
                 .await?
@@ -403,7 +404,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, new_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -415,6 +416,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = new_path;
 
         Ok(())
     }
@@ -501,7 +503,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -513,6 +515,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
         Ok(())
     }
 
