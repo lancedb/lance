@@ -393,6 +393,8 @@ impl ZoneMapsFieldScheduler {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             /*should_validate= */ false,
+            LanceFileVersion::default(),
+            None,
         )
         .await?;
 
