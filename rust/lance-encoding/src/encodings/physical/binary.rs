@@ -15,8 +15,8 @@ use snafu::{location, Location};
 
 use futures::{future::BoxFuture, FutureExt};
 
-use crate::decoder::{LogicalPageDecoder, MiniBlockDecompressor};
-use crate::encoder::{MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor};
+use crate::decoder::{BlockDecompressor, LogicalPageDecoder, MiniBlockDecompressor};
+use crate::encoder::{BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor};
 use crate::encodings::logical::primitive::PrimitiveFieldDecoder;
 
 use crate::buffer::LanceBuffer;
@@ -739,6 +739,80 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct BinaryBlockEncoder {}
+impl BlockCompressor for BinaryBlockEncoder {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        println!("inside BinaryBlockEncoder");
+        let num_values: u32 = data
+            .num_values()
+            .try_into()
+            .expect("The Maximum number of values BinaryBlockEncoder can work with is u32::MAX");
+        match data {
+            DataBlock::VariableWidth(mut variable_width_data) => {
+                if variable_width_data.bits_per_offset != 32 {
+                    panic!("BinaryBlockEncoder only works with 32 bits per offset VariableWidth DataBlock.");
+                }
+                let original_offsets = variable_width_data.data.borrow_to_typed_slice::<u32>();
+                let original_offsets = original_offsets.as_ref();
+                // the first 4 bytes store the number of values, then offsets data, then bytes data.
+                let bytes_start_offset = std::mem::size_of_val(original_offsets) as u32 + 4;
+
+                let block_offsets = original_offsets
+                    .iter()
+                    .map(|offset| offset - original_offsets[0] + bytes_start_offset as u32)
+                    .collect::<Vec<_>>();
+                const BINARY_BLOCK_ALIGNMENT: usize = 4;
+                const BLOCK_PAD_BUFFER: [u8; BINARY_BLOCK_ALIGNMENT] = [72; BINARY_BLOCK_ALIGNMENT];
+
+                let output_total_bytes =
+                    ((bytes_start_offset as usize + variable_width_data.data.len()) + 3) / 4;
+                let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
+
+                output.extend_from_slice(&(num_values).to_le_bytes());
+                output.extend_from_slice(cast_slice(&block_offsets));
+                output.extend_from_slice(&variable_width_data.data);
+                // pad this chunk to make it align to 4 bytes.
+                output.extend_from_slice(
+                    &BLOCK_PAD_BUFFER[..pad_bytes::<BINARY_BLOCK_ALIGNMENT>(output.len())],
+                );
+                Ok(LanceBuffer::reinterpret_vec(output))
+            }
+            _ => {
+                panic!();
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct BinaryBlockDecompressor {}
+
+impl BlockDecompressor for BinaryBlockDecompressor {
+    fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
+        let header: &[u32] =
+            try_cast_slice(&data).expect("casting buffer failed during BinaryBlock decompression");
+
+        let num_values = header[0] as u64;
+
+        let offsets = &header[4..];
+        let result_offsets = offsets[0..(num_values + 1) as usize]
+            .iter()
+            .map(|offset| offset - offsets[0])
+            .collect::<Vec<u32>>();
+
+        Ok(DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(
+                data[offsets[0] as usize..offsets[num_values as usize] as usize].to_vec(),
+            ),
+            offsets: LanceBuffer::reinterpret_vec(result_offsets),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+        }))
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use arrow_array::{
@@ -746,6 +820,8 @@ pub mod tests {
         ArrayRef, StringArray,
     };
     use arrow_schema::{DataType, Field};
+    
+    
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
@@ -757,7 +833,6 @@ pub mod tests {
     };
 
     use super::get_indices_from_string_arrays;
-
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_utf8_binary(
