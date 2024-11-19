@@ -715,8 +715,8 @@ mod tests {
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.6)]
-    #[case(4, DistanceType::Dot, 0.2)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
