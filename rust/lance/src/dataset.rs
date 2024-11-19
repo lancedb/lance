@@ -33,6 +33,7 @@ use lance_table::io::manifest::{read_manifest, write_manifest};
 use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
+use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -114,6 +115,7 @@ pub struct Dataset {
 }
 
 /// Dataset Version
+#[derive(Deserialize, Serialize)]
 pub struct Version {
     /// version number
     pub version: u64,
