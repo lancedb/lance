@@ -4349,6 +4349,7 @@ mod test {
     ) {
         // Create a large dataset with a scalar indexed column and a sorted but not scalar
         // indexed column
+        use lance_table::io::commit::RenameCommitHandler;
         let data = gen()
             .col(
                 "vector",
@@ -4367,6 +4368,7 @@ mod test {
                     object_store_wrapper: Some(io_stats_wrapper),
                     ..Default::default()
                 }),
+                commit_handler: Some(Arc::new(RenameCommitHandler)),
                 data_storage_version: Some(data_storage_version),
                 ..Default::default()
             }),
