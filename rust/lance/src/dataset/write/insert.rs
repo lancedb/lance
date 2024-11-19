@@ -64,12 +64,16 @@ impl<'a> InsertBuilder<'a> {
     }
 
     /// Execute the insert operation with the given data.
+    ///
+    /// This writes the data fragments and commits them into the dataset.
     pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
         let (transaction, context) = self.write_uncommitted_impl(data).await?;
         Self::do_commit(&context, transaction).await
     }
 
     /// Execute the insert operation with the given stream.
+    ///
+    /// This writes the data fragments and commits them into the dataset.
     pub async fn execute_stream(
         &self,
         stream: impl RecordBatchReader + Send + 'static,
