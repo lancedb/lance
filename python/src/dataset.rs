@@ -63,15 +63,15 @@ use lance_table::format::Fragment;
 use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::exceptions::{PyNotImplementedError, PyStopIteration, PyTypeError};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
+use pyo3::{intern, prelude::*};
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -364,6 +364,30 @@ impl Operation {
             removed_indices: vec![],
         };
         Ok(Self(op))
+    }
+
+    /// Convert to a pydict that can be used as kwargs into the Operation dataclasses
+    fn to_dict<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        match &self.0 {
+            LanceOperation::Append { fragments } => {
+                let fragments = fragments
+                    .iter()
+                    .cloned()
+                    .map(FragmentMetadata::new)
+                    .map(|f| f.into_py(py))
+                    .collect::<Vec<_>>();
+                dict.set_item("fragments", fragments).unwrap();
+            }
+            _ => {
+                return Err(PyNotImplementedError::new_err(format!(
+                    "Operation.to_dict is not implemented for this operation: {:?}",
+                    self.0
+                )));
+            }
+        }
+
+        Ok(dict)
     }
 }
 
@@ -1442,6 +1466,68 @@ impl Dataset {
         })
     }
 
+    #[staticmethod]
+    fn commit_bulk<'py>(
+        dest: &Bound<'py, PyAny>,
+        transactions: Vec<Bound<'py, PyAny>>,
+        commit_lock: Option<&'py PyAny>,
+        storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
+        max_retries: Option<u32>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let object_store_params =
+            storage_options
+                .as_ref()
+                .map(|storage_options| ObjectStoreParams {
+                    storage_options: Some(storage_options.clone()),
+                    ..Default::default()
+                });
+
+        let commit_handler = commit_lock.map(|commit_lock| {
+            Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
+                as Arc<dyn CommitHandler>
+        });
+
+        let py = dest.py();
+        let dest = if dest.is_instance_of::<Dataset>() {
+            let dataset: Dataset = dest.extract()?;
+            WriteDestination::Dataset(dataset.ds.clone())
+        } else {
+            WriteDestination::Uri(dest.extract()?)
+        };
+
+        let mut builder = CommitBuilder::new(dest)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
+            .with_detached(detached.unwrap_or(false))
+            .with_max_retries(max_retries.unwrap_or(20));
+
+        if let Some(store_params) = object_store_params {
+            builder = builder.with_store_params(store_params);
+        }
+
+        if let Some(commit_handler) = commit_handler {
+            builder = builder.with_commit_handler(commit_handler);
+        }
+
+        let transactions = transactions
+            .into_iter()
+            .map(|transaction| extract_transaction(&transaction))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let res = RT
+            .block_on(Some(py), builder.execute_batch(transactions))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let uri = res.dataset.uri().to_string();
+        let ds = Self {
+            ds: Arc::new(res.dataset),
+            uri,
+        };
+        let merged = export_transaction(&res.merged, py)?.to_object(py);
+        let ds = ds.into_py(py);
+        Ok(PyTuple::new_bound(py, [ds, merged]))
+    }
+
     fn validate(&self) -> PyResult<()> {
         RT.block_on(None, self.ds.validate())?
             .map_err(|err| PyIOError::new_err(err.to_string()))
@@ -1964,4 +2050,60 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             )
         })
     }
+}
+
+/// py_transaction is a dataclass with attributes
+/// read_version: int
+/// uuid: str
+/// operation: LanceOperation.BaseOperation
+/// blobs_op: Optional[LanceOperation.BaseOperation] = None
+fn extract_transaction(py_transaction: &Bound<PyAny>) -> PyResult<Transaction> {
+    let py = py_transaction.py();
+    let read_version = py_transaction.getattr("read_version")?.extract()?;
+    let uuid = py_transaction.getattr("uuid")?.extract()?;
+    let operation: Operation = py_transaction
+        .getattr("operation")?
+        .call_method0(intern!(py, "_to_inner"))?
+        .extract()?;
+    let operation = operation.0;
+    let blobs_op: Option<Operation> = {
+        let blobs_op: Option<Bound<PyAny>> = py_transaction.getattr("blobs_op")?.extract()?;
+        if let Some(blobs_op) = blobs_op {
+            Some(blobs_op.call_method0(intern!(py, "_to_inner"))?.extract()?)
+        } else {
+            None
+        }
+    };
+    let blobs_op = blobs_op.map(|op| op.0);
+    Ok(Transaction {
+        read_version,
+        uuid,
+        operation,
+        blobs_op,
+        tag: None,
+    })
+}
+
+// Exports to a pydict of kwargs to instantiation the python Transaction dataclass.
+fn export_transaction<'a>(
+    transaction: &Transaction,
+    py: Python<'a>,
+) -> PyResult<Bound<'a, PyDict>> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("read_version", transaction.read_version)?;
+    dict.set_item("uuid", transaction.uuid.clone())?;
+    dict.set_item(
+        "operation",
+        Operation(transaction.operation.clone()).to_dict(py)?,
+    )?;
+    dict.set_item(
+        "blobs_op",
+        transaction
+            .blobs_op
+            .clone()
+            .map(Operation)
+            .map(|op| op.to_dict(py))
+            .transpose()?,
+    )?;
+    Ok(dict)
 }

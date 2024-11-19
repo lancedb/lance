@@ -347,6 +347,74 @@ impl<'a> CommitBuilder<'a> {
             }),
         }
     }
+
+    /// Commit a set of transactions as a single new version.
+    ///
+    /// <div class="warning">
+    ///   Only works for append transactions right now. Other kinds of transactions
+    ///   will be supported in the future.
+    /// </div>
+    pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
+        if transactions.is_empty() {
+            return Err(Error::InvalidInput {
+                source: "No transactions to commit".into(),
+                location: location!(),
+            });
+        }
+        if transactions
+            .iter()
+            .any(|t| !matches!(t.operation, Operation::Append { .. }))
+        {
+            return Err(Error::NotSupported {
+                source: "Only append transactions are supported in batch commits".into(),
+                location: location!(),
+            });
+        }
+
+        let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
+        let blob_new_frags = transactions
+            .iter()
+            .flat_map(|t| &t.blobs_op)
+            .flat_map(|b| match b {
+                Operation::Append { fragments } => fragments.clone(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        let blobs_op = if blob_new_frags.is_empty() {
+            None
+        } else {
+            Some(Operation::Append {
+                fragments: blob_new_frags,
+            })
+        };
+
+        let merged = Transaction {
+            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::Append {
+                fragments: transactions
+                    .iter()
+                    .flat_map(|t| match &t.operation {
+                        Operation::Append { fragments } => fragments.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            },
+            read_version,
+            blobs_op,
+            tag: None,
+        };
+        let dataset = self.execute(merged.clone()).await?;
+        Ok(BatchCommitResult { dataset, merged })
+    }
+}
+
+pub struct BatchCommitResult {
+    pub dataset: Dataset,
+    /// The final transaction that was committed.
+    pub merged: Transaction,
+    // TODO: Reject conflicts that need to be retried.
+    // /// Transactions that were rejected due to conflicts.
+    // pub rejected: Vec<Transaction>,
 }
 
 #[cfg(test)]
@@ -363,23 +431,27 @@ mod tests {
 
     use super::*;
 
+    fn sample_fragment() -> Fragment {
+        Fragment {
+            id: 0,
+            files: vec![DataFile {
+                path: "file.lance".to_string(),
+                fields: vec![0],
+                column_indices: vec![0],
+                file_major_version: 2,
+                file_minor_version: 0,
+            }],
+            deletion_file: None,
+            row_id_meta: None,
+            physical_rows: Some(10),
+        }
+    }
+
     fn sample_transaction(read_version: u64) -> Transaction {
         Transaction {
             uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
             operation: Operation::Append {
-                fragments: vec![Fragment {
-                    id: 0,
-                    files: vec![DataFile {
-                        path: "file.lance".to_string(),
-                        fields: vec![0],
-                        column_indices: vec![0],
-                        file_major_version: 2,
-                        file_minor_version: 0,
-                    }],
-                    deletion_file: None,
-                    row_id_meta: None,
-                    physical_rows: Some(10),
-                }],
+                fragments: vec![sample_fragment()],
             },
             read_version,
             blobs_op: None,
@@ -486,5 +558,69 @@ mod tests {
         let (reads, writes) = get_new_iops();
         assert!(reads > 20);
         assert_eq!(writes, 3);
+    }
+
+    #[tokio::test]
+    async fn test_commit_batch() {
+        // Create a dataset
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..10_i32))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://test")
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+
+        // Attempting to commit empty gives error
+        let res = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![])
+            .await;
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
+
+        // Attempting to commit update gives error
+        let update_transaction = Transaction {
+            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
+            operation: Operation::Update {
+                updated_fragments: vec![],
+                new_fragments: vec![],
+                removed_fragment_ids: vec![],
+            },
+            read_version: 1,
+            blobs_op: None,
+            tag: None,
+        };
+        let res = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![update_transaction])
+            .await;
+        assert!(matches!(res, Err(Error::NotSupported { .. })));
+
+        // Doing multiple appends includes all.
+        let append1 = sample_transaction(1);
+        let append2 = sample_transaction(2);
+        let mut expected_fragments = vec![];
+        if let Operation::Append { fragments } = &append1.operation {
+            expected_fragments.extend(fragments.clone());
+        }
+        if let Operation::Append { fragments } = &append2.operation {
+            expected_fragments.extend(fragments.clone());
+        }
+        let res = CommitBuilder::new(dataset.clone())
+            .execute_batch(vec![append1.clone(), append2.clone()])
+            .await
+            .unwrap();
+        let transaction = res.merged;
+        assert!(
+            matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
+        );
+        assert_eq!(transaction.read_version, 1);
+        assert!(transaction.blobs_op.is_none());
     }
 }
