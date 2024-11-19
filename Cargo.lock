@@ -3017,6 +3017,7 @@ dependencies = [
  "pretty_assertions",
  "prost",
  "prost-build",
+ "prost-types",
  "rand",
  "random_word",
  "roaring",

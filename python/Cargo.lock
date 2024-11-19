@@ -2810,6 +2810,7 @@ dependencies = [
  "pin-project",
  "prost 0.12.6",
  "prost-build 0.12.6",
+ "prost-types 0.12.6",
  "rand",
  "roaring",
  "serde",
