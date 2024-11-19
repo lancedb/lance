@@ -399,14 +399,17 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.copy(from, to).await
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.rename(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.copy_if_not_exists(from, to).await
     }
 }

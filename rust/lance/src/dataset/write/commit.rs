@@ -445,7 +445,13 @@ mod tests {
             // 2. Open that manifest
             // 3. (If any indices exist,) read the indices off of that manifest
             // TODO: can we cache the last two?
-            assert_eq!(get_new_iops().0, 2, "i = {}", i);
+            let (reads, writes) = get_new_iops();
+            assert_eq!(reads, 2, "i = {}", i);
+            // Should see 3 IOPs:
+            // 1. Write the transaction files
+            // 2. Write the manifest
+            // 3. Atomically rename the manifest
+            assert_eq!(writes, 3, "i = {}", i);
         }
 
         // Commit transaction with URI and session
@@ -460,7 +466,9 @@ mod tests {
         // Session should still be re-used
         // However, the dataset needs to be loaded, so an additional two IOPs
         // are needed.
-        assert_eq!(get_new_iops().0, 4);
+        let (reads, writes) = get_new_iops();
+        assert_eq!(reads, 4);
+        assert_eq!(writes, 3);
 
         // Commit transaction with URI and no session
         let new_ds = CommitBuilder::new("memory://test")
@@ -471,6 +479,8 @@ mod tests {
             .unwrap();
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
-        assert!(get_new_iops().0 > 20);
+        let (reads, writes) = get_new_iops();
+        assert!(reads > 20);
+        assert_eq!(writes, 3);
     }
 }
