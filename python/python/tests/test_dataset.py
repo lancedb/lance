@@ -117,11 +117,11 @@ def test_dataset_append(tmp_path: Path):
     # verify appending batches with a different schema doesn't work
     table2 = pa.Table.from_pydict({"COLUMN-C": [1, 2, 3], "colB": [4, 5, 6]})
     with pytest.raises(OSError):
-        lance.write_dataset(table2, base_dir, mode="append")
+        lance.write_dataset(table2, dataset, mode="append")
 
     # But we can append subschemas
     table3 = pa.Table.from_pydict({"colA": [4, 5, 6]})
-    dataset = lance.write_dataset(table3, base_dir, mode="append")
+    dataset.insert(table3)  # Append is default
     assert dataset.to_table() == pa.table(
         {"colA": [1, 2, 3, 4, 5, 6], "colB": [4, 5, 6, None, None, None]}
     )
@@ -842,16 +842,16 @@ def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
 
-    lance.write_dataset(table, base_dir)
+    dataset = lance.write_dataset(table, base_dir)
 
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
     with pytest.raises(OSError):
         # Must specify read version
-        dataset = lance.LanceDataset.commit(base_dir, append)
+        dataset = lance.LanceDataset.commit(dataset, append)
 
-    dataset = lance.LanceDataset.commit(base_dir, append, read_version=1)
+    dataset = lance.LanceDataset.commit(dataset, append, read_version=1)
 
     tbl = dataset.to_table()
 

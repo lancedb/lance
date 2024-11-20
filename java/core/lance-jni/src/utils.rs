@@ -18,7 +18,7 @@ use arrow::array::Float32Array;
 use jni::objects::{JMap, JObject, JString};
 use jni::JNIEnv;
 use lance::dataset::{WriteMode, WriteParams};
-use lance::index::vector::{StageParams, VectorIndexParams};
+use lance::index::vector::{IndexFileVersion, StageParams, VectorIndexParams};
 use lance::io::ObjectStoreParams;
 use lance_encoding::version::LanceFileVersion;
 use lance_index::vector::hnsw::builder::HnswBuildParams;
@@ -265,6 +265,7 @@ pub fn get_index_params(
         Some(VectorIndexParams {
             metric_type: distance_type,
             stages,
+            version: IndexFileVersion::V3,
         })
     } else {
         None
