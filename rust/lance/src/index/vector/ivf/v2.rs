@@ -629,7 +629,7 @@ mod tests {
             &vectors,
             query.as_primitive::<Float32Type>().values(),
             k,
-            DistanceType::L2,
+            params.metric_type,
         );
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
@@ -678,6 +678,24 @@ mod tests {
     #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
+    async fn test_build_ivf_pq_v3(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+            .version(crate::index::vector::IndexFileVersion::V3)
+            .clone();
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
+    #[tokio::test]
     async fn test_create_ivf_hnsw_sq(
         #[case] nlist: usize,
         #[case] distance_type: DistanceType,
@@ -697,8 +715,8 @@ mod tests {
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.6)]
-    #[case(4, DistanceType::Dot, 0.2)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
