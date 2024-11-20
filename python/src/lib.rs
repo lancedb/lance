@@ -304,7 +304,7 @@ fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
     let indices = RT
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
-    let manifest = RT
+    let (manifest, _) = RT
         .block_on(Some(py), dataset_ref.latest_manifest())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     Ok(::lance::io::commit::manifest_needs_migration(

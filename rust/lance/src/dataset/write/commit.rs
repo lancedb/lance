@@ -6,7 +6,7 @@ use std::sync::Arc;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::{
-    format::DataStorageFormat,
+    format::{is_detached_version, DataStorageFormat},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
 use snafu::{location, Location};
@@ -199,7 +199,7 @@ impl<'a> CommitBuilder<'a> {
             WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
             WriteDestination::Uri(uri) => {
                 // Check if it already exists.
-                let builder = DatasetBuilder::from_uri(uri)
+                let mut builder = DatasetBuilder::from_uri(uri)
                     .with_read_params(ReadParams {
                         store_options: self.store_params.clone(),
                         commit_handler: self.commit_handler.clone(),
@@ -207,6 +207,13 @@ impl<'a> CommitBuilder<'a> {
                         ..Default::default()
                     })
                     .with_session(session.clone());
+
+                // If we are using a detached version, we need to load the dataset.
+                // Otherwise, we are writing to the main history, and need to check
+                // out the latest version.
+                if is_detached_version(transaction.read_version) {
+                    builder = builder.with_version(transaction.read_version)
+                }
 
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
@@ -440,13 +447,8 @@ mod tests {
 
             // Because we are writing transactions sequentially, and caching them,
             // we shouldn't need to read anything from disk.
-            // We have the following read IOPs:
-            // 1. Find the latest version
-            // 2. Open that manifest
-            // 3. (If any indices exist,) read the indices off of that manifest
-            // TODO: can we cache the last two?
             let (reads, writes) = get_new_iops();
-            assert_eq!(reads, 2, "i = {}", i);
+            assert_eq!(reads, 0, "i = {}", i);
             // Should see 3 IOPs:
             // 1. Write the transaction files
             // 2. Write the manifest
@@ -467,7 +469,7 @@ mod tests {
         // However, the dataset needs to be loaded, so an additional two IOPs
         // are needed.
         let (reads, writes) = get_new_iops();
-        assert_eq!(reads, 4);
+        assert_eq!(reads, 2);
         assert_eq!(writes, 3);
 
         // Commit transaction with URI and no session

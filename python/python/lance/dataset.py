@@ -2187,6 +2187,14 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
+        if read_version is None and not isinstance(
+            operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+        ):
+            raise ValueError(
+                "read_version is required for all operations except "
+                "Overwrite and Restore"
+            )
+
         new_ds = _Dataset.commit(
             base_uri,
             operation._to_inner(),
