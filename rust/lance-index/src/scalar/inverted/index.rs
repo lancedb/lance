@@ -37,7 +37,8 @@ use super::builder::inverted_list_schema;
 use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
-    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, SargableQuery, ScalarIndex,
+    AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, SargableQuery,
+    ScalarIndex,
 };
 use crate::Index;
 
@@ -70,6 +71,7 @@ lazy_static! {
 
 #[derive(Clone)]
 pub struct InvertedIndex {
+    params: InvertedIndexParams,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
     tokens: TokenSet,
     inverted_list: Arc<InvertedListReader>,
@@ -181,7 +183,7 @@ impl InvertedIndex {
         let tokens = self.tokens.clone();
         let inverted_list = self.inverted_list.clone();
         let docs = self.docs.clone();
-        InvertedIndexBuilder::from_existing_index(tokens, inverted_list, docs)
+        InvertedIndexBuilder::from_existing_index(self.params.clone(), tokens, inverted_list, docs)
     }
 }
 
@@ -255,8 +257,7 @@ impl ScalarIndex for InvertedIndex {
                     .get("tokenizer")
                     .map(|s| serde_json::from_str::<TokenizerConfig>(s))
                     .transpose()?
-                    .unwrap_or_default()
-                    .build()?;
+                    .unwrap_or_default();
                 let tokens = TokenSet::load(token_reader).await?;
                 Result::Ok((tokenizer, tokens))
             }
@@ -278,11 +279,17 @@ impl ScalarIndex for InvertedIndex {
             }
         });
 
-        let (tokenizer, tokens) = tokens_fut.await??;
+        let (tokenizer_config, tokens) = tokens_fut.await??;
         let inverted_list = invert_list_fut.await??;
         let docs = docs_fut.await??;
 
+        let tokenizer = tokenizer_config.build()?;
+        let params = InvertedIndexParams {
+            with_position: inverted_list.has_positions(),
+            tokenizer_config: tokenizer_config,
+        };
         Ok(Arc::new(Self {
+            params,
             tokenizer,
             tokens,
             inverted_list,

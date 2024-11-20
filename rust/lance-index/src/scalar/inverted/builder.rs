@@ -83,12 +83,11 @@ impl InvertedIndexBuilder {
     }
 
     pub fn from_existing_index(
+        params: InvertedIndexParams,
         tokens: TokenSet,
         inverted_list: Arc<InvertedListReader>,
         docs: DocSet,
     ) -> Self {
-        let params = InvertedIndexParams::default().with_position(inverted_list.has_positions());
-
         Self {
             params,
             tokens,
@@ -345,10 +344,11 @@ impl InvertedIndexBuilder {
         }
         let mut merged_stream = stream::select_all(posting_streams);
         let mut last_num_rows = 0;
+        self.tokens = TokenSet::default();
         let start = std::time::Instant::now();
         while let Some(r) = merged_stream.try_next().await? {
             let (token, batch, max_score) = r?;
-            self.tokens.add(token);
+            self.tokens.add(token.clone());
             offsets.push(num_rows);
             max_scores.push(max_score);
             num_rows += batch.num_rows();
@@ -635,6 +635,7 @@ impl PostingReader {
             let schema = schema.clone();
             let docs = docs.clone();
             tokio::spawn(async move {
+                // read the posting lists from new data
                 let batches = offsets.into_iter().map(|(offset, length)| {
                     let reader = posting_reader.reader.clone();
                     let schema = schema.clone();
@@ -648,6 +649,7 @@ impl PostingReader {
                 });
                 let mut batches = futures::future::try_join_all(batches).await?;
 
+                // read the posting lists from existing data
                 if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
                     let token_id =
                         posting_reader
