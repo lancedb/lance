@@ -629,7 +629,7 @@ mod tests {
             &vectors,
             query.as_primitive::<Float32Type>().values(),
             k,
-            DistanceType::L2,
+            params.metric_type,
         );
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
@@ -686,7 +686,7 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
-            .index_version(crate::index::vector::IndexVersion::V3)
+            .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params, nlist, recall_requirement).await;
     }
@@ -694,7 +694,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.8)]
     #[tokio::test]
     async fn test_build_ivf_pq_4bit(
         #[case] nlist: usize,
@@ -702,9 +702,9 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::new(16, 4);
+        let pq_params = PQBuildParams::new(32, 4);
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
-            .index_version(crate::index::vector::IndexVersion::V3)
+            .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params, nlist, recall_requirement).await;
     }
@@ -733,8 +733,8 @@ mod tests {
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.6)]
-    #[case(4, DistanceType::Dot, 0.2)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,

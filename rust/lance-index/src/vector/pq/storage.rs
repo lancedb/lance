@@ -170,7 +170,7 @@ impl ProductQuantizationStorage {
             .into();
 
         if !transposed {
-            let num_columns = if num_bits == 4 {
+            let num_sub_vectors_in_byte = if num_bits == 4 {
                 num_sub_vectors / 2
             } else {
                 num_sub_vectors
@@ -179,11 +179,11 @@ impl ProductQuantizationStorage {
             let transposed_code = transpose(
                 pq_col.values().as_primitive::<UInt8Type>(),
                 row_ids.len(),
-                num_columns,
+                num_sub_vectors_in_byte,
             );
             let pq_code_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
                 transposed_code,
-                num_columns as i32,
+                num_sub_vectors_in_byte as i32,
             )?);
             batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code_fsl)?;
         }
@@ -579,7 +579,12 @@ impl PQDistCalculator {
     }
 
     fn get_pq_code(&self, id: u32) -> Vec<usize> {
-        let num_vectors = self.pq_code.len() / self.num_sub_vectors;
+        let num_sub_vectors_in_byte = if self.num_bits == 4 {
+            self.num_sub_vectors / 2
+        } else {
+            self.num_sub_vectors
+        };
+        let num_vectors = self.pq_code.len() / num_sub_vectors_in_byte;
         self.pq_code
             .values()
             .iter()
@@ -594,11 +599,25 @@ impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
         let num_centroids = 2_usize.pow(self.num_bits);
         let pq_code = self.get_pq_code(id);
-        pq_code
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| self.distance_table[i * num_centroids + c])
-            .sum()
+
+        if self.num_bits == 4 {
+            pq_code
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let current_idx = c & 0x0F;
+                    let next_idx = c >> 4;
+                    self.distance_table[2 * i * num_centroids + current_idx]
+                        + self.distance_table[(2 * i + 1) * num_centroids + next_idx]
+                })
+                .sum()
+        } else {
+            pq_code
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| self.distance_table[i * num_centroids + c])
+                .sum()
+        }
     }
 
     fn distance_all(&self) -> Vec<f32> {
@@ -610,6 +629,12 @@ impl DistCalculator for PQDistCalculator {
                 self.pq_code.values(),
             ),
             DistanceType::Cosine => {
+                // it seems we implemented cosine distance at some version,
+                // but from now on, we should use normalized L2 distance.
+                debug_assert!(
+                    false,
+                    "cosine distance should be converted to normalized L2 distance"
+                );
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2

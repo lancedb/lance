@@ -58,18 +58,13 @@ pub enum StageParams {
     SQ(SQBuildParams),
 }
 
+// The version of the index file.
+// `Legacy` is used for only IVF_PQ index, and is the default value.
+// The other index types are using `V3`.
 #[derive(Debug, Clone)]
-pub enum IndexVersion {
-    // Only IVF_PQ is using the legacy index version,
-    // and it's the default version for IVF_PQ.
+pub enum IndexFileVersion {
     Legacy,
     V3,
-}
-
-impl Default for IndexVersion {
-    fn default() -> Self {
-        Self::Legacy
-    }
 }
 
 /// The parameters to build vector index.
@@ -80,12 +75,13 @@ pub struct VectorIndexParams {
     /// Vector distance metrics type.
     pub metric_type: MetricType,
 
-    pub index_version: IndexVersion,
+    /// The version of the index file.
+    pub version: IndexFileVersion,
 }
 
 impl VectorIndexParams {
-    pub fn index_version(&mut self, version: IndexVersion) -> &mut Self {
-        self.index_version = version;
+    pub fn version(&mut self, version: IndexFileVersion) -> &mut Self {
+        self.version = version;
         self
     }
 
@@ -95,7 +91,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            index_version: IndexVersion::V3,
+            version: IndexFileVersion::V3,
         }
     }
 
@@ -128,7 +124,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            index_version: IndexVersion::Legacy,
+            version: IndexFileVersion::Legacy,
         }
     }
 
@@ -142,7 +138,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            index_version: IndexVersion::Legacy,
+            version: IndexFileVersion::Legacy,
         }
     }
 
@@ -162,7 +158,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            index_version: IndexVersion::V3,
+            version: IndexFileVersion::V3,
         }
     }
 
@@ -182,7 +178,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            index_version: IndexVersion::V3,
+            version: IndexFileVersion::V3,
         }
     }
 }
@@ -277,8 +273,8 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        match params.index_version {
-            IndexVersion::Legacy => {
+        match params.version {
+            IndexFileVersion::Legacy => {
                 build_ivf_pq_index(
                     dataset,
                     column,
@@ -290,7 +286,7 @@ pub(crate) async fn build_vector_index(
                 )
                 .await?;
             }
-            IndexVersion::V3 => {
+            IndexFileVersion::V3 => {
                 IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
                     dataset.clone(),
                     column.to_owned(),

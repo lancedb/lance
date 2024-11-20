@@ -243,7 +243,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer = Q::build(&training_data, dt, quantizer_params)?;
+        let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
         info!(
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
@@ -393,19 +393,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             if num_rows == 0 {
                 continue;
             }
-            let mut batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
-            if self.distance_type == DistanceType::Cosine {
-                let vectors = batch
-                    .column_by_name(&self.column)
-                    .ok_or(Error::invalid_input(
-                        format!("column {} not found", self.column).as_str(),
-                        location!(),
-                    ))?
-                    .as_fixed_size_list();
-                let vectors = lance_linalg::kernels::normalize_fsl(vectors)?;
-                batch = batch.replace_column_by_name(&self.column, Arc::new(vectors))?;
-            }
-
+            let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
             let sizes = self.build_partition(partition, &batch).await?;
             partition_sizes[partition] = sizes;
             log::info!(
@@ -428,8 +416,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         // build quantized vector storage
         let object_store = ObjectStore::local();
         let storage_len = {
-            let storage =
-                StorageBuilder::new(self.column.clone(), quantizer, quantizer).build(batch)?;
+            let storage = StorageBuilder::new(self.column.clone(), self.distance_type, quantizer)
+                .build(batch)?;
             let path = self.temp_dir.child(format!("storage_part{}", part_id));
             let writer = object_store.create(&path).await?;
             let mut writer = FileWriter::try_new(

@@ -254,6 +254,7 @@ use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor}
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
 use crate::repdef::{LevelBuffer, RepDefUnraveler};
+use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
@@ -2368,16 +2369,20 @@ pub async fn decode_batch(
     filter: &FilterExpression,
     decoder_plugins: Arc<DecoderPlugins>,
     should_validate: bool,
+    version: LanceFileVersion,
+    cache: Option<Arc<FileMetadataCache>>,
 ) -> Result<RecordBatch> {
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
     // Still, if we just use now_or_never we hit misfires because some futures (channels) need to be
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = Arc::new(FileMetadataCache::with_capacity(
-        128 * 1024 * 1024,
-        CapacityMode::Bytes,
-    ));
+    let cache = cache.unwrap_or_else(|| {
+        Arc::new(FileMetadataCache::with_capacity(
+            128 * 1024 * 1024,
+            CapacityMode::Bytes,
+        ))
+    });
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,
@@ -2392,7 +2397,7 @@ pub async fn decode_batch(
     .await?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
-    let is_structural = false;
+    let is_structural = version >= LanceFileVersion::V2_1;
     let mut decode_stream = create_decode_stream(
         &batch.schema,
         batch.num_rows,

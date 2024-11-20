@@ -1105,6 +1105,34 @@ class LanceDataset(pa.dataset.Dataset):
             predicate = str(predicate)
         self._ds.delete(predicate)
 
+    def insert(
+        self,
+        data: ReaderLike,
+        *,
+        mode="append",
+        **kwargs,
+    ):
+        """
+        Insert data into the dataset.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be written. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
+            - Huggingface dataset
+        mode: str, default 'append'
+            The mode to use when writing the data. Options are:
+                **create** - create a new dataset (raises if uri already exists).
+                **overwrite** - create a new snapshot version
+                **append** - create a new version that is the concat of the input the
+                latest version (raises if uri does not exist)
+        **kwargs : dict, optional
+            Additional keyword arguments to pass to :func:`write_dataset`.
+        """
+        new_ds = write_dataset(data, self, mode=mode, **kwargs)
+        self._ds = new_ds._ds
+
     def merge_insert(
         self,
         on: Union[str, Iterable[str]],
@@ -2052,13 +2080,14 @@ class LanceDataset(pa.dataset.Dataset):
 
     @staticmethod
     def commit(
-        base_uri: Union[str, Path],
+        base_uri: Union[str, Path, LanceDataset],
         operation: LanceOperation.BaseOperation,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
         detached: Optional[bool] = False,
+        max_retries: int = 20,
     ) -> LanceDataset:
         """Create a new version of dataset
 
@@ -2082,8 +2111,10 @@ class LanceDataset(pa.dataset.Dataset):
 
         Parameters
         ----------
-        base_uri: str or Path
-            The base uri of the dataset
+        base_uri: str, Path, or LanceDataset
+            The base uri of the dataset, or the dataset object itself. Using
+            the dataset object can be more efficient because it can re-use the
+            file metadata cache.
         operation: BaseOperation
             The operation to apply to the dataset.  This describes what changes
             have been made. See available operations under :class:`LanceOperation`.
@@ -2111,6 +2142,8 @@ class LanceDataset(pa.dataset.Dataset):
             a random version that is only unique amongst detached commits.  The caller
             should store this somewhere as there will be no other way to obtain it in
             the future.
+        max_retries : int
+            The maximum number of retries to perform when committing the dataset.
 
         Returns
         -------
@@ -2141,6 +2174,12 @@ class LanceDataset(pa.dataset.Dataset):
         # TODO: mode is never used!
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
+        elif isinstance(base_uri, LanceDataset):
+            base_uri = base_uri._ds
+        elif not isinstance(base_uri, str):
+            raise TypeError(
+                f"base_uri must be str, Path, or LanceDataset, got {type(base_uri)}"
+            )
 
         if commit_lock:
             if not callable(commit_lock):
@@ -2156,10 +2195,13 @@ class LanceDataset(pa.dataset.Dataset):
             storage_options=storage_options,
             enable_v2_manifest_paths=enable_v2_manifest_paths,
             detached=detached,
+            max_retries=max_retries,
         )
-        return LanceDataset(
-            base_uri, version=new_ds.version(), storage_options=storage_options
-        )
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._default_scan_options = None
+        return ds
 
     def validate(self):
         """
@@ -3208,7 +3250,7 @@ class LanceStats:
 
 def write_dataset(
     data_obj: ReaderLike,
-    uri: Union[str, Path],
+    uri: Union[str, Path, LanceDataset],
     schema: Optional[pa.Schema] = None,
     mode: str = "create",
     *,
@@ -3230,8 +3272,9 @@ def write_dataset(
         The data to be written. Acceptable types are:
         - Pandas DataFrame, Pyarrow Table, Dataset, Scanner, or RecordBatchReader
         - Huggingface dataset
-    uri: str or Path
-        Where to write the dataset to (directory)
+    uri: str, Path, or LanceDataset
+        Where to write the dataset to (directory). If a LanceDataset is passed,
+        the session will be reused.
     schema: Schema, optional
         If specified and the input is a pandas DataFrame, use this schema
         instead of the default pandas to arrow table conversion.
@@ -3313,12 +3356,18 @@ def write_dataset(
             raise TypeError(f"commit_lock must be a function, got {type(commit_lock)}")
         params["commit_handler"] = commit_lock
 
-    uri = os.fspath(uri) if isinstance(uri, Path) else uri
+    if isinstance(uri, Path):
+        uri = os.fspath(uri)
+    elif isinstance(uri, LanceDataset):
+        uri = uri._ds
+    elif not isinstance(uri, str):
+        raise TypeError(f"dest must be a str, Path, or LanceDataset. Got {type(uri)}")
+
     inner_ds = _write_dataset(reader, uri, params)
 
     ds = LanceDataset.__new__(LanceDataset)
     ds._ds = inner_ds
-    ds._uri = uri
+    ds._uri = inner_ds.uri
     ds._default_scan_options = None
     return ds
 

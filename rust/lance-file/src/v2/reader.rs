@@ -1315,6 +1315,8 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
+            LanceFileVersion::default(),
+            None,
         )
         .await
         .unwrap();
@@ -1331,6 +1333,8 @@ pub mod tests {
             &FilterExpression::no_filter(),
             Arc::<DecoderPlugins>::default(),
             false,
+            LanceFileVersion::default(),
+            None,
         )
         .await
         .unwrap();

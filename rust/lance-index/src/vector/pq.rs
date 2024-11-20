@@ -11,10 +11,10 @@ use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
-use distance::compute_dot_distance;
+use distance::{build_distance_table_dot, compute_dot_distance};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
 use prost::Message;
@@ -153,16 +153,16 @@ impl ProductQuantizer {
             })
             .collect::<Vec<_>>();
 
-        let real_num_sub_vectors = if num_bits == 4 {
+        let num_sub_vectors_in_byte = if num_bits == 4 {
             num_sub_vectors / 2
         } else {
             num_sub_vectors
         };
 
-        debug_assert_eq!(values.len(), fsl.len() * real_num_sub_vectors);
+        debug_assert_eq!(values.len(), fsl.len() * num_sub_vectors_in_byte);
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(values),
-            real_num_sub_vectors as i32,
+            num_sub_vectors_in_byte as i32,
         )?))
     }
 
@@ -175,9 +175,17 @@ impl ProductQuantizer {
         match self.distance_type {
             DistanceType::L2 => self.l2_distances(query, code),
             DistanceType::Cosine => {
-                panic!(
-                    "Cosine distance should be converted to L2 distance by normalizing the vectors"
+                // it seems we implemented cosine distance at some version,
+                // but from now on, we should use normalized L2 distance.
+                debug_assert!(
+                    false,
+                    "cosine distance should be converted to normalized L2 distance"
                 );
+                // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
+                // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
+                // Therefore, Cosine = L2 / 2
+                let l2_dists = self.l2_distances(query, code)?;
+                Ok(l2_dists.values().iter().map(|v| *v / 2.0).collect())
             }
             DistanceType::Dot => self.dot_distances(query, code),
             _ => panic!(
@@ -234,18 +242,12 @@ impl ProductQuantizer {
     where
         T::Native: Dot,
     {
-        let capacity = self.num_sub_vectors * num_centroids(self.num_bits);
-        let mut distance_table = Vec::with_capacity(capacity);
-
-        let sub_vector_length = self.dimension / self.num_sub_vectors;
-        key.values()
-            .chunks_exact(sub_vector_length)
-            .enumerate()
-            .for_each(|(sub_vec_id, sub_vec)| {
-                let subvec_centroids = self.centroids::<T>(sub_vec_id);
-                let distances = dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
-                distance_table.extend(distances);
-            });
+        let distance_table = build_distance_table_dot(
+            self.codebook.values().as_primitive::<T>().values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            key.values(),
+        );
 
         let distances = compute_dot_distance(
             &distance_table,

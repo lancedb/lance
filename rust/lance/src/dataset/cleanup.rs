@@ -474,6 +474,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
     use lance_linalg::distance::MetricType;
+    use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
 
@@ -585,6 +586,7 @@ mod tests {
                 &self.dataset_path,
                 Some(WriteParams {
                     store_params: Some(self.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
                     mode,
                     ..Default::default()
                 }),
