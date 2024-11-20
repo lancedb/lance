@@ -755,12 +755,14 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             self.meta_buf_position..self.meta_buf_position + self.meta_buf_size,
             0,
         );
-        let dictionary_data = self.dictionary.as_ref().map(|dictionary| io.submit_single(
+        let dictionary_data = self.dictionary.as_ref().map(|dictionary| {
+            io.submit_single(
                 dictionary.dictionary_buf_position_and_size.0
                     ..dictionary.dictionary_buf_position_and_size.0
                         + dictionary.dictionary_buf_position_and_size.1,
                 0,
-            ));
+            )
+        });
         async move {
             let bytes = metadata.await?;
             assert!(bytes.len() % 2 == 0);
@@ -874,7 +876,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
-        let dictionary = self.dictionary.as_ref().map(|dictionary| dictionary.dictionary_data.clone());
+        let dictionary = self
+            .dictionary
+            .as_ref()
+            .map(|dictionary| dictionary.dictionary_data.clone());
 
         for scheduled_chunk in scheduled_chunks.iter_mut() {
             scheduled_chunk.vals_targeted =

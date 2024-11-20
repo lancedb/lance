@@ -755,7 +755,7 @@ impl BlockCompressor for BinaryBlockEncoder {
                 }
                 let offsets = variable_width_data.offsets.borrow_to_typed_slice::<u32>();
                 let offsets = offsets.as_ref();
-                // the first 4 bytes store the number of values, then 4 bytes for bytes_start_offset, 
+                // the first 4 bytes store the number of values, then 4 bytes for bytes_start_offset,
                 // then offsets data, then bytes data.
                 let bytes_start_offset = std::mem::size_of_val(offsets) as u32 + 4 + 4;
 
@@ -770,7 +770,7 @@ impl BlockCompressor for BinaryBlockEncoder {
 
                 output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
 
-                output.extend_from_slice(cast_slice(&offsets));
+                output.extend_from_slice(cast_slice(offsets));
 
                 output.extend_from_slice(&variable_width_data.data);
 
@@ -805,7 +805,9 @@ impl BlockDecompressor for BinaryBlockDecompressor {
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             data: LanceBuffer::Owned(
-                data[bytes_start_offset..bytes_start_offset + offsets[num_values as usize] as usize].to_vec(),
+                data[bytes_start_offset
+                    ..bytes_start_offset + offsets[num_values as usize] as usize]
+                    .to_vec(),
             ),
             offsets: LanceBuffer::reinterpret_vec(offsets),
             bits_per_offset: 32,
