@@ -112,10 +112,10 @@ pub(super) fn compute_l2_distance_4bit(
             .zip(distances.iter_mut())
             .for_each(|(&centroid_idx, sum)| {
                 // for 4bit PQ, `centroid_idx` is 2 index, each index is 4bit.
-                let low_idx = centroid_idx & 0xF;
-                let high_idx = centroid_idx >> 4;
-                *sum += dist_table[low_idx as usize];
-                *sum += dist_table[high_idx as usize];
+                let current_idx = centroid_idx & 0xF;
+                let next_idx = centroid_idx >> 4;
+                *sum += dist_table[current_idx as usize];
+                *sum += dist_table[num_centroids + next_idx as usize];
             });
     }
 
@@ -171,6 +171,9 @@ pub fn compute_dot_distance(
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
+    if num_bits == 4 {
+        return compute_dot_distance_4bit(distance_table, num_sub_vectors, code);
+    }
     let num_vectors = code.len() / num_sub_vectors;
     let mut distances = vec![0.0; num_vectors];
     let num_centroids = num_centroids(num_bits);
@@ -181,6 +184,31 @@ pub fn compute_dot_distance(
             .zip(distances.iter_mut())
             .for_each(|(&centroid_idx, sum)| {
                 *sum += dist_table[centroid_idx as usize];
+            });
+    }
+
+    distances
+}
+
+pub fn compute_dot_distance_4bit(
+    distance_table: &[f32],
+    num_sub_vectors: usize,
+    code: &[u8],
+) -> Vec<f32> {
+    let num_vectors = code.len() * 2 / num_sub_vectors;
+    let mut distances = vec![0.0; num_vectors];
+    let num_centroids = 2_usize.pow(4);
+    for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
+        let dist_table = &distance_table[sub_vec_idx * 2 * num_centroids..];
+        vec_indices
+            .iter()
+            .zip(distances.iter_mut())
+            .for_each(|(&centroid_idx, sum)| {
+                // for 4bit PQ, `centroid_idx` is 2 index, each index is 4bit.
+                let current_idx = centroid_idx & 0xF;
+                let next_idx = centroid_idx >> 4;
+                *sum += dist_table[current_idx as usize];
+                *sum += dist_table[num_centroids + next_idx as usize];
             });
     }
 

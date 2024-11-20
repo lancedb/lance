@@ -195,6 +195,10 @@ impl ProductQuantizationStorage {
             .clone()
             .into();
 
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         Ok(Self {
             codebook,
             batch,
