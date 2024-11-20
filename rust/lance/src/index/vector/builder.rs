@@ -428,8 +428,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         // build quantized vector storage
         let object_store = ObjectStore::local();
         let storage_len = {
-            let storage = StorageBuilder::new(self.column.clone(), self.distance_type, quantizer)
-                .build(batch)?;
+            let storage =
+                StorageBuilder::new(self.column.clone(), quantizer, quantizer).build(batch)?;
             let path = self.temp_dir.child(format!("storage_part{}", part_id));
             let writer = object_store.create(&path).await?;
             let mut writer = FileWriter::try_new(
@@ -654,15 +654,13 @@ pub(crate) fn index_type_string(sub_index: SubIndexType, quantizer: Quantization
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, ops::Range, sync::Arc};
-
+    use crate::Dataset;
     use arrow::datatypes::Float32Type;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::hnsw::HNSW;
-
     use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::sq::ScalarQuantizer;
@@ -674,9 +672,8 @@ mod tests {
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array_with_range;
     use object_store::path::Path;
+    use std::{collections::HashMap, ops::Range, sync::Arc};
     use tempfile::tempdir;
-
-    use crate::Dataset;
 
     const DIM: usize = 32;
 

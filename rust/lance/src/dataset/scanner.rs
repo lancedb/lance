@@ -5283,6 +5283,7 @@ mod test {
                             ..Default::default()
                         }),
                     ],
+                    index_version: crate::index::vector::IndexVersion::Legacy,
                 },
                 false,
             )

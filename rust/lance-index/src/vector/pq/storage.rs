@@ -32,9 +32,9 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use super::distance::build_distance_table_dot;
+use super::distance::{build_distance_table_dot, compute_l2_distance};
+use super::distance::{build_distance_table_l2, compute_dot_distance};
 use super::ProductQuantizer;
-use super::{distance::build_distance_table_l2, num_centroids};
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
@@ -170,15 +170,20 @@ impl ProductQuantizationStorage {
             .into();
 
         if !transposed {
+            let num_columns = if num_bits == 4 {
+                num_sub_vectors / 2
+            } else {
+                num_sub_vectors
+            };
             let pq_col = batch[PQ_CODE_COLUMN].as_fixed_size_list();
             let transposed_code = transpose(
                 pq_col.values().as_primitive::<UInt8Type>(),
                 row_ids.len(),
-                num_sub_vectors,
+                num_columns,
             );
             let pq_code_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
                 transposed_code,
-                num_sub_vectors as i32,
+                num_columns as i32,
             )?);
             batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code_fsl)?;
         }
@@ -542,7 +547,8 @@ pub struct PQDistCalculator {
     distance_table: Vec<f32>,
     pq_code: Arc<UInt8Array>,
     num_sub_vectors: usize,
-    num_centroids: usize,
+    num_bits: u32,
+    distance_type: DistanceType,
 }
 
 impl PQDistCalculator {
@@ -567,7 +573,8 @@ impl PQDistCalculator {
             distance_table,
             num_sub_vectors,
             pq_code,
-            num_centroids: num_centroids(num_bits),
+            num_bits,
+            distance_type,
         }
     }
 
@@ -585,12 +592,43 @@ impl PQDistCalculator {
 
 impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
+        let num_centroids = 2_usize.pow(self.num_bits);
         let pq_code = self.get_pq_code(id);
         pq_code
             .into_iter()
             .enumerate()
-            .map(|(i, c)| self.distance_table[i * self.num_centroids + c])
+            .map(|(i, c)| self.distance_table[i * num_centroids + c])
             .sum()
+    }
+
+    fn distance_all(&self) -> Vec<f32> {
+        match self.distance_type {
+            DistanceType::L2 => compute_l2_distance(
+                &self.distance_table,
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.values(),
+            ),
+            DistanceType::Cosine => {
+                // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
+                // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
+                // Therefore, Cosine = L2 / 2
+                let l2_dists = compute_l2_distance(
+                    &self.distance_table,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.pq_code.values(),
+                );
+                l2_dists.into_iter().map(|v| v / 2.0).collect()
+            }
+            DistanceType::Dot => compute_dot_distance(
+                &self.distance_table,
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.values(),
+            ),
+            _ => unimplemented!("distance type is not supported: {:?}", self.distance_type),
+        }
     }
 }
 
@@ -670,5 +708,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage, storage2);
+    }
+
+    #[tokio::test]
+    async fn test_distance_all() {
+        let storage = create_pq_storage().await;
+        let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
+        let dist_calc = storage.dist_calculator(query);
+        let expected = (0..storage.len())
+            .map(|id| dist_calc.distance(id as u32))
+            .collect::<Vec<_>>();
+        let distances = dist_calc.distance_all();
+        assert_eq!(distances, expected);
     }
 }

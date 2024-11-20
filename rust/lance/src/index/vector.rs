@@ -58,6 +58,20 @@ pub enum StageParams {
     SQ(SQBuildParams),
 }
 
+#[derive(Debug, Clone)]
+pub enum IndexVersion {
+    // Only IVF_PQ is using the legacy index version,
+    // and it's the default version for IVF_PQ.
+    Legacy,
+    V3,
+}
+
+impl Default for IndexVersion {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
 /// The parameters to build vector index.
 #[derive(Debug, Clone)]
 pub struct VectorIndexParams {
@@ -65,15 +79,23 @@ pub struct VectorIndexParams {
 
     /// Vector distance metrics type.
     pub metric_type: MetricType,
+
+    pub index_version: IndexVersion,
 }
 
 impl VectorIndexParams {
+    pub fn index_version(&mut self, version: IndexVersion) -> &mut Self {
+        self.index_version = version;
+        self
+    }
+
     pub fn ivf_flat(num_partitions: usize, metric_type: MetricType) -> Self {
         let ivf_params = IvfBuildParams::new(num_partitions);
         let stages = vec![StageParams::Ivf(ivf_params)];
         Self {
             stages,
             metric_type,
+            index_version: IndexVersion::V3,
         }
     }
 
@@ -106,6 +128,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
+            index_version: IndexVersion::Legacy,
         }
     }
 
@@ -119,6 +142,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
+            index_version: IndexVersion::Legacy,
         }
     }
 
@@ -138,6 +162,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
+            index_version: IndexVersion::V3,
         }
     }
 
@@ -157,6 +182,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
+            index_version: IndexVersion::V3,
         }
     }
 }
@@ -243,7 +269,6 @@ pub(crate) async fn build_vector_index(
         .build()
         .await?;
     } else if is_ivf_pq(stages) {
-        // This is a IVF PQ index.
         let len = stages.len();
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
             return Err(Error::Index {
@@ -252,16 +277,34 @@ pub(crate) async fn build_vector_index(
             });
         };
 
-        build_ivf_pq_index(
-            dataset,
-            column,
-            name,
-            uuid,
-            params.metric_type,
-            ivf_params,
-            pq_params,
-        )
-        .await?;
+        match params.index_version {
+            IndexVersion::Legacy => {
+                build_ivf_pq_index(
+                    dataset,
+                    column,
+                    name,
+                    uuid,
+                    params.metric_type,
+                    ivf_params,
+                    pq_params,
+                )
+                .await?;
+            }
+            IndexVersion::V3 => {
+                IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new(
+                    dataset.clone(),
+                    column.to_owned(),
+                    dataset.indices_dir().child(uuid),
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params.clone()),
+                    Some(pq_params.clone()),
+                    (),
+                )?
+                .build()
+                .await?;
+            }
+        }
     } else if is_ivf_hnsw(stages) {
         let len = stages.len();
         let StageParams::Hnsw(hnsw_params) = &stages[1] else {

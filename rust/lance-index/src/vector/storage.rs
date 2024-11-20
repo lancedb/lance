@@ -38,6 +38,9 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
+    fn distance_all(&self) -> Vec<f32> {
+        unimplemented!("Implement this")
+    }
     fn prefetch(&self, _id: u32) {}
 }
 
@@ -61,6 +64,8 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     where
         Self: 'a;
 
+    /// Create a [VectorStore] from a [RecordBatch].
+    /// The batch should consist of row IDs and quantized vector.
     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
