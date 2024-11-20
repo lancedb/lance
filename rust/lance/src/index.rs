@@ -1328,7 +1328,7 @@ mod tests {
         tokenizer_config = tokenizer_config.stem(false);
         let params = InvertedIndexParams {
             with_position: true,
-            tokenizer_config: tokenizer_config,
+            tokenizer_config,
         };
         dataset
             .create_index(&["text"], IndexType::Inverted, None, &params, true)
