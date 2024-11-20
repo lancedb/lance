@@ -286,7 +286,7 @@ impl ScalarIndex for InvertedIndex {
         let tokenizer = tokenizer_config.build()?;
         let params = InvertedIndexParams {
             with_position: inverted_list.has_positions(),
-            tokenizer_config: tokenizer_config,
+            tokenizer_config,
         };
         Ok(Arc::new(Self {
             params,
