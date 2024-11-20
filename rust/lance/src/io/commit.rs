@@ -688,7 +688,11 @@ pub(crate) async fn commit_transaction(
     // First, get all transactions since read_version
     let read_version = transaction.read_version;
     let mut dataset = dataset.clone();
-    dataset.checkout_latest().await?;
+    if let Operation::Restore { version } = transaction.operation {
+        dataset.checkout_version(version).await?;
+    } else {
+        dataset.checkout_latest().await?;
+    }
     let latest_version = dataset.manifest.version;
     let other_transactions = futures::stream::iter((read_version + 1)..latest_version)
         .map(|version| {

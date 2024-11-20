@@ -309,7 +309,9 @@ impl Dataset {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        self.manifest = Arc::new(self.latest_manifest().await?);
+        let (manifest, path) = self.latest_manifest().await?;
+        self.manifest = Arc::new(manifest);
+        self.manifest_file = path;
         Ok(())
     }
 
@@ -524,7 +526,7 @@ impl Dataset {
             == LanceFileVersion::Legacy
     }
 
-    pub async fn latest_manifest(&self) -> Result<Manifest> {
+    pub async fn latest_manifest(&self) -> Result<(Manifest, Path)> {
         let location = self
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
@@ -540,7 +542,7 @@ impl Dataset {
             };
             populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
         }
-        Ok(manifest)
+        Ok((manifest, location.path))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -559,7 +561,7 @@ impl Dataset {
 
     /// Restore the currently checked out version of the dataset as the latest version.
     pub async fn restore(&mut self) -> Result<()> {
-        let latest_manifest = self.latest_manifest().await?;
+        let (latest_manifest, _) = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
         let transaction = Transaction::new(
