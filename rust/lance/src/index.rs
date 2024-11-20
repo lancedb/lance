@@ -1326,8 +1326,10 @@ mod tests {
             .unwrap_or(TokenizerConfig::default());
         tokenizer_config = tokenizer_config.remove_stop_words(false);
         tokenizer_config = tokenizer_config.stem(false);
-        let mut params = InvertedIndexParams::default();
-        params.tokenizer_config = tokenizer_config;
+        let params = InvertedIndexParams {
+            with_position: true,
+            tokenizer_config: tokenizer_config,
+        };
         dataset
             .create_index(&["text"], IndexType::Inverted, None, &params, true)
             .await
