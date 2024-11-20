@@ -348,7 +348,7 @@ impl InvertedIndexBuilder {
         let start = std::time::Instant::now();
         while let Some(r) = merged_stream.try_next().await? {
             let (token, batch, max_score) = r?;
-            self.tokens.add(token.clone());
+            self.tokens.add(token);
             offsets.push(num_rows);
             max_scores.push(max_score);
             num_rows += batch.num_rows();
