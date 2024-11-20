@@ -529,7 +529,18 @@ impl Dataset {
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
-        read_manifest(&self.object_store, &location.path, location.size).await
+        let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
+        if manifest.schema.has_dictionary_types() {
+            let reader = if let Some(size) = location.size {
+                self.object_store
+                    .open_with_size(&location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&location.path).await?
+            };
+            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+        }
+        Ok(manifest)
     }
 
     /// Read the transaction file for this version of the dataset.
