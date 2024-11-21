@@ -269,7 +269,7 @@ pub(super) async fn add_columns(
         /*blob_op= */ None,
         None,
     );
-    let new_manifest = commit_transaction(
+    let (new_manifest, new_path) = commit_transaction(
         dataset,
         &dataset.object_store,
         dataset.commit_handler.as_ref(),
@@ -281,6 +281,7 @@ pub(super) async fn add_columns(
     .await?;
 
     dataset.manifest = Arc::new(new_manifest);
+    dataset.manifest_file = new_path;
 
     Ok(())
 }
@@ -590,7 +591,7 @@ pub(super) async fn alter_columns(
 
     // TODO: adjust the indices here for the new schema
 
-    let manifest = commit_transaction(
+    let (manifest, manifest_path) = commit_transaction(
         dataset,
         &dataset.object_store,
         dataset.commit_handler.as_ref(),
@@ -602,6 +603,7 @@ pub(super) async fn alter_columns(
     .await?;
 
     dataset.manifest = Arc::new(manifest);
+    dataset.manifest_file = manifest_path;
 
     Ok(())
 }
@@ -651,7 +653,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         None,
     );
 
-    let manifest = commit_transaction(
+    let (manifest, manifest_path) = commit_transaction(
         dataset,
         &dataset.object_store,
         dataset.commit_handler.as_ref(),
@@ -663,6 +665,7 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
     .await?;
 
     dataset.manifest = Arc::new(manifest);
+    dataset.manifest_file = manifest_path;
 
     Ok(())
 }

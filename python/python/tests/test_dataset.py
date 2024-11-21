@@ -847,7 +847,7 @@ def test_append_with_commit(tmp_path: Path):
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError):
         # Must specify read version
         dataset = lance.LanceDataset.commit(dataset, append)
 
