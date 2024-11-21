@@ -474,6 +474,14 @@ pub trait CommitHandler: Debug + Send + Sync {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<(), CommitError>;
+
+    /// Delete the recorded manifest information for a dataset at the base_path
+    async fn delete(
+        &self,
+        _base_path: &Path,
+    ) ->  Result<()> {
+        Ok(())
+    }
 }
 
 async fn default_resolve_version(
