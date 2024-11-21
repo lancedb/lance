@@ -35,7 +35,6 @@ fn dist_table(c: &mut Criterion) {
         FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
         DistanceType::L2,
     );
-
     c.bench_function(
         format!("{},L2,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
         |b| {
@@ -49,12 +48,45 @@ fn dist_table(c: &mut Criterion) {
         PQ,
         8,
         DIM,
-        FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap(),
+        FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
         DistanceType::Cosine,
     );
-
     c.bench_function(
         format!("{},Cosine,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(cosine_pq.compute_distances(&query, &code).unwrap());
+            })
+        },
+    );
+
+    // 4bit PQ
+    let num_sub_vectors = PQ * 2;
+    let l2_pq = ProductQuantizer::new(
+        num_sub_vectors,
+        4,
+        DIM,
+        FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
+        DistanceType::L2,
+    );
+    c.bench_function(
+        format!("{},L2,4bitPQ={},DIM={}", TOTAL, num_sub_vectors, DIM).as_str(),
+        |b| {
+            b.iter(|| {
+                black_box(l2_pq.compute_distances(&query, &code).unwrap().len());
+            })
+        },
+    );
+
+    let cosine_pq = ProductQuantizer::new(
+        num_sub_vectors,
+        4,
+        DIM,
+        FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
+        DistanceType::Cosine,
+    );
+    c.bench_function(
+        format!("{},Cosine,4bitPQ={},DIM={}", TOTAL, num_sub_vectors, DIM).as_str(),
         |b| {
             b.iter(|| {
                 black_box(cosine_pq.compute_distances(&query, &code).unwrap());

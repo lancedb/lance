@@ -128,28 +128,30 @@ impl ProductQuantizer {
             .values()
             .chunks_exact(dim)
             .flat_map(|vector| {
-                let sub_vec_code = vector
-                    .chunks_exact(sub_dim)
-                    .enumerate()
-                    .map(|(sub_idx, sub_vector)| {
-                        let centroids = get_sub_vector_centroids(
-                            codebook.values(),
-                            dim,
-                            num_bits,
-                            num_sub_vectors,
-                            sub_idx,
-                        );
-                        compute_partition(centroids, sub_vector, distance_type).unwrap() as u8
-                    })
-                    .collect::<Vec<_>>();
-                if num_bits == 4 {
-                    sub_vec_code
-                        .chunks_exact(2)
-                        .map(|v| (v[1] << 4) | v[0])
-                        .collect::<Vec<_>>()
-                } else {
-                    sub_vec_code
-                }
+                let sub_vec_code =
+                    vector
+                        .chunks_exact(sub_dim)
+                        .enumerate()
+                        .map(|(sub_idx, sub_vector)| {
+                            let centroids = get_sub_vector_centroids(
+                                codebook.values(),
+                                dim,
+                                num_bits,
+                                num_sub_vectors,
+                                sub_idx,
+                            );
+                            compute_partition(centroids, sub_vector, distance_type).unwrap() as u8
+                        });
+                sub_vec_code
+                // .collect::<Vec<_>>();
+                // if num_bits == 4 {
+                //     sub_vec_code
+                //         .chunks_exact(2)
+                //         .map(|v| (v[1] << 4) | v[0])
+                //         .collect::<Vec<_>>()
+                // } else {
+                //     sub_vec_code
+                // }
             })
             .collect::<Vec<_>>();
 
