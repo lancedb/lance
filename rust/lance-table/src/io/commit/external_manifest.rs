@@ -74,7 +74,9 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     async fn put_if_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()>;
 
     /// Delete the manifest information for given base_uri from the store
-    async fn delete(&self, base_uri: &str) -> Result<()>;
+    async fn delete(&self, _base_uri: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNamingScheme> {
