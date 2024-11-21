@@ -1467,7 +1467,7 @@ impl Dataset {
     }
 
     #[staticmethod]
-    fn commit_bulk<'py>(
+    fn commit_batch<'py>(
         dest: &Bound<'py, PyAny>,
         transactions: Vec<Bound<'py, PyAny>>,
         commit_lock: Option<&'py PyAny>,

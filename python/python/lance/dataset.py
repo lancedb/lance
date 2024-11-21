@@ -25,6 +25,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Set,
     TypedDict,
     Union,
@@ -2215,7 +2216,7 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def commit_batch(
         dest: Union[str, Path, LanceDataset],
-        transactions: Iterable[Transaction],
+        transactions: Sequence[Transaction],
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_v2_manifest_paths: Optional[bool] = None,
@@ -2287,7 +2288,7 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        new_ds, merged = _Dataset.commit_bulk(
+        new_ds, merged = _Dataset.commit_batch(
             dest,
             transactions,
             commit_lock,
@@ -2297,6 +2298,9 @@ class LanceDataset(pa.dataset.Dataset):
             max_retries=max_retries,
         )
         merged = Transaction(**merged)
+        # This logic is specific to append, which is all that should
+        # be returned here.
+        # TODO: generalize this to all other transaction types.
         merged.operation["fragments"] = [
             FragmentMetadata.from_metadata(f) for f in merged.operation["fragments"]
         ]
