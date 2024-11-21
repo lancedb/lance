@@ -23,6 +23,7 @@ use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
 use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
+use bytemuck::cast_slice;
 use lance_arrow::DataTypeExt;
 use snafu::{location, Location};
 
@@ -265,12 +266,11 @@ impl VariableWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
-        let block = data_block.as_variable_width_mut_ref().unwrap();
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == 32);
 
-        let offsets = block.offsets.borrow_to_typed_slice::<u32>();
-        let offsets = offsets.as_ref();
+        let offsets: &[u32] = cast_slice(&block.offsets);
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];
@@ -321,7 +321,7 @@ impl FixedWidthDataBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         let block = data_block.as_fixed_width_ref().unwrap();
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
@@ -460,10 +460,10 @@ impl FixedSizeListBlockBuilder {
 }
 
 impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         let selection = selection.start * self.dimension..selection.end * self.dimension;
-        let fsl = data_block.as_fixed_size_list_mut_ref().unwrap();
-        self.inner.append(fsl.child.as_mut(), selection);
+        let fsl = data_block.as_fixed_size_list_ref().unwrap();
+        self.inner.append(fsl.child.as_ref(), selection);
     }
 
     fn finish(self: Box<Self>) -> DataBlock {
@@ -1415,7 +1415,7 @@ impl From<ArrayRef> for DataBlock {
 }
 
 pub trait DataBlockBuilderImpl {
-    fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>);
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>);
     fn finish(self: Box<Self>) -> DataBlock;
 }
 
@@ -1439,7 +1439,7 @@ impl DataBlockBuilder {
         self.builder.as_mut().unwrap().as_mut()
     }
 
-    pub fn append(&mut self, data_block: &mut DataBlock, selection: Range<u64>) {
+    pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
         self.get_builder(data_block).append(data_block, selection);
     }
 

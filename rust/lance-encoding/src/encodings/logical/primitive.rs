@@ -411,7 +411,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let p2 = pad_bytes::<MINIBLOCK_ALIGNMENT>(6 + bytes_rep + p1 + bytes_def);
             let values = buf.slice_with_length(6 + bytes_rep + bytes_def + p2, bytes_val);
 
-            let mut values = self
+            let values = self
                 .value_decompressor
                 .decompress(LanceBuffer::Borrowed(values), chunk.vals_in_chunk)?;
 
@@ -459,7 +459,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     &def,
                     level_offset,
                 );
-                data_builder.append(&mut values, range);
+                data_builder.append(&values, range);
                 remaining -= to_take;
                 offset += to_take;
                 level_offset += to_take as usize;
@@ -471,7 +471,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
-            let mut dictionary = dictionary.write().unwrap().borrow_and_clone();
+            let dictionary = dictionary.read().unwrap();
             // if dictionary encoding is applied, indices are of type `UInt8`
             let estimated_size_bytes = dictionary.data_size()
                 * (data.num_values() + dictionary.num_values() - 1)
@@ -482,7 +482,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 let indices = indices.as_ref();
 
                 indices.iter().for_each(|&idx| {
-                    data_builder.append(&mut dictionary, idx as u64..idx as u64 + 1);
+                    data_builder.append(&dictionary, idx as u64..idx as u64 + 1);
                 });
 
                 let data = data_builder.finish();
@@ -1107,10 +1107,10 @@ impl DecodePageTask for FixedFullZipDecodeTask {
 
                 // Finally, we decompress the values and add them to our output buffer
                 let values_buf = LanceBuffer::Owned(values);
-                let mut decompressed = self
+                let decompressed = self
                     .value_decompressor
                     .decompress(values_buf, rows_in_buf)?;
-                data_builder.append(&mut decompressed, 0..rows_in_buf);
+                data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
             let repetition = if rep.is_empty() { None } else { Some(rep) };
