@@ -30,13 +30,13 @@ fn dist_table(c: &mut Criterion) {
 
     let l2_pq = ProductQuantizer::new(
         PQ,
-        8,
+        4,
         DIM,
         FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
         DistanceType::L2,
     );
     c.bench_function(
-        format!("{},L2,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
+        format!("{},L2,4bitPQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
         |b| {
             b.iter(|| {
                 black_box(l2_pq.compute_distances(&query, &code).unwrap().len());
@@ -46,13 +46,13 @@ fn dist_table(c: &mut Criterion) {
 
     let cosine_pq = ProductQuantizer::new(
         PQ,
-        8,
+        4,
         DIM,
         FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
         DistanceType::Cosine,
     );
     c.bench_function(
-        format!("{},Cosine,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
+        format!("{},Cosine,4bitPQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
         |b| {
             b.iter(|| {
                 black_box(cosine_pq.compute_distances(&query, &code).unwrap());
