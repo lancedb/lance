@@ -9,29 +9,76 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::{FileWriter, ManifestProvider};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::format::{DataFile, Fragment};
-use lance_table::io::commit::CommitHandler;
+use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::session::Session;
 use crate::Dataset;
 
 use super::blob::BlobStreamExt;
-use super::builder::DatasetBuilder;
 use super::progress::{NoopFragmentWriteProgress, WriteFragmentProgress};
+use super::transaction::Transaction;
 use super::DATA_DIR;
 
+mod commit;
+mod insert;
 pub mod merge_insert;
 pub mod update;
+
+pub use commit::CommitBuilder;
+pub use insert::InsertBuilder;
+
+/// The destination to write data to.
+#[derive(Debug, Clone)]
+pub enum WriteDestination<'a> {
+    /// An existing dataset to write to.
+    Dataset(Arc<Dataset>),
+    /// A URI to write to.
+    Uri(&'a str),
+}
+
+impl WriteDestination<'_> {
+    pub fn dataset(&self) -> Option<&Dataset> {
+        match self {
+            WriteDestination::Dataset(dataset) => Some(dataset.as_ref()),
+            WriteDestination::Uri(_) => None,
+        }
+    }
+}
+
+impl From<Arc<Dataset>> for WriteDestination<'_> {
+    fn from(dataset: Arc<Dataset>) -> Self {
+        WriteDestination::Dataset(dataset)
+    }
+}
+
+impl<'a> From<&'a str> for WriteDestination<'a> {
+    fn from(uri: &'a str) -> Self {
+        WriteDestination::Uri(uri)
+    }
+}
+
+impl<'a> From<&'a String> for WriteDestination<'a> {
+    fn from(uri: &'a String) -> Self {
+        WriteDestination::Uri(uri.as_str())
+    }
+}
+
+impl<'a> From<&'a Path> for WriteDestination<'a> {
+    fn from(path: &'a Path) -> Self {
+        WriteDestination::Uri(path.as_ref())
+    }
+}
 
 /// The mode to write dataset.
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +167,8 @@ pub struct WriteParams {
     pub enable_v2_manifest_paths: bool,
 
     pub object_store_registry: Arc<ObjectStoreRegistry>,
+
+    pub session: Option<Arc<Session>>,
 }
 
 impl Default for WriteParams {
@@ -138,6 +187,7 @@ impl Default for WriteParams {
             enable_move_stable_row_ids: false,
             enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
+            session: None,
         }
     }
 }
@@ -162,54 +212,19 @@ impl WriteParams {
 /// NOTE: the fragments have not yet been assigned an ID. That must be done
 /// by the caller. This is so this function can be called in parallel, and the
 /// IDs can be assigned after writing is complete.
+#[deprecated(
+    since = "0.20.0",
+    note = "Use [`InsertBuilder::write_uncommitted_stream`] instead"
+)]
 pub async fn write_fragments(
-    dataset_uri: &str,
+    dest: impl Into<WriteDestination<'_>>,
     data: impl RecordBatchReader + Send + 'static,
     params: WriteParams,
-) -> Result<WrittenFragments> {
-    let (dataset, object_store, base) = if matches!(params.mode, WriteMode::Append) {
-        match DatasetBuilder::from_uri(dataset_uri)
-            .with_write_params(params.clone())
-            .load()
-            .await
-        {
-            Ok(dataset) => {
-                let store = dataset.object_store().clone();
-                let base = dataset.base.clone();
-                (Some(dataset), store, base)
-            }
-            Err(Error::DatasetNotFound { .. }) => {
-                let (object_store, base) = ObjectStore::from_uri_and_params(
-                    params.object_store_registry.clone(),
-                    dataset_uri,
-                    &params.store_params.clone().unwrap_or_default(),
-                )
-                .await?;
-                (None, object_store, base)
-            }
-            Err(err) => return Err(err),
-        }
-    } else {
-        let (object_store, base) = ObjectStore::from_uri_and_params(
-            params.object_store_registry.clone(),
-            dataset_uri,
-            &params.store_params.clone().unwrap_or_default(),
-        )
-        .await?;
-        (None, object_store, base)
-    };
-
-    let (data, schema) = peek_reader_schema(Box::new(data)).await?;
-    let stream = reader_to_stream(data);
-    write_fragments_internal(
-        dataset.as_ref(),
-        Arc::new(object_store),
-        &base,
-        schema,
-        stream,
-        params,
-    )
-    .await
+) -> Result<Transaction> {
+    InsertBuilder::new(dest.into())
+        .with_params(&params)
+        .execute_uncommitted_stream(Box::new(data))
+        .await
 }
 
 pub async fn do_write_fragments(
@@ -551,6 +566,37 @@ impl WriterGenerator {
         .await?;
 
         Ok((writer, fragment))
+    }
+}
+
+// Given input options resolve what the commit handler should be.
+async fn resolve_commit_handler(
+    uri: &str,
+    commit_handler: Option<Arc<dyn CommitHandler>>,
+    store_options: &Option<ObjectStoreParams>,
+) -> Result<Arc<dyn CommitHandler>> {
+    match commit_handler {
+        None => {
+            if store_options
+                .as_ref()
+                .map(|opts| opts.object_store.is_some())
+                .unwrap_or_default()
+            {
+                return Err(Error::InvalidInput { source: "when creating a dataset with a custom object store the commit_handler must also be specified".into(), location: location!() });
+            }
+            commit_handler_from_url(uri, store_options).await
+        }
+        Some(commit_handler) => {
+            if uri.starts_with("s3+ddb") {
+                Err(Error::InvalidInput {
+                    source: "`s3+ddb://` scheme and custom commit handler are mutually exclusive"
+                        .into(),
+                    location: location!(),
+                })
+            } else {
+                Ok(commit_handler)
+            }
+        }
     }
 }
 
