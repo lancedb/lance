@@ -78,10 +78,13 @@ impl IvfSubIndex for FlatIndex {
         let dist_calc = storage.dist_calculator(query);
 
         let (row_ids, dists): (Vec<u64>, Vec<f32>) = match prefilter.is_empty() {
-            true => (0..storage.len())
-                .map(|id| OrderedNode {
-                    id: id as u32,
-                    dist: OrderedFloat(dist_calc.distance(id as u32)),
+            true => dist_calc
+                .distance_all()
+                .into_iter()
+                .zip(0..storage.len() as u32)
+                .map(|(dist, id)| OrderedNode {
+                    id,
+                    dist: OrderedFloat(dist),
                 })
                 .sorted_unstable()
                 .take(k)

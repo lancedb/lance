@@ -265,7 +265,6 @@ pub(crate) async fn build_vector_index(
         .build()
         .await?;
     } else if is_ivf_pq(stages) {
-        // This is a IVF PQ index.
         let len = stages.len();
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
             return Err(Error::Index {

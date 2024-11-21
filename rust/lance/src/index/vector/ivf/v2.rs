@@ -694,6 +694,24 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.8)]
+    #[tokio::test]
+    async fn test_build_ivf_pq_4bit(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::new(32, 4);
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+            .version(crate::index::vector::IndexFileVersion::V3)
+            .clone();
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
     #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq(
@@ -725,6 +743,28 @@ mod tests {
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
+        let hnsw_params = HnswBuildParams::default();
+        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
+            distance_type,
+            ivf_params,
+            hnsw_params,
+            pq_params,
+        );
+        test_index(params, nlist, recall_requirement).await;
+    }
+
+    #[rstest]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.8)]
+    #[tokio::test]
+    async fn test_create_ivf_hnsw_pq_4bit(
+        #[case] nlist: usize,
+        #[case] distance_type: DistanceType,
+        #[case] recall_requirement: f32,
+    ) {
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::new(32, 4);
         let hnsw_params = HnswBuildParams::default();
         let params = VectorIndexParams::with_ivf_hnsw_pq_params(
             distance_type,

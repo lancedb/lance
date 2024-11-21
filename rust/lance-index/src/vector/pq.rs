@@ -11,7 +11,7 @@ use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
-use distance::build_distance_table_dot;
+use distance::{build_distance_table_dot, compute_dot_distance};
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
@@ -109,6 +109,15 @@ impl ProductQuantizer {
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
         let num_bits = self.num_bits;
+        if num_bits == 4 && num_sub_vectors % 2 != 0 {
+            return Err(Error::Index {
+                message: format!(
+                    "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",
+                    num_sub_vectors,
+                ),
+                location: location!(),
+            });
+        }
         let codebook = self.codebook.values().as_primitive::<T>();
 
         let distance_type = self.distance_type;
@@ -119,7 +128,7 @@ impl ProductQuantizer {
             .values()
             .chunks_exact(dim)
             .flat_map(|vector| {
-                vector
+                let sub_vec_code = vector
                     .chunks_exact(sub_dim)
                     .enumerate()
                     .map(|(sub_idx, sub_vector)| {
@@ -130,15 +139,30 @@ impl ProductQuantizer {
                             num_sub_vectors,
                             sub_idx,
                         );
-                        compute_partition(centroids, sub_vector, distance_type).map(|v| v as u8)
+                        compute_partition(centroids, sub_vector, distance_type).unwrap() as u8
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                if num_bits == 4 {
+                    sub_vec_code
+                        .chunks_exact(2)
+                        .map(|v| (v[1] << 4) | v[0])
+                        .collect::<Vec<_>>()
+                } else {
+                    sub_vec_code
+                }
             })
             .collect::<Vec<_>>();
 
+        let num_sub_vectors_in_byte = if num_bits == 4 {
+            num_sub_vectors / 2
+        } else {
+            num_sub_vectors
+        };
+
+        debug_assert_eq!(values.len(), fsl.len() * num_sub_vectors_in_byte);
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(values),
-            self.num_sub_vectors as i32,
+            num_sub_vectors_in_byte as i32,
         )?))
     }
 
@@ -225,18 +249,12 @@ impl ProductQuantizer {
             key.values(),
         );
 
-        let num_vectors = code.len() / self.num_sub_vectors;
-        let mut distances = vec![0.0; num_vectors];
-        let num_centroids = num_centroids(self.num_bits);
-        for (sub_vec_idx, vec_indices) in code.values().chunks_exact(num_vectors).enumerate() {
-            let dist_table = &distance_table[sub_vec_idx * num_centroids..];
-            vec_indices
-                .iter()
-                .zip(distances.iter_mut())
-                .for_each(|(&centroid_idx, sum)| {
-                    *sum += dist_table[centroid_idx as usize];
-                });
-        }
+        let distances = compute_dot_distance(
+            &distance_table,
+            self.num_bits,
+            self.num_sub_vectors,
+            code.values(),
+        );
         Ok(distances.into())
     }
 
