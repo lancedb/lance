@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchReader};
+use arrow_array::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
+use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
@@ -218,12 +219,12 @@ impl WriteParams {
 )]
 pub async fn write_fragments(
     dest: impl Into<WriteDestination<'_>>,
-    data: impl RecordBatchReader + Send + 'static,
+    data: impl StreamingWriteSource,
     params: WriteParams,
 ) -> Result<Transaction> {
     InsertBuilder::new(dest.into())
         .with_params(&params)
-        .execute_uncommitted_stream(Box::new(data))
+        .execute_uncommitted_stream(data)
         .await
 }
 
@@ -604,7 +605,7 @@ async fn resolve_commit_handler(
 mod tests {
     use super::*;
 
-    use arrow_array::{Int32Array, StructArray};
+    use arrow_array::{Int32Array, RecordBatchReader, StructArray};
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
     use datafusion::{error::DataFusionError, physical_plan::stream::RecordBatchStreamAdapter};
     use futures::TryStreamExt;

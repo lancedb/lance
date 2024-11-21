@@ -6,6 +6,8 @@ use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Allocates error on the heap and then places `e` into it.
+#[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
 }

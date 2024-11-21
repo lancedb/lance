@@ -12,7 +12,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
-use lance_datafusion::utils::reader_to_stream;
+use lance_datafusion::utils::StreamingWriteSource;
 use lance_table::format::Fragment;
 use snafu::{location, Location};
 
@@ -234,7 +234,7 @@ pub(super) async fn add_columns_to_fragments(
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
-            let stream = reader_to_stream(reader);
+            let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
             Ok((output_schema, fragments))
         }

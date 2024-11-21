@@ -22,8 +22,7 @@ use std::{
 };
 
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchReader, StructArray,
-    UInt64Array,
+    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, StructArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
@@ -58,7 +57,7 @@ use lance_core::{
 };
 use lance_datafusion::{
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
-    utils::reader_to_stream,
+    utils::StreamingWriteSource,
 };
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
@@ -345,9 +344,9 @@ enum SchemaComparison {
 impl MergeInsertJob {
     pub async fn execute_reader(
         self,
-        source: Box<dyn RecordBatchReader + Send>,
+        source: impl StreamingWriteSource,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let stream = reader_to_stream(source);
+        let stream = source.into_stream();
         self.execute(stream).await
     }
 
@@ -1302,10 +1301,12 @@ impl Merger {
 mod tests {
 
     use arrow_array::{
-        types::UInt32Type, Int64Array, RecordBatchIterator, StringArray, UInt32Array,
+        types::UInt32Type, Int64Array, RecordBatchIterator, RecordBatchReader, StringArray,
+        UInt32Array,
     };
     use arrow_select::concat::concat_batches;
     use datafusion::common::Column;
+    use lance_datafusion::utils::reader_to_stream;
     use lance_datagen::{array, BatchCount, RowCount, Seed};
     use lance_index::{scalar::ScalarIndexParams, IndexType};
     use tempfile::tempdir;
