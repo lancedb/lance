@@ -531,6 +531,9 @@ impl Dataset {
             .commit_handler
             .resolve_latest_location(&self.base, &self.object_store)
             .await?;
+        if location.version == self.manifest.version {
+            return Ok((self.manifest.as_ref().clone(), self.manifest_file.clone()));
+        }
         let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
         if manifest.schema.has_dictionary_types() {
             let reader = if let Some(size) = location.size {
