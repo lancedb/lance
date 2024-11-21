@@ -446,9 +446,11 @@ mod tests {
             assert_eq!(dataset.manifest().version, i + 2);
 
             // Because we are writing transactions sequentially, and caching them,
-            // we shouldn't need to read anything from disk.
+            // we shouldn't need to read anything from disk. Except we do need
+            // to check for the latest version to see if we need to do conflict
+            // resolution.
             let (reads, writes) = get_new_iops();
-            assert_eq!(reads, 0, "i = {}", i);
+            assert_eq!(reads, 1, "i = {}", i);
             // Should see 3 IOPs:
             // 1. Write the transaction files
             // 2. Write the manifest
@@ -469,7 +471,7 @@ mod tests {
         // However, the dataset needs to be loaded, so an additional two IOPs
         // are needed.
         let (reads, writes) = get_new_iops();
-        assert_eq!(reads, 2);
+        assert_eq!(reads, 3);
         assert_eq!(writes, 3);
 
         // Commit transaction with URI and no session

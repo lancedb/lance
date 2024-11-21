@@ -688,8 +688,8 @@ pub(crate) async fn commit_transaction(
     // First, get all transactions since read_version
     let read_version = transaction.read_version;
     let mut dataset = dataset.clone();
-    let latest_version = dataset.manifest.version;
-    let other_transactions = futures::stream::iter((read_version + 1)..latest_version)
+    let latest_version = dataset.latest_version_id().await?;
+    let other_transactions = futures::stream::iter((read_version + 1)..=latest_version)
         .map(|version| {
             read_dataset_transaction_file(&dataset, version)
                 .map(move |res| res.map(|tx| (version, tx)))
@@ -711,7 +711,7 @@ pub(crate) async fn commit_transaction(
     }
 
     // If any of them conflict with the transaction, return an error
-    for (other_version, other_transaction) in other_transactions.iter() {
+    for (other_version, other_transaction) in dbg!(other_transactions).iter() {
         check_transaction(
             transaction,
             *other_version,
