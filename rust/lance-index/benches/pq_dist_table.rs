@@ -19,7 +19,7 @@ use pprof::criterion::{Output, PProfProfiler};
 
 const PQ: usize = 96;
 const DIM: usize = 1536;
-const TOTAL: usize = 5 * 1024 * 1024;
+const TOTAL: usize = 500 * 1000;
 
 fn dist_table(c: &mut Criterion) {
     let codebook = generate_random_array_with_seed::<Float32Type>(256 * DIM, [88; 32]);
@@ -28,37 +28,24 @@ fn dist_table(c: &mut Criterion) {
     let mut rnd = StdRng::from_seed([32; 32]);
     let code = UInt8Array::from_iter_values(repeat(rnd.gen::<u8>()).take(TOTAL * PQ));
 
-    let l2_pq = ProductQuantizer::new(
-        PQ,
-        8,
-        DIM,
-        FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
-        DistanceType::L2,
-    );
-    c.bench_function(
-        format!("{},L2,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
-        |b| {
-            b.iter(|| {
-                black_box(l2_pq.compute_distances(&query, &code).unwrap().len());
-            })
-        },
-    );
+    for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot].iter() {
+        let pq = ProductQuantizer::new(
+            PQ,
+            8,
+            DIM,
+            FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
+            *dt,
+        );
 
-    let cosine_pq = ProductQuantizer::new(
-        PQ,
-        8,
-        DIM,
-        FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap(),
-        DistanceType::Cosine,
-    );
-    c.bench_function(
-        format!("{},Cosine,PQ={},DIM={}", TOTAL, PQ, DIM).as_str(),
-        |b| {
-            b.iter(|| {
-                black_box(cosine_pq.compute_distances(&query, &code).unwrap());
-            })
-        },
-    );
+        c.bench_function(
+            format!("{},{},PQ={},DIM={}", TOTAL, dt, PQ, DIM).as_str(),
+            |b| {
+                b.iter(|| {
+                    black_box(pq.compute_distances(&query, &code).unwrap());
+                })
+            },
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
