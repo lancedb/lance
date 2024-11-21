@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::RwLock;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Debug,
@@ -294,7 +293,7 @@ struct DecodeMiniBlockTask {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
-    dictionary_data: Option<Arc<RwLock<DataBlock>>>,
+    dictionary_data: Option<Arc<DataBlock>>,
     // The mini-blocks to decode
     //
     // For each mini-block we also have the ranges of rows that we want to decode
@@ -471,7 +470,6 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
-            let dictionary = dictionary.read().unwrap();
             let estimated_size_bytes = dictionary.data_size()
                 * (data.num_values() + dictionary.num_values() - 1)
                 / dictionary.num_values();
@@ -483,7 +481,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 let indices = indices.as_ref();
 
                 indices.iter().for_each(|&idx| {
-                    data_builder.append(&dictionary, idx as u64..idx as u64 + 1);
+                    data_builder.append(dictionary, idx as u64..idx as u64 + 1);
                 });
 
                 let data = data_builder.finish();
@@ -513,7 +511,7 @@ struct MiniBlockDecoder {
     data: VecDeque<ScheduledChunk>,
     offset_in_current_chunk: u64,
     num_rows: u64,
-    dictionary: Option<Arc<RwLock<DataBlock>>>,
+    dictionary: Option<Arc<DataBlock>>,
 }
 
 impl StructuralPageDecoder for MiniBlockDecoder {
@@ -622,7 +620,7 @@ struct MiniBlockSchedulerDictionary {
     dictionary_data_alignment: u64,
 
     // This is set after initialization
-    dictionary_data: Arc<RwLock<DataBlock>>,
+    dictionary_data: Arc<DataBlock>,
 }
 
 /// A scheduler for a page that has been encoded with the mini-block layout
@@ -670,7 +668,7 @@ impl MiniBlockScheduler {
                             .into(),
                         dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
                         dictionary_data_alignment: 4,
-                        dictionary_data: Arc::new(RwLock::new(DataBlock::Empty())),
+                        dictionary_data: Arc::new(DataBlock::Empty()),
                     })
                 }
                 pb::array_encoding::ArrayEncoding::Flat(_) => Some(MiniBlockSchedulerDictionary {
@@ -679,7 +677,7 @@ impl MiniBlockScheduler {
                         .into(),
                     dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
                     dictionary_data_alignment: 16,
-                    dictionary_data: Arc::new(RwLock::new(DataBlock::Empty())),
+                    dictionary_data: Arc::new(DataBlock::Empty()),
                 }),
                 _ => {
                     unreachable!("Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary.")
@@ -795,12 +793,12 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             if let Some(ref mut dictionary) = self.dictionary {
                 let dictionary_data = dictionary_data.unwrap().await?;
                 dictionary.dictionary_data =
-                    Arc::new(RwLock::new(dictionary.dictionary_decompressor.decompress(
+                    Arc::new(dictionary.dictionary_decompressor.decompress(
                         LanceBuffer::from_bytes(
                             dictionary_data,
                             dictionary.dictionary_data_alignment,
                         ),
-                    )?))
+                    )?)
             };
             Ok(())
         }
