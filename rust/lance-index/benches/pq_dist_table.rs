@@ -19,7 +19,7 @@ use pprof::criterion::{Output, PProfProfiler};
 
 const PQ: usize = 96;
 const DIM: usize = 1536;
-const TOTAL: usize = 500 * 1000;
+const TOTAL: usize = 16 * 1000;
 
 fn dist_table(c: &mut Criterion) {
     let codebook = generate_random_array_with_seed::<Float32Type>(256 * DIM, [88; 32]);
