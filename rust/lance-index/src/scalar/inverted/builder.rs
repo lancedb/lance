@@ -650,14 +650,11 @@ impl PostingReader {
 
                 // read the posting lists from existing data
                 if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
-                    match posting_reader.existing_tokens.get(&token) {
-                        Some(token_id) => {
-                            let batch = inverted_list
-                                .posting_batch(*token_id, inverted_list.has_positions())
-                                .await?;
-                            batches.push(batch);
-                        }
-                        None => {}
+                    if let Some(token_id) = posting_reader.existing_tokens.get(&token) {
+                        let batch = inverted_list
+                            .posting_batch(*token_id, inverted_list.has_positions())
+                            .await?;
+                        batches.push(batch);
                     }
                 }
 
