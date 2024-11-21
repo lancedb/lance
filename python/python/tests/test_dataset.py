@@ -864,6 +864,30 @@ def test_append_with_commit(tmp_path: Path):
     assert tbl == expected
 
 
+def test_commit_batch_append():
+    data1 = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data1, "memory://test")
+
+    data2 = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragments2 = lance.fragment.write_fragments(data2, dataset)
+    op2 = lance.LanceOperation.Append(fragments2)
+    txn2 = lance.Transaction(1, op2)
+    data3 = pa.Table.from_pydict({"a": range(200, 300), "b": range(200, 300)})
+    fragments3 = lance.fragment.write_fragments(data3, dataset)
+    op3 = lance.LanceOperation.Append(fragments3)
+    txn3 = lance.Transaction(2, op3)
+
+    result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
+    dataset = result["dataset"]
+    assert dataset.version == 2
+    assert len(dataset.get_fragments()) == 3
+    assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
+    merged_txn = result["merged"]
+    assert isinstance(merged_txn, lance.Transaction)
+    assert isinstance(merged_txn.operation, lance.LanceOperation.Append)
+    assert merged_txn.operation.fragments == fragments2 + fragments3
+
+
 def test_delete_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
