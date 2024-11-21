@@ -904,11 +904,9 @@ mod tests {
 
     use super::*;
 
-    use arrow::array::StringBuilder;
-    use arrow_array::{
-        ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray,
-    };
-    use arrow_schema::{Field, Schema, SchemaRef};
+    use arrow::array::AsArray;
+    use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_schema::{Field, Schema};
     use lance_arrow::*;
     use lance_index::scalar::inverted::TokenizerConfig;
     use lance_index::scalar::FullTextSearchQuery;
@@ -1300,32 +1298,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_text_search() {
-        let words = ["spotted", "crib", "irritating", "disturbed"];
+    async fn test_optimize_fts() {
+        let words = ["apple", "banana", "cherry", "date"];
 
         let dir = tempdir().unwrap();
         let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
-        let mut builder = StringBuilder::new();
-        for word in words.iter() {
-            builder.append_value(word);
-        }
-        let array = builder.finish();
-        let fields = vec![Arc::new(array) as ArrayRef];
-        let record_batch = RecordBatch::try_new(schema.clone(), fields).unwrap();
-        let iter_schema: SchemaRef = schema.clone();
-        let batches = vec![Ok(record_batch)].into_iter();
-        let batch_iterator = RecordBatchIterator::new(batches, iter_schema);
+        let data = StringArray::from_iter_values(words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
+        let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
 
         let mut dataset = Dataset::write(batch_iterator, dir.path().to_str().unwrap(), None)
             .await
             .unwrap();
 
-        let mut tokenizer_config = TokenizerConfig::default();
-        tokenizer_config = tokenizer_config
-            .language("English")
-            .unwrap_or(TokenizerConfig::default());
-        tokenizer_config = tokenizer_config.remove_stop_words(false);
-        tokenizer_config = tokenizer_config.stem(false);
+        let tokenizer_config = TokenizerConfig::default();
         let params = InvertedIndexParams {
             with_position: true,
             tokenizer_config,
@@ -1335,6 +1321,12 @@ mod tests {
             .await
             .unwrap();
 
+        let new_words = ["elephant", "fig", "grape", "honeydew"];
+        let new_data = StringArray::from_iter_values(new_words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
+        let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(batch_iter, None).await.unwrap();
+
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0,
@@ -1342,38 +1334,32 @@ mod tests {
             })
             .await
             .unwrap();
-        let query_result = dataset
-            .scan()
-            .project(&["text"])
-            .unwrap()
-            .full_text_search(FullTextSearchQuery::new("spotted".to_owned()))
-            .unwrap()
-            .limit(Some(10), None)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
 
-        let column_downcast = query_result
-            .column_by_name("text")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>();
+        for &word in words.iter().chain(new_words.iter()) {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
 
-        assert!(column_downcast.is_some());
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
 
-        let texts = column_downcast
-            .unwrap()
-            .iter()
-            .map(|v| match v {
-                None => "".to_string(),
-                Some(v) => v.to_string(),
-            })
-            .collect::<Vec<String>>();
-
-        assert_eq!(texts.len(), 1);
-
-        assert_eq!(texts[0], "spotted");
+            assert_eq!(texts.len(), 1);
+            assert_eq!(texts[0], word);
+        }
     }
 
     #[tokio::test]

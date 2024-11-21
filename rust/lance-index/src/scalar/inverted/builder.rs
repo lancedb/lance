@@ -22,11 +22,10 @@ use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use object_store::path::Path;
-use snafu::{location, Location};
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -651,18 +650,15 @@ impl PostingReader {
 
                 // read the posting lists from existing data
                 if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
-                    let token_id =
-                        posting_reader
-                            .existing_tokens
-                            .get(&token)
-                            .ok_or(Error::Index {
-                                message: format!("token {} not found", token),
-                                location: location!(),
-                            })?;
-                    let batch = inverted_list
-                        .posting_batch(*token_id, inverted_list.has_positions())
-                        .await?;
-                    batches.push(batch);
+                    match posting_reader.existing_tokens.get(&token) {
+                        Some(token_id) => {
+                            let batch = inverted_list
+                                .posting_batch(*token_id, inverted_list.has_positions())
+                                .await?;
+                            batches.push(batch);
+                        }
+                        None => {}
+                    }
                 }
 
                 let (batch, max_score) =
