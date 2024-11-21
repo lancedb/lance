@@ -238,9 +238,7 @@ impl DynamoDBExternalManifestStore {
     }
 
     fn ddb_delete(&self) -> DeleteItemFluentBuilder {
-        self.client
-            .delete_item()
-            .table_name(&self.table_name)
+        self.client.delete_item().table_name(&self.table_name)
     }
 }
 
@@ -383,7 +381,8 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
 
     /// Delete the manifest information for the given base_uri in dynamodb
     async fn delete(&self, base_uri: &str) -> Result<()> {
-        let query_result = self.ddb_query()
+        let query_result = self
+            .ddb_query()
             .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
             .expression_attribute_values(
                 format!(":{}", base_uri!()),

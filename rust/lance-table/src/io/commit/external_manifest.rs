@@ -350,6 +350,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
     }
 
     async fn delete(&self, base_path: &Path) -> Result<()> {
-        self.external_manifest_store.delete(base_path.as_ref()).await
+        self.external_manifest_store
+            .delete(base_path.as_ref())
+            .await
     }
 }

@@ -476,10 +476,7 @@ pub trait CommitHandler: Debug + Send + Sync {
     ) -> std::result::Result<Path, CommitError>;
 
     /// Delete the recorded manifest information for a dataset at the base_path
-    async fn delete(
-        &self,
-        _base_path: &Path,
-    ) ->  Result<()> {
+    async fn delete(&self, _base_path: &Path) -> Result<()> {
         Ok(())
     }
 }
