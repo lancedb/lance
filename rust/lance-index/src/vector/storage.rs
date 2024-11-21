@@ -38,9 +38,7 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
-    fn distance_all(&self) -> Vec<f32> {
-        unimplemented!("Implement this")
-    }
+    fn distance_all(&self) -> Vec<f32>;
     fn prefetch(&self, _id: u32) {}
 }
 
