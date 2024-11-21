@@ -171,7 +171,7 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest = read_manifest(&self.dataset.object_store, &path).await?;
+        let manifest = read_manifest(&self.dataset.object_store, &path, None).await?;
         let dataset_version = self.dataset.version().version;
 
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,

@@ -307,7 +307,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
         object_store: &ObjectStore,
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
-    ) -> std::result::Result<(), CommitError> {
+    ) -> std::result::Result<Path, CommitError> {
         // path we get here is the path to the manifest we want to write
         // use object_store.base_path.as_ref() for getting the root of the dataset
 
@@ -323,27 +323,26 @@ impl CommitHandler for ExternalManifestCommitHandler {
             .await
             .map_err(|_| CommitError::CommitConflict {});
 
-        if res.is_err() {
+        if let Err(err) = res {
             // delete the staging manifest
             match object_store.inner.delete(&staging_path).await {
                 Ok(_) => {}
                 Err(ObjectStoreError::NotFound { .. }) => {}
                 Err(e) => return Err(CommitError::OtherError(e.into())),
             }
-            return res;
+            return Err(err);
         }
 
         let scheme = detect_naming_scheme_from_path(&path)?;
 
-        self.finalize_manifest(
-            base_path,
-            &staging_path,
-            manifest.version,
-            &object_store.inner,
-            scheme,
-        )
-        .await?;
-
-        Ok(())
+        Ok(self
+            .finalize_manifest(
+                base_path,
+                &staging_path,
+                manifest.version,
+                &object_store.inner,
+                scheme,
+            )
+            .await?)
     }
 }

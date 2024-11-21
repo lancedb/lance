@@ -1000,7 +1000,7 @@ impl MergeInsertJob {
             None,
         );
 
-        let manifest = commit_transaction(
+        let (manifest, manifest_path) = commit_transaction(
             dataset.as_ref(),
             dataset.object_store(),
             dataset.commit_handler.as_ref(),
@@ -1013,6 +1013,7 @@ impl MergeInsertJob {
 
         let mut dataset = dataset.as_ref().clone();
         dataset.manifest = Arc::new(manifest);
+        dataset.manifest_file = manifest_path;
 
         Ok(Arc::new(dataset))
     }

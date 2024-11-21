@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
@@ -16,7 +17,7 @@ use lance_core::error::Result;
 /// Lance Data File
 ///
 /// A data file is one piece of file storing data.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct DataFile {
     /// Relative path of the data file to dataset root.
     pub path: String,
@@ -144,7 +145,7 @@ impl TryFrom<pb::DataFile> for DataFile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 #[serde(rename_all = "lowercase")]
 pub enum DeletionFileType {
     Array,
@@ -161,7 +162,7 @@ impl DeletionFileType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -199,7 +200,7 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
 }
 
 /// A reference to a part of a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct ExternalFile {
     pub path: String,
     pub offset: u64,
@@ -207,7 +208,7 @@ pub struct ExternalFile {
 }
 
 /// Metadata about location of the row id sequence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub enum RowIdMeta {
     Inline(Vec<u8>),
     External(ExternalFile),
@@ -234,7 +235,7 @@ impl TryFrom<pb::data_fragment::RowIdSequence> for RowIdMeta {
 ///
 /// A fragment is a set of files which represent the different columns of the same rows.
 /// If column exists in the schema, but the related file does not exist, treat this column as `nulls`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct Fragment {
     /// Fragment ID
     pub id: u64,
