@@ -472,11 +472,12 @@ impl DecodePageTask for DecodeMiniBlockTask {
         // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
             let dictionary = dictionary.read().unwrap();
-            // if dictionary encoding is applied, indices are of type `UInt8`
             let estimated_size_bytes = dictionary.data_size()
                 * (data.num_values() + dictionary.num_values() - 1)
                 / dictionary.num_values();
             let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+
+            // if dictionary encoding is applied, indices are of type `UInt8`
             if let DataBlock::FixedWidth(mut fixed_width_data_block) = data {
                 let indices = fixed_width_data_block.data.borrow_to_typed_slice::<u8>();
                 let indices = indices.as_ref();
@@ -620,7 +621,7 @@ struct MiniBlockSchedulerDictionary {
     dictionary_buf_position_and_size: (u64, u64),
     dictionary_data_alignment: u64,
 
-    // This is set after initializaton
+    // This is set after initialization
     dictionary_data: Arc<RwLock<DataBlock>>,
 }
 
@@ -1076,7 +1077,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             // We decompress each buffer and add it to our output buffer
             for (buf, rows_in_buf) in self.data.into_iter() {
                 let mut decompressed = self.value_decompressor.decompress(buf, rows_in_buf)?;
-                data_builder.append(&mut decompressed, 0..rows_in_buf);
+                data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
             Ok(DecodedPage {
