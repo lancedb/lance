@@ -1076,7 +1076,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             //
             // We decompress each buffer and add it to our output buffer
             for (buf, rows_in_buf) in self.data.into_iter() {
-                let mut decompressed = self.value_decompressor.decompress(buf, rows_in_buf)?;
+                let decompressed = self.value_decompressor.decompress(buf, rows_in_buf)?;
                 data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
