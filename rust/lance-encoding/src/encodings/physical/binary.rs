@@ -1048,4 +1048,25 @@ pub mod tests {
         let field = Field::new("", DataType::Utf8, false);
         check_round_trip_encoding_random(field, version).await;
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary_dictionary_encoding() {
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let strings = [
+            "Hal Abelson",
+            "Charles Babbage",
+            "Vint Cerf",
+            "Jim Gray",
+            "Alonzo Church",
+            "Edgar F. Codd",
+        ];
+        let repeated_strings: Vec<_> = strings
+            .iter()
+            .cycle()
+            .take(strings.len() * 10000)
+            .cloned()
+            .collect();
+        let string_array = Arc::new(StringArray::from(repeated_strings)) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![string_array], &test_cases, HashMap::new()).await;
+    }
 }

@@ -2317,7 +2317,7 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn dicitonary_encoding(mut data_block: DataBlock, cardinality: u64) -> (DataBlock, DataBlock) {
+    fn dicitionary_encoding(mut data_block: DataBlock, cardinality: u64) -> (DataBlock, DataBlock) {
         match data_block {
             DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
                 // Currently FixedWidth DataBlock with only bits_per_value 128 has cardinality
@@ -2460,11 +2460,11 @@ impl PrimitiveStructuralEncoder {
                     };
 
                 // The triggering threshold for dictionary encoding can be further tuned.
-                if cardinality < DICTIONARY_ENCODING_THRESHOLD
-                    && data_block.num_values() > 10 * cardinality
+                if cardinality <= DICTIONARY_ENCODING_THRESHOLD
+                    && data_block.num_values() >= 10 * cardinality
                 {
                     let (indices_data_block, dictionary_data_block) =
-                        Self::dicitonary_encoding(data_block, cardinality);
+                        Self::dicitionary_encoding(data_block, cardinality);
                     Self::encode_miniblock(
                         column_idx,
                         &field,
