@@ -48,7 +48,7 @@ fn dist_table(c: &mut Criterion) {
         PQ,
         4,
         DIM,
-        FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
+        FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap(),
         DistanceType::Cosine,
     );
     c.bench_function(
