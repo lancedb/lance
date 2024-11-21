@@ -10,11 +10,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
-use aws_sdk_dynamodb::operation::RequestId;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
 };
+use aws_sdk_dynamodb::operation::{query, RequestId};
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
 use snafu::OptionExt;
@@ -392,20 +392,17 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .await
             .wrap_err()?;
 
-        match query_result.items {
-            Some(items) => {
-                for item in items {
-                    if let Some(AttributeValue::N(version)) = item.get("version") {
-                        self.ddb_delete()
-                            .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
-                            .key(version!(), AttributeValue::N(version.clone()))
-                            .send()
-                            .await
-                            .wrap_err()?;
-                    }
+        if let Some(items) = query_result.items {
+            for item in items {
+                if let Some(AttributeValue::N(version)) = item.get("version") {
+                    self.ddb_delete()
+                        .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
+                        .key(version!(), AttributeValue::N(version.clone()))
+                        .send()
+                        .await
+                        .wrap_err()?;
                 }
             }
-            _ => (),
         }
         Ok(())
     }
