@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
 
+/// JSON representation of an Apache Arrow [DataType].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonDataType {
+pub struct JsonDataType {
     #[serde(rename = "type")]
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,8 +165,9 @@ impl TryFrom<&JsonDataType> for DataType {
     }
 }
 
+/// JSON representation of an Apache Arrow [Field].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonField {
+pub struct JsonField {
     name: String,
     #[serde(rename = "type")]
     type_: JsonDataType,
