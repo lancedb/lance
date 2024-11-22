@@ -23,6 +23,10 @@ jobs:
         with:
           fetch-depth: 0
           lfs: true
+      - name: Authenticate with GCS
+        uses: "google-github-actions/auth@v2"
+        with:
+          credentials_json: "${{ secrets.GCLOUD_BENCH_STORAGE_USER_KEY }}"
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
