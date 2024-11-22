@@ -44,7 +44,7 @@ jobs:
         run: |
           python -m venv venv
           source venv/bin/activate
-          pip install maturin duckdb requests
+          pip install maturin duckdb requests pytest pytest-benchmark
           maturin develop --locked --release
       - name: Generate datasets
         run: |
