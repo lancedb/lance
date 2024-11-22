@@ -22,11 +22,10 @@ use itertools::Itertools;
 use lance_arrow::iter_str_array;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME};
-use lance_core::{Error, Result, ROW_ID};
+use lance_core::{Result, ROW_ID};
 use lance_io::object_store::ObjectStore;
 use lazy_static::lazy_static;
 use object_store::path::Path;
-use snafu::{location, Location};
 use tempfile::{tempdir, TempDir};
 use tracing::instrument;
 
@@ -83,12 +82,11 @@ impl InvertedIndexBuilder {
     }
 
     pub fn from_existing_index(
+        params: InvertedIndexParams,
         tokens: TokenSet,
         inverted_list: Arc<InvertedListReader>,
         docs: DocSet,
     ) -> Self {
-        let params = InvertedIndexParams::default().with_position(inverted_list.has_positions());
-
         Self {
             params,
             tokens,
@@ -345,6 +343,7 @@ impl InvertedIndexBuilder {
         }
         let mut merged_stream = stream::select_all(posting_streams);
         let mut last_num_rows = 0;
+        self.tokens = TokenSet::default();
         let start = std::time::Instant::now();
         while let Some(r) = merged_stream.try_next().await? {
             let (token, batch, max_score) = r?;
@@ -635,6 +634,7 @@ impl PostingReader {
             let schema = schema.clone();
             let docs = docs.clone();
             tokio::spawn(async move {
+                // read the posting lists from new data
                 let batches = offsets.into_iter().map(|(offset, length)| {
                     let reader = posting_reader.reader.clone();
                     let schema = schema.clone();
@@ -648,19 +648,14 @@ impl PostingReader {
                 });
                 let mut batches = futures::future::try_join_all(batches).await?;
 
+                // read the posting lists from existing data
                 if let Some(inverted_list) = posting_reader.inverted_list_reader.as_ref() {
-                    let token_id =
-                        posting_reader
-                            .existing_tokens
-                            .get(&token)
-                            .ok_or(Error::Index {
-                                message: format!("token {} not found", token),
-                                location: location!(),
-                            })?;
-                    let batch = inverted_list
-                        .posting_batch(*token_id, inverted_list.has_positions())
-                        .await?;
-                    batches.push(batch);
+                    if let Some(token_id) = posting_reader.existing_tokens.get(&token) {
+                        let batch = inverted_list
+                            .posting_batch(*token_id, inverted_list.has_positions())
+                            .await?;
+                        batches.push(batch);
+                    }
                 }
 
                 let (batch, max_score) =
