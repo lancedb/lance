@@ -112,7 +112,7 @@ impl TryFrom<&JsonDataType> for DataType {
         let type_name = value.type_.as_str();
         match type_name {
             "null" | "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16"
-            | "uint32" | "halffloat" | "float" | "double" | "string" | "binary"
+            | "uint32" | "uint64" | "halffloat" | "float" | "double" | "string" | "binary"
             | "large_string" | "large_binary" | "date32:day" | "date64:ms" => {
                 let logical_type: LogicalType = type_name.into();
                 (&logical_type).try_into()
