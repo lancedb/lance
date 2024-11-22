@@ -197,7 +197,7 @@ impl LanceExecutionOptions {
     }
 }
 
-pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
+pub fn new_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let session_config = SessionConfig::new();
     let mut runtime_config = RuntimeConfig::new();
     if options.use_spilling() {
@@ -212,16 +212,16 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
 
 lazy_static! {
     static ref DEFAULT_SESSION_CONTEXT: SessionContext =
-        new_session_context(LanceExecutionOptions::default());
+        new_session_context(&LanceExecutionOptions::default());
     static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
-        new_session_context(LanceExecutionOptions {
+        new_session_context(&LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         })
     };
 }
 
-pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
+pub fn get_session_context(options: &LanceExecutionOptions) -> SessionContext {
     let session_ctx: SessionContext;
     if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
         if options.use_spilling() {
@@ -247,7 +247,7 @@ pub fn execute_plan(
         DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
     );
 
-    let session_ctx = get_session_context(options);
+    let session_ctx = get_session_context(&options);
 
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.

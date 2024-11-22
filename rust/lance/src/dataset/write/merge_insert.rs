@@ -592,7 +592,7 @@ impl MergeInsertJob {
     ) -> Result<Vec<Fragment>> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
-        let session_ctx = get_session_context(LanceExecutionOptions {
+        let session_ctx = get_session_context(&LanceExecutionOptions {
             use_spilling: true,
             ..Default::default()
         });

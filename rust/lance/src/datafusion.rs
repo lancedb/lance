@@ -6,3 +6,4 @@
 
 pub(crate) mod dataframe;
 pub(crate) mod logical_plan;
+pub mod sql;
