@@ -25,7 +25,7 @@ pub fn build_distance_table_l2<T: L2>(
 }
 
 #[inline]
-pub fn build_distance_table_l2_impl<const NUM_BITS: u32,T: L2>(
+pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
     codebook: &[T],
     num_sub_vectors: usize,
     query: &[T],
@@ -38,7 +38,7 @@ pub fn build_distance_table_l2_impl<const NUM_BITS: u32,T: L2>(
         .enumerate()
         .flat_map(|(i, sub_vec)| {
             let subvec_centroids =
-                get_sub_vector_centroids::<NUM_BITS,_>(codebook, dimension, num_sub_vectors, i);
+                get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
             l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
         })
         .exact_size(num_sub_vectors * num_centroids)
@@ -60,7 +60,7 @@ pub fn build_distance_table_dot<T: Dot>(
     }
 }
 
-pub fn build_distance_table_dot_impl<const NUM_BITS:u32, T: Dot>(
+pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     codebook: &[T],
     num_sub_vectors: usize,
     query: &[T],
@@ -73,7 +73,7 @@ pub fn build_distance_table_dot_impl<const NUM_BITS:u32, T: Dot>(
         .enumerate()
         .flat_map(|(i, sub_vec)| {
             let subvec_centroids =
-                get_sub_vector_centroids::<NUM_BITS,_>(codebook, dimension, num_sub_vectors, i);
+                get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
             dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
         })
         .exact_size(num_sub_vectors * num_centroids)

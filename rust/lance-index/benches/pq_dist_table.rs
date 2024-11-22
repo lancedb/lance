@@ -22,7 +22,7 @@ const PQ: usize = 96;
 const DIM: usize = 1536;
 const TOTAL: usize = 16 * 1000;
 
-fn construc_dist_table(c: &mut Criterion) {
+fn construct_dist_table(c: &mut Criterion) {
     let codebook = generate_random_array_with_seed::<Float32Type>(256 * DIM, [88; 32]);
     let query = generate_random_array_with_seed::<Float32Type>(DIM, [32; 32]);
 
@@ -101,12 +101,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = construc_dist_table, compute_distances);
+    targets = construct_dist_table, compute_distances);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = construc_dist_table, compute_distances);
+    targets = construct_dist_table, compute_distances);
 
 criterion_main!(benches);
