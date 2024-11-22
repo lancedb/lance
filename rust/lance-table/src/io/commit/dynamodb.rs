@@ -10,11 +10,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
+use aws_sdk_dynamodb::operation::RequestId;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
     query::builders::QueryFluentBuilder,
 };
-use aws_sdk_dynamodb::operation::{query, RequestId};
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
 use snafu::OptionExt;
