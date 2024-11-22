@@ -9,6 +9,7 @@ use arrow_array::types::UInt64Type;
 use arrow_array::ArrayRef;
 use arrow_buffer::{bit_util, BooleanBuffer, BooleanBufferBuilder, NullBuffer, ScalarBuffer};
 use bytemuck::{cast_slice, try_cast_slice};
+use byteorder::{ByteOrder, LittleEndian};
 use futures::TryFutureExt;
 use lance_core::utils::bit::pad_bytes;
 use snafu::{location, Location};
@@ -757,28 +758,25 @@ impl BlockCompressor for BinaryBlockEncoder {
                 let offsets = offsets.as_ref();
                 // the first 4 bytes store the number of values, then 4 bytes for bytes_start_offset,
                 // then offsets data, then bytes data.
-                let bytes_start_offset = std::mem::size_of_val(offsets) as u32 + 4 + 4;
-
-                const BINARY_BLOCK_ALIGNMENT: usize = 4;
-                const BLOCK_PAD_BUFFER: [u8; BINARY_BLOCK_ALIGNMENT] = [72; BINARY_BLOCK_ALIGNMENT];
+                let bytes_start_offset = 4 + 4 + std::mem::size_of_val(offsets) as u32;
 
                 let output_total_bytes =
-                    ((bytes_start_offset as usize + variable_width_data.data.len()) + 3) / 4;
+                    bytes_start_offset as usize + variable_width_data.data.len();
                 let mut output: Vec<u8> = Vec::with_capacity(output_total_bytes);
 
+                // store `num_values` in the first 4 bytes of output buffer
                 output.extend_from_slice(&(num_values).to_le_bytes());
 
+                // store `bytes_start_offset` in the next 4 bytes of output buffer
                 output.extend_from_slice(&(bytes_start_offset).to_le_bytes());
 
+                // store offsets
                 output.extend_from_slice(cast_slice(offsets));
 
+                // store bytes
                 output.extend_from_slice(&variable_width_data.data);
 
-                // pad this chunk to make it align to 4 bytes.
-                output.extend_from_slice(
-                    &BLOCK_PAD_BUFFER[..pad_bytes::<BINARY_BLOCK_ALIGNMENT>(output.len())],
-                );
-                Ok(LanceBuffer::reinterpret_vec(output))
+                Ok(LanceBuffer::Owned(output))
             }
             _ => {
                 panic!("BinaryBlockEncoder can only work with Variable Width DataBlock.");
@@ -792,24 +790,24 @@ pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
     fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
-        let header: &[u32] =
-            try_cast_slice(&data).expect("casting buffer failed during BinaryBlock decompression");
-
         // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-        let num_values = header[0] as u64;
+        let num_values = LittleEndian::read_u32(&data[..4]) as u64;
 
         // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
-        let bytes_start_offset = header[1] as usize;
+        let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
 
-        let offsets = header[2..2 + num_values as usize + 1].to_vec();
+        // the next `bytes_start_offset - 8` stores the offsets.
+        let offsets = data.slice_with_length(8, bytes_start_offset as usize - 8);
+
+        // the rest are the binary bytes.
+        let data = data.slice_with_length(
+            bytes_start_offset as usize,
+            data.len() - bytes_start_offset as usize,
+        );
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::Owned(
-                data[bytes_start_offset
-                    ..bytes_start_offset + offsets[num_values as usize] as usize]
-                    .to_vec(),
-            ),
-            offsets: LanceBuffer::reinterpret_vec(offsets),
+            data,
+            offsets,
             bits_per_offset: 32,
             num_values,
             block_info: BlockInfo::new(),

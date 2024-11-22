@@ -881,7 +881,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                     let encoding = ProtobufUtils::binary_block();
                     Ok((encoder, encoding))
                 } else {
-                    todo!("Implement BlockCompression for VariableWidth DataBlock with offsets type u32")
+                    todo!("Implement BlockCompression for VariableWidth DataBlock with 64 bits offsets.")
                 }
             }
             _ => unreachable!(),

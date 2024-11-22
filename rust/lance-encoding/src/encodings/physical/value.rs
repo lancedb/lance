@@ -289,7 +289,6 @@ impl ValueEncoder {
     }
 }
 
-// fn compress(&self, data: DataBlock) -> Result<(VariableWidthBlock, pb::ArrayEncoding)>;
 impl BlockCompressor for ValueEncoder {
     fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
         let data = match data {

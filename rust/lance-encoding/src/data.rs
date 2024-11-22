@@ -23,7 +23,7 @@ use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
 use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
-use bytemuck::cast_slice;
+use bytemuck::try_cast_slice;
 use lance_arrow::DataTypeExt;
 use snafu::{location, Location};
 
@@ -270,7 +270,8 @@ impl DataBlockBuilderImpl for VariableWidthDataBlockBuilder {
         let block = data_block.as_variable_width_ref().unwrap();
         assert!(block.bits_per_offset == 32);
 
-        let offsets: &[u32] = cast_slice(&block.offsets);
+        let offsets: &[u32] = try_cast_slice(&block.offsets)
+            .expect("cast from a bits_per_offset=32 `VariableWidthDataBlock's offsets field field to &[32] should be fine.");
 
         let start_offset = offsets[selection.start as usize];
         let end_offset = offsets[selection.end as usize];

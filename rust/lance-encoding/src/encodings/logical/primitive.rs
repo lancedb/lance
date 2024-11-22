@@ -470,6 +470,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
+            // assume the indices are uniformly distributed.
             let estimated_size_bytes = dictionary.data_size()
                 * (data.num_values() + dictionary.num_values() - 1)
                 / dictionary.num_values();
