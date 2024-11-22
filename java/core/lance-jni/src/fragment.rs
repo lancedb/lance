@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StructArray};
+use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
@@ -24,6 +24,7 @@ use jni::{
 use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
+use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
 use crate::{
@@ -208,7 +209,7 @@ fn create_fragment<'a>(
     max_bytes_per_file: JObject,  // Optional<Long>
     mode: JObject,                // Optional<String>
     storage_options_obj: JObject, // Map<String, String>
-    reader: impl RecordBatchReader + Send + 'static,
+    source: impl StreamingWriteSource,
 ) -> Result<JString<'a>> {
     let path_str = dataset_uri.extract(env)?;
 
@@ -225,7 +226,7 @@ fn create_fragment<'a>(
     let fragment = RT.block_on(FileFragment::create(
         &path_str,
         fragment_id_opts.unwrap_or(0) as usize,
-        reader,
+        source,
         Some(write_params),
     ))?;
     let json_string = serde_json::to_string(&fragment)?;

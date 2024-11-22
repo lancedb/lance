@@ -5,12 +5,11 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
-use arrow_array::RecordBatchReader;
+use datafusion::execution::SendableRecordBatchStream;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
-use lance_datafusion::utils::peek_reader_schema;
-use lance_datafusion::utils::reader_to_stream;
+use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
@@ -74,21 +73,17 @@ impl<'a> InsertBuilder<'a> {
     /// Execute the insert operation with the given stream.
     ///
     /// This writes the data fragments and commits them into the dataset.
-    pub async fn execute_stream(
-        &self,
-        stream: impl RecordBatchReader + Send + 'static,
-    ) -> Result<Dataset> {
-        // Box it so we don't monomorphize for every one. We take the generic
-        // parameter for API ergonomics.
-        let stream = Box::new(stream);
-        self.execute_stream_impl(stream).await
+    pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Dataset> {
+        let (stream, schema) = source.into_stream_and_schema().await?;
+        self.execute_stream_impl(stream, schema).await
     }
 
     async fn execute_stream_impl(
         &self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
     ) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_stream_impl(stream).await?;
+        let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
         Self::do_commit(&context, transaction).await
     }
 
@@ -162,7 +157,8 @@ impl<'a> InsertBuilder<'a> {
             }
         }
         let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
-        self.write_uncommitted_stream_impl(Box::new(reader)).await
+        let (stream, schema) = reader.into_stream_and_schema().await?;
+        self.write_uncommitted_stream_impl(stream, schema).await
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -170,20 +166,19 @@ impl<'a> InsertBuilder<'a> {
     /// Use [`CommitBuilder`] to commit the transaction.
     pub async fn execute_uncommitted_stream(
         &self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream).await?;
+        let (stream, schema) = source.into_stream_and_schema().await?;
+        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
         Ok(transaction)
     }
 
     async fn write_uncommitted_stream_impl(
         &self,
-        stream: Box<dyn RecordBatchReader + Send + 'static>,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
     ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
-
-        let (batches, schema) = peek_reader_schema(stream).await?;
-        let stream = reader_to_stream(batches);
 
         self.validate_write(&mut context, &schema)?;
 

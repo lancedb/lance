@@ -453,7 +453,9 @@ impl Dataset {
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
-        builder.execute_stream(batches).await
+        builder
+            .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
+            .await
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
@@ -471,7 +473,7 @@ impl Dataset {
 
         let new_dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(self.clone())))
             .with_params(&write_params)
-            .execute_stream(batches)
+            .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
             .await?;
 
         *self = new_dataset;

@@ -12,9 +12,7 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{
-    new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
-};
+use arrow_array::{new_null_array, RecordBatch, StructArray, UInt32Array, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
@@ -25,6 +23,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
@@ -511,7 +510,7 @@ impl FileFragment {
         Self { dataset, metadata }
     }
 
-    /// Create a new [`FileFragment`] from a [`RecordBatchReader`].
+    /// Create a new [`FileFragment`] from a [`StreamingWriteSource`].
     ///
     /// This method can be used before a `Dataset` is created. For example,
     /// Fragments can be created distributed first, before a central machine to
@@ -520,7 +519,7 @@ impl FileFragment {
     pub async fn create(
         dataset_uri: &str,
         id: usize,
-        reader: impl RecordBatchReader + Send + 'static,
+        source: impl StreamingWriteSource,
         params: Option<WriteParams>,
     ) -> Result<Fragment> {
         let mut builder = FragmentCreateBuilder::new(dataset_uri);
@@ -529,7 +528,7 @@ impl FileFragment {
             builder = builder.write_params(params);
         }
 
-        builder.write(reader, Some(id as u64)).await
+        builder.write(source, Some(id as u64)).await
     }
 
     pub async fn create_from_file(
