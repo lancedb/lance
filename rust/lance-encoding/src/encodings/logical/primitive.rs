@@ -1640,10 +1640,11 @@ impl PrimitiveFieldEncoder {
             .create_array_encoder(&arrays, &self.field)?;
         let column_idx = self.column_index;
         let data_type = self.field.data_type();
+        let arrow_field = arrow_schema::Field::from(&self.field);
 
         Ok(tokio::task::spawn(async move {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
-            let data = DataBlock::from_arrays(&arrays, num_values);
+            let data = DataBlock::from_arrays(&arrays, num_values, Some(&arrow_field));
             let mut buffer_index = 0;
             let array = encoder.encode(data, &data_type, &mut buffer_index)?;
             let (data, description) = array.into_buffers();
@@ -2214,7 +2215,8 @@ impl PrimitiveStructuralEncoder {
                 );
                 Self::encode_simple_all_null(column_idx, num_values, row_number)
             } else {
-                let data_block = DataBlock::from_arrays(&arrays, num_values);
+                let arrow_field = arrow_schema::Field::from(&field);
+                let data_block = DataBlock::from_arrays(&arrays, num_values, Some(&arrow_field));
                 if Self::is_narrow(&data_block) {
                     log::debug!(
                         "Encoding column {} with {} rows using mini-block layout",
@@ -2318,6 +2320,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, Int8Array, StringArray};
+    use arrow_schema::DataType;
 
     use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 
@@ -2327,19 +2330,22 @@ mod tests {
     fn test_is_narrow() {
         let int8_array = Int8Array::from(vec![1, 2, 3]);
         let array_ref: ArrayRef = Arc::new(int8_array);
-        let block = DataBlock::from_array(array_ref);
+        let field = arrow_schema::Field::new("", DataType::Int8, false);
+        let block = DataBlock::from_array(array_ref, Some(&field));
 
         assert!(PrimitiveStructuralEncoder::is_narrow(&block));
 
         let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
-        let block = DataBlock::from_array(string_array);
+        let field = arrow_schema::Field::new("", DataType::Utf8, false);
+        let block = DataBlock::from_array(string_array, Some(&field));
         assert!(PrimitiveStructuralEncoder::is_narrow(&block));
 
         let string_array = StringArray::from(vec![
             Some("hello world".repeat(100)),
             Some("world".to_string()),
         ]);
-        let block = DataBlock::from_array(string_array);
+
+        let block = DataBlock::from_array(string_array, Some(&field));
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
     }
 }

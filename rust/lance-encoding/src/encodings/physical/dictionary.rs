@@ -10,7 +10,7 @@ use arrow_array::types::UInt8Type;
 use arrow_array::{
     make_array, new_null_array, Array, ArrayRef, DictionaryArray, StringArray, UInt8Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
@@ -215,16 +215,19 @@ impl PrimitivePageDecoder for DictionaryPageDecoder {
 pub struct AlreadyDictionaryEncoder {
     indices_encoder: Box<dyn ArrayEncoder>,
     items_encoder: Box<dyn ArrayEncoder>,
+    field: ArrowField,
 }
 
 impl AlreadyDictionaryEncoder {
     pub fn new(
         indices_encoder: Box<dyn ArrayEncoder>,
         items_encoder: Box<dyn ArrayEncoder>,
+        field: ArrowField,
     ) -> Self {
         Self {
             indices_encoder,
             items_encoder,
+            field,
         }
     }
 }
@@ -248,6 +251,8 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                 let indices = arrow_cast::cast(&indices, key_type.as_ref()).unwrap();
                 let indices = indices.into_data();
                 let values = new_null_array(value_type, 1);
+                let values_field = ArrowField::new("", value_type.as_ref().clone(), true)
+                    .with_metadata(self.field.metadata().clone());
                 DictionaryDataBlock {
                     indices: FixedWidthDataBlock {
                         bits_per_value: key_type.byte_width() as u64 * 8,
@@ -255,7 +260,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                         num_values: all_null.num_values,
                         block_info: BlockInfo::new(),
                     },
-                    dictionary: Box::new(DataBlock::from_array(values)),
+                    dictionary: Box::new(DataBlock::from_array(values, Some(&values_field))),
                 }
             }
             _ => panic!("Expected dictionary data"),
@@ -375,8 +380,10 @@ impl ArrayEncoder for DictionaryEncoder {
 
         let (index_array, items_array) = encode_dict_indices_and_items(str_data.as_string());
         let dict_size = items_array.len() as u32;
-        let index_data = DataBlock::from(index_array);
-        let items_data = DataBlock::from(items_array);
+        let indices_field = ArrowField::new("", index_array.data_type().clone(), true);
+        let items_field = ArrowField::new("", items_array.data_type().clone(), true);
+        let index_data = DataBlock::from_array(index_array, Some(&indices_field));
+        let items_data = DataBlock::from_array(items_array, Some(&items_field));
 
         let encoded_indices =
             self.indices_encoder

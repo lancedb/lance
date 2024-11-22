@@ -810,7 +810,8 @@ pub mod test {
                 num_bits: params.num_bits,
                 signed_type: params.signed,
             };
-            let data = DataBlock::from_array(arr);
+            let field = arrow_schema::Field::new("", data_type.clone(), false);
+            let data = DataBlock::from_array(arr, Some(&field));
             let result = encoder.encode(data, &data_type, &mut buffed_index).unwrap();
 
             let data = result.data.as_fixed_width().unwrap();

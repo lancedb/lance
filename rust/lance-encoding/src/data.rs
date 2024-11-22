@@ -20,10 +20,10 @@ use std::{
 };
 
 use arrow::array::{ArrayData, ArrayDataBuilder, AsArray};
-use arrow_array::{new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
+use arrow_array::{make_array, new_empty_array, new_null_array, Array, ArrayRef, UInt64Array};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer};
-use arrow_schema::DataType;
-use lance_arrow::DataTypeExt;
+use arrow_schema::{DataType, Field};
+use lance_arrow::{dict_enum::DictionaryEnumType, DataTypeExt};
 use snafu::{location, Location};
 
 use lance_core::{Error, Result};
@@ -1091,7 +1091,7 @@ fn encode_bitmap_data(arrays: &[ArrayRef], num_values: u64) -> LanceBuffer {
 
 // Concatenate dictionary arrays.  This is a bit tricky because we might overflow the
 // index type.  If we do, we need to upscale the indices to a larger type.
-fn concat_dict_arrays(arrays: &[ArrayRef]) -> ArrayRef {
+fn concat_dictionary_categorical(arrays: &[ArrayRef]) -> ArrayRef {
     let value_type = arrays[0].as_any_dictionary().values().data_type();
     let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
     match arrow_select::concat::concat(&array_refs) {
@@ -1146,6 +1146,34 @@ fn max_index_val(index_type: &DataType) -> u64 {
     }
 }
 
+fn concat_dictionary_enum(arrays: &[ArrayRef], enum_values: &dyn Array) -> Arc<dyn Array> {
+    // If this is an enum type then all arrays should have the same dictionary
+    //
+    // This is a bit of an expensive check but it seems worthwhile to ensure correctness.  Could maybe
+    // add some kind of "unsafe" path at some point.
+    //
+    // If the values are not equivalent then we'd be silently writing corrupt data.
+    assert!(arrays
+        .iter()
+        .all(|arr| arr.as_any_dictionary().values().as_ref() == enum_values));
+    let indices_array_refs = arrays
+        .iter()
+        .map(|arr| arr.as_any_dictionary().keys())
+        .collect::<Vec<_>>();
+    let combined_indices = arrow_select::concat::concat(&indices_array_refs).unwrap();
+
+    let dict_type = arrays[0].data_type().clone();
+    let dict_arr_data = combined_indices
+        .to_data()
+        .into_builder()
+        .data_type(dict_type)
+        .add_child_data(enum_values.to_data())
+        .build()
+        .unwrap();
+
+    make_array(dict_arr_data)
+}
+
 // If we get multiple dictionary arrays and they don't all have the same dictionary
 // then we need to normalize the indices.  Otherwise we might have something like:
 //
@@ -1164,8 +1192,20 @@ fn max_index_val(index_type: &DataType) -> u64 {
 //
 // In addition, we want to normalize the representation of nulls.  The cheapest thing to
 // do (space-wise) is to put the nulls in the dictionary.
-fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuffer>) -> DataBlock {
-    let array = concat_dict_arrays(arrays);
+fn arrow_dictionary_to_data_block(
+    arrays: &[ArrayRef],
+    validity: Option<NullBuffer>,
+    field: Option<&Field>,
+) -> DataBlock {
+    let array = if let Some(field) = field {
+        if let Some(enum_type) = DictionaryEnumType::from_field(field, arrays.first()).unwrap() {
+            concat_dictionary_enum(arrays, &enum_type.categories)
+        } else {
+            concat_dictionary_categorical(arrays)
+        }
+    } else {
+        concat_dictionary_categorical(arrays)
+    };
     let array_dict = array.as_any_dictionary();
     let mut indices = array_dict.keys();
     let num_values = indices.len() as u64;
@@ -1232,7 +1272,14 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
         }
     };
 
-    let items = DataBlock::from(values);
+    // There's a bit of ambiguity on where to put the metadata in dictionary encoding.  Here we
+    // assume the metadata of the field applies to the values and not the dictionary itself.
+    let mut items_field = Field::new("", values.data_type().clone(), true);
+    if let Some(field) = field {
+        items_field = items_field.with_metadata(field.metadata().clone());
+    }
+
+    let items = DataBlock::from_array(values, Some(&items_field));
     DataBlock::Dictionary(DictionaryDataBlock {
         indices: indices_block,
         dictionary: Box::new(items),
@@ -1285,12 +1332,22 @@ fn extract_nulls(arrays: &[ArrayRef], num_values: u64) -> Nullability {
 }
 
 impl DataBlock {
-    pub fn from_arrays(arrays: &[ArrayRef], num_values: u64) -> Self {
+    /// Convert a slice of Arrow arrays into a DataBlock
+    ///
+    /// This process should not fail but will panic if any of the arrays are not internally
+    /// consistent with the field.
+    pub fn from_arrays(arrays: &[ArrayRef], num_values: u64, field: Option<&Field>) -> Self {
         if arrays.is_empty() || num_values == 0 {
             return Self::AllNull(AllNullDataBlock { num_values: 0 });
         }
 
-        let data_type = arrays[0].data_type();
+        let data_type = field
+            .as_ref()
+            .map(|f| f.data_type())
+            .unwrap_or(arrays[0].data_type());
+
+        debug_assert!(arrays.iter().all(|arr| arr.data_type() == data_type));
+
         let nulls = extract_nulls(arrays, num_values);
 
         if let Nullability::All = nulls {
@@ -1344,25 +1401,28 @@ impl DataBlock {
                 })
             }
             DataType::Null => Self::AllNull(AllNullDataBlock { num_values }),
-            DataType::Dictionary(_, _) => arrow_dictionary_to_data_block(arrays, nulls.to_option()),
+            DataType::Dictionary(_, _) => {
+                arrow_dictionary_to_data_block(arrays, nulls.to_option(), field)
+            }
             DataType::Struct(fields) => {
                 let structs = arrays.iter().map(|arr| arr.as_struct()).collect::<Vec<_>>();
                 let mut children = Vec::with_capacity(fields.len());
-                for child_idx in 0..fields.len() {
+                for (child_idx, child_field) in fields.iter().enumerate() {
                     let child_vec = structs
                         .iter()
                         .map(|s| s.column(child_idx).clone())
                         .collect::<Vec<_>>();
-                    children.push(Self::from_arrays(&child_vec, num_values));
+                    children.push(Self::from_arrays(&child_vec, num_values, Some(child_field)));
                 }
                 Self::Struct(StructDataBlock { children })
             }
-            DataType::FixedSizeList(_, dim) => {
+            DataType::FixedSizeList(child_field, dim) => {
                 let children = arrays
                     .iter()
                     .map(|arr| arr.as_fixed_size_list().values().clone())
                     .collect::<Vec<_>>();
-                let child_block = Self::from_arrays(&children, num_values * *dim as u64);
+                let child_block =
+                    Self::from_arrays(&children, num_values * *dim as u64, Some(&child_field));
                 Self::FixedSizeList(FixedSizeListBlock {
                     child: Box::new(child_block),
                     dimension: *dim as u64,
@@ -1401,16 +1461,9 @@ impl DataBlock {
         }
     }
 
-    pub fn from_array<T: Array + 'static>(array: T) -> Self {
+    pub fn from_array<T: Array + 'static>(array: T, field: Option<&Field>) -> Self {
         let num_values = array.len();
-        Self::from_arrays(&[Arc::new(array)], num_values as u64)
-    }
-}
-
-impl From<ArrayRef> for DataBlock {
-    fn from(array: ArrayRef) -> Self {
-        let num_values = array.len() as u64;
-        Self::from_arrays(&[array], num_values)
+        Self::from_arrays(&[Arc::new(array)], num_values as u64, field)
     }
 }
 
@@ -1456,11 +1509,12 @@ mod tests {
     use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
         make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
-        StringArray, UInt8Array,
+        StringArray, UInt16Array, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
     use arrow_schema::{DataType, Field, Fields};
+    use lance_arrow::dict_enum::DictionaryEnumType;
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
@@ -1476,13 +1530,14 @@ mod tests {
         let strings1 = StringArray::from(vec![Some("hello"), None, Some("world")]);
         let strings2 = StringArray::from(vec![Some("a"), Some("b")]);
         let strings3 = StringArray::from(vec![Option::<&'static str>::None, None]);
+        let field = Field::new("", DataType::Utf8, true);
 
         let arrays = &[strings1, strings2, strings3]
             .iter()
             .map(|arr| Arc::new(arr.clone()) as ArrayRef)
             .collect::<Vec<_>>();
 
-        let block = DataBlock::from_arrays(arrays, 7);
+        let block = DataBlock::from_arrays(arrays, 7, Some(&field));
 
         assert_eq!(block.num_values(), 7);
         let block = block.as_nullable().unwrap();
@@ -1506,7 +1561,7 @@ mod tests {
             .map(|arr| Arc::new(arr.clone()) as ArrayRef)
             .collect::<Vec<_>>();
 
-        let block = DataBlock::from_arrays(arrays, 3);
+        let block = DataBlock::from_arrays(arrays, 3, Some(&field));
 
         assert_eq!(block.num_values(), 3);
         // Should be no nullable wrapper
@@ -1517,13 +1572,15 @@ mod tests {
 
     #[test]
     fn test_string_sliced() {
+        let field = Field::new("", DataType::Utf8, true);
+
         let check = |arr: Vec<StringArray>, expected_off: Vec<i32>, expected_data: &[u8]| {
             let arrs = arr
                 .into_iter()
                 .map(|a| Arc::new(a) as ArrayRef)
                 .collect::<Vec<_>>();
             let num_rows = arrs.iter().map(|a| a.len()).sum::<usize>() as u64;
-            let data = DataBlock::from_arrays(&arrs, num_rows);
+            let data = DataBlock::from_arrays(&arrs, num_rows, Some(&field));
 
             assert_eq!(data.num_values(), num_rows);
 
@@ -1551,8 +1608,9 @@ mod tests {
 
     #[test]
     fn test_large() {
+        let field = Field::new("", DataType::LargeBinary, true);
         let arr = LargeBinaryArray::from_vec(vec![b"hello", b"world"]);
-        let data = DataBlock::from_array(arr);
+        let data = DataBlock::from_array(arr, Some(&field));
 
         assert_eq!(data.num_values(), 2);
         let data = data.as_variable_width().unwrap();
@@ -1567,10 +1625,15 @@ mod tests {
 
     #[test]
     fn test_dictionary_indices_normalized() {
+        let field = Field::new(
+            "",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        );
         let arr1 = DictionaryArray::<Int8Type>::from_iter([Some("a"), Some("a"), Some("b")]);
         let arr2 = DictionaryArray::<Int8Type>::from_iter([Some("b"), Some("c")]);
 
-        let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5);
+        let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5, Some(&field));
 
         assert_eq!(data.num_values(), 5);
         let data = data.as_dictionary().unwrap();
@@ -1597,13 +1660,19 @@ mod tests {
 
     #[test]
     fn test_dictionary_nulls() {
+        let field = Field::new(
+            "",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        );
+
         // Test both ways of encoding nulls
 
         // By default, nulls get encoded into the indices
         let arr1 = DictionaryArray::<Int8Type>::from_iter([None, Some("a"), Some("b")]);
         let arr2 = DictionaryArray::<Int8Type>::from_iter([Some("c"), None]);
 
-        let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5);
+        let data = DataBlock::from_arrays(&[Arc::new(arr1), Arc::new(arr2)], 5, Some(&field));
 
         let check_common = |data: DataBlock| {
             assert_eq!(data.num_values(), 5);
@@ -1637,13 +1706,18 @@ mod tests {
         let indices = Int8Array::from(vec![Some(3), Some(0), Some(1), Some(2), Some(3)]);
         let dict = DictionaryArray::new(indices, Arc::new(items));
 
-        let data = DataBlock::from_array(dict);
+        let data = DataBlock::from_array(dict, Some(&field));
 
         check_common(data);
     }
 
     #[test]
     fn test_dictionary_cannot_add_null() {
+        let field = Field::new(
+            "",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            true,
+        );
         // 256 unique strings
         let items = StringArray::from(
             (0..256)
@@ -1659,7 +1733,7 @@ mod tests {
         // We want to normalize this by pushing nulls into the dictionary, but we cannot because
         // the dictionary is too large for the index type
         let dict = DictionaryArray::new(indices, Arc::new(items));
-        let data = DataBlock::from_array(dict);
+        let data = DataBlock::from_array(dict, Some(&field));
 
         assert_eq!(data.num_values(), 257);
 
@@ -1706,6 +1780,12 @@ mod tests {
 
     #[test]
     fn test_dictionary_cannot_concatenate() {
+        let field = Field::new(
+            "",
+            DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8)),
+            true,
+        );
+
         // 256 unique strings
         let items = StringArray::from(
             (0..256)
@@ -1721,7 +1801,7 @@ mod tests {
         let indices = UInt8Array::from_iter_values(0..=255);
         let dict1 = DictionaryArray::new(indices.clone(), Arc::new(items));
         let dict2 = DictionaryArray::new(indices, Arc::new(other_items));
-        let data = DataBlock::from_arrays(&[Arc::new(dict1), Arc::new(dict2)], 512);
+        let data = DataBlock::from_arrays(&[Arc::new(dict1), Arc::new(dict2)], 512, Some(&field));
         assert_eq!(data.num_values(), 512);
 
         let dict = data.as_dictionary().unwrap();
@@ -1739,23 +1819,59 @@ mod tests {
     }
 
     #[test]
+    fn test_enum_dictionary() {
+        let field = Field::new(
+            "",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            true,
+        );
+        let items = Arc::new(StringArray::from_iter_values(
+            (0..1000).map(|s| s.to_string()),
+        ));
+        let items2 = Arc::new(StringArray::from_iter_values(
+            (0..1000).map(|s| s.to_string()),
+        ));
+
+        let indices1 = UInt16Array::from_iter_values(0..500);
+        let indices2 = UInt16Array::from_iter_values(500..999);
+        let dict1 = Arc::new(DictionaryArray::new(indices1, items));
+        let dict2 = Arc::new(DictionaryArray::new(indices2, items2));
+        let data = DataBlock::from_arrays(&[dict1.clone(), dict2.clone()], 1000, Some(&field));
+        let data = data.as_dictionary().unwrap();
+
+        // Concatenating the dictionaries will drop the unused value ("999")
+        assert_eq!(data.dictionary.num_values(), 999);
+
+        // However, if the input arrays are "enum" arrays, then we should not lose any
+        // values
+        let enum_type = DictionaryEnumType::from_dict_array(dict1.as_ref()).unwrap();
+        let enum_field = enum_type.wrap_field(&field).unwrap();
+
+        let data = DataBlock::from_arrays(&[dict1.clone(), dict2.clone()], 1000, Some(&enum_field));
+        let data = data.as_dictionary().unwrap();
+        assert_eq!(data.dictionary.num_values(), 1000);
+    }
+
+    #[test]
     fn test_data_size() {
+        let field = Field::new("", DataType::Int32, true);
+
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(DEFAULT_SEED.0);
         // test data_size() when input has no nulls
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, false, false]);
 
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr.clone());
+        let block = DataBlock::from_array(arr.clone(), Some(&field));
         assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr.clone());
+        let block = DataBlock::from_array(arr.clone(), Some(&field));
         assert!(block.data_size() == arr.get_buffer_memory_size() as u64);
 
         // test data_size() when input has nulls
         let mut gen = array::rand::<Int32Type>().with_nulls(&[false, true, false]);
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr.clone());
+        let block = DataBlock::from_array(arr.clone(), Some(&field));
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
@@ -1764,7 +1880,7 @@ mod tests {
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr.clone());
+        let block = DataBlock::from_array(arr.clone(), Some(&field));
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
@@ -1773,7 +1889,7 @@ mod tests {
 
         let mut gen = array::rand::<Int32Type>().with_nulls(&[true, true, false]);
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr.clone());
+        let block = DataBlock::from_array(arr.clone(), Some(&field));
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
@@ -1781,7 +1897,7 @@ mod tests {
         assert!(block.data_size() == (total_buffer_size + array_nulls_size_in_bytes) as u64);
 
         let arr = gen.generate(RowCount::from(400), &mut rng).unwrap();
-        let block = DataBlock::from_array(arr.clone());
+        let block = DataBlock::from_array(arr.clone(), Some(&field));
 
         let array_data = arr.to_data();
         let total_buffer_size: usize = array_data.buffers().iter().map(|buffer| buffer.len()).sum();
@@ -1792,7 +1908,8 @@ mod tests {
         let arr1 = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let arr2 = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let arr3 = gen.generate(RowCount::from(3), &mut rng).unwrap();
-        let block = DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9);
+        let block =
+            DataBlock::from_arrays(&[arr1.clone(), arr2.clone(), arr3.clone()], 9, Some(&field));
 
         let concatenated_array = concat(&[
             &*Arc::new(arr1.clone()) as &dyn Array,

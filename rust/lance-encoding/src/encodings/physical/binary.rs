@@ -778,7 +778,10 @@ pub mod tests {
             None,
             None,
         ])) as ArrayRef;
-        let string_data = DataBlock::from(string_array).as_nullable().unwrap();
+        let field = Field::new("", DataType::Utf8, true);
+        let string_data = DataBlock::from_array(string_array, Some(&field))
+            .as_nullable()
+            .unwrap();
         let nulls = string_data.nulls;
         let string_data = string_data.data.as_variable_width().unwrap();
 
