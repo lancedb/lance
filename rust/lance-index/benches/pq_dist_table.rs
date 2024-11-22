@@ -28,7 +28,7 @@ fn construct_dist_table(c: &mut Criterion) {
 
     c.bench_function(
         format!(
-            "construc_dist_table: {},PQ={},DIM={}",
+            "construct_dist_table: {},PQ={},DIM={}",
             DistanceType::L2,
             PQ,
             DIM
@@ -48,7 +48,7 @@ fn construct_dist_table(c: &mut Criterion) {
 
     c.bench_function(
         format!(
-            "construc_dist_table: {},PQ={},DIM={}",
+            "construct_dist_table: {},PQ={},DIM={}",
             DistanceType::Dot,
             PQ,
             DIM
