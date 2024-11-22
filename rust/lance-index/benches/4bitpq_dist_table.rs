@@ -31,7 +31,7 @@ fn dist_table(c: &mut Criterion) {
     for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot].iter() {
         let pq = ProductQuantizer::new(
             PQ,
-            8,
+            4,
             DIM,
             FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
             *dt,

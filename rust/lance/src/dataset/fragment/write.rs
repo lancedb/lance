@@ -3,14 +3,13 @@
 
 use std::borrow::Cow;
 
-use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::utils::{peek_reader_schema, reader_to_stream};
+use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
@@ -62,10 +61,10 @@ impl<'a> FragmentCreateBuilder<'a> {
     /// Write a fragment.
     pub async fn write(
         &self,
-        reader: impl RecordBatchReader + Send + 'static,
+        source: impl StreamingWriteSource,
         id: Option<u64>,
     ) -> Result<Fragment> {
-        let (stream, schema) = self.get_stream_and_schema(Box::new(reader)).await?;
+        let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
         self.write_impl(stream, schema, id).await
     }
 
@@ -195,22 +194,16 @@ impl<'a> FragmentCreateBuilder<'a> {
 
     async fn get_stream_and_schema(
         &self,
-        reader: Box<dyn RecordBatchReader + Send>,
+        source: impl StreamingWriteSource,
     ) -> Result<(SendableRecordBatchStream, Schema)> {
         if let Some(schema) = self.schema {
-            // Just wrap the stream and use as usual.
-            let stream = reader_to_stream(reader);
-
-            return Ok((stream, schema.clone()));
+            return Ok((source.into_stream(), schema.clone()));
         } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
             if let Some(schema) = self.existing_dataset_schema().await? {
-                return Ok((reader_to_stream(reader), schema));
+                return Ok((source.into_stream(), schema));
             }
         }
-        // Infer the schema from the first batch.
-        let (reader, schema) = peek_reader_schema(reader).await?;
-        let stream = reader_to_stream(reader);
-        Ok((stream, schema))
+        source.into_stream_and_schema().await
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
@@ -247,7 +240,9 @@ impl<'a> FragmentCreateBuilder<'a> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{
+        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+    };
     use arrow_schema::{DataType, Field as ArrowField};
     use lance_arrow::SchemaExt;
 
