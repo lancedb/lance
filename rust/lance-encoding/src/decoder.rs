@@ -246,7 +246,7 @@ use crate::encodings::logical::primitive::{
 use crate::encodings::logical::r#struct::{
     SimpleStructDecoder, SimpleStructScheduler, StructuralStructDecoder, StructuralStructScheduler,
 };
-use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
+use crate::encodings::physical::binary::{BinaryBlockDecompressor, BinaryMiniBlockDecompressor};
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
 use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
 use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
@@ -548,6 +548,9 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
                     scalar,
                     constant.num_values,
                 )))
+            }
+            pb::array_encoding::ArrayEncoding::BinaryBlock(_) => {
+                Ok(Box::new(BinaryBlockDecompressor::default()))
             }
             _ => todo!(),
         }

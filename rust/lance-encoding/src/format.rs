@@ -19,9 +19,9 @@ use pb::{
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg,
-    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock, MiniBlockLayout,
-    Nullable, PackedStruct, PageLayout,
+    AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
+    BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
+    MiniBlockLayout, Nullable, PackedStruct, PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionConfig;
@@ -139,6 +139,12 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn binary_block() -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::BinaryBlock(BinaryBlock {})),
+        }
+    }
+
     // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually
     // not used and `FsstMiniBlockDecompressor` constructs a `binary_mini_block` in a `hard-coded` fashion.
     // This can be an optimization later.
@@ -227,12 +233,14 @@ impl ProtobufUtils {
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
+        dictionary_encoding: Option<ArrayEncoding>,
     ) -> PageLayout {
         PageLayout {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
+                dictionary: dictionary_encoding,
             })),
         }
     }

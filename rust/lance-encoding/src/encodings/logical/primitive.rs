@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, fmt::Debug, iter, ops::Range, sync::Arc, vec};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+    iter,
+    ops::Range,
+    sync::Arc,
+    vec,
+};
 
 use arrow::array::AsArray;
 use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
@@ -10,6 +17,7 @@ use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
 use lance_arrow::deepcopy::deep_copy_array;
 use lance_core::utils::bit::pad_bytes;
+use lance_core::utils::hash::U8SliceKey;
 use log::{debug, trace};
 use snafu::{location, Location};
 
@@ -17,7 +25,7 @@ use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
 use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{build_control_word_iterator, ControlWordIterator, ControlWordParser};
-use crate::statistics::{GetStat, Stat};
+use crate::statistics::{ComputeStat, GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
@@ -285,6 +293,7 @@ struct DecodeMiniBlockTask {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    dictionary_data: Option<Arc<DataBlock>>,
     // The mini-blocks to decode
     //
     // For each mini-block we also have the ranges of rows that we want to decode
@@ -401,7 +410,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
             let p2 = pad_bytes::<MINIBLOCK_ALIGNMENT>(6 + bytes_rep + p1 + bytes_def);
             let values = buf.slice_with_length(6 + bytes_rep + bytes_def + p2, bytes_val);
 
-            let mut values = self
+            let values = self
                 .value_decompressor
                 .decompress(LanceBuffer::Borrowed(values), chunk.vals_in_chunk)?;
 
@@ -449,7 +458,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     &def,
                     level_offset,
                 );
-                data_builder.append(&mut values, range);
+                data_builder.append(&values, range);
                 remaining -= to_take;
                 offset += to_take;
                 level_offset += to_take as usize;
@@ -458,6 +467,32 @@ impl DecodePageTask for DecodeMiniBlockTask {
         debug_assert_eq!(remaining, 0);
 
         let data = data_builder.finish();
+
+        // if dictionary encoding is applied, do dictionary decode here.
+        if let Some(dictionary) = &self.dictionary_data {
+            // assume the indices are uniformly distributed.
+            let estimated_size_bytes = dictionary.data_size()
+                * (data.num_values() + dictionary.num_values() - 1)
+                / dictionary.num_values();
+            let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+
+            // if dictionary encoding is applied, indices are of type `UInt8`
+            if let DataBlock::FixedWidth(mut fixed_width_data_block) = data {
+                let indices = fixed_width_data_block.data.borrow_to_typed_slice::<u8>();
+                let indices = indices.as_ref();
+
+                indices.iter().for_each(|&idx| {
+                    data_builder.append(dictionary, idx as u64..idx as u64 + 1);
+                });
+
+                let data = data_builder.finish();
+                return Ok(DecodedPage {
+                    data,
+                    repetition: repbuf,
+                    definition: defbuf,
+                });
+            }
+        }
 
         Ok(DecodedPage {
             data,
@@ -477,6 +512,7 @@ struct MiniBlockDecoder {
     data: VecDeque<ScheduledChunk>,
     offset_in_current_chunk: u64,
     num_rows: u64,
+    dictionary: Option<Arc<DataBlock>>,
 }
 
 impl StructuralPageDecoder for MiniBlockDecoder {
@@ -506,6 +542,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             rep_decompressor: self.rep_decompressor.clone(),
             def_decompressor: self.def_decompressor.clone(),
             value_decompressor: self.value_decompressor.clone(),
+            dictionary_data: self.dictionary.clone(),
             num_rows,
             offset_into_first_chunk,
         }))
@@ -576,6 +613,17 @@ impl StructuralPageDecoder for SimpleAllNullPageDecoder {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MiniBlockSchedulerDictionary {
+    // These come from the protobuf
+    dictionary_decompressor: Arc<dyn BlockDecompressor>,
+    dictionary_buf_position_and_size: (u64, u64),
+    dictionary_data_alignment: u64,
+
+    // This is set after initialization
+    dictionary_data: Arc<DataBlock>,
+}
+
 /// A scheduler for a page that has been encoded with the mini-block layout
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
@@ -588,8 +636,11 @@ pub struct MiniBlockScheduler {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
+
     // This is set after initialization
     chunk_meta: Vec<ChunkMeta>,
+
+    dictionary: Option<MiniBlockSchedulerDictionary>,
 }
 
 impl MiniBlockScheduler {
@@ -609,6 +660,34 @@ impl MiniBlockScheduler {
             decompressors.create_block_decompressor(layout.def_compression.as_ref().unwrap())?;
         let value_decompressor = decompressors
             .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
+        let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
+            match dictionary_encoding.array_encoding.as_ref().unwrap() {
+                pb::array_encoding::ArrayEncoding::BinaryBlock(_) => {
+                    Some(MiniBlockSchedulerDictionary {
+                        dictionary_decompressor: decompressors
+                            .create_block_decompressor(dictionary_encoding)?
+                            .into(),
+                        dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                        dictionary_data_alignment: 4,
+                        dictionary_data: Arc::new(DataBlock::Empty()),
+                    })
+                }
+                pb::array_encoding::ArrayEncoding::Flat(_) => Some(MiniBlockSchedulerDictionary {
+                    dictionary_decompressor: decompressors
+                        .create_block_decompressor(dictionary_encoding)?
+                        .into(),
+                    dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
+                    dictionary_data_alignment: 16,
+                    dictionary_data: Arc::new(DataBlock::Empty()),
+                }),
+                _ => {
+                    unreachable!("Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary.")
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             meta_buf_position,
             meta_buf_size,
@@ -619,6 +698,7 @@ impl MiniBlockScheduler {
             priority,
             rows_in_page,
             chunk_meta: Vec::new(),
+            dictionary,
         })
     }
 
@@ -675,6 +755,14 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             self.meta_buf_position..self.meta_buf_position + self.meta_buf_size,
             0,
         );
+        let dictionary_data = self.dictionary.as_ref().map(|dictionary| {
+            io.submit_single(
+                dictionary.dictionary_buf_position_and_size.0
+                    ..dictionary.dictionary_buf_position_and_size.0
+                        + dictionary.dictionary_buf_position_and_size.1,
+                0,
+            )
+        });
         async move {
             let bytes = metadata.await?;
             assert!(bytes.len() % 2 == 0);
@@ -702,6 +790,17 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                     chunk_size_bytes: num_bytes as u64,
                 });
             }
+            // decode dictionary
+            if let Some(ref mut dictionary) = self.dictionary {
+                let dictionary_data = dictionary_data.unwrap().await?;
+                dictionary.dictionary_data =
+                    Arc::new(dictionary.dictionary_decompressor.decompress(
+                        LanceBuffer::from_bytes(
+                            dictionary_data,
+                            dictionary.dictionary_data_alignment,
+                        ),
+                    )?)
+            };
             Ok(())
         }
         .boxed()
@@ -777,6 +876,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
+        let dictionary = self
+            .dictionary
+            .as_ref()
+            .map(|dictionary| dictionary.dictionary_data.clone());
 
         for scheduled_chunk in scheduled_chunks.iter_mut() {
             scheduled_chunk.vals_targeted =
@@ -795,6 +898,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 data: scheduled_chunks,
                 offset_in_current_chunk: 0,
                 num_rows,
+                dictionary,
             }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed())
@@ -971,8 +1075,8 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             //
             // We decompress each buffer and add it to our output buffer
             for (buf, rows_in_buf) in self.data.into_iter() {
-                let mut decompressed = self.value_decompressor.decompress(buf, rows_in_buf)?;
-                data_builder.append(&mut decompressed, 0..rows_in_buf);
+                let decompressed = self.value_decompressor.decompress(buf, rows_in_buf)?;
+                data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
             Ok(DecodedPage {
@@ -1003,10 +1107,10 @@ impl DecodePageTask for FixedFullZipDecodeTask {
 
                 // Finally, we decompress the values and add them to our output buffer
                 let values_buf = LanceBuffer::Owned(values);
-                let mut decompressed = self
+                let decompressed = self
                     .value_decompressor
                     .decompress(values_buf, rows_in_buf)?;
-                data_builder.append(&mut decompressed, 0..rows_in_buf);
+                data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
             let repetition = if rep.is_empty() { None } else { Some(rep) };
@@ -2015,6 +2119,7 @@ impl PrimitiveStructuralEncoder {
         data: DataBlock,
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
+        dictionary_data: Option<DataBlock>,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
 
@@ -2053,15 +2158,38 @@ impl PrimitiveStructuralEncoder {
         let (block_value_buffer, block_meta_buffer) =
             Self::serialize_miniblocks(compressed_data, compressed_rep, compressed_def);
 
-        let description =
-            ProtobufUtils::miniblock_layout(rep_encoding, def_encoding, value_encoding);
-        Ok(EncodedPage {
-            num_rows: num_values,
-            column_idx,
-            data: vec![block_meta_buffer, block_value_buffer],
-            description: PageEncoding::Structural(description),
-            row_number,
-        })
+        if let Some(dictionary_data) = dictionary_data {
+            // field in `create_block_compressor` is not used currently.
+            let dummy_dictionary_field = Field::new_arrow("", DataType::UInt16, false)?;
+
+            let (compressor, dictionary_encoding) = compression_strategy
+                .create_block_compressor(&dummy_dictionary_field, &dictionary_data)?;
+            let dictionary_buffer = compressor.compress(dictionary_data)?;
+
+            let description = ProtobufUtils::miniblock_layout(
+                rep_encoding,
+                def_encoding,
+                value_encoding,
+                Some(dictionary_encoding),
+            );
+            Ok(EncodedPage {
+                num_rows: num_values,
+                column_idx,
+                data: vec![block_meta_buffer, block_value_buffer, dictionary_buffer],
+                description: PageEncoding::Structural(description),
+                row_number,
+            })
+        } else {
+            let description =
+                ProtobufUtils::miniblock_layout(rep_encoding, def_encoding, value_encoding, None);
+            Ok(EncodedPage {
+                num_rows: num_values,
+                column_idx,
+                data: vec![block_meta_buffer, block_value_buffer],
+                description: PageEncoding::Structural(description),
+                row_number,
+            })
+        }
     }
 
     // For fixed-size data we encode < control word | data > for each value
@@ -2189,6 +2317,114 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    fn dictionary_encode(mut data_block: DataBlock, cardinality: u64) -> (DataBlock, DataBlock) {
+        match data_block {
+            DataBlock::FixedWidth(ref mut fixed_width_data_block) => {
+                // Currently FixedWidth DataBlock with only bits_per_value 128 has cardinality
+                // TODO: a follow up PR to support `FixedWidth DataBlock with bits_per_value == 256`.
+                let mut map = HashMap::new();
+                let u128_slice = fixed_width_data_block.data.borrow_to_typed_slice::<u128>();
+                let u128_slice = u128_slice.as_ref();
+                let mut dictionary_buffer = Vec::with_capacity(cardinality as usize);
+                let mut indices_buffer =
+                    Vec::with_capacity(fixed_width_data_block.num_values as usize);
+                let mut curr_idx: u8 = 0;
+                u128_slice.iter().for_each(|&value| {
+                    let idx = *map.entry(value).or_insert_with(|| {
+                        dictionary_buffer.push(value);
+                        curr_idx += 1;
+                        curr_idx - 1
+                    });
+                    indices_buffer.push(idx);
+                });
+                let dictionary_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(dictionary_buffer),
+                    bits_per_value: 128,
+                    num_values: curr_idx as u64,
+                    block_info: BlockInfo::default(),
+                });
+                let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                    data: LanceBuffer::reinterpret_vec(indices_buffer),
+                    bits_per_value: 8,
+                    num_values: fixed_width_data_block.num_values,
+                    block_info: BlockInfo::default(),
+                });
+                // Todo: if we decide to do eager statistics computing, wrap statistics computing
+                // in DataBlock constructor.
+                indices_data_block.compute_stat();
+
+                (indices_data_block, dictionary_data_block)
+            }
+            DataBlock::VariableWidth(ref mut variable_width_data_block) => {
+                match variable_width_data_block.bits_per_offset {
+                    32 => {
+                        let mut map: HashMap<U8SliceKey, u8> = HashMap::new();
+                        let offsets = variable_width_data_block
+                            .offsets
+                            .borrow_to_typed_slice::<u32>();
+                        let offsets = offsets.as_ref();
+
+                        let max_len = variable_width_data_block.get_stat(Stat::MaxLength).expect(
+                            "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
+                        );
+                        let max_len = max_len.as_primitive::<UInt64Type>().value(0);
+
+                        let mut dictionary_buffer: Vec<u8> =
+                            Vec::with_capacity((max_len * cardinality) as usize);
+                        let mut dictionary_offsets_buffer = vec![0];
+                        let mut curr_idx = 0;
+                        let mut indices_buffer =
+                            Vec::with_capacity(variable_width_data_block.num_values as usize);
+
+                        offsets
+                            .iter()
+                            .zip(offsets.iter().skip(1))
+                            .for_each(|(&start, &end)| {
+                                let key =
+                                    &variable_width_data_block.data[start as usize..end as usize];
+                                let idx = *map.entry(U8SliceKey(key)).or_insert_with(|| {
+                                    dictionary_buffer.extend_from_slice(key);
+                                    dictionary_offsets_buffer.push(dictionary_buffer.len() as u32);
+                                    curr_idx += 1;
+                                    curr_idx - 1
+                                });
+                                indices_buffer.push(idx);
+                            });
+
+                        let dictionary_data_block = DataBlock::VariableWidth(VariableWidthBlock {
+                            data: LanceBuffer::reinterpret_vec(dictionary_buffer),
+                            offsets: LanceBuffer::reinterpret_vec(dictionary_offsets_buffer),
+                            bits_per_offset: 32,
+                            num_values: curr_idx as u64,
+                            block_info: BlockInfo::default(),
+                        });
+
+                        let mut indices_data_block = DataBlock::FixedWidth(FixedWidthDataBlock {
+                            data: LanceBuffer::Owned(indices_buffer),
+                            bits_per_value: 8,
+                            num_values: variable_width_data_block.num_values,
+                            block_info: BlockInfo::default(),
+                        });
+                        // Todo: if we decide to do eager statistics computing, wrap statistics computing
+                        // in DataBlock constructor.
+                        indices_data_block.compute_stat();
+
+                        (indices_data_block, dictionary_data_block)
+                    }
+                    64 => {
+                        todo!("A follow up PR to support dictionary encoding with dictionary type `VariableWidth DataBlock` with bits_per_offset 64");
+                    }
+                    _ => {
+                        unreachable!()
+                    }
+                }
+            }
+            _ => {
+                unreachable!()
+            }
+        }
+    }
+
     // Creates an encode task, consuming all buffered data
     fn do_flush(
         &mut self,
@@ -2215,7 +2451,30 @@ impl PrimitiveStructuralEncoder {
                 Self::encode_simple_all_null(column_idx, num_values, row_number)
             } else {
                 let data_block = DataBlock::from_arrays(&arrays, num_values);
-                if Self::is_narrow(&data_block) {
+                const DICTIONARY_ENCODING_THRESHOLD: u64 = 100;
+                let cardinality =
+                    if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
+                        cardinality_array.as_primitive::<UInt64Type>().value(0)
+                    } else {
+                        u64::MAX
+                    };
+
+                // The triggering threshold for dictionary encoding can be further tuned.
+                if cardinality <= DICTIONARY_ENCODING_THRESHOLD
+                    && data_block.num_values() >= 10 * cardinality
+                {
+                    let (indices_data_block, dictionary_data_block) =
+                        Self::dictionary_encode(data_block, cardinality);
+                    Self::encode_miniblock(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        indices_data_block,
+                        repdefs,
+                        row_number,
+                        Some(dictionary_data_block),
+                    )
+                } else if Self::is_narrow(&data_block) {
                     log::debug!(
                         "Encoding column {} with {} rows using mini-block layout",
                         column_idx,
@@ -2228,6 +2487,7 @@ impl PrimitiveStructuralEncoder {
                         data_block,
                         repdefs,
                         row_number,
+                        None,
                     )
                 } else {
                     log::debug!(
