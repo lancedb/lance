@@ -85,6 +85,7 @@ use crate::{LanceReader, Scanner};
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
 
+pub mod align;
 pub mod blob;
 pub mod cleanup;
 pub mod commit;

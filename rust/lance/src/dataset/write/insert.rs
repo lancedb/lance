@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchIterator;
+use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
@@ -75,6 +76,12 @@ impl<'a> InsertBuilder<'a> {
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Dataset> {
         let (stream, schema) = source.into_stream_and_schema().await?;
+        self.execute_stream_impl(stream, schema).await
+    }
+
+    pub async fn execute_empty(&self, schema: Schema) -> Result<Dataset> {
+        let arrow_schema = Arc::new(ArrowSchema::from(&schema));
+        let stream = RecordBatchIterator::new(std::iter::empty(), arrow_schema).into_stream();
         self.execute_stream_impl(stream, schema).await
     }
 

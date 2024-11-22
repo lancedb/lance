@@ -15,10 +15,28 @@ def is_datagen_supported():
 
 
 def rand_batches(
-    schema: pa.Schema, *, num_batches: int = None, batch_size_bytes: int = None
+    schema: pa.Schema,
+    *,
+    num_batches: int = None,
+    batch_size_bytes: int = None,
+    batch_size_rows: int = None,
 ):
     if not datagen.is_datagen_supported():
         raise NotImplementedError(
             "This version of lance was not built with the datagen feature"
         )
-    return datagen.rand_batches(schema, num_batches, batch_size_bytes)
+    return datagen.rand_batches(schema, num_batches, batch_size_bytes, batch_size_rows)
+
+
+def rand_reader(
+    schema: pa.Schema,
+    *,
+    num_batches: int = None,
+    batch_size_bytes: int = None,
+    batch_size_rows: int = None,
+):
+    if not datagen.is_datagen_supported():
+        raise NotImplementedError(
+            "This version of lance was not built with the datagen feature"
+        )
+    return datagen.rand_reader(schema, num_batches, batch_size_bytes, batch_size_rows)

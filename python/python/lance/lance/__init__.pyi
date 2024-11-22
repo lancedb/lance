@@ -23,6 +23,9 @@ def infer_tfrecord_schema(
 ) -> pa.Schema: ...
 def read_tfrecord(uri: str, schema: pa.Schema) -> pa.RecordBatchReader: ...
 
+class _Dataset:
+    pass
+
 class CleanupStats:
     bytes_removed: int
     old_versions: int
