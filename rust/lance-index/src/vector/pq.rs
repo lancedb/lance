@@ -23,7 +23,7 @@ use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADA
 use tracing::instrument;
 
 pub mod builder;
-mod distance;
+pub mod distance;
 pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
@@ -99,6 +99,26 @@ impl ProductQuantizer {
     where
         T::Native: Float + L2 + Dot,
     {
+        match self.num_bits {
+            4 => self.transform_impl::<4, T>(vectors),
+            8 => self.transform_impl::<8, T>(vectors),
+            _ => Err(Error::Index {
+                message: format!(
+                    "ProductQuantization: num_bits {} not supported",
+                    self.num_bits
+                ),
+                location: location!(),
+            }),
+        }
+    }
+
+    fn transform_impl<const NUM_BITS: u32, T: ArrowPrimitiveType>(
+        &self,
+        vectors: &dyn Array,
+    ) -> Result<ArrayRef>
+    where
+        T::Native: Float + L2 + Dot,
+    {
         let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
                 "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
@@ -108,8 +128,7 @@ impl ProductQuantizer {
         })?;
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
-        let num_bits = self.num_bits;
-        if num_bits == 4 && num_sub_vectors % 2 != 0 {
+        if NUM_BITS == 4 && num_sub_vectors % 2 != 0 {
             return Err(Error::Index {
                 message: format!(
                     "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",
@@ -132,17 +151,16 @@ impl ProductQuantizer {
                     .chunks_exact(sub_dim)
                     .enumerate()
                     .map(|(sub_idx, sub_vector)| {
-                        let centroids = get_sub_vector_centroids(
+                        let centroids = get_sub_vector_centroids::<NUM_BITS, _>(
                             codebook.values(),
                             dim,
-                            num_bits,
                             num_sub_vectors,
                             sub_idx,
                         );
                         compute_partition(centroids, sub_vector, distance_type).unwrap() as u8
                     })
                     .collect::<Vec<_>>();
-                if num_bits == 4 {
+                if NUM_BITS == 4 {
                     sub_vec_code
                         .chunks_exact(2)
                         .map(|v| (v[1] << 4) | v[0])
@@ -153,7 +171,7 @@ impl ProductQuantizer {
             })
             .collect::<Vec<_>>();
 
-        let num_sub_vectors_in_byte = if num_bits == 4 {
+        let num_sub_vectors_in_byte = if NUM_BITS == 4 {
             num_sub_vectors / 2
         } else {
             num_sub_vectors
@@ -321,13 +339,24 @@ impl ProductQuantizer {
     ///
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
     pub fn centroids<T: ArrowPrimitiveType>(&self, sub_vector_idx: usize) -> &[T::Native] {
-        get_sub_vector_centroids(
-            self.codebook.values().as_primitive::<T>().values(),
-            self.dimension,
-            self.num_bits,
-            self.num_sub_vectors,
-            sub_vector_idx,
-        )
+        match self.num_bits {
+            4 => get_sub_vector_centroids::<4, _>(
+                self.codebook.values().as_primitive::<T>().values(),
+                self.dimension,
+                self.num_sub_vectors,
+                sub_vector_idx,
+            ),
+            8 => get_sub_vector_centroids::<8, _>(
+                self.codebook.values().as_primitive::<T>().values(),
+                self.dimension,
+                self.num_sub_vectors,
+                sub_vector_idx,
+            ),
+            _ => panic!(
+                "ProductQuantization: num_bits {} not supported",
+                self.num_bits
+            ),
+        }
     }
 }
 
