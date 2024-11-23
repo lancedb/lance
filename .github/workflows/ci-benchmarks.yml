@@ -52,4 +52,9 @@ jobs:
           source venv/bin/activate
           python python/ci_benchmarks/datagen/gen_all.py
       - name: Run benchmarks
-        run: bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} --adapter python_pytest --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json results.json python/ci_benchmarks"
+        run: |
+          python -m venv venv
+          source venv/bin/activate
+          bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} --adapter python_pytest \
+                      --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json \
+                      results.json python/ci_benchmarks"
