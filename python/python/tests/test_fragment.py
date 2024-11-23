@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import copy
 import json
 import multiprocessing
 import uuid
@@ -22,6 +23,15 @@ from lance.debug import format_fragment
 from lance.file import LanceFileWriter
 from lance.fragment import write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
+
+CONFIG = {
+    "allow_http": "true",
+    "aws_access_key_id": "ACCESSKEY",
+    "aws_secret_access_key": "SECRETKEY",
+    "aws_endpoint": "http://localhost:9000",
+    "dynamodb_endpoint": "http://localhost:8000",
+    "aws_region": "us-west-2",
+}
 
 
 def test_write_fragment(tmp_path: Path):
@@ -354,3 +364,12 @@ def test_create_from_file(tmp_path):
     assert dataset.count_rows() == 1600
     assert len(dataset.get_fragments()) == 1
     assert dataset.get_fragments()[0].fragment_id == 2
+
+
+@pytest.mark.integration
+def test_append(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
+    lance.fragment.LanceFragment.create(
+        f"s3://{s3_bucket}/test_append.lance", table, storage_options=storage_options
+    )
