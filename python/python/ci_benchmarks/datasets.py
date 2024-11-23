@@ -38,5 +38,5 @@ def get_dataset_uri(name: str) -> str:
     if name == "image_eda":
         if not _is_on_google():
             raise ValueError("The image_eda dataset is only available on Google Cloud")
-        return "gs://weston-bench/image_eda.lance"
+        return "gs://lance-benchmarks-ci-datasets/image_eda.lance"
     return f"{_get_base_uri()}{name}"
