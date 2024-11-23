@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import copy
 from pathlib import Path
 
 import lance
@@ -16,6 +17,15 @@ from lance.ray.sink import (  # noqa: E402
     LanceFragmentWriter,
     _register_hooks,
 )
+
+CONFIG = {
+    "allow_http": "true",
+    "aws_access_key_id": "ACCESSKEY",
+    "aws_secret_access_key": "SECRETKEY",
+    "aws_endpoint": "http://localhost:9000",
+    "dynamodb_endpoint": "http://localhost:8000",
+    "aws_region": "us-west-2",
+}
 
 # Use this hook until we have official DataSink in Ray.
 _register_hooks()
@@ -116,3 +126,14 @@ def test_ray_empty_write_lance(tmp_path: Path):
     # empty write would not generate dataset.
     with pytest.raises(ValueError):
         lance.dataset(tmp_path)
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.integration
+def test_ray_read_lance(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
+    path = f"s3://{s3_bucket}/test_ray_read.lance"
+    lance.write_dataset(table, path, storage_options=storage_options)
+    ds = ray.data.read_lance(path, storage_options=storage_options, concurrency=1)
+    ds.take(1)

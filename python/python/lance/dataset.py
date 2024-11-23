@@ -164,6 +164,7 @@ class LanceDataset(pa.dataset.Dataset):
     ):
         uri = os.fspath(uri) if isinstance(uri, Path) else uri
         self._uri = uri
+        self._storage_options = storage_options
         self._ds = _Dataset(
             uri,
             version,
@@ -180,6 +181,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __deserialize__(
         cls,
         uri: str,
+        storage_options: Optional[Dict[str, str]],
         version: int,
         manifest: bytes,
         default_scan_options: Optional[Dict[str, Any]],
@@ -187,6 +189,7 @@ class LanceDataset(pa.dataset.Dataset):
         return cls(
             uri,
             version,
+            storage_options=storage_options,
             serialized_manifest=manifest,
             default_scan_options=default_scan_options,
         )
@@ -194,6 +197,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __reduce__(self):
         return type(self).__deserialize__, (
             self.uri,
+            self._storage_options,
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
@@ -202,16 +206,20 @@ class LanceDataset(pa.dataset.Dataset):
     def __getstate__(self):
         return (
             self.uri,
+            self._storage_options,
             self._ds.version(),
             self._ds.serialized_manifest(),
             self._default_scan_options,
         )
 
     def __setstate__(self, state):
-        self._uri, version, manifest, default_scan_options = state
+        self._uri, self._storage_options, version, manifest, default_scan_options = (
+            state
+        )
         self._ds = _Dataset(
             self._uri,
             version,
+            storage_options=self._storage_options,
             manifest=manifest,
             default_scan_options=default_scan_options,
         )
@@ -219,6 +227,7 @@ class LanceDataset(pa.dataset.Dataset):
     def __copy__(self):
         ds = LanceDataset.__new__(LanceDataset)
         ds._uri = self._uri
+        ds._storage_options = self._storage_options
         ds._ds = copy.copy(self._ds)
         ds._default_scan_options = self._default_scan_options
         return ds
@@ -2198,6 +2207,7 @@ class LanceDataset(pa.dataset.Dataset):
             max_retries=max_retries,
         )
         ds = LanceDataset.__new__(LanceDataset)
+        ds._storage_options = storage_options
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
@@ -3366,6 +3376,7 @@ def write_dataset(
     inner_ds = _write_dataset(reader, uri, params)
 
     ds = LanceDataset.__new__(LanceDataset)
+    ds._storage_options = storage_options
     ds._ds = inner_ds
     ds._uri = inner_ds.uri
     ds._default_scan_options = None
