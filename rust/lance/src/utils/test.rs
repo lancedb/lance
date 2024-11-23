@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
+use lance_datagen::{BatchCount, BatchGeneratorBuilder, RowCount};
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStoreRegistry, WrappingObjectStore};
 use lance_table::format::Fragment;
@@ -437,6 +438,56 @@ impl MultipartUpload for IoTrackingMultipartUpload {
             stats.write_bytes += payload.content_length() as u64;
         }
         self.target.put_part(payload)
+    }
+}
+
+pub struct FragmentCount(pub u32);
+
+impl From<u32> for FragmentCount {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+pub struct FragmentRowCount(pub u32);
+
+impl From<u32> for FragmentRowCount {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+#[async_trait::async_trait]
+pub trait DatagenExt {
+    async fn into_dataset(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset>;
+}
+
+#[async_trait::async_trait]
+impl DatagenExt for BatchGeneratorBuilder {
+    async fn into_dataset(
+        self,
+        path: &str,
+        frag_count: FragmentCount,
+        rows_per_fragment: FragmentRowCount,
+    ) -> crate::Result<Dataset> {
+        let reader = self.into_reader_rows(
+            RowCount::from(rows_per_fragment.0 as u64),
+            BatchCount::from(frag_count.0),
+        );
+        Dataset::write(
+            reader,
+            path,
+            Some(WriteParams {
+                max_rows_per_file: rows_per_fragment.0 as usize,
+                ..Default::default()
+            }),
+        )
+        .await
     }
 }
 
