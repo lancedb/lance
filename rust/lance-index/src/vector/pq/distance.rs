@@ -1,52 +1,82 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use core::panic;
 use std::cmp::min;
 
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_table::utils::LanceIteratorExtension;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 
 /// Build a Distance Table from the query to each PQ centroid
 /// using L2 distance.
-pub(super) fn build_distance_table_l2<T: L2>(
+pub fn build_distance_table_l2<T: L2>(
     codebook: &[T],
     num_bits: u32,
     num_sub_vectors: usize,
     query: &[T],
 ) -> Vec<f32> {
-    let dimension = query.len();
+    match num_bits {
+        4 => build_distance_table_l2_impl::<4, T>(codebook, num_sub_vectors, query),
+        8 => build_distance_table_l2_impl::<8, T>(codebook, num_sub_vectors, query),
+        _ => panic!("Unsupported number of bits: {}", num_bits),
+    }
+}
 
+#[inline]
+pub fn build_distance_table_l2_impl<const NUM_BITS: u32, T: L2>(
+    codebook: &[T],
+    num_sub_vectors: usize,
+    query: &[T],
+) -> Vec<f32> {
+    let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
+    let num_centroids = 2_usize.pow(NUM_BITS);
     query
         .chunks_exact(sub_vector_length)
         .enumerate()
         .flat_map(|(i, sub_vec)| {
             let subvec_centroids =
-                get_sub_vector_centroids(codebook, dimension, num_bits, num_sub_vectors, i);
+                get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
             l2_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
         })
+        .exact_size(num_sub_vectors * num_centroids)
         .collect()
 }
 
 /// Build a Distance Table from the query to each PQ centroid
 /// using Dot distance.
-pub(super) fn build_distance_table_dot<T: Dot>(
+pub fn build_distance_table_dot<T: Dot>(
     codebook: &[T],
     num_bits: u32,
     num_sub_vectors: usize,
     query: &[T],
 ) -> Vec<f32> {
+    match num_bits {
+        4 => build_distance_table_dot_impl::<4, T>(codebook, num_sub_vectors, query),
+        8 => build_distance_table_dot_impl::<8, T>(codebook, num_sub_vectors, query),
+        _ => panic!("Unsupported number of bits: {}", num_bits),
+    }
+}
+
+pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
+    codebook: &[T],
+    num_sub_vectors: usize,
+    query: &[T],
+) -> Vec<f32> {
     let dimension = query.len();
     let sub_vector_length = dimension / num_sub_vectors;
+    let num_centroids = 2_usize.pow(NUM_BITS);
     query
         .chunks_exact(sub_vector_length)
         .enumerate()
         .flat_map(|(i, sub_vec)| {
             let subvec_centroids =
-                get_sub_vector_centroids(codebook, dimension, num_bits, num_sub_vectors, i);
+                get_sub_vector_centroids::<NUM_BITS, _>(codebook, dimension, num_sub_vectors, i);
             dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length)
         })
+        .exact_size(num_sub_vectors * num_centroids)
         .collect()
 }
 
