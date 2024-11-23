@@ -56,5 +56,5 @@ jobs:
           python -m venv venv
           source venv/bin/activate
           bencher run --project weston-lancedb --token ${{ secrets.LANCE_BENCHER_TOKEN }} --adapter python_pytest \
-                      --branch main --testbed google-genoa --err --file results.json "venv/bin/pytest --benchmark-json \
+                      --branch main --testbed google-genoa --err --file results.json "python -mpytest --benchmark-json \
                       results.json python/ci_benchmarks"
