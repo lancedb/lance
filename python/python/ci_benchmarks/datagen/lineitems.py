@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright The Lance Authors
+
 # Creates a dataset containing the TPC-H lineitems table using a prebuilt Parquet file
 import logging
 
