@@ -96,21 +96,24 @@ def test_add_columns_udf(tmp_path, use_fragments):
 
     @lance.batch_udf(
         output_schema=pa.schema([pa.field("double_a", pa.int64())]),
+        concat_const=2,
     )
-    def double_a(batch):
+    def double_a(batch, concat_const):
         assert batch.schema.names == ["a"]
         return pa.record_batch(
-            [pa.array([2 * x.as_py() for x in batch["a"]])], ["double_a"]
+            [pa.array([concat_const * x.as_py() for x in batch["a"]])], ["double_a"]
         )
 
     expected = tab.append_column("double_a", pa.array([2 * x for x in range(100)]))
-    check_add_columns(dataset, expected, use_fragments, double_a, read_columns=["a"])
+    check_add_columns(
+        dataset, expected, use_fragments, double_a, read_columns=["a"], concat_const=2
+    )
 
     # Check: errors if produces inconsistent schema
     @lance.batch_udf()
-    def make_new_col(batch):
+    def make_new_col(batch, concat_const="abc"):
         col_name = str(uuid.uuid4())
-        return pa.record_batch([batch["a"]], [col_name])
+        return pa.record_batch([batch["a"]], [col_name + concat_const])
 
     check_add_columns_fails(
         dataset,
@@ -118,6 +121,7 @@ def test_add_columns_udf(tmp_path, use_fragments):
         Exception,
         "Output schema of function does not match the expected schema",
         make_new_col,
+        concat_const="def",
     )
 
     # Schema inference and Pandas conversion
