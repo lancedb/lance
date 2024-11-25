@@ -60,6 +60,7 @@ pub fn build_distance_table_dot<T: Dot>(
     }
 }
 
+#[inline]
 pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     codebook: &[T],
     num_sub_vectors: usize,
@@ -204,6 +205,7 @@ fn compute_l2_distance_without_transposing<const C: usize, const V: usize>(
     distances.chain(remainder).collect()
 }
 
+#[inline]
 pub fn compute_dot_distance(
     distance_table: &[f32],
     num_bits: u32,
@@ -229,6 +231,7 @@ pub fn compute_dot_distance(
     distances
 }
 
+#[inline]
 pub fn compute_dot_distance_4bit(
     distance_table: &[f32],
     num_sub_vectors: usize,
