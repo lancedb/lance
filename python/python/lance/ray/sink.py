@@ -48,7 +48,7 @@ def _pd_to_arrow(
 
 
 def _write_fragment(
-    stream: Iterable[Union[pa.Table, "pd.Pandas"]],
+    stream: Iterable[Union[pa.Table, "pd.DataFrame"]],
     uri: str,
     *,
     schema: Optional[pa.Schema] = None,
@@ -57,7 +57,7 @@ def _write_fragment(
     max_rows_per_group: int = 1024,  # Only useful for v1 writer.
     data_storage_version: Optional[str] = None,
     storage_options: Optional[Dict[str, Any]] = None,
-) -> Tuple[FragmentMetadata, pa.Schema]:
+) -> List[Tuple[FragmentMetadata, pa.Schema]]:
     from ..dependencies import _PANDAS_AVAILABLE
     from ..dependencies import pandas as pd
 
