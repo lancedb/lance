@@ -61,17 +61,17 @@ lance-test-macros = { version = "=0.19.2", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=0.19.2", path = "./rust/lance-testing" }
 approx = "0.5.1"
 # Note that this one does not include pyarrow
-arrow = { version = "52.2", optional = false, features = ["prettyprint"] }
-arrow-arith = "52.2"
-arrow-array = "52.2"
-arrow-buffer = "52.2"
-arrow-cast = "52.2"
-arrow-data = "52.2"
-arrow-ipc = { version = "52.2", features = ["zstd"] }
-arrow-ord = "52.2"
-arrow-row = "52.2"
-arrow-schema = "52.2"
-arrow-select = "52.2"
+arrow = { version = "53.2", optional = false, features = ["prettyprint"] }
+arrow-arith = "53.2"
+arrow-array = "53.2"
+arrow-buffer = "53.2"
+arrow-cast = "53.2"
+arrow-data = "53.2"
+arrow-ipc = { version = "53.2", features = ["zstd"] }
+arrow-ord = "53.2"
+arrow-row = "53.2"
+arrow-schema = "53.2"
+arrow-select = "53.2"
 async-recursion = "1.0"
 async-trait = "0.1"
 aws-config = "1.2.0"
@@ -95,18 +95,18 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "41.0", default-features = false, features = [
+datafusion = { version = "42.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "41.0"
-datafusion-functions = { version = "41.0", features = ["regex_expressions"] }
-datafusion-sql = "41.0"
-datafusion-expr = "41.0"
-datafusion-execution = "41.0"
-datafusion-optimizer = "41.0"
-datafusion-physical-expr = { version = "41.0", features = [
+datafusion-common = "42.0"
+datafusion-functions = { version = "42.0", features = ["regex_expressions"] }
+datafusion-sql = "42.0"
+datafusion-expr = "42.0"
+datafusion-execution = "42.0"
+datafusion-optimizer = "42.0"
+datafusion-physical-expr = { version = "42.0", features = [
     "regex_expressions",
 ] }
 deepsize = "0.2.0"
@@ -129,9 +129,9 @@ pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 proptest = "1.3.1"
-prost = "0.12.2"
-prost-build = "0.12.2"
-prost-types = "0.12.2"
+prost = "0.13.2"
+prost-build = "0.13.2"
+prost-types = "0.13.2"
 rand = { version = "0.8.3", features = ["small_rng"] }
 rangemap = { version = "1.0" }
 rayon = "1.10"

@@ -369,7 +369,12 @@ pub(crate) async fn open_vector_index(
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,
 ) -> Result<Arc<dyn VectorIndex>> {
-    let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)?.into();
+    let metric_type = pb::VectorMetricType::try_from(vec_idx.metric_type)
+        .map_err(|_| Error::Internal {
+            message: "Unexpected vector enum value".into(),
+            location: location!(),
+        })?
+        .into();
 
     let mut last_stage: Option<Arc<dyn VectorIndex>> = None;
 

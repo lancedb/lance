@@ -26,11 +26,11 @@ use datafusion::physical_plan::{
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
-    udaf::create_aggregate_expr,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
+use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::{Partitioning, PhysicalExpr};
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
@@ -957,17 +957,18 @@ impl Scanner {
         let plan = self.create_plan().await?;
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
-        let count_expr = create_aggregate_expr(
-            &count_udaf(),
-            &[one],
-            &[lit(1)],
-            &[],
-            &[],
-            &plan.schema(),
-            None,
-            false,
-            false,
-        )?;
+
+        let input_phy_exprs: &[Arc<dyn PhysicalExpr>] = &[one];
+        let schema = plan.schema();
+
+        let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
+        //builder = builder.logical_exprs(input_exprs.to_vec());
+        builder = builder.schema(schema);
+        // TODO: This alias seem to be required?
+        builder = builder.alias("count".to_string());
+
+        let count_expr = builder.build()?;
+
         let plan_schema = plan.schema();
         let count_plan = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
