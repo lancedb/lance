@@ -3179,6 +3179,7 @@ dependencies = [
  "pin-project",
  "pprof",
  "pretty_assertions",
+ "prost 0.12.6",
  "prost 0.13.3",
  "prost-build 0.13.3",
  "rand",
