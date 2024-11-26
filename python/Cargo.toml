@@ -42,8 +42,8 @@ lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lazy_static = "1"
 log = "0.4"
-prost = "0.12.2"
-pyo3 = { version = "0.21", features = [
+prost = "0.13.2"
+pyo3 = { version = "0.22", features = [
     "extension-module",
     "abi3-py39",
     "gil-refs",
