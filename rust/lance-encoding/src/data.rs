@@ -951,17 +951,17 @@ impl DataBlock {
     as_type_ref!(as_variable_width_ref, VariableWidth, VariableWidthBlock);
     as_type_ref!(as_struct_ref, Struct, StructDataBlock);
     as_type_ref!(as_dictionary_ref, Dictionary, DictionaryDataBlock);
-    as_type_ref_mut!(as_all_null_mut_ref, AllNull, AllNullDataBlock);
-    as_type_ref_mut!(as_nullable_mut_ref, Nullable, NullableDataBlock);
-    as_type_ref_mut!(as_fixed_width_mut_ref, FixedWidth, FixedWidthDataBlock);
+    as_type_ref_mut!(as_all_null_ref_mut, AllNull, AllNullDataBlock);
+    as_type_ref_mut!(as_nullable_ref_mut, Nullable, NullableDataBlock);
+    as_type_ref_mut!(as_fixed_width_ref_mut, FixedWidth, FixedWidthDataBlock);
     as_type_ref_mut!(
-        as_fixed_size_list_mut_ref,
+        as_fixed_size_list_ref_mut,
         FixedSizeList,
         FixedSizeListBlock
     );
-    as_type_ref_mut!(as_variable_width_mut_ref, VariableWidth, VariableWidthBlock);
-    as_type_ref_mut!(as_struct_mut_ref, Struct, StructDataBlock);
-    as_type_ref_mut!(as_dictionary_mut_ref, Dictionary, DictionaryDataBlock);
+    as_type_ref_mut!(as_variable_width_ref_mut, VariableWidth, VariableWidthBlock);
+    as_type_ref_mut!(as_struct_ref_mut, Struct, StructDataBlock);
+    as_type_ref_mut!(as_dictionary_ref_mut, Dictionary, DictionaryDataBlock);
 }
 
 // Methods to convert from Arrow -> DataBlock
