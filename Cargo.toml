@@ -124,7 +124,7 @@ moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 # Set min to prevent use of versions with CVE-2024-41178
 object_store = { version = "0.10.2" }
-parquet = "52.0"
+parquet = "53.0"
 pin-project = "1.0"
 path_abs = "0.5"
 pprof = { version = "0.14.0", features = ["flamegraph", "criterion"] }
