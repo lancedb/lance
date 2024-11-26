@@ -63,6 +63,7 @@ pub fn build_distance_table_dot<T: Dot>(
     }
 }
 
+#[inline]
 pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
     codebook: &[T],
     num_sub_vectors: usize,
@@ -225,6 +226,7 @@ fn compute_l2_distance_without_transposing<const C: usize, const V: usize>(
     distances.chain(remainder).collect()
 }
 
+#[inline]
 pub fn compute_dot_distance(
     distance_table: &[f32],
     num_bits: u32,
@@ -250,6 +252,7 @@ pub fn compute_dot_distance(
     distances
 }
 
+#[inline]
 pub fn compute_dot_distance_4bit(
     distance_table: &[f32],
     num_sub_vectors: usize,
@@ -257,9 +260,13 @@ pub fn compute_dot_distance_4bit(
 ) -> Vec<f32> {
     let num_vectors = code.len() * 2 / num_sub_vectors;
     let mut distances = vec![0.0; num_vectors];
-    let num_centroids = 2_usize.pow(4);
+    const NUM_CENTROIDS: usize = 2_usize.pow(4);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
-        let dist_table = &distance_table[sub_vec_idx * 2 * num_centroids..];
+        let dist_table =
+            &distance_table[sub_vec_idx * 2 * NUM_CENTROIDS..(sub_vec_idx * 2 + 1) * NUM_CENTROIDS];
+        let dist_table_next = &distance_table
+            [(sub_vec_idx * 2 + 1) * NUM_CENTROIDS..(sub_vec_idx * 2 + 2) * NUM_CENTROIDS];
+        debug_assert_eq!(vec_indices.len(), distances.len());
         vec_indices
             .iter()
             .zip(distances.iter_mut())
@@ -268,7 +275,7 @@ pub fn compute_dot_distance_4bit(
                 let current_idx = centroid_idx & 0xF;
                 let next_idx = centroid_idx >> 4;
                 *sum += dist_table[current_idx as usize];
-                *sum += dist_table[num_centroids + next_idx as usize];
+                *sum += dist_table_next[next_idx as usize];
             });
     }
 
