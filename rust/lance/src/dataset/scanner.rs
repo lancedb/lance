@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::functions_aggregate::count::count_udaf;
-use datafusion::logical_expr::{lit, Expr};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -963,10 +963,8 @@ impl Scanner {
         let schema = plan.schema();
 
         let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
-        //builder = builder.logical_exprs(input_exprs.to_vec());
         builder = builder.schema(schema);
-        // TODO: This alias seem to be required?
-        builder = builder.alias("count".to_string());
+        builder = builder.alias("count_rows".to_string());
 
         let count_expr = builder.build()?;
 

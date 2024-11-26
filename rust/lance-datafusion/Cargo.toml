@@ -32,8 +32,7 @@ snafu.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-# TODO: This is too old
-#substrait-expr = { version = "0.2.1" }
+substrait-expr = { version = "0.2.2" }
 lance-datagen.workspace = true
 
 [features]
