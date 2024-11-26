@@ -382,7 +382,6 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<E
     Ok(expr.data)
 }
 
-/*
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -441,4 +440,3 @@ mod tests {
         assert_eq!(df_expr, expected);
     }
 }
-*/
