@@ -5,6 +5,9 @@ use core::panic;
 use std::cmp::min;
 
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
+use lance_linalg::simd::f32::f32x16;
+use lance_linalg::simd::u8::u8x16;
+use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
@@ -135,26 +138,44 @@ pub(super) fn compute_l2_distance_4bit(
 ) -> Vec<f32> {
     let num_vectors = code.len() * 2 / num_sub_vectors;
     let mut distances = vec![0.0_f32; num_vectors];
+    let mut distance_chunks = distances.chunks_exact_mut(16);
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
-        let dist_table: &[f32; NUM_CENTROIDS] = &distance_table
-            [sub_vec_idx * 2 * NUM_CENTROIDS..(sub_vec_idx * 2 + 1) * NUM_CENTROIDS]
-            .try_into()
-            .unwrap();
-        let dist_table_next: &[f32; NUM_CENTROIDS] = &distance_table
-            [(sub_vec_idx * 2 + 1) * NUM_CENTROIDS..(sub_vec_idx * 2 + 2) * NUM_CENTROIDS]
-            .try_into()
-            .unwrap();
+        let vec_indices_chunks = vec_indices.chunks_exact(16);
+        for vec_indices_chunk in vec_indices_chunks {
+            let vec_indices_vec = unsafe { u8x16::load_unaligned(vec_indices_chunk.as_ptr()) };
+            let low_indices = vec_indices_vec.bit_and(0x0F);
+            let dist_table = unsafe {
+                f32x16::load_unaligned(distance_table.as_ptr().add(sub_vec_idx * NUM_CENTROIDS))
+            };
+            let dists = dist_table.shuffle(low_indices);
+
+            vec_indices_chunk
+                .iter()
+                .zip(distances.iter_mut())
+                .for_each(|(&centroid_idx, sum)| {
+                    *sum += dist_table[centroid_idx as usize];
+                });
+        }
+
         debug_assert_eq!(vec_indices.len(), distances.len());
+        let dist_table =
+            &distance_table[sub_vec_idx * 2 * NUM_CENTROIDS..(sub_vec_idx * 2 + 1) * NUM_CENTROIDS];
         vec_indices
             .iter()
+            .map(|idx| idx & 0xF)
             .zip(distances.iter_mut())
-            .for_each(|(&centroid_idx, sum)| {
-                // for 4bit PQ, `centroid_idx` is 2 index, each index is 4bit.
-                let current_idx = centroid_idx & 0xF;
-                let next_idx = centroid_idx >> 4;
-                *sum += dist_table[current_idx as usize];
-                *sum += dist_table_next[next_idx as usize];
+            .for_each(|(idx, sum)| {
+                *sum += dist_table[idx as usize];
+            });
+        let dist_table_next = &distance_table
+            [(sub_vec_idx * 2 + 1) * NUM_CENTROIDS..(sub_vec_idx * 2 + 2) * NUM_CENTROIDS];
+        vec_indices
+            .iter()
+            .map(|idx| idx >> 4)
+            .zip(distances.iter_mut())
+            .for_each(|(idx, sum)| {
+                *sum += dist_table_next[idx as usize];
             });
     }
 

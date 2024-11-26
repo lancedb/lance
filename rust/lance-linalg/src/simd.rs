@@ -16,8 +16,10 @@ use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 pub mod f32;
 pub mod i32;
+pub mod u8;
 
 use num_traits::{Float, Num};
+use u8::u8x16;
 
 /// Lance SIMD lib
 ///
@@ -94,4 +96,8 @@ pub trait FloatSimd<F: Float, const N: usize>: SIMD<F, N> {
     ///
     /// c = a * b + c
     fn multiply_add(&mut self, a: Self, b: Self);
+}
+
+pub trait Shuffle {
+    fn shuffle(&self, indices: u8x16) -> Self;
 }

@@ -15,7 +15,7 @@ use std::arch::x86_64::*;
 use std::mem::transmute;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::{FloatSimd, SIMD};
+use super::{FloatSimd, Shuffle, SIMD};
 
 /// 8 of 32-bit `f32` values. Use 256-bit SIMD if possible.
 #[allow(non_camel_case_types)]
@@ -796,6 +796,36 @@ impl FloatSimd<f32, 16> for f32x16 {
         unsafe {
             self.0 = lasx_xvfmadd_s(a.0, b.0, self.0);
             self.1 = lasx_xvfmadd_s(a.1, b.1, self.1);
+        }
+    }
+}
+
+impl Shuffle for f32x16 {
+    fn shuffle(&self, indices: super::u8::u8x16) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        unsafe {
+            // cast m128i to m512i
+            let extended_indices = _mm512_cvtepu8_epi32(indices);
+            Self(_mm512_permutexvar_ps(extended_indices, self.0))
+        }
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+        unsafe {
+            let low_indices = _mm256_castsi128_si256(_mm_srli_si128(indices, 0));
+            let high_indices = _mm256_castsi128_si256(_mm_srli_si128(indices, 8));
+            let result_low = _mm256_permutevar8x32_ps(self.0, indices_low);
+            let result_high = _mm256_permutevar8x32_ps(self.1, indices_high);
+            Self(result_low, result_high)
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // aarch does not have shuffle instruction for floats
+            let values = self.as_array();
+            let indices = indices.as_array();
+            let mut result = [0.0; 16];
+            for i in 0..16 {
+                result[i] = values[indices[i] as usize];
+            }
+            Self::load_unaligned(result.as_ptr())
         }
     }
 }
