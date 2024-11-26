@@ -205,7 +205,7 @@ pub fn bytes_to_array(
 
         // alignment or size isn't right -- just make a copy
         if (bytes.len() < min_buffer_size) || (bytes.as_ptr().align_offset(*alignment) != 0) {
-            Buffer::from_vec(bytes.to_vec())
+            Buffer::from_vec(bytes.into())
         } else {
             // SAFETY: the alignment is correct we can make this conversion
             unsafe {
@@ -218,7 +218,7 @@ pub fn bytes_to_array(
         }
     } else {
         // cases we don't handle, just copy
-        Buffer::from_vec(bytes.to_vec())
+        Buffer::from_vec(bytes.into())
     };
 
     let array_data = ArrayDataBuilder::new(data_type.clone())

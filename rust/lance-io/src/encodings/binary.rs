@@ -224,7 +224,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
                 .null_bit_buffer(null_buf);
         }
 
-        let buf = Buffer::from_vec(bytes.to_vec());
+        let buf = Buffer::from_vec(bytes.into());
         let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(buf)
