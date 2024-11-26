@@ -42,7 +42,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
-use scalar::{build_inverted_index, detect_scalar_index_type};
+use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -173,6 +173,11 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     Ok(proto)
 }
 
+fn vector_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::VectorIndexDetails::default();
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
@@ -223,13 +228,13 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        match (index_type, params.index_name()) {
+        let index_details: prost_types::Any = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap | IndexType::BTree | IndexType::Inverted | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?;
+                build_scalar_index(self, column, &index_id.to_string(), &params).await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -240,7 +245,7 @@ impl DatasetIndexExt for Dataset {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?;
+                build_scalar_index(self, column, &index_id.to_string(), params).await?
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
@@ -253,6 +258,7 @@ impl DatasetIndexExt for Dataset {
                     })?;
 
                 build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
+                inverted_index_details()
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -266,6 +272,7 @@ impl DatasetIndexExt for Dataset {
 
                 build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
                     .await?;
+                vector_index_details()
             }
             // Can't use if let Some(...) here because it's not stable yet.
             // TODO: fix after https://github.com/rust-lang/rust/issues/51114
@@ -291,6 +298,7 @@ impl DatasetIndexExt for Dataset {
 
                 ext.create_index(self, column, &index_id.to_string(), params)
                     .await?;
+                vector_index_details()
             }
             (index_type, index_name) => {
                 return Err(Error::Index {
@@ -300,7 +308,7 @@ impl DatasetIndexExt for Dataset {
                     location: location!(),
                 });
             }
-        }
+        };
 
         let new_idx = IndexMetadata {
             uuid: index_id,
@@ -308,6 +316,7 @@ impl DatasetIndexExt for Dataset {
             fields: vec![field.id],
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            index_details: Some(index_details),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -319,7 +328,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -331,6 +340,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -345,7 +355,7 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let manifest_file = self.manifest_file(self.version().version).await?;
+        let manifest_file = self.manifest_file().await?;
         let loaded_indices: Arc<Vec<IndexMetadata>> =
             read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest)
                 .await?
@@ -372,12 +382,16 @@ impl DatasetIndexExt for Dataset {
             });
         };
 
+        // TODO: We will need some way to determine the index details here.  Perhaps
+        // we can load the index itself and get the details that way.
+
         let new_idx = IndexMetadata {
             uuid: index_id,
             name: index_name.to_string(),
             fields: vec![field.id],
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            index_details: None,
         };
 
         let transaction = Transaction::new(
@@ -390,7 +404,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, new_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -402,6 +416,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = new_path;
 
         Ok(())
     }
@@ -461,6 +476,7 @@ impl DatasetIndexExt for Dataset {
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(new_frag_ids),
+                index_details: last_idx.index_details.clone(),
             };
             removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed.len() {
@@ -487,7 +503,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -499,6 +515,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
         Ok(())
     }
 
@@ -629,7 +646,12 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index);
         }
 
-        let index = crate::index::scalar::open_scalar_index(self, column, uuid).await?;
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+
+        let index = crate::index::scalar::open_scalar_index(self, column, &index_meta).await?;
         self.session.index_cache.insert_scalar(uuid, index.clone());
         Ok(index)
     }
@@ -795,6 +817,7 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(index)
     }
 
+    #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
@@ -820,8 +843,9 @@ impl DatasetIndexInternalExt for Dataset {
                     Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
                 }
                 DataType::Utf8 | DataType::LargeUtf8 => {
-                    let uuid = index.uuid.to_string();
-                    let index_type = detect_scalar_index_type(self, &field.name, &uuid).await?;
+                    let index_type =
+                        detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
+                            .await?;
                     // Inverted index can't be used for filtering
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         continue;
@@ -883,9 +907,12 @@ mod tests {
 
     use super::*;
 
+    use arrow::array::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_index::scalar::inverted::TokenizerConfig;
+    use lance_index::scalar::FullTextSearchQuery;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -1271,6 +1298,71 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_fts() {
+        let words = ["apple", "banana", "cherry", "date"];
+
+        let dir = tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let data = StringArray::from_iter_values(words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
+        let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(batch_iterator, dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let tokenizer_config = TokenizerConfig::default();
+        let params = InvertedIndexParams {
+            with_position: true,
+            tokenizer_config,
+        };
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let new_words = ["elephant", "fig", "grape", "honeydew"];
+        let new_data = StringArray::from_iter_values(new_words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
+        let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(batch_iter, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,
+                index_names: None,
+            })
+            .await
+            .unwrap();
+
+        for &word in words.iter().chain(new_words.iter()) {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
+
+            assert_eq!(texts.len(), 1);
+            assert_eq!(texts[0], word);
+        }
     }
 
     #[tokio::test]

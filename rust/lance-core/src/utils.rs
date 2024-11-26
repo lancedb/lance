@@ -6,6 +6,7 @@ pub mod bit;
 pub mod cpu;
 pub mod deletion;
 pub mod futures;
+pub mod hash;
 pub mod mask;
 pub mod path;
 pub mod testing;

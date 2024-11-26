@@ -300,6 +300,13 @@ def test_fts_with_other_str_scalar_index(dataset):
     assert dataset.to_table(full_text_query=query).num_rows > 0
 
 
+def test_fts_all_deleted(dataset):
+    dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
+    first_row_doc = dataset.take(indices=[0], columns=["doc"]).column(0)[0].as_py()
+    dataset.delete(f"doc = '{first_row_doc}'")
+    dataset.to_table(full_text_query=first_row_doc)
+
+
 def test_bitmap_index(tmp_path: Path):
     """Test create bitmap index"""
     tbl = pa.Table.from_arrays(

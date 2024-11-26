@@ -454,7 +454,7 @@ impl PerValueCompressor for ValueEncoder {
 pub(crate) mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow_array::{Array, Int32Array};
+    use arrow_array::{Array, ArrayRef, Decimal128Array, Int32Array};
     use arrow_schema::{DataType, Field, TimeUnit};
     use rstest::rstest;
 
@@ -519,6 +519,20 @@ pub(crate) mod tests {
             let field = Field::new("", data_type.clone(), false);
             check_round_trip_encoding_random(field, version).await;
         }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_decimal128_dictionary_encoding() {
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let decimals: Vec<i32> = (0..100).collect();
+        let repeated_strings: Vec<_> = decimals
+            .iter()
+            .cycle()
+            .take(decimals.len() * 10000)
+            .map(|&v| Some(v as i128))
+            .collect();
+        let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]

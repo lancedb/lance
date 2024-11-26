@@ -23,7 +23,7 @@ use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
-use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
+use crate::encodings::physical::binary::{BinaryBlockEncoder, BinaryMiniBlockEncoder};
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
@@ -867,6 +867,15 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((encoder, encoding))
             }
+            DataBlock::VariableWidth(variable_width) => {
+                if variable_width.bits_per_offset == 32 {
+                    let encoder = Box::new(BinaryBlockEncoder::default());
+                    let encoding = ProtobufUtils::binary_block();
+                    Ok((encoder, encoding))
+                } else {
+                    todo!("Implement BlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -911,6 +920,17 @@ pub struct EncodingOptions {
     /// The encoder needs to know this so it figures the position of out-of-line
     /// buffers correctly
     pub buffer_alignment: u64,
+}
+
+impl Default for EncodingOptions {
+    fn default() -> Self {
+        Self {
+            cache_bytes_per_column: 8 * 1024 * 1024,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: 64,
+        }
+    }
 }
 
 /// A trait to pick which kind of field encoding to use for a field

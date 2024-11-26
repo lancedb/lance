@@ -9,6 +9,7 @@ fn main() -> Result<()> {
     let mut prost_build = prost_build::Config::new();
     prost_build.extern_path(".lance.file", "::lance_file::format::pb");
     prost_build.protoc_arg("--experimental_allow_proto3_optional");
+    prost_build.enable_type_names();
     prost_build.compile_protos(
         &[
             "./protos/table.proto",

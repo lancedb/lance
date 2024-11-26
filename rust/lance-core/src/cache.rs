@@ -114,6 +114,7 @@ impl FileMetadataCache {
 
     pub fn size(&self) -> usize {
         if let Some(cache) = self.cache.as_ref() {
+            cache.run_pending_tasks();
             cache.entry_count() as usize
         } else {
             0

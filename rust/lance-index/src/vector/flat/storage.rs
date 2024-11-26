@@ -210,6 +210,14 @@ impl DistCalculator for FlatDistanceCal<'_> {
         (self.distance_fn)(&self.query, vector)
     }
 
+    fn distance_all(&self) -> Vec<f32> {
+        let query = &self.query;
+        self.vectors
+            .chunks_exact(self.dimension)
+            .map(|vector| (self.distance_fn)(query, vector))
+            .collect()
+    }
+
     #[inline]
     fn prefetch(&self, id: u32) {
         let vector = self.get_vector(id);

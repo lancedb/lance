@@ -286,6 +286,7 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::Bitpack2(_) => unreachable!(),
         pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => unreachable!(),
         pb::array_encoding::ArrayEncoding::FsstMiniBlock(_) => unreachable!(),
+        pb::array_encoding::ArrayEncoding::BinaryBlock(_) => unreachable!(),
     }
 }
 

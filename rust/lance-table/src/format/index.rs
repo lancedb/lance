@@ -30,6 +30,12 @@ pub struct Index {
     ///
     /// If this is None, then this is unknown.
     pub fragment_bitmap: Option<RoaringBitmap>,
+
+    /// Metadata specific to the index type
+    ///
+    /// This is an Option because older versions of Lance may not have this defined.  However, it should always
+    /// be present in newer versions.
+    pub index_details: Option<prost_types::Any>,
 }
 
 impl DeepSizeOf for Index {
@@ -69,6 +75,7 @@ impl TryFrom<pb::IndexMetadata> for Index {
             fields: proto.fields,
             dataset_version: proto.dataset_version,
             fragment_bitmap,
+            index_details: proto.index_details,
         })
     }
 }
@@ -91,6 +98,7 @@ impl From<&Index> for pb::IndexMetadata {
             fields: idx.fields.clone(),
             dataset_version: idx.dataset_version,
             fragment_bitmap,
+            index_details: idx.index_details.clone(),
         }
     }
 }

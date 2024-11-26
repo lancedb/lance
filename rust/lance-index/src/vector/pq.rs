@@ -11,9 +11,10 @@ use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
+use distance::{build_distance_table_dot, compute_dot_distance};
 use lance_arrow::*;
 use lance_core::{Error, Result};
-use lance_linalg::distance::{dot_distance_batch, DistanceType, Dot, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
 use prost::Message;
@@ -22,7 +23,7 @@ use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADA
 use tracing::instrument;
 
 pub mod builder;
-mod distance;
+pub mod distance;
 pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
@@ -98,6 +99,26 @@ impl ProductQuantizer {
     where
         T::Native: Float + L2 + Dot,
     {
+        match self.num_bits {
+            4 => self.transform_impl::<4, T>(vectors),
+            8 => self.transform_impl::<8, T>(vectors),
+            _ => Err(Error::Index {
+                message: format!(
+                    "ProductQuantization: num_bits {} not supported",
+                    self.num_bits
+                ),
+                location: location!(),
+            }),
+        }
+    }
+
+    fn transform_impl<const NUM_BITS: u32, T: ArrowPrimitiveType>(
+        &self,
+        vectors: &dyn Array,
+    ) -> Result<ArrayRef>
+    where
+        T::Native: Float + L2 + Dot,
+    {
         let fsl = vectors.as_fixed_size_list_opt().ok_or(Error::Index {
             message: format!(
                 "Expect to be a FixedSizeList<float> vector array, got: {:?} array",
@@ -107,7 +128,15 @@ impl ProductQuantizer {
         })?;
         let num_sub_vectors = self.num_sub_vectors;
         let dim = self.dimension;
-        let num_bits = self.num_bits;
+        if NUM_BITS == 4 && num_sub_vectors % 2 != 0 {
+            return Err(Error::Index {
+                message: format!(
+                    "PQ: num_sub_vectors must be divisible by 2 for num_bits=4, but got {}",
+                    num_sub_vectors,
+                ),
+                location: location!(),
+            });
+        }
         let codebook = self.codebook.values().as_primitive::<T>();
 
         let distance_type = self.distance_type;
@@ -118,26 +147,40 @@ impl ProductQuantizer {
             .values()
             .chunks_exact(dim)
             .flat_map(|vector| {
-                vector
+                let sub_vec_code = vector
                     .chunks_exact(sub_dim)
                     .enumerate()
                     .map(|(sub_idx, sub_vector)| {
-                        let centroids = get_sub_vector_centroids(
+                        let centroids = get_sub_vector_centroids::<NUM_BITS, _>(
                             codebook.values(),
                             dim,
-                            num_bits,
                             num_sub_vectors,
                             sub_idx,
                         );
-                        compute_partition(centroids, sub_vector, distance_type).map(|v| v as u8)
+                        compute_partition(centroids, sub_vector, distance_type).unwrap() as u8
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                if NUM_BITS == 4 {
+                    sub_vec_code
+                        .chunks_exact(2)
+                        .map(|v| (v[1] << 4) | v[0])
+                        .collect::<Vec<_>>()
+                } else {
+                    sub_vec_code
+                }
             })
             .collect::<Vec<_>>();
 
+        let num_sub_vectors_in_byte = if NUM_BITS == 4 {
+            num_sub_vectors / 2
+        } else {
+            num_sub_vectors
+        };
+
+        debug_assert_eq!(values.len(), fsl.len() * num_sub_vectors_in_byte);
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(values),
-            self.num_sub_vectors as i32,
+            num_sub_vectors_in_byte as i32,
         )?))
     }
 
@@ -150,6 +193,12 @@ impl ProductQuantizer {
         match self.distance_type {
             DistanceType::L2 => self.l2_distances(query, code),
             DistanceType::Cosine => {
+                // it seems we implemented cosine distance at some version,
+                // but from now on, we should use normalized L2 distance.
+                debug_assert!(
+                    false,
+                    "cosine distance should be converted to normalized L2 distance"
+                );
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2
@@ -211,31 +260,19 @@ impl ProductQuantizer {
     where
         T::Native: Dot,
     {
-        let capacity = self.num_sub_vectors * num_centroids(self.num_bits);
-        let mut distance_table = Vec::with_capacity(capacity);
+        let distance_table = build_distance_table_dot(
+            self.codebook.values().as_primitive::<T>().values(),
+            self.num_bits,
+            self.num_sub_vectors,
+            key.values(),
+        );
 
-        let sub_vector_length = self.dimension / self.num_sub_vectors;
-        key.values()
-            .chunks_exact(sub_vector_length)
-            .enumerate()
-            .for_each(|(sub_vec_id, sub_vec)| {
-                let subvec_centroids = self.centroids::<T>(sub_vec_id);
-                let distances = dot_distance_batch(sub_vec, subvec_centroids, sub_vector_length);
-                distance_table.extend(distances);
-            });
-
-        let num_vectors = code.len() / self.num_sub_vectors;
-        let mut distances = vec![0.0; num_vectors];
-        let num_centroids = num_centroids(self.num_bits);
-        for (sub_vec_idx, vec_indices) in code.values().chunks_exact(num_vectors).enumerate() {
-            let dist_table = &distance_table[sub_vec_idx * num_centroids..];
-            vec_indices
-                .iter()
-                .zip(distances.iter_mut())
-                .for_each(|(&centroid_idx, sum)| {
-                    *sum += dist_table[centroid_idx as usize];
-                });
-        }
+        let distances = compute_dot_distance(
+            &distance_table,
+            self.num_bits,
+            self.num_sub_vectors,
+            code.values(),
+        );
         Ok(distances.into())
     }
 
@@ -302,13 +339,24 @@ impl ProductQuantizer {
     ///
     /// Returns a flatten `num_centroids * sub_vector_width` f32 array.
     pub fn centroids<T: ArrowPrimitiveType>(&self, sub_vector_idx: usize) -> &[T::Native] {
-        get_sub_vector_centroids(
-            self.codebook.values().as_primitive::<T>().values(),
-            self.dimension,
-            self.num_bits,
-            self.num_sub_vectors,
-            sub_vector_idx,
-        )
+        match self.num_bits {
+            4 => get_sub_vector_centroids::<4, _>(
+                self.codebook.values().as_primitive::<T>().values(),
+                self.dimension,
+                self.num_sub_vectors,
+                sub_vector_idx,
+            ),
+            8 => get_sub_vector_centroids::<8, _>(
+                self.codebook.values().as_primitive::<T>().values(),
+                self.dimension,
+                self.num_sub_vectors,
+                sub_vector_idx,
+            ),
+            _ => panic!(
+                "ProductQuantization: num_bits {} not supported",
+                self.num_bits
+            ),
+        }
     }
 }
 

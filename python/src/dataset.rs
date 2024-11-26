@@ -31,7 +31,7 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::MaterializationStyle;
 use lance::dataset::transaction::{
-    validate_operation, RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex,
+    RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex, Transaction,
 };
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
@@ -40,7 +40,9 @@ use lance::dataset::{
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
-use lance::dataset::{BatchInfo, BatchUDF, NewColumnTransform, UDFCheckpointStore};
+use lance::dataset::{
+    BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
+};
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
@@ -61,15 +63,15 @@ use lance_table::format::Fragment;
 use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
+use pyo3::exceptions::{PyNotImplementedError, PyStopIteration, PyTypeError};
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
+use pyo3::{intern, prelude::*};
 use snafu::{location, Location};
 use uuid::Uuid;
 
@@ -353,12 +355,39 @@ impl Operation {
             fields,
             dataset_version,
             fragment_bitmap: Some(fragment_ids.into_iter().collect()),
+            // TODO: we should use lance::dataset::Dataset::commit_existing_index once
+            // we have a way to determine index details from an existing index.
+            index_details: None,
         }];
         let op = LanceOperation::CreateIndex {
             new_indices,
             removed_indices: vec![],
         };
         Ok(Self(op))
+    }
+
+    /// Convert to a pydict that can be used as kwargs into the Operation dataclasses
+    fn to_dict<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        match &self.0 {
+            LanceOperation::Append { fragments } => {
+                let fragments = fragments
+                    .iter()
+                    .cloned()
+                    .map(FragmentMetadata::new)
+                    .map(|f| f.into_py(py))
+                    .collect::<Vec<_>>();
+                dict.set_item("fragments", fragments).unwrap();
+            }
+            _ => {
+                return Err(PyNotImplementedError::new_err(format!(
+                    "Operation.to_dict is not implemented for this operation: {:?}",
+                    self.0
+                )));
+            }
+        }
+
+        Ok(dict)
     }
 }
 
@@ -1378,15 +1407,17 @@ impl Dataset {
         Session::new(self.ds.session())
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     fn commit(
-        dataset_uri: &str,
+        dest: &Bound<PyAny>,
         operation: Operation,
         read_version: Option<u64>,
         commit_lock: Option<&PyAny>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
+        max_retries: Option<u32>,
     ) -> PyResult<Self> {
         let object_store_params =
             storage_options
@@ -1400,52 +1431,101 @@ impl Dataset {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
                 as Arc<dyn CommitHandler>
         });
+
+        let dest = if dest.is_instance_of::<Self>() {
+            let dataset: Self = dest.extract()?;
+            WriteDestination::Dataset(dataset.ds.clone())
+        } else {
+            WriteDestination::Uri(dest.extract()?)
+        };
+
+        let transaction =
+            Transaction::new(read_version.unwrap_or_default(), operation.0, None, None);
+
+        let mut builder = CommitBuilder::new(dest)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
+            .with_detached(detached.unwrap_or(false))
+            .with_max_retries(max_retries.unwrap_or(20));
+
+        if let Some(store_params) = object_store_params {
+            builder = builder.with_store_params(store_params);
+        }
+
+        if let Some(commit_handler) = commit_handler {
+            builder = builder.with_commit_handler(commit_handler);
+        }
+
         let ds = RT
-            .block_on(commit_lock.map(|cl| cl.py()), async move {
-                let mut builder = DatasetBuilder::from_uri(dataset_uri);
-                if let Some(storage_options) = storage_options {
-                    builder = builder.with_storage_options(storage_options);
-                }
-                if let Some(read_version) = read_version {
-                    builder = builder.with_version(read_version);
-                }
-                let dataset = match builder.load().await {
-                    Ok(ds) => Some(ds),
-                    Err(lance::Error::DatasetNotFound { .. }) => None,
-                    Err(err) => return Err(err),
-                };
-                let manifest = dataset.as_ref().map(|ds| ds.manifest());
-                validate_operation(manifest, &operation.0)?;
-                let object_store_registry = Arc::new(lance::io::ObjectStoreRegistry::default());
-                if detached.unwrap_or(false) {
-                    LanceDataset::commit_detached(
-                        dataset_uri,
-                        operation.0,
-                        read_version,
-                        object_store_params,
-                        commit_handler,
-                        object_store_registry,
-                        enable_v2_manifest_paths.unwrap_or(false),
-                    )
-                    .await
-                } else {
-                    LanceDataset::commit(
-                        dataset_uri,
-                        operation.0,
-                        read_version,
-                        object_store_params,
-                        commit_handler,
-                        object_store_registry,
-                        enable_v2_manifest_paths.unwrap_or(false),
-                    )
-                    .await
-                }
-            })?
-            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            .block_on(commit_lock.map(|cl| cl.py()), builder.execute(transaction))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let uri = ds.uri().to_string();
         Ok(Self {
             ds: Arc::new(ds),
-            uri: dataset_uri.to_string(),
+            uri,
         })
+    }
+
+    #[staticmethod]
+    fn commit_batch<'py>(
+        dest: &Bound<'py, PyAny>,
+        transactions: Vec<Bound<'py, PyAny>>,
+        commit_lock: Option<&'py PyAny>,
+        storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
+        max_retries: Option<u32>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let object_store_params =
+            storage_options
+                .as_ref()
+                .map(|storage_options| ObjectStoreParams {
+                    storage_options: Some(storage_options.clone()),
+                    ..Default::default()
+                });
+
+        let commit_handler = commit_lock.map(|commit_lock| {
+            Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
+                as Arc<dyn CommitHandler>
+        });
+
+        let py = dest.py();
+        let dest = if dest.is_instance_of::<Dataset>() {
+            let dataset: Dataset = dest.extract()?;
+            WriteDestination::Dataset(dataset.ds.clone())
+        } else {
+            WriteDestination::Uri(dest.extract()?)
+        };
+
+        let mut builder = CommitBuilder::new(dest)
+            .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
+            .with_detached(detached.unwrap_or(false))
+            .with_max_retries(max_retries.unwrap_or(20));
+
+        if let Some(store_params) = object_store_params {
+            builder = builder.with_store_params(store_params);
+        }
+
+        if let Some(commit_handler) = commit_handler {
+            builder = builder.with_commit_handler(commit_handler);
+        }
+
+        let transactions = transactions
+            .into_iter()
+            .map(|transaction| extract_transaction(&transaction))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let res = RT
+            .block_on(Some(py), builder.execute_batch(transactions))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let uri = res.dataset.uri().to_string();
+        let ds = Self {
+            ds: Arc::new(res.dataset),
+            uri,
+        };
+        let merged = export_transaction(&res.merged, py)?.to_object(py);
+        let ds = ds.into_py(py);
+        Ok(PyTuple::new_bound(py, [ds, merged]))
     }
 
     fn validate(&self) -> PyResult<()> {
@@ -1543,24 +1623,34 @@ impl Dataset {
 }
 
 #[pyfunction(name = "_write_dataset")]
-pub fn write_dataset(reader: &Bound<PyAny>, uri: String, options: &PyDict) -> PyResult<Dataset> {
+pub fn write_dataset(
+    reader: &Bound<PyAny>,
+    dest: &Bound<PyAny>,
+    options: &PyDict,
+) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
+    let dest = if dest.is_instance_of::<Dataset>() {
+        let dataset: Dataset = dest.extract()?;
+        WriteDestination::Dataset(dataset.ds.clone())
+    } else {
+        WriteDestination::Uri(dest.extract()?)
+    };
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
+        RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        RT.block_on(Some(py), LanceDataset::write(batches, &uri, params))?
+        RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
     Ok(Dataset {
-        uri,
+        uri: ds.uri().to_string(),
         ds: Arc::new(ds),
     })
 }
@@ -1960,4 +2050,60 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             )
         })
     }
+}
+
+/// py_transaction is a dataclass with attributes
+/// read_version: int
+/// uuid: str
+/// operation: LanceOperation.BaseOperation
+/// blobs_op: Optional[LanceOperation.BaseOperation] = None
+fn extract_transaction(py_transaction: &Bound<PyAny>) -> PyResult<Transaction> {
+    let py = py_transaction.py();
+    let read_version = py_transaction.getattr("read_version")?.extract()?;
+    let uuid = py_transaction.getattr("uuid")?.extract()?;
+    let operation: Operation = py_transaction
+        .getattr("operation")?
+        .call_method0(intern!(py, "_to_inner"))?
+        .extract()?;
+    let operation = operation.0;
+    let blobs_op: Option<Operation> = {
+        let blobs_op: Option<Bound<PyAny>> = py_transaction.getattr("blobs_op")?.extract()?;
+        if let Some(blobs_op) = blobs_op {
+            Some(blobs_op.call_method0(intern!(py, "_to_inner"))?.extract()?)
+        } else {
+            None
+        }
+    };
+    let blobs_op = blobs_op.map(|op| op.0);
+    Ok(Transaction {
+        read_version,
+        uuid,
+        operation,
+        blobs_op,
+        tag: None,
+    })
+}
+
+// Exports to a pydict of kwargs to instantiation the python Transaction dataclass.
+fn export_transaction<'a>(
+    transaction: &Transaction,
+    py: Python<'a>,
+) -> PyResult<Bound<'a, PyDict>> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("read_version", transaction.read_version)?;
+    dict.set_item("uuid", transaction.uuid.clone())?;
+    dict.set_item(
+        "operation",
+        Operation(transaction.operation.clone()).to_dict(py)?,
+    )?;
+    dict.set_item(
+        "blobs_op",
+        transaction
+            .blobs_op
+            .clone()
+            .map(Operation)
+            .map(|op| op.to_dict(py))
+            .transpose()?,
+    )?;
+    Ok(dict)
 }
