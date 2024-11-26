@@ -3209,6 +3209,7 @@ dependencies = [
  "arrow-data 53.3.0",
  "arrow-schema 53.3.0",
  "arrow-select 53.3.0",
+ "bytes",
  "getrandom",
  "half",
  "num-traits",

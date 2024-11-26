@@ -26,6 +26,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use lance_arrow::BufferExt;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
@@ -224,7 +225,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
                 .null_bit_buffer(null_buf);
         }
 
-        let buf = Buffer::from_vec(bytes.into());
+        let buf = Buffer::from_bytes_bytes(bytes, /*bytes_per_value=*/ 1);
         let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(buf)

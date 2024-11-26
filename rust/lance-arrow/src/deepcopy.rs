@@ -8,7 +8,7 @@ use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::ArrayData;
 
 pub fn deep_copy_buffer(buffer: &Buffer) -> Buffer {
-    Buffer::from(Vec::from(buffer.as_slice()))
+    Buffer::from(buffer.as_slice())
 }
 
 fn deep_copy_nulls(nulls: &NullBuffer) -> Buffer {
