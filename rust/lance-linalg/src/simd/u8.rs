@@ -186,8 +186,8 @@ impl SIMD<u8, 16> for u8x16 {
     fn reduce_min(&self) -> u8 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let low = _mm_and_si128(vec, _mm_set1_epi8(0xFF));
-            let high = _mm_srli_si128(vec, 8);
+            let low = _mm_and_si128(self.0, _mm_set1_epi8(0xFF));
+            let high = _mm_srli_si128(self.0, 8);
             let min_low = _mm_min_epu8(low, high);
             let min_low = _mm_min_epu8(min_low, _mm_srli_si128(min_low, 4));
             let min_low = _mm_min_epu8(min_low, _mm_srli_si128(min_low, 2));
