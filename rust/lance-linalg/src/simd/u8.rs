@@ -139,7 +139,7 @@ impl SIMD<u8, 16> for u8x16 {
     unsafe fn store(&self, ptr: *mut u8) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            _mm_storeu_si128(ptr as *mut i8, self.0)
+            _mm_storeu_si128(ptr as *mut __m128i, self.0)
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
@@ -152,7 +152,7 @@ impl SIMD<u8, 16> for u8x16 {
     unsafe fn store_unaligned(&self, ptr: *mut u8) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            _mm_storeu_epi8(ptr as *mut i8, self.0)
+            _mm_storeu_si128(ptr as *mut __m128i, self.0)
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
