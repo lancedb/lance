@@ -113,7 +113,7 @@ impl SIMD<u8, 16> for u8x16 {
 
     #[inline]
     unsafe fn load(ptr: *const u8) -> Self {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         unsafe {
             Self(_mm_loadu_epi8(ptr as *const i8))
         }
@@ -137,7 +137,7 @@ impl SIMD<u8, 16> for u8x16 {
 
     #[inline]
     unsafe fn store(&self, ptr: *mut u8) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         unsafe {
             _mm_storeu_epi8(ptr as *mut i8, self.0)
         }
