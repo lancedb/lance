@@ -282,7 +282,15 @@ impl Mul for u8x16 {
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm_mullo_epi16(self.0, rhs.0))
+            let a_lo = _mm_unpacklo_epi8(self.0, _mm_setzero_si128());
+            let a_hi = _mm_unpackhi_epi8(self.0, _mm_setzero_si128());
+            let b_lo = _mm_unpacklo_epi8(rhs.0, _mm_setzero_si128());
+            let b_hi = _mm_unpackhi_epi8(rhs.0, _mm_setzero_si128());
+
+            let res_lo = _mm_mullo_epi16(a_lo, b_lo);
+            let res_hi = _mm_mullo_epi16(a_hi, b_hi);
+
+            Self(_mm_packus_epi16(res_lo, res_hi))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
