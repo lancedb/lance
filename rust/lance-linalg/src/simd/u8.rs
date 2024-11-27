@@ -15,7 +15,7 @@ use std::arch::x86_64::*;
 use std::mem::transmute;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
-use super::SIMD;
+use super::{Shuffle, SIMD};
 
 /// 16 of 8-bit `u8` values.
 #[allow(non_camel_case_types)]
@@ -43,6 +43,22 @@ impl u8x16 {
         #[cfg(target_arch = "loongarch64")]
         unsafe {
             Self(lasx_xvfand_b(self.0, mask))
+        }
+    }
+
+    #[inline]
+    pub fn right_shift_4(self) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm_srli_epi16(self.0, 4))
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(vshrq_n_u8::<4>(self.0))
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvfrsh_b(self.0, 4))
         }
     }
 }
@@ -202,6 +218,23 @@ impl SIMD<u8, 16> for u8x16 {
     }
 }
 
+impl Shuffle for u8x16 {
+    fn shuffle(&self, indices: u8x16) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            Self(_mm_shuffle_epi8(self.0, indices.0))
+        }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            Self(vqtbl1q_u8(self.0, indices.0))
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            Self(lasx_xvqtbl_b(self.0, indices.0))
+        }
+    }
+}
+
 impl Add for u8x16 {
     type Output = Self;
 
@@ -213,7 +246,7 @@ impl Add for u8x16 {
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            Self(vaddq_u8(self.0, rhs.0))
+            Self(vqaddq_u8(self.0, rhs.0))
         }
         #[cfg(target_arch = "loongarch64")]
         unsafe {

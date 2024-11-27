@@ -5,7 +5,6 @@ use core::panic;
 use std::cmp::min;
 
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
-use lance_linalg::simd::f32::f32x16;
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
@@ -100,14 +99,14 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
 ///  The squared L2 distance.
 ///
 #[inline]
-pub(super) fn compute_l2_distance(
+pub(super) fn compute_pq_distance(
     distance_table: &[f32],
     num_bits: u32,
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
     if num_bits == 4 {
-        return compute_l2_distance_4bit(distance_table, num_sub_vectors, code);
+        return compute_pq_distance_4bit(distance_table, num_sub_vectors, code);
     }
     // here `code` has been transposed,
     // so code[i][j] is the code of i-th sub-vector of the j-th vector,
@@ -133,7 +132,7 @@ pub(super) fn compute_l2_distance(
 }
 
 #[inline]
-pub(super) fn compute_l2_distance_4bit(
+pub(super) fn compute_pq_distance_4bit(
     distance_table: &[f32],
     num_sub_vectors: usize,
     code: &[u8],
@@ -141,24 +140,50 @@ pub(super) fn compute_l2_distance_4bit(
     let (_, _, distance_table) = quantize_distance_table(distance_table);
     let num_vectors = code.len() * 2 / num_sub_vectors;
     // store the distances in u32 to avoid overflow
-    let mut distances = vec![0u32; num_vectors];
+    let mut distances = vec![0u8; num_vectors];
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
-        let dist_table =
-            &distance_table[sub_vec_idx * 2 * NUM_CENTROIDS..(sub_vec_idx * 2 + 1) * NUM_CENTROIDS];
-        let dist_table_next = &distance_table
-            [(sub_vec_idx * 2 + 1) * NUM_CENTROIDS..(sub_vec_idx * 2 + 2) * NUM_CENTROIDS];
         debug_assert_eq!(vec_indices.len(), distances.len());
-        vec_indices
-            .iter()
-            .zip(distances.iter_mut())
-            .for_each(|(&centroid_idx, sum)| {
-                // for 4bit PQ, `centroid_idx` is 2 index, each index is 4bit.
+        let dist_table = unsafe {
+            u8x16::load_unaligned(distance_table.as_ptr().add(sub_vec_idx * 2 * NUM_CENTROIDS))
+        };
+        let next_dist_table = unsafe {
+            u8x16::load_unaligned(
+                distance_table
+                    .as_ptr()
+                    .add((sub_vec_idx * 2 + 1) * NUM_CENTROIDS),
+            )
+        };
+        for i in (0..num_vectors - NUM_CENTROIDS + 1).step_by(NUM_CENTROIDS) {
+            let vec_indices = unsafe { u8x16::load_unaligned(vec_indices.as_ptr().add(i)) };
+            let distances = &mut distances[i..i + NUM_CENTROIDS];
+            let results = unsafe { u8x16::load_unaligned(distances.as_ptr()) };
+
+            // compute current distances
+            let current_indices = vec_indices.bit_and(0x0F);
+            let results = results + dist_table.shuffle(current_indices);
+
+            // compute next distances
+            let next_indices = vec_indices.right_shift_4();
+            let results = results + next_dist_table.shuffle(next_indices);
+
+            unsafe {
+                results.store_unaligned(distances.as_mut_ptr());
+            }
+        }
+        let remainder = num_vectors % NUM_CENTROIDS;
+        if remainder > 0 {
+            let vec_indices = &vec_indices[num_vectors - remainder..];
+            let distances = &mut distances[num_vectors - remainder..];
+            let dist_table = &distance_table[sub_vec_idx * 2 * NUM_CENTROIDS..];
+            let next_dist_table = &distance_table[(sub_vec_idx * 2 + 1) * NUM_CENTROIDS..];
+            for (i, &centroid_idx) in vec_indices.iter().enumerate() {
                 let current_idx = centroid_idx & 0xF;
                 let next_idx = centroid_idx >> 4;
-                *sum += dist_table[current_idx as usize] as u32;
-                *sum += dist_table_next[next_idx as usize] as u32;
-            });
+                distances[i] += dist_table[current_idx as usize];
+                distances[i] += next_dist_table[next_idx as usize];
+            }
+        }
     }
 
     // cast u32 to f32
@@ -168,24 +193,27 @@ pub(super) fn compute_l2_distance_4bit(
 
 // Quantize the distance table to u8
 // returns (min, max, quantized_distance_table)
+// used for only 4bit PQ so num_centroids must be 16
 #[inline]
 fn quantize_distance_table(distance_table: &[f32]) -> (f32, f32, Vec<u8>) {
-    // don't use ScalarQuantizer here, because it would introduce some overhead.
-    let min_dist = distance_table.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_dist = distance_table
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    const NUM_CENTROIDS: usize = 16;
+    // we set qmax to the maximum possible distance,
+    // then no need to handle overflow
+    let qmin = distance_table.iter().cloned().fold(f32::INFINITY, f32::min);
+    let qmax = distance_table
+        .chunks(NUM_CENTROIDS)
+        .map(|chunk| chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
+        .sum::<f32>();
     let quantized_dist_table = distance_table
         .iter()
         .map(|&dist| {
-            ((dist - min_dist) * 255.0 / (max_dist - min_dist))
+            ((dist - qmin) * 255.0 / (qmax - qmin))
                 .round()
                 .to_u8()
-                .unwrap()
+                .unwrap_or(u8::MAX)
         })
         .collect();
-    (min_dist, max_dist, quantized_dist_table)
+    (qmin, qmax, quantized_dist_table)
 }
 
 /// Compute L2 distance from the query to all code without transposing the code.
@@ -231,62 +259,6 @@ fn compute_l2_distance_without_transposing<const C: usize, const V: usize>(
     distances.chain(remainder).collect()
 }
 
-#[inline]
-pub fn compute_dot_distance(
-    distance_table: &[f32],
-    num_bits: u32,
-    num_sub_vectors: usize,
-    code: &[u8],
-) -> Vec<f32> {
-    if num_bits == 4 {
-        return compute_dot_distance_4bit(distance_table, num_sub_vectors, code);
-    }
-    let num_vectors = code.len() / num_sub_vectors;
-    let mut distances = vec![0.0; num_vectors];
-    let num_centroids = num_centroids(num_bits);
-    for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
-        let dist_table = &distance_table[sub_vec_idx * num_centroids..];
-        vec_indices
-            .iter()
-            .zip(distances.iter_mut())
-            .for_each(|(&centroid_idx, sum)| {
-                *sum += dist_table[centroid_idx as usize];
-            });
-    }
-
-    distances
-}
-
-#[inline]
-pub fn compute_dot_distance_4bit(
-    distance_table: &[f32],
-    num_sub_vectors: usize,
-    code: &[u8],
-) -> Vec<f32> {
-    let num_vectors = code.len() * 2 / num_sub_vectors;
-    let mut distances = vec![0.0; num_vectors];
-    const NUM_CENTROIDS: usize = 2_usize.pow(4);
-    for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
-        let dist_table =
-            &distance_table[sub_vec_idx * 2 * NUM_CENTROIDS..(sub_vec_idx * 2 + 1) * NUM_CENTROIDS];
-        let dist_table_next = &distance_table
-            [(sub_vec_idx * 2 + 1) * NUM_CENTROIDS..(sub_vec_idx * 2 + 2) * NUM_CENTROIDS];
-        debug_assert_eq!(vec_indices.len(), distances.len());
-        vec_indices
-            .iter()
-            .zip(distances.iter_mut())
-            .for_each(|(&centroid_idx, sum)| {
-                // for 4bit PQ, `centroid_idx` is 2 index, each index is 4bit.
-                let current_idx = centroid_idx & 0xF;
-                let next_idx = centroid_idx >> 4;
-                *sum += dist_table[current_idx as usize];
-                *sum += dist_table_next[next_idx as usize];
-            });
-    }
-
-    distances
-}
-
 #[cfg(test)]
 mod tests {
     use crate::vector::pq::storage::transpose;
@@ -308,7 +280,7 @@ mod tests {
         let pq_codes = Vec::from_iter((0..num_vectors * num_sub_vectors).map(|v| v as u8));
         let pq_codes = UInt8Array::from_iter_values(pq_codes);
         let transposed_codes = transpose(&pq_codes, num_vectors, num_sub_vectors);
-        let distances = compute_l2_distance(
+        let distances = compute_pq_distance(
             &distance_table,
             num_bits,
             num_sub_vectors,

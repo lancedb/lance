@@ -692,9 +692,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.8)]
+    #[case(4, DistanceType::L2, 0.8)]
+    #[case(4, DistanceType::Cosine, 0.8)]
+    #[case(4, DistanceType::Dot, 0.4)]
     #[tokio::test]
     async fn test_build_ivf_pq_4bit(
         #[case] nlist: usize,
