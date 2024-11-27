@@ -50,7 +50,9 @@ impl u8x16 {
     pub fn right_shift_4(self) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            Self(_mm_srli_epi16(self.0, 4))
+            let shifted = _mm_srli_epi16(self.0, 4);
+            let mask = _mm_set1_epi8(0x0F);
+            Self(_mm_and_si128(shifted, mask))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
