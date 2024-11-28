@@ -347,28 +347,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_basic_ops() {
-        let a = (0..16).map(|f| f as u8).collect::<Vec<_>>();
-        let b = (16..32).map(|f| f as u8).collect::<Vec<_>>();
-
-        let simd_a = unsafe { u8x16::load_unaligned(a.as_ptr()) };
-        let simd_b = unsafe { u8x16::load_unaligned(b.as_ptr()) };
-
-        let simd_add = simd_a + simd_b;
-        (0..16)
-            .zip(simd_add.as_array().iter())
-            .for_each(|(x, &y)| assert_eq!((x + x + 16) as u8, y));
-
-        let simd_mul = simd_a * simd_b;
-        (0..16)
-            .zip(simd_mul.as_array().iter())
-            .for_each(|(x, &y)| assert_eq!((x * (x + 16)) as u8, y));
-
-        let simd_sub = simd_b - simd_a;
-        simd_sub.as_array().iter().for_each(|&v| assert_eq!(v, 16));
-    }
-
-    #[test]
     fn test_basic_u8x16_ops() {
         let a = (0..16).map(|f| f as u8).collect::<Vec<_>>();
         let b = (16..32).map(|f| f as u8).collect::<Vec<_>>();
