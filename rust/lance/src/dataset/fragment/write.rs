@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::borrow::Cow;
-use std::sync::Arc;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
@@ -17,6 +15,8 @@ use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use snafu::{location, Location};
+use std::borrow::Cow;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::dataset::builder::DatasetBuilder;
@@ -160,9 +160,16 @@ impl<'a> FragmentCreateBuilder<'a> {
             self.dataset_uri,
             &params.store_params.clone().unwrap_or_default(),
         )
-            .await?;
-        do_write_fragments(Arc::new(object_store), &base_path, &schema, stream,
-                           params.into_owned(), LanceFileVersion::Stable).await
+        .await?;
+        do_write_fragments(
+            Arc::new(object_store),
+            &base_path,
+            &schema,
+            stream,
+            params.into_owned(),
+            LanceFileVersion::Stable,
+        )
+        .await
     }
 
     async fn write_impl(
@@ -443,7 +450,6 @@ mod tests {
         assert_eq!(fragments[0].files.len(), 1);
         assert_eq!(fragments[0].files[0].fields, vec![0, 1]);
     }
-
 
     #[tokio::test]
     async fn test_write_fragments_with_options() {
