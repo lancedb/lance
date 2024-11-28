@@ -29,7 +29,6 @@ use lance_datafusion::utils::StreamingWriteSource;
 use crate::error::{Error, Result};
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
-    ffi::JNIEnvExt,
     traits::FromJString,
     utils::extract_write_params,
     RT,
