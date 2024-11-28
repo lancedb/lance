@@ -1,28 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
 use criterion::{criterion_group, criterion_main, Criterion};
+use object_store::ObjectStore;
+#[cfg(target_os = "linux")]
+use pprof::criterion::{Output, PProfProfiler};
+use rand::Rng;
+use url::Url;
 
+use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance::{
     arrow::FixedSizeListArrayExt,
     dataset::{builder::DatasetBuilder, ProjectionRequest},
 };
 use lance_file::version::LanceFileVersion;
 use lance_table::io::commit::RenameCommitHandler;
-use object_store::ObjectStore;
-#[cfg(target_os = "linux")]
-use pprof::criterion::{Output, PProfProfiler};
-use rand::Rng;
-use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
-use url::Url;
-
-use lance::dataset::{Dataset, WriteMode, WriteParams};
 
 const BATCH_SIZE: u64 = 1024;
 
@@ -198,6 +198,7 @@ criterion_group!(
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_random_take);
+
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
