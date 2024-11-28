@@ -225,17 +225,20 @@ public class ScannerTest {
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      int[] fragment0 = new int[]{0, 3};
-      int[] fragment1 = new int[]{1, 5};
-      int[] fragment2 = new int[]{2, 7};
-      FragmentMetadata metadata0 = testDataset.createNewFragment(fragment0[0], fragment0[1]);
-      FragmentMetadata metadata1 = testDataset.createNewFragment(fragment1[0], fragment1[1]);
-      FragmentMetadata metadata2 = testDataset.createNewFragment(fragment2[0], fragment2[1]);
+      int rowCount0 = 3;
+      int rowCount1 = 5;
+      int rowCount2 = 7;
+      FragmentMetadata metadata0 = testDataset.createNewFragment(rowCount0);
+      FragmentMetadata metadata1 = testDataset.createNewFragment(rowCount1);
+      FragmentMetadata metadata2 = testDataset.createNewFragment(rowCount2);
+      int fragmentId0 = metadata0.getId();
+      int fragmentId1 = metadata1.getId();
+      int fragmentId2 = metadata2.getId();
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        validScanResult(dataset, fragment0[0], fragment0[1]);
-        validScanResult(dataset, fragment1[0], fragment1[1]);
-        validScanResult(dataset, fragment2[0], fragment2[1]);
+        validScanResult(dataset, fragmentId0, rowCount0);
+        validScanResult(dataset, fragmentId1, rowCount1);
+        validScanResult(dataset, fragmentId2, rowCount2);
       }
     }
   }
@@ -249,12 +252,14 @@ public class ScannerTest {
       int[] fragment0 = new int[]{0, 3};
       int[] fragment1 = new int[]{1, 5};
       int[] fragment2 = new int[]{2, 7};
-      FragmentMetadata metadata0 = testDataset.createNewFragment(fragment0[0], fragment0[1]);
-      FragmentMetadata metadata1 = testDataset.createNewFragment(fragment1[0], fragment1[1]);
-      FragmentMetadata metadata2 = testDataset.createNewFragment(fragment2[0], fragment2[1]);
+      FragmentMetadata metadata0 = testDataset.createNewFragment(fragment0[1]);
+      FragmentMetadata metadata1 = testDataset.createNewFragment(fragment1[1]);
+      FragmentMetadata metadata2 = testDataset.createNewFragment(fragment2[1]);
+      int fragmentId1 = metadata1.getId();
+      int fragmentId2 = metadata2.getId();
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(1, 2)).build())) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(fragmentId1, fragmentId2)).build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
             int rowcount = 0;

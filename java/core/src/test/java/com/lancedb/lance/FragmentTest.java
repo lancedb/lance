@@ -21,7 +21,7 @@ import com.lancedb.lance.ipc.LanceScanner;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.List;
 import java.util.Optional;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -37,7 +37,7 @@ public class FragmentTest {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      testDataset.createNewFragment(123, 20);
+      testDataset.createNewFragment(20);
     }
   }
 
@@ -47,9 +47,8 @@ public class FragmentTest {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      int fragmentId = 312;
       int rowCount = 21;
-      FragmentMetadata fragmentMeta = testDataset.createNewFragment(fragmentId, rowCount);
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
 
       // Commit fragment
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
@@ -58,8 +57,7 @@ public class FragmentTest {
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
         DatasetFragment fragment = dataset.getFragments().get(0);
-        assertEquals(fragmentId, fragment.getId());
-  
+
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
@@ -74,7 +72,7 @@ public class FragmentTest {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      FragmentMetadata meta = testDataset.createNewFragment(123, 20);
+      FragmentMetadata meta = testDataset.createNewFragment(20);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(meta));
       assertThrows(IllegalArgumentException.class, () -> {
         Dataset.commit(allocator, datasetPath, appendOp, Optional.empty());
@@ -88,7 +86,7 @@ public class FragmentTest {
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      FragmentMetadata meta = testDataset.createNewFragment(123, 20);
+      FragmentMetadata meta = testDataset.createNewFragment(20);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(meta));
       assertThrows(IllegalArgumentException.class, () -> {
         Dataset.commit(allocator, datasetPath, appendOp, Optional.of(0L));
@@ -105,6 +103,28 @@ public class FragmentTest {
       assertThrows(IllegalArgumentException.class, () -> {
         new FragmentOperation.Append(new ArrayList<>());
       });
+    }
+  }
+
+  @Test
+  void testEmptyFragments() {
+    String datasetPath = tempDir.resolve("testEmptyFragments").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(0, 10);
+      assertEquals(0, fragments.size());
+    }
+  }
+
+  @Test
+  void testMultiFragments() {
+    String datasetPath = tempDir.resolve("testMultiFragments").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(20, 10);
+      assertEquals(2, fragments.size());
     }
   }
 }

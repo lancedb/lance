@@ -102,7 +102,7 @@ public class TestVectorDataset implements AutoCloseable {
       root.setRowCount(80);
 
       WriteParams fragmentWriteParams = new WriteParams.Builder().build();
-      return Fragment.create(datasetPath.toString(), allocator, root, Optional.of(batchIndex), fragmentWriteParams);
+      return Fragment.create(datasetPath.toString(), allocator, root, fragmentWriteParams).get(0);
     }
   }
 
@@ -127,8 +127,8 @@ public class TestVectorDataset implements AutoCloseable {
       root.setRowCount(10);
 
       WriteParams writeParams = new WriteParams.Builder().build();
-      fragmentMetadata = Fragment.create(datasetPath.toString(), allocator, root, Optional.empty(),
-          writeParams);
+      fragmentMetadata = Fragment.create(datasetPath.toString(), allocator, root,
+          writeParams).get(0);
     }
     FragmentOperation.Append appendOp = new FragmentOperation.Append(Collections.singletonList(fragmentMetadata));
     return Dataset.commit(allocator, datasetPath.toString(), appendOp, Optional.of(2L));

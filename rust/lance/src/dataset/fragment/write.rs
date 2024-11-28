@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::borrow::Cow;
-
+use std::sync::Arc;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
@@ -20,6 +20,7 @@ use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::write::do_write_fragments;
 use crate::dataset::{WriteMode, WriteParams, DATA_DIR};
 use crate::Result;
 
@@ -66,6 +67,15 @@ impl<'a> FragmentCreateBuilder<'a> {
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
         self.write_impl(stream, schema, id).await
+    }
+
+    /// Write multi fragment which separated by max_rows_per_file.
+    pub async fn write_fragments(
+        &self,
+        source: impl StreamingWriteSource,
+    ) -> Result<Vec<Fragment>> {
+        let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
+        self.write_fragments_v2_impl(stream, schema).await
     }
 
     async fn write_v2_impl(
@@ -135,6 +145,24 @@ impl<'a> FragmentCreateBuilder<'a> {
         progress.complete(&fragment).await?;
 
         Ok(fragment)
+    }
+    async fn write_fragments_v2_impl(
+        &self,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
+    ) -> Result<Vec<Fragment>> {
+        let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
+
+        Self::validate_schema(&schema, stream.schema().as_ref())?;
+
+        let (object_store, base_path) = ObjectStore::from_uri_and_params(
+            params.object_store_registry.clone(),
+            self.dataset_uri,
+            &params.store_params.clone().unwrap_or_default(),
+        )
+            .await?;
+        do_write_fragments(Arc::new(object_store), &base_path, &schema, stream,
+                           params.into_owned(), LanceFileVersion::Stable).await
     }
 
     async fn write_impl(
@@ -352,5 +380,93 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields, vec![3, 1]);
         assert_eq!(fragment.files[0].column_indices, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_validation() {
+        // Writing with empty schema produces an error
+        let empty_schema = Arc::new(ArrowSchema::empty());
+        let empty_reader = Box::new(RecordBatchIterator::new(vec![], empty_schema));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+            .write_fragments(empty_reader)
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::InvalidInput { source, .. }
+            if source.to_string().contains("Cannot write with an empty schema.")),
+            "{:?}",
+            &result
+        );
+
+        // Writing empty reader produces an error
+        let arrow_schema = test_data().schema();
+        let empty_reader = Box::new(RecordBatchIterator::new(vec![], arrow_schema.clone()));
+        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+            .write_fragments(empty_reader)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+
+        // Writing with incorrect schema produces an error.
+        let wrong_schema = arrow_schema
+            .as_ref()
+            .try_with_column(ArrowField::new("c", DataType::Utf8, false))
+            .unwrap();
+        let wrong_schema = Schema::try_from(&wrong_schema).unwrap();
+        let result = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+            .schema(&wrong_schema)
+            .write_fragments(test_data())
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::SchemaMismatch { difference, .. }
+            if difference.contains("fields did not match")),
+            "{:?}",
+            &result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_fragments_default_schema() {
+        // Infers schema and uses 0 as default field id
+        let data = test_data();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+            .write_fragments(data)
+            .await
+            .unwrap();
+
+        // If unspecified, the fragment id should be 0.
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].deletion_file, None);
+        assert_eq!(fragments[0].files.len(), 1);
+        assert_eq!(fragments[0].files[0].fields, vec![0, 1]);
+    }
+
+
+    #[tokio::test]
+    async fn test_write_fragments_with_options() {
+        // Uses provided schema. Field ids are correct in fragment metadata.
+        let data = test_data();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mut writer_params = WriteParams::default();
+        writer_params.max_rows_per_file = 1;
+        let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
+            .write_params(&writer_params)
+            .write_fragments(data)
+            .await
+            .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        assert_eq!(fragments[0].deletion_file, None);
+        assert_eq!(fragments[0].files.len(), 1);
+        assert_eq!(fragments[0].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[1].deletion_file, None);
+        assert_eq!(fragments[1].files.len(), 1);
+        assert_eq!(fragments[1].files[0].column_indices, vec![0, 1]);
+        assert_eq!(fragments[2].deletion_file, None);
+        assert_eq!(fragments[2].files.len(), 1);
+        assert_eq!(fragments[2].files[0].column_indices, vec![0, 1]);
     }
 }
