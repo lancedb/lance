@@ -377,13 +377,18 @@ mod tests {
         let simd_b = unsafe { u8x16::load_unaligned(b.as_ptr()) };
 
         let simd_add = simd_a + simd_b;
-        assert!((0..16)
+        (0..16)
             .zip(simd_add.as_array().iter())
-            .all(|(x, &y)| (x + x + 16) as u8 == y));
+            .for_each(|(x, &y)| assert_eq!((x + x + 16) as u8, y));
 
+        // on x86_64, the result of simd_mul is saturated
+        // on aarch64, the result of simd_mul is not saturated
         let simd_mul = simd_a * simd_b;
-        assert!((0..16)
-            .zip(simd_mul.as_array().iter())
-            .all(|(x, &y)| (x * (x + 16)) as u8 == y));
+        (0..16).zip(simd_mul.as_array().iter()).for_each(|(x, &y)| {
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(std::cmp::min(x * (x + 16), 255) as u8, y);
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(x * (x + 16) as u8, y);
+        });
     }
 }
