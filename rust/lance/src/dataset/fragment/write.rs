@@ -456,7 +456,10 @@ mod tests {
         // Uses provided schema. Field ids are correct in fragment metadata.
         let data = test_data();
         let tmp_dir = tempfile::tempdir().unwrap();
-        let writer_params = WriteParams { max_rows_per_file: 1, ..Default::default() };
+        let writer_params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
         let fragments = FragmentCreateBuilder::new(tmp_dir.path().to_str().unwrap())
             .write_params(&writer_params)
             .write_fragments(data)
