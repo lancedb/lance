@@ -364,9 +364,9 @@ mod tests {
         let simd_mul = simd_a * simd_b;
         (0..16).zip(simd_mul.as_array().iter()).for_each(|(x, &y)| {
             #[cfg(target_arch = "x86_64")]
-            assert_eq!(std::cmp::min(x * (x + 16), 255) as u8, y);
+            assert_eq!(std::cmp::min(x * (x + 16), 255_i32) as u8, y);
             #[cfg(target_arch = "aarch64")]
-            assert_eq!(x * (x + 16) as u8, y);
+            assert_eq!((x * (x + 16_i32)) as u8, y);
         });
     }
 }
