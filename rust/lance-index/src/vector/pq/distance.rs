@@ -6,9 +6,8 @@ use std::cmp::min;
 
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
-use lance_linalg::simd::{Shuffle, SIMD};
+use lance_linalg::simd::Shuffle;
 use lance_table::utils::LanceIteratorExtension;
-use num_traits::ToPrimitive;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 
@@ -137,17 +136,17 @@ pub(super) fn compute_pq_distance_4bit(
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
-    let (_, _, distance_table) = quantize_distance_table(distance_table);
+    let (qmin, qmax, distance_table) = quantize_distance_table(distance_table);
     let num_vectors = code.len() * 2 / num_sub_vectors;
     // store the distances in u32 to avoid overflow
-    let mut distances = vec![0u8; num_vectors];
+    let mut distances = vec![0.0f32; num_vectors];
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
         debug_assert_eq!(vec_indices.len(), distances.len());
-        let dist_table = unsafe {
+        let origin_dist_table = unsafe {
             u8x16::load_unaligned(distance_table.as_ptr().add(sub_vec_idx * 2 * NUM_CENTROIDS))
         };
-        let next_dist_table = unsafe {
+        let origin_next_dist_table = unsafe {
             u8x16::load_unaligned(
                 distance_table
                     .as_ptr()
@@ -157,19 +156,25 @@ pub(super) fn compute_pq_distance_4bit(
         for i in (0..num_vectors - NUM_CENTROIDS + 1).step_by(NUM_CENTROIDS) {
             let vec_indices = unsafe { u8x16::load_unaligned(vec_indices.as_ptr().add(i)) };
             let distances = &mut distances[i..i + NUM_CENTROIDS];
-            let results = unsafe { u8x16::load_unaligned(distances.as_ptr()) };
 
             // compute current distances
             let current_indices = vec_indices.bit_and(0x0F);
-            let results = results + dist_table.shuffle(current_indices);
+            let dist_table = origin_dist_table;
+            let results = dist_table.shuffle(current_indices);
+            debug_assert_eq!(dist_table.as_array(), origin_dist_table.as_array());
 
             // compute next distances
             let next_indices = vec_indices.right_shift_4();
+            let next_dist_table = origin_next_dist_table;
             let results = results + next_dist_table.shuffle(next_indices);
 
-            unsafe {
-                results.store_unaligned(distances.as_mut_ptr());
-            }
+            results
+                .as_array()
+                .into_iter()
+                .zip(distances.iter_mut())
+                .for_each(|(d, sum)| {
+                    *sum += d as f32;
+                });
         }
         let remainder = num_vectors % NUM_CENTROIDS;
         if remainder > 0 {
@@ -180,39 +185,48 @@ pub(super) fn compute_pq_distance_4bit(
             for (i, &centroid_idx) in vec_indices.iter().enumerate() {
                 let current_idx = centroid_idx & 0xF;
                 let next_idx = centroid_idx >> 4;
-                distances[i] += dist_table[current_idx as usize];
-                distances[i] += next_dist_table[next_idx as usize];
+                distances[i] += dist_table[current_idx as usize] as f32;
+                distances[i] += next_dist_table[next_idx as usize] as f32;
             }
         }
     }
 
-    // cast u32 to f32
-    // no need to convert because it's still comparable
-    distances.iter().map(|&dist| dist as f32).collect()
+    // need to dequantize the distances
+    // to make the distances comparable to the others from the other partitions
+    distances.iter_mut().for_each(|d| {
+        *d = *d * (qmax - qmin) / 255.0 + qmin;
+    });
+    distances
 }
 
 // Quantize the distance table to u8
-// returns (min, max, quantized_distance_table)
+// returns quantized_distance_table
 // used for only 4bit PQ so num_centroids must be 16
 #[inline]
 fn quantize_distance_table(distance_table: &[f32]) -> (f32, f32, Vec<u8>) {
     const NUM_CENTROIDS: usize = 16;
     // we set qmax to the maximum possible distance,
     // then no need to handle overflow
+
     let qmin = distance_table.iter().cloned().fold(f32::INFINITY, f32::min);
+    // let qmax = distance_table
+    //     .chunks(NUM_CENTROIDS)
+    //     .tuple_windows()
+    //     .map(|(a, b)| {
+    //         let a_max = a.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    //         let b_max = b.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    //         a_max + b_max
+    //     })
+    //     .fold(f32::NEG_INFINITY, f32::max);
     let qmax = distance_table
-        .chunks(NUM_CENTROIDS)
-        .map(|chunk| chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
+        .chunks_exact(NUM_CENTROIDS)
+        .map(|c| c.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
         .sum::<f32>();
     let quantized_dist_table = distance_table
         .iter()
-        .map(|&dist| {
-            ((dist - qmin) * 255.0 / (qmax - qmin))
-                .round()
-                .to_u8()
-                .unwrap_or(u8::MAX)
-        })
+        .map(|&d| ((d - qmin) * 255.0 / (qmax - qmin)).round() as u8)
         .collect();
+
     (qmin, qmax, quantized_dist_table)
 }
 
