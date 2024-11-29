@@ -6,7 +6,7 @@ use std::cmp::min;
 
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
-use lance_linalg::simd::Shuffle;
+use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
