@@ -203,6 +203,15 @@ public class Dataset implements Closeable {
       List<String> fragmentsMetadata, Map<String, String> storageOptions);
 
   /**
+   * Drop a Dataset.
+   *
+   * @param path The file path of the dataset
+   * @param storageOptions Storage options
+   *
+   */
+  public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
    * Create a new Dataset Scanner.
    *
    * @return a dataset scanner

@@ -3,6 +3,7 @@
 
 import base64
 import contextlib
+import copy
 import os
 import pickle
 import platform
@@ -31,6 +32,15 @@ from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
 from lance.util import validate_vector_index
+
+CONFIG = {
+    "allow_http": "true",
+    "aws_access_key_id": "ACCESSKEY",
+    "aws_secret_access_key": "SECRETKEY",
+    "aws_endpoint": "http://localhost:9000",
+    "dynamodb_endpoint": "http://localhost:8000",
+    "aws_region": "us-west-2",
+}
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -2715,3 +2725,24 @@ def test_detached_commits(tmp_path: Path):
     )
 
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
+
+
+def test_dataset_drop(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    lance.write_dataset(table, tmp_path)
+    assert Path(tmp_path).exists()
+    lance.LanceDataset.drop(tmp_path)
+    assert not Path(tmp_path).exists()
+
+
+@pytest.mark.integration
+def test_s3_drop(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table_name = uuid.uuid4().hex
+    tmp_path = f"s3://{s3_bucket}/{table_name}"
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path, storage_options=storage_options)
+    dataset.validate()
+    lance.LanceDataset.drop(tmp_path, storage_options=storage_options)
+    with pytest.raises(Exception):
+        dataset.validate()

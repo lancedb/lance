@@ -17,6 +17,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
+import java.util.HashMap;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.AfterAll;
@@ -181,6 +183,18 @@ public class DatasetTest {
       Dataset dataset = testDataset.createEmptyDataset();
       dataset.close();
       assertThrows(RuntimeException.class, dataset::getSchema);
+    }
+  }
+
+  @Test
+  void testDropPath() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      Dataset.drop(datasetPath, new HashMap<>());
     }
   }
 }

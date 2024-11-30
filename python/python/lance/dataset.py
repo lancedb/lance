@@ -2353,6 +2353,12 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return LanceStats(self._ds)
 
+    @staticmethod
+    def drop(
+        base_uri: Union[str, Path], storage_options: Optional[Dict[str, str]] = None
+    ) -> None:
+        _Dataset.drop(str(base_uri), storage_options)
+
 
 class BulkCommitResult(TypedDict):
     dataset: LanceDataset

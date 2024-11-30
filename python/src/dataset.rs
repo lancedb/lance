@@ -76,6 +76,7 @@ use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::error::PythonErrorExt;
+use crate::file::object_store_from_uri_or_path;
 use crate::fragment::{FileFragment, FragmentMetadata};
 use crate::schema::LanceSchema;
 use crate::session::Session;
@@ -1405,6 +1406,19 @@ impl Dataset {
 
     fn session(&self) -> Session {
         Session::new(self.ds.session())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    fn drop(dest: String, storage_options: Option<HashMap<String, String>>) -> PyResult<()> {
+        RT.spawn(None, async move {
+            let (object_store, path) =
+                object_store_from_uri_or_path(&dest, storage_options).await?;
+            object_store
+                .remove_dir_all(path)
+                .await
+                .map_err(|e| PyIOError::new_err(e.to_string()))
+        })?
     }
 
     #[allow(clippy::too_many_arguments)]
