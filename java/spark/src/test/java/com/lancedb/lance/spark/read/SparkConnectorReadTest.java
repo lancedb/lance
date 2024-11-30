@@ -55,6 +55,14 @@ public class SparkConnectorReadTest {
     }
   }
 
+  @Test
+  public void testMetadata() {
+    String path = LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName);
+    Dataset<Row> df = spark.sql("SELECT _rowid AS row_id, * FROM lance.`" + path + "`");
+    Object rows = df.collect();
+    System.out.println(rows);
+  }
+
   private void validateData(Dataset<Row> data, List<List<Long>> expectedValues) {
     List<Row> rows = data.collectAsList();
     assertEquals(expectedValues.size(), rows.size());
