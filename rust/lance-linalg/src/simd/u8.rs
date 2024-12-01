@@ -7,12 +7,8 @@ use std::fmt::Formatter;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
-#[cfg(target_arch = "loongarch64")]
-use std::arch::loongarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-#[cfg(target_arch = "loongarch64")]
-use std::mem::transmute;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 
 use super::{Shuffle, SIMD};
@@ -23,7 +19,7 @@ use super::{Shuffle, SIMD};
 #[derive(Clone, Copy)]
 pub struct u8x16(pub __m128i);
 
-/// 16 of 32-bit `f32` values. Use 512-bit SIMD if possible.
+/// 16 of 8-bit `u8` values.
 #[allow(non_camel_case_types)]
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
@@ -40,10 +36,6 @@ impl u8x16 {
         unsafe {
             Self(vandq_u8(self.0, vdupq_n_u8(mask)))
         }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            Self(lasx_xvfand_b(self.0, mask))
-        }
     }
 
     #[inline]
@@ -57,10 +49,6 @@ impl u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(vshrq_n_u8::<4>(self.0))
-        }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            Self(lasx_xvfrsh_b(self.0, 4))
         }
     }
 }
@@ -230,10 +218,6 @@ impl Shuffle for u8x16 {
         unsafe {
             Self(vqtbl1q_u8(self.0, indices.0))
         }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            Self(lasx_xvqtbl_b(self.0, indices.0))
-        }
     }
 }
 
@@ -250,10 +234,6 @@ impl Add for u8x16 {
         unsafe {
             Self(vqaddq_u8(self.0, rhs.0))
         }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            Self(lasx_xvfadd_b(self.0, rhs.0))
-        }
     }
 }
 
@@ -267,10 +247,6 @@ impl AddAssign for u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             self.0 = vaddq_u8(self.0, rhs.0)
-        }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            self.0 = lasx_xvfadd_b(self.0, rhs.0)
         }
     }
 }
@@ -296,10 +272,6 @@ impl Mul for u8x16 {
         unsafe {
             Self(vmulq_u8(self.0, rhs.0))
         }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            Self(lasx_xvfmul_b(self.0, rhs.0))
-        }
     }
 }
 
@@ -316,10 +288,6 @@ impl Sub for u8x16 {
         unsafe {
             Self(vsubq_u8(self.0, rhs.0))
         }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            Self(lasx_xvfsub_b(self.0, rhs.0))
-        }
     }
 }
 
@@ -333,10 +301,6 @@ impl SubAssign for u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             self.0 = vsubq_u8(self.0, rhs.0)
-        }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            self.0 = lasx_xvfsub_b(self.0, rhs.0)
         }
     }
 }

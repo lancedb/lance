@@ -4,6 +4,7 @@
 use core::panic;
 use std::cmp::min;
 
+use itertools::Itertools;
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
@@ -138,7 +139,7 @@ pub(super) fn compute_pq_distance_4bit(
 ) -> Vec<f32> {
     let (qmin, qmax, distance_table) = quantize_distance_table(distance_table);
     let num_vectors = code.len() * 2 / num_sub_vectors;
-    // store the distances in u32 to avoid overflow
+    // store the distances in f32 to avoid overflow
     let mut distances = vec![0.0f32; num_vectors];
     const NUM_CENTROIDS: usize = 2_usize.pow(4);
     for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
@@ -199,32 +200,26 @@ pub(super) fn compute_pq_distance_4bit(
     distances
 }
 
-// Quantize the distance table to u8
-// returns quantized_distance_table
+// Quantize the distance table to u8,
+// map distance `d` to `(d-qmin) * 255 / (qmax-qmin)`m
 // used for only 4bit PQ so num_centroids must be 16
+// returns (qmin, qmax, quantized_distance_table)
 #[inline]
 fn quantize_distance_table(distance_table: &[f32]) -> (f32, f32, Vec<u8>) {
     const NUM_CENTROIDS: usize = 16;
-    // we set qmax to the maximum possible distance,
-    // then no need to handle overflow
-
     let qmin = distance_table.iter().cloned().fold(f32::INFINITY, f32::min);
-    // let qmax = distance_table
-    //     .chunks(NUM_CENTROIDS)
-    //     .tuple_windows()
-    //     .map(|(a, b)| {
-    //         let a_max = a.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    //         let b_max = b.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    //         a_max + b_max
-    //     })
-    //     .fold(f32::NEG_INFINITY, f32::max);
     let qmax = distance_table
-        .chunks_exact(NUM_CENTROIDS)
-        .map(|c| c.iter().cloned().fold(f32::NEG_INFINITY, f32::max))
-        .sum::<f32>();
+        .chunks(NUM_CENTROIDS)
+        .tuple_windows()
+        .map(|(a, b)| {
+            let a_max = a.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let b_max = b.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            a_max + b_max
+        })
+        .fold(f32::NEG_INFINITY, f32::max);
     let quantized_dist_table = distance_table
         .iter()
-        .map(|&d| ((d - qmin) * 255.0 / (qmax - qmin)).round() as u8)
+        .map(|&d| ((d - qmin) * 255.0 / (qmax - qmin)).ceil() as u8)
         .collect();
 
     (qmin, qmax, quantized_dist_table)
