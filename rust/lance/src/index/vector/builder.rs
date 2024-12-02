@@ -68,6 +68,8 @@ use super::v2::IVFIndex;
 pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     dataset: Dataset,
     column: String,
+    // used for multivector type
+    modal_index: Option<usize>,
     index_dir: Path,
     distance_type: DistanceType,
     shuffler: Arc<dyn Shuffler>,
@@ -105,6 +107,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         Ok(Self {
             dataset,
             column,
+            modal_index: None,
             index_dir,
             distance_type,
             shuffler: shuffler.into(),
@@ -140,6 +143,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             None,
             sub_index_params,
         )
+    }
+
+    pub fn with_modal_index(&mut self, modal_index: usize) -> &mut Self {
+        self.modal_index = Some(modal_index);
+        self
     }
 
     // build the index with the all data in the dataset,
@@ -190,6 +198,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         super::build_ivf_model(
             &self.dataset,
             &self.column,
+            self.modal_index,
             dim,
             self.distance_type,
             ivf_params,
@@ -211,9 +220,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             "loading training data for quantizer. sample size: {}",
             sample_size_hint
         );
-        let training_data =
-            utils::maybe_sample_training_data(&self.dataset, &self.column, sample_size_hint)
-                .await?;
+        let training_data = utils::maybe_sample_training_data(
+            &self.dataset,
+            &self.column,
+            self.modal_index,
+            sample_size_hint,
+        )
+        .await?;
         info!(
             "Finished loading training data in {:02} seconds",
             start.elapsed().as_secs_f32()
@@ -252,11 +265,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
     }
 
     async fn shuffle_dataset(&mut self) -> Result<()> {
+        let column = match self.modal_index {
+            Some(index) => format!("{}[{}]", self.column, index),
+            None => self.column.clone(),
+        };
         let stream = self
             .dataset
             .scan()
             .batch_readahead(get_num_compute_intensive_cpus())
-            .project(&[self.column.as_str()])?
+            .project(&[column])?
             .with_row_id()
             .try_into_stream()
             .await?;

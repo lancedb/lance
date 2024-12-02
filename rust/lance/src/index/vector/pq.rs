@@ -414,7 +414,7 @@ pub async fn build_pq_model(
     );
     let start = std::time::Instant::now();
     let mut training_data =
-        maybe_sample_training_data(dataset, column, expected_sample_size).await?;
+        maybe_sample_training_data(dataset, column, None, expected_sample_size).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -572,9 +572,16 @@ mod tests {
         let (dataset, vectors) = generate_dataset(test_uri, 100.0..120.0).await;
 
         let ivf_params = IvfBuildParams::new(4);
-        let ivf = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
-            .await
-            .unwrap();
+        let ivf = build_ivf_model(
+            &dataset,
+            "vector",
+            None,
+            DIM,
+            MetricType::Cosine,
+            &ivf_params,
+        )
+        .await
+        .unwrap();
         let params = PQBuildParams::new(16, 8);
         let pq = build_pq_model(
             &dataset,
