@@ -5081,11 +5081,12 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-            FlatFts: query=hello
-              EmptyExec"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+              FlatFts: query=hello
+                EmptyExec"#,
         )
         .await?;
 
@@ -5104,12 +5105,13 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-              ScalarIndexQuery: query=i > 10
-            FlatFts: query=hello
-              EmptyExec"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+                ScalarIndexQuery: query=i > 10
+              FlatFts: query=hello
+                EmptyExec"#,
         )
         .await?;
 
@@ -5126,11 +5128,12 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-            FlatFts: query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+              FlatFts: query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false"#,
         )
         .await?;
 
@@ -5148,13 +5151,14 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-              ScalarIndexQuery: query=i > 10
-            FlatFts: query=hello
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+                ScalarIndexQuery: query=i > 10
+              FlatFts: query=hello
+                FilterExec: i@1 > 10
+                  LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,
         )
         .await?;
 
