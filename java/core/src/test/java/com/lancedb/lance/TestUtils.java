@@ -76,8 +76,16 @@ public class TestUtils {
       return dataset;
     }
 
-    public FragmentMetadata createNewFragment(int fragmentId, int rowCount) {
-      FragmentMetadata fragmentMeta;
+    public FragmentMetadata createNewFragment(int rowCount) {
+      List<FragmentMetadata>  fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
+      assertEquals(1, fragmentMetas.size());
+      FragmentMetadata fragmentMeta = fragmentMetas.get(0);
+      assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+      return fragmentMeta;
+    }
+
+    public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         root.allocateNew();
         IntVector idVector = (IntVector) root.getVector("id");
@@ -90,16 +98,14 @@ public class TestUtils {
         }
         root.setRowCount(rowCount);
 
-        fragmentMeta = Fragment.create(datasetPath,
-            allocator, root, Optional.of(fragmentId), new WriteParams.Builder().build());
-        assertEquals(fragmentId, fragmentMeta.getId());
-        assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+        fragmentMetas = Fragment.create(datasetPath,
+            allocator, root, new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
       }
-      return fragmentMeta;
+      return fragmentMetas;
     }
 
     public Dataset write(long version, int rowCount) {
-      FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
+      FragmentMetadata metadata = createNewFragment(rowCount);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata));
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
     }
