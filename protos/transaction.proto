@@ -25,8 +25,11 @@ message Transaction {
   // The UUID that unique identifies a transaction.
   string uuid = 2;
 
-  // Optional version tag.
-  string tag = 3;
+  reserved 3; // Deprecated "tag"
+
+  // A human-readable description of the transaction.
+  // This might be the SQL query that generated the transaction, for example.
+  string description = 4;
 
   // Add new rows to the dataset.
   message Append {
@@ -165,6 +168,38 @@ message Transaction {
     repeated string delete_keys = 2;
   }
 
+  message ReplaceSchemaMetadata {
+    map<string, bytes> replace_values = 1;
+  }
+
+  message UpdateSchemaMetadata {
+    map<string, bytes> upsert_values = 1;
+    repeated string delete_keys = 2;
+  }
+
+  // A generic composite operation
+  message CompositeOperation {
+    // Fragment changes
+    repeated DataFragment new_fragments = 1;
+    repeated DataFragment moved_row_fragments = 2;
+    repeated DataFragment modified_fragments = 3;
+    repeated uint32 deleted_fragment_ids = 4;
+    // Index changes
+    repeated IndexMetadata new_indices = 5;
+    repeated IndexMetadata removed_indices = 6;
+    // Metadata
+    // The new schema
+    repeated lance.file.Field schema = 7;
+    // Schema metadata.
+    oneof schema_update {
+      ReplaceSchemaMetadata replace_schema_metadata = 8;
+      UpdateSchemaMetadata update_schema_metadata = 9;
+    }
+    // TODO: upsert and delete in schema metadata
+    // Key-value pairs to merge with existing config.
+    UpdateConfig config = 10;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -178,6 +213,7 @@ message Transaction {
     Update update = 108;
     Project project = 109;
     UpdateConfig update_config = 110;
+    CompositeOperation composite = 111;
   }
 
   // An operation to apply to the blob dataset

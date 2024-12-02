@@ -166,6 +166,9 @@ pub enum Operation {
         upsert_values: Option<HashMap<String, String>>,
         delete_keys: Option<Vec<String>>,
     },
+
+    /// An operation that is a composite of other operations.
+    Composite(CompositeOperation),
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +187,20 @@ impl DeepSizeOf for RewrittenIndex {
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
+}
+
+#[derive(Debug, Clone, DeepSizeOf, Default)]
+pub struct CompositeOperation {
+    pub new_fragments: Vec<Fragment>,
+    pub moved_row_fragments: Vec<Fragment>,
+    pub modified_fragments: Vec<Fragment>,
+    pub deleted_fragments: Vec<u32>,
+    pub new_indices: Vec<Index>,
+    pub removed_indices: Vec<Index>,
+    pub schema: Schema,
+    pub schema_metadata_upsert_values: Option<HashMap<String, String>>,
+    pub config_upsert_values: Option<HashMap<String, String>>,
+    pub config_delete_keys: Option<Vec<String>>,
 }
 
 impl Operation {
@@ -226,6 +243,16 @@ impl Operation {
                     .map(|f| f.id)
                     .chain(removed_fragment_ids.iter().copied()),
             ),
+            Self::Composite(CompositeOperation {
+                modified_fragments,
+                deleted_fragments,
+                ..
+            }) => Box::new(
+                modified_fragments
+                    .iter()
+                    .map(|f| f.id)
+                    .chain(deleted_fragments.iter().map(|id| *id as u64)),
+            ),
         }
     }
 
@@ -251,13 +278,17 @@ impl Operation {
     }
 
     /// Returns the config keys that have been deleted by this operation.
-    fn get_delete_config_keys(&self) -> Vec<String> {
+    fn get_delete_config_keys(&self) -> &[String] {
         match self {
             Self::UpdateConfig {
                 delete_keys: Some(dk),
                 ..
-            } => dk.clone(),
-            _ => Vec::<String>::new(),
+            } => dk.as_slice(),
+            Self::Composite(CompositeOperation {
+                config_delete_keys: Some(dk),
+                ..
+            }) => dk.as_slice(),
+            _ => &[],
         }
     }
 
@@ -297,6 +328,28 @@ impl Operation {
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
             Self::UpdateConfig { .. } => "UpdateConfig",
+            Self::Composite(_) => "Composite",
+        }
+    }
+
+    pub fn into_composite(self) -> Option<CompositeOperation> {
+        match self {
+            Self::Composite(op) => Some(op),
+            Self::Append { fragments } => Some(CompositeOperation {
+                new_fragments: fragments,
+                ..Default::default()
+            }),
+            Self::Overwrite {
+                fragments,
+                schema,
+                config_upsert_values,
+            } => Some(CompositeOperation {
+                new_fragments: fragments,
+                schema,
+                schema_metadata_upsert_values: config_upsert_values,
+                ..Default::default()
+            }),
+            _ => None,
         }
     }
 }
@@ -413,6 +466,9 @@ impl Transaction {
                 Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
+            Operation::Composite(_) => {
+                todo!()
+            }
         }
     }
 
