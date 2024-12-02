@@ -25,6 +25,10 @@ pub struct u8x16(pub __m128i);
 #[derive(Clone, Copy)]
 pub struct u8x16(pub uint8x16_t);
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[derive(Clone, Copy)]
+pub struct u8x16(pub [u8; 16]);
+
 impl u8x16 {
     #[inline]
     pub fn bit_and(self, mask: u8) -> Self {
@@ -35,6 +39,12 @@ impl u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(vandq_u8(self.0, vdupq_n_u8(mask)))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            for i in 0..16 {
+                self.0[i] &= mask;
+            }
         }
     }
 
@@ -49,6 +59,14 @@ impl u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(vshrq_n_u8::<4>(self.0))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = self.0[i] >> 4;
+            }
+            Self(result)
         }
     }
 }
@@ -87,6 +105,14 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             Self(vdupq_n_u8(val))
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = val;
+            }
+            Self(result)
+        }
     }
 
     #[inline]
@@ -99,6 +125,10 @@ impl SIMD<u8, 16> for u8x16 {
         {
             Self::splat(0)
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Self([0; 16])
+        }
     }
 
     #[inline]
@@ -108,6 +138,10 @@ impl SIMD<u8, 16> for u8x16 {
             Self(_mm_loadu_si128(ptr as *const __m128i))
         }
         #[cfg(target_arch = "aarch64")]
+        {
+            Self::load_unaligned(ptr)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             Self::load_unaligned(ptr)
         }
@@ -123,6 +157,14 @@ impl SIMD<u8, 16> for u8x16 {
         {
             Self(vld1q_u8(ptr))
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = *ptr.add(i);
+            }
+            Self(result)
+        }
     }
 
     #[inline]
@@ -134,6 +176,10 @@ impl SIMD<u8, 16> for u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vst1q_u8(ptr, self.0)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            self.store_unaligned(ptr);
         }
     }
 
@@ -148,28 +194,16 @@ impl SIMD<u8, 16> for u8x16 {
         unsafe {
             vst1q_u8(ptr, self.0)
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            for i in 0..16 {
+                *ptr.add(i) = self.0[i];
+            }
+        }
     }
 
     fn reduce_sum(&self) -> u8 {
-        todo!("the signature of reduce_sum is not correct");
-        // #[cfg(target_arch = "x86_64")]
-        // unsafe {
-        //     let zeros = _mm_setzero_si128();
-        //     let sum = _mm_sad_epu8(self.0, zeros);
-
-        //     let lower = _mm_cvtsi128_si64(sum) as u32;
-        //     let upper = _mm_extract_epi64(sum, 1) as u32;
-        //     lower + upper
-        // }
-        // #[cfg(target_arch = "aarch64")]
-        // unsafe {
-        //     let low = vget_low_u8(self.0);
-        //     let high = vget_high_u8(self.0);
-        //     let sum = vaddl_u8(low, high);
-        //     let sum16 = vaddw_u16(vdupq_n_u32(0), sum);
-        //     let total = vpadd_u32(vget_low_u32(sum16), vget_high_u32(sum16));
-        //     vget_lane_u32(total, 0) + vget_lane_u32(total, 1)
-        // }
+        todo!("it is not implemented yet");
     }
 
     #[inline]
@@ -184,10 +218,17 @@ impl SIMD<u8, 16> for u8x16 {
             let min_low = _mm_min_epu8(min_low, _mm_srli_si128(min_low, 1));
             _mm_extract_epi8(min_low, 0) as u8
         }
-
         #[cfg(target_arch = "aarch64")]
         unsafe {
             vminvq_u8(self.0)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut min = self.0[0];
+            for i in 1..16 {
+                min = std::cmp::min(min, self.0[i]);
+            }
+            min
         }
     }
 
@@ -200,6 +241,14 @@ impl SIMD<u8, 16> for u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             Self(vminq_u8(self.0, rhs.0))
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = std::cmp::min(self.0[i], rhs.0[i]);
+            }
+            Self(result)
         }
     }
 
@@ -218,6 +267,14 @@ impl Shuffle for u8x16 {
         unsafe {
             Self(vqtbl1q_u8(self.0, indices.0))
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = self.0[indices.0[i] as usize];
+            }
+            Self(result)
+        }
     }
 }
 
@@ -234,6 +291,14 @@ impl Add for u8x16 {
         unsafe {
             Self(vqaddq_u8(self.0, rhs.0))
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = self.0[i].saturating_add(rhs.0[i]);
+            }
+            Self(result)
+        }
     }
 }
 
@@ -247,6 +312,12 @@ impl AddAssign for u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             self.0 = vaddq_u8(self.0, rhs.0)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            for i in 0..16 {
+                self.0[i] = self.0[i].saturating_add(rhs.0[i]);
+            }
         }
     }
 }
@@ -272,6 +343,14 @@ impl Mul for u8x16 {
         unsafe {
             Self(vmulq_u8(self.0, rhs.0))
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = self.0[i].wrapping_mul(rhs.0[i]);
+            }
+            Self(result)
+        }
     }
 }
 
@@ -288,6 +367,14 @@ impl Sub for u8x16 {
         unsafe {
             Self(vsubq_u8(self.0, rhs.0))
         }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let mut result = [0u8; 16];
+            for i in 0..16 {
+                result[i] = self.0[i].wrapping_sub(rhs.0[i]);
+            }
+            Self(result)
+        }
     }
 }
 
@@ -301,6 +388,12 @@ impl SubAssign for u8x16 {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             self.0 = vsubq_u8(self.0, rhs.0)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            for i in 0..16 {
+                self.0[i] = self.0[i].wrapping_sub(rhs.0[i]);
+            }
         }
     }
 }
