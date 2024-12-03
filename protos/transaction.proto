@@ -179,25 +179,26 @@ message Transaction {
 
   // A generic composite operation
   message CompositeOperation {
+    bool remove_existing_fragments = 1;
     // Fragment changes
-    repeated DataFragment new_fragments = 1;
-    repeated DataFragment moved_row_fragments = 2;
-    repeated DataFragment modified_fragments = 3;
-    repeated uint32 deleted_fragment_ids = 4;
+    repeated DataFragment new_fragments = 2;
+    repeated DataFragment moved_row_fragments = 3;
+    repeated DataFragment modified_fragments = 4;
+    repeated uint32 deleted_fragment_ids = 5;
     // Index changes
-    repeated IndexMetadata new_indices = 5;
-    repeated IndexMetadata removed_indices = 6;
+    repeated IndexMetadata new_indices = 6;
+    repeated IndexMetadata removed_indices = 7;
     // Metadata
     // The new schema
-    repeated lance.file.Field schema = 7;
+    repeated lance.file.Field schema = 8;
     // Schema metadata.
-    oneof schema_update {
-      ReplaceSchemaMetadata replace_schema_metadata = 8;
-      UpdateSchemaMetadata update_schema_metadata = 9;
+    oneof schema_metadata_update {
+      ReplaceSchemaMetadata replace_schema_metadata = 9;
+      UpdateSchemaMetadata update_schema_metadata = 10;
     }
     // TODO: upsert and delete in schema metadata
     // Key-value pairs to merge with existing config.
-    UpdateConfig config = 10;
+    UpdateConfig config_update = 11;
   }
 
   // The operation of this transaction.

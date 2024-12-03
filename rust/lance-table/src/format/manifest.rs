@@ -193,17 +193,6 @@ impl Manifest {
         self.timestamp_nanos = nanos;
     }
 
-    /// Set the `config` from an iterator
-    pub fn update_config(&mut self, upsert_values: impl IntoIterator<Item = (String, String)>) {
-        self.config.extend(upsert_values);
-    }
-
-    /// Delete `config` keys using a slice of keys
-    pub fn delete_config_keys(&mut self, delete_keys: &[&str]) {
-        self.config
-            .retain(|key, _| !delete_keys.contains(&key.as_str()));
-    }
-
     /// Check the current fragment list and update the high water mark
     pub fn update_max_fragment_id(&mut self) {
         let max_fragment_id = self

@@ -191,16 +191,17 @@ pub struct RewriteGroup {
 
 #[derive(Debug, Clone, DeepSizeOf, Default)]
 pub struct CompositeOperation {
+    pub remove_existing_fragments: bool,
     pub new_fragments: Vec<Fragment>,
     pub moved_row_fragments: Vec<Fragment>,
     pub modified_fragments: Vec<Fragment>,
-    pub deleted_fragments: Vec<u32>,
+    pub deleted_fragment_ids: Vec<u32>,
     pub new_indices: Vec<Index>,
     pub removed_indices: Vec<Index>,
     pub schema: Schema,
-    pub schema_metadata_upsert_values: Option<HashMap<String, String>>,
-    pub config_upsert_values: Option<HashMap<String, String>>,
-    pub config_delete_keys: Option<Vec<String>>,
+    pub schema_metadata_upsert_values: HashMap<String, String>,
+    pub config_upsert_values: HashMap<String, String>,
+    pub config_delete_keys: Vec<String>,
 }
 
 impl Operation {
@@ -245,7 +246,7 @@ impl Operation {
             ),
             Self::Composite(CompositeOperation {
                 modified_fragments,
-                deleted_fragments,
+                deleted_fragment_ids: deleted_fragments,
                 ..
             }) => Box::new(
                 modified_fragments
@@ -285,9 +286,8 @@ impl Operation {
                 ..
             } => dk.as_slice(),
             Self::Composite(CompositeOperation {
-                config_delete_keys: Some(dk),
-                ..
-            }) => dk.as_slice(),
+                config_delete_keys, ..
+            }) => config_delete_keys.as_slice(),
             _ => &[],
         }
     }
@@ -332,10 +332,24 @@ impl Operation {
         }
     }
 
-    pub fn into_composite(self) -> Option<CompositeOperation> {
+    /// Try to convert the operation into a composite operation.
+    ///
+    /// If the operation is already a composite operation, it will be returned.
+    /// If the operation is not a composite operation, it will be converted into
+    /// a composite operation.
+    ///
+    /// However, if the operation cannot be converted into a composite operation,
+    /// the original operation will be returned as the error.
+    ///
+    /// The following operations are not yet supported:
+    ///
+    /// * ReserveFragments
+    /// * Restore
+    /// * Rewrite
+    pub fn into_composite(self) -> std::result::Result<CompositeOperation, Self> {
         match self {
-            Self::Composite(op) => Some(op),
-            Self::Append { fragments } => Some(CompositeOperation {
+            Self::Composite(op) => Ok(op),
+            Self::Append { fragments } => Ok(CompositeOperation {
                 new_fragments: fragments,
                 ..Default::default()
             }),
@@ -343,13 +357,66 @@ impl Operation {
                 fragments,
                 schema,
                 config_upsert_values,
-            } => Some(CompositeOperation {
+            } => Ok(CompositeOperation {
                 new_fragments: fragments,
                 schema,
-                schema_metadata_upsert_values: config_upsert_values,
+                schema_metadata_upsert_values: config_upsert_values.unwrap_or_default(),
+                remove_existing_fragments: true,
                 ..Default::default()
             }),
-            _ => None,
+            Self::Delete {
+                updated_fragments,
+                deleted_fragment_ids,
+                ..
+            } => Ok(CompositeOperation {
+                modified_fragments: updated_fragments,
+                deleted_fragment_ids: deleted_fragment_ids
+                    .into_iter()
+                    .map(|id| id as u32)
+                    .collect(),
+                ..Default::default()
+            }),
+            Self::CreateIndex {
+                new_indices,
+                removed_indices,
+            } => Ok(CompositeOperation {
+                new_indices,
+                removed_indices,
+                ..Default::default()
+            }),
+            Self::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            } => Ok(CompositeOperation {
+                deleted_fragment_ids: removed_fragment_ids
+                    .into_iter()
+                    .map(|id| id as u32)
+                    .collect(),
+                modified_fragments: updated_fragments,
+                new_fragments,
+                ..Default::default()
+            }),
+            Self::Project { schema } => Ok(CompositeOperation {
+                schema,
+                ..Default::default()
+            }),
+            Self::UpdateConfig {
+                upsert_values,
+                delete_keys,
+            } => Ok(CompositeOperation {
+                config_upsert_values: upsert_values.unwrap_or_default(),
+                config_delete_keys: delete_keys.unwrap_or_default(),
+                ..Default::default()
+            }),
+            Self::Merge { fragments, schema } => Ok(CompositeOperation {
+                new_fragments: fragments,
+                schema,
+                ..Default::default()
+            }),
+            Self::Rewrite { .. } | Self::Restore { .. } | Self::ReserveFragments { .. } => {
+                Err(self)
+            }
         }
     }
 }
@@ -556,6 +623,7 @@ impl Transaction {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
+            Operation::Composite(CompositeOperation { ref schema, .. }) => schema.clone(),
             _ => {
                 if let Some(current_manifest) = current_manifest {
                     current_manifest.schema.clone()
@@ -598,88 +666,81 @@ impl Transaction {
             }
         };
 
-        let maybe_existing_fragments =
-            current_manifest
-                .map(|m| m.fragments.as_ref())
-                .ok_or_else(|| Error::Internal {
-                    message: format!(
-                        "No current manifest was provided while building manifest for operation {}",
-                        self.operation.name()
-                    ),
-                    location: location!(),
-                });
+        let existing_fragments = current_manifest
+            .map(|m| m.fragments.as_ref().iter())
+            .unwrap_or_else(|| [].iter());
 
-        match &self.operation {
-            Operation::Append { ref fragments } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
-                let mut new_fragments =
-                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
-                if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
-                }
-                final_fragments.extend(new_fragments);
-            }
-            Operation::Delete {
-                ref updated_fragments,
-                ref deleted_fragment_ids,
-                ..
-            } => {
-                // Remove the deleted fragments
-                final_fragments.extend(maybe_existing_fragments?.clone());
-                final_fragments.retain(|f| !deleted_fragment_ids.contains(&f.id));
-                final_fragments.iter_mut().for_each(|f| {
-                    for updated in updated_fragments {
-                        if updated.id == f.id {
-                            *f = updated.clone();
+        let mut table_config = current_manifest
+            .map(|m| m.config.clone())
+            .unwrap_or_default();
+
+        match self.operation.clone().into_composite() {
+            Ok(operation) => {
+                if !operation.remove_existing_fragments {
+                    let fragments_to_keep = existing_fragments.filter_map(|f| {
+                        if operation.deleted_fragment_ids.contains(&(f.id as u32)) {
+                            return None;
                         }
-                    }
+                        if let Some(updated) =
+                            operation.modified_fragments.iter().find(|uf| uf.id == f.id)
+                        {
+                            Some(updated.clone())
+                        } else {
+                            Some(f.clone())
+                        }
+                    });
+                    final_fragments.extend(fragments_to_keep);
+                }
+
+                let new_fragments = operation
+                    .new_fragments
+                    .into_iter()
+                    .chain(operation.moved_row_fragments.into_iter());
+                let mut new_fragments =
+                    Self::fragments_with_ids(new_fragments, &mut fragment_id).collect::<Vec<_>>();
+                if let Some(next_row_id) = &mut next_row_id {
+                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                }
+                final_fragments.extend(new_fragments);
+
+                if operation.remove_existing_fragments {
+                    // If we removed all the fragments, we can assume we don't want the
+                    // indices anymore.
+                    // TODO: this could change if we allow indices that have no parts.
+                    final_indices.clear();
+                } else {
+                    Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+                }
+
+                final_indices.retain(|existing_index| {
+                    !operation
+                        .new_indices
+                        .iter()
+                        .any(|new_index| new_index.name == existing_index.name)
+                        && !operation
+                            .removed_indices
+                            .iter()
+                            .any(|old_index| old_index.uuid == existing_index.uuid)
                 });
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
-            }
-            Operation::Update {
-                removed_fragment_ids,
-                updated_fragments,
-                new_fragments,
-            } => {
-                final_fragments.extend(maybe_existing_fragments?.iter().filter_map(|f| {
-                    if removed_fragment_ids.contains(&f.id) {
-                        return None;
-                    }
-                    if let Some(updated) = updated_fragments.iter().find(|uf| uf.id == f.id) {
-                        Some(updated.clone())
-                    } else {
-                        Some(f.clone())
-                    }
-                }));
-                let mut new_fragments =
-                    Self::fragments_with_ids(new_fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
-                if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
+                final_indices.extend(operation.new_indices);
+
+                Self::retain_relevant_data_files(&mut final_fragments, &schema);
+
+                // Update config as well
+                for key in operation.config_delete_keys {
+                    table_config.remove(&key);
                 }
-                final_fragments.extend(new_fragments);
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
+                table_config.extend(operation.config_upsert_values);
             }
-            Operation::Overwrite { ref fragments, .. } => {
-                let mut new_fragments =
-                    Self::fragments_with_ids(fragments.clone(), &mut fragment_id)
-                        .collect::<Vec<_>>();
-                if let Some(next_row_id) = &mut next_row_id {
-                    Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
-                }
-                final_fragments.extend(new_fragments);
-                final_indices = Vec::new();
-            }
-            Operation::Rewrite {
-                ref groups,
-                ref rewritten_indices,
-            } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
+            Err(Operation::Rewrite {
+                groups,
+                rewritten_indices,
+            }) => {
+                final_fragments.extend(existing_fragments.cloned());
                 let current_version = current_manifest.map(|m| m.version).unwrap_or_default();
                 Self::handle_rewrite_fragments(
                     &mut final_fragments,
-                    groups,
+                    &groups,
                     &mut fragment_id,
                     current_version,
                 )?;
@@ -690,63 +751,17 @@ impl Transaction {
                     for index in final_indices.iter_mut() {
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap =
-                                Self::recalculate_fragment_bitmap(fragment_bitmap, groups)?;
+                                Self::recalculate_fragment_bitmap(fragment_bitmap, &groups)?;
                         }
                     }
                 } else {
-                    Self::handle_rewrite_indices(&mut final_indices, rewritten_indices, groups)?;
+                    Self::handle_rewrite_indices(&mut final_indices, &rewritten_indices, &groups)?;
                 }
             }
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
-                final_indices.retain(|existing_index| {
-                    !new_indices
-                        .iter()
-                        .any(|new_index| new_index.name == existing_index.name)
-                        && !removed_indices
-                            .iter()
-                            .any(|old_index| old_index.uuid == existing_index.uuid)
-                });
-                final_indices.extend(new_indices.clone());
+            Err(Operation::ReserveFragments { .. }) => {
+                final_fragments.extend(existing_fragments.cloned());
             }
-            Operation::ReserveFragments { .. } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
-            }
-            Operation::Merge { ref fragments, .. } => {
-                final_fragments.extend(fragments.clone());
-
-                // Some fields that have indices may have been removed, so we should
-                // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
-            }
-            Operation::Project { .. } => {
-                final_fragments.extend(maybe_existing_fragments?.clone());
-
-                // We might have removed all fields for certain data files, so
-                // we should remove the data files that are no longer relevant.
-                let remaining_field_ids = schema
-                    .fields_pre_order()
-                    .map(|f| f.id)
-                    .collect::<HashSet<_>>();
-                for fragment in final_fragments.iter_mut() {
-                    fragment.files.retain(|file| {
-                        file.fields
-                            .iter()
-                            .any(|field_id| remaining_field_ids.contains(field_id))
-                    });
-                }
-
-                // Some fields that have indices may have been removed, so we should
-                // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
-            }
-            Operation::Restore { .. } => {
-                unreachable!()
-            }
-            Operation::UpdateConfig { .. } => {}
+            Err(_) => unreachable!(),
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
@@ -787,6 +802,8 @@ impl Transaction {
             )
         };
 
+        manifest.config = table_config;
+
         manifest.tag.clone_from(&self.tag);
 
         if config.auto_set_feature_flags {
@@ -795,33 +812,6 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
-
-        match &self.operation {
-            Operation::Overwrite {
-                config_upsert_values: Some(tm),
-                ..
-            } => manifest.update_config(tm.clone()),
-            Operation::UpdateConfig {
-                upsert_values,
-                delete_keys,
-            } => {
-                // Delete is handled first. If the same key is referenced by upsert and
-                // delete, then upserted key-value pair will remain.
-                if let Some(delete_keys) = delete_keys {
-                    manifest.delete_config_keys(
-                        delete_keys
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                    )
-                }
-                if let Some(upsert_values) = upsert_values {
-                    manifest.update_config(upsert_values.clone());
-                }
-            }
-            _ => {}
-        }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
             manifest.max_fragment_id += num_fragments;
@@ -858,6 +848,22 @@ impl Transaction {
                 .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
                 .unwrap_or(true)
         });
+    }
+
+    fn retain_relevant_data_files(fragments: &mut [Fragment], schema: &Schema) {
+        // We might have removed all fields for certain data files, so
+        // we should remove the data files that are no longer relevant.
+        let remaining_field_ids = schema
+            .fields_pre_order()
+            .map(|f| f.id)
+            .collect::<HashSet<_>>();
+        for fragment in fragments.iter_mut() {
+            fragment.files.retain(|file| {
+                file.fields
+                    .iter()
+                    .any(|field_id| remaining_field_ids.contains(field_id))
+            });
+        }
     }
 
     fn recalculate_fragment_bitmap(
@@ -1138,6 +1144,47 @@ impl TryFrom<pb::Transaction> for Transaction {
                     delete_keys,
                 }
             }
+            Some(pb::transaction::Operation::Composite(pb::transaction::CompositeOperation {
+                remove_existing_fragments,
+                new_fragments,
+                moved_row_fragments,
+                modified_fragments,
+                deleted_fragment_ids,
+                new_indices,
+                removed_indices,
+                schema,
+                schema_metadata_update,
+                config_update,
+            })) => {
+                let mut schema = Schema::from(&Fields(schema));
+                Operation::Composite(CompositeOperation {
+                    remove_existing_fragments,
+                    new_fragments: new_fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    moved_row_fragments: moved_row_fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    modified_fragments: modified_fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    deleted_fragment_ids,
+                    new_indices: new_indices
+                        .into_iter()
+                        .map(Index::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    removed_indices: removed_indices
+                        .into_iter()
+                        .map(Index::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    schema: Schema::from(&Fields(schema)),
+                    schema_update: schema_metadata_update.map(Schema::from),
+                    config_update: config_update,
+                })
+            }
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -1184,11 +1231,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             uuid: message.uuid.clone(),
             operation,
             blobs_op,
-            tag: if message.tag.is_empty() {
-                None
-            } else {
-                Some(message.tag.clone())
-            },
+            tag: None,
         })
     }
 }
@@ -1365,7 +1408,6 @@ impl From<&Transaction> for pb::Transaction {
             uuid: value.uuid.clone(),
             operation: Some(operation),
             blob_operation,
-            tag: value.tag.clone().unwrap_or("".to_string()),
         }
     }
 }
