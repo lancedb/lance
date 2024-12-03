@@ -1509,8 +1509,8 @@ impl Dataset {
         });
 
         let py = dest.py();
-        let dest = if dest.is_instance_of::<Dataset>() {
-            let dataset: Dataset = dest.extract()?;
+        let dest = if dest.is_instance_of::<Self>() {
+            let dataset: Self = dest.extract()?;
             WriteDestination::Dataset(dataset.ds.clone())
         } else {
             WriteDestination::Uri(dest.extract()?)

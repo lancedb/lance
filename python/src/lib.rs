@@ -89,10 +89,10 @@ pub fn is_datagen_supported() -> bool {
 
 // A fallback module for when datagen is not enabled
 #[cfg(not(feature = "datagen"))]
-fn register_datagen(py: Python, m: &PyModule) -> PyResult<()> {
-    let datagen = PyModule::new(py, "datagen")?;
+fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let datagen = PyModule::new_bound(py, "datagen")?;
     datagen.add_wrapped(wrap_pyfunction!(is_datagen_supported))?;
-    m.add_submodule(datagen)?;
+    m.add_submodule(&datagen)?;
     Ok(())
 }
 
