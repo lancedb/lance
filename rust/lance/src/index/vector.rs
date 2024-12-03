@@ -372,6 +372,7 @@ pub(crate) async fn remap_vector_index(
         .open_vector_index(column, &old_uuid.to_string())
         .await?;
     old_index.check_can_remap()?;
+
     let ivf_index: &IVFIndex =
         old_index
             .as_any()
