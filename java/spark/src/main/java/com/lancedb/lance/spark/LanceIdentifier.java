@@ -17,7 +17,7 @@ package com.lancedb.lance.spark;
 import org.apache.spark.sql.connector.catalog.Identifier;
 
 public class LanceIdentifier implements Identifier {
-  private final String[] namespace = new String[]{"default"};
+  private final String[] namespace = new String[] {"default"};
   private final String datasetUri;
 
   public LanceIdentifier(String datasetUri) {

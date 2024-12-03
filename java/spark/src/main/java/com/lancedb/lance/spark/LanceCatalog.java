@@ -17,6 +17,7 @@ package com.lancedb.lance.spark;
 import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
@@ -33,6 +34,7 @@ import java.util.Map;
 
 public class LanceCatalog implements TableCatalog {
   private CaseInsensitiveStringMap options;
+
   @Override
   public Identifier[] listTables(String[] namespace) throws NoSuchNamespaceException {
     throw new UnsupportedOperationException("Please use lancedb catalog for dataset listing");
@@ -49,8 +51,9 @@ public class LanceCatalog implements TableCatalog {
   }
 
   @Override
-  public Table createTable(Identifier ident, StructType schema, Transform[] partitions,
-      Map<String, String> properties) throws TableAlreadyExistsException, NoSuchNamespaceException {
+  public Table createTable(
+      Identifier ident, StructType schema, Transform[] partitions, Map<String, String> properties)
+      throws TableAlreadyExistsException, NoSuchNamespaceException {
     try {
       LanceConfig config = LanceConfig.from(options, ident.name());
       WriteParams params = SparkOptions.genWriteParamsFromConfig(config);

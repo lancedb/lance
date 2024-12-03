@@ -22,9 +22,8 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Used by the JNI test to test the JNI FFI functionality.
- * Note that if ffi parsing errors out, the whole JVM will crash
- * or all tests will show as UnsatisfiedLinkError.
+ * Used by the JNI test to test the JNI FFI functionality. Note that if ffi parsing errors out, the
+ * whole JVM will crash or all tests will show as UnsatisfiedLinkError.
  */
 public class JniTestHelper {
   static {

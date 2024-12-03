@@ -14,15 +14,9 @@
 
 package com.lancedb.lance;
 
-import java.io.IOException;
-import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
-import java.util.stream.Collectors;
-
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -38,13 +32,19 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScannerTest {
-  @TempDir
-  static Path tempDir; // Temporary directory for the tests
+  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
@@ -62,7 +62,8 @@ public class ScannerTest {
   void testDatasetScanner() throws IOException {
     String datasetPath = tempDir.resolve("dataset_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 40;
       int batchRows = 20;
@@ -77,11 +78,13 @@ public class ScannerTest {
   void testDatasetScannerFilter() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+        try (Scanner scanner =
+            dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           testDataset.validateScanResults(dataset, scanner, 20, 20);
         }
       }
@@ -92,13 +95,18 @@ public class ScannerTest {
   void testDatasetScannerColumns() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_columns").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
-            .batchSize(batchRows).columns(Arrays.asList("id")).build())) {
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(batchRows)
+                    .columns(Arrays.asList("id"))
+                    .build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;
@@ -124,15 +132,19 @@ public class ScannerTest {
   void testDatasetScannerSchema() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_schema").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 40;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
-            .batchSize(totalRows).columns(Arrays.asList("id")).build())) {
-          Schema expectedSchema = new Schema(Arrays.asList(
-              Field.nullable("id", new ArrowType.Int(32, true))
-          ));
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(totalRows)
+                    .columns(Arrays.asList("id"))
+                    .build())) {
+          Schema expectedSchema =
+              new Schema(Arrays.asList(Field.nullable("id", new ArrowType.Int(32, true))));
           assertEquals(expectedSchema, scanner.schema());
         }
       }
@@ -143,11 +155,13 @@ public class ScannerTest {
   void testDatasetScannerCountRows() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_count").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
-        try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+        try (LanceScanner scanner =
+            dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           assertEquals(20, scanner.countRows());
         }
       }
@@ -158,7 +172,8 @@ public class ScannerTest {
   void testFragmentScanner() throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 40;
       int batchRows = 20;
@@ -175,12 +190,14 @@ public class ScannerTest {
   void testFragmentScannerFilter() throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner_filter").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
         DatasetFragment fragment = dataset.getFragments().get(0);
-        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+        try (Scanner scanner =
+            fragment.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           testDataset.validateScanResults(dataset, scanner, 20, 20);
         }
       }
@@ -191,13 +208,19 @@ public class ScannerTest {
   void testFragmentScannerColumns() throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner_columns").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         DatasetFragment fragment = dataset.getFragments().get(0);
-        try (Scanner scanner = fragment.newScan(new ScanOptions.Builder().batchSize(batchRows).columns(Arrays.asList("id")).build())) {
+        try (Scanner scanner =
+            fragment.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(batchRows)
+                    .columns(Arrays.asList("id"))
+                    .build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
             int index = 0;
@@ -223,12 +246,14 @@ public class ScannerTest {
   void testScanFragment() throws Exception {
     String datasetPath = tempDir.resolve("fragment_scanner_single_fragment").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       FragmentMetadata metadata0 = testDataset.createNewFragment(3);
       FragmentMetadata metadata1 = testDataset.createNewFragment(5);
       FragmentMetadata metadata2 = testDataset.createNewFragment(7);
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
+      FragmentOperation.Append appendOp =
+          new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         List<DatasetFragment> frags = dataset.getFragments();
         assertEquals(3, frags.size());
@@ -243,18 +268,27 @@ public class ScannerTest {
   void testScanFragments() throws Exception {
     String datasetPath = tempDir.resolve("fragments_scanner").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       FragmentMetadata metadata0 = testDataset.createNewFragment(3);
       FragmentMetadata metadata1 = testDataset.createNewFragment(5);
       FragmentMetadata metadata2 = testDataset.createNewFragment(7);
-      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
+      FragmentOperation.Append appendOp =
+          new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
         List<DatasetFragment> frags = dataset.getFragments();
         assertEquals(3, frags.size());
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(frags.get(1).getId(), frags.get(2).getId())).build())) {
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(1024)
+                    .fragmentIds(Arrays.asList(frags.get(1).getId(), frags.get(2).getId()))
+                    .build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
-            assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+            assertEquals(
+                dataset.getSchema().getFields(),
+                reader.getVectorSchemaRoot().getSchema().getFields());
             int rowcount = 0;
             reader.loadNextBatch();
             int currentRowCount = reader.getVectorSchemaRoot().getRowCount();
@@ -275,7 +309,8 @@ public class ScannerTest {
   void testDatasetScannerLimit() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_limit").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 100;
       int limit = 50;
@@ -291,13 +326,15 @@ public class ScannerTest {
   void testDatasetScannerOffset() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_offset").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 100;
       int offset = 50;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
         try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().offset(offset).build())) {
-          testDataset.validateScanResults(dataset, scanner, totalRows - offset, totalRows - offset, offset);
+          testDataset.validateScanResults(
+              dataset, scanner, totalRows - offset, totalRows - offset, offset);
         }
       }
     }
@@ -305,40 +342,47 @@ public class ScannerTest {
 
   @Test
   void testDatasetScannerWithRowId() throws Exception {
-      String datasetPath = tempDir.resolve("dataset_scanner_with_row_id").toString();
-      try (BufferAllocator allocator = new RootAllocator()) {
-          TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
-          testDataset.createEmptyDataset().close();
-          int totalRows = 50;
-          try (Dataset dataset = testDataset.write(1, totalRows)) {
-              try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().withRowId(true).build())) {
-                  try (ArrowReader reader = scanner.scanBatches()) {
-                      VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                      assertTrue(root.getSchema().getFields().stream().anyMatch(field -> field.getName().equals("_rowid")));
-                      while (reader.loadNextBatch()) {
-                          List<FieldVector> fieldVectors = root.getFieldVectors();
-                          assertTrue(fieldVectors.stream().anyMatch(vector -> vector.getName().equals("_rowid")));
-                      }
-                  }
-              }
+    String datasetPath = tempDir.resolve("dataset_scanner_with_row_id").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      int totalRows = 50;
+      try (Dataset dataset = testDataset.write(1, totalRows)) {
+        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().withRowId(true).build())) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            assertTrue(
+                root.getSchema().getFields().stream()
+                    .anyMatch(field -> field.getName().equals("_rowid")));
+            while (reader.loadNextBatch()) {
+              List<FieldVector> fieldVectors = root.getFieldVectors();
+              assertTrue(
+                  fieldVectors.stream().anyMatch(vector -> vector.getName().equals("_rowid")));
+            }
           }
+        }
       }
+    }
   }
 
   @Test
   void testDatasetScannerBatchReadahead() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_batch_readahead").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 1000;
       int batchSize = 100;
       int batchReadahead = 5;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        try (LanceScanner scanner = dataset.newScan(new ScanOptions.Builder()
-            .batchSize(batchSize)
-            .batchReadahead(batchReadahead)
-            .build())) {
+        try (LanceScanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .batchSize(batchSize)
+                    .batchReadahead(batchReadahead)
+                    .build())) {
           // This test is more about ensuring that the batchReadahead parameter is accepted
           // and doesn't cause errors. The actual effect of batchReadahead might not be
           // directly observable in this test.
@@ -359,25 +403,29 @@ public class ScannerTest {
   void testDatasetScannerCombinedParams() throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_combined_params").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      TestUtils.SimpleTestDataset testDataset = new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       int totalRows = 600;
       int limit = 200;
       int offset = 300;
       int batchSize = 50;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        try (Scanner scanner = dataset.newScan(new ScanOptions.Builder()
-            .limit(limit)
-            .offset(offset)
-            .withRowId(true)
-            .batchSize(batchSize)
-            .batchReadahead(3)
-            .build())) {
+        try (Scanner scanner =
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .limit(limit)
+                    .offset(offset)
+                    .withRowId(true)
+                    .batchSize(batchSize)
+                    .batchReadahead(3)
+                    .build())) {
           try (ArrowReader reader = scanner.scanBatches()) {
             VectorSchemaRoot root = reader.getVectorSchemaRoot();
-            List<String> fieldNames = root.getSchema().getFields().stream()
-                .map(Field::getName)
-                .collect(Collectors.toList());
+            List<String> fieldNames =
+                root.getSchema().getFields().stream()
+                    .map(Field::getName)
+                    .collect(Collectors.toList());
             assertTrue(fieldNames.contains("_rowid"), "Schema should contain _rowid column");
             assertTrue(fieldNames.contains("id"), "Schema should contain id column");
 
@@ -385,7 +433,8 @@ public class ScannerTest {
             int expectedIdStart = offset;
             while (reader.loadNextBatch()) {
               List<FieldVector> fieldVectors = root.getFieldVectors();
-              assertTrue(fieldVectors.stream().anyMatch(vector -> vector.getName().equals("_rowid")));
+              assertTrue(
+                  fieldVectors.stream().anyMatch(vector -> vector.getName().equals("_rowid")));
               IntVector idVector = (IntVector) root.getVector("id");
               int batchRowCount = root.getRowCount();
               rowCount += batchRowCount;
@@ -393,9 +442,15 @@ public class ScannerTest {
 
               for (int i = 0; i < batchRowCount; i++) {
                 int expectedId = expectedIdStart + i;
-                assertEquals(expectedId, idVector.get(i), 
-                    "Mismatch at row " + (rowCount - batchRowCount + i) + 
-                    ". Expected: " + expectedId + ", Actual: " + idVector.get(i));
+                assertEquals(
+                    expectedId,
+                    idVector.get(i),
+                    "Mismatch at row "
+                        + (rowCount - batchRowCount + i)
+                        + ". Expected: "
+                        + expectedId
+                        + ", Actual: "
+                        + idVector.get(i));
               }
               expectedIdStart += batchRowCount;
             }
@@ -407,9 +462,15 @@ public class ScannerTest {
   }
 
   private void validScanResult(Dataset dataset, int fragmentId, int rowCount) throws Exception {
-    try (Scanner scanner = dataset.newScan(new ScanOptions.Builder().batchSize(1024).fragmentIds(Arrays.asList(fragmentId)).build())) {
+    try (Scanner scanner =
+        dataset.newScan(
+            new ScanOptions.Builder()
+                .batchSize(1024)
+                .fragmentIds(Arrays.asList(fragmentId))
+                .build())) {
       try (ArrowReader reader = scanner.scanBatches()) {
-        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        assertEquals(
+            dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
         reader.loadNextBatch();
         assertEquals(rowCount, reader.getVectorSchemaRoot().getRowCount());
         assertFalse(reader.loadNextBatch());
