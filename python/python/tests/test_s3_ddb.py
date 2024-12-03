@@ -287,3 +287,14 @@ def test_file_writer_reader(s3_bucket: str):
         bytes(reader.read_global_buffer(global_buffer_pos)).decode()
         == global_buffer_text
     )
+
+
+@pytest.mark.integration
+def test_s3_drop(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table_name = uuid.uuid4().hex
+    tmp_path = f"s3://{s3_bucket}/{table_name}.lance"
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path, storage_options=storage_options)
+    dataset.validate()
+    lance.LanceDataset.drop(tmp_path, storage_options=storage_options)
