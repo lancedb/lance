@@ -112,9 +112,15 @@ fn remove_extension_types(
             field_counter += 1;
         }
     }
+    let mut names = vec![String::new(); index_mapping.len()];
+    for (old_idx, old_name) in substrait_schema.names.iter().enumerate() {
+        if let Some(new_idx) = index_mapping.get(&old_idx) {
+            names[*new_idx] = old_name.clone();
+        }
+    }
     let new_arrow_schema = Arc::new(Schema::new(kept_arrow_fields));
     let new_substrait_schema = NamedStruct {
-        names: vec![],
+        names,
         r#struct: Some(Struct {
             nullability: fields.nullability,
             type_variation_reference: fields.type_variation_reference,

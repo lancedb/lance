@@ -102,7 +102,7 @@ lazy_static! {
 }
 
 #[pymodule]
-fn lance(py: Python, m: &PyModule) -> PyResult<()> {
+fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
@@ -297,10 +297,10 @@ fn read_tfrecord(
 
 #[pyfunction]
 #[pyo3(signature = (dataset,))]
-fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
+fn manifest_needs_migration(dataset: &Bound<'_, PyAny>) -> PyResult<bool> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let indices = RT
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;

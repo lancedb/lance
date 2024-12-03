@@ -55,6 +55,7 @@ fn get_filter(level: Option<&str>) -> PyResult<filter::LevelFilter> {
 }
 
 #[pyfunction]
+#[pyo3(signature=(path=None, level=None))]
 pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<TraceGuard> {
     let mut builder = ChromeLayerBuilder::new()
         .trace_style(TraceStyle::Async)

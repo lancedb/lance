@@ -213,6 +213,7 @@ impl LanceFileWriter {
 #[pymethods]
 impl LanceFileWriter {
     #[new]
+    #[pyo3(signature=(path, schema=None, data_cache_bytes=None, version=None, storage_options=None, keep_original_array=None))]
     pub fn new(
         path: String,
         schema: Option<PyArrowType<ArrowSchema>>,
@@ -390,6 +391,7 @@ impl LanceFileReader {
 #[pymethods]
 impl LanceFileReader {
     #[new]
+    #[pyo3(signature=(path, storage_options=None))]
     pub fn new(path: String, storage_options: Option<HashMap<String, String>>) -> PyResult<Self> {
         RT.runtime.block_on(Self::open(path, storage_options))
     }
