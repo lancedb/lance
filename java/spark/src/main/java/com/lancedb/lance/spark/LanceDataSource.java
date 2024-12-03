@@ -16,6 +16,7 @@ package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.SupportsCatalogOptions;
 import org.apache.spark.sql.connector.catalog.Table;
@@ -36,8 +37,8 @@ public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegist
   }
 
   @Override
-  public Table getTable(StructType schema, Transform[] partitioning,
-      Map<String, String> properties) {
+  public Table getTable(
+      StructType schema, Transform[] partitioning, Map<String, String> properties) {
     return new LanceDataset(LanceConfig.from(properties), schema);
   }
 
