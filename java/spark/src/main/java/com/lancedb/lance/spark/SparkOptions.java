@@ -34,7 +34,6 @@ public class SparkOptions {
     private static final String max_row_per_file = "max_row_per_file";
     private static final String max_rows_per_group = "max_rows_per_group";
     private static final String max_bytes_per_file = "max_bytes_per_file";
-    private static final String with_row_id = "with_row_id";
     private static final String batch_size = "batch_size";
 
     public static ReadOptions genReadOptionFromConfig(LanceConfig config) {
@@ -88,13 +87,6 @@ public class SparkOptions {
         return storageOptions;
     }
 
-    public static boolean enableRowId(LanceConfig config) {
-        Map<String, String> options = config.getOptions();
-        if (options.containsKey(with_row_id)) {
-            return Boolean.parseBoolean(options.get(with_row_id));
-        }
-        return false;
-    }
     public static int getBatchSize(LanceConfig config) {
         Map<String, String> options = config.getOptions();
         if (options.containsKey(batch_size)) {

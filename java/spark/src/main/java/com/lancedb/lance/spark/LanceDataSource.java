@@ -37,9 +37,6 @@ public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegist
       return null;
     }
     StructType actualSchema = schema.get();
-    if (SparkOptions.enableRowId(config)) {
-      actualSchema = actualSchema.add(LanceConstant.ROW_ID_SPARK_TYPE);
-    }
     return actualSchema;
   }
 

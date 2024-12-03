@@ -56,11 +56,11 @@ public class LanceFragmentScanner implements AutoCloseable {
       fragment = dataset.getFragments().get(fragmentId);
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));
+      scanOptions.withRowId(getWithRowId(inputPartition.getSchema()));
       if (inputPartition.getWhereCondition().isPresent()) {
         scanOptions.filter(inputPartition.getWhereCondition().get());
       }
       scanOptions.batchSize(SparkOptions.getBatchSize(config));
-      scanOptions.withRowId(SparkOptions.enableRowId(config));
       scanner = fragment.newScan(scanOptions.build());
     } catch (Throwable t) {
       if (scanner != null) {
@@ -108,5 +108,11 @@ public class LanceFragmentScanner implements AutoCloseable {
         .map(StructField::name)
         .filter(name -> !name.equals(LanceConstant.ROW_ID))
         .collect(Collectors.toList());
+  }
+
+  private static boolean getWithRowId(StructType schema) {
+    return Arrays.stream(schema.fields())
+            .map(StructField::name)
+            .anyMatch(name -> name.equals(LanceConstant.ROW_ID));
   }
 }

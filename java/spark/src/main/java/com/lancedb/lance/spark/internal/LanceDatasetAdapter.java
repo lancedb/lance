@@ -16,7 +16,6 @@ package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.*;
 import com.lancedb.lance.spark.LanceConfig;
-import com.lancedb.lance.spark.LanceConstant;
 import com.lancedb.lance.spark.read.LanceInputPartition;
 import com.lancedb.lance.spark.SparkOptions;
 import com.lancedb.lance.spark.utils.Optional;
@@ -41,9 +40,6 @@ public class LanceDatasetAdapter {
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
       StructType actualSchema = ArrowUtils.fromArrowSchema(dataset.getSchema());
-      if (SparkOptions.enableRowId(config)) {
-        actualSchema = actualSchema.add(LanceConstant.ROW_ID_SPARK_TYPE);
-      }
       return Optional.of(actualSchema);
     } catch (IllegalArgumentException e) {
       // dataset not found
