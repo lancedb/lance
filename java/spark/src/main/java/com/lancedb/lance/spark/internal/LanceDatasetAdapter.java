@@ -33,9 +33,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 public class LanceDatasetAdapter {
-  private static final BufferAllocator allocator = new RootAllocator(
-      RootAllocator.configBuilder().from(RootAllocator.defaultConfig())
-          .maxAllocation(64 * 1024 * 1024).build());
+  private static final BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
 
   public static Optional<StructType> getSchema(LanceConfig config) {
     String uri = config.getDatasetUri();
@@ -88,12 +86,12 @@ public class LanceDatasetAdapter {
         ArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false), batchSize);
   }
 
-  public static FragmentMetadata createFragment(String datasetUri, ArrowReader reader,
+  public static List<FragmentMetadata> createFragment(String datasetUri, ArrowReader reader,
                                                 WriteParams params) {
     try (ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
       Data.exportArrayStream(allocator, reader, arrowStream);
       return Fragment.create(datasetUri, arrowStream,
-          java.util.Optional.empty(), params);
+          params);
     }
   }
 

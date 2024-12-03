@@ -32,7 +32,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
@@ -52,6 +54,7 @@ public class SparkWriteTest {
         .appName("spark-lance-connector-test")
         .master("local")
         .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
+        .config("spark.sql.catalog.lance.max_row_per_file", "1")
         .getOrCreate();
     StructType schema = new StructType(new StructField[]{
         DataTypes.createStructField("id", DataTypes.IntegerType, false),
@@ -143,6 +146,31 @@ public class SparkWriteTest {
         .save();
 
     validateData(datasetName, 1);
+  }
+
+  @Test
+  public void writeMultiFiles(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String filePath = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    testData.write().format(LanceDataSource.name)
+            .option(LanceConfig.CONFIG_DATASET_URI, filePath)
+            .save();
+
+    validateData(datasetName, 1);
+    File directory = new File(filePath + "/data");
+    assertEquals(2, directory.listFiles().length);
+  }
+
+  @Test
+  public void writeEmptyTaskFiles(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String filePath = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    testData.repartition(4).write().format(LanceDataSource.name)
+            .option(LanceConfig.CONFIG_DATASET_URI, filePath)
+            .save();
+
+    File directory = new File(filePath + "/data");
+    assertEquals(2, directory.listFiles().length);
   }
 
   private void validateData(String datasetName, int iteration) {

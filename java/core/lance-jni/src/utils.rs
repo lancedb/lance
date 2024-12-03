@@ -76,8 +76,8 @@ pub fn extract_write_params(
     if let Some(mode_val) = env.get_string_opt(mode)? {
         write_params.mode = WriteMode::try_from(mode_val.as_str())?;
     }
-    // Java code always sets the data storage version to Legacy for now
-    write_params.data_storage_version = Some(LanceFileVersion::Legacy);
+    // Java code always sets the data storage version to stable for now
+    write_params.data_storage_version = Some(LanceFileVersion::Stable);
     let storage_options: HashMap<String, String> =
         extract_storage_options(env, storage_options_obj)?;
 
