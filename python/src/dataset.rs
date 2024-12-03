@@ -1408,7 +1408,6 @@ impl Dataset {
         Session::new(self.ds.session())
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     fn drop(dest: String, storage_options: Option<HashMap<String, String>>) -> PyResult<()> {
         RT.spawn(None, async move {
