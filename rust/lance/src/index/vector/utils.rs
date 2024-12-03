@@ -33,6 +33,17 @@ pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
     }
 }
 
+fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
+    match data_type {
+        arrow::datatypes::DataType::FixedSizeList(_, dim) => Ok(*dim as usize),
+        arrow::datatypes::DataType::List(inner) => infer_vector_dim(inner.data_type()),
+        _ => Err(Error::Index {
+            message: format!("Data type is not a FixedSizeListArray, but {:?}", data_type),
+            location: location!(),
+        }),
+    }
+}
+
 /// Maybe sample training data from dataset, specified by column name.
 ///
 /// Returns a [FixedSizeListArray], containing the training dataset.
