@@ -310,6 +310,7 @@ impl VectorIndex for PQIndex {
     }
 
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        let num_vectors = self.row_ids.as_ref().unwrap().len();
         let code = self
             .code
             .as_ref()
