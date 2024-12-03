@@ -35,6 +35,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use super::local::LocalObjectReader;
+mod options;
 mod tracing;
 use self::tracing::ObjectStoreTracingExt;
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
