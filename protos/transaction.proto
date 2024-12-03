@@ -61,6 +61,8 @@ message Transaction {
     repeated lance.file.Field schema = 2;
     // Schema metadata.
     map<string, bytes> schema_metadata = 3;
+    // Key-value pairs to merge with existing config.
+    map<string, string> config_upsert_values = 4;
   }
 
   // Add or replace a new secondary index.
@@ -156,6 +158,12 @@ message Transaction {
     // The new fragments where updated rows have been moved to.
     repeated DataFragment new_fragments = 3;
   }
+  
+  // An operation that updates the table config.
+  message UpdateConfig {
+    map<string, string> upsert_values = 1;
+    repeated string delete_keys = 2;
+  }
 
   // The operation of this transaction.
   oneof operation {
@@ -169,5 +177,12 @@ message Transaction {
     ReserveFragments reserve_fragments = 107;
     Update update = 108;
     Project project = 109;
+    UpdateConfig update_config = 110;
   }
+
+  // An operation to apply to the blob dataset
+  oneof blob_operation {
+    Append blob_append = 200;
+    Overwrite blob_overwrite = 202;
+  }  
 }

@@ -168,14 +168,13 @@ impl ScalarIndex for BitmapIndex {
                     Bound::Unbounded => Bound::Unbounded,
                 };
 
-                let range_iter = self.index_map.range((range_start, range_end));
-                let mut union_bitmap = RowIdTreeMap::default();
+                let maps = self
+                    .index_map
+                    .range((range_start, range_end))
+                    .map(|(_, v)| v)
+                    .collect::<Vec<_>>();
 
-                for (_, bitmap) in range_iter {
-                    union_bitmap |= bitmap.clone();
-                }
-
-                union_bitmap
+                RowIdTreeMap::union_all(&maps)
             }
             SargableQuery::IsIn(values) => {
                 let mut union_bitmap = RowIdTreeMap::default();
@@ -214,7 +213,7 @@ impl ScalarIndex for BitmapIndex {
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let serialized_lookup = page_lookup_file
-            .read_range(0..page_lookup_file.num_rows())
+            .read_range(0..page_lookup_file.num_rows(), None)
             .await?;
 
         Ok(Arc::new(Self::try_from_serialized(

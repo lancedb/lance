@@ -15,7 +15,7 @@ use lance_linalg::{
 
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
-pub async fn train_kmeans<T: ArrowPrimitiveType>(
+pub fn train_kmeans<T: ArrowPrimitiveType>(
     array: &[T::Native],
     dimension: usize,
     k: usize,
@@ -36,7 +36,7 @@ where
         ),location: location!()});
     }
 
-    // Ony sample sample_rate * num_clusters. See Faiss
+    // Only sample sample_rate * num_clusters. See Faiss
     let data = if num_rows > sample_rate * k {
         info!(
             "Sample {} out of {} to train kmeans of {} dim, {} clusters",

@@ -14,6 +14,8 @@
 
 package com.lancedb.lance;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -29,34 +31,47 @@ public class Fragment {
     JniLoader.ensureLoaded();
   }
 
-  /** Create a fragment from the given data in vector schema root. */
-  public static FragmentMetadata create(String datasetUri, BufferAllocator allocator,
-      VectorSchemaRoot root, Optional<Integer> fragmentId, WriteParams params) {
+  /**
+   * Create a fragment from the given data.
+   *
+   * @param datasetUri the dataset uri
+   * @param allocator the buffer allocator
+   * @param root the vector schema root
+   * @param params the write params
+   * @return the fragment metadata
+   */
+  public static List<FragmentMetadata> create(String datasetUri, BufferAllocator allocator,
+      VectorSchemaRoot root, WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(root);
-    Preconditions.checkNotNull(fragmentId);
     Preconditions.checkNotNull(params);
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
          ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
-      return FragmentMetadata.fromJson(createWithFfiArray(datasetUri, arrowArray.memoryAddress(),
-          arrowSchema.memoryAddress(), fragmentId, params.getMaxRowsPerFile(),
-          params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode()));
+      return FragmentMetadata.fromJsonArray(createWithFfiArray(datasetUri,
+              arrowArray.memoryAddress(), arrowSchema.memoryAddress(),
+              params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(),
+              params.getMode(), params.getStorageOptions()));
     }
   }
 
-  /** Create a fragment from the given data. */
-  public static FragmentMetadata create(String datasetUri, ArrowArrayStream stream,
-      Optional<Integer> fragmentId, WriteParams params) {
+  /**
+   * Create a fragment from the given arrow stream.
+   * @param datasetUri  the dataset uri
+   * @param stream  the arrow stream
+   * @param params  the write params
+   * @return  the fragment metadata
+   */
+  public static List<FragmentMetadata> create(String datasetUri, ArrowArrayStream stream,
+      WriteParams params) {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
-    Preconditions.checkNotNull(fragmentId);
     Preconditions.checkNotNull(params);
-    return FragmentMetadata.fromJson(createWithFfiStream(datasetUri,
-        stream.memoryAddress(), fragmentId,
+    return FragmentMetadata.fromJsonArray(createWithFfiStream(datasetUri,
+        stream.memoryAddress(),
         params.getMaxRowsPerFile(), params.getMaxRowsPerGroup(),
-        params.getMaxBytesPerFile(), params.getMode()));
+        params.getMaxBytesPerFile(), params.getMode(), params.getStorageOptions()));
   }
 
   /**
@@ -65,9 +80,9 @@ public class Fragment {
    * @return the json serialized fragment metadata
    */
   private static native String createWithFfiArray(String datasetUri,
-      long arrowArrayMemoryAddress, long arrowSchemaMemoryAddress, Optional<Integer> fragmentId,
+      long arrowArrayMemoryAddress, long arrowSchemaMemoryAddress,
       Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode);
+      Optional<Long> maxBytesPerFile, Optional<String> mode, Map<String, String> storageOptions);
 
   /**
    * Create a fragment from the given arrow stream.
@@ -75,7 +90,7 @@ public class Fragment {
    * @return the json serialized fragment metadata
    */
   private static native String createWithFfiStream(String datasetUri, long arrowStreamMemoryAddress,
-      Optional<Integer> fragmentId, Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerFile,
       Optional<Integer> maxRowsPerGroup, Optional<Long> maxBytesPerFile,
-      Optional<String> mode);
+      Optional<String> mode, Map<String, String> storageOptions);
 }

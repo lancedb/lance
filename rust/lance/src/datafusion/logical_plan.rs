@@ -6,9 +6,9 @@ use std::{any::Any, sync::Arc};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
 use datafusion::{
+    catalog::Session,
     datasource::TableProvider,
     error::Result as DatafusionResult,
-    execution::context::SessionState,
     logical_expr::{LogicalPlan, TableType},
     physical_plan::ExecutionPlan,
     prelude::Expr,
@@ -40,12 +40,12 @@ impl TableProvider for Dataset {
 
     async fn scan(
         &self,
-        _: &SessionState,
+        _: &dyn Session,
         projection: Option<&Vec<usize>>,
         _: &[Expr],
         limit: Option<usize>,
     ) -> DatafusionResult<Arc<dyn ExecutionPlan>> {
-        let mut scanner = self.scan();
+        let scanner = self.scan();
 
         let schema_ref = self.schema();
         let projections = if let Some(projection) = projection {
@@ -60,10 +60,9 @@ impl TableProvider for Dataset {
             schema_ref.clone()
         };
 
-        if let Some(limit) = limit {
-            scanner.limit(Some(limit as i64), None)?;
-        }
-        let plan: Arc<dyn ExecutionPlan> = scanner.scan(false, false, false, projections.into());
+        let scan_range = limit.map(|l| (0..l as u64));
+        let plan: Arc<dyn ExecutionPlan> =
+            scanner.scan(false, false, false, scan_range, projections.into());
 
         Ok(plan)
     }

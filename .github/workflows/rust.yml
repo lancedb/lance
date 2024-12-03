@@ -1,4 +1,4 @@
-name: Build and run Rust tests
+name: Rust
 on:
   push:
     branches:
@@ -28,8 +28,28 @@ env:
   CARGO_BUILD_JOBS: "1"
 
 jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check formatting
+        run: cargo fmt -- --check
+  clippy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Run clippy
+        run: |
+          cargo clippy --version
+          cargo clippy --locked --all-features --tests --benches -- -D warnings
   linux-build:
-    runs-on: buildjet-8vcpu-ubuntu-2204
+    runs-on: "ubuntu-24.04"
     timeout-minutes: 45
     strategy:
       matrix:
@@ -38,44 +58,22 @@ jobs:
           - nightly
     env:
       # Need up-to-date compilers for kernels
-      CC: gcc-12
-      CXX: g++-12
+      CC: clang
+      CXX: clang
     steps:
       - uses: actions/checkout@v4
       # pin the toolchain version to avoid surprises
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-        if: ${{ matrix.toolchain == 'stable' }}
         with:
-          toolchain: "1.78.0"
-          cache-workspaces: "src/rust"
-          # Disable full debug symbol generation to speed up CI build and keep memory down
-          # "1" means line tables only, which is useful for panic tracebacks.
-          rustflags: "-C debuginfo=1"
-          components: "rustfmt,clippy"
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        if: ${{ matrix.toolchain != 'stable' }}
-        with:
-          toolchain: "nightly"
-          cache-workspaces: "src/rust"
-          # Disable full debug symbol generation to speed up CI build and keep memory down
-          # "1" means line tables only, which is useful for panic tracebacks.
-          rustflags: "-C debuginfo=1"
-          components: "rustfmt,clippy"
+          toolchain: ${{ matrix.toolchain }}
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "buildjet-v1"
-          workspaces: rust
-          cache-provider: "buildjet"
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-          rustup component add rustfmt
-      - name: Run cargo fmt
-        run: cargo fmt --check
       - name: Start DynamoDB local for tests
-        if: ${{ matrix.toolchain == 'stable' }}
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Install cargo-llvm-cov
@@ -83,11 +81,13 @@ jobs:
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
-          cargo llvm-cov --workspace --codecov --output-path coverage.codecov --features dynamodb,tensorflow,dynamodb_tests,cli
+          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --all-features
+      - name: Build tests (nightly)
+        run: cargo test --locked --all-features --workspace --no-run
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
-          cargo test
+          cargo test --all-features --workspace
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -98,50 +98,48 @@ jobs:
           flags: unittests
           fail_ci_if_error: false
   linux-arm:
-    runs-on: warp-ubuntu-latest-arm64-4x
-    timeout-minutes: 30
+    runs-on: ubuntu-2404-4x-arm64
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: "1.78.0"
-          cache-workspaces: "src/rust"
-          # Disable full debug symbol generation to speed up CI build and keep memory down
-          # "1" means line tables only, which is useful for panic tracebacks.
-          rustflags: "-C debuginfo=1"
-          components: "rustfmt,clippy"
+          toolchain: "stable"
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Install dependencies
         run: |
           sudo apt -y -qq update
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
-      - name: Run cargo fmt
-        run: cargo fmt --check
-        shell: bash
+      - name: Build tests
+        run: |
+          cargo test --locked --all-features --no-run
       - name: Start DynamoDB local for tests
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
         run: |
-          cargo test --all-features -- --test-threads 1
-  clippy_and_benchmark:
-    runs-on: ubuntu-22.04
+          cargo test --locked --all-features
+  build-no-lock:
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang
+      CXX: clang
     steps:
       - uses: actions/checkout@v4
+      # Remote cargo.lock to force a fresh build
+      - name: Remove Cargo.lock
+        run: rm -f Cargo.lock
+      - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
-      - name: Run clippy
-        run: cargo clippy --features cli,dynamodb,tensorflow,dynamodb_tests --tests --benches -- -D warnings
-      - name: Build benchmarks
-        run: cargo build --benches
+      - name: Build all
+        run: cargo build --benches --all-features --tests
   mac-build:
     runs-on: "macos-14"
     timeout-minutes: 45
@@ -156,11 +154,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Select new xcode
         # Default XCode right now is 15.0.1, which contains a bug that causes
-        # backtraces to not show properly. See: 
+        # backtraces to not show properly. See:
         # https://github.com/rust-lang/rust/issues/113783
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
       - name: Install dependencies
@@ -168,12 +164,12 @@ jobs:
       - name: Set up Rust
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-          rustup component add rustfmt
+      - name: Build tests
+        run: cargo test --locked --all-features --no-run
       - name: Run tests
-        # Check all benches, even though we aren't going to run them.
-        run: |  
-          cargo build --tests --benches --all-features --workspace
-          cargo test --all-features
+        run: cargo test --all-features
+      - name: Check benchmarks
+        run: cargo check --benches --all-features
   windows-build:
     runs-on: windows-latest
     defaults:
@@ -182,8 +178,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
       - name: Install Protoc v21.12
         working-directory: C:\
         run: |
@@ -193,8 +187,35 @@ jobs:
           7z x protoc.zip
           Add-Content $env:GITHUB_PATH "C:\protoc\bin"
         shell: powershell
+      - name: Build tests
+        run: cargo test --locked --no-run
       - name: Run tests
-        # Check all benches, even though we aren't going to run them.
+        run: cargo test
+      - name: Check benchmarks
+        run: cargo check --benches
+  msrv:
+    # Check the minimum supported Rust version
+    name: MSRV Check - Rust v${{ matrix.msrv }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        msrv: ["1.78.0"] # This should match up with rust-version in Cargo.toml
+    env:
+      # Need up-to-date compilers for kernels
+      CC: clang
+      CXX: clang
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
         run: |
-          cargo build --tests --benches --all-features --workspace
-          cargo test
+          sudo apt update
+          sudo apt install -y protobuf-compiler libssl-dev
+      - name: Install ${{ matrix.msrv }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.msrv }}
+      - name: cargo +${{ matrix.msrv }} check
+        run: cargo check --workspace --tests --benches --all-features

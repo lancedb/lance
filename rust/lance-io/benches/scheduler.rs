@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+#![allow(clippy::print_stdout)]
 
 use bytes::Bytes;
 use lance_core::Result;

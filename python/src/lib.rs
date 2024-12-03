@@ -29,6 +29,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::blob::LanceBlobFile;
 use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
@@ -63,7 +64,6 @@ pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
 pub(crate) mod tracing;
-pub(crate) mod updater;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
@@ -72,7 +72,7 @@ pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
-pub use dataset::{Dataset, Operation};
+pub use dataset::{Dataset, Operation, RewriteGroup, RewrittenIndex};
 pub use fragment::FragmentMetadata;
 use fragment::{DataFile, FileFragment};
 pub use indices::register_indices;
@@ -111,9 +111,12 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
     m.add_class::<Operation>()?;
+    m.add_class::<RewriteGroup>()?;
+    m.add_class::<RewrittenIndex>()?;
     m.add_class::<FileFragment>()?;
     m.add_class::<FragmentMetadata>()?;
     m.add_class::<MergeInsertBuilder>()?;
+    m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileMetadata>()?;
@@ -301,7 +304,7 @@ fn manifest_needs_migration(dataset: &PyAny) -> PyResult<bool> {
     let indices = RT
         .block_on(Some(py), dataset_ref.load_indices())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
-    let manifest = RT
+    let (manifest, _) = RT
         .block_on(Some(py), dataset_ref.latest_manifest())?
         .map_err(|err| PyIOError::new_err(format!("Could not read dataset metadata: {}", err)))?;
     Ok(::lance::io::commit::manifest_needs_migration(

@@ -64,7 +64,7 @@ pub fn load_row_id_sequences<'a>(
         .map(|fragment| {
             load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
         })
-        .buffer_unordered(num_cpus::get())
+        .buffer_unordered(dataset.object_store.io_parallelism())
 }
 
 pub async fn get_row_id_index(
@@ -117,11 +117,7 @@ mod test {
             DataType::Int32,
             false,
         )]));
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from_iter_values(values))],
-        )
-        .unwrap()
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(values))]).unwrap()
     }
 
     #[tokio::test]
@@ -161,7 +157,8 @@ mod test {
             .unwrap();
         assert!(!dataset.manifest().uses_move_stable_row_ids());
 
-        // Trying to append without stable row ids should fail.
+        // Trying to append without stable row ids should pass (a warning is emitted) but should not
+        // affect the move_stable_row_ids setting.
         let write_params = WriteParams {
             enable_move_stable_row_ids: true,
             mode: WriteMode::Append,
@@ -169,11 +166,10 @@ mod test {
         };
         let reader =
             RecordBatchIterator::new(vec![batch.clone()].into_iter().map(Ok), batch.schema());
-        let result = Dataset::write(reader, tmp_path, Some(write_params)).await;
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(),
-                Error::NotSupported { source, .. }
-                    if source.to_string().contains("Cannot enable stable row ids on existing dataset")));
+        let dataset = Dataset::write(reader, tmp_path, Some(write_params))
+            .await
+            .unwrap();
+        assert!(!dataset.manifest().uses_move_stable_row_ids());
     }
 
     #[tokio::test]
@@ -410,7 +406,7 @@ mod test {
 
         assert_eq!(dataset.manifest().next_row_id, num_rows);
 
-        let dataset = UpdateBuilder::new(Arc::new(dataset))
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
             .update_where("id = 3")
             .unwrap()
             .set("id", "100")
@@ -421,6 +417,7 @@ mod test {
             .await
             .unwrap();
 
+        let dataset = update_result.new_dataset;
         let index = get_row_id_index(&dataset).await.unwrap().unwrap();
         assert!(index.get(0).is_some());
         // Old address is still there.

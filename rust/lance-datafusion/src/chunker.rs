@@ -180,7 +180,7 @@ pub fn chunk_concat_stream(
     stream: SendableRecordBatchStream,
     chunk_size: usize,
 ) -> SendableRecordBatchStream {
-    let schema = stream.schema().clone();
+    let schema = stream.schema();
     let schema_copy = schema.clone();
     let chunked = chunk_stream(stream, chunk_size);
     let chunk_concat = chunked

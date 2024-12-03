@@ -9,7 +9,8 @@ use std::{collections::BTreeMap, io::Read};
 use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use roaring::RoaringBitmap;
+use deepsize::DeepSizeOf;
+use roaring::{MultiOps, RoaringBitmap};
 
 use crate::Result;
 
@@ -23,7 +24,7 @@ use super::address::RowAddress;
 ///
 /// If both the allow_list and the block_list are None (the default) then
 /// all row ids are selected
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, DeepSizeOf)]
 pub struct RowIdMask {
     /// If Some then only these row ids are selected
     pub allow_list: Option<RowIdTreeMap>,
@@ -273,7 +274,7 @@ impl std::ops::BitOr for RowIdMask {
 ///
 /// This is similar to a [RoaringTreemap] but it is optimized for the case where
 /// entire fragments are selected or deselected.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, DeepSizeOf)]
 pub struct RowIdTreeMap {
     /// The contents of the set. If there is a pair (k, Full) then the entire
     /// fragment k is selected. If there is a pair (k, Partial(v)) then the
@@ -285,6 +286,40 @@ pub struct RowIdTreeMap {
 enum RowIdSelection {
     Full,
     Partial(RoaringBitmap),
+}
+
+impl DeepSizeOf for RowIdSelection {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        match self {
+            Self::Full => 0,
+            Self::Partial(bitmap) => bitmap.serialized_size(),
+        }
+    }
+}
+
+impl RowIdSelection {
+    fn union_all(selections: &[&Self]) -> Self {
+        let mut is_full = false;
+
+        let res = Self::Partial(
+            selections
+                .iter()
+                .filter_map(|selection| match selection {
+                    Self::Full => {
+                        is_full = true;
+                        None
+                    }
+                    Self::Partial(bitmap) => Some(bitmap),
+                })
+                .union(),
+        );
+
+        if is_full {
+            Self::Full
+        } else {
+            res
+        }
+    }
 }
 
 impl RowIdTreeMap {
@@ -515,6 +550,27 @@ impl RowIdTreeMap {
             }
         }
         Ok(Self { inner })
+    }
+
+    pub fn union_all(maps: &[&Self]) -> Self {
+        let mut new_map = BTreeMap::new();
+
+        for map in maps {
+            for (fragment, selection) in &map.inner {
+                new_map
+                    .entry(fragment)
+                    // I hate this allocation, but I can't think of a better way
+                    .or_insert_with(|| Vec::with_capacity(maps.len()))
+                    .push(selection);
+            }
+        }
+
+        let new_map = new_map
+            .into_iter()
+            .map(|(&fragment, selections)| (fragment, RowIdSelection::union_all(&selections)))
+            .collect();
+
+        Self { inner: new_map }
     }
 }
 
@@ -891,7 +947,7 @@ mod tests {
             right_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
         ) {
             let mut left = RowIdTreeMap::default();
-            for fragment in left_full_fragments.clone() {
+            for fragment in left_full_fragments {
                 left.insert_fragment(fragment);
             }
             left.extend(left_rows.iter().copied());
@@ -915,7 +971,7 @@ mod tests {
             left_rows in proptest::collection::vec(0..u64::MAX, 0..1000),
         ) {
             let mut left = RowIdTreeMap::default();
-            for fragment in left_full_fragments.clone() {
+            for fragment in left_full_fragments {
                 left.insert_fragment(fragment);
             }
             left.extend(left_rows.iter().copied());

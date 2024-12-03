@@ -8,7 +8,11 @@ from typing import List, Literal, Optional, Tuple, Union
 import pyarrow as pa
 from tqdm import tqdm
 
-from lance.dependencies import _check_for_numpy, _check_for_torch, torch
+from lance.dependencies import (
+    _check_for_numpy,
+    _check_for_torch,
+    torch,
+)
 from lance.dependencies import numpy as np
 
 from . import preferred_device
@@ -79,6 +83,8 @@ class KMeans:
         self.tolerance = tolerance
         self.seed = seed
 
+        self.y2 = None
+
     def __repr__(self):
         return f"KMeans(k={self.k}, metric={self.metric}, device={self.device})"
 
@@ -86,7 +92,10 @@ class KMeans:
         self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
-            data = torch.from_numpy(np.stack(data.to_numpy(zero_copy_only=False)))
+            np_tensor = data.values.to_numpy(zero_copy_only=True).reshape(
+                -1, data.type.list_size
+            )
+            data = torch.from_numpy(np_tensor)
         elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
         elif isinstance(data, torch.Tensor):
@@ -122,6 +131,7 @@ class KMeans:
             torch.Tensor,
             pa.FixedSizeListArray,
         ],
+        column: Optional[str] = None,
     ) -> None:
         """Fit - Train the kmeans model.
 
@@ -151,7 +161,7 @@ class KMeans:
         for i in tqdm(range(self.max_iters)):
             try:
                 self.total_distance = self._fit_once(
-                    data, i, last_dist=self.total_distance
+                    data, i, last_dist=self.total_distance, column=column
                 )
             except StopIteration:
                 break
@@ -190,7 +200,11 @@ class KMeans:
         return num_rows
 
     def _fit_once(
-        self, data: torch.utils.data.IterableDataset, epoch: int, last_dist: float = 0.0
+        self,
+        data: torch.utils.data.IterableDataset,
+        epoch: int,
+        last_dist: float = 0.0,
+        column: Optional[str] = None,
     ) -> float:
         """Train KMean once and return the total distance.
 
@@ -208,7 +222,7 @@ class KMeans:
         float
             The total distance of the current centroids and the input data.
         """
-        total_dist = 0
+        total_dist = torch.tensor(0.0, device=self.device)
 
         # Use float32 to accumulate centroids, esp. if the vectors are
         # float16 / bfloat16 types.
@@ -217,21 +231,24 @@ class KMeans:
         )
         counts_per_part = torch.zeros(self.centroids.shape[0], device=self.device)
         ones = torch.ones(1024 * 16, device=self.device)
-        y2 = (self.centroids * self.centroids).sum(dim=1)
+        self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
                 logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+            if column is not None:
+                chunk = chunk[column]
             chunk: torch.Tensor = chunk
             dtype = chunk.dtype
             chunk = chunk.to(self.device)
-            ids, dists = self._transform(chunk, y2=y2)
+            ids, dists = self._transform(chunk, y2=self.y2)
 
+            # Training is significantly faster w/o these checks
             valid_mask = ids >= 0
             if torch.any(~valid_mask):
                 chunk = chunk[valid_mask]
                 ids = ids[valid_mask]
 
-            total_dist += dists.nansum().item()
+            total_dist += dists.nansum()
             if ones.shape[0] < ids.shape[0]:
                 ones = torch.ones(len(ids), out=ones, device=self.device)
 
@@ -240,6 +257,8 @@ class KMeans:
             del ids
             del dists
             del chunk
+
+        total_dist = total_dist.item()
 
         # this happens when there are too many NaNs or the data is just the same
         # vectors repeated over and over. Performance may be bad but we don't
@@ -259,6 +278,9 @@ class KMeans:
             dtype
         )
         return total_dist
+
+    def rebuild_index(self):
+        self.y2 = (self.centroids * self.centroids).sum(dim=1)
 
     def _transform(
         self,

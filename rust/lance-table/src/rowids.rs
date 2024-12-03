@@ -153,23 +153,33 @@ impl RowIdSequence {
     }
 
     /// Delete row ids by position.
-    pub fn mask(&mut self, positions: impl IntoIterator<Item = usize>) -> Result<()> {
-        let row_ids = positions
-            .into_iter()
-            .map(|pos| {
-                self.get(pos).ok_or_else(|| {
-                    Error::invalid_input(
-                        format!(
-                            "position out of bounds: {} on sequence of length {}",
-                            pos,
-                            self.len()
-                        ),
-                        location!(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.delete(row_ids);
+    pub fn mask(&mut self, positions: impl IntoIterator<Item = u32>) -> Result<()> {
+        let mut local_positions = Vec::new();
+        let mut positions_iter = positions.into_iter();
+        let mut curr_position = positions_iter.next();
+        let mut offset = 0;
+        let mut cutoff = 0;
+
+        for segment in &mut self.0 {
+            // Make vector of local positions
+            cutoff += segment.len() as u32;
+            while let Some(position) = curr_position {
+                if position >= cutoff {
+                    break;
+                }
+                local_positions.push(position - offset);
+                curr_position = positions_iter.next();
+            }
+
+            if !local_positions.is_empty() {
+                segment.mask(&local_positions);
+                local_positions.clear();
+            }
+            offset = cutoff;
+        }
+
+        self.0.retain(|segment| segment.len() != 0);
+
         Ok(())
     }
 
@@ -628,7 +638,7 @@ mod test {
 
         // Large pieces to smaller ones
         assert_rechunked(
-            fewer_segments.clone(),
+            fewer_segments,
             many_segments.iter().map(|seq| seq.len()).collect(),
             many_segments.clone(),
         );
@@ -645,7 +655,7 @@ mod test {
         assert!(result.is_err());
 
         // Too many segments -> error
-        let result = rechunk_sequences(many_segments.clone(), vec![5]);
+        let result = rechunk_sequences(many_segments, vec![5]);
         assert!(result.is_err());
     }
 
@@ -752,5 +762,72 @@ mod test {
         .into_iter()
         .collect::<RowIdTreeMap>();
         assert_eq!(tree_map, expected);
+    }
+
+    #[test]
+    fn test_row_id_mask() {
+        // 0, 1, 2, 3, 4
+        // 50, 51, 52, 55, 56, 57, 58, 59
+        // 7, 9
+        // 10, 12, 14
+        // 35, 39
+        let sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::RangeWithHoles {
+                range: 50..60,
+                holes: vec![53, 54].into(),
+            },
+            U64Segment::SortedArray(vec![7, 9].into()),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, true, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35, 39].into()),
+        ]);
+
+        // Masking one in each segment
+        let values_to_remove = [4, 55, 7, 12, 39];
+        let positions_to_remove = sequence
+            .iter()
+            .enumerate()
+            .filter_map(|(i, val)| {
+                if values_to_remove.contains(&val) {
+                    Some(i as u32)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut sequence = sequence;
+        sequence.mask(positions_to_remove).unwrap();
+        let expected = RowIdSequence(vec![
+            U64Segment::Range(0..4),
+            U64Segment::RangeWithBitmap {
+                range: 50..60,
+                bitmap: [
+                    true, true, true, false, false, false, true, true, true, true,
+                ]
+                .as_slice()
+                .into(),
+            },
+            U64Segment::Range(9..10),
+            U64Segment::RangeWithBitmap {
+                range: 10..15,
+                bitmap: [true, false, false, false, true].as_slice().into(),
+            },
+            U64Segment::Array(vec![35].into()),
+        ]);
+        assert_eq!(sequence, expected);
+    }
+
+    #[test]
+    fn test_row_id_mask_everything() {
+        let mut sequence = RowIdSequence(vec![
+            U64Segment::Range(0..5),
+            U64Segment::SortedArray(vec![7, 9].into()),
+        ]);
+        sequence.mask(0..sequence.len() as u32).unwrap();
+        let expected = RowIdSequence(vec![]);
+        assert_eq!(sequence, expected);
     }
 }

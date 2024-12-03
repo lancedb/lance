@@ -11,6 +11,7 @@ use crossbeam_queue::ArrayQueue;
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
 use snafu::{location, Location};
@@ -174,7 +175,12 @@ impl HNSW {
         let nodes = &self.nodes();
         for level in (0..self.max_level()).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc);
+            ep = greedy_search(
+                &cur_level,
+                ep,
+                &dist_calc,
+                self.inner.params.prefetch_distance,
+            );
         }
 
         let bottom_level = HnswBottomView::new(nodes);
@@ -220,7 +226,7 @@ impl HNSW {
         match self.inner.visited_generator_queue.push(visited_generator) {
             Ok(_) => {}
             Err(_) => {
-                println!("visited_generator_queue is full");
+                log::warn!("visited_generator_queue is full");
             }
         }
 
@@ -331,8 +337,8 @@ impl HnswBuilder {
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>();
 
-        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get()));
-        for _ in 0..num_cpus::get() {
+        let visited_generator_queue = Arc::new(ArrayQueue::new(get_num_compute_intensive_cpus()));
+        for _ in 0..get_num_compute_intensive_cpus() {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
@@ -403,7 +409,7 @@ impl HnswBuilder {
         let dist_calc = storage.dist_calculator_from_id(node);
         for level in (target_level + 1..self.params.max_level).rev() {
             let cur_level = HnswLevelView::new(level, nodes);
-            ep = greedy_search(&cur_level, ep, &dist_calc);
+            ep = greedy_search(&cur_level, ep, &dist_calc, self.params.prefetch_distance);
         }
 
         let mut pruned_neighbors_per_level: Vec<Vec<_>> =
@@ -611,8 +617,9 @@ impl IvfSubIndex for HNSW {
             }
         }
 
-        let visited_generator_queue = Arc::new(ArrayQueue::new(num_cpus::get() * 2));
-        for _ in 0..num_cpus::get() * 2 {
+        let visited_generator_queue =
+            Arc::new(ArrayQueue::new(get_num_compute_intensive_cpus() * 2));
+        for _ in 0..get_num_compute_intensive_cpus() * 2 {
             visited_generator_queue
                 .push(VisitedGenerator::new(0))
                 .unwrap();
@@ -628,10 +635,6 @@ impl IvfSubIndex for HNSW {
         Ok(Self {
             inner: Arc::new(inner),
         })
-    }
-
-    fn use_residual() -> bool {
-        false
     }
 
     fn name() -> &'static str {

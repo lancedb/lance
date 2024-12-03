@@ -107,8 +107,7 @@ pub fn to_duckdb_logical_type(data_type: &DataType) -> Result<LogicalType> {
             child.data_type(),
         )?))
     } else {
-        println!("Unsupported data type: {data_type}, please file an issue https://github.com/eto-ai/lance");
-        todo!()
+        todo!("Unsupported data type: {data_type}, please file an issue at https://github.com/lancedb/lance");
     }
 }
 
@@ -142,8 +141,7 @@ pub fn record_batch_to_duckdb_data_chunk(batch: &RecordBatch, chunk: &mut DataCh
                 struct_array_to_vector(struct_array, &mut struct_vector);
             }
             _ => {
-                println!("column {} is not supported yet, please file an issue https://github.com/eto-ai/lance", batch.schema().field(i));
-                todo!()
+                todo!("column {} is not supported yet, please file an issue at https://github.com/lancedb/lance", batch.schema().field(i));
             }
         }
     }
@@ -268,8 +266,7 @@ fn list_array_to_vector<O: OffsetSizeTrait + AsPrimitive<usize>>(
             }
         }
         _ => {
-            println!("Nested list is not supported yet.");
-            todo!()
+            todo!("Nested list is not supported yet.");
         }
     }
 }
@@ -288,8 +285,7 @@ fn fixed_size_list_array_to_vector(array: &FixedSizeListArray, out: &mut ListVec
             out.set_len(value_array.len());
         }
         _ => {
-            println!("Nested list is not supported yet.");
-            todo!()
+            todo!("Nested list is not supported yet.");
         }
     }
 }
@@ -328,8 +324,7 @@ fn struct_array_to_vector(array: &StructArray, out: &mut StructVector) {
                 struct_array_to_vector(struct_array, &mut struct_vector);
             }
             _ => {
-                println!("Unsupported data type: {}, please file an issue https://github.com/eto-ai/lance", column.data_type());
-                todo!()
+                todo!("Unsupported data type: {}, please file an issue at https://github.com/lancedb/lance", column.data_type());
             }
         }
     }

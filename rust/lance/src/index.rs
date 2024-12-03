@@ -4,7 +4,7 @@
 //! Secondary Index
 //!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::DataType;
@@ -13,15 +13,17 @@ use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_file::reader::FileReader;
 use lance_file::v2;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ScalarIndex;
+use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
 pub use lance_index::IndexParams;
 use lance_index::INDEX_METADATA_SCHEMA_KEY;
@@ -40,6 +42,7 @@ use lance_table::format::Index as IndexMetadata;
 use lance_table::format::{Fragment, SelfDescribingFileReader};
 use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
+use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
@@ -170,6 +173,11 @@ async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
     Ok(proto)
 }
 
+fn vector_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::VectorIndexDetails::default();
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
@@ -220,13 +228,13 @@ impl DatasetIndexExt for Dataset {
         }
 
         let index_id = Uuid::new_v4();
-        match (index_type, params.index_name()) {
+        let index_details: prost_types::Any = match (index_type, params.index_name()) {
             (
                 IndexType::Bitmap | IndexType::BTree | IndexType::Inverted | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?;
+                build_scalar_index(self, column, &index_id.to_string(), &params).await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -237,7 +245,20 @@ impl DatasetIndexExt for Dataset {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?;
+                build_scalar_index(self, column, &index_id.to_string(), params).await?
+            }
+            (IndexType::Inverted, _) => {
+                // Inverted index params.
+                let inverted_params = params
+                    .as_any()
+                    .downcast_ref::<InvertedIndexParams>()
+                    .ok_or_else(|| Error::Index {
+                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
+                        location: location!(),
+                    })?;
+
+                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
+                inverted_index_details()
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
                 // Vector index params.
@@ -251,6 +272,7 @@ impl DatasetIndexExt for Dataset {
 
                 build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
                     .await?;
+                vector_index_details()
             }
             // Can't use if let Some(...) here because it's not stable yet.
             // TODO: fix after https://github.com/rust-lang/rust/issues/51114
@@ -267,7 +289,7 @@ impl DatasetIndexExt for Dataset {
                     .expect("already checked")
                     .clone()
                     .to_vector()
-                    // this should never happen beause we control the registration
+                    // this should never happen because we control the registration
                     // if this fails, the registration logic has a bug
                     .ok_or(Error::Internal {
                         message: "unable to cast index extension to vector".to_string(),
@@ -276,6 +298,7 @@ impl DatasetIndexExt for Dataset {
 
                 ext.create_index(self, column, &index_id.to_string(), params)
                     .await?;
+                vector_index_details()
             }
             (index_type, index_name) => {
                 return Err(Error::Index {
@@ -285,7 +308,7 @@ impl DatasetIndexExt for Dataset {
                     location: location!(),
                 });
             }
-        }
+        };
 
         let new_idx = IndexMetadata {
             uuid: index_id,
@@ -293,6 +316,7 @@ impl DatasetIndexExt for Dataset {
             fields: vec![field.id],
             dataset_version: self.manifest.version,
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            index_details: Some(index_details),
         };
         let transaction = Transaction::new(
             self.manifest.version,
@@ -300,20 +324,23 @@ impl DatasetIndexExt for Dataset {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
+            /*blobs_op= */ None,
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -328,7 +355,7 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let manifest_file = self.manifest_file(self.version().version).await?;
+        let manifest_file = self.manifest_file().await?;
         let loaded_indices: Arc<Vec<IndexMetadata>> =
             read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest)
                 .await?
@@ -340,6 +367,58 @@ impl DatasetIndexExt for Dataset {
             loaded_indices.clone(),
         );
         Ok(loaded_indices)
+    }
+
+    async fn commit_existing_index(
+        &mut self,
+        index_name: &str,
+        column: &str,
+        index_id: Uuid,
+    ) -> Result<()> {
+        let Some(field) = self.schema().field(column) else {
+            return Err(Error::Index {
+                message: format!("CreateIndex: column '{column}' does not exist"),
+                location: location!(),
+            });
+        };
+
+        // TODO: We will need some way to determine the index details here.  Perhaps
+        // we can load the index itself and get the details that way.
+
+        let new_idx = IndexMetadata {
+            uuid: index_id,
+            name: index_name.to_string(),
+            fields: vec![field.id],
+            dataset_version: self.manifest.version,
+            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            index_details: None,
+        };
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices: vec![],
+            },
+            /*blobs_op= */ None,
+            None,
+        );
+
+        let (new_manifest, new_path) = commit_transaction(
+            self,
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(new_manifest);
+        self.manifest_file = new_path;
+
+        Ok(())
     }
 
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
@@ -364,8 +443,17 @@ impl DatasetIndexExt for Dataset {
         let dataset = Arc::new(self.clone());
         let indices = self.load_indices().await?;
 
+        let indices_to_optimize = options
+            .index_names
+            .as_ref()
+            .map(|names| names.iter().collect::<HashSet<_>>());
         let name_to_indices = indices
             .iter()
+            .filter(|idx| {
+                indices_to_optimize
+                    .as_ref()
+                    .map_or(true, |names| names.contains(&idx.name))
+            })
             .map(|idx| (idx.name.clone(), idx))
             .into_group_map();
 
@@ -381,13 +469,14 @@ impl DatasetIndexExt for Dataset {
                 new_frag_ids |= removed_idx.fragment_bitmap.as_ref().unwrap();
             }
 
-            let last_idx = deltas.last().expect("Delte indices should not be empty");
+            let last_idx = deltas.last().expect("Delta indices should not be empty");
             let new_idx = IndexMetadata {
                 uuid: new_id,
                 name: last_idx.name.clone(), // Keep the same name
                 fields: last_idx.fields.clone(),
                 dataset_version: self.manifest.version,
                 fragment_bitmap: Some(new_frag_ids),
+                index_details: last_idx.index_details.clone(),
             };
             removed_indices.extend(removed.iter().map(|&idx| idx.clone()));
             if deltas.len() > removed.len() {
@@ -410,20 +499,23 @@ impl DatasetIndexExt for Dataset {
                 new_indices,
                 removed_indices,
             },
+            /*blobs_op= */ None,
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
             &transaction,
             &Default::default(),
             &Default::default(),
+            self.manifest_naming_scheme,
         )
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
         Ok(())
     }
 
@@ -457,20 +549,30 @@ impl DatasetIndexExt for Dataset {
             .map(|idx| idx.statistics())
             .collect::<Result<Vec<_>>>()?;
 
-        let unindexed_fragments = self.unindexed_fragments(index_name).await?;
-        let mut num_unindexed_rows = 0;
-        for f in unindexed_fragments.iter() {
-            num_unindexed_rows += f.num_rows().ok_or(Error::Index {
-                message: format!("fragment {} has no rows", f.id),
-                location: location!(),
-            })?;
-        }
-        let num_unindexed_fragments = unindexed_fragments.len();
-        let num_indexed_fragments = self.fragments().len() - num_unindexed_fragments;
-        let num_indexed_rows = self.count_rows(None).await? - num_unindexed_rows;
+        let index_type = indices[0].index_type().to_string();
+
+        let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
+        let num_indexed_rows_per_delta = self.indexed_fragments(index_name).await?
+        .iter()
+        .map(|frags| {
+            frags.iter().map(|f| f.num_rows().expect("Fragment should have row counts, please upgrade lance and trigger a single right to fix this")).sum::<usize>()
+        })
+        .collect::<Vec<_>>();
+
+        let num_indexed_fragments = indexed_fragments_per_delta
+            .clone()
+            .into_iter()
+            .flatten()
+            .map(|f| f.id)
+            .collect::<HashSet<_>>()
+            .len();
+
+        let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
+        let num_indexed_rows = num_indexed_rows_per_delta.iter().last().unwrap();
+        let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
 
         let stats = json!({
-            "index_type": indices_stats[0]["index_type"],
+            "index_type": index_type,
             "name": index_name,
             "num_indices": metadatas.len(),
             "indices": indices_stats,
@@ -478,6 +580,7 @@ impl DatasetIndexExt for Dataset {
             "num_indexed_rows": num_indexed_rows,
             "num_unindexed_fragments": num_unindexed_fragments,
             "num_unindexed_rows": num_unindexed_rows,
+            "num_indexed_rows_per_delta": num_indexed_rows_per_delta,
         });
 
         serde_json::to_string(&stats).map_err(|e| Error::Index {
@@ -503,6 +606,9 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
 
     /// Return the fragments that are not covered by any of the deltas of the index.
     async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
+
+    /// Return the fragments that are covered by each of the deltas of the index.
+    async fn indexed_fragments(&self, idx_name: &str) -> Result<Vec<Vec<Fragment>>>;
 }
 
 #[async_trait]
@@ -540,7 +646,12 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(index);
         }
 
-        let index = crate::index::scalar::open_scalar_index(self, column, uuid).await?;
+        let index_meta = self.load_index(uuid).await?.ok_or_else(|| Error::Index {
+            message: format!("Index with id {} does not exist", uuid),
+            location: location!(),
+        })?;
+
+        let index = crate::index::scalar::open_scalar_index(self, column, &index_meta).await?;
         self.session.index_cache.insert_scalar(uuid, index.clone());
         Ok(index)
     }
@@ -600,11 +711,17 @@ impl DatasetIndexInternalExt for Dataset {
             (0, 3) => {
                 let scheduler = ScanScheduler::new(
                     self.object_store.clone(),
-                    SchedulerConfig::fast_and_not_too_ram_intensive(),
+                    SchedulerConfig::max_bandwidth(&self.object_store),
                 );
                 let file = scheduler.open_file(&index_file).await?;
-                let reader =
-                    v2::reader::FileReader::try_open(file, None, Default::default()).await?;
+                let reader = v2::reader::FileReader::try_open(
+                    file,
+                    None,
+                    Default::default(),
+                    &self.session.file_metadata_cache,
+                    FileReaderOptions::default(),
+                )
+                .await?;
                 let index_metadata = reader
                     .schema()
                     .metadata
@@ -629,7 +746,7 @@ impl DatasetIndexInternalExt for Dataset {
                     });
                 }?;
                 match index_metadata.index_type.as_str() {
-                    "FLAT" => match value_type {
+                    "IVF_FLAT" => match value_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
                                 self.object_store.clone(),
@@ -649,8 +766,30 @@ impl DatasetIndexInternalExt for Dataset {
                         }),
                     },
 
-                    "HNSW" => {
+                    "IVF_PQ" => {
+                        let ivf = IVFIndex::<FlatIndex, ProductQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_HNSW_SQ" => {
                         let ivf = IVFIndex::<HNSW, ScalarQuantizer>::try_new(
+                            self.object_store.clone(),
+                            self.indices_dir(),
+                            uuid.to_owned(),
+                            Arc::downgrade(&self.session),
+                        )
+                        .await?;
+                        Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                    }
+
+                    "IVF_HNSW_PQ" => {
+                        let ivf = IVFIndex::<HNSW, ProductQuantizer>::try_new(
                             self.object_store.clone(),
                             self.indices_dir(),
                             uuid.to_owned(),
@@ -678,25 +817,46 @@ impl DatasetIndexInternalExt for Dataset {
         Ok(index)
     }
 
+    #[instrument(level = "trace", skip_all)]
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo> {
         let indices = self.load_indices().await?;
         let schema = self.schema();
-        let indexed_fields = indices
-        .iter()
-        .filter(|idx| idx.fields.len() == 1)
-        .map(|idx| {
-            let field = idx.fields[0];
-            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal { message: format!("Index referenced a field with id {field} which did not exist in the schema"), location: location!() });
-            field.map(|field| {
-                let query_parser = if let DataType::List(_) = field.data_type() {
+        let mut indexed_fields = Vec::new();
+        for index in indices.iter().filter(|idx| {
+            let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
+            let is_vector_index = idx_schema
+                .fields
+                .iter()
+                .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
+            idx.fields.len() == 1 && !is_vector_index
+        }) {
+            let field = index.fields[0];
+            let field = schema.field_by_id(field).ok_or_else(|| Error::Internal {
+                message: format!(
+                    "Index referenced a field with id {field} which did not exist in the schema"
+                ),
+                location: location!(),
+            })?;
+
+            let query_parser = match field.data_type() {
+                DataType::List(_) => {
                     Box::<LabelListQueryParser>::default() as Box<dyn ScalarQueryParser>
-                } else {
+                }
+                DataType::Utf8 | DataType::LargeUtf8 => {
+                    let index_type =
+                        detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
+                            .await?;
+                    // Inverted index can't be used for filtering
+                    if matches!(index_type, ScalarIndexType::Inverted) {
+                        continue;
+                    }
                     Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
-                };
-                (field.name.clone(), (field.data_type(), query_parser))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+                }
+                _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
+            };
+
+            indexed_fields.push((field.name.clone(), (field.data_type(), query_parser)));
+        }
         let index_info_map = HashMap::from_iter(indexed_fields);
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
@@ -719,6 +879,26 @@ impl DatasetIndexInternalExt for Dataset {
             .cloned()
             .collect())
     }
+
+    async fn indexed_fragments(&self, name: &str) -> Result<Vec<Vec<Fragment>>> {
+        let indices = self.load_indices_by_name(name).await?;
+        indices
+            .iter()
+            .map(|index| {
+                let fragment_bitmap = index.fragment_bitmap.as_ref().ok_or(Error::Index {
+                    message: "Please upgrade lance to 0.8+ to use this function".to_string(),
+                    location: location!(),
+                })?;
+                let mut indexed_frags = Vec::with_capacity(fragment_bitmap.len() as usize);
+                for frag in self.fragments().iter() {
+                    if fragment_bitmap.contains(frag.id as u32) {
+                        indexed_frags.push(frag.clone());
+                    }
+                }
+                Ok(indexed_frags)
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -727,9 +907,12 @@ mod tests {
 
     use super::*;
 
+    use arrow::array::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_index::scalar::inverted::TokenizerConfig;
+    use lance_index::scalar::FullTextSearchQuery;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -867,7 +1050,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let dimensions = 16;
         let column_name = "vec";
-        let field = Field::new(
+        let vec_field = Field::new(
             column_name,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
@@ -875,14 +1058,25 @@ mod tests {
             ),
             false,
         );
-        let schema = Arc::new(Schema::new(vec![field]));
+        let other_column_name = "other_vec";
+        let other_vec_field = Field::new(
+            other_column_name,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimensions,
+            ),
+            false,
+        );
+        let schema = Arc::new(Schema::new(vec![vec_field, other_vec_field]));
 
         let float_arr = generate_random_array(512 * dimensions as usize);
 
-        let vectors =
-            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap();
+        let vectors = Arc::new(
+            arrow_array::FixedSizeListArray::try_new_from_values(float_arr, dimensions).unwrap(),
+        );
 
-        let record_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors)]).unwrap();
+        let record_batch =
+            RecordBatch::try_new(schema.clone(), vec![vectors.clone(), vectors.clone()]).unwrap();
 
         let reader = RecordBatchIterator::new(
             vec![record_batch.clone()].into_iter().map(Ok),
@@ -897,6 +1091,16 @@ mod tests {
                 &[column_name],
                 IndexType::Vector,
                 Some("vec_idx".into()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &[other_column_name],
+                IndexType::Vector,
+                Some("other_vec_idx".into()),
                 &params,
                 true,
             )
@@ -924,7 +1128,48 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,   // Just create index for delta
+                index_names: Some(vec![]), // Optimize nothing
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        // optimize the other index
+        dataset
+            .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0, // Just create index for delta
+                index_names: Some(vec!["other_vec_idx".to_string()]),
+            })
+            .await
+            .unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 512);
+        assert_eq!(stats["num_indexed_rows"], 512);
+        assert_eq!(stats["num_indexed_fragments"], 1);
+        assert_eq!(stats["num_unindexed_fragments"], 1);
+        assert_eq!(stats["num_indices"], 1);
+
+        let stats: serde_json::Value =
+            serde_json::from_str(&dataset.index_statistics("other_vec_idx").await.unwrap())
+                .unwrap();
+        assert_eq!(stats["num_unindexed_rows"], 0);
+        assert_eq!(stats["num_indexed_rows"], 1024);
+        assert_eq!(stats["num_indexed_fragments"], 2);
+        assert_eq!(stats["num_unindexed_fragments"], 0);
+        assert_eq!(stats["num_indices"], 2);
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0, // Just create index for delta
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -941,6 +1186,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 2,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1025,6 +1271,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0, // Just create index for delta
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1040,6 +1287,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 2,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1050,6 +1298,71 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_fts() {
+        let words = ["apple", "banana", "cherry", "date"];
+
+        let dir = tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let data = StringArray::from_iter_values(words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
+        let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(batch_iterator, dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let tokenizer_config = TokenizerConfig::default();
+        let params = InvertedIndexParams {
+            with_position: true,
+            tokenizer_config,
+        };
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let new_words = ["elephant", "fig", "grape", "honeydew"];
+        let new_data = StringArray::from_iter_values(new_words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
+        let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(batch_iter, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,
+                index_names: None,
+            })
+            .await
+            .unwrap();
+
+        for &word in words.iter().chain(new_words.iter()) {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
+
+            assert_eq!(texts.len(), 1);
+            assert_eq!(texts[0], word);
+        }
     }
 
     #[tokio::test]

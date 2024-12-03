@@ -75,7 +75,7 @@ fn remap_batch(batch: RecordBatch, mapping: &HashMap<u64, Option<u64>>) -> Resul
     );
     let new_vals = arrow_select::take::take(batch.column(0), &new_val_indices, None)?;
     Ok(RecordBatch::try_new(
-        batch.schema().clone(),
+        batch.schema(),
         vec![new_vals, new_ids],
     )?)
 }
@@ -182,7 +182,7 @@ impl Index for FlatIndex {
             .ids()
             .as_primitive::<UInt64Type>()
             .iter()
-            .map(|row_id| RowAddress::new_from_id(row_id.unwrap()).fragment_id())
+            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
             .collect::<Vec<_>>();
         frag_ids.sort();
         frag_ids.dedup();

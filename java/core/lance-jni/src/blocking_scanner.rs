@@ -16,11 +16,15 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
+use arrow::array::Float32Array;
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::SchemaRef;
-use jni::{objects::JObject, sys::jlong, JNIEnv};
+use jni::objects::{JObject, JString};
+use jni::sys::{jboolean, jint, JNI_TRUE};
+use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
+use lance_linalg::distance::DistanceType;
 
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -71,6 +75,11 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     substrait_filter_obj: JObject, // Optional<ByteBuffer>
     filter_obj: JObject,           // Optional<String>
     batch_size_obj: JObject,       // Optional<Long>
+    limit_obj: JObject,            // Optional<Integer>
+    offset_obj: JObject,           // Optional<Integer>
+    query_obj: JObject,            // Optional<Query>
+    with_row_id: jboolean,         // boolean
+    batch_readahead: jint,         // int
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -81,11 +90,17 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
             columns_obj,
             substrait_filter_obj,
             filter_obj,
-            batch_size_obj
+            batch_size_obj,
+            limit_obj,
+            offset_obj,
+            query_obj,
+            with_row_id,
+            batch_readahead
         )
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inner_create_scanner<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
@@ -94,11 +109,19 @@ fn inner_create_scanner<'local>(
     substrait_filter_obj: JObject,
     filter_obj: JObject,
     batch_size_obj: JObject,
+    limit_obj: JObject,
+    offset_obj: JObject,
+    query_obj: JObject,
+    with_row_id: jboolean,
+    batch_readahead: jint,
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+
     let mut scanner = dataset_guard.inner.scan();
+
+    // handle fragment_ids
     if let Some(fragment_ids) = fragment_ids_opt {
         let mut fragments = Vec::with_capacity(fragment_ids.len());
         for fragment_id in fragment_ids {
@@ -112,22 +135,76 @@ fn inner_create_scanner<'local>(
         scanner.with_fragments(fragments);
     }
     drop(dataset_guard);
+
     let columns_opt = env.get_strings_opt(&columns_obj)?;
     if let Some(columns) = columns_opt {
         scanner.project(&columns)?;
     };
+
     let substrait_opt = env.get_bytes_opt(&substrait_filter_obj)?;
     if let Some(substrait) = substrait_opt {
-        RT.block_on(async { scanner.filter_substrait(substrait).await })?;
+        RT.block_on(async { scanner.filter_substrait(substrait) })?;
     }
+
     let filter_opt = env.get_string_opt(&filter_obj)?;
     if let Some(filter) = filter_opt {
         scanner.filter(filter.as_str())?;
     }
+
     let batch_size_opt = env.get_long_opt(&batch_size_obj)?;
     if let Some(batch_size) = batch_size_opt {
         scanner.batch_size(batch_size as usize);
     }
+
+    let limit_opt = env.get_long_opt(&limit_obj)?;
+    let offset_opt = env.get_long_opt(&offset_obj)?;
+    scanner
+        .limit(limit_opt, offset_opt)
+        .map_err(|err| Error::input_error(err.to_string()))?;
+
+    if with_row_id == JNI_TRUE {
+        scanner.with_row_id();
+    }
+
+    let query_is_present = env.call_method(&query_obj, "isPresent", "()Z", &[])?.z()?;
+
+    if query_is_present {
+        let java_obj = env
+            .call_method(&query_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+
+        // Set column and key for nearest search
+        let column = env.get_string_from_method(&java_obj, "getColumn")?;
+        let key_array = env.get_vec_f32_from_method(&java_obj, "getKey")?;
+        let key = Float32Array::from(key_array);
+        let k = env.get_int_as_usize_from_method(&java_obj, "getK")?;
+        let _ = scanner.nearest(&column, &key, k);
+
+        let nprobes = env.get_int_as_usize_from_method(&java_obj, "getNprobes")?;
+        scanner.nprobs(nprobes);
+
+        if let Some(ef) = env.get_optional_usize_from_method(&java_obj, "getEf")? {
+            scanner.ef(ef);
+        }
+
+        if let Some(refine_factor) =
+            env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?
+        {
+            scanner.refine(refine_factor);
+        }
+
+        let distance_type_jstr: JString = env
+            .call_method(&java_obj, "getDistanceType", "()Ljava/lang/String;", &[])?
+            .l()?
+            .into();
+        let distance_type_str: String = env.get_string(&distance_type_jstr)?.into();
+        let distance_type = DistanceType::try_from(distance_type_str.as_str())?;
+        scanner.distance_metric(distance_type);
+
+        let use_index = env.get_boolean_from_method(&java_obj, "isUseIndex")?;
+        scanner.use_index(use_index);
+    }
+    scanner.batch_readahead(batch_readahead as usize);
     let scanner = BlockingScanner::create(scanner);
     scanner.into_java(env)
 }

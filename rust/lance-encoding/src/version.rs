@@ -16,8 +16,8 @@ pub enum LanceFileVersion {
     // Note that Stable must come AFTER the stable version and Next must come AFTER the next version
     // this way comparisons like x >= V2_0 will work the same if x is Stable or V2_0
     /// The legacy (0.1) format
-    #[default]
     Legacy,
+    #[default]
     V2_0,
     /// The latest stable release
     Stable,
@@ -36,10 +36,29 @@ impl LanceFileVersion {
         }
     }
 
-    /// Returns the default version if Legacy is not an option
-    pub fn default_v2() -> Self {
-        // This will go away soon, but there are a few spots where the Legacy default doesn't make sense
-        Self::V2_0
+    pub fn try_from_major_minor(major: u32, minor: u32) -> Result<Self> {
+        match (major, minor) {
+            (0, 0) => Ok(Self::Legacy),
+            (0, 1) => Ok(Self::Legacy),
+            (0, 2) => Ok(Self::Legacy),
+            (0, 3) => Ok(Self::V2_0),
+            (2, 0) => Ok(Self::V2_0),
+            (2, 1) => Ok(Self::V2_1),
+            _ => Err(Error::InvalidInput {
+                source: format!("Unknown Lance storage version: {}.{}", major, minor).into(),
+                location: location!(),
+            }),
+        }
+    }
+
+    pub fn to_numbers(&self) -> (u32, u32) {
+        match self {
+            Self::Legacy => (0, 2),
+            Self::V2_0 => (2, 0),
+            Self::V2_1 => (2, 1),
+            Self::Stable => self.resolve().to_numbers(),
+            Self::Next => self.resolve().to_numbers(),
+        }
     }
 }
 

@@ -13,9 +13,10 @@ mod test {
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
     };
-    use lance_table::io::commit::{latest_manifest_path, manifest_path, CommitHandler};
+    use lance_table::io::commit::{CommitHandler, ManifestNamingScheme};
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
     use snafu::{location, Location};
     use tokio::sync::Mutex;
 
@@ -237,6 +238,32 @@ mod test {
                 .await
                 .unwrap();
             assert_eq!(ds.count_rows(None).await.unwrap(), 60);
+
+            // No temporary manifests left over
+            let manifest_path = dir.path().join("_versions/");
+            let unexpected_entries = std::fs::read_dir(manifest_path)
+                .unwrap()
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    !entry
+                        .file_name()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .ends_with(".manifest")
+                })
+                // There is a bug in local fs where concurrent commits can leave behind
+                // temporary `x.manifest#n` files. This might be a bug in object-store.
+                // TODO: fix this.
+                .filter(|entry| {
+                    let entry = entry.as_ref().unwrap();
+                    !entry
+                        .file_name()
+                        .as_os_str()
+                        .to_string_lossy()
+                        .contains(".manifest#")
+                })
+                .collect::<Vec<_>>();
+            assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
         }
     }
 
@@ -271,11 +298,23 @@ mod test {
 
         // manually simulate last version is out of sync
         let localfs: Box<dyn object_store::ObjectStore> = Box::new(LocalFileSystem::new());
-        localfs.delete(&manifest_path(&ds.base, 6)).await.unwrap();
+        // Move version 6 to a temporary location, put that in the store.
+        let base_path = Path::parse(ds_uri).unwrap();
+        let version_six_staging_location =
+            base_path.child(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
-            .copy(&manifest_path(&ds.base, 5), &latest_manifest_path(&ds.base))
+            .rename(
+                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &version_six_staging_location,
+            )
             .await
             .unwrap();
+        {
+            inner_store.lock().await.insert(
+                (ds.base.to_string(), 6),
+                version_six_staging_location.to_string(),
+            );
+        }
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
             .list(Some(&ds.base))
@@ -313,5 +352,20 @@ mod test {
         let ds = DatasetBuilder::from_uri(ds_uri).load().await.unwrap();
         assert_eq!(ds.version().version, 6);
         assert_eq!(ds.count_rows(None).await.unwrap(), 60);
+
+        // No temporary manifests left over
+        let manifest_path = dir.path().join("_versions/");
+        let unexpected_entries = std::fs::read_dir(manifest_path)
+            .unwrap()
+            .filter(|entry| {
+                let entry = entry.as_ref().unwrap();
+                !entry
+                    .file_name()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .ends_with(".manifest")
+            })
+            .collect::<Vec<_>>();
+        assert!(unexpected_entries.is_empty(), "{:?}", unexpected_entries);
     }
 }

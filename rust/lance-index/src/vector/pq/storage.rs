@@ -7,17 +7,17 @@
 
 use std::{cmp::min, collections::HashMap, sync::Arc};
 
-use arrow::datatypes::{self};
+use arrow::datatypes::{self, UInt8Type};
 use arrow_array::{
     cast::AsArray,
-    types::{Float32Type, UInt64Type, UInt8Type},
+    types::{Float32Type, UInt64Type},
     FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_arrow::FixedSizeListArrayExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -25,15 +25,16 @@ use lance_io::{
     traits::{WriteExt, Writer},
     utils::read_message,
 };
-use lance_linalg::distance::{DistanceType, L2};
+use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
+use super::distance::{build_distance_table_dot, compute_l2_distance};
+use super::distance::{build_distance_table_l2, compute_dot_distance};
 use super::ProductQuantizer;
-use super::{distance::build_distance_table_l2, num_centroids};
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
@@ -47,7 +48,7 @@ use crate::{
     IndexMetadata, INDEX_METADATA_SCHEMA_KEY,
 };
 
-pub const PQ_METADTA_KEY: &str = "lance:pq";
+pub const PQ_METADATA_KEY: &str = "lance:pq";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
@@ -61,6 +62,7 @@ pub struct ProductQuantizationMetadata {
 
     // empty for old format
     pub codebook_tensor: Vec<u8>,
+    pub transposed: bool,
 }
 
 impl DeepSizeOf for ProductQuantizationMetadata {
@@ -78,11 +80,11 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
         let metadata = reader
             .schema()
             .metadata
-            .get(PQ_METADTA_KEY)
+            .get(PQ_METADATA_KEY)
             .ok_or(Error::Index {
                 message: format!(
                     "Reading PQ storage: metadata key {} not found",
-                    PQ_METADTA_KEY
+                    PQ_METADATA_KEY
                 ),
                 location: location!(),
             })?;
@@ -100,9 +102,9 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
 
 /// Product Quantization Storage
 ///
-/// It stores PQ code, as well as the row ID to the orignal vectors.
+/// It stores PQ code, as well as the row ID to the original vectors.
 ///
-/// It is possible to store additonal metadata to accelerate filtering later.
+/// It is possible to store additional metadata to accelerate filtering later.
 ///
 /// TODO: support f16/f64 later.
 #[derive(Clone, Debug)]
@@ -145,11 +147,12 @@ impl PartialEq for ProductQuantizationStorage {
 impl ProductQuantizationStorage {
     pub fn new(
         codebook: FixedSizeListArray,
-        batch: RecordBatch,
+        mut batch: RecordBatch,
         num_bits: u32,
         num_sub_vectors: usize,
         dimension: usize,
         distance_type: DistanceType,
+        transposed: bool,
     ) -> Result<Self> {
         let Some(row_ids) = batch.column_by_name(ROW_ID) else {
             return Err(Error::Index {
@@ -166,32 +169,36 @@ impl ProductQuantizationStorage {
             .clone()
             .into();
 
-        let Some(pq_col) = batch.column_by_name(PQ_CODE_COLUMN) else {
-            return Err(Error::Index {
-                message: format!("{PQ_CODE_COLUMN} column not found from PQ storage"),
-                location: location!(),
-            });
-        };
-        let pq_code_fsl = pq_col.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
-                pq_col.data_type()
-            ),
-            location: location!(),
-        })?;
-        let pq_code: Arc<UInt8Array> = pq_code_fsl
+        if !transposed {
+            let num_sub_vectors_in_byte = if num_bits == 4 {
+                num_sub_vectors / 2
+            } else {
+                num_sub_vectors
+            };
+            let pq_col = batch[PQ_CODE_COLUMN].as_fixed_size_list();
+            let transposed_code = transpose(
+                pq_col.values().as_primitive::<UInt8Type>(),
+                row_ids.len(),
+                num_sub_vectors_in_byte,
+            );
+            let pq_code_fsl = Arc::new(FixedSizeListArray::try_new_from_values(
+                transposed_code,
+                num_sub_vectors_in_byte as i32,
+            )?);
+            batch = batch.replace_column_by_name(PQ_CODE_COLUMN, pq_code_fsl)?;
+        }
+
+        let pq_code = batch[PQ_CODE_COLUMN]
+            .as_fixed_size_list()
             .values()
-            .as_primitive_opt::<UInt8Type>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "{PQ_CODE_COLUMN} column is not of type UInt8: {}",
-                    pq_col.data_type()
-                ),
-                location: location!(),
-            })?
+            .as_primitive()
             .clone()
             .into();
 
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         Ok(Self {
             codebook,
             batch,
@@ -230,7 +237,6 @@ impl ProductQuantizationStorage {
         let metric_type = quantizer.distance_type;
         let transform = PQTransformer::new(quantizer, vector_col, PQ_CODE_COLUMN);
         let batch = transform.transform(batch)?;
-
         Self::new(
             codebook,
             batch,
@@ -238,6 +244,7 @@ impl ProductQuantizationStorage {
             num_sub_vectors,
             dimension,
             metric_type,
+            false,
         )
     }
 
@@ -326,6 +333,7 @@ impl ProductQuantizationStorage {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: Vec::new(),
+            transposed: true,
         };
 
         let index_metadata = IndexMetadata {
@@ -335,7 +343,7 @@ impl ProductQuantizationStorage {
 
         let mut schema_metadata = HashMap::new();
         schema_metadata.insert(
-            PQ_METADTA_KEY.to_string(),
+            PQ_METADATA_KEY.to_string(),
             serde_json::to_string(&metadata)?,
         );
         schema_metadata.insert(
@@ -345,6 +353,28 @@ impl ProductQuantizationStorage {
         writer.finish_with_metadata(&schema_metadata).await?;
         Ok(())
     }
+}
+
+pub fn transpose<T: ArrowPrimitiveType>(
+    original: &PrimitiveArray<T>,
+    num_rows: usize,
+    num_columns: usize,
+) -> PrimitiveArray<T>
+where
+    PrimitiveArray<T>: From<Vec<T::Native>>,
+{
+    if original.is_empty() {
+        return original.clone();
+    }
+
+    let mut transposed_codes = vec![T::default_value(); original.len()];
+    for (vec_idx, codes) in original.values().chunks_exact(num_columns).enumerate() {
+        for (sub_vec_idx, code) in codes.iter().enumerate() {
+            transposed_codes[sub_vec_idx * num_rows + vec_idx] = *code;
+        }
+    }
+
+    transposed_codes.into()
 }
 
 #[async_trait]
@@ -372,6 +402,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             .values()
             .as_primitive::<Float32Type>()
             .clone();
+
         let codebook =
             FixedSizeListArray::try_new_from_values(codebook, metadata.dimension as i32)?;
 
@@ -385,6 +416,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
             metadata.num_sub_vectors,
             metadata.dimension,
             distance_type,
+            metadata.transposed,
         )
     }
 }
@@ -410,35 +442,15 @@ impl VectorStore for ProductQuantizationStorage {
         let codebook_tensor = pb::Tensor::decode(metadata.codebook_tensor.as_slice())?;
         let codebook = FixedSizeListArray::try_from(&codebook_tensor)?;
 
-        let row_ids = batch
-            .column_by_name(ROW_ID)
-            .ok_or(Error::Index {
-                message: "Row IDs column not found in batch".to_string(),
-                location: location!(),
-            })?
-            .as_primitive::<UInt64Type>()
-            .clone();
-        let pq_code = batch
-            .column_by_name(PQ_CODE_COLUMN)
-            .ok_or(Error::Index {
-                message: "PQ code column not found in batch".to_string(),
-                location: location!(),
-            })?
-            .as_fixed_size_list()
-            .values()
-            .as_primitive::<UInt8Type>()
-            .clone();
-
-        Ok(Self {
+        Self::new(
             codebook,
             batch,
-            num_bits: metadata.num_bits,
-            num_sub_vectors: metadata.num_sub_vectors,
-            dimension: metadata.dimension,
+            metadata.num_bits,
+            metadata.num_sub_vectors,
+            metadata.dimension,
             distance_type,
-            pq_code: Arc::new(pq_code),
-            row_ids: Arc::new(row_ids),
-        })
+            metadata.transposed,
+        )
     }
 
     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
@@ -450,18 +462,12 @@ impl VectorStore for ProductQuantizationStorage {
             dimension: self.dimension,
             codebook: None,
             codebook_tensor: codebook,
+            transposed: true, // we always transpose the pq codes for efficiency
         };
 
         let metadata_json = serde_json::to_string(&metadata)?;
         let metadata = HashMap::from_iter(vec![(STORAGE_METADATA_KEY.to_string(), metadata_json)]);
-
-        let schema = self
-            .batch
-            .schema_ref()
-            .as_ref()
-            .clone()
-            .with_metadata(metadata);
-        Ok([self.batch.clone().with_schema(schema.into())?].into_iter())
+        Ok([self.batch.with_metadata(metadata)?].into_iter())
     }
 
     fn append_batch(&self, _batch: RecordBatch, _vector_column: &str) -> Result<Self> {
@@ -545,11 +551,12 @@ pub struct PQDistCalculator {
     distance_table: Vec<f32>,
     pq_code: Arc<UInt8Array>,
     num_sub_vectors: usize,
-    num_centroids: usize,
+    num_bits: u32,
+    distance_type: DistanceType,
 }
 
 impl PQDistCalculator {
-    fn new<T: L2>(
+    fn new<T: L2 + Dot>(
         codebook: &[T],
         num_bits: u32,
         num_sub_vectors: usize,
@@ -557,34 +564,100 @@ impl PQDistCalculator {
         query: &[T],
         distance_type: DistanceType,
     ) -> Self {
-        let distance_table = if matches!(distance_type, DistanceType::Cosine | DistanceType::L2) {
-            build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
-        } else {
-            unimplemented!("DistanceType is not supported: {:?}", distance_type);
+        let distance_table = match distance_type {
+            DistanceType::L2 | DistanceType::Cosine => {
+                build_distance_table_l2(codebook, num_bits, num_sub_vectors, query)
+            }
+            DistanceType::Dot => {
+                build_distance_table_dot(codebook, num_bits, num_sub_vectors, query)
+            }
+            _ => unimplemented!("DistanceType is not supported: {:?}", distance_type),
         };
         Self {
             distance_table,
             num_sub_vectors,
             pq_code,
-            num_centroids: num_centroids(num_bits),
+            num_bits,
+            distance_type,
         }
     }
 
-    fn get_pq_code(&self, id: u32) -> &[u8] {
-        let start = id as usize * self.num_sub_vectors;
-        let end = start + self.num_sub_vectors;
-        &self.pq_code.values()[start..end]
+    fn get_pq_code(&self, id: u32) -> Vec<usize> {
+        let num_sub_vectors_in_byte = if self.num_bits == 4 {
+            self.num_sub_vectors / 2
+        } else {
+            self.num_sub_vectors
+        };
+        let num_vectors = self.pq_code.len() / num_sub_vectors_in_byte;
+        self.pq_code
+            .values()
+            .iter()
+            .skip(id as usize)
+            .step_by(num_vectors)
+            .map(|&c| c as usize)
+            .collect()
     }
 }
 
 impl DistCalculator for PQDistCalculator {
     fn distance(&self, id: u32) -> f32 {
+        let num_centroids = 2_usize.pow(self.num_bits);
         let pq_code = self.get_pq_code(id);
-        pq_code
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| self.distance_table[i * self.num_centroids + c as usize])
-            .sum()
+
+        if self.num_bits == 4 {
+            pq_code
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let current_idx = c & 0x0F;
+                    let next_idx = c >> 4;
+                    self.distance_table[2 * i * num_centroids + current_idx]
+                        + self.distance_table[(2 * i + 1) * num_centroids + next_idx]
+                })
+                .sum()
+        } else {
+            pq_code
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| self.distance_table[i * num_centroids + c])
+                .sum()
+        }
+    }
+
+    fn distance_all(&self) -> Vec<f32> {
+        match self.distance_type {
+            DistanceType::L2 => compute_l2_distance(
+                &self.distance_table,
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.values(),
+            ),
+            DistanceType::Cosine => {
+                // it seems we implemented cosine distance at some version,
+                // but from now on, we should use normalized L2 distance.
+                debug_assert!(
+                    false,
+                    "cosine distance should be converted to normalized L2 distance"
+                );
+                // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
+                // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
+                // Therefore, Cosine = L2 / 2
+                let l2_dists = compute_l2_distance(
+                    &self.distance_table,
+                    self.num_bits,
+                    self.num_sub_vectors,
+                    self.pq_code.values(),
+                );
+                l2_dists.into_iter().map(|v| v / 2.0).collect()
+            }
+            DistanceType::Dot => compute_dot_distance(
+                &self.distance_table,
+                self.num_bits,
+                self.num_sub_vectors,
+                self.pq_code.values(),
+            ),
+            _ => unimplemented!("distance type is not supported: {:?}", self.distance_type),
+        }
     }
 }
 
@@ -664,5 +737,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage, storage2);
+    }
+
+    #[tokio::test]
+    async fn test_distance_all() {
+        let storage = create_pq_storage().await;
+        let query = Arc::new(Float32Array::from_iter_values((0..DIM).map(|v| v as f32)));
+        let dist_calc = storage.dist_calculator(query);
+        let expected = (0..storage.len())
+            .map(|id| dist_calc.distance(id as u32))
+            .collect::<Vec<_>>();
+        let distances = dist_calc.distance_all();
+        assert_eq!(distances, expected);
     }
 }

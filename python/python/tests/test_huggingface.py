@@ -4,7 +4,6 @@
 from pathlib import Path
 
 import lance
-import lance.torch.data
 import numpy as np
 import pytest
 
@@ -26,7 +25,10 @@ def test_write_hf_dataset(tmp_path: Path):
     assert ds.schema == hf_ds.features.arrow_schema
 
 
+@pytest.mark.cuda
 def test_image_hf_dataset(tmp_path: Path):
+    import lance.torch.data
+
     ds = datasets.Dataset.from_dict(
         {"i": [np.zeros(shape=(16, 16, 3), dtype=np.uint8)]},
         features=datasets.Features({"i": datasets.Image()}),

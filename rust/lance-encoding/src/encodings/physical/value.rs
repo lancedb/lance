@@ -1,57 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_array::ArrayRef;
+use arrow_buffer::bit_util;
+use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
 use snafu::{location, Location};
-use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{DataBlock, FixedWidthDataBlock};
-use crate::encoder::BufferEncodingStrategy;
+use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock};
+use crate::decoder::PerValueDecompressor;
+use crate::decoder::{BlockDecompressor, MiniBlockDecompressor};
+use crate::encoder::{
+    BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
+    PerValueDataBlock, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
+};
+use crate::format::pb::{self, ArrayEncoding};
+use crate::format::ProtobufUtils;
 use crate::{
     decoder::{PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray, EncodedArrayBuffer},
-    format::pb,
+    encoder::{ArrayEncoder, EncodedArray},
     EncodingsIo,
 };
 
 use lance_core::{Error, Result};
 
-use super::buffers::GeneralBufferCompressor;
-
-pub const COMPRESSION_META_KEY: &str = "lance:compression";
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CompressionScheme {
-    None,
-    Zstd,
-}
-
-impl fmt::Display for CompressionScheme {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let scheme_str = match self {
-            Self::Zstd => "zstd",
-            Self::None => "none",
-        };
-        write!(f, "{}", scheme_str)
-    }
-}
-
-pub fn parse_compression_scheme(scheme: &str) -> Result<CompressionScheme> {
-    match scheme {
-        "none" => Ok(CompressionScheme::None),
-        "zstd" => Ok(CompressionScheme::Zstd),
-        _ => Err(Error::invalid_input(
-            format!("Unknown compression scheme: {}", scheme),
-            location!(),
-        )),
-    }
-}
+use super::block_compress::{CompressionConfig, CompressionScheme, GeneralBufferCompressor};
 
 /// Scheduler for a simple encoding where buffers of fixed-size items are stored as-is on disk
 #[derive(Debug, Clone, Copy)]
@@ -61,7 +38,7 @@ pub struct ValuePageScheduler {
     bytes_per_value: u64,
     buffer_offset: u64,
     buffer_size: u64,
-    compression_scheme: CompressionScheme,
+    compression_config: CompressionConfig,
 }
 
 impl ValuePageScheduler {
@@ -69,13 +46,13 @@ impl ValuePageScheduler {
         bytes_per_value: u64,
         buffer_offset: u64,
         buffer_size: u64,
-        compression_scheme: CompressionScheme,
+        compression_config: CompressionConfig,
     ) -> Self {
         Self {
             bytes_per_value,
             buffer_offset,
             buffer_size,
-            compression_scheme,
+            compression_config,
         }
     }
 }
@@ -88,7 +65,7 @@ impl PageScheduler for ValuePageScheduler {
         top_level_row: u64,
     ) -> BoxFuture<'static, Result<Box<dyn PrimitivePageDecoder>>> {
         let (mut min, mut max) = (u64::MAX, 0);
-        let byte_ranges = if self.compression_scheme == CompressionScheme::None {
+        let byte_ranges = if self.compression_config.scheme == CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
@@ -119,7 +96,7 @@ impl PageScheduler for ValuePageScheduler {
         let bytes = scheduler.submit_request(byte_ranges, top_level_row);
         let bytes_per_value = self.bytes_per_value;
 
-        let range_offsets = if self.compression_scheme != CompressionScheme::None {
+        let range_offsets = if self.compression_config.scheme != CompressionScheme::None {
             ranges
                 .iter()
                 .map(|range| {
@@ -132,6 +109,7 @@ impl PageScheduler for ValuePageScheduler {
             vec![]
         };
 
+        let compression_config = self.compression_config;
         async move {
             let bytes = bytes.await?;
 
@@ -140,6 +118,7 @@ impl PageScheduler for ValuePageScheduler {
                 data: bytes,
                 uncompressed_data: Arc::new(Mutex::new(None)),
                 uncompressed_range_offsets: range_offsets,
+                compression_config,
             }) as Box<dyn PrimitivePageDecoder>)
         }
         .boxed()
@@ -151,13 +130,14 @@ struct ValuePageDecoder {
     data: Vec<Bytes>,
     uncompressed_data: Arc<Mutex<Option<Vec<Bytes>>>>,
     uncompressed_range_offsets: Vec<std::ops::Range<usize>>,
+    compression_config: CompressionConfig,
 }
 
 impl ValuePageDecoder {
     fn decompress(&self) -> Result<Vec<Bytes>> {
         // for compressed page, it is guaranteed that only one range is passed
         let bytes_u8: Vec<u8> = self.data[0].to_vec();
-        let buffer_compressor = GeneralBufferCompressor::get_compressor("");
+        let buffer_compressor = GeneralBufferCompressor::get_compressor(self.compression_config);
         let mut uncompressed_bytes: Vec<u8> = Vec::new();
         buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
 
@@ -221,7 +201,7 @@ impl ValuePageDecoder {
 }
 
 impl PrimitivePageDecoder for ValuePageDecoder {
-    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<Box<dyn DataBlock>> {
+    fn decode(&self, rows_to_skip: u64, num_rows: u64) -> Result<DataBlock> {
         let bytes_to_skip = rows_to_skip * self.bytes_per_value;
         let bytes_to_take = num_rows * self.bytes_per_value;
 
@@ -232,104 +212,254 @@ impl PrimitivePageDecoder for ValuePageDecoder {
         } else {
             self.decode_buffers(&self.data, bytes_to_skip, bytes_to_take)
         };
-        Ok(Box::new(FixedWidthDataBlock {
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
             bits_per_value: self.bytes_per_value * 8,
             data: data_buffer,
             num_values: num_rows,
+            block_info: BlockInfo::new(),
         }))
     }
 }
 
-#[derive(Debug)]
-pub struct ValueEncoder {
-    buffer_encoding_strategy: Arc<dyn BufferEncodingStrategy>,
-}
+/// A compression strategy that writes fixed-width data as-is (no compression)
+#[derive(Debug, Default)]
+pub struct ValueEncoder {}
 
 impl ValueEncoder {
-    pub fn try_new(buffer_encoding_strategy: Arc<dyn BufferEncodingStrategy>) -> Result<Self> {
-        Ok(Self {
-            buffer_encoding_strategy,
-        })
+    /// Use the largest chunk we can smaller than 4KiB
+    fn find_log_vals_per_chunk(bytes_per_value: u64) -> (u64, u64) {
+        let mut size_bytes = 2 * bytes_per_value;
+        let mut log_num_vals = 1;
+        let mut num_vals = 2;
+
+        // If the type is so wide that we can't even fit 2 values we shouldn't be here
+        assert!(size_bytes < MAX_MINIBLOCK_BYTES);
+
+        while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals < MAX_MINIBLOCK_VALUES {
+            log_num_vals += 1;
+            size_bytes *= 2;
+            num_vals *= 2;
+        }
+
+        (log_num_vals, num_vals)
+    }
+
+    fn chunk_data(data: FixedWidthDataBlock) -> MiniBlockCompressed {
+        // For now, only support byte-sized data
+        debug_assert!(data.bits_per_value % 8 == 0);
+        let bytes_per_value = data.bits_per_value / 8;
+
+        // Aim for 4KiB chunks
+        let (log_vals_per_chunk, vals_per_chunk) = Self::find_log_vals_per_chunk(bytes_per_value);
+        let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
+        let bytes_per_chunk = bytes_per_value * vals_per_chunk;
+        let bytes_per_chunk = u16::try_from(bytes_per_chunk).unwrap();
+
+        let data_buffer = data.data;
+
+        let mut row_offset = 0;
+        let mut chunks = Vec::with_capacity(num_chunks);
+
+        let mut bytes_counter = 0;
+        loop {
+            if row_offset + vals_per_chunk <= data.num_values {
+                chunks.push(MiniBlockChunk {
+                    log_num_values: log_vals_per_chunk as u8,
+                    num_bytes: bytes_per_chunk,
+                });
+                row_offset += vals_per_chunk;
+                bytes_counter += bytes_per_chunk as u64;
+            } else {
+                // Final chunk, special values
+                let num_bytes = data_buffer.len() as u64 - bytes_counter;
+                let num_bytes = u16::try_from(num_bytes).unwrap();
+                chunks.push(MiniBlockChunk {
+                    log_num_values: 0,
+                    num_bytes,
+                });
+                break;
+            }
+        }
+
+        MiniBlockCompressed {
+            chunks,
+            data: data_buffer,
+            num_values: data.num_values,
+        }
+    }
+}
+
+impl BlockCompressor for ValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
+        let data = match data {
+            DataBlock::FixedWidth(fixed_width) => fixed_width.data,
+            _ => unimplemented!(
+                "Cannot compress block of type {} with ValueEncoder",
+                data.name()
+            ),
+        };
+        Ok(data)
     }
 }
 
 impl ArrayEncoder for ValueEncoder {
-    fn encode(&self, arrays: &[ArrayRef], buffer_index: &mut u32) -> Result<EncodedArray> {
+    fn encode(
+        &self,
+        data: DataBlock,
+        _data_type: &DataType,
+        buffer_index: &mut u32,
+    ) -> Result<EncodedArray> {
         let index = *buffer_index;
         *buffer_index += 1;
 
-        let buffer_encoder = self
-            .buffer_encoding_strategy
-            .create_buffer_encoder(arrays)?;
-        let (encoded_buffer, encoded_buffer_meta) = buffer_encoder.encode(arrays)?;
+        let encoding = match &data {
+            DataBlock::FixedWidth(fixed_width) => Ok(ProtobufUtils::flat_encoding(
+                fixed_width.bits_per_value,
+                index,
+                None,
+            )),
+            _ => Err(Error::InvalidInput {
+                source: format!(
+                    "Cannot encode a data block of type {} with ValueEncoder",
+                    data.name()
+                )
+                .into(),
+                location: location!(),
+            }),
+        }?;
+        Ok(EncodedArray { data, encoding })
+    }
+}
 
-        let array_encoding = if let Some(bitpacking_meta) = encoded_buffer_meta.bitpacking {
-            pb::array_encoding::ArrayEncoding::Bitpacked(pb::Bitpacked {
-                compressed_bits_per_value: bitpacking_meta.bits_per_value,
-                uncompressed_bits_per_value: encoded_buffer_meta.bits_per_value,
-                signed: bitpacking_meta.signed,
-                buffer: Some(pb::Buffer {
-                    buffer_index: index,
-                    buffer_type: pb::buffer::BufferType::Page as i32,
-                }),
-            })
-        } else {
-            pb::array_encoding::ArrayEncoding::Flat(pb::Flat {
-                bits_per_value: encoded_buffer_meta.bits_per_value,
-                buffer: Some(pb::Buffer {
-                    buffer_index: index,
-                    buffer_type: pb::buffer::BufferType::Page as i32,
-                }),
-                compression: encoded_buffer_meta
-                    .compression_scheme
-                    .map(|compression_scheme| pb::Compression {
-                        scheme: compression_scheme.to_string(),
-                    }),
-            })
+impl MiniBlockCompressor for ValueEncoder {
+    fn compress(
+        &self,
+        chunk: DataBlock,
+    ) -> Result<(
+        crate::encoder::MiniBlockCompressed,
+        crate::format::pb::ArrayEncoding,
+    )> {
+        match chunk {
+            DataBlock::FixedWidth(fixed_width) => {
+                let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
+                Ok((Self::chunk_data(fixed_width), encoding))
+            }
+            _ => Err(Error::InvalidInput {
+                source: format!(
+                    "Cannot compress a data block of type {} with ValueEncoder",
+                    chunk.name()
+                )
+                .into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
+/// A decompressor for constant-encoded data
+#[derive(Debug)]
+pub struct ConstantDecompressor {
+    scalar: LanceBuffer,
+    num_values: u64,
+}
+
+impl ConstantDecompressor {
+    pub fn new(scalar: LanceBuffer, num_values: u64) -> Self {
+        Self {
+            scalar: scalar.into_borrowed(),
+            num_values,
+        }
+    }
+}
+
+impl BlockDecompressor for ConstantDecompressor {
+    fn decompress(&self, _data: LanceBuffer) -> Result<DataBlock> {
+        Ok(DataBlock::Constant(ConstantDataBlock {
+            data: self.scalar.try_clone().unwrap(),
+            num_values: self.num_values,
+        }))
+    }
+}
+
+/// A decompressor for fixed-width data that has
+/// been written, as-is, to disk in single contiguous array
+#[derive(Debug)]
+pub struct ValueDecompressor {
+    bytes_per_value: u64,
+}
+
+impl ValueDecompressor {
+    pub fn new(description: &pb::Flat) -> Self {
+        assert!(description.bits_per_value % 8 == 0);
+        Self {
+            bytes_per_value: description.bits_per_value / 8,
+        }
+    }
+}
+
+impl BlockDecompressor for ValueDecompressor {
+    fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
+        let num_values = data.len() as u64 / self.bytes_per_value;
+        assert_eq!(data.len() as u64 % self.bytes_per_value, 0);
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            data,
+            num_values,
+            block_info: BlockInfo::new(),
+        }))
+    }
+}
+
+impl MiniBlockDecompressor for ValueDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        debug_assert!(data.len() as u64 >= num_values * self.bytes_per_value);
+
+        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+            data,
+            bits_per_value: self.bytes_per_value * 8,
+            num_values,
+            block_info: BlockInfo::new(),
+        }))
+    }
+}
+
+impl PerValueDecompressor for ValueDecompressor {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+        MiniBlockDecompressor::decompress(self, data, num_values)
+    }
+
+    fn bits_per_value(&self) -> u64 {
+        self.bytes_per_value * 8
+    }
+}
+
+impl PerValueCompressor for ValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, ArrayEncoding)> {
+        let (data, encoding) = match data {
+            DataBlock::FixedWidth(fixed_width) => {
+                let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
+                (PerValueDataBlock::Fixed(fixed_width), encoding)
+            }
+            _ => unimplemented!(
+                "Cannot compress block of type {} with ValueEncoder",
+                data.name()
+            ),
         };
-
-        let array_bufs = vec![EncodedArrayBuffer {
-            parts: encoded_buffer.parts,
-            index,
-        }];
-
-        Ok(EncodedArray {
-            buffers: array_bufs,
-            encoding: pb::ArrayEncoding {
-                array_encoding: Some(array_encoding),
-            },
-        })
+        Ok((data, encoding))
     }
 }
 
 // public tests module because we share the PRIMITIVE_TYPES constant with fixed_size_list
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
 
-    use super::*;
-
-    use std::marker::PhantomData;
-    use std::sync::Arc;
-
-    use arrow::datatypes::{Int16Type, Int32Type, Int64Type};
-    use arrow_array::{
-        types::{UInt32Type, UInt64Type, UInt8Type},
-        ArrayRef, ArrowPrimitiveType, Float32Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        PrimitiveArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-    };
+    use arrow_array::{Array, ArrayRef, Decimal128Array, Int32Array};
     use arrow_schema::{DataType, Field, TimeUnit};
-    use rand::distributions::Uniform;
-
-    use lance_arrow::DataTypeExt;
-    use lance_datagen::{array::rand_with_distribution, ArrayGenerator};
+    use rstest::rstest;
 
     use crate::{
-        encoder::{ArrayEncoder, CoreBufferEncodingStrategy},
-        testing::{
-            check_round_trip_encoding_generated, check_round_trip_encoding_random,
-            ArrayGeneratorProvider,
-        },
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
         version::LanceFileVersion,
     };
 
@@ -360,386 +490,97 @@ pub(crate) mod tests {
         // DataType::Interval(IntervalUnit::DayTime),
     ];
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_value_primitive() {
+    async fn test_value_primitive(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         for data_type in PRIMITIVE_TYPES {
+            log::info!("Testing encoding for {:?}", data_type);
             let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_random(field, HashMap::new()).await;
+            check_round_trip_encoding_random(field, version).await;
         }
     }
 
-    #[test_log::test(test)]
-    fn test_will_bitpack_allowed_types_when_possible() {
-        let test_cases: Vec<(DataType, ArrayRef, u64)> = vec![
-            (
-                DataType::UInt8,
-                Arc::new(UInt8Array::from_iter_values(vec![0, 1, 2, 3, 4, 5])),
-                3, // bits per value
-            ),
-            (
-                DataType::UInt16,
-                Arc::new(UInt16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
-                11,
-            ),
-            (
-                DataType::UInt32,
-                Arc::new(UInt32Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 16])),
-                19,
-            ),
-            (
-                DataType::UInt64,
-                Arc::new(UInt64Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 32])),
-                35,
-            ),
-            (
-                DataType::Int8,
-                Arc::new(Int8Array::from_iter_values(vec![0, 2, 3, 4, -5])),
-                4,
-            ),
-            (
-                DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![0, 1, 2, 3, 4, 5 << 8])),
-                12,
-            ),
-            (
-                DataType::Int32,
-                Arc::new(Int32Array::from_iter_values(vec![0, 1, 2, 3, 4, -5 << 16])),
-                20,
-            ),
-            (
-                DataType::Int64,
-                Arc::new(Int64Array::from_iter_values(vec![
-                    0,
-                    1,
-                    2,
-                    -3,
-                    -4,
-                    -5 << 32,
-                ])),
-                36,
-            ),
-        ];
-
-        for (data_type, arr, bits_per_value) in test_cases {
-            let arrs = vec![arr.clone() as _];
-            let mut buffed_index = 1;
-            let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
-                compression_scheme: CompressionScheme::None,
-                version: LanceFileVersion::V2_1,
-            }))
-            .unwrap();
-            let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
-            let array_encoding = result.encoding.array_encoding.unwrap();
-
-            match array_encoding {
-                pb::array_encoding::ArrayEncoding::Bitpacked(bitpacked) => {
-                    assert_eq!(bits_per_value, bitpacked.compressed_bits_per_value);
-                    assert_eq!(
-                        (data_type.byte_width() * 8) as u64,
-                        bitpacked.uncompressed_bits_per_value
-                    );
-                }
-                _ => {
-                    panic!("Array did not use bitpacking encoding")
-                }
-            }
-        }
-
-        // check it will otherwise use flat encoding
-        let test_cases: Vec<(DataType, ArrayRef)> = vec![
-            // it should use flat encoding for datatypes that don't support bitpacking
-            (
-                DataType::Float32,
-                Arc::new(Float32Array::from_iter_values(vec![0.1, 0.2, 0.3])),
-            ),
-            // it should still use flat encoding if bitpacked encoding would be packed
-            // into the full byte range
-            (
-                DataType::UInt8,
-                Arc::new(UInt8Array::from_iter_values(vec![0, 1, 2, 3, 4, 250])),
-            ),
-            (
-                DataType::UInt16,
-                Arc::new(UInt16Array::from_iter_values(vec![0, 1, 2, 3, 4, 250 << 8])),
-            ),
-            (
-                DataType::UInt32,
-                Arc::new(UInt32Array::from_iter_values(vec![
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    250 << 24,
-                ])),
-            ),
-            (
-                DataType::UInt64,
-                Arc::new(UInt64Array::from_iter_values(vec![
-                    0,
-                    1,
-                    2,
-                    3,
-                    4,
-                    250 << 56,
-                ])),
-            ),
-            (
-                DataType::Int8,
-                Arc::new(Int8Array::from_iter_values(vec![-100])),
-            ),
-            (
-                DataType::Int16,
-                Arc::new(Int16Array::from_iter_values(vec![-100 << 8])),
-            ),
-            (
-                DataType::Int32,
-                Arc::new(Int32Array::from_iter_values(vec![-100 << 24])),
-            ),
-            (
-                DataType::Int64,
-                Arc::new(Int64Array::from_iter_values(vec![-100 << 56])),
-            ),
-        ];
-
-        for (data_type, arr) in test_cases {
-            let arrs = vec![arr.clone() as _];
-            let mut buffed_index = 1;
-            let encoder = ValueEncoder::try_new(Arc::new(CoreBufferEncodingStrategy {
-                compression_scheme: CompressionScheme::None,
-                version: LanceFileVersion::default_v2(),
-            }))
-            .unwrap();
-            let result = encoder.encode(&arrs, &mut buffed_index).unwrap();
-            let array_encoding = result.encoding.array_encoding.unwrap();
-
-            match array_encoding {
-                pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                    assert_eq!((data_type.byte_width() * 8) as u64, flat.bits_per_value);
-                }
-                _ => {
-                    panic!("Array did not use bitpacking encoding")
-                }
-            }
-        }
+    lazy_static::lazy_static! {
+        static ref LARGE_TYPES: Vec<DataType> = vec![DataType::FixedSizeList(
+            Arc::new(Field::new("", DataType::Int32, false)),
+            128,
+        )];
     }
 
-    struct DistributionArrayGeneratorProvider<
-        DataType,
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-    >
-    where
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        phantom: PhantomData<DataType>,
-        distribution: Dist,
-    }
-
-    impl<DataType, Dist> DistributionArrayGeneratorProvider<DataType, Dist>
-    where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        fn new(dist: Dist) -> Self {
-            Self {
-                distribution: dist,
-                phantom: Default::default(),
-            }
-        }
-    }
-
-    impl<DataType, Dist> ArrayGeneratorProvider for DistributionArrayGeneratorProvider<DataType, Dist>
-    where
-        Dist: rand::distributions::Distribution<DataType::Native> + Clone + Send + Sync + 'static,
-        DataType::Native: Copy + 'static,
-        PrimitiveArray<DataType>: From<Vec<DataType::Native>> + 'static,
-        DataType: ArrowPrimitiveType,
-    {
-        fn provide(&self) -> Box<dyn ArrayGenerator> {
-            rand_with_distribution::<DataType, Dist>(self.distribution.clone())
-        }
-
-        fn copy(&self) -> Box<dyn ArrayGeneratorProvider> {
-            Box::new(Self {
-                phantom: self.phantom,
-                distribution: self.distribution.clone(),
-            })
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_large_primitive(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
+        for data_type in LARGE_TYPES.iter() {
+            log::info!("Testing encoding for {:?}", data_type);
+            let field = Field::new("", data_type.clone(), false);
+            check_round_trip_encoding_random(field, version).await;
         }
     }
 
     #[test_log::test(tokio::test)]
-    async fn test_bitpack_primitive() {
-        let bitpacked_test_cases: &Vec<(DataType, Box<dyn ArrayGeneratorProvider>)> = &vec![
-            // check less than one byte for multi-byte type
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(0, 19),
-                    ),
-                ),
-            ),
-            // // check that more than one byte for multi-byte type
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        Uniform::new(5 << 7, 6 << 7),
-                    ),
-                ),
-            ),
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(5 << 42, 6 << 42),
-                    ),
-                ),
-            ),
-            // check less than one byte for single-byte type
-            (
-                DataType::UInt8,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt8Type, Uniform<u8>>::new(
-                        Uniform::new(0, 19),
-                    ),
-                ),
-            ),
-            // check less than one byte for single-byte type
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(129, 259),
-                    ),
-                ),
-            ),
-            // check byte aligned for single byte
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always give 8 bits
-                        Uniform::new(200, 250),
-                    ),
-                ),
-            ),
-            // check where the num_bits divides evenly into the bit length of the type
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        Uniform::new(1, 3), // 2 bits
-                    ),
-                ),
-            ),
-            // check byte aligned for multiple bytes
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always always give 16 bits
-                        Uniform::new(200 << 8, 250 << 8),
-                    ),
-                ),
-            ),
-            // check byte aligned where the num bits doesn't divide evenly into the byte length
-            (
-                DataType::UInt64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt64Type, Uniform<u64>>::new(
-                        // this range should always give 24 hits
-                        Uniform::new(200 << 16, 250 << 16),
-                    ),
-                ),
-            ),
-            // check that we can still encode an all-0 array
-            (
-                DataType::UInt32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<UInt32Type, Uniform<u32>>::new(
-                        // this range should always always give 16 bits
-                        Uniform::new(0, 1),
-                    ),
-                ),
-            ),
-            // check for signed types
-            (
-                DataType::Int16,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int16Type, Uniform<i16>>::new(
-                        Uniform::new(-5, 5),
-                    ),
-                ),
-            ),
-            (
-                DataType::Int64,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int64Type, Uniform<i64>>::new(
-                        Uniform::new(-(5 << 42), 6 << 42),
-                    ),
-                ),
-            ),
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-(5 << 7), 6 << 7),
-                    ),
-                ),
-            ),
-            // check signed where packed to < 1 byte for multi-byte type
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(-19, 19),
-                    ),
-                ),
-            ),
-            // check signed byte aligned to single byte
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        // this range should always give 8 bits
-                        Uniform::new(-120, 120),
-                    ),
-                ),
-            ),
-            // check signed byte aligned to multiple bytes
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        // this range should always give 16 bits
-                        Uniform::new(-120 << 8, 120 << 8),
-                    ),
-                ),
-            ),
-            // check that all 0 works for signed type
-            (
-                DataType::Int32,
-                Box::new(
-                    DistributionArrayGeneratorProvider::<Int32Type, Uniform<i32>>::new(
-                        Uniform::new(0, 1),
-                    ),
-                ),
-            ),
-        ];
+    async fn test_decimal128_dictionary_encoding() {
+        let test_cases = TestCases::default().with_file_version(LanceFileVersion::V2_1);
+        let decimals: Vec<i32> = (0..100).collect();
+        let repeated_strings: Vec<_> = decimals
+            .iter()
+            .cycle()
+            .take(decimals.len() * 10000)
+            .map(|&v| Some(v as i128))
+            .collect();
+        let decimal_array = Arc::new(Decimal128Array::from(repeated_strings)) as ArrayRef;
+        check_round_trip_encoding_of_data(vec![decimal_array], &test_cases, HashMap::new()).await;
+    }
 
-        for (data_type, array_gen_provider) in bitpacked_test_cases {
-            let field = Field::new("", data_type.clone(), false);
-            check_round_trip_encoding_generated(
-                field,
-                array_gen_provider.copy(),
-                LanceFileVersion::V2_1,
-            )
-            .await;
+    #[test_log::test(tokio::test)]
+    async fn test_miniblock_stress() {
+        // Tests for strange page sizes and batch sizes and validity scenarios for miniblock
+
+        // 10K integers, 100 per array, all valid
+        let data1 = (0..100)
+            .map(|_| Arc::new(Int32Array::from_iter_values(0..100)) as Arc<dyn Array>)
+            .collect::<Vec<_>>();
+
+        // Same as above but with mixed validity
+        let data2 = (0..100)
+            .map(|_| {
+                Arc::new(Int32Array::from_iter((0..100).map(|i| {
+                    if i % 2 == 0 {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }))) as Arc<dyn Array>
+            })
+            .collect::<Vec<_>>();
+
+        // Same as above but with all null for first half then all valid
+        // TODO: Re-enable once the all-null path is complete
+        let _data3 = (0..100)
+            .map(|chunk_idx| {
+                Arc::new(Int32Array::from_iter((0..100).map(|i| {
+                    if chunk_idx < 50 {
+                        None
+                    } else {
+                        Some(i)
+                    }
+                }))) as Arc<dyn Array>
+            })
+            .collect::<Vec<_>>();
+
+        for data in [data1, data2 /*data3*/] {
+            for batch_size in [10, 100, 1500, 15000] {
+                // 40000 bytes of data
+                let test_cases = TestCases::default()
+                    .with_page_sizes(vec![1000, 2000, 3000, 60000])
+                    .with_batch_size(batch_size)
+                    .with_file_version(LanceFileVersion::V2_1);
+
+                check_round_trip_encoding_of_data(data.clone(), &test_cases, HashMap::new()).await;
+            }
         }
     }
 }

@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::datatypes::LogicalType;
 use lance_core::error::{Error, Result};
 
+/// JSON representation of an Apache Arrow [DataType].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonDataType {
+pub struct JsonDataType {
     #[serde(rename = "type")]
     type_: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,6 +49,8 @@ impl TryFrom<&DataType> for JsonDataType {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
             | DataType::Utf8
             | DataType::Binary
             | DataType::LargeUtf8
@@ -63,7 +66,6 @@ impl TryFrom<&DataType> for JsonDataType {
                 let logical_type: LogicalType = dt.try_into()?;
                 (logical_type.to_string(), None)
             }
-
             DataType::List(f) => {
                 let fields = vec![JsonField::try_from(f.as_ref())?];
                 ("list".to_string(), Some(fields))
@@ -110,7 +112,7 @@ impl TryFrom<&JsonDataType> for DataType {
         let type_name = value.type_.as_str();
         match type_name {
             "null" | "bool" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16"
-            | "uint32" | "halffloat" | "float" | "double" | "string" | "binary"
+            | "uint32" | "uint64" | "halffloat" | "float" | "double" | "string" | "binary"
             | "large_string" | "large_binary" | "date32:day" | "date64:ms" => {
                 let logical_type: LogicalType = type_name.into();
                 (&logical_type).try_into()
@@ -119,7 +121,8 @@ impl TryFrom<&JsonDataType> for DataType {
                 || dt.starts_with("time64:")
                 || dt.starts_with("timestamp:")
                 || dt.starts_with("duration:")
-                || dt.starts_with("dict:") =>
+                || dt.starts_with("dict:")
+                || dt.starts_with("decimal:") =>
             {
                 let logical_type: LogicalType = dt.into();
                 (&logical_type).try_into()
@@ -162,8 +165,9 @@ impl TryFrom<&JsonDataType> for DataType {
     }
 }
 
+/// JSON representation of an Apache Arrow [Field].
 #[derive(Serialize, Deserialize, Debug)]
-struct JsonField {
+pub struct JsonField {
     name: String,
     #[serde(rename = "type")]
     type_: JsonDataType,
@@ -312,6 +316,10 @@ mod test {
         assert_primitive_types(DataType::Date32, "date32:day");
         assert_primitive_types(DataType::Date64, "date64:ms");
         assert_primitive_types(DataType::Time32(TimeUnit::Second), "time32:s");
+        assert_primitive_types(DataType::Decimal128(38, 10), "decimal:128:38:10");
+        assert_primitive_types(DataType::Decimal256(76, 20), "decimal:256:76:20");
+        assert_primitive_types(DataType::Decimal128(18, 6), "decimal:128:18:6");
+        assert_primitive_types(DataType::Decimal256(50, 15), "decimal:256:50:15");
     }
 
     #[test]

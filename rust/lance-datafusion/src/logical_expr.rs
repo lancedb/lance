@@ -22,12 +22,12 @@ use snafu::{location, Location};
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
         Expr::Literal(scalar_value) => {
-            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::io(
+            Ok(Expr::Literal(safe_coerce_scalar(scalar_value, data_type).ok_or_else(|| Error::invalid_input(
                 format!("Received literal {expr} and could not convert to literal of type '{data_type:?}'"),
                 location!(),
             ))?))
         }
-        _ => Err(Error::io(
+        _ => Err(Error::invalid_input(
             format!("Expected a literal of type '{data_type:?}' but received: {expr}"),
             location!(),
         )),
@@ -287,7 +287,7 @@ pub mod tests {
 
     #[test]
     fn test_resolve_in_expr() {
-        // Type coersion should apply for `A IN (0)` or `A NOT IN (0)`
+        // Type coercion should apply for `A IN (0)` or `A NOT IN (0)`
         let arrow_schema = ArrowSchema::new(vec![Field::new("a", DataType::Float32, false)]);
         let expr = Expr::in_list(
             Expr::Column("a".to_string().into()),

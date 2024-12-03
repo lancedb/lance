@@ -1,0 +1,30 @@
+[package]
+name = "fsst"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "FSST string compression"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rand.workspace = true
+
+# this should be put in dev-dependencies, TODO: remove it from here
+[dev-dependencies]
+arrow-array.workspace = true
+test-log.workspace = true
+tokio.workspace = true
+rand_xoshiro = "0.6.0"
+lance-datagen = { workspace = true }
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
+
+[lints]
+workspace = true

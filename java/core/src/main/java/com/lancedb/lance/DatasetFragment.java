@@ -78,7 +78,9 @@ public class DatasetFragment {
     return metadata.getId();
   }
 
-  /** Count rows in this Fragment. */
+  /**
+   * @return row counts in this Fragment
+   */
   public int countRows() {
     return countRowsNative(dataset, metadata.getId());
   }

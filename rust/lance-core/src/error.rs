@@ -6,6 +6,8 @@ use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Allocates error on the heap and then places `e` into it.
+#[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
 }
@@ -160,6 +162,9 @@ impl ToSnafuLocation for std::panic::Location<'static> {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type ArrowResult<T> = std::result::Result<T, ArrowError>;
+#[cfg(feature = "datafusion")]
+pub type DataFusionResult<T> = std::result::Result<T, datafusion_common::DataFusionError>;
 
 impl From<ArrowError> for Error {
     #[track_caller]
@@ -316,9 +321,34 @@ impl From<Error> for datafusion_common::DataFusionError {
 impl From<datafusion_common::DataFusionError> for Error {
     #[track_caller]
     fn from(e: datafusion_common::DataFusionError) -> Self {
-        Self::IO {
-            source: box_error(e),
-            location: std::panic::Location::caller().to_snafu_location(),
+        let location = std::panic::Location::caller().to_snafu_location();
+        match e {
+            datafusion_common::DataFusionError::SQL(..)
+            | datafusion_common::DataFusionError::Plan(..)
+            | datafusion_common::DataFusionError::Configuration(..) => Self::InvalidInput {
+                source: box_error(e),
+                location,
+            },
+            datafusion_common::DataFusionError::SchemaError(..) => Self::Schema {
+                message: e.to_string(),
+                location,
+            },
+            datafusion_common::DataFusionError::ArrowError(..) => Self::Arrow {
+                message: e.to_string(),
+                location,
+            },
+            datafusion_common::DataFusionError::NotImplemented(..) => Self::NotSupported {
+                source: box_error(e),
+                location,
+            },
+            datafusion_common::DataFusionError::Execution(..) => Self::Execution {
+                message: e.to_string(),
+                location,
+            },
+            _ => Self::IO {
+                source: box_error(e),
+                location,
+            },
         }
     }
 }

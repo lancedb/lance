@@ -25,14 +25,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use lance_table::format::{pb, DeletionFile, Fragment, Index, Manifest, WriterVersion};
-use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler};
+use lance_file::version::LanceFileVersion;
+use lance_table::format::{
+    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
+    WriterVersion, DETACHED_VERSION_MASK,
+};
+use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use snafu::{location, Location};
 
 use futures::future::Either;
-use futures::{StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
 use lance_index::DatasetIndexExt;
 use object_store::path::Path;
@@ -41,8 +45,9 @@ use prost::Message;
 use super::ObjectStore;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig};
+use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
+use crate::session::Session;
 use crate::Dataset;
 
 #[cfg(all(feature = "dynamodb", test))]
@@ -61,6 +66,42 @@ async fn read_transaction_file(
     let data = result.bytes().await?;
     let transaction = pb::Transaction::decode(data)?;
     transaction.try_into()
+}
+
+fn transaction_file_cache_path(base_path: &Path, version: u64) -> Path {
+    base_path
+        .child("_transactions")
+        .child(format!("{}.txn", version))
+}
+
+async fn read_dataset_transaction_file(
+    dataset: &Dataset,
+    version: u64,
+) -> Result<Arc<Transaction>> {
+    let cache_path = transaction_file_cache_path(&dataset.base, version);
+    dataset
+        .session
+        .file_metadata_cache
+        .get_or_insert(&cache_path, |_| async move {
+            let dataset_version = dataset.checkout_version(version).await?;
+            let object_store = dataset_version.object_store();
+            let path = dataset_version
+                .manifest
+                .transaction_file
+                .as_ref()
+                .ok_or_else(|| Error::Internal {
+                    message: format!(
+                        "Dataset version {} does not have a transaction file",
+                        version
+                    ),
+                    location: location!(),
+                })?;
+            let transaction = read_transaction_file(object_store, &dataset.base, path)
+                .await
+                .unwrap();
+            Ok(transaction)
+        })
+        .await
 }
 
 /// Write a transaction to a file and return the relative path.
@@ -82,7 +123,7 @@ async fn write_transaction_file(
 fn check_transaction(
     transaction: &Transaction,
     other_version: u64,
-    other_transaction: &Option<Transaction>,
+    other_transaction: Option<&Transaction>,
 ) -> Result<()> {
     if other_transaction.is_none() {
         return Err(crate::Error::Internal {
@@ -112,19 +153,25 @@ fn check_transaction(
     Ok(())
 }
 
-pub(crate) async fn commit_new_dataset(
+#[allow(clippy::too_many_arguments)]
+async fn do_commit_new_dataset(
     object_store: &ObjectStore,
     commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
-) -> Result<Manifest> {
+    manifest_naming_scheme: ManifestNamingScheme,
+    blob_version: Option<u64>,
+    session: &Session,
+) -> Result<(Manifest, Path)> {
     let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
 
     let (mut manifest, indices) =
-        transaction.build_manifest(None, vec![], &transaction_file, write_config)?;
+        transaction.build_manifest(None, vec![], &transaction_file, write_config, blob_version)?;
 
-    write_manifest_file(
+    manifest.blob_dataset_version = blob_version;
+
+    let result = write_manifest_file(
         object_store,
         commit_handler,
         base_path,
@@ -135,10 +182,67 @@ pub(crate) async fn commit_new_dataset(
             Some(indices.clone())
         },
         write_config,
+        manifest_naming_scheme,
     )
-    .await?;
+    .await;
 
-    Ok(manifest)
+    // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
+    // if there is a conflict.
+    match result {
+        Ok(manifest_path) => {
+            session.file_metadata_cache.insert(
+                transaction_file_cache_path(base_path, manifest.version),
+                Arc::new(transaction.clone()),
+            );
+            Ok((manifest, manifest_path))
+        }
+        Err(CommitError::CommitConflict) => Err(crate::Error::DatasetAlreadyExists {
+            uri: base_path.to_string(),
+            location: location!(),
+        }),
+        Err(CommitError::OtherError(err)) => Err(err),
+    }
+}
+
+pub(crate) async fn commit_new_dataset(
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    base_path: &Path,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    manifest_naming_scheme: ManifestNamingScheme,
+    session: &Session,
+) -> Result<(Manifest, Path)> {
+    let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+        let blob_path = base_path.child(BLOB_DIR);
+        let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
+        let (blob_manifest, _) = do_commit_new_dataset(
+            object_store,
+            commit_handler,
+            &blob_path,
+            &blob_tx,
+            write_config,
+            manifest_naming_scheme,
+            None,
+            session,
+        )
+        .await?;
+        Some(blob_manifest.version)
+    } else {
+        None
+    };
+
+    do_commit_new_dataset(
+        object_store,
+        commit_handler,
+        base_path,
+        transaction,
+        write_config,
+        manifest_naming_scheme,
+        blob_version,
+        session,
+    )
+    .await
 }
 
 /// Internal function to check if a manifest could use some migration.
@@ -188,6 +292,48 @@ async fn migrate_manifest(
     manifest.fragments =
         Arc::new(migrate_fragments(dataset, &manifest.fragments, recompute_stats).await?);
 
+    Ok(())
+}
+
+fn check_storage_version(manifest: &mut Manifest) -> Result<()> {
+    let data_storage_version = manifest.data_storage_format.lance_file_version()?;
+    if manifest.data_storage_format.lance_file_version()? == LanceFileVersion::Legacy {
+        // Due to bugs in 0.16 it is possible the dataset's data storage version does not
+        // match the file version.  As a result, we need to check and see if they are out
+        // of sync.
+        if let Some(actual_file_version) =
+            Fragment::try_infer_version(&manifest.fragments).map_err(|e| Error::Internal {
+                message: format!(
+                    "The dataset contains a mixture of file versions.  You will need to rollback to an earlier version: {}",
+                    e
+                ),
+                location: location!(),
+            })? {
+                if actual_file_version > data_storage_version {
+                    log::warn!(
+                        "Data storage version {} is less than the actual file version {}.  This has been automatically updated.",
+                        data_storage_version,
+                        actual_file_version
+                    );
+                    manifest.data_storage_format = DataStorageFormat::new(actual_file_version);
+                }
+            }
+    } else {
+        // Otherwise, if we are on 2.0 or greater, we should ensure that the file versions
+        // match the data storage version.  This is a sanity assertion to prevent data corruption.
+        if let Some(actual_file_version) = Fragment::try_infer_version(&manifest.fragments)? {
+            if actual_file_version != data_storage_version {
+                return Err(Error::Internal {
+                    message: format!(
+                        "The operation added files with version {}.  However, the data storage version is {}.",
+                        actual_file_version,
+                        data_storage_version
+                    ),
+                    location: location!(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -252,6 +398,10 @@ fn fix_schema(manifest: &mut Manifest) -> Result<()> {
     for (old_field_id, new_field_id) in &old_field_id_mapping {
         let field = manifest.schema.mut_field_by_id(*old_field_id).unwrap();
         field.id = *new_field_id;
+
+        if let Some(local_field) = manifest.local_schema.mut_field_by_id(*old_field_id) {
+            local_field.id = *new_field_id;
+        }
     }
 
     // Drop data files that are no longer in use.
@@ -331,7 +481,7 @@ pub(crate) async fn migrate_fragments(
                 ..fragment.clone()
             })
         })
-        .buffered(num_cpus::get() * 2)
+        .buffered(dataset.object_store.io_parallelism())
         .boxed();
 
     new_fragments.try_collect().await
@@ -357,9 +507,149 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
                 .await?;
             index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
         }
+        // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
+        // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
+        if index.index_details.is_none() {
+            log::debug!("the index with uuid {} is missing index metadata.  This probably means it was written with Lance version <= 0.19.2.  This is not a problem.", index.uuid);
+        }
     }
 
     Ok(())
+}
+
+pub(crate) async fn do_commit_detached_transaction(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+    new_blob_version: Option<u64>,
+) -> Result<(Manifest, Path)> {
+    // We don't strictly need a transaction file but we go ahead and create one for
+    // record-keeping if nothing else.
+    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+
+    // We still do a loop since we may have conflicts in the random version we pick
+    for attempt_i in 0..commit_config.num_retries {
+        // Pick a random u64 with the highest bit set to indicate it is detached
+        let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
+
+        let (mut manifest, mut indices) = match transaction.operation {
+            Operation::Restore { version } => {
+                Transaction::restore_old_manifest(
+                    object_store,
+                    commit_handler,
+                    &dataset.base,
+                    version,
+                    write_config,
+                    &transaction_file,
+                )
+                .await?
+            }
+            _ => transaction.build_manifest(
+                Some(dataset.manifest.as_ref()),
+                dataset.load_indices().await?.as_ref().clone(),
+                &transaction_file,
+                write_config,
+                new_blob_version,
+            )?,
+        };
+
+        manifest.version = random_version;
+
+        // recompute_stats is always false so far because detached manifests are newer than
+        // the old stats bug.
+        migrate_manifest(dataset, &mut manifest, /*recompute_stats=*/ false).await?;
+        // fix_schema and check_storage_version are just for sanity-checking and consistency
+        fix_schema(&mut manifest)?;
+        check_storage_version(&mut manifest)?;
+        migrate_indices(dataset, &mut indices).await?;
+
+        // Try to commit the manifest
+        let result = write_manifest_file(
+            object_store,
+            commit_handler,
+            &dataset.base,
+            &mut manifest,
+            if indices.is_empty() {
+                None
+            } else {
+                Some(indices.clone())
+            },
+            write_config,
+            ManifestNamingScheme::V2,
+        )
+        .await;
+
+        match result {
+            Ok(path) => {
+                return Ok((manifest, path));
+            }
+            Err(CommitError::CommitConflict) => {
+                // We pick a random u64 for the version, so it's possible (though extremely unlikely)
+                // that we have a conflict. In that case, we just try again.
+
+                let backoff_time = backoff_time(attempt_i);
+                tokio::time::sleep(backoff_time).await;
+            }
+            Err(CommitError::OtherError(err)) => {
+                // If other error, return
+                return Err(err);
+            }
+        }
+    }
+
+    // This should be extremely unlikely.  There should not be *that* many detached commits.  If
+    // this happens then it seems more likely there is a bug in our random u64 generation.
+    Err(crate::Error::CommitConflict {
+        version: 0,
+        source: format!(
+            "Failed find unused random u64 after {} retries.",
+            commit_config.num_retries
+        )
+        .into(),
+        location: location!(),
+    })
+}
+
+pub(crate) async fn commit_detached_transaction(
+    dataset: &Dataset,
+    object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
+    transaction: &Transaction,
+    write_config: &ManifestWriteConfig,
+    commit_config: &CommitConfig,
+) -> Result<(Manifest, Path)> {
+    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
+        let blobs_tx =
+            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
+        let (blobs_manifest, _) = do_commit_detached_transaction(
+            blobs_dataset.as_ref(),
+            object_store,
+            commit_handler,
+            &blobs_tx,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await?;
+        Some(blobs_manifest.version)
+    } else {
+        None
+    };
+
+    do_commit_detached_transaction(
+        dataset,
+        object_store,
+        commit_handler,
+        transaction,
+        write_config,
+        commit_config,
+        new_blob_version,
+    )
+    .await
 }
 
 /// Attempt to commit a transaction, with retries and conflict resolution.
@@ -370,42 +660,67 @@ pub(crate) async fn commit_transaction(
     transaction: &Transaction,
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
-) -> Result<Manifest> {
+    manifest_naming_scheme: ManifestNamingScheme,
+) -> Result<(Manifest, Path)> {
+    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
+        let blobs_tx =
+            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
+        let (blobs_manifest, _) = do_commit_detached_transaction(
+            blobs_dataset.as_ref(),
+            object_store,
+            commit_handler,
+            &blobs_tx,
+            write_config,
+            commit_config,
+            None,
+        )
+        .await?;
+        Some(blobs_manifest.version)
+    } else {
+        None
+    };
+
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
-    let mut dataset = dataset.clone();
     // First, get all transactions since read_version
-    let mut other_transactions = Vec::new();
-    let mut version = transaction.read_version;
-    loop {
-        version += 1;
-        match dataset.checkout_version(version).await {
-            Ok(next_dataset) => {
-                let other_txn = if let Some(txn_file) = &next_dataset.manifest.transaction_file {
-                    Some(read_transaction_file(object_store, &next_dataset.base, txn_file).await?)
-                } else {
-                    None
-                };
-                other_transactions.push(other_txn);
-                dataset = next_dataset;
-            }
-            Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. }) => {
-                break;
-            }
-            Err(e) => {
-                return Err(e);
-            }
-        }
+    let read_version = transaction.read_version;
+    let mut dataset = dataset.clone();
+    // We need to checkout the latest version, because any fixes we apply
+    // (like computing the new row ids) needs to be done based on the most
+    // recent manifest.
+    dataset.checkout_latest().await?;
+    let latest_version = dataset.manifest.version;
+    let other_transactions = futures::stream::iter((read_version + 1)..=latest_version)
+        .map(|version| {
+            read_dataset_transaction_file(&dataset, version)
+                .map(move |res| res.map(|tx| (version, tx)))
+        })
+        .buffer_unordered(dataset.object_store().io_parallelism())
+        .take_while(|res| {
+            futures::future::ready(!matches!(
+                res,
+                Err(crate::Error::NotFound { .. }) | Err(crate::Error::DatasetNotFound { .. })
+            ))
+        })
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut target_version = latest_version + 1;
+
+    if is_detached_version(target_version) {
+        return Err(Error::Internal { message: "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.".into(), location: location!() });
     }
 
-    let mut target_version = version;
-
     // If any of them conflict with the transaction, return an error
-    for (version_offset, other_transaction) in other_transactions.iter().enumerate() {
-        let other_version = transaction.read_version + version_offset as u64 + 1;
-        check_transaction(transaction, other_version, other_transaction)?;
+    for (other_version, other_transaction) in other_transactions.iter() {
+        check_transaction(
+            transaction,
+            *other_version,
+            Some(other_transaction.as_ref()),
+        )?;
     }
 
     for attempt_i in 0..commit_config.num_retries {
@@ -427,6 +742,7 @@ pub(crate) async fn commit_transaction(
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
+                new_blob_version,
             )?,
         };
 
@@ -443,6 +759,8 @@ pub(crate) async fn commit_transaction(
 
         fix_schema(&mut manifest)?;
 
+        check_storage_version(&mut manifest)?;
+
         migrate_indices(&dataset, &mut indices).await?;
 
         // Try to commit the manifest
@@ -457,12 +775,19 @@ pub(crate) async fn commit_transaction(
                 Some(indices.clone())
             },
             write_config,
+            manifest_naming_scheme,
         )
         .await;
 
         match result {
-            Ok(()) => {
-                return Ok(manifest);
+            Ok(manifest_path) => {
+                let cache_path = transaction_file_cache_path(&dataset.base, target_version);
+                dataset
+                    .session()
+                    .file_metadata_cache
+                    .insert(cache_path, Arc::new(transaction.clone()));
+
+                return Ok((manifest, manifest_path));
             }
             Err(CommitError::CommitConflict) => {
                 // See if we can retry the commit. Try to account for all
@@ -473,18 +798,23 @@ pub(crate) async fn commit_transaction(
                 let backoff_time = backoff_time(attempt_i);
                 tokio::time::sleep(backoff_time).await;
 
-                let latest_version = dataset.latest_version_id().await?;
-                for version in target_version..=latest_version {
-                    dataset = dataset.checkout_version(version).await?;
-                    let other_transaction = if let Some(txn_file) =
-                        dataset.manifest.transaction_file.as_ref()
-                    {
-                        Some(read_transaction_file(object_store, &dataset.base, txn_file).await?)
-                    } else {
-                        None
-                    };
-                    check_transaction(transaction, version, &other_transaction)?;
-                }
+                dataset.checkout_latest().await?;
+                let latest_version = dataset.manifest.version;
+                futures::stream::iter(target_version..=latest_version)
+                    .map(|version| {
+                        read_dataset_transaction_file(&dataset, version)
+                            .map(move |res| res.map(|tx| (version, tx)))
+                    })
+                    .buffer_unordered(dataset.object_store().io_parallelism())
+                    .try_for_each(|(version, other_transaction)| {
+                        let res = check_transaction(
+                            transaction,
+                            version,
+                            Some(other_transaction.as_ref()),
+                        );
+                        futures::future::ready(res)
+                    })
+                    .await?;
                 target_version = latest_version + 1;
             }
             Err(CommitError::OtherError(err)) => {
@@ -673,6 +1003,7 @@ mod tests {
         let transaction = Transaction::new(
             42,
             Operation::Append { fragments: vec![] },
+            /*blobs_op= */ None,
             Some("hello world".to_string()),
         );
 
@@ -856,6 +1187,128 @@ mod tests {
         }
     }
 
+    async fn get_empty_dataset() -> (tempfile::TempDir, Dataset) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+            test_uri,
+            None,
+        )
+        .await
+        .unwrap();
+        (test_dir, ds)
+    }
+
+    #[tokio::test]
+    async fn test_good_concurrent_config_writes() {
+        let (_tmpdir, dataset) = get_empty_dataset().await;
+
+        // Test successful concurrent insert config operations
+        let futures: Vec<_> = ["key1", "key2", "key3", "key4", "key5"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .await
+                })
+            })
+            .collect();
+        let results = join_all(futures).await;
+
+        // Assert all succeeded
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        let dataset = dataset.checkout_version(6).await.unwrap();
+        assert_eq!(dataset.manifest.config.len(), 5);
+
+        dataset.validate().await.unwrap();
+
+        // Test successful concurrent delete operations. If multiple delete
+        // operations attempt to delete the same key, they are all successful.
+        let futures: Vec<_> = ["key1", "key1", "key1", "key2", "key2"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move { dataset.delete_config_keys(&[key]).await })
+            })
+            .collect();
+        let results = join_all(futures).await;
+
+        // Assert all succeeded
+        for result in results {
+            assert!(matches!(result, Ok(Ok(_))), "{:?}", result);
+        }
+
+        let dataset = dataset.checkout_version(11).await.unwrap();
+
+        // There are now two fewer keys
+        assert_eq!(dataset.manifest.config.len(), 3);
+
+        dataset.validate().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_bad_concurrent_config_writes() {
+        // If two concurrent insert config operations occur for the same key, a
+        // `CommitConflict` should be returned
+        let (_tmpdir, dataset) = get_empty_dataset().await;
+
+        let futures: Vec<_> = ["key1", "key1", "key2", "key3", "key4"]
+            .iter()
+            .map(|key| {
+                let mut dataset = dataset.clone();
+                tokio::spawn(async move {
+                    dataset
+                        .update_config(vec![(key.to_string(), "value".to_string())])
+                        .await
+                })
+            })
+            .collect();
+
+        let results = join_all(futures).await;
+
+        // Assert that either the first or the second operation fails
+        let mut first_operation_failed = false;
+        for (i, result) in results.into_iter().enumerate() {
+            let result = result.unwrap();
+            match i {
+                0 => {
+                    if result.is_err() {
+                        first_operation_failed = true;
+                        assert!(
+                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            "{:?}",
+                            result,
+                        );
+                    }
+                }
+                1 => match first_operation_failed {
+                    true => assert!(result.is_ok(), "{:?}", result),
+                    false => {
+                        assert!(
+                            matches!(&result, &Err(Error::CommitConflict { .. })),
+                            "{:?}",
+                            result,
+                        );
+                    }
+                },
+                _ => assert!(result.is_ok(), "{:?}", result),
+            }
+        }
+    }
+
     #[test]
     fn test_fix_schema() {
         // Manifest has a fragment with no fields in use
@@ -894,7 +1347,12 @@ mod tests {
             },
         ];
 
-        let mut manifest = Manifest::new(schema, Arc::new(fragments), DataStorageFormat::default());
+        let mut manifest = Manifest::new(
+            schema,
+            Arc::new(fragments),
+            DataStorageFormat::default(),
+            /*blob_dataset_version=*/ None,
+        );
 
         fix_schema(&mut manifest).unwrap();
 

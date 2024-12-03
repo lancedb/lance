@@ -6,6 +6,7 @@ import contextlib
 import os
 import pickle
 import platform
+import random
 import re
 import time
 import uuid
@@ -16,6 +17,7 @@ from unittest import mock
 
 import lance
 import lance.fragment
+import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import polars as pl
@@ -28,6 +30,7 @@ from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
+from lance.util import validate_vector_index
 
 # Various valid inputs for write_dataset
 input_schema = pa.schema([pa.field("a", pa.float64()), pa.field("b", pa.int64())])
@@ -81,7 +84,8 @@ def test_roundtrip_types(tmp_path: Path):
         }
     )
 
-    dataset = lance.write_dataset(table, tmp_path)
+    # TODO: V2 does not currently handle large_dict
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="legacy")
     assert dataset.schema == table.schema
     assert dataset.to_table() == table
 
@@ -113,7 +117,14 @@ def test_dataset_append(tmp_path: Path):
     # verify appending batches with a different schema doesn't work
     table2 = pa.Table.from_pydict({"COLUMN-C": [1, 2, 3], "colB": [4, 5, 6]})
     with pytest.raises(OSError):
-        lance.write_dataset(table2, base_dir, mode="append")
+        lance.write_dataset(table2, dataset, mode="append")
+
+    # But we can append subschemas
+    table3 = pa.Table.from_pydict({"colA": [4, 5, 6]})
+    dataset.insert(table3)  # Append is default
+    assert dataset.to_table() == pa.table(
+        {"colA": [1, 2, 3, 4, 5, 6], "colB": [4, 5, 6, None, None, None]}
+    )
 
 
 def test_dataset_from_record_batch_iterable(tmp_path: Path):
@@ -250,6 +261,30 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_v2_manifest_paths(tmp_path: Path):
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
+def test_v2_manifest_paths_migration(tmp_path: Path):
+    # Create a dataset with v1 manifest paths
+    lance.write_dataset(
+        pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
+    )
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert manifest_path == ["1.manifest"]
+
+    # Migrate to v2 manifest paths
+    lance.dataset(tmp_path).migrate_manifest_paths_v2()
+    manifest_path = os.listdir(tmp_path / "_versions")
+    assert len(manifest_path) == 1
+    assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
 def test_tag(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"
@@ -288,6 +323,25 @@ def test_tag(tmp_path: Path):
 
     with pytest.raises(ValueError):
         lance.dataset(base_dir, "missing-tag")
+
+    # test tag update
+    with pytest.raises(
+        ValueError, match="Version not found error: version 3 does not exist"
+    ):
+        ds.tags.update("tag1", 3)
+
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag3 does not exist"
+    ):
+        ds.tags.update("tag3", 1)
+
+    ds.tags.update("tag1", 2)
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 2
+
+    ds.tags.update("tag1", 1)
+    ds = lance.dataset(base_dir, "tag1")
+    assert ds.version == 1
 
 
 def test_sample(tmp_path: Path):
@@ -368,10 +422,31 @@ def test_filter(tmp_path: Path):
     assert actual_tab == pa.Table.from_pydict({"a": range(51, 100)})
 
 
-def test_limit_offset(tmp_path: Path):
+def test_filter_meta_columns(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
+    ds = lance.write_dataset(table, base_dir)
+
+    rowids = ds.to_table(with_row_id=True, columns=[])
+    some_row_id = random.sample(rowids.column(0).to_pylist(), 1)[0]
+    filtered = ds.to_table(filter=f"_rowid = {some_row_id}", with_row_id=True)
+
+    assert len(filtered) == 1
+
+    rowaddrs = ds.to_table(with_row_address=True, columns=[])
+    some_row_addr = random.sample(rowaddrs.column(0).to_pylist(), 1)[0]
+    filtered = ds.to_table(filter=f"_rowaddr = {some_row_addr}", with_row_address=True)
+
+    assert len(filtered) == 1
+
+
+@pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
+def test_limit_offset(tmp_path: Path, data_storage_version: str):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(
+        table, base_dir, data_storage_version=data_storage_version, max_rows_per_file=10
+    )
     dataset = lance.dataset(base_dir)
 
     # test just limit
@@ -382,6 +457,40 @@ def test_limit_offset(tmp_path: Path):
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
+
+    # Slicing in the middle of fragments
+    assert dataset.to_table(offset=5, limit=20) == table.slice(5, 20)
+
+    # Slicing within a single fragment
+    assert dataset.to_table(offset=5, limit=3) == table.slice(5, 3)
+
+    # Skipping entire fragments
+    assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
+
+    # Limit past the end
+    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+
+    # Invalid limit / offset
+    with pytest.raises(ValueError, match="Offset must be non-negative"):
+        assert dataset.to_table(offset=-1, limit=10) == table.slice(50, 50)
+    with pytest.raises(ValueError, match="Limit must be non-negative"):
+        assert dataset.to_table(offset=10, limit=-1) == table.slice(50, 50)
+
+    full_ds_version = dataset.version
+    dataset.delete("a % 2 = 0")
+    filt_table = table.filter((pa.compute.bit_wise_and(pa.compute.field("a"), 1)) != 0)
+    assert (
+        dataset.to_table(offset=10).combine_chunks()
+        == filt_table.slice(10).combine_chunks()
+    )
+
+    dataset = dataset.checkout_version(full_ds_version)
+    dataset.restore()
+    dataset.delete("a > 2 AND a < 7")
+    print(dataset.to_table(offset=3, limit=1))
+    filt_table = table.slice(7, 1)
+
+    assert dataset.to_table(offset=3, limit=1) == filt_table
 
 
 def test_relative_paths(tmp_path: Path):
@@ -471,6 +580,55 @@ def test_pickle(tmp_path: Path):
     pickled = pickle.dumps(dataset)
     unpickled = pickle.loads(pickled)
     assert dataset.to_table() == unpickled.to_table()
+
+
+def test_nested_projection(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "struct": [{"x": counter, "y": counter % 2 == 0} for counter in range(100)],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    projected = dataset.to_table(columns=["struct.x"])
+    assert projected == pa.Table.from_pydict({"struct.x": range(100)})
+
+    projected = dataset.to_table(columns=["struct.y"])
+    assert projected == pa.Table.from_pydict(
+        {"struct.y": [i % 2 == 0 for i in range(100)]}
+    )
+
+
+def test_nested_projection_list(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "list_struct": [
+                [{"x": counter, "y": counter % 2 == 0}] for counter in range(100)
+            ],
+        }
+    )
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+
+    projected = dataset.to_table(columns={"list_struct": "list_struct[1]['x']"})
+    assert projected == pa.Table.from_pydict({"list_struct": range(100)})
+
+    # FIXME: sqlparser seems to ignore the .y part, but I can't create a simple
+    # reproducible example for sqlparser. Possibly an issue in our dialect.
+    # projected = dataset.to_table(
+    #   columns={"list_struct": "array_element(list_struct, 1).y"})
+    # assert projected == pa.Table.from_pydict(
+    #     {"list_struct": [i % 2 == 0 for i in range(100)]}
+    # )
 
 
 def test_polar_scan(tmp_path: Path):
@@ -572,36 +730,6 @@ def test_pickle_fragment(tmp_path: Path):
     unpickled = pickle.loads(pickled)
 
     assert fragment.to_table() == unpickled.to_table()
-
-
-def test_add_columns(tmp_path: Path):
-    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
-    base_dir = tmp_path / "test"
-    lance.write_dataset(table, base_dir)
-
-    dataset = lance.dataset(base_dir)
-    fragments = dataset.get_fragments()
-
-    fragment = fragments[0]
-
-    def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
-        c_array = pa.compute.multiply(batch.column(0), 2)
-        return pa.RecordBatch.from_arrays([c_array], names=["c"])
-
-    fragment_metadata, schema = fragment.merge_columns(adder, columns=["a"])
-
-    operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
-    dataset = lance.LanceDataset.commit(base_dir, operation)
-    assert dataset.schema == schema.to_pyarrow()
-
-    tbl = dataset.to_table()
-    assert tbl == pa.Table.from_pydict(
-        {
-            "a": range(100),
-            "b": range(100),
-            "c": pa.array(range(0, 200, 2), pa.int64()),
-        }
-    )
 
 
 def test_cleanup_old_versions(tmp_path):
@@ -714,16 +842,16 @@ def test_append_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
 
-    lance.write_dataset(table, base_dir)
+    dataset = lance.write_dataset(table, base_dir)
 
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
     append = lance.LanceOperation.Append([fragment])
 
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError):
         # Must specify read version
-        dataset = lance.LanceDataset.commit(base_dir, append)
+        dataset = lance.LanceDataset.commit(dataset, append)
 
-    dataset = lance.LanceDataset.commit(base_dir, append, read_version=1)
+    dataset = lance.LanceDataset.commit(dataset, append, read_version=1)
 
     tbl = dataset.to_table()
 
@@ -734,6 +862,30 @@ def test_append_with_commit(tmp_path: Path):
         }
     )
     assert tbl == expected
+
+
+def test_commit_batch_append():
+    data1 = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data1, "memory://test")
+
+    data2 = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragments2 = lance.fragment.write_fragments(data2, dataset)
+    op2 = lance.LanceOperation.Append(fragments2)
+    txn2 = lance.Transaction(1, op2)
+    data3 = pa.Table.from_pydict({"a": range(200, 300), "b": range(200, 300)})
+    fragments3 = lance.fragment.write_fragments(data3, dataset)
+    op3 = lance.LanceOperation.Append(fragments3)
+    txn3 = lance.Transaction(2, op3)
+
+    result = lance.LanceDataset.commit_batch(dataset, [txn2, txn3])
+    dataset = result["dataset"]
+    assert dataset.version == 2
+    assert len(dataset.get_fragments()) == 3
+    assert dataset.to_table() == pa.concat_tables([data1, data2, data3])
+    merged_txn = result["merged"]
+    assert isinstance(merged_txn, lance.Transaction)
+    assert isinstance(merged_txn.operation, lance.LanceOperation.Append)
+    assert merged_txn.operation.fragments == fragments2 + fragments3
 
 
 def test_delete_with_commit(tmp_path: Path):
@@ -789,12 +941,9 @@ def test_merge_with_commit(tmp_path: Path):
     lance.write_dataset(table, base_dir)
 
     fragment = lance.dataset(base_dir).get_fragments()[0]
-    # add_columns is deprecated, but we can make sure it still works
-    # for now.
-    with pytest.deprecated_call():
-        merged = fragment.add_columns(
-            lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
-        )
+    merged = fragment.merge_columns(
+        lambda _: pa.RecordBatch.from_pydict({"c": range(100)})
+    )[0]
 
     expected = pa.Table.from_pydict({"a": range(100), "b": range(100), "c": range(100)})
 
@@ -1413,6 +1562,10 @@ def test_merge_insert_vector_column(tmp_path: Path):
     check_merge_stats(merge_dict, (1, 1, 0))
 
 
+def check_update_stats(update_dict, expected):
+    assert (update_dict["num_rows_updated"],) == expected
+
+
 def test_update_dataset(tmp_path: Path):
     nrows = 100
     vecs = pa.FixedSizeListArray.from_arrays(
@@ -1423,11 +1576,12 @@ def test_update_dataset(tmp_path: Path):
 
     dataset = lance.dataset(tmp_path / "dataset")
 
-    dataset.update(dict(b="b + 1"))
+    update_dict = dataset.update(dict(b="b + 1"))
     expected = pa.table({"a": range(100), "b": range(1, 101)})
     assert dataset.to_table(columns=["a", "b"]) == expected
+    check_update_stats(update_dict, (100,))
 
-    dataset.update(dict(a="a * 2"), where="a < 50")
+    update_dict = dataset.update(dict(a="a * 2"), where="a < 50")
     expected = pa.table(
         {
             "a": [x * 2 if x < 50 else x for x in range(100)],
@@ -1435,8 +1589,9 @@ def test_update_dataset(tmp_path: Path):
         }
     )
     assert dataset.to_table(columns=["a", "b"]).sort_by("b") == expected
+    check_update_stats(update_dict, (50,))
 
-    dataset.update(dict(vec="[42.0, 43.0]"))
+    update_dict = dataset.update(dict(vec="[42.0, 43.0]"))
     expected = pa.table(
         {
             "b": range(1, 101),
@@ -1446,6 +1601,7 @@ def test_update_dataset(tmp_path: Path):
         }
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
+    check_update_stats(update_dict, (100,))
 
 
 def test_update_dataset_all_types(tmp_path: Path):
@@ -1470,7 +1626,7 @@ def test_update_dataset_all_types(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
 
     # One update with all matching types
-    dataset.update(
+    update_dict = dataset.update(
         dict(
             int32="2",
             int64="2",
@@ -1505,6 +1661,7 @@ def test_update_dataset_all_types(tmp_path: Path):
         }
     )
     assert dataset.to_table() == expected
+    check_update_stats(update_dict, (1,))
 
 
 def test_update_with_binary_field(tmp_path: Path):
@@ -1519,12 +1676,13 @@ def test_update_with_binary_field(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path)
 
     # Update binary field
-    dataset.update({"b": "X'616263'"}, where="c < 2")
+    update_dict = dataset.update({"b": "X'616263'"}, where="c < 2")
 
     ds = lance.dataset(tmp_path)
     assert ds.scanner(filter="c < 2").to_table().column(
         "b"
     ).combine_chunks() == pa.array([b"abc", b"abc"])
+    check_update_stats(update_dict, (2,))
 
 
 def test_create_update_empty_dataset(tmp_path: Path, provide_pandas: bool):
@@ -1583,6 +1741,242 @@ def test_scan_with_batch_size(tmp_path: Path):
     batches = dataset.scanner(scan_in_order=True).to_batches()
     for batch in batches:
         assert batch.num_rows != 12
+
+
+@pytest.mark.slow
+def test_io_buffer_size(tmp_path: Path):
+    # These cases regress deadlock issues that happen when the
+    # batch size was very large (in bytes) so that batches are
+    # bigger than the I/O buffer size
+    #
+    # The test is slow (it needs to generate enough data to cover a variety
+    # of cases) but it is essential to run if any changes are made to the
+    # 2.0 scheduling priority / decoding strategy
+    #
+    # In this test we create 4 pages of data, 2 for each column.  We
+    # then set the I/O buffer size to 5000 bytes so that we only read
+    # 1 page at a time and set the batch size to 2M rows so that we
+    # read in all 4 pages for a single batch.
+    #
+    # The scheduler will schedule in this order: C0P0, C1P0, C0P1, C1P1
+    #
+    # The deadlock would happen because the decoder was decoding in this
+    # order: C0P0, C0P1, C1P0, C1P1.
+    #
+    # The decoder will wait for C0P1 but the scheduler will only have scheduled
+    # C1P0 and so deadlock would happen.
+    #
+    # The fix was to change the decoder to decode in the same order as the
+    # scheduler.
+    base_dir = tmp_path / "dataset"
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.uint64(), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This test is similar but the first column is a list column.  The I/O to grab
+    # the list items will span multiple requests and it is important that all of
+    # those requests share the priority of the parent list
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array([[0]] * 1024 * 1024, pa.list_(pa.uint64())),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # Another scenario.  Each list item is a page in itself and we have two list
+    # columns
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                    pa.array([[0] * 5 * 1024 * 1024], pa.list_(pa.uint64())),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.list_(pa.uint64()), "b": pa.list_(pa.uint64())})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Same scenario as above except now it's a list<list<int>>
+
+    def datagen():
+        for i in range(16):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                    pa.array(
+                        [[[0] * 5 * 1024 * 1024]], pa.list_(pa.list_(pa.uint64()))
+                    ),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.list_(pa.list_(pa.uint64())), "b": pa.list_(pa.list_(pa.uint64()))}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=16, io_buffer_size=5000).to_table()
+
+    # Next we consider the case where the column is a struct column and we want to
+    # make sure we don't decode too deeply into the struct child
+
+    def datagen():
+        for i in range(2):
+            yield pa.record_batch(
+                [
+                    pa.array(
+                        [{"foo": i} for i in range(1024 * 1024)],
+                        pa.struct([pa.field("foo", pa.uint64())]),
+                    ),
+                    pa.array(range(1024 * 1024), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema(
+        {"a": pa.struct([pa.field("foo", pa.uint64())]), "b": pa.uint64()}
+    )
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=2 * 1024 * 1024, io_buffer_size=5000).to_table()
+
+    # This reproduces another issue we saw where there are a bunch of empty lists and
+    # lance was calculating the page priority incorrectly.
+
+    fsl_type = pa.list_(pa.uint64(), 32 * 1024 * 1024)
+    list_type = pa.list_(fsl_type)
+
+    def datagen():
+        # Each item is 32
+        values = pa.array(range(32 * 1024 * 1024 * 7), pa.uint64())
+        fsls = pa.FixedSizeListArray.from_arrays(values, 32 * 1024 * 1024)
+        # 3 items, 5 empties, 2 items
+        offsets = pa.array([0, 1, 2, 3, 4, 4, 5, 6, 7], pa.int32())
+        lists = pa.ListArray.from_arrays(offsets, fsls)
+
+        values2 = pa.array(range(32 * 1024 * 1024 * 8), pa.uint64())
+        fsls2 = pa.FixedSizeListArray.from_arrays(values2, 32 * 1024 * 1024)
+        offsets2 = pa.array([0, 1, 2, 3, 4, 5, 6, 7, 8], pa.int32())
+        lists2 = pa.ListArray.from_arrays(offsets2, fsls2)
+
+        yield pa.record_batch(
+            [
+                lists,
+                lists2,
+            ],
+            names=["a", "b"],
+        )
+
+    schema = pa.schema({"a": list_type, "b": list_type})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        mode="overwrite",
+    )
+
+    dataset.scanner(batch_size=10, io_buffer_size=5000).to_table()
+
+    # We need to make sure that different data files within a fragment are
+    # given the same priority.  This is because we scan both files at the same
+    # time in order.
+
+    def datagen():
+        for i in range(2):
+            buf = pa.allocate_buffer(8 * 1024 * 1024)
+            arr = pa.FixedSizeBinaryArray.from_buffers(
+                pa.binary(1024 * 1024), 8, [None, buf]
+            )
+            yield pa.record_batch(
+                [
+                    arr,
+                    pa.array(range(8), pa.uint64()),
+                ],
+                names=["a", "b"],
+            )
+
+    schema = pa.schema({"a": pa.binary(1024 * 1024), "b": pa.uint64()})
+
+    dataset = lance.write_dataset(
+        datagen(),
+        base_dir,
+        schema=schema,
+        data_storage_version="stable",
+        max_rows_per_file=2 * 1024 * 1024,
+        mode="overwrite",
+    )
+
+    dataset.add_columns({"c": "b"})
+
+    dataset.scanner(batch_size=1, io_buffer_size=5000).to_table()
 
 
 def test_scan_no_columns(tmp_path: Path):
@@ -1732,6 +2126,17 @@ def test_dataset_restore(tmp_path: Path):
     assert dataset.count_rows() == 100
 
 
+def test_mixed_mode_overwrite(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(data, tmp_path, data_storage_version="legacy")
+
+    assert dataset.data_storage_version == "0.1"
+
+    dataset = lance.write_dataset(data, tmp_path, mode="overwrite")
+
+    assert dataset.data_storage_version == "0.1"
+
+
 def test_roundtrip_reader(tmp_path: Path):
     # Can roundtrip a reader
     data = pa.table({"a": range(100)})
@@ -1753,6 +2158,26 @@ def test_metadata(tmp_path: Path):
     lance.write_dataset(data, tmp_path)
 
 
+def test_default_scan_options(tmp_path: Path):
+    data = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+    assert dataset.schema.names == ["a", "b"]
+
+    dataset = lance.dataset(tmp_path)
+    assert dataset.schema.names == ["a", "b"]
+
+    dataset = lance.dataset(
+        tmp_path,
+        default_scan_options={
+            "with_row_id": True,
+        },
+    )
+    assert dataset.schema.names == ["a", "b", "_rowid"]
+
+    dataset = lance.dataset(tmp_path, default_scan_options={"with_row_address": True})
+    assert dataset.schema.names == ["a", "b", "_rowaddr"]
+
+
 def test_scan_with_row_ids(tmp_path: Path):
     """Test expose physical row ids in the scanner."""
     data = pa.table({"a": range(1000)})
@@ -1765,6 +2190,150 @@ def test_scan_with_row_ids(tmp_path: Path):
 
     tbl2 = ds._take_rows(row_ids)
     assert tbl2["a"] == tbl["a"]
+
+
+@pytest.mark.cuda
+def test_random_dataset_recall_accelerated(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=32,
+        accelerator=torch.device("cpu"),
+    )
+    validate_vector_index(dataset, "a", pass_threshold=0.5)
+
+
+@pytest.mark.cuda
+def test_random_dataset_recall_accelerated_one_pass(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        num_partitions=2,
+        num_sub_vectors=32,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    validate_vector_index(dataset, "a", pass_threshold=0.5)
+
+
+@pytest.mark.cuda
+def test_count_index_rows_accelerated(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        accelerator=torch.device("cpu"),
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+
+@pytest.mark.cuda
+def test_count_index_rows_accelerated_one_pass(tmp_path: Path):
+    dims = 32
+    schema = pa.schema([pa.field("a", pa.list_(pa.float32(), dims), False)])
+    values = pc.random(512 * dims).cast("float32")
+    table = pa.Table.from_pydict(
+        {"a": pa.FixedSizeListArray.from_arrays(values, dims)}, schema=schema
+    )
+
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    # assert we return None for index name that doesn't exist
+    index_name = "a_idx"
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_unindexed_rows"]
+    with pytest.raises(KeyError):
+        dataset.stats.index_stats(index_name)["num_indexed_rows"]
+
+    from lance.dependencies import torch
+
+    # create index and assert no rows are uncounted
+    dataset.create_index(
+        "a",
+        "IVF_PQ",
+        name=index_name,
+        num_partitions=2,
+        num_sub_vectors=1,
+        accelerator=torch.device("cpu"),
+        one_pass_ivfpq=True,
+    )
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 0
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
+
+    # append some data
+    new_table = pa.Table.from_pydict(
+        {"a": [[float(i) for i in range(32)] for _ in range(512)]}, schema=schema
+    )
+    dataset = lance.write_dataset(new_table, base_dir, mode="append")
+
+    # assert rows added since index was created are uncounted
+    assert dataset.stats.index_stats(index_name)["num_unindexed_rows"] == 512
+    assert dataset.stats.index_stats(index_name)["num_indexed_rows"] == 512
 
 
 def test_count_index_rows(tmp_path: Path):
@@ -1932,7 +2501,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert len(batches) == 1
     assert pa.Table.from_batches(batches) == table
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
     assert dataset.data_storage_version == "2.0"
 
     # Append will write v2 if dataset was originally created with v2
@@ -1941,7 +2510,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert len(dataset.get_fragments()) == 2
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     dataset = lance.write_dataset(
         table, tmp_path, data_storage_version="legacy", mode="overwrite"
@@ -1949,7 +2518,7 @@ def test_legacy_dataset(tmp_path: Path):
     assert dataset.data_storage_version == "0.1"
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Append will write v1 if dataset was originally created with v1
     dataset = lance.write_dataset(
@@ -1957,7 +2526,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[1]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v2 will put dataset in "v2 mode"
     dataset = lance.write_dataset(
@@ -1975,7 +2544,7 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" in format_fragment(fragment.metadata, dataset)
 
     # Writing an empty table with v1 will put dataset in "v1 mode"
     dataset = lance.write_dataset(
@@ -1993,4 +2562,156 @@ def test_legacy_dataset(tmp_path: Path):
     )
 
     fragment = list(dataset.get_fragments())[0]
-    assert "minor_version: 3" not in format_fragment(fragment.metadata, dataset)
+    assert "major_version: 2" not in format_fragment(fragment.metadata, dataset)
+
+
+def test_late_materialization_param(tmp_path: Path):
+    table = pa.table(
+        {
+            "filter": np.arange(4),
+            "values": pa.array([b"abcd", b"efgh", b"ijkl", b"mnop"]),
+        }
+    )
+    dataset = lance.write_dataset(
+        table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
+    )
+    filt = "filter % 2 == 0"
+
+    assert "(values)" in dataset.scanner(
+        filter=filt, late_materialization=None
+    ).explain_plan(True)
+    assert ", values" in dataset.scanner(
+        filter=filt, late_materialization=False
+    ).explain_plan(True)
+    assert "(values)" in dataset.scanner(
+        filter=filt, late_materialization=True
+    ).explain_plan(True)
+    assert "(values)" in dataset.scanner(
+        filter=filt, late_materialization=["values"]
+    ).explain_plan(True)
+    assert ", values" in dataset.scanner(
+        filter=filt, late_materialization=["filter"]
+    ).explain_plan(True)
+
+    # These tests just make sure we can pass in the parameter.  There's no great
+    # way to know if late materialization happened or not.  That will have to be
+    # for benchmarks
+    expected = dataset.to_table(filter=filt)
+    assert dataset.to_table(filter=filt, late_materialization=None) == expected
+    assert dataset.to_table(filter=filt, late_materialization=False) == expected
+    assert dataset.to_table(filter=filt, late_materialization=True) == expected
+    assert dataset.to_table(filter=filt, late_materialization=["values"]) == expected
+
+    expected = list(dataset.to_batches(filter=filt))
+    assert list(dataset.to_batches(filter=filt, late_materialization=None)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=False)) == expected
+    assert list(dataset.to_batches(filter=filt, late_materialization=True)) == expected
+    assert (
+        list(dataset.to_batches(filter=filt, late_materialization=["values"]))
+        == expected
+    )
+
+
+def test_late_materialization_batch_size(tmp_path: Path):
+    table = pa.table({"filter": np.arange(32 * 32), "values": np.arange(32 * 32)})
+    dataset = lance.write_dataset(
+        table, tmp_path, data_storage_version="stable", max_rows_per_file=10000
+    )
+    for batch in dataset.to_batches(
+        columns=["values"],
+        filter="filter % 2 == 0",
+        batch_size=32,
+        late_materialization=True,
+    ):
+        assert batch.num_rows == 32
+
+
+def test_use_scalar_index(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("filter", "BTREE")
+
+    assert "MaterializeIndex" in dataset.scanner(filter="filter = 10").explain_plan(
+        True
+    )
+    assert "MaterializeIndex" in dataset.scanner(
+        filter="filter = 10", use_scalar_index=True
+    ).explain_plan(True)
+    assert "MaterializeIndex" not in dataset.scanner(
+        filter="filter = 10", use_scalar_index=False
+    ).explain_plan(True)
+
+
+EXPECTED_DEFAULT_STORAGE_VERSION = "2.0"
+EXPECTED_MAJOR_VERSION = 2
+EXPECTED_MINOR_VERSION = 0
+
+
+def test_default_storage_version(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+    assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
+
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+    from lance.fragment import write_fragments
+
+    frags = write_fragments(table, dataset.uri)
+    frag = frags[0]
+    sample_file = frag.to_json()["files"][0]
+    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
+    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+
+
+def test_no_detached_v1(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    with pytest.raises(OSError, match="v1 manifest paths"):
+        dataset.commit(dataset.uri, op, read_version=dataset.version, detached=True)
+
+
+def test_detached_commits(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    dataset = lance.write_dataset(table, tmp_path, enable_v2_manifest_paths=True)
+
+    # Make a detached append
+    table = pa.table({"x": [1]})
+    frag = lance.LanceFragment.create(dataset.uri, table)
+    op = lance.LanceOperation.Append([frag])
+    detached = dataset.commit(
+        dataset.uri, op, read_version=dataset.version, detached=True
+    )
+    assert (detached.version & 0x8000000000000000) != 0
+
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+    # Detached commit should not show up in the dataset
+    dataset = lance.dataset(tmp_path)
+    assert dataset.to_table() == pa.table({"x": [0]})
+
+    # We can make more commits to dataset and they don't affect attached
+    table = pa.table({"x": [2]})
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert dataset.to_table() == pa.table({"x": [0, 2]})
+
+    # We can check out the detached commit
+    detached = dataset.checkout_version(detached.version)
+    assert detached.to_table() == pa.table({"x": [0, 1]})
+
+    # Detached commit can use detached commit as read version
+    table = pa.table({"x": [3]})
+    frag = lance.LanceFragment.create(detached.uri, table)
+    op = lance.LanceOperation.Append([frag])
+
+    detached2 = dataset.commit(
+        dataset.uri, op, read_version=detached.version, detached=True
+    )
+
+    assert detached2.to_table() == pa.table({"x": [0, 1, 3]})

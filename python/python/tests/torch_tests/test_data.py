@@ -15,7 +15,19 @@ torch = pytest.importorskip("torch")
 from lance.torch.data import LanceDataset  # noqa: E402
 
 
-def test_iter_over_dataset(tmp_path):
+def test_iter_over_dataset_fixed_shape_tensor(tmp_path):
+    data = np.random.random((10240, 32)).astype("f")
+
+    tensor_array = pa.FixedShapeTensorArray.from_numpy_ndarray(data)
+    ids = pa.array(range(0, 10240), type=pa.int32())
+    tbl = pa.Table.from_arrays([ids, tensor_array], ["ids", "vec"])
+
+    lance.write_dataset(tbl, tmp_path / "data.lance")
+
+    iter_over_dataset(tmp_path)
+
+
+def test_iter_over_dataset_fixed_size_lists(tmp_path):
     # 10240 of 32-d vectors.
     data = np.random.random(10240 * 32).astype("f")
 
@@ -23,7 +35,13 @@ def test_iter_over_dataset(tmp_path):
     ids = pa.array(range(0, 10240), type=pa.int32())
     tbl = pa.Table.from_arrays([ids, fsl], ["ids", "vec"])
 
-    ds = lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+    lance.write_dataset(tbl, tmp_path / "data.lance", max_rows_per_group=32)
+
+    iter_over_dataset(tmp_path)
+
+
+def iter_over_dataset(tmp_path):
+    ds = lance.dataset(tmp_path / "data.lance")
 
     # test when sample size is smaller than max_takes
     torch_ds_small = LanceDataset(
@@ -116,42 +134,17 @@ def test_iter_filter(tmp_path):
         )
     )
 
-    # sampling fails
-    with pytest.raises(ValueError):
-        LanceDataset(
-            ds,
-            batch_size=10,
-            filter="ids >= 300",
-            samples=100,
-            columns=["ids"],
+    # sampling with filter
+    with pytest.raises(NotImplementedError):
+        check(
+            LanceDataset(
+                ds,
+                batch_size=10,
+                filter="ids >= 300",
+                samples=100,
+                columns=["ids"],
+            )
         )
-
-
-def test_sharded_torch_dataset(tmp_path):
-    arr = pa.array(range(1000))
-    tbl = pa.Table.from_arrays([arr], ["ids"])
-
-    # Write 10 files
-    ds = lance.write_dataset(tbl, tmp_path, max_rows_per_file=100)
-    assert len(ds.get_fragments()) == 10
-    for f in ds.get_fragments():
-        assert f.count_rows() == 100
-
-    ds = LanceDataset(
-        tmp_path, batch_size=10, columns=["ids"], rank=1, world_size=2, with_row_id=True
-    )
-
-    all_ids = []
-    row_ids = []
-    for batch in ds:
-        assert set(batch.keys()) == {"ids", "_rowid"}
-        all_ids.extend(batch["ids"].tolist())
-        row_ids.extend(batch["_rowid"].tolist())
-
-    assert all_ids == [i for i in range(1000) if i // 100 % 2 == 1]
-    assert set(row_ids) == {
-        i % 100 + (i // 100 << 32) for i in range(1000) if i // 100 % 2 == 1
-    }
 
 
 def test_sample_fragments(tmp_path: Path):
@@ -190,6 +183,32 @@ def test_sample_batches(tmp_path: Path):
 
     all_ids = list(chain.from_iterable([batch.cpu().numpy() for batch in ds]))
     assert all_ids == [i for i in range(2000) if i // 25 % 2 == 1]
+
+
+def test_filtered_sampling_odd_batch_size(tmp_path: Path):
+    tbl = pa.Table.from_pydict(
+        {
+            "vector": pa.array(
+                [[1.0, 2.0, 3.0] for _ in range(10000)], pa.list_(pa.float32(), 3)
+            ),
+            "filterme": [i % 2 for i in range(10000)],
+        }
+    )
+
+    lance.write_dataset(tbl, tmp_path, max_rows_per_file=200)
+
+    ds = LanceDataset(
+        tmp_path,
+        batch_size=38,
+        columns=["vector"],
+        samples=38 * 256,
+        filter="vector is not null",
+    )
+
+    x = next(iter(ds))
+
+    assert x.shape[0] == 38
+    assert x.shape[1] == 3
 
 
 def test_sample_batches_with_filter(tmp_path: Path):

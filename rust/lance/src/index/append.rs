@@ -35,7 +35,7 @@ pub async fn merge_indices<'a>(
 ) -> Result<Option<(Uuid, Vec<&'a IndexMetadata>, RoaringBitmap)>> {
     if old_indices.is_empty() {
         return Err(Error::Index {
-            message: "Append index: no prevoius index found".to_string(),
+            message: "Append index: no previous index found".to_string(),
             location: location!(),
         });
     };
@@ -85,12 +85,14 @@ pub async fn merge_indices<'a>(
                 .await?;
 
             let mut scanner = dataset.scan();
+            let orodering = match index.index_type() {
+                IndexType::Inverted => None,
+                _ => Some(vec![ColumnOrdering::asc_nulls_first(column.name.clone())]),
+            };
             scanner
                 .with_fragments(unindexed)
                 .with_row_id()
-                .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
-                    column.name.clone(),
-                )]))?
+                .order_by(orodering)?
                 .project(&[&column.name])?;
             let new_data_stream = scanner.try_into_stream().await?;
 
@@ -295,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn test_query_delta_indices(
         #[values(
-            VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+            VectorIndexParams::ivf_pq(2, 8, 4, MetricType::L2, 2),
             VectorIndexParams::with_ivf_hnsw_sq_params(
                 MetricType::L2,
                 IvfBuildParams::new(2),
@@ -368,6 +370,7 @@ mod tests {
         dataset
             .optimize_indices(&OptimizeOptions {
                 num_indices_to_merge: 0,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -384,6 +387,7 @@ mod tests {
             .unwrap()
             .nearest("vector", array.value(0).as_primitive(), 2)
             .unwrap()
+            .refine(1)
             .try_into_batch()
             .await
             .unwrap();

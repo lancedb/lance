@@ -24,7 +24,6 @@ impl<T: Clone> SharedPrerequisite<T> {
         self.0
             .get()
             .await
-            .clone()
             .map_err(|err| crate::Error::PrerequisiteFailed {
                 message: err,
                 location: location!(),
@@ -38,9 +37,9 @@ impl<T: Clone> SharedPrerequisite<T> {
         self.0
             .try_get()
             // There was no call to wait_ready and the value was accessed to early
-            .expect("SharedPrequisite cached value accessed without call to wait_ready")
+            .expect("SharedPrerequisite cached value accessed without call to wait_ready")
             // There was no call to wait_ready and the value was actually ready, but failed
-            .expect("SharedPrequisite cached value accessed without call to wait_ready")
+            .expect("SharedPrerequisite cached value accessed without call to wait_ready")
     }
 
     /// Asynchronously wait for the output to be ready

@@ -85,8 +85,10 @@ use std::collections::HashMap;
 use std::ops::{AddAssign, Range};
 use std::sync::{Arc, RwLock};
 
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_index::DatasetIndexExt;
 use lance_table::io::deletion::read_deletion_file;
 use roaring::{RoaringBitmap, RoaringTreemap};
@@ -122,6 +124,13 @@ pub struct CompactionOptions {
     /// This does not affect which fragments need compaction, but does affect
     /// how they are re-written if selected.
     pub max_rows_per_group: usize,
+    /// Max number of bytes per file
+    ///
+    /// This does not affect which frgamnets need compaction, but does affect
+    /// how they are re-written if selected.
+    ///
+    /// If not specified then the default (see [`WriteParams`]) will be used.
+    pub max_bytes_per_file: Option<usize>,
     /// Whether to compact fragments with deletions so there are no deletions.
     /// Defaults to true.
     pub materialize_deletions: bool,
@@ -130,8 +139,14 @@ pub struct CompactionOptions {
     /// lower) will materialize deletions for all fragments with deletions.
     /// Setting above 1.0 will never materialize deletions.
     pub materialize_deletions_threshold: f32,
-    /// The number of threads to use. Defaults to the number of cores.
-    pub num_threads: usize,
+    /// The number of threads to use (how many compaction tasks to run in parallel).
+    /// Defaults to the number of compute-intensive CPUs.  Not used when running
+    /// tasks manually using [`plan_compaction`]
+    pub num_threads: Option<usize>,
+    /// The batch size to use when scanning the input fragments.  If not
+    /// specified then the default (see
+    /// [`crate::dataset::Scanner::batch_size`]) will be used.
+    pub batch_size: Option<usize>,
 }
 
 impl Default for CompactionOptions {
@@ -142,7 +157,9 @@ impl Default for CompactionOptions {
             max_rows_per_group: 1024,
             materialize_deletions: true,
             materialize_deletions_threshold: 0.1,
-            num_threads: num_cpus::get(),
+            num_threads: None,
+            max_bytes_per_file: None,
+            batch_size: None,
         }
     }
 }
@@ -207,7 +224,11 @@ pub async fn compact_files(
 
     let result_stream = futures::stream::iter(compaction_plan.tasks.into_iter())
         .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &options))
-        .buffer_unordered(options.num_threads);
+        .buffer_unordered(
+            options
+                .num_threads
+                .unwrap_or_else(get_num_compute_intensive_cpus),
+        );
 
     let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
     let remap_options = remap_options.unwrap_or(Arc::new(DatasetIndexRemapperOptions::default()));
@@ -454,7 +475,7 @@ pub async fn plan_compaction(
                 Err(e) => Err(e),
             }
         })
-        .buffered(num_cpus::get() * 2);
+        .buffered(dataset.object_store().io_parallelism());
 
     let index_fragmaps = load_index_fragmaps(dataset).await?;
     let indices_containing_frag = |frag_id: u32| {
@@ -572,16 +593,18 @@ async fn reserve_fragment_ids(
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
+        /*blob_op=*/ None,
         None,
     );
 
-    let manifest = commit_transaction(
+    let (manifest, _) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
@@ -618,7 +641,7 @@ async fn rewrite_files(
 
     let previous_writer_version = &dataset.manifest.writer_version;
     // The versions of Lance prior to when we started writing the writer version
-    // sometimes wrote incorrect `Fragment.phyiscal_rows` values, so we should
+    // sometimes wrote incorrect `Fragment.physical_rows` values, so we should
     // make sure to recompute them.
     // See: https://github.com/lancedb/lance/issues/1531
     let recompute_stats = previous_writer_version.is_none();
@@ -627,9 +650,24 @@ async fn rewrite_files(
     // num deletions recorded. If that's the case, we need to grab and set that
     // information.
     let fragments = migrate_fragments(dataset.as_ref(), &task.fragments, recompute_stats).await?;
+    let num_rows = fragments
+        .iter()
+        .map(|f| f.physical_rows.unwrap() as u64)
+        .sum::<u64>();
     // If we aren't using move-stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_move_stable_row_ids();
     let mut scanner = dataset.scan();
+    if let Some(batch_size) = options.batch_size {
+        scanner.batch_size(batch_size);
+    }
+    // Generate an ID for logging purposes
+    let task_id = uuid::Uuid::new_v4();
+    log::info!(
+        "Compaction task {}: Begin compacting {} rows across {} fragments",
+        task_id,
+        num_rows,
+        fragments.len()
+    );
     scanner
         .with_fragments(fragments.clone())
         .scan_in_order(true);
@@ -644,21 +682,48 @@ async fn rewrite_files(
         (None, data)
     };
 
-    let params = WriteParams {
+    let mut rows_read = 0;
+    let schema = reader.schema();
+    let reader = reader.inspect_ok(move |batch| {
+        rows_read += batch.num_rows();
+        log::info!(
+            "Compaction task {}: Read progress {}/{}",
+            task_id,
+            rows_read,
+            num_rows,
+        );
+    });
+    let reader = Box::pin(RecordBatchStreamAdapter::new(schema, reader));
+
+    let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
         ..Default::default()
     };
-    let mut new_fragments = write_fragments_internal(
+    if let Some(max_bytes_per_file) = options.max_bytes_per_file {
+        params.max_bytes_per_file = max_bytes_per_file;
+    }
+
+    if dataset.manifest.uses_move_stable_row_ids() {
+        params.enable_move_stable_row_ids = true;
+    }
+
+    let new_fragments = write_fragments_internal(
         Some(dataset.as_ref()),
         dataset.object_store.clone(),
         &dataset.base,
-        dataset.schema(),
+        dataset.schema().clone(),
         reader,
         params,
     )
     .await?;
+
+    // We should not be rewriting any blob data
+    assert!(new_fragments.blob.is_none());
+    let mut new_fragments = new_fragments.default.0;
+
+    log::info!("Compaction task {}: file written", task_id);
 
     let row_id_map = if let Some(row_ids) = row_ids {
         let row_ids = Arc::try_unwrap(row_ids)
@@ -666,10 +731,15 @@ async fn rewrite_files(
             .into_inner()
             .expect("Row ids mutex still locked");
 
+        log::info!(
+            "Compaction task {}: reserving fragment ids and transposing row ids",
+            task_id
+        );
         reserve_fragment_ids(&dataset, new_fragments.iter_mut()).await?;
 
         remapping::transpose_row_ids(row_ids, &fragments, &new_fragments)
     } else {
+        log::info!("Compaction task {}: rechunking stable row ids", task_id);
         rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
 
         HashMap::new()
@@ -686,6 +756,8 @@ async fn rewrite_files(
         .iter()
         .map(|f| f.files.len() + f.deletion_file.is_some() as usize)
         .sum();
+
+    log::info!("Compaction task {}: completed", task_id);
 
     Ok(RewriteResult {
         metrics,
@@ -719,12 +791,24 @@ async fn rechunk_stable_row_ids(
             let deletions = read_deletion_file(&dataset.base, frag, dataset.object_store()).await?;
             if let Some(deletions) = deletions {
                 let mut new_seq = seq.as_ref().clone();
-                new_seq.mask(deletions.into_iter().map(|x| x as usize))?;
+                new_seq.mask(deletions.into_iter())?;
                 *seq = Arc::new(new_seq);
             }
             Ok::<(), crate::Error>(())
         })
         .await?;
+
+    debug_assert_eq!(
+        { old_sequences.iter().map(|(_, seq)| seq.len()).sum::<u64>() },
+        {
+            new_fragments
+                .iter()
+                .map(|frag| frag.physical_rows.unwrap() as u64)
+                .sum::<u64>()
+        },
+        "{:?}",
+        old_sequences
+    );
 
     let new_sequences = lance_table::rowids::rechunk_sequences(
         old_sequences
@@ -813,20 +897,24 @@ pub async fn commit_compaction(
             groups: rewrite_groups,
             rewritten_indices,
         },
+        // TODO: Add a blob compaction pass
+        /*blob_op= */ None,
         None,
     );
 
-    let manifest = commit_transaction(
+    let (manifest, manifest_path) = commit_transaction(
         dataset,
         dataset.object_store(),
         dataset.commit_handler.as_ref(),
         &transaction,
         &Default::default(),
         &Default::default(),
+        dataset.manifest_naming_scheme,
     )
     .await?;
 
     dataset.manifest = Arc::new(manifest);
+    dataset.manifest_file = manifest_path;
 
     Ok(metrics)
 }
@@ -894,7 +982,7 @@ mod tests {
         assert!(!single_bin.is_noop());
 
         let big_bin = CandidateBin {
-            fragments: std::iter::repeat(fragment.clone()).take(8).collect(),
+            fragments: std::iter::repeat(fragment).take(8).collect(),
             pos_range: 0..8,
             candidacy: std::iter::repeat(CompactionCandidacy::CompactItself)
                 .take(8)
@@ -943,8 +1031,8 @@ mod tests {
                 .map(|key| {
                     format!(
                         "{}:{:?}",
-                        RowAddress::new_from_id(*key),
-                        map[key].map(RowAddress::new_from_id)
+                        RowAddress::from(*key),
+                        map[key].map(RowAddress::from)
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1589,8 +1677,6 @@ mod tests {
                 .unwrap()
                 .project(&["i"])
                 .unwrap();
-
-            println!("{}", scanner.explain_plan(true).await.unwrap());
 
             scanner.try_into_batch().await.unwrap()
         }

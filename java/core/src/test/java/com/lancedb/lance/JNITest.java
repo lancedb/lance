@@ -14,12 +14,22 @@
 
 package com.lancedb.lance;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import java.util.Arrays;
 import java.util.Optional;
 
 import org.junit.jupiter.api.Test;
 
 import com.lancedb.lance.test.JniTestHelper;
+import com.lancedb.lance.index.DistanceType;
+import com.lancedb.lance.index.IndexParams;
+import com.lancedb.lance.index.vector.HnswBuildParams;
+import com.lancedb.lance.index.vector.IvfBuildParams;
+import com.lancedb.lance.index.vector.PQBuildParams;
+import com.lancedb.lance.index.vector.SQBuildParams;
+import com.lancedb.lance.index.vector.VectorIndexParams;
+import com.lancedb.lance.ipc.Query;
 
 public class JNITest {
   @Test
@@ -30,5 +40,140 @@ public class JNITest {
   @Test
   public void testIntsOpt() {
     JniTestHelper.parseIntsOpt(Optional.of(Arrays.asList(1, 2, 3)));
+  }
+
+  @Test
+  public void testQuery() {
+    JniTestHelper.parseQuery(Optional.of(new Query.Builder()
+        .setColumn("column")
+        .setKey(new float[] { 1.0f, 2.0f, 3.0f })
+        .setK(10)
+        .setNprobes(20)
+        .setEf(30)
+        .setRefineFactor(40)
+        .setDistanceType(DistanceType.L2)
+        .setUseIndex(true)
+        .build()));
+  }
+
+  @Test
+  public void testIvfFlatIndexParams() {
+    JniTestHelper.parseIndexParams(new IndexParams.Builder()
+        .setVectorIndexParams(
+            VectorIndexParams.ivfFlat(10, DistanceType.L2))
+        .build());
+  }
+
+  @Test
+  public void testIvfPqIndexParams() {
+    JniTestHelper.parseIndexParams(new IndexParams.Builder()
+        .setVectorIndexParams(
+            VectorIndexParams.ivfPq(10, 8, 4, DistanceType.L2, 50))
+        .build());
+  }
+
+  @Test
+  public void testIvfPqWithCustomParamsIndexParams() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder()
+        .setNumPartitions(20)
+        .setMaxIters(100)
+        .setSampleRate(512)
+        .build();
+    PQBuildParams pq = new PQBuildParams.Builder()
+        .setNumSubVectors(8)
+        .setNumBits(8)
+        .setMaxIters(100)
+        .setKmeansRedos(3)
+        .setSampleRate(1024)
+        .build();
+
+    JniTestHelper.parseIndexParams(new IndexParams.Builder()
+        .setVectorIndexParams(
+            VectorIndexParams.withIvfPqParams(DistanceType.Cosine, ivf, pq))
+        .build());
+  }
+
+  @Test
+  public void testIvfHnswPqIndexParams() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder()
+        .setNumPartitions(15)
+        .build();
+    HnswBuildParams hnsw = new HnswBuildParams.Builder()
+        .setMaxLevel((short) 10)
+        .setM(30)
+        .setEfConstruction(200)
+        .setPrefetchDistance(3)
+        .build();
+    PQBuildParams pq = new PQBuildParams.Builder()
+        .setNumSubVectors(16)
+        .setNumBits(8)
+        .build();
+
+    JniTestHelper.parseIndexParams(new IndexParams.Builder()
+        .setVectorIndexParams(
+            VectorIndexParams.withIvfHnswPqParams(DistanceType.L2, ivf, hnsw, pq))
+        .build());
+  }
+
+  @Test
+  public void testIvfHnswSqIndexParams() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder()
+        .setNumPartitions(25)
+        .build();
+    HnswBuildParams hnsw = new HnswBuildParams.Builder()
+        .setMaxLevel((short) 8)
+        .setM(25)
+        .setEfConstruction(175)
+        .build();
+    SQBuildParams sq = new SQBuildParams.Builder()
+        .setNumBits((short) 16)
+        .setSampleRate(512)
+        .build();
+
+    JniTestHelper.parseIndexParams(new IndexParams.Builder()
+        .setVectorIndexParams(
+            VectorIndexParams.withIvfHnswSqParams(DistanceType.Dot, ivf, hnsw, sq))
+        .build());
+  }
+
+  @Test
+  public void testInvalidCombinationPqAndSq() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(10).build();
+    PQBuildParams pq = new PQBuildParams.Builder().build();
+    SQBuildParams sq = new SQBuildParams.Builder().build();
+
+    assertThrows(IllegalArgumentException.class, () -> {
+      new VectorIndexParams.Builder(ivf)
+          .setDistanceType(DistanceType.L2)
+          .setPqParams(pq)
+          .setSqParams(sq)
+          .build();
+    });
+  }
+
+  @Test
+  public void testInvalidCombinationHnswWithoutPqOrSq() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(10).build();
+    HnswBuildParams hnsw = new HnswBuildParams.Builder().build();
+
+    assertThrows(IllegalArgumentException.class, () -> {
+      new VectorIndexParams.Builder(ivf)
+          .setDistanceType(DistanceType.L2)
+          .setHnswParams(hnsw)
+          .build();
+    });
+  }
+
+  @Test
+  public void testInvalidCombinationSqWithoutHnsw() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(10).build();
+    SQBuildParams sq = new SQBuildParams.Builder().build();
+
+    assertThrows(IllegalArgumentException.class, () -> {
+      new VectorIndexParams.Builder(ivf)
+          .setDistanceType(DistanceType.L2)
+          .setSqParams(sq)
+          .build();
+    });
   }
 }

@@ -25,8 +25,8 @@ runs:
       shell: bash
       run: |
         echo "ARM BUILD: ${{ inputs.arm-build }}"
-    - name: Build x86_64 Manylinux wheel
-      if: ${{ inputs.arm-build == 'false' }}
+    - name: Build x86_64 Manylinux2014 wheel
+      if: ${{ inputs.arm-build == 'false' && inputs.manylinux == '2_17' }}
       uses: PyO3/maturin-action@v1
       with:
         command: build
@@ -37,6 +37,24 @@ runs:
         before-script-linux: |
           set -e
           yum install -y openssl-devel \
+            && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$(uname -m).zip > /tmp/protoc.zip \
+            && unzip /tmp/protoc.zip -d /usr/local \
+            && rm /tmp/protoc.zip
+    - name: Build x86_64 Manylinux {manylinux} wheel
+      if: ${{ inputs.arm-build == 'false' && inputs.manylinux != '2_17' }}
+      uses: PyO3/maturin-action@v1
+      with:
+        command: build
+        working-directory: python
+        target: x86_64-unknown-linux-gnu
+        manylinux: ${{ inputs.manylinux }}
+        docker-options: |
+          -e CC=clang
+          -e CXX=clang++
+        args: ${{ inputs.args }}
+        before-script-linux: |
+          set -e
+          yum install -y openssl-devel clang \
             && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-$(uname -m).zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip

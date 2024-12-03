@@ -3,24 +3,337 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
 use snafu::{location, Location};
-use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tokio::sync::{AcquireError, Semaphore, TryAcquireError};
-use tokio::time::error::Elapsed;
+use std::time::Instant;
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 
 use lance_core::{Error, Result};
 
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
+
+// Don't log backpressure warnings until at least this many seconds have passed
+const BACKPRESSURE_MIN: u64 = 5;
+// Don't log backpressure warnings more than once / minute
+const BACKPRESSURE_DEBOUNCE: u64 = 60;
+
+// There are two structures that control the I/O scheduler concurrency.  First,
+// we have a hard limit on the number of IOPS that can be issued concurrently.
+// This limit is process-wide.
+//
+// Second, we try and limit how many I/O requests can be buffered in memory without
+// being consumed by a decoder of some kind.  This limit is per-scheduler.  We cannot
+// make this limit process wide without introducing deadlock (because the decoder for
+// file 0 might be waiting on IOPS blocked by a queue filled with requests for file 1)
+// and vice-versa.
+//
+// There is also a per-scan limit on the number of IOPS that can be issued concurrently.
+//
+// The process-wide limit exists when users need a hard limit on the number of parallel
+// IOPS, e.g. due to port availability limits or to prevent multiple scans from saturating
+// the network.  (Note: a process-wide limit of X will not necessarily limit the number of
+// open TCP connections to exactly X.  The underlying object store may open more connections
+// anyways)
+//
+// However, it can be too tough in some cases, e.g. when some scans are reading from
+// cloud storage and other scans are reading from local disk.  In these cases users don't
+// need to set a process-limit and can rely on the per-scan limits.
+
+// The IopsQuota enforces the first of the above limits, it is the per-process hard cap
+// on the number of IOPS that can be issued concurrently.
+//
+// The per-scan limits are enforced by IoQueue
+struct IopsQuota {
+    // An Option is used here to avoid mutex overhead if no limit is set
+    iops_avail: Option<Semaphore>,
+}
+
+/// A reservation on the global IOPS quota
+///
+/// When the reservation is dropped, the IOPS quota is released unless
+/// [`Self::forget`] is called.
+struct IopsReservation<'a> {
+    value: Option<SemaphorePermit<'a>>,
+}
+
+impl<'a> IopsReservation<'a> {
+    // Forget the reservation, so it won't be released on drop
+    fn forget(&mut self) {
+        if let Some(value) = self.value.take() {
+            value.forget();
+        }
+    }
+}
+
+impl IopsQuota {
+    // By default, there is no process-wide limit on IOPS
+    //
+    // However, the user can request one by setting the environment variable
+    // LANCE_PROCESS_IO_THREADS_LIMIT to a positive integer.
+    fn new() -> Self {
+        let initial_capacity = std::env::var("LANCE_PROCESS_IO_THREADS_LIMIT")
+            .map(|s| {
+                let limit = s
+                    .parse::<i32>()
+                    .expect("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer");
+                if limit <= 0 {
+                    panic!("LANCE_PROCESS_IO_THREADS_LIMIT must be a positive integer.  To disable the limit, unset the environment variable");
+                }
+                limit
+            })
+            // The default (-1) does not apply any limit
+            .unwrap_or(-1);
+        let iops_avail = if initial_capacity < 0 {
+            None
+        } else {
+            Some(Semaphore::new(initial_capacity as usize))
+        };
+        Self { iops_avail }
+    }
+
+    // Return a reservation on the global IOPS quota
+    fn release(&self) {
+        if let Some(iops_avail) = self.iops_avail.as_ref() {
+            iops_avail.add_permits(1);
+        }
+    }
+
+    // Acquire a reservation on the global IOPS quota
+    async fn acquire(&self) -> IopsReservation {
+        if let Some(iops_avail) = self.iops_avail.as_ref() {
+            IopsReservation {
+                value: Some(iops_avail.acquire().await.unwrap()),
+            }
+        } else {
+            IopsReservation { value: None }
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref IOPS_QUOTA: IopsQuota = IopsQuota::new();
+}
+
+// We want to allow requests that have a lower priority than any
+// currently in-flight request.  This helps avoid potential deadlocks
+// related to backpressure.  Unfortunately, it is quite expensive to
+// keep track of which priorities are in-flight.
+//
+// TODO: At some point it would be nice if we can optimize this away but
+// in_flight should remain relatively small (generally less than 256 items)
+// and has not shown itself to be a bottleneck yet.
+struct PrioritiesInFlight {
+    in_flight: Vec<u128>,
+}
+
+impl PrioritiesInFlight {
+    fn new(capacity: u32) -> Self {
+        Self {
+            in_flight: Vec::with_capacity(capacity as usize * 2),
+        }
+    }
+
+    fn min_in_flight(&self) -> u128 {
+        self.in_flight.first().copied().unwrap_or(u128::MAX)
+    }
+
+    fn push(&mut self, prio: u128) {
+        let pos = match self.in_flight.binary_search(&prio) {
+            Ok(pos) => pos,
+            Err(pos) => pos,
+        };
+        self.in_flight.insert(pos, prio);
+    }
+
+    fn remove(&mut self, prio: u128) {
+        if let Ok(pos) = self.in_flight.binary_search(&prio) {
+            self.in_flight.remove(pos);
+        } else {
+            unreachable!();
+        }
+    }
+}
+
+struct IoQueueState {
+    // Number of IOPS we can issue concurrently before pausing I/O
+    iops_avail: u32,
+    // Number of bytes we are allowed to buffer in memory before pausing I/O
+    //
+    // This can dip below 0 due to I/O prioritization
+    bytes_avail: i64,
+    // Pending I/O requests
+    pending_requests: BinaryHeap<IoTask>,
+    // Priorities of in-flight requests
+    priorities_in_flight: PrioritiesInFlight,
+    // Set when the scheduler is finished to notify the I/O loop to shut down
+    // once all outstanding requests have been completed.
+    done_scheduling: bool,
+    // Time when the scheduler started
+    start: Instant,
+    // Last time we warned about backpressure
+    last_warn: AtomicU64,
+}
+
+impl IoQueueState {
+    fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+        Self {
+            iops_avail: io_capacity,
+            bytes_avail: io_buffer_size as i64,
+            pending_requests: BinaryHeap::new(),
+            priorities_in_flight: PrioritiesInFlight::new(io_capacity),
+            done_scheduling: false,
+            start: Instant::now(),
+            last_warn: AtomicU64::from(0),
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.done_scheduling && self.pending_requests.is_empty()
+    }
+
+    fn warn_if_needed(&self) {
+        let seconds_elapsed = self.start.elapsed().as_secs();
+        let last_warn = self.last_warn.load(Ordering::Acquire);
+        let since_last_warn = seconds_elapsed - last_warn;
+        if (last_warn == 0
+            && seconds_elapsed > BACKPRESSURE_MIN
+            && seconds_elapsed < BACKPRESSURE_DEBOUNCE)
+            || since_last_warn > BACKPRESSURE_DEBOUNCE
+        {
+            tracing::event!(tracing::Level::WARN, "Backpressure throttle exceeded");
+            log::warn!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
+            self.last_warn
+                .store(seconds_elapsed.max(1), Ordering::Release);
+        }
+    }
+
+    fn can_deliver(&self, task: &IoTask) -> bool {
+        if self.iops_avail == 0 {
+            false
+        } else if task.priority <= self.priorities_in_flight.min_in_flight() {
+            true
+        } else if task.num_bytes() as i64 > self.bytes_avail {
+            self.warn_if_needed();
+            false
+        } else {
+            true
+        }
+    }
+
+    fn next_task(&mut self) -> Option<IoTask> {
+        let task = self.pending_requests.peek()?;
+        if self.can_deliver(task) {
+            self.priorities_in_flight.push(task.priority);
+            self.iops_avail -= 1;
+            self.bytes_avail -= task.num_bytes() as i64;
+            if self.bytes_avail < 0 {
+                // This can happen when we admit special priority requests
+                log::debug!(
+                    "Backpressure throttle temporarily exceeded by {} bytes due to priority I/O",
+                    -self.bytes_avail
+                );
+            }
+            Some(self.pending_requests.pop().unwrap())
+        } else {
+            None
+        }
+    }
+}
+
+// This is modeled after the MPSC queue described here: https://docs.rs/tokio/latest/tokio/sync/struct.Notify.html
+//
+// However, it only needs to be SPSC since there is only one "scheduler thread"
+// and one I/O loop.
+struct IoQueue {
+    // Queue state
+    state: Mutex<IoQueueState>,
+    // Used to signal new I/O requests have arrived that might potentially be runnable
+    notify: Notify,
+}
+
+impl IoQueue {
+    fn new(io_capacity: u32, io_buffer_size: u64) -> Self {
+        Self {
+            state: Mutex::new(IoQueueState::new(io_capacity, io_buffer_size)),
+            notify: Notify::new(),
+        }
+    }
+
+    fn push(&self, task: IoTask) {
+        log::trace!(
+            "Inserting I/O request for {} bytes with priority ({},{}) into I/O queue",
+            task.num_bytes(),
+            task.priority >> 64,
+            task.priority & 0xFFFFFFFFFFFFFFFF
+        );
+        let mut state = self.state.lock().unwrap();
+        state.pending_requests.push(task);
+        drop(state);
+
+        self.notify.notify_one();
+    }
+
+    async fn pop(&self) -> Option<IoTask> {
+        loop {
+            {
+                // First, grab a reservation on the global IOPS quota
+                // If we then get a task to run, transfer the reservation
+                // to the task.  Otherwise, the reservation will be released
+                // when iop_res is dropped.
+                let mut iop_res = IOPS_QUOTA.acquire().await;
+                // Next, try and grab a reservation from the queue
+                let mut state = self.state.lock().unwrap();
+                if let Some(task) = state.next_task() {
+                    // Reservation successfully acquired, we will release the global
+                    // global reservation after task has run.
+                    iop_res.forget();
+                    return Some(task);
+                }
+
+                if state.finished() {
+                    return None;
+                }
+            }
+
+            self.notify.notified().await;
+        }
+    }
+
+    fn on_iop_complete(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.iops_avail += 1;
+        drop(state);
+
+        self.notify.notify_one();
+    }
+
+    fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.bytes_avail += bytes as i64;
+        for _ in 0..num_reqs {
+            state.priorities_in_flight.remove(priority);
+        }
+        drop(state);
+
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.done_scheduling = true;
+        drop(state);
+
+        self.notify.notify_one();
+    }
+}
 
 // There is one instance of MutableBatch shared by all the I/O operations
 // that make up a single request.  When all the I/O operations complete
@@ -29,16 +342,20 @@ use crate::traits::Reader;
 struct MutableBatch<F: FnOnce(Response) + Send> {
     when_done: Option<F>,
     data_buffers: Vec<Bytes>,
-    permits_consumed: AtomicU64,
+    num_bytes: u64,
+    priority: u128,
+    num_reqs: usize,
     err: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
 impl<F: FnOnce(Response) + Send> MutableBatch<F> {
-    fn new(when_done: F, num_data_buffers: u32) -> Self {
+    fn new(when_done: F, num_data_buffers: u32, priority: u128, num_reqs: usize) -> Self {
         Self {
             when_done: Some(when_done),
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
-            permits_consumed: AtomicU64::from(0),
+            num_bytes: 0,
+            priority,
+            num_reqs,
             err: None,
         }
     }
@@ -65,7 +382,9 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
         // the result go out of scope and get cleaned up
         let response = Response {
             data: result,
-            permits_acquired: self.permits_consumed.load(Ordering::Acquire),
+            num_bytes: self.num_bytes,
+            priority: self.priority,
+            num_reqs: self.num_reqs,
         };
         (self.when_done.take().unwrap())(response);
     }
@@ -73,7 +392,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
 
 struct DataChunk {
     task_idx: usize,
-    permits_acquired: u64,
+    num_bytes: u64,
     data: Result<Bytes>,
 }
 
@@ -84,8 +403,7 @@ trait DataSink: Send {
 impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     // Called by worker tasks to add data to the MutableBatch
     fn deliver_data(&mut self, data: DataChunk) {
-        self.permits_consumed
-            .fetch_add(data.permits_acquired, Ordering::Release);
+        self.num_bytes += data.num_bytes;
         match data.data {
             Ok(data_bytes) => {
                 self.data_buffers[data.task_idx] = data_bytes;
@@ -98,110 +416,32 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     }
 }
 
-// Don't log backpressure warnings more than once / minute
-const BACKPRESSURE_DEBOUNCE: f64 = 60.0;
-
-struct BackpressureThrottle {
-    semaphore: Semaphore,
-    capacity: u64,
-    start: Instant,
-    last_warn: Mutex<f64>,
-    deadlock_prevention_timeout: Option<Duration>,
-}
-
-impl BackpressureThrottle {
-    fn new(
-        semaphore: Semaphore,
-        capacity: u64,
-        deadlock_prevention_timeout: Option<Duration>,
-    ) -> Self {
-        Self {
-            semaphore,
-            capacity,
-            last_warn: Mutex::new(0_f64),
-            start: Instant::now(),
-            deadlock_prevention_timeout,
-        }
-    }
-
-    fn warn_if_needed(&self) {
-        let seconds_elapsed = self.start.elapsed().as_secs_f64();
-        let mut last_warn = self.last_warn.lock().unwrap();
-        let since_last_warn = seconds_elapsed - *last_warn;
-        if *last_warn == 0.0 || since_last_warn > BACKPRESSURE_DEBOUNCE {
-            log::warn!("Backpressure throttle is full, I/O will pause until buffer is drained.  Max I/O bandwidth will not be achieved because CPU is falling behind");
-            *last_warn = seconds_elapsed;
-        }
-    }
-
-    async fn acquire_permit(&self, num_bytes: u64) -> u64 {
-        // First, try and acquire the permit without waiting
-        let permits_needed = num_bytes.min(self.capacity).min(u32::MAX as u64);
-        if permits_needed < num_bytes {
-            log::warn!(
-                "I/O request for {} bytes exceeds the I/O buffer size of {}",
-                num_bytes,
-                self.capacity
-            );
-        }
-        let permit = self.semaphore.try_acquire_many(permits_needed as u32);
-        match permit {
-            Ok(permit) => {
-                permit.forget();
-                return permits_needed;
-            }
-            Err(TryAcquireError::Closed) => {
-                // If we're shutting down the scan, ignore backpressure
-                return 0;
-            }
-            Err(TryAcquireError::NoPermits) => {}
-        };
-        // If backpressure is full we need to alert the user and wait
-        self.warn_if_needed();
-        let wait_for_backpressure = self.semaphore.acquire_many(permits_needed as u32);
-        if let Some(deadline) = self.deadlock_prevention_timeout {
-            match tokio::time::timeout(deadline, wait_for_backpressure).await {
-                Ok(Ok(permit)) => {
-                    permit.forget();
-                    permits_needed
-                }
-                Ok(Err(AcquireError { .. })) => 0,
-                Err(Elapsed { .. }) => {
-                    log::error!(
-                        concat!(
-                            "Waited over {} seconds for backpressure throttle to clear. ",
-                            "Deadlock prevention is kicking in and we will release the I/O. ",
-                            "If your data processing is simply very slow then increase the ",
-                            "deadlock prevention timeout or disable it entirely.  If your ",
-                            "data processing is fast then you may try increasing the size ",
-                            "of your I/O buffer or there may be a bug."
-                        ),
-                        deadline.as_secs()
-                    );
-                    0
-                }
-            }
-        } else {
-            match wait_for_backpressure.await {
-                Ok(permit) => {
-                    permit.forget();
-                    permits_needed
-                }
-                Err(AcquireError { .. }) => 0,
-            }
-        }
-    }
-
-    fn release(&self, num_permits: u64) {
-        self.semaphore.add_permits(num_permits as usize);
-    }
-}
-
 struct IoTask {
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
-    when_done: Box<dyn FnOnce((Result<Bytes>, u64)) + Send>,
-    permits_to_realease: u64,
+    when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
+    priority: u128,
+}
+
+impl Eq for IoTask {}
+
+impl PartialEq for IoTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl PartialOrd for IoTask {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IoTask {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // This is intentionally inverted.  We want a min-heap
+        other.priority.cmp(&self.priority)
+    }
 }
 
 impl IoTask {
@@ -209,57 +449,32 @@ impl IoTask {
         self.to_read.end - self.to_read.start
     }
 
-    fn set_permits_to_release(&mut self, permits: u64) {
-        self.permits_to_realease = permits;
-    }
-
     async fn run(self) {
-        let bytes_fut = self
-            .reader
-            .get_range(self.to_read.start as usize..self.to_read.end as usize);
-        let bytes = bytes_fut.await.map_err(Error::from);
-        (self.when_done)((bytes, self.permits_to_realease));
+        let bytes = if self.to_read.start == self.to_read.end {
+            Ok(Bytes::new())
+        } else {
+            let bytes_fut = self
+                .reader
+                .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            bytes_fut.await.map_err(Error::from)
+        };
+        IOPS_QUOTA.release();
+        (self.when_done)(bytes);
     }
 }
 
 // Every time a scheduler starts up it launches a task to run the I/O loop.  This loop
 // repeats endlessly until the scheduler is destroyed.
-async fn run_io_loop(
-    tasks: async_priority_channel::Receiver<IoTask, Reverse<u128>>,
-    backpressure_throttle: Arc<BackpressureThrottle>,
-    io_capacity: u32,
-) {
-    let mut in_process = FuturesUnordered::new();
-
-    // First, prime the queue up to io_capacity
-    for _ in 0..io_capacity {
-        let next_task = tasks.recv().await;
-        match next_task {
-            Ok(task) => {
-                let mut task = task.0;
-                let permits_acquired = backpressure_throttle.acquire_permit(task.num_bytes()).await;
-                task.set_permits_to_release(permits_acquired);
-                let handle = tokio::spawn(task.run());
-                in_process.push(handle);
-            }
-            Err(async_priority_channel::RecvError) => {
-                // The sender has been dropped, we are done
-                return;
-            }
-        }
-    }
+async fn run_io_loop(tasks: Arc<IoQueue>) {
     // Pop the first finished task off the queue and submit another until
     // we are done
     loop {
-        let res = in_process.next().await;
-        res.unwrap().unwrap();
-        let next_task = tasks.recv().await;
+        let next_task = tasks.pop().await;
         match next_task {
-            Ok(task) => {
-                let handle = tokio::spawn(task.0.run());
-                in_process.push(handle);
+            Some(task) => {
+                tokio::spawn(task.run());
             }
-            Err(async_priority_channel::RecvError) => {
+            None => {
                 // The sender has been dropped, we are done
                 return;
             }
@@ -273,23 +488,22 @@ async fn run_io_loop(
 /// TODO: This will also add coalescing
 pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
-    io_submitter: async_priority_channel::Sender<IoTask, Reverse<u128>>,
-    file_counter: Mutex<u32>,
-    backpressure_throttle: Arc<BackpressureThrottle>,
+    io_queue: Arc<IoQueue>,
 }
 
 impl Debug for ScanScheduler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanScheduler")
             .field("object_store", &self.object_store)
-            .field("file_counter", &self.file_counter)
             .finish()
     }
 }
 
 struct Response {
     data: Result<Vec<Bytes>>,
-    permits_acquired: u64,
+    priority: u128,
+    num_reqs: usize,
+    num_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -298,37 +512,21 @@ pub struct SchedulerConfig {
     /// This controls back pressure.  If data is not processed quickly enough then this
     /// buffer will fill up and the I/O loop will pause until the buffer is drained.
     pub io_buffer_size_bytes: u64,
-    /// The backpressure mechanism can potentially lead to deadlock if there are bugs.
-    /// A complete hang is a pretty bad user experience so we log an error and panic
-    /// if the I/O loop is paused for longer than this timeout.
-    ///
-    /// On the other hand, the user might be doing some very expensive and slow processing
-    /// and they are just reading the data very very slowly (or maybe they are doing some
-    /// kind of paging).  In these cases we don't want to panic so we allow this to be
-    /// disabled.
-    pub deadlock_prevention_timeout: Option<Duration>,
 }
 
 impl SchedulerConfig {
-    /// Default configuration for that should be suitable for most unit testing purposes
-    ///
-    /// Note, we intentionally do not implement Default here because callers should think
-    /// about these values.
+    /// Big enough for unit testing
     pub fn default_for_testing() -> Self {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
-            deadlock_prevention_timeout: Some(Duration::from_secs(30)),
         }
     }
 
-    /// We read files for a number of tasks (e.g. creating indices, updating indices, running
-    /// compaction, etc.)  In these cases, if the user has no input on the I/O buffer size we
-    /// should choose something fairly reasonable (256MiB) and our internal scans should all
-    /// be pretty fast and not trigger deadlock.
-    pub fn fast_and_not_too_ram_intensive() -> Self {
+    /// Configuration that should generally maximize bandwidth (not trying to save RAM
+    /// at all).  We assume a max page size of 32MiB and then allow 32MiB per I/O thread
+    pub fn max_bandwidth(store: &ObjectStore) -> Self {
         Self {
-            io_buffer_size_bytes: 256 * 1024 * 1024,
-            deadlock_prevention_timeout: Some(Duration::from_secs(60)),
+            io_buffer_size_bytes: 32 * 1024 * 1024 * store.io_parallelism() as u64,
         }
     }
 }
@@ -341,38 +539,47 @@ impl ScanScheduler {
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        let (reg_tx, reg_rx) = async_priority_channel::unbounded();
-        let io_capacity = object_store.io_parallelism().unwrap();
-        let backpressure_throttle = Arc::new(BackpressureThrottle::new(
-            Semaphore::new(config.io_buffer_size_bytes as usize),
+        let io_capacity = object_store.io_parallelism();
+        let io_queue = Arc::new(IoQueue::new(
+            io_capacity as u32,
             config.io_buffer_size_bytes,
-            config.deadlock_prevention_timeout,
         ));
         let scheduler = Self {
             object_store,
-            io_submitter: reg_tx,
-            file_counter: Mutex::new(0),
-            backpressure_throttle: backpressure_throttle.clone(),
+            io_queue: io_queue.clone(),
         };
-        tokio::task::spawn(
-            async move { run_io_loop(reg_rx, backpressure_throttle, io_capacity).await },
-        );
+        tokio::task::spawn(async move { run_io_loop(io_queue).await });
         Arc::new(scheduler)
     }
 
     /// Open a file for reading
-    pub async fn open_file(self: &Arc<Self>, path: &Path) -> Result<FileScheduler> {
+    ///
+    /// # Arguments
+    ///
+    /// * path - the path to the file to open
+    /// * base_priority - the base priority for I/O requests submitted to this file scheduler
+    ///                   this will determine the upper 64 bits of priority (the lower 64 bits
+    ///                   come from `submit_request` and `submit_single`)
+    pub async fn open_file_with_priority(
+        self: &Arc<Self>,
+        path: &Path,
+        base_priority: u64,
+    ) -> Result<FileScheduler> {
         let reader = self.object_store.open(path).await?;
-        let mut file_counter = self.file_counter.lock().unwrap();
-        let file_index = *file_counter;
         let block_size = self.object_store.block_size() as u64;
-        *file_counter += 1;
         Ok(FileScheduler {
             reader: reader.into(),
             block_size,
             root: self.clone(),
-            file_index,
+            base_priority,
         })
+    }
+
+    /// Open a file with a default priority of 0
+    ///
+    /// See [`Self::open_file_with_priority`] for more information on the priority
+    pub async fn open_file(self: &Arc<Self>, path: &Path) -> Result<FileScheduler> {
+        self.open_file_with_priority(path, 0).await
     }
 
     fn do_submit_request(
@@ -392,28 +599,30 @@ impl ScanScheduler {
         let dest = Arc::new(Mutex::new(Box::new(MutableBatch::new(
             when_all_io_done,
             num_iops,
+            priority,
+            request.len(),
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
             let dest = dest.clone();
+            let io_queue = self.io_queue.clone();
+            let num_bytes = iop.end - iop.start;
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
-                // This will be set by run_io_loop
-                permits_to_realease: 0,
-                when_done: Box::new(move |(data, permits_acquired)| {
+                priority,
+                when_done: Box::new(move |data| {
+                    io_queue.on_iop_complete();
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
                         data,
                         task_idx,
-                        permits_acquired,
+                        num_bytes,
                     };
                     dest.deliver_data(chunk);
                 }),
             };
-            if self.io_submitter.try_send(task, Reverse(priority)).is_err() {
-                panic!("unable to submit I/O because the I/O thread has panic'd");
-            }
+            self.io_queue.push(task);
         }
     }
 
@@ -427,14 +636,21 @@ impl ScanScheduler {
 
         self.do_submit_request(reader, request, tx, priority);
 
-        let backpressure_throttle = self.backpressure_throttle.clone();
+        let io_queue = self.io_queue.clone();
+
         rx.map(move |wrapped_rsp| {
             // Right now, it isn't possible for I/O to be cancelled so a cancel error should
             // not occur
             let rsp = wrapped_rsp.unwrap();
-            backpressure_throttle.release(rsp.permits_acquired);
+            io_queue.on_bytes_consumed(rsp.num_bytes, rsp.priority, rsp.num_reqs);
             rsp.data
         })
+    }
+}
+
+impl Drop for ScanScheduler {
+    fn drop(&mut self) {
+        self.io_queue.close();
     }
 }
 
@@ -444,7 +660,7 @@ pub struct FileScheduler {
     reader: Arc<dyn Reader>,
     root: Arc<ScanScheduler>,
     block_size: u64,
-    file_index: u32,
+    base_priority: u64,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -461,13 +677,21 @@ impl FileScheduler {
     ///
     /// The requests will be queued in a FIFO manner and, when all requests
     /// have been fulfilled, the returned future will be completed.
+    ///
+    /// Each request has a given priority.  If the I/O loop is full then requests
+    /// will be buffered and requests with the *lowest* priority will be released
+    /// from the buffer first.
+    ///
+    /// Each request has a backpressure ID which controls which backpressure throttle
+    /// is applied to the request.  Requests made to the same backpressure throttle
+    /// will be throttled together.
     pub fn submit_request(
         &self,
         request: Vec<Range<u64>>,
         priority: u64,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send {
         // The final priority is a combination of the row offset and the file number
-        let priority = ((self.file_index as u128) << 64) + priority as u128;
+        let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
         let mut updated_requests = Vec::with_capacity(request.len());
 
@@ -522,8 +746,10 @@ impl FileScheduler {
 
     /// Submit a single IOP to the reader
     ///
-    /// If you have multpile IOPS to perform then [`Self::submit_request`] is going
+    /// If you have multiple IOPS to perform then [`Self::submit_request`] is going
     /// to be more efficient.
+    ///
+    /// See [`Self::submit_request`] for more information on the priority and backpressure.
     pub fn submit_single(
         &self,
         range: Range<u64>,
@@ -555,7 +781,7 @@ mod tests {
     use tokio::{runtime::Handle, time::timeout};
     use url::Url;
 
-    use crate::testing::MockObjectStore;
+    use crate::{object_store::DEFAULT_DOWNLOAD_RETRY_COUNT, testing::MockObjectStore};
 
     use super::*;
 
@@ -574,10 +800,7 @@ mod tests {
         rand::thread_rng().fill_bytes(&mut some_data);
         obj_store.put(&tmp_file, &some_data).await.unwrap();
 
-        let config = SchedulerConfig {
-            deadlock_prevention_timeout: None,
-            io_buffer_size_bytes: 1024 * 1024,
-        };
+        let config = SchedulerConfig::default_for_testing();
 
         let scheduler = ScanScheduler::new(obj_store, config);
 
@@ -639,11 +862,12 @@ mod tests {
             None,
             None,
             false,
+            false,
             1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
         ));
 
         let config = SchedulerConfig {
-            deadlock_prevention_timeout: None,
             io_buffer_size_bytes: 1024 * 1024,
         };
 
@@ -727,11 +951,12 @@ mod tests {
             None,
             None,
             false,
+            false,
             1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
         ));
 
         let config = SchedulerConfig {
-            deadlock_prevention_timeout: Some(Duration::from_millis(50)),
             io_buffer_size_bytes: 10,
         };
 
@@ -806,7 +1031,6 @@ mod tests {
 
         // Ensure deadlock prevention timeout can be disabled
         let config = SchedulerConfig {
-            deadlock_prevention_timeout: None,
             io_buffer_size_bytes: 10,
         };
 
@@ -838,7 +1062,6 @@ mod tests {
 
         // Only one request will be allowed in
         let config = SchedulerConfig {
-            deadlock_prevention_timeout: Some(Duration::from_millis(1000)),
             io_buffer_size_bytes: 1,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);

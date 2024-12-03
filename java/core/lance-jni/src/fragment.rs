@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use arrow::array::{RecordBatch, RecordBatchIterator, RecordBatchReader, StructArray};
+use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{from_ffi_and_data_type, FFI_ArrowArray, FFI_ArrowSchema};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::DataType;
@@ -24,11 +24,11 @@ use jni::{
 use std::iter::once;
 
 use lance::dataset::fragment::FileFragment;
+use lance_datafusion::utils::StreamingWriteSource;
 
 use crate::error::{Error, Result};
 use crate::{
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
-    ffi::JNIEnvExt,
     traits::FromJString,
     utils::extract_write_params,
     RT,
@@ -76,11 +76,11 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    fragment_id: JObject,        // Optional<Integer>
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JString<'local> {
     ok_or_throw_with_return!(
         env,
@@ -89,11 +89,11 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiArray<'local
             dataset_uri,
             arrow_array_addr,
             arrow_schema_addr,
-            fragment_id,
             max_rows_per_file,
             max_rows_per_group,
             max_bytes_per_file,
-            mode
+            mode,
+            storage_options_obj
         ),
         JString::default()
     )
@@ -105,11 +105,11 @@ fn inner_create_with_ffi_array<'local>(
     dataset_uri: JString,
     arrow_array_addr: jlong,
     arrow_schema_addr: jlong,
-    fragment_id: JObject,        // Optional<Integer>
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JString<'local>> {
     let c_array_ptr = arrow_array_addr as *mut FFI_ArrowArray;
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
@@ -127,11 +127,11 @@ fn inner_create_with_ffi_array<'local>(
     create_fragment(
         env,
         dataset_uri,
-        fragment_id,
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
         mode,
+        storage_options_obj,
         reader,
     )
 }
@@ -142,11 +142,11 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
     _obj: JObject,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    fragment_id: JObject,        // Optional<Integer>
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> JString<'a> {
     ok_or_throw_with_return!(
         env,
@@ -154,11 +154,11 @@ pub extern "system" fn Java_com_lancedb_lance_Fragment_createWithFfiStream<'a>(
             &mut env,
             dataset_uri,
             arrow_array_stream_addr,
-            fragment_id,
             max_rows_per_file,
             max_rows_per_group,
             max_bytes_per_file,
-            mode
+            mode,
+            storage_options_obj
         ),
         JString::default()
     )
@@ -169,11 +169,11 @@ fn inner_create_with_ffi_stream<'local>(
     env: &mut JNIEnv<'local>,
     dataset_uri: JString,
     arrow_array_stream_addr: jlong,
-    fragment_id: JObject,        // Optional<Integer>
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JString<'local>> {
     let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
     let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
@@ -181,11 +181,11 @@ fn inner_create_with_ffi_stream<'local>(
     create_fragment(
         env,
         dataset_uri,
-        fragment_id,
         max_rows_per_file,
         max_rows_per_group,
         max_bytes_per_file,
         mode,
+        storage_options_obj,
         reader,
     )
 }
@@ -194,16 +194,14 @@ fn inner_create_with_ffi_stream<'local>(
 fn create_fragment<'a>(
     env: &mut JNIEnv<'a>,
     dataset_uri: JString,
-    fragment_id: JObject,        // Optional<Integer>
-    max_rows_per_file: JObject,  // Optional<Integer>
-    max_rows_per_group: JObject, // Optional<Integer>
-    max_bytes_per_file: JObject, // Optional<Long>
-    mode: JObject,               // Optional<String>
-    reader: impl RecordBatchReader + Send + 'static,
+    max_rows_per_file: JObject,   // Optional<Integer>
+    max_rows_per_group: JObject,  // Optional<Integer>
+    max_bytes_per_file: JObject,  // Optional<Long>
+    mode: JObject,                // Optional<String>
+    storage_options_obj: JObject, // Map<String, String>
+    source: impl StreamingWriteSource,
 ) -> Result<JString<'a>> {
     let path_str = dataset_uri.extract(env)?;
-
-    let fragment_id_opts = env.get_int_opt(&fragment_id)?;
 
     let write_params = extract_write_params(
         env,
@@ -211,11 +209,11 @@ fn create_fragment<'a>(
         &max_rows_per_group,
         &max_bytes_per_file,
         &mode,
+        &storage_options_obj,
     )?;
-    let fragment = RT.block_on(FileFragment::create(
+    let fragment = RT.block_on(FileFragment::create_fragments(
         &path_str,
-        fragment_id_opts.unwrap_or(0) as usize,
-        reader,
+        source,
         Some(write_params),
     ))?;
     let json_string = serde_json::to_string(&fragment)?;

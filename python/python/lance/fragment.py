@@ -27,6 +27,7 @@ from .dependencies import pandas as pd
 from .lance import _Fragment, _write_fragments
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
+from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
@@ -114,9 +115,9 @@ class LanceFragment(pa.dataset.Fragment):
     @staticmethod
     def create_from_file(
         filename: Union[str, Path],
-        schema: pa.Schema,
+        dataset: LanceDataset,
         fragment_id: int,
-    ) -> LanceFragment:
+    ) -> FragmentMetadata:
         """Create a fragment from the given datafile uri.
 
         This can be used if the datafile is loss from dataset.
@@ -129,12 +130,13 @@ class LanceFragment(pa.dataset.Fragment):
         ----------
         filename: str
             The filename of the datafile.
-        scheme: pa.Schema
-            The schema for the new datafile.
+        dataset: LanceDataset
+            The dataset that the fragment belongs to.
         fragment_id: int
             The ID of the fragment.
         """
-        return _Fragment.create_from_file(filename, schema, fragment_id)
+        fragment = _Fragment.create_from_file(filename, dataset._ds, fragment_id)
+        return FragmentMetadata(fragment.json())
 
     @staticmethod
     def create(
@@ -146,7 +148,7 @@ class LanceFragment(pa.dataset.Fragment):
         progress: Optional[FragmentWriteProgress] = None,
         mode: str = "append",
         *,
-        data_storage_version: str = "legacy",
+        data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
@@ -179,11 +181,10 @@ class LanceFragment(pa.dataset.Fragment):
             The write mode. If "append" is specified, the data will be checked
             against the existing dataset's schema. Otherwise, pass "create" or
             "overwrite" to assign new field ids to the schema.
-        data_storage_version: optional, str, default "legacy"
+        data_storage_version: optional, str, default None
             The version of the data storage format to use. Newer versions are more
-            efficient but require newer versions of lance to read.  The default is
-            "legacy" which will use the legacy v1 version.  See the user guide
-            for more details.
+            efficient but require newer versions of lance to read.  The default (None)
+            will use the latest stable version.  See the user guide for more details.
         use_legacy_format: bool, default None
             Deprecated parameter.  Use data_storage_version instead.
         storage_options : optional, dict
@@ -361,8 +362,13 @@ class LanceFragment(pa.dataset.Fragment):
 
     def merge_columns(
         self,
-        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
+        value_func: Dict[str, str]
+        | BatchUDF
+        | ReaderLike
+        | Callable[[pa.RecordBatch], pa.RecordBatch],
         columns: Optional[list[str]] = None,
+        batch_size: Optional[int] = None,
+        reader_schema: Optional[pa.Schema] = None,
     ) -> Tuple[FragmentMetadata, LanceSchema]:
         """Add columns to this Fragment.
 
@@ -370,13 +376,12 @@ class LanceFragment(pa.dataset.Fragment):
 
             Internal API. This method is not intended to be used by end users.
 
-        Parameters
-        ----------
-        value_func: Callable.
-            A function that takes a RecordBatch as input and returns a RecordBatch.
-        columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the
-            value_func. Otherwise, all columns will be passed to the value_func.
+        The parameters and their interpretation are the same as in the
+        :meth:`lance.dataset.LanceDataset.add_columns` operation.
+
+        The only difference is that, instead of modifying the dataset, a new
+        fragment is created.  The new schema of the fragment is returned as well.
+        These can be used in a later operation to commit the changes to the dataset.
 
         See Also
         --------
@@ -389,63 +394,26 @@ class LanceFragment(pa.dataset.Fragment):
         Tuple[FragmentMetadata, LanceSchema]
             A new fragment with the added column(s) and the final schema.
         """
-        updater = self._fragment.updater(columns)
+        transforms = normalize_transform(value_func, self, columns, reader_schema)
 
-        while True:
-            batch = updater.next()
-            if batch is None:
-                break
-            new_value = value_func(batch)
-            if not isinstance(new_value, pa.RecordBatch):
+        if isinstance(transforms, BatchUDF):
+            if transforms.cache is not None:
                 raise ValueError(
-                    f"value_func must return a Pyarrow RecordBatch, "
-                    f"got {type(new_value)}"
+                    "A checkpoint file cannot be used when applying a UDF with "
+                    "LanceFragment.merge_columns.  You must apply your own "
+                    "checkpointing for fragment-level operations."
                 )
 
-            updater.update(new_value)
-        metadata = updater.finish()
-        schema = updater.schema()
+        if isinstance(transforms, pa.RecordBatchReader):
+            metadata, schema = self._fragment.add_columns_from_reader(
+                transforms, batch_size
+            )
+        else:
+            metadata, schema = self._fragment.add_columns(
+                transforms, columns, batch_size
+            )
+
         return FragmentMetadata.from_metadata(metadata), schema
-
-    def add_columns(
-        self,
-        value_func: Callable[[pa.RecordBatch], pa.RecordBatch],
-        columns: Optional[list[str]] = None,
-    ) -> FragmentMetadata:
-        """Add columns to this Fragment.
-
-        .. deprecated:: 0.10.14
-            Use :meth:`merge_columns` instead.
-
-        .. warning::
-
-            Internal API. This method is not intended to be used by end users.
-
-        Parameters
-        ----------
-        value_func: Callable.
-            A function that takes a RecordBatch as input and returns a RecordBatch.
-        columns: Optional[list[str]].
-            If specified, only the columns in this list will be passed to the
-            value_func. Otherwise, all columns will be passed to the value_func.
-
-        See Also
-        --------
-        lance.dataset.LanceOperation.Merge :
-            The operation used to commit these changes to the dataset. See the
-            doc page for an example of using this API.
-
-        Returns
-        -------
-        FragmentMetadata
-            A new fragment with the added column(s).
-        """
-        warnings.warn(
-            "LanceFragment.add_columns is deprecated, use LanceFragment.merge_columns "
-            "instead",
-            DeprecationWarning,
-        )
-        return self.merge_columns(value_func, columns)[0]
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
@@ -519,7 +487,7 @@ class LanceFragment(pa.dataset.Fragment):
 
 def write_fragments(
     data: ReaderLike,
-    dataset_uri: Union[str, Path],
+    dataset_uri: Union[str, Path, LanceDataset],
     schema: Optional[pa.Schema] = None,
     *,
     mode: str = "append",
@@ -527,7 +495,7 @@ def write_fragments(
     max_rows_per_group: int = 1024,
     max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
     progress: Optional[FragmentWriteProgress] = None,
-    data_storage_version: str = "legacy",
+    data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> List[FragmentMetadata]:
@@ -543,8 +511,8 @@ def write_fragments(
     ----------
     data : pa.Table or pa.RecordBatchReader
         The data to be written to the fragment.
-    dataset_uri : str
-        The URI of the dataset.
+    dataset_uri : str, Path, or LanceDataset
+        The URI of the dataset or the dataset object.
     schema : pa.Schema, optional
         The schema of the data. If not specified, the schema will be inferred
         from the data.
@@ -566,11 +534,10 @@ def write_fragments(
         *Experimental API*. Progress tracking for writing the fragment. Pass
         a custom class that defines hooks to be called when each fragment is
         starting to write and finishing writing.
-    data_storage_version: optional, str, default "legacy"
+    data_storage_version: optional, str, default None
         The version of the data storage format to use. Newer versions are more
-        efficient but require newer versions of lance to read.  The default is
-        "legacy" which will use the legacy v1 version.  See the user guide
-        for more details.
+        efficient but require newer versions of lance to read.  The default (None)
+        will use the 2.0 version.  See the user guide for more details.
     use_legacy_format : optional, bool, default None
         Deprecated method for setting the data storage version. Use the
         `data_storage_version` parameter instead.
@@ -585,6 +552,8 @@ def write_fragments(
         fragment ids are left as zero meaning they are not yet specified. They
         will be assigned when the fragments are committed to a dataset.
     """
+    from .dataset import LanceDataset
+
     if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
         reader = pa.Table.from_pandas(data, schema=schema).to_reader()
     elif isinstance(data, pa.Table):
@@ -598,6 +567,10 @@ def write_fragments(
 
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
+    elif isinstance(dataset_uri, LanceDataset):
+        dataset_uri = dataset_uri._ds
+    elif not isinstance(dataset_uri, str):
+        raise TypeError(f"Unknown dataset_uri type {type(dataset_uri)}")
 
     if use_legacy_format is not None:
         warnings.warn(

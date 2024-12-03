@@ -14,6 +14,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lance = { workspace = true, features = ["substrait"] }
+lance-datafusion = { workspace = true }
+lance-encoding = { workspace = true }
+lance-linalg = { workspace = true }
+lance-index = { workspace = true }
 lance-io.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-schema.workspace = true

@@ -4,6 +4,7 @@
 //! Extend [object_store::ObjectStore] functionalities
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_credential_types::provider::ProvideCredentials;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
@@ -42,9 +44,11 @@ use lance_core::{Error, Result};
 // Note: the number of threads here also impacts the number of files
 // we need to read in some situations.  So keeping this at 8 keeps the
 // RAM on our scanner down.
-pub const DEFAULT_LOCAL_IO_PARALLELISM: u32 = 8;
+pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 // Cloud disks often need many many threads to saturate the network
-pub const DEFAULT_CLOUD_IO_PARALLELISM: u32 = 64;
+pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
+
+pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
 
 #[async_trait]
 pub trait ObjectStoreExt {
@@ -93,8 +97,15 @@ pub struct ObjectStore {
     pub inner: Arc<dyn OSObjectStore>,
     scheme: String,
     block_size: usize,
+    /// Whether to use constant size upload parts for multipart uploads. This
+    /// is only necessary for Cloudflare R2.
     pub use_constant_size_upload_parts: bool,
-    io_parallelism: u32,
+    /// Whether we can assume that the list of files is lexically ordered. This
+    /// is true for object stores, but not for local filesystems.
+    pub list_is_lexically_ordered: bool,
+    io_parallelism: usize,
+    /// Number of times to retry a failed download
+    download_retry_count: usize,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -135,7 +146,7 @@ const AWS_CREDS_CACHE_KEY: &str = "aws_credentials";
 pub struct AwsCredentialAdapter {
     pub inner: Arc<dyn ProvideCredentials>,
 
-    // RefCell can't be shared accross threads, so we use HashMap
+    // RefCell can't be shared across threads, so we use HashMap
     cache: Arc<RwLock<HashMap<String, Arc<aws_credential_types::Credentials>>>>,
 
     // The amount of time before expiry to refresh credentials
@@ -338,6 +349,7 @@ pub struct ObjectStoreParams {
     /// is false, max upload size is 2.5TB. When this is true, the max size is
     /// 50GB.
     pub use_constant_size_upload_parts: bool,
+    pub list_is_lexically_ordered: Option<bool>,
 }
 
 impl Default for ObjectStoreParams {
@@ -350,6 +362,7 @@ impl Default for ObjectStoreParams {
             object_store_wrapper: None,
             storage_options: None,
             use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: None,
         }
     }
 }
@@ -387,6 +400,23 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
+        if let Some((store, path)) = params.object_store.as_ref() {
+            let mut inner = store.clone();
+            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                inner = wrapper.wrap(inner);
+            }
+            let store = Self {
+                inner,
+                scheme: path.scheme().to_string(),
+                block_size: params.block_size.unwrap_or(64 * 1024),
+                use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+                list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+            };
+            let path = Path::from(path.path());
+            return Ok((store, path));
+        }
         let (object_store, path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
@@ -422,7 +452,7 @@ impl ObjectStore {
         // path_abs::PathAbs::new(".") returns an empty string.
         if let Some(s) = expanded_path.as_path().to_str() {
             if s.is_empty() {
-                expanded_path = std::env::current_dir()?.to_path_buf();
+                expanded_path = std::env::current_dir()?;
             }
         }
         Ok((
@@ -431,7 +461,9 @@ impl ObjectStore {
                 scheme: String::from(scheme),
                 block_size: 4 * 1024, // 4KB block size
                 use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: false,
                 io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
             },
             Path::from_absolute_path(expanded_path.as_path())?,
         ))
@@ -456,7 +488,9 @@ impl ObjectStore {
             scheme: String::from("file"),
             block_size: 4 * 1024, // 4KB block size
             use_constant_size_upload_parts: false,
+            list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
+            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
         }
     }
 
@@ -467,13 +501,19 @@ impl ObjectStore {
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
-            io_parallelism: get_num_compute_intensive_cpus() as u32,
+            list_is_lexically_ordered: true,
+            io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
         }
     }
 
     /// Returns true if the object store pointed to a local file system.
     pub fn is_local(&self) -> bool {
         self.scheme == "file"
+    }
+
+    pub fn is_cloud(&self) -> bool {
+        self.scheme != "file" && self.scheme != "memory"
     }
 
     pub fn block_size(&self) -> usize {
@@ -484,24 +524,14 @@ impl ObjectStore {
         self.block_size = new_size;
     }
 
-    pub fn set_io_parallelism(&mut self, io_parallelism: u32) {
+    pub fn set_io_parallelism(&mut self, io_parallelism: usize) {
         self.io_parallelism = io_parallelism;
     }
 
-    pub fn io_parallelism(&self) -> Result<u32> {
+    pub fn io_parallelism(&self) -> usize {
         std::env::var("LANCE_IO_THREADS")
-            .map(|val| {
-                val.parse::<u32>().map_err(|parse_err| {
-                    Error::invalid_input(
-                        format!(
-                            "The LANCE_IO_THREADS variable is not set to an integer: {}",
-                            parse_err
-                        ),
-                        location!(),
-                    )
-                })
-            })
-            .unwrap_or(Ok(self.io_parallelism))
+            .map(|val| val.parse::<usize>().unwrap())
+            .unwrap_or(self.io_parallelism)
     }
 
     /// Open a file for path.
@@ -516,6 +546,7 @@ impl ObjectStore {
                 path.clone(),
                 self.block_size,
                 None,
+                self.download_retry_count,
             )?)),
         }
     }
@@ -533,6 +564,7 @@ impl ObjectStore {
                 path.clone(),
                 self.block_size,
                 Some(known_size),
+                self.download_retry_count,
             )?)),
         }
     }
@@ -640,7 +672,44 @@ impl ObjectStore {
     pub async fn size(&self, path: &Path) -> Result<usize> {
         Ok(self.inner.head(path).await?.size)
     }
+
+    /// Convenience function to open a reader and read all the bytes
+    pub async fn read_one_all(&self, path: &Path) -> Result<Bytes> {
+        let reader = self.open(path).await?;
+        Ok(reader.get_all().await?)
+    }
+
+    /// Convenience function open a reader and make a single request
+    ///
+    /// If you will be making multiple requests to the path it is more efficient to call [`Self::open`]
+    /// and then call [`Reader::get_range`] multiple times.
+    pub async fn read_one_range(&self, path: &Path, range: Range<usize>) -> Result<Bytes> {
+        let reader = self.open(path).await?;
+        Ok(reader.get_range(range).await?)
+    }
 }
+
+/// Options that can be set for multiple object stores
+#[derive(PartialEq, Eq, Hash, Clone, Debug, Copy)]
+pub enum LanceConfigKey {
+    /// Number of times to retry a download that fails
+    DownloadRetryCount,
+}
+
+impl FromStr for LanceConfigKey {
+    type Err = Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "download_retry_count" => Ok(Self::DownloadRetryCount),
+            _ => Err(Error::InvalidInput {
+                source: format!("Invalid LanceConfigKey: {}", s).into(),
+                location: location!(),
+            }),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StorageOptions(pub HashMap<String, String>);
 
@@ -709,6 +778,15 @@ impl StorageOptions {
         })
     }
 
+    /// Number of times to retry a download that fails
+    pub fn download_retry_count(&self) -> usize {
+        self.0
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == "download_retry_count")
+            .map(|(_, value)| value.parse::<usize>().unwrap_or(3))
+            .unwrap_or(3)
+    }
+
     /// Subset of options relevant for azure storage
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
         self.0
@@ -755,6 +833,7 @@ async fn configure_store(
     options: ObjectStoreParams,
 ) -> Result<ObjectStore> {
     let mut storage_options = StorageOptions(options.storage_options.clone().unwrap_or_default());
+    let download_retry_count = storage_options.download_retry_count();
     let mut url = ensure_table_uri(url)?;
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
@@ -811,7 +890,9 @@ async fn configure_store(
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts,
+                list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         "gs" => {
@@ -828,7 +909,9 @@ async fn configure_store(
                 scheme: String::from("gs"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         "az" => {
@@ -841,7 +924,9 @@ async fn configure_store(
                 scheme: String::from("az"),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts: false,
+                list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count,
             })
         }
         // we have a bypass logic to use `tokio::fs` directly to lower overhead
@@ -857,7 +942,9 @@ async fn configure_store(
             scheme: String::from("memory"),
             block_size: 64 * 1024,
             use_constant_size_upload_parts: false,
-            io_parallelism: get_num_compute_intensive_cpus() as u32,
+            list_is_lexically_ordered: true,
+            io_parallelism: get_num_compute_intensive_cpus(),
+            download_retry_count,
         }),
         unknown_scheme => {
             if let Some(provider) = registry.providers.get(unknown_scheme) {
@@ -874,13 +961,16 @@ async fn configure_store(
 }
 
 impl ObjectStore {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DynObjectStore>,
         location: Url,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
         use_constant_size_upload_parts: bool,
-        io_parallelism: u32,
+        list_is_lexically_ordered: bool,
+        io_parallelism: usize,
+        download_retry_count: usize,
     ) -> Self {
         let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
@@ -895,7 +985,9 @@ impl ObjectStore {
             scheme: scheme.into(),
             block_size,
             use_constant_size_upload_parts,
+            list_is_lexically_ordered,
             io_parallelism,
+            download_retry_count,
         }
     }
 }
@@ -1244,6 +1336,26 @@ mod tests {
 
         let reader = ObjectStore::open_local(file_path.as_path()).await.unwrap();
         let buf = reader.get_range(0..5).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
+    }
+
+    #[tokio::test]
+    async fn test_read_one() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let file_path = temp_dir.path().join("test_file");
+        let mut writer = ObjectStore::create_local_writer(file_path.as_path())
+            .await
+            .unwrap();
+        writer.write_all(b"LOCAL").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let file_path_os = object_store::path::Path::parse(file_path.to_str().unwrap()).unwrap();
+        let obj_store = ObjectStore::local();
+        let buf = obj_store.read_one_all(&file_path_os).await.unwrap();
+        assert_eq!(buf.as_bytes(), b"LOCAL");
+
+        let buf = obj_store.read_one_range(&file_path_os, 0..5).await.unwrap();
         assert_eq!(buf.as_bytes(), b"LOCAL");
     }
 

@@ -26,8 +26,22 @@ from ..sampler import (
     ShardedFragmentSampler,
     maybe_sample,
 )
+from .dist import get_global_rank, get_global_world_size
 
 __all__ = ["LanceDataset"]
+
+
+# Convert an Arrow FSL array into a 2D torch tensor
+def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
+    # Note: FixedSizeListArray.values does not take offset/len into account and
+    # so may we need to slice here
+    values = arr.values
+    start = arr.offset * dimension
+    num_vals = len(arr) * dimension
+    values = values.slice(start, num_vals)
+    # Convert to numpy
+    nparr = values.to_numpy(zero_copy_only=True).reshape(-1, dimension)
+    return torch.from_numpy(nparr)
 
 
 def _to_tensor(
@@ -41,28 +55,28 @@ def _to_tensor(
 
     for col in batch.schema.names:
         arr: pa.Array = batch[col]
-        if pa.types.is_uint64(arr.type) and uint64_as_int64:
-            arr = arr.cast(pa.int64())
 
         tensor: torch.Tensor = None
-        if (
-            pa.types.is_fixed_size_list(arr.type)
-            or isinstance(arr.type, pa.FixedShapeTensorType)
-        ) and (
+        if (isinstance(arr.type, pa.FixedShapeTensorType)) and (
             pa.types.is_floating(arr.type.value_type)
             or pa.types.is_integer(arr.type.value_type)
         ):
-            np_arrs = arr.to_numpy(zero_copy_only=False)
-            np_tensor = np.stack(np_arrs)
-            del np_arrs
-            tensor = torch.tensor(np_tensor)
-            del np_tensor
+            arr = arr.storage
+
+        if (pa.types.is_fixed_size_list(arr.type)) and (
+            pa.types.is_floating(arr.type.value_type)
+            or pa.types.is_integer(arr.type.value_type)
+        ):
+            tensor = _fsl_to_tensor(arr, arr.type.list_size)
         elif (
             pa.types.is_integer(arr.type)
             or pa.types.is_floating(arr.type)
             or pa.types.is_boolean(arr.type)
         ):
-            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False))
+            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=True))
+
+            if uint64_as_int64 and tensor.dtype == torch.uint64:
+                tensor = tensor.to(torch.int64)
         elif hf_converter is not None:
             tensor = hf_converter.to_pytorch(col, arr)
 
@@ -129,7 +143,12 @@ def _buffer_arrow_batches(
     cur_size = 0
     for item in it:
         if cur_size > 0 and cur_size + item.num_rows > buffer_size:
-            yield concat_batches(buffer)
+            if len(buffer) == 1:
+                # Most of the time, we are in the happy situation where we have a single
+                # batch to yield.
+                yield buffer[0]
+            else:
+                yield concat_batches(buffer)
             buffer = []
             cur_size = 0
 
@@ -183,9 +202,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
         with_row_id : bool, optional
             If set true, the returned batch will have an additional column named
             `_rowid` that contains the row id of the batch.
-        rank: int, optional
+        rank: int, optional (deprecated)
             If set, the rank (idx) of this process in distributed training / inference.
-        world_size: int, optional
+        world_size: int, optional (deprecated)
             If set, the total number of processes in distributed training / inference.
         shard_granularity: str, optional
             The basic unit of sharding data. If set to "fragment", each worker will get
@@ -216,30 +235,12 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self._hf_converter = None
 
         # As Shared Dataset
+        self.shard_granularity = shard_granularity
         self.rank = rank
         self.world_size = world_size
-        self.shard_granularity = shard_granularity
-        if sampler is None:
-            if shard_granularity is None:
-                if rank is not None or world_size is not None:
-                    warnings.warn(
-                        "rank and world_size are deprecated,"
-                        + " use ShardedFragmentSampler instead.",
-                    )
-                    sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
-                else:
-                    sampler = FullScanSampler()
-            elif shard_granularity == "batch":
-                sampler = ShardedBatchSampler(rank, world_size)
-            elif shard_granularity == "fragment":
-                sampler = ShardedFragmentSampler(rank, world_size)
-            else:
-                raise ValueError("Invalid shard_granularity: {}")
-
-        if filter is not None and self.samples > 0 or self.samples is None:
-            raise ValueError("`filter` is not supported with `samples`")
-
-        self.sampler: Sampler = sampler
+        if rank is not None and world_size is not None:
+            warnings.warn("rank and world_size are deprecated", DeprecationWarning)
+        self.sampler: Optional[Sampler] = sampler
 
         # Dataset with huggingface metadata
         if (
@@ -258,6 +259,27 @@ class LanceDataset(torch.utils.data.IterableDataset):
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
     def __iter__(self):
+        if self.sampler is None:
+            if self.rank is not None and self.world_size is not None:
+                rank = self.rank
+                world_size = self.world_size
+            else:
+                rank = get_global_rank()
+                world_size = get_global_world_size()
+            if self.shard_granularity is None:
+                if rank is not None and world_size is not None:
+                    sampler = ShardedFragmentSampler(rank=rank, world_size=world_size)
+                else:
+                    sampler = FullScanSampler()
+            elif self.shard_granularity == "batch":
+                sampler = ShardedBatchSampler(rank, world_size)
+            elif self.shard_granularity == "fragment":
+                sampler = ShardedFragmentSampler(rank, world_size)
+            else:
+                raise ValueError("Invalid shard_granularity: {}")
+        else:
+            sampler = self.sampler
+
         stream: Iterable[pa.RecordBatch]
         if self.cached_ds:
             stream = self.cached_ds
@@ -268,9 +290,10 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     n=self.samples,
                     columns=self.columns,
                     batch_size=self.batch_size,
+                    filt=self.filter,
                 )
             else:
-                raw_stream = self.sampler(
+                raw_stream = sampler(
                     self.dataset,
                     columns=self.columns,
                     filter=self.filter,

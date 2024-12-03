@@ -121,7 +121,12 @@ impl<'a, T: Clone> Stream for SharedStream<'a, T> {
             if let Some(polling_side) = inner_state.polling.as_ref() {
                 if *polling_side != self.side {
                     // Another task is already polling the inner stream, so we don't need to do anything
-                    debug_assert!(inner_state.waker.is_none());
+
+                    // Per rust docs:
+                    //   Note that on multiple calls to poll, only the Waker from the Context
+                    //   passed to the most recent call should be scheduled to receive a wakeup.
+                    //
+                    // So it is safe to replace a potentially stale waker here.
                     inner_state.waker = Some(cx.waker().clone());
                     return std::task::Poll::Pending;
                 }

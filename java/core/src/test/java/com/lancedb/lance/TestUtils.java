@@ -38,11 +38,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestUtils {
   public static class SimpleTestDataset {
@@ -74,8 +76,16 @@ public class TestUtils {
       return dataset;
     }
 
-    public FragmentMetadata createNewFragment(int fragmentId, int rowCount) {
-      FragmentMetadata fragmentMeta;
+    public FragmentMetadata createNewFragment(int rowCount) {
+      List<FragmentMetadata>  fragmentMetas = createNewFragment(rowCount, Integer.MAX_VALUE);
+      assertEquals(1, fragmentMetas.size());
+      FragmentMetadata fragmentMeta = fragmentMetas.get(0);
+      assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+      return fragmentMeta;
+    }
+
+    public List<FragmentMetadata> createNewFragment(int rowCount, int maxRowsPerFile) {
+      List<FragmentMetadata> fragmentMetas;
       try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
         root.allocateNew();
         IntVector idVector = (IntVector) root.getVector("id");
@@ -88,16 +98,14 @@ public class TestUtils {
         }
         root.setRowCount(rowCount);
 
-        fragmentMeta = Fragment.create(datasetPath,
-            allocator, root, Optional.of(fragmentId), new WriteParams.Builder().build());
-        assertEquals(fragmentId, fragmentMeta.getId());
-        assertEquals(rowCount, fragmentMeta.getPhysicalRows());
+        fragmentMetas = Fragment.create(datasetPath,
+            allocator, root, new WriteParams.Builder().withMaxRowsPerFile(maxRowsPerFile).build());
       }
-      return fragmentMeta;
+      return fragmentMetas;
     }
 
     public Dataset write(long version, int rowCount) {
-      FragmentMetadata metadata = createNewFragment(rowCount, rowCount);
+      FragmentMetadata metadata = createNewFragment(rowCount);
       FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(metadata));
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
     }
@@ -113,6 +121,27 @@ public class TestUtils {
           rowcount += currentRowCount;
         }
         assertEquals(totalRows, rowcount);
+      }
+    }
+
+    public void validateScanResults(Dataset dataset, Scanner scanner, int expectedRows, int batchRows, int offset)
+        throws IOException {
+      try (ArrowReader reader = scanner.scanBatches()) {
+        assertEquals(dataset.getSchema().getFields(), reader.getVectorSchemaRoot().getSchema().getFields());
+        int rowcount = 0;
+        while (reader.loadNextBatch()) {
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          int currentRowCount = root.getRowCount();
+          assertTrue(currentRowCount <= batchRows);
+          rowcount += currentRowCount;
+
+          IntVector idVector = (IntVector) root.getVector("id");
+          for (int i = 0; i < currentRowCount; i++) {
+            int expectedId = offset + rowcount - currentRowCount + i;
+            assertEquals(expectedId, idVector.get(i), "Mismatch at row " + (rowcount - currentRowCount + i));
+          }
+        }
+        assertEquals(expectedRows, rowcount);
       }
     }
   }
@@ -147,6 +176,7 @@ public class TestUtils {
                 .withMaxRowsPerFile(10)
                 .withMaxRowsPerGroup(20)
                 .withMode(WriteParams.WriteMode.CREATE)
+                .withStorageOptions(new HashMap<>())
                 .build())) {
           assertEquals(ROW_COUNT, dataset.countRows());
           schema = reader.getVectorSchemaRoot().getSchema();

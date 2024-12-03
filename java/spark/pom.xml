@@ -8,7 +8,7 @@
     <parent>
         <groupId>com.lancedb</groupId>
         <artifactId>lance-parent</artifactId>
-        <version>0.0.4</version>
+        <version>0.20.0</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -34,13 +34,55 @@
                 <scala.compat.version>2.13</scala.compat.version>
             </properties>
         </profile>
+        <profile>
+            <id>shade-jar</id>
+            <activation>
+                <activeByDefault>false</activeByDefault>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>uber-jar</id>
+                                <goals>
+                                    <goal>shade</goal>
+                                </goals>
+                                <phase>package</phase>
+                                <configuration>
+                                    <finalName>${project.artifactId}-${scala.compat.version}-${project.version}-jar-with-dependencies</finalName>
+                                    <transformers>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer"/>
+                                    </transformers>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>LICENSE</exclude>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
     </profiles>
 
     <dependencies>
         <dependency>
             <groupId>com.lancedb</groupId>
             <artifactId>lance-core</artifactId>
-            <version>0.0.4</version>
+            <version>0.20.0</version>
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
@@ -53,41 +95,4 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-shade-plugin</artifactId>
-                <executions>
-                    <execution>
-                        <id>uber-jar</id>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
-                        <phase>package</phase>
-                        <configuration>
-                            <finalName>${project.artifactId}-${scala.compat.version}-${project.version}-jar-with-dependencies</finalName>
-                            <transformers>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer"/>
-                            </transformers>
-                            <filters>
-                                <filter>
-                                    <artifact>*:*</artifact>
-                                    <excludes>
-                                        <exclude>LICENSE</exclude>
-                                        <exclude>META-INF/*.SF</exclude>
-                                        <exclude>META-INF/*.DSA</exclude>
-                                        <exclude>META-INF/*.RSA</exclude>
-                                    </excludes>
-                                </filter>
-                            </filters>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-        </plugins>
-    </build>
 </project>

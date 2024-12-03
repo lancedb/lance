@@ -1,0 +1,57 @@
+name: Rust Benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 9 * * *" # 9AM UTC = 2AM PST
+  pull_request:
+    paths:
+      - ".github/workflows/rust-benchmark.yml"
+
+permissions:
+  # deployments permission to deploy GitHub pages website
+  deployments: write
+  # contents permission to update benchmark contents in gh-pages branch
+  contents: write
+
+env:
+  # This env var is used by Swatinem/rust-cache@v2 for the cache
+  # key, so we set it to make sure it is always consistent.
+  CARGO_TERM_COLOR: always
+  # Disable full debug symbol generation to speed up CI build and keep memory down
+  # "1" means line tables only, which is useful for panic tracebacks.
+  RUSTFLAGS: "-C debuginfo=1 -C target-cpu=native"
+  RUST_BACKTRACE: "1"
+  # according to: https://matklad.github.io/2021/09/04/fast-rust-builds.html
+  # CI builds are faster with incremental disabled.
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  Benchmark:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run linalg benchmarks
+        working-directory: ./rust/lance-linalg
+        run: |
+          # TODO: a few benchmarks are failing. Re-enable everything once they are fixed.
+          cargo bench --features "fp16kernels" --bench l2 --bench cosine --bench dot --bench kmeans --bench norm_l2 -- --output-format bencher | tee -a ../../output.txt
+      - name: Run index benchmarks
+        working-directory: ./rust/lance-index
+        run: |
+          # TODO: a few benchmarks are failing. Re-enable everything once they are fixed.
+          cargo bench --bench sq --bench hnsw --bench inverted --bench pq_dist_table --bench pq_assignment -- --output-format bencher | tee -a ../../output.txt
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Lance Rust Benchmarks
+          tool: "cargo"
+          output-file-path: output.txt
+          # Access token to deploy GitHub Pages branch
+          github-token: ${{ secrets.BENCHMARK_PUSH }}
+          # Push and deploy GitHub pages branch automatically
+          auto-push: true
+          gh-repository: "github.com/lancedb/lance-benchmark-results"

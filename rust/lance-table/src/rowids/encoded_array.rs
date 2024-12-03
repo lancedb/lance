@@ -276,7 +276,7 @@ mod test {
                 assert_eq!(Some(*v), encoded.get(i));
             }
 
-            let encoded2 = values.clone().into_iter().collect::<EncodedU64Array>();
+            let encoded2 = values.into_iter().collect::<EncodedU64Array>();
             assert_eq!(&encoded2, expected);
         }
 
@@ -292,7 +292,7 @@ mod test {
             },
         );
 
-        // u16 version, it can start beyong the u16 range, but the
+        // u16 version, it can start beyond the u16 range, but the
         // relative values must be within u16 range.
         let relative_values = [42, 0, 43, u16::MAX as u64, 99];
         let values = relative_values.map(|v| v + 2 * u16::MAX as u64).to_vec();
@@ -394,7 +394,7 @@ mod test {
 
         // Empty one
         let range = 42..42;
-        let encoded = EncodedU64Array::from(range.clone());
+        let encoded = EncodedU64Array::from(range);
         assert_eq!(encoded.len(), 0);
     }
 }

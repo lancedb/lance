@@ -4,6 +4,7 @@
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
 use std::cmp::min;
+use std::collections::HashMap;
 use std::{any::Any, sync::Arc};
 
 use arrow_array::RecordBatch;
@@ -12,8 +13,9 @@ use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{cache::FileMetadataCache, Error, Result};
-use lance_encoding::decoder::{DecoderMiddlewareChain, FilterExpression};
+use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
+use lance_file::v2::reader::FileReaderOptions;
 use lance_file::writer::FileWriterOptions;
 use lance_file::{
     reader::FileReader,
@@ -36,7 +38,7 @@ use super::{IndexReader, IndexStore, IndexWriter};
 pub struct LanceIndexStore {
     object_store: Arc<ObjectStore>,
     index_dir: Path,
-    metadata_cache: Option<FileMetadataCache>,
+    metadata_cache: FileMetadataCache,
     scheduler: Arc<ScanScheduler>,
     use_legacy_format: bool,
 }
@@ -54,12 +56,12 @@ impl LanceIndexStore {
     pub fn new(
         object_store: ObjectStore,
         index_dir: Path,
-        metadata_cache: Option<FileMetadataCache>,
+        metadata_cache: FileMetadataCache,
     ) -> Self {
         let object_store = Arc::new(object_store);
         let scheduler = ScanScheduler::new(
             object_store.clone(),
-            SchedulerConfig::fast_and_not_too_ram_intensive(),
+            SchedulerConfig::max_bandwidth(&object_store),
         );
         Self {
             object_store,
@@ -87,6 +89,12 @@ impl<M: ManifestProvider + Send + Sync> IndexWriter for FileWriter<M> {
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
+
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        Self::finish_with_metadata(self, &metadata)
+            .await
+            .map(|_| ())
+    }
 }
 
 #[async_trait]
@@ -100,6 +108,13 @@ impl IndexWriter for v2::writer::FileWriter {
     async fn finish(&mut self) -> Result<()> {
         Self::finish(self).await.map(|_| ())
     }
+
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()> {
+        metadata.into_iter().for_each(|(k, v)| {
+            self.add_schema_metadata(k, v);
+        });
+        Self::finish(self).await.map(|_| ())
+    }
 }
 
 #[async_trait]
@@ -109,8 +124,16 @@ impl IndexReader for FileReader {
             .await
     }
 
-    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
-        self.read_range(range, self.schema()).await
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let projection = match projection {
+            Some(projection) => self.schema().project(projection)?,
+            None => self.schema().clone(),
+        };
+        self.read_range(range, &projection).await
     }
 
     async fn num_batches(&self) -> u32 {
@@ -132,12 +155,30 @@ impl IndexReader for v2::reader::FileReader {
         unimplemented!("v2 format has no concept of row groups")
     }
 
-    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        if range.is_empty() {
+            return Ok(RecordBatch::new_empty(Arc::new(
+                self.schema().as_ref().into(),
+            )));
+        }
+        let projection = if let Some(projection) = projection {
+            v2::reader::ReaderProjection::from_column_names(self.schema(), projection)?
+        } else {
+            v2::reader::ReaderProjection::from_whole_schema(
+                self.schema(),
+                self.metadata().version(),
+            )
+        };
         let batches = self
-            .read_stream(
+            .read_stream_projected(
                 ReadBatchParams::Range(range),
                 u32::MAX,
                 u32::MAX,
+                projection,
                 FilterExpression::no_filter(),
             )?
             .try_collect::<Vec<_>>()
@@ -165,6 +206,10 @@ impl IndexReader for v2::reader::FileReader {
 impl IndexStore for LanceIndexStore {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.object_store.io_parallelism()
     }
 
     async fn new_index_file(
@@ -200,7 +245,9 @@ impl IndexStore for LanceIndexStore {
         match v2::reader::FileReader::try_open(
             file_scheduler,
             None,
-            DecoderMiddlewareChain::default(),
+            Arc::<DecoderPlugins>::default(),
+            &self.metadata_cache,
+            FileReaderOptions::default(),
         )
         .await
         {
@@ -212,7 +259,7 @@ impl IndexStore for LanceIndexStore {
                     let file_reader = FileReader::try_new_self_described(
                         &self.object_store,
                         &path,
-                        self.metadata_cache.as_ref(),
+                        Some(&self.metadata_cache),
                     )
                     .await?;
                     Ok(Arc::new(file_reader))
@@ -241,7 +288,7 @@ impl IndexStore for LanceIndexStore {
 
             for offset in (0..reader.num_rows()).step_by(4096) {
                 let next_offset = min(offset + 4096, reader.num_rows());
-                let batch = reader.read_range(offset..next_offset).await?;
+                let batch = reader.read_range(offset..next_offset, None).await?;
                 writer.write_record_batch(batch).await?;
             }
             writer.finish().await?;
@@ -276,7 +323,7 @@ mod tests {
     use arrow_select::take::TakeOptions;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::ScalarValue;
-    use lance_core::utils::mask::RowIdTreeMap;
+    use lance_core::{cache::CapacityMode, utils::mask::RowIdTreeMap};
     use lance_datagen::{array, gen, ArrayGeneratorExt, BatchCount, ByteCount, RowCount};
     use tempfile::{tempdir, TempDir};
 
@@ -284,20 +331,16 @@ mod tests {
         let test_path: &Path = tempdir.path();
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(
-            object_store,
-            test_path.to_owned(),
-            None,
-        ))
+        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache))
     }
 
     fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path: &Path = tempdir.path();
+        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
         let (object_store, test_path) =
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(
-            LanceIndexStore::new(object_store, test_path.to_owned(), None).with_legacy_format(true),
-        )
+        Arc::new(LanceIndexStore::new(object_store, test_path, cache).with_legacy_format(true))
     }
 
     struct MockTrainingSource {
@@ -1220,7 +1263,7 @@ mod tests {
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
-        let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema().clone());
+        let batch_reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
 
         // This is probably enough data that we can be assured each tag is used at least once
         train_tag(&index_store, batch_reader).await;

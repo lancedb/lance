@@ -70,7 +70,7 @@ impl QuantizerMetadata for ScalarQuantizationMetadata {
     }
 }
 
-/// An immutable chunk of SclarQuantizationStorage.
+/// An immutable chunk of ScalarQuantizationStorage.
 #[derive(Debug, Clone)]
 struct SQStorageChunk {
     batch: RecordBatch,
@@ -354,7 +354,7 @@ impl VectorStore for ScalarQuantizationStorage {
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
-    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
         SQDistCalculator::new(query, self, self.quantizer.bounds.clone())
@@ -411,6 +411,34 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
         }
     }
 
+    fn distance_all(&self) -> Vec<f32> {
+        match self.storage.distance_type {
+            DistanceType::L2 | DistanceType::Cosine => self
+                .storage
+                .chunks
+                .iter()
+                .flat_map(|c| {
+                    c.sq_codes
+                        .values()
+                        .chunks_exact(c.dim())
+                        .map(|sq_codes| l2_distance_uint_scalar(sq_codes, &self.query_sq_code))
+                })
+                .collect(),
+            DistanceType::Dot => self
+                .storage
+                .chunks
+                .iter()
+                .flat_map(|c| {
+                    c.sq_codes
+                        .values()
+                        .chunks_exact(c.dim())
+                        .map(|sq_codes| dot_distance(sq_codes, &self.query_sq_code))
+                })
+                .collect(),
+            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
+        }
+    }
+
     #[allow(unused_variables)]
     fn prefetch(&self, id: u32) {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -451,7 +479,7 @@ mod tests {
         const DIM: usize = 64;
 
         let mut rng = rand::thread_rng();
-        let row_ids = UInt64Array::from_iter_values(row_ids.clone());
+        let row_ids = UInt64Array::from_iter_values(row_ids);
         let sq_code =
             UInt8Array::from_iter_values(repeat_with(|| rng.gen::<u8>()).take(row_ids.len() * DIM));
         let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();

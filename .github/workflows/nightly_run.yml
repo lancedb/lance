@@ -1,0 +1,17 @@
+name: Nightly Run Jobs
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Runs every day at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Nightly Run File Verification Workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: file_verification.yml
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}

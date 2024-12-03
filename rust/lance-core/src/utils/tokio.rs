@@ -10,6 +10,10 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::Span;
 
 pub fn get_num_compute_intensive_cpus() -> usize {
+    if let Ok(user_specified) = std::env::var("LANCE_CPU_THREADS") {
+        return user_specified.parse().unwrap();
+    }
+
     let cpus = num_cpus::get();
 
     if cpus <= *IO_CORE_RESERVATION {

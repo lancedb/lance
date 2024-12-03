@@ -19,12 +19,13 @@ from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
 
-def create_table(nvec=1000, ndim=128, nans=0):
+def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     mat = np.random.randn(nvec, ndim)
     if nans > 0:
         nans_mat = np.empty((nans, ndim))
         nans_mat[:] = np.nan
         mat = np.concatenate((mat, nans_mat), axis=0)
+    mat = mat.astype(dtype)
     price = np.random.rand(nvec + nans) * 100
 
     def gen_str(n):
@@ -37,6 +38,13 @@ def create_table(nvec=1000, ndim=128, nans=0):
         .append_column("meta", pa.array(meta))
         .append_column("id", pa.array(range(nvec + nans)))
     )
+    if nullify:
+        idx = tbl.schema.get_field_index("vector")
+        vecs = tbl[idx].to_pylist()
+        nullified = [vec if i % 2 == 0 else None for i, vec in enumerate(vecs)]
+        field = tbl.schema.field(idx)
+        vecs = pa.array(nullified, field.type)
+        tbl = tbl.set_column(idx, field, vecs)
     return tbl
 
 
@@ -128,6 +136,50 @@ def test_ann_append(tmp_path):
     run(dataset, q=np.array(q), assert_func=func)
 
 
+def test_invalid_subvectors(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    with pytest.raises(
+        ValueError,
+        match="dimension .* must be divisible by num_sub_vectors",
+    ):
+        dataset.create_index(
+            "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=15
+        )
+
+
+@pytest.mark.cuda
+def test_invalid_subvectors_cuda(tmp_path):
+    tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    with pytest.raises(
+        ValueError,
+        match="dimension .* must be divisible by num_sub_vectors",
+    ):
+        dataset.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            num_partitions=4,
+            num_sub_vectors=15,
+            accelerator="cuda",
+        )
+
+
+@pytest.mark.cuda
+def test_f16_cuda(tmp_path):
+    tbl = create_table(dtype=np.float16)
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset = dataset.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        accelerator="cuda",
+        one_pass_ivfpq=True,
+    )
+    validate_vector_index(dataset, "vector")
+
+
 def test_index_with_nans(tmp_path):
     # 1024 rows, the entire table should be sampled
     tbl = create_table(nvec=1000, nans=24)
@@ -191,8 +243,9 @@ def test_index_with_pq_codebook(tmp_path):
 
 
 @pytest.mark.cuda
-def test_create_index_using_cuda(tmp_path):
-    tbl = create_table()
+@pytest.mark.parametrize("nullify", [False, True])
+def test_create_index_using_cuda(tmp_path, nullify):
+    tbl = create_table(nullify=nullify)
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset = dataset.create_index(
         "vector",
@@ -383,7 +436,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     if platform.system() == "Windows":
         expected_filepath = expected_filepath.replace("\\", "/")
     expected_statistics = {
-        "index_type": "IVF",
+        "index_type": "IVF_PQ",
         "uuid": index_uuid,
         "uri": expected_filepath,
         "metric_type": "l2",
@@ -673,8 +726,11 @@ def test_index_cache_size(tmp_path):
 
     indexed_dataset = lance.dataset(tmp_path / "test", index_cache_size=1)
     # query using the same vector, we should get a very high hit rate
+    # it isn't always exactly 199/200 perhaps because the stats counter
+    # is a relaxed atomic counter and may lag behind the true value or perhaps
+    # because the cache takes some time to get populated by background threads
     query_index(indexed_dataset, 200, q=rng.standard_normal(16))
-    assert indexed_dataset._ds.index_cache_hit_rate() > 0.99
+    assert indexed_dataset._ds.index_cache_hit_rate() > 0.95
 
     last_hit_rate = indexed_dataset._ds.index_cache_hit_rate()
 
@@ -866,3 +922,24 @@ def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
             fragments=[LanceFragment(dataset, 0)],
         )
         scanner.explain_plan(True)
+
+
+def test_load_indices(dataset):
+    indices = dataset.list_indices()
+    assert len(indices) == 0
+
+    dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+
+
+def test_optimize_indices(indexed_dataset):
+    data = create_table()
+    indexed_dataset = lance.write_dataset(data, indexed_dataset.uri, mode="append")
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 1
+    indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 2

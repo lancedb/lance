@@ -4,7 +4,7 @@
 //! Optimized local I/Os
 
 use std::fs::File;
-use std::io::{ErrorKind, SeekFrom};
+use std::io::{ErrorKind, Read, SeekFrom};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;
 
+use crate::object_store::DEFAULT_LOCAL_IO_PARALLELISM;
 use crate::traits::{Reader, Writer};
 
 /// Convert an [`object_store::path::Path`] to a [`std::path::Path`].
@@ -105,7 +106,7 @@ impl LocalObjectReader {
                 file: Arc::new(file),
                 block_size,
                 size,
-                path: path.clone(),
+                path,
             }) as Box<dyn Reader>)
         })
         .await?
@@ -120,6 +121,10 @@ impl Reader for LocalObjectReader {
 
     fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    fn io_parallelism(&self) -> usize {
+        DEFAULT_LOCAL_IO_PARALLELISM
     }
 
     /// Returns the file size.
@@ -155,6 +160,22 @@ impl Reader for LocalObjectReader {
             read_exact_at(file, buf.as_mut(), range.start as u64)?;
 
             Ok(buf.freeze())
+        })
+        .await?
+        .map_err(|err: std::io::Error| object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: err.into(),
+        })
+    }
+
+    /// Reads the entire file.
+    #[instrument(level = "debug", skip(self))]
+    async fn get_all(&self) -> object_store::Result<Bytes> {
+        let mut file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            file.read_to_end(buf.as_mut())?;
+            Ok(Bytes::from(buf))
         })
         .await?
         .map_err(|err: std::io::Error| object_store::Error::Generic {

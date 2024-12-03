@@ -242,7 +242,7 @@ pub fn l2_distance_batch<'a, T: L2>(
     debug_assert_eq!(from.len(), dimension);
     debug_assert_eq!(to.len() % dimension, 0);
 
-    Box::new(T::l2_batch(from, to, dimension))
+    T::l2_batch(from, to, dimension)
 }
 
 fn do_l2_distance_arrow_batch<T: ArrowFloatType>(

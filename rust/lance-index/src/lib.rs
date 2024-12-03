@@ -13,9 +13,11 @@ use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
-use lance_core::Result;
+use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
+use snafu::{location, Location};
+use std::convert::TryFrom;
 
 pub mod optimize;
 pub mod prefilter;
@@ -79,7 +81,12 @@ pub enum IndexType {
 
     // 100+ and up for vector index.
     /// Flat vector index.
-    Vector = 100,
+    Vector = 100, // Legacy vector index, alias to IvfPq
+    IvfFlat = 101,
+    IvfSq = 102,
+    IvfPq = 103,
+    IvfHnswSq = 104,
+    IvfHnswPq = 105,
 }
 
 impl std::fmt::Display for IndexType {
@@ -89,7 +96,35 @@ impl std::fmt::Display for IndexType {
             Self::Bitmap => write!(f, "Bitmap"),
             Self::LabelList => write!(f, "LabelList"),
             Self::Inverted => write!(f, "Inverted"),
-            Self::Vector => write!(f, "Vector"),
+            Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
+            Self::IvfFlat => write!(f, "IVF_FLAT"),
+            Self::IvfSq => write!(f, "IVF_SQ"),
+            Self::IvfHnswSq => write!(f, "IVF_HNSW_SQ"),
+            Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
+        }
+    }
+}
+
+impl TryFrom<i32> for IndexType {
+    type Error = Error;
+
+    fn try_from(value: i32) -> Result<Self> {
+        match value {
+            v if v == Self::Scalar as i32 => Ok(Self::Scalar),
+            v if v == Self::BTree as i32 => Ok(Self::BTree),
+            v if v == Self::Bitmap as i32 => Ok(Self::Bitmap),
+            v if v == Self::LabelList as i32 => Ok(Self::LabelList),
+            v if v == Self::Inverted as i32 => Ok(Self::Inverted),
+            v if v == Self::Vector as i32 => Ok(Self::Vector),
+            v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
+            v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
+            v if v == Self::IvfPq as i32 => Ok(Self::IvfPq),
+            v if v == Self::IvfHnswSq as i32 => Ok(Self::IvfHnswSq),
+            v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
+            _ => Err(Error::InvalidInput {
+                source: format!("the input value {} is not a valid IndexType", value).into(),
+                location: location!(),
+            }),
         }
     }
 }
@@ -103,7 +138,10 @@ impl IndexType {
     }
 
     pub fn is_vector(&self) -> bool {
-        matches!(self, Self::Vector)
+        matches!(
+            self,
+            Self::Vector | Self::IvfPq | Self::IvfHnswSq | Self::IvfHnswPq
+        )
     }
 }
 

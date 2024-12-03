@@ -11,6 +11,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
+from lance import LanceDataset
+from lance.file import LanceFileReader, LanceFileWriter
 
 
 def test_drop_columns(tmp_path: Path):
@@ -47,7 +49,48 @@ def test_drop_columns(tmp_path: Path):
         dataset.drop_columns(["c"])
 
 
-def test_add_columns_udf(tmp_path):
+# The LanceDataset.add_columns and LanceFragment.merge_columns should be mostly the
+# same.  Tests that test these methods can use this fixture to test both methods.
+def check_add_columns(
+    dataset: LanceDataset, expected: pa.Table, use_fragments: bool, *args, **kwargs
+):
+    if use_fragments:
+        # Ensure we are working with latest dataset version
+        dataset = lance.dataset(dataset.uri)
+        new_frags = []
+        for fragment in dataset.get_fragments():
+            # the parameter name is different in `merge_columns` (backwards compat.)
+            if "read_columns" in kwargs:
+                kwargs["columns"] = kwargs.pop("read_columns")
+            new_frag, schema = fragment.merge_columns(*args, **kwargs)
+            new_frags.append(new_frag)
+        op = lance.LanceOperation.Merge(new_frags, schema)
+        dataset = LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
+        assert dataset.to_table() == expected
+    else:
+        dataset.add_columns(*args, **kwargs)
+        assert dataset.to_table() == expected
+
+
+def check_add_columns_fails(
+    dataset: LanceDataset,
+    use_fragments: bool,
+    expected_exception: any,
+    match: str,
+    *args,
+    **kwargs,
+):
+    if use_fragments:
+        with pytest.raises(expected_exception, match=match):
+            frag = dataset.get_fragments()[0]
+            frag.merge_columns(*args, **kwargs)
+    else:
+        with pytest.raises(expected_exception, match=match):
+            dataset.add_columns(*args, **kwargs)
+
+
+@pytest.mark.parametrize("use_fragments", [False, True])
+def test_add_columns_udf(tmp_path, use_fragments):
     tab = pa.table({"a": range(100), "b": range(100)})
     dataset = lance.write_dataset(tab, tmp_path, max_rows_per_file=25)
 
@@ -60,10 +103,8 @@ def test_add_columns_udf(tmp_path):
             [pa.array([2 * x.as_py() for x in batch["a"]])], ["double_a"]
         )
 
-    dataset.add_columns(double_a, read_columns=["a"])
-
     expected = tab.append_column("double_a", pa.array([2 * x for x in range(100)]))
-    assert expected == dataset.to_table()
+    check_add_columns(dataset, expected, use_fragments, double_a, read_columns=["a"])
 
     # Check: errors if produces inconsistent schema
     @lance.batch_udf()
@@ -71,19 +112,115 @@ def test_add_columns_udf(tmp_path):
         col_name = str(uuid.uuid4())
         return pa.record_batch([batch["a"]], [col_name])
 
-    with pytest.raises(
-        Exception, match="Output schema of function does not match the expected schema"
-    ):
-        dataset.add_columns(make_new_col)
+    check_add_columns_fails(
+        dataset,
+        use_fragments,
+        Exception,
+        "Output schema of function does not match the expected schema",
+        make_new_col,
+    )
 
     # Schema inference and Pandas conversion
     @lance.batch_udf()
     def triple_a(batch):
         return pd.DataFrame({"triple_a": [3 * x.as_py() for x in batch["a"]]})
 
-    dataset.add_columns(triple_a, read_columns=["a"])
-
     expected = expected.append_column("triple_a", pa.array([3 * x for x in range(100)]))
+    check_add_columns(dataset, expected, use_fragments, triple_a, read_columns=["a"])
+
+
+def test_add_columns_from_rbr(tmp_path):
+    tab = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(tab, tmp_path / "dataset", max_rows_per_file=25)
+
+    # New data in smaller chunks than old data
+    def gen_data():
+        for i in range(34):
+            num_rows = 3
+            if i == 33:
+                num_rows = 1
+            yield pa.record_batch(
+                [pa.array(range(num_rows)), pa.array(range(num_rows))], ["c", "d"]
+            )
+
+    dataset.add_columns(
+        gen_data(),
+        reader_schema=pa.schema([pa.field("c", pa.int64()), pa.field("d", pa.int64())]),
+    )
+
+    expected = tab.append_column(
+        "c", pa.array([i % 3 for i in range(100)])
+    ).append_column("d", pa.array([i % 3 for i in range(100)]))
+
+    assert expected == dataset.to_table()
+
+    # New data in larger chunks than old data
+    def gen_data():
+        for i in range(3):
+            num_rows = 40
+            if i == 2:
+                num_rows = 20
+            yield pa.record_batch([pa.array(range(num_rows))], ["e"])
+
+    dataset.add_columns(
+        gen_data(),
+        reader_schema=pa.schema([pa.field("e", pa.int64())]),
+    )
+
+    expected = expected.append_column("e", pa.array([i % 40 for i in range(100)]))
+
+    assert expected == dataset.to_table()
+
+    # Insufficient number of rows
+
+    def gen_data():
+        yield pa.record_batch([pa.array(range(50))], ["f"])
+
+    with pytest.raises(
+        OSError, match="Stream ended before producing values for all rows in dataset"
+    ):
+        dataset.add_columns(
+            gen_data(),
+            reader_schema=pa.schema([pa.field("f", pa.int64())]),
+        )
+
+    # Too many rows
+
+    def gen_data():
+        yield pa.record_batch([pa.array(range(101))], ["f"])
+
+    with pytest.raises(
+        OSError, match="Stream produced more values than expected for dataset"
+    ):
+        dataset.add_columns(
+            gen_data(),
+            reader_schema=pa.schema([pa.field("f", pa.int64())]),
+        )
+
+
+def test_add_columns_from_file(tmp_path):
+    tab = pa.table({"a": range(100), "b": range(100)})
+    dataset = lance.write_dataset(tab, tmp_path / "dataset", max_rows_per_file=25)
+
+    tbl_one = dataset.to_table(columns={"double_b": "b * 2"}, limit=50)
+    with LanceFileWriter(tmp_path / "tbl_0") as writer:
+        writer.write_batch(tbl_one)
+
+    tbl_two = dataset.to_table(columns={"double_b": "b * 2"}, offset=50, limit=50)
+    with LanceFileWriter(tmp_path / "tbl_1") as writer:
+        writer.write_batch(tbl_two)
+
+    def data_gen():
+        for i in range(2):
+            reader = LanceFileReader(str(tmp_path / f"tbl_{i}"))
+            for batch in reader.read_all().to_batches():
+                yield batch
+
+    reader_schema = pa.schema([pa.field("double_b", pa.int64())])
+
+    dataset.add_columns(data_gen(), reader_schema=reader_schema)
+
+    expected = tab.append_column("double_b", pa.array([2 * x for x in range(100)]))
     assert expected == dataset.to_table()
 
 
@@ -121,11 +258,12 @@ def test_add_columns_udf_caching(tmp_path):
     assert "cache.sqlite" not in os.listdir(tmp_path)
 
 
-def test_add_columns_exprs(tmp_path):
+@pytest.mark.parametrize("use_fragments", [False, True])
+def test_add_columns_exprs(tmp_path, use_fragments):
     tab = pa.table({"a": range(100)})
     dataset = lance.write_dataset(tab, tmp_path)
-    dataset.add_columns({"b": "a + 1"})
-    assert dataset.to_table() == pa.table({"a": range(100), "b": range(1, 101)})
+    expected = pa.table({"a": range(100), "b": range(1, 101)})
+    check_add_columns(dataset, expected, use_fragments, {"b": "a + 1"})
 
 
 def test_add_many_columns(tmp_path: Path):
@@ -134,6 +272,19 @@ def test_add_many_columns(tmp_path: Path):
     dataset.add_columns(dict([(str(i), "0") for i in range(1, 1000)]))
     dataset = lance.dataset(tmp_path)
     assert dataset.to_table().num_rows == 3
+
+
+@pytest.mark.parametrize("use_fragments", [False, True])
+def test_add_columns_callable(tmp_path: Path, use_fragments):
+    table = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+
+    def mapper(batch: pa.RecordBatch):
+        plus_one = pc.add(batch["a"], 1)
+        return pa.record_batch([plus_one], names=["b"])
+
+    expected = pa.table({"a": range(100), "b": range(1, 101)})
+    check_add_columns(dataset, expected, use_fragments, mapper)
 
 
 def test_query_after_merge(tmp_path):
@@ -227,3 +378,137 @@ def test_alter_columns(tmp_path: Path):
         match="At least one of name, nullable, or data_type must be specified",
     ):
         dataset.alter_columns({"path": "x"})
+
+
+def test_merge_columns(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragments = dataset.get_fragments()
+
+    fragment = fragments[0]
+
+    def adder(batch: pa.RecordBatch) -> pa.RecordBatch:
+        c_array = pa.compute.multiply(batch.column(0), 2)
+        return pa.RecordBatch.from_arrays([c_array], names=["c"])
+
+    fragment_metadata, schema = fragment.merge_columns(adder, columns=["a"])
+
+    operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
+    dataset = lance.LanceDataset.commit(base_dir, operation)
+    assert dataset.schema == schema.to_pyarrow()
+
+    tbl = dataset.to_table()
+    assert tbl == pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "c": pa.array(range(0, 200, 2), pa.int64()),
+        }
+    )
+
+
+def test_merge_columns_from_reader(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    lance.write_dataset(table, base_dir)
+
+    dataset = lance.dataset(base_dir)
+    fragments = dataset.get_fragments()
+
+    fragment = fragments[0]
+
+    with LanceFileWriter(tmp_path / "some_file") as writer:
+        writer.write_batch(pa.table({"c": range(100), "d": range(100)}))
+
+    def datareader():
+        reader = LanceFileReader(str(tmp_path / "some_file"))
+        for batch in reader.read_all(batch_size=10).to_batches():
+            yield batch
+
+    fragment_metadata, schema = fragment.merge_columns(
+        datareader(),
+        reader_schema=pa.schema([pa.field("c", pa.int64()), pa.field("d", pa.int64())]),
+        batch_size=15,
+    )
+
+    operation = lance.LanceOperation.Overwrite(schema.to_pyarrow(), [fragment_metadata])
+    dataset = lance.LanceDataset.commit(base_dir, operation)
+    assert dataset.schema == schema.to_pyarrow()
+
+    tbl = dataset.to_table()
+    assert tbl == pa.Table.from_pydict(
+        {
+            "a": range(100),
+            "b": range(100),
+            "c": range(100),
+            "d": range(100),
+        }
+    )
+
+
+def test_merge_batch_size(tmp_path: Path):
+    # Create dataset with 10 fragments with 100 rows each
+    table = pa.table({"a": range(1000)})
+    for batch_size in [1, 10, 100, 1000]:
+        ds_path = str(tmp_path / str(batch_size))
+        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
+        fragments = []
+
+        def mutate(batch):
+            assert batch.num_rows <= batch_size
+            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
+
+        for frag in dataset.get_fragments():
+            merged, schema = frag.merge_columns(mutate, batch_size=batch_size)
+            fragments.append(merged)
+
+        merge = lance.LanceOperation.Merge(fragments, schema)
+        dataset = lance.LanceDataset.commit(
+            ds_path, merge, read_version=dataset.version
+        )
+
+        dataset.validate()
+        tbl = dataset.to_table()
+        expected = pa.table({"a": range(1000), "b": range(1000)})
+        assert tbl == expected
+
+
+def test_add_cols_batch_size(tmp_path: Path):
+    # Same test as `test_merge_batch_size` but using LanceDataset.add_columns instead
+    table = pa.table({"a": range(1000)})
+    for batch_size in [1, 10, 100, 1000]:
+        ds_path = str(tmp_path / str(batch_size))
+        dataset = lance.write_dataset(table, ds_path, max_rows_per_file=100)
+
+        def mutate(batch):
+            assert batch.num_rows <= batch_size
+            return pa.RecordBatch.from_pydict({"b": batch.column("a")})
+
+        dataset.add_columns(mutate, batch_size=batch_size)
+
+        dataset.validate()
+        tbl = dataset.to_table()
+        expected = pa.table({"a": range(1000), "b": range(1000)})
+        assert tbl == expected
+
+
+def test_no_checkpoint_merge_columns(tmp_path: Path):
+    tab = pa.table(
+        {
+            "a": range(100),
+            "b": range(100),
+        }
+    )
+    dataset = lance.write_dataset(tab, tmp_path, max_rows_per_file=20)
+
+    @lance.batch_udf(checkpoint_file=tmp_path / "cache.sqlite")
+    def some_udf(batch):
+        return batch
+
+    frag = dataset.get_fragments()[0]
+
+    with pytest.raises(ValueError, match="A checkpoint file cannot be used"):
+        frag.merge_columns(some_udf, columns=["a"])

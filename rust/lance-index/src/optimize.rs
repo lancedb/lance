@@ -17,12 +17,16 @@ pub struct OptimizeOptions {
     /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
     /// and accumulate a few delta indices, then merge them into the snapshot.
     pub num_indices_to_merge: usize,
+
+    /// the index names to optimize. If None, all indices will be optimized.
+    pub index_names: Option<Vec<String>>,
 }
 
 impl Default for OptimizeOptions {
     fn default() -> Self {
         Self {
             num_indices_to_merge: 1,
+            index_names: None,
         }
     }
 }

@@ -4,6 +4,7 @@
 //! Scalar indices for metadata search & filtering
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -17,6 +18,7 @@ use datafusion_common::{scalar::ScalarValue, Column};
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
+use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use snafu::{location, Location};
@@ -33,7 +35,7 @@ pub mod lance_format;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
@@ -91,6 +93,61 @@ impl IndexParams for ScalarIndexParams {
     }
 }
 
+#[derive(Clone)]
+pub struct InvertedIndexParams {
+    /// If true, store the position of the term in the document
+    /// This can significantly increase the size of the index
+    /// If false, only store the frequency of the term in the document
+    /// Default is true
+    pub with_position: bool,
+
+    pub tokenizer_config: TokenizerConfig,
+}
+
+impl Debug for InvertedIndexParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InvertedIndexParams")
+            .field("with_position", &self.with_position)
+            .finish()
+    }
+}
+
+impl DeepSizeOf for InvertedIndexParams {
+    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
+impl Default for InvertedIndexParams {
+    fn default() -> Self {
+        Self {
+            with_position: true,
+            tokenizer_config: TokenizerConfig::default(),
+        }
+    }
+}
+
+impl InvertedIndexParams {
+    pub fn with_position(mut self, with_position: bool) -> Self {
+        self.with_position = with_position;
+        self
+    }
+}
+
+impl IndexParams for InvertedIndexParams {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn index_type(&self) -> IndexType {
+        IndexType::Inverted
+    }
+
+    fn index_name(&self) -> &str {
+        "INVERTED"
+    }
+}
+
 /// Trait for storing an index (or parts of an index) into storage
 #[async_trait]
 pub trait IndexWriter: Send {
@@ -100,6 +157,8 @@ pub trait IndexWriter: Send {
     async fn write_record_batch(&mut self, batch: RecordBatch) -> Result<u64>;
     /// Finishes writing the file and closes the file
     async fn finish(&mut self) -> Result<()>;
+    /// Finishes writing the file and closes the file with additional metadata
+    async fn finish_with_metadata(&mut self, metadata: HashMap<String, String>) -> Result<()>;
 }
 
 /// Trait for reading an index (or parts of an index) from storage
@@ -107,8 +166,15 @@ pub trait IndexWriter: Send {
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
-    /// Read the range of rows from the file
-    async fn read_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch>;
+    /// Read the range of rows from the file.
+    /// If projection is Some, only return the columns in the projection,
+    /// nested columns like Some(&["x.y"]) are not supported.
+    /// If projection is None, return all columns.
+    async fn read_range(
+        &self,
+        range: std::ops::Range<usize>,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch>;
     /// Return the number of batches in the file
     async fn num_batches(&self) -> u32;
     /// Return the number of rows in the file
@@ -125,6 +191,9 @@ pub trait IndexReader: Send + Sync {
 #[async_trait]
 pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn as_any(&self) -> &dyn Any;
+
+    /// Suggested I/O parallelism for the store
+    fn io_parallelism(&self) -> usize;
 
     /// Create a new file and return a writer to store data in the file
     async fn new_index_file(&self, name: &str, schema: Arc<Schema>)
@@ -413,7 +482,7 @@ impl AnyQuery for LabelListQuery {
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// Search the scalar index
     ///
-    /// Returns all row ids that satisfy the query, these row ids are not neccesarily ordered
+    /// Returns all row ids that satisfy the query, these row ids are not necessarily ordered
     async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap>;
 
     /// Load the scalar index from storage

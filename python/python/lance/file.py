@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from typing import Optional, Union
+from pathlib import Path
+from typing import Dict, Optional, Union
 
 import pyarrow as pa
 
@@ -55,7 +56,7 @@ class LanceFileReader:
     """
 
     # TODO: make schema optional
-    def __init__(self, path: str):
+    def __init__(self, path: str, storage_options: Optional[Dict[str, str]] = None):
         """
         Creates a new file reader to read the given file
 
@@ -65,8 +66,13 @@ class LanceFileReader:
         path: str
             The path to read, can be a pathname for local storage
             or a URI to read from cloud storage.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         """
-        self._reader = _LanceFileReader(path)
+        if isinstance(path, Path):
+            path = str(path)
+        self._reader = _LanceFileReader(path, storage_options=storage_options)
 
     def read_all(self, *, batch_size: int = 1024, batch_readahead=16) -> ReaderResults:
         """
@@ -115,7 +121,7 @@ class LanceFileReader:
         Parameters
         ----------
         indices: List[int]
-            The indices of the rows to read from the file
+            The indices of the rows to read from the file in ascending order
         batch_size: int, default 1024
             The file will be read in batches.  This parameter controls
             how many rows will be in each batch (except the final batch)
@@ -123,6 +129,13 @@ class LanceFileReader:
             Smaller batches will use less memory but might be slightly
             slower because there is more per-batch overhead
         """
+        for i in range(len(indices) - 1):
+            if indices[i] > indices[i + 1]:
+                raise ValueError(
+                    f"Indices must be sorted in ascending order for \
+                                 file API, got {indices[i]} > {indices[i+1]}"
+                )
+
         return ReaderResults(
             self._reader.take_rows(indices, batch_size, batch_readahead)
         )
@@ -132,6 +145,22 @@ class LanceFileReader:
         Return metadata describing the file contents
         """
         return self._reader.metadata()
+
+    def read_global_buffer(self, index: int) -> bytes:
+        """
+        Read a global buffer from the file at a given index
+
+        Parameters
+        ----------
+        index: int
+            The index of the global buffer to read
+
+        Returns
+        -------
+        bytes
+            The contents of the global buffer
+        """
+        return self._reader.read_global_buffer(index)
 
 
 class LanceFileWriter:
@@ -150,6 +179,7 @@ class LanceFileWriter:
         *,
         data_cache_bytes: Optional[int] = None,
         version: Optional[str] = None,
+        storage_options: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         """
@@ -171,9 +201,19 @@ class LanceFileWriter:
             The version of the file format to write.  If not specified then
             the latest stable version will be used.  Newer versions are more
             efficient but may not be readable by older versions of the software.
+        storage_options : optional, dict
+            Extra options to be used for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
         """
+        if isinstance(path, Path):
+            path = str(path)
         self._writer = _LanceFileWriter(
-            path, schema, data_cache_bytes=data_cache_bytes, version=version, **kwargs
+            path,
+            schema,
+            data_cache_bytes=data_cache_bytes,
+            version=version,
+            storage_options=storage_options,
+            **kwargs,
         )
         self.closed = False
 
@@ -202,6 +242,38 @@ class LanceFileWriter:
             return
         self.closed = True
         return self._writer.finish()
+
+    def add_schema_metadata(self, key: str, value: str) -> None:
+        """
+        Add a metadata (key/value pair) entry to the schema. This method allows you to
+        alter the schema metadata. It must be called before `close` is called.
+
+        Parameters
+        ----------
+        key: str
+            The key to add.
+        value: str
+            The value to add.
+        """
+        self._writer.add_schema_metadata(key, value)
+
+    def add_global_buffer(self, data: bytes) -> int:
+        """
+        Add a global buffer to the file. The global buffer can contain any
+        arbitrary bytes.
+
+        Parameters
+        ----------
+        data: bytes
+            The data to write to the file.
+
+        Returns
+        -------
+        int
+            The index of the global buffer. This will always start at 1
+            and increment by 1 each time this method is called.
+        """
+        return self._writer.add_global_buffer(data)
 
     def __enter__(self) -> "LanceFileWriter":
         return self

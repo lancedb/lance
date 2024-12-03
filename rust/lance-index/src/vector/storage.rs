@@ -41,6 +41,7 @@ use super::DISTANCE_TYPE_KEY;
 /// </section>
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
+    fn distance_all(&self) -> Vec<f32>;
     fn prefetch(&self, _id: u32) {}
 }
 
@@ -64,6 +65,8 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     where
         Self: 'a;
 
+    /// Create a [VectorStore] from a [RecordBatch].
+    /// The batch should consist of row IDs and quantized vector.
     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self>;
 
     fn as_any(&self) -> &dyn Any;
@@ -130,7 +133,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     /// Create a [DistCalculator] to compute the distance between the query.
     ///
-    /// Using dist calcualtor can be more efficient as it can pre-compute some
+    /// Using dist calculator can be more efficient as it can pre-compute some
     /// values.
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 
@@ -263,21 +266,29 @@ impl IvfQuantizationStorage {
 
     pub async fn load_partition<Q: Quantization>(&self, part_id: usize) -> Result<Q::Storage> {
         let range = self.ivf.row_range(part_id);
-        let batches = self
-            .reader
-            .read_stream(
-                ReadBatchParams::Range(range),
-                4096,
-                16,
-                FilterExpression::no_filter(),
-            )?
-            .try_collect::<Vec<_>>()
-            .await?;
-        let schema = Arc::new(self.reader.schema().as_ref().into());
-        let batch = concat_batches(&schema, batches.iter())?;
+        let batch = if range.is_empty() {
+            let schema = self.reader.schema();
+            let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
+            RecordBatch::new_empty(Arc::new(arrow_schema))
+        } else {
+            let batches = self
+                .reader
+                .read_stream(
+                    ReadBatchParams::Range(range),
+                    u32::MAX,
+                    16,
+                    FilterExpression::no_filter(),
+                )?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let schema = Arc::new(self.reader.schema().as_ref().into());
+            concat_batches(&schema, batches.iter())?
+        };
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
-            self.metadata[part_id].clone(),
+            // TODO: this is a hack, cause the metadata is just the quantizer metadata
+            // it's all the same for all partitions, so now we store only one copy of it
+            self.metadata[0].clone(),
         )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }

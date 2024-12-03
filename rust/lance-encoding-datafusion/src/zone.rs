@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::{cast::AsArray, types::UInt32Type, ArrayRef, RecordBatch, UInt32Array};
-use arrow_buffer::Buffer;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
-use datafusion_common::{arrow::datatypes::DataType, DFSchemaRef, ScalarValue};
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion_common::{arrow::datatypes::DataType, DFSchema, DFSchemaRef, ScalarValue};
 use datafusion_expr::{
     col,
     execution_props::ExecutionProps,
@@ -17,23 +21,28 @@ use datafusion_expr::{
 };
 use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_optimizer::simplify_expressions::ExprSimplifier;
-use datafusion_physical_expr::expressions::{MaxAccumulator, MinAccumulator};
 use futures::{future::BoxFuture, FutureExt};
+use lance_datafusion::planner::Planner;
 use lance_encoding::{
+    buffer::LanceBuffer,
     decoder::{
-        decode_batch, ColumnInfo, DecoderMiddlewareChain, FieldScheduler, FilterExpression,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        decode_batch, ColumnInfoIter, DecoderPlugins, FieldScheduler, FilterExpression,
+        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
     },
     encoder::{
-        encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedBuffer, EncodedColumn,
-        EncodingOptions, FieldEncoder,
+        encode_batch, CoreFieldEncodingStrategy, EncodedBatch, EncodedColumn, EncodingOptions,
+        FieldEncoder, OutOfLineBuffers,
     },
     format::pb,
+    repdef::RepDefBuilder,
     EncodingsIo,
 };
 
-use lance_core::{datatypes::Schema, Error, Result};
-use lance_file::v2::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt};
+use lance_core::{cache::FileMetadataCache, datatypes::Schema, Error, Result};
+use lance_file::{
+    v2::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt},
+    version::LanceFileVersion,
+};
 use snafu::{location, Location};
 
 use crate::substrait::FilterExpressionExt;
@@ -122,39 +131,45 @@ fn path_to_expr(path: &VecDeque<u32>) -> Expr {
 }
 
 /// If a column has zone info in the encoding description then extract it
+#[allow(unused)]
 pub(crate) fn extract_zone_info(
-    _column_info: &ColumnInfo,
-    _data_type: &DataType,
-    _cur_path: &VecDeque<u32>,
+    column_info: &mut ColumnInfoIter,
+    data_type: &DataType,
+    cur_path: &VecDeque<u32>,
 ) -> Option<(u32, UnloadedPushdown)> {
-    todo!()
-    // let encoding = column_info.encoding.column_encoding.take().unwrap();
-    // match encoding {
-    //     pb::column_encoding::ColumnEncoding::ZoneIndex(mut zone_index) => {
-    //         let inner = zone_index.inner.take().unwrap();
-    //         let rows_per_zone = zone_index.rows_per_zone;
-    //         let zone_map_buffer = zone_index.zone_map_buffer.as_ref().unwrap().clone();
-    //         assert_eq!(
-    //             zone_map_buffer.buffer_type,
-    //             i32::from(pb::buffer::BufferType::Column)
-    //         );
-    //         let (position, size) =
-    //             column_info.buffer_offsets_and_sizes[zone_map_buffer.buffer_index as usize];
-    //         column_info.encoding = *inner;
-    //         let column = path_to_expr(cur_path);
-    //         let unloaded_pushdown = UnloadedPushdown {
-    //             data_type: data_type.clone(),
-    //             column,
-    //             position,
-    //             size,
-    //         };
-    //         Some((rows_per_zone, unloaded_pushdown))
-    //     }
-    //     _ => {
-    //         column_info.encoding.column_encoding = Some(encoding);
-    //         None
-    //     }
-    // }
+    let mut result: Option<(u32, UnloadedPushdown)> = None;
+    let result_ref = &mut result;
+    column_info.peek_transform(|col_info| {
+        let encoding = col_info.encoding.column_encoding.as_ref().unwrap();
+        match *encoding {
+            pb::column_encoding::ColumnEncoding::ZoneIndex(ref zone_index) => {
+                let mut zone_index = zone_index.clone();
+                let inner = zone_index.inner.take().unwrap();
+                let rows_per_zone = zone_index.rows_per_zone;
+                let zone_map_buffer = zone_index.zone_map_buffer.as_ref().unwrap().clone();
+                assert_eq!(
+                    zone_map_buffer.buffer_type,
+                    i32::from(pb::buffer::BufferType::Column)
+                );
+                let (position, size) =
+                    col_info.buffer_offsets_and_sizes[zone_map_buffer.buffer_index as usize];
+                let column = path_to_expr(cur_path);
+                let unloaded_pushdown = UnloadedPushdown {
+                    data_type: data_type.clone(),
+                    column,
+                    position,
+                    size,
+                };
+                *result_ref = Some((rows_per_zone, unloaded_pushdown));
+
+                let mut col_info = col_info.as_ref().clone();
+                col_info.encoding = *inner;
+                Arc::new(col_info)
+            }
+            _ => col_info,
+        }
+    });
+    result
 }
 
 /// Extracted pushdown information obtained from the column encoding
@@ -171,23 +186,36 @@ pub struct UnloadedPushdown {
     size: u64,
 }
 
+#[derive(Debug)]
+struct ZoneMap {
+    items: Vec<(Expr, NullableInterval)>,
+}
+
+#[derive(Debug)]
+struct InitializedState {
+    zone_maps: Vec<ZoneMap>,
+    filter: Option<Expr>,
+    df_schema: Option<DFSchemaRef>,
+}
+
 /// A top level scheduler that refines the requested range based on
 /// pushdown filtering with zone maps
 #[derive(Debug)]
 pub struct ZoneMapsFieldScheduler {
     inner: Arc<dyn FieldScheduler>,
     schema: Arc<Schema>,
-    pushdown_buffers: Vec<UnloadedPushdown>,
-    zone_guarantees: Arc<Vec<Vec<(Expr, NullableInterval)>>>,
+    // A map from field id to unloaded zone map for that field
+    pushdown_buffers: HashMap<u32, UnloadedPushdown>,
     rows_per_zone: u32,
     num_rows: u64,
+    initialized_state: Mutex<Option<InitializedState>>,
 }
 
 impl ZoneMapsFieldScheduler {
     pub fn new(
         inner: Arc<dyn FieldScheduler>,
         schema: Arc<Schema>,
-        pushdown_buffers: Vec<UnloadedPushdown>,
+        pushdown_buffers: HashMap<u32, UnloadedPushdown>,
         rows_per_zone: u32,
         num_rows: u64,
     ) -> Self {
@@ -195,58 +223,103 @@ impl ZoneMapsFieldScheduler {
             inner,
             schema,
             pushdown_buffers,
-            zone_guarantees: Arc::default(),
             rows_per_zone,
             num_rows,
+            // These are set during initialization
+            initialized_state: Mutex::new(None),
         }
+    }
+
+    async fn load_pushdowns(
+        &self,
+        io: &dyn EncodingsIo,
+        _cache: &FileMetadataCache,
+        pushdowns: &[&UnloadedPushdown],
+    ) -> Result<Vec<ZoneMap>> {
+        // TODO: Use cache
+        let ranges = pushdowns
+            .iter()
+            .map(|pushdown| pushdown.position..pushdown.position + pushdown.size)
+            .collect();
+        let buffers = io.submit_request(ranges, 0).await?;
+        let mut maps = Vec::new();
+        for (buffer, pushdown) in buffers.into_iter().zip(pushdowns.iter()) {
+            // There's no point in running this in parallel since it's actually synchronous
+            let map = self
+                .parse_zone(buffer, &pushdown.data_type, &pushdown.column)
+                .await?;
+            maps.push(map);
+        }
+        // A this point each item in `maps` is a vector of guarantees for a single field
+        // We need to transpose this so that each item is a vector of guarantees for a single zone
+        let zone_maps = transpose2(maps)
+            .into_iter()
+            .map(|items| ZoneMap { items })
+            .collect();
+        Ok(zone_maps)
     }
 
     /// Load the zone maps from the file
-    ///
-    /// TODO: only load zone maps for columns used in the filter
-    pub fn initialize<'a>(&'a mut self, io: &dyn EncodingsIo) -> BoxFuture<'a, Result<()>> {
-        let ranges = self
-            .pushdown_buffers
+    async fn load_maps(
+        &self,
+        io: &dyn EncodingsIo,
+        cache: &FileMetadataCache,
+        filter_schema: &Schema,
+    ) -> Result<Vec<ZoneMap>> {
+        let pushdowns_to_load = filter_schema
+            .fields
             .iter()
-            .map(|unloaded_pushdown| {
-                unloaded_pushdown.position..(unloaded_pushdown.position + unloaded_pushdown.size)
+            .filter_map(|field| {
+                let field_id = field.id as u32;
+                let unloaded = self.pushdown_buffers.get(&field_id)?;
+                Some(unloaded)
             })
             .collect::<Vec<_>>();
-        let zone_maps_fut = io.submit_request(ranges, 0);
-        async move {
-            let zone_map_buffers = zone_maps_fut.await?;
-            let mut all_fields = Vec::with_capacity(zone_map_buffers.len());
-            for (bytes, unloaded_pushdown) in
-                zone_map_buffers.iter().zip(self.pushdown_buffers.iter())
-            {
-                let guarantees = self
-                    .map_from_buffer(
-                        bytes.clone(),
-                        &unloaded_pushdown.data_type,
-                        &unloaded_pushdown.column,
-                    )
-                    .await?;
-                all_fields.push(guarantees);
-            }
-            self.zone_guarantees = Arc::new(transpose2(all_fields));
-            Ok(())
-        }
-        .boxed()
+        self.load_pushdowns(io, cache, &pushdowns_to_load).await
     }
 
-    fn process_filter(
+    async fn do_initialize(
         &self,
-        filter: Expr,
-        projection_schema: DFSchemaRef,
-    ) -> Result<impl Fn(u64) -> bool> {
-        let zone_guarantees = self.zone_guarantees.clone();
+        io: &dyn EncodingsIo,
+        cache: &FileMetadataCache,
+        filter: &FilterExpression,
+    ) -> Result<()> {
+        if filter.is_noop() {
+            return Ok(());
+        }
+
+        let arrow_schema = ArrowSchema::from(self.schema.as_ref());
+        let df_schema = DFSchema::try_from(arrow_schema.clone())?;
+        let df_filter = filter.substrait_to_df(Arc::new(arrow_schema))?;
+
+        let columns = Planner::column_names_in_expr(&df_filter);
+        let referenced_schema = self.schema.project(&columns)?;
+
+        let df_schema = Some(Arc::new(df_schema));
+        let zone_maps = self.load_maps(io, cache, &referenced_schema).await?;
+        let filter = Some(df_filter);
+
+        let state = InitializedState {
+            zone_maps,
+            filter,
+            df_schema,
+        };
+        let mut initialized_state = self.initialized_state.lock().unwrap();
+        *initialized_state = Some(state);
+        Ok(())
+    }
+
+    fn create_filter(&self) -> Result<impl Fn(u64) -> bool + '_> {
         Ok(move |zone_idx| {
-            let guarantees = &zone_guarantees[zone_idx as usize];
+            let state = self.initialized_state.lock().unwrap();
+            let state = state.as_ref().unwrap();
+            let zone_map = &state.zone_maps[zone_idx as usize];
             let props = ExecutionProps::new();
-            let context = SimplifyContext::new(&props).with_schema(projection_schema.clone());
+            let context =
+                SimplifyContext::new(&props).with_schema(state.df_schema.as_ref().unwrap().clone());
             let mut simplifier = ExprSimplifier::new(context);
-            simplifier = simplifier.with_guarantees(guarantees.clone());
-            match simplifier.simplify(filter.clone()) {
+            simplifier = simplifier.with_guarantees(zone_map.items.clone());
+            match simplifier.simplify(state.filter.as_ref().unwrap().clone()) {
                 Ok(expr) => match expr {
                     // Predicate, given guarantees, is always false, we can skip the zone
                     Expr::Literal(ScalarValue::Boolean(Some(false))) => false,
@@ -301,7 +374,7 @@ impl ZoneMapsFieldScheduler {
         guarantees
     }
 
-    async fn map_from_buffer(
+    async fn parse_zone(
         &self,
         buffer: Bytes,
         data_type: &DataType,
@@ -313,11 +386,15 @@ impl ZoneMapsFieldScheduler {
             ArrowField::new("null_count", DataType::UInt32, false),
         ]))
         .unwrap();
-        let zone_maps_batch = EncodedBatch::try_from_mini_lance(buffer, &zone_map_schema)?;
+        let zone_maps_batch =
+            EncodedBatch::try_from_mini_lance(buffer, &zone_map_schema, LanceFileVersion::V2_0)?;
         let zone_maps_batch = decode_batch(
             &zone_maps_batch,
             &FilterExpression::no_filter(),
-            &DecoderMiddlewareChain::default(),
+            Arc::<DecoderPlugins>::default(),
+            /*should_validate= */ false,
+            LanceFileVersion::default(),
+            None,
         )
         .await?;
 
@@ -356,7 +433,7 @@ impl SchedulingJob for EmptySchedulingJob {
     fn schedule_next(
         &mut self,
         _context: &mut SchedulerContext,
-        _top_level_row: u64,
+        _priority: &dyn PriorityRange,
     ) -> Result<ScheduledScanLine> {
         Ok(ScheduledScanLine {
             rows_scheduled: 0,
@@ -370,13 +447,27 @@ impl SchedulingJob for EmptySchedulingJob {
 }
 
 impl FieldScheduler for ZoneMapsFieldScheduler {
+    fn initialize<'a>(
+        &'a self,
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        async move {
+            self.do_initialize(context.io().as_ref(), context.cache(), filter)
+                .await
+        }
+        .boxed()
+    }
+
     fn schedule_ranges<'a>(
         &'a self,
         ranges: &[std::ops::Range<u64>],
         filter: &FilterExpression,
     ) -> Result<Box<dyn SchedulingJob + 'a>> {
-        let (df_filter, projection_schema) = filter.substrait_to_df(self.schema.as_ref())?;
-        let zone_filter_fn = self.process_filter(df_filter, Arc::new(projection_schema))?;
+        if filter.is_noop() {
+            return self.inner.schedule_ranges(ranges, filter);
+        }
+        let zone_filter_fn = self.create_filter()?;
         let zone_filter = ZoneMapsFilter::new(zone_filter_fn, self.rows_per_zone as u64);
         let ranges = zone_filter.refine_ranges(ranges);
         if ranges.is_empty() {
@@ -478,8 +569,7 @@ impl ZoneMapsFieldEncoder {
         Ok(())
     }
 
-    async fn maps_to_metadata(&mut self) -> Result<EncodedBuffer> {
-        let maps = std::mem::take(&mut self.maps);
+    async fn maps_to_metadata(maps: Vec<CreatedZoneMap>) -> Result<LanceBuffer> {
         let (mins, (maxes, null_counts)): (Vec<_>, (Vec<_>, Vec<_>)) = maps
             .into_iter()
             .map(|mp| (mp.min, (mp.max, mp.null_count)))
@@ -504,14 +594,13 @@ impl ZoneMapsFieldEncoder {
                 cache_bytes_per_column: u64::MAX,
                 max_page_bytes: u64::MAX,
                 keep_original_array: true,
+                buffer_alignment: 8,
             },
         )
         .await?;
         let zone_maps_buffer = encoded_zone_maps.try_to_mini_lance()?;
 
-        Ok(EncodedBuffer {
-            parts: vec![Buffer::from(zone_maps_buffer)],
-        })
+        Ok(LanceBuffer::from_bytes(zone_maps_buffer, 1))
     }
 }
 
@@ -519,6 +608,9 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        repdef: RepDefBuilder,
+        row_number: u64,
     ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
         // TODO: If we do the zone map calculation as part of the encoding task then we can
         // parallelize statistics gathering.  Could be faster too since the encoding task is
@@ -526,20 +618,33 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         // probably too big for the CPU cache anyways).  We can worry about this if we need
         // to improve write speed.
         self.update(&array)?;
-        self.items_encoder.maybe_encode(array)
+        self.items_encoder
+            .maybe_encode(array, external_buffers, repdef, row_number)
     }
 
-    fn flush(&mut self) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
+    fn flush(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
+        self.items_encoder.flush(external_buffers)
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
         if self.cur_offset > 0 {
             // Create final map
-            self.new_map()?;
+            if let Err(err) = self.new_map() {
+                return async move { Err(err) }.boxed();
+            }
         }
-        self.items_encoder.flush()
-    }
+        let maps = std::mem::take(&mut self.maps);
+        let rows_per_zone = self.rows_per_map;
+        let items_columns = self.items_encoder.finish(external_buffers);
 
-    fn finish(&mut self) -> BoxFuture<'_, Result<Vec<EncodedColumn>>> {
         async move {
-            let items_columns = self.items_encoder.finish().await?;
+            let items_columns = items_columns.await?;
             if items_columns.is_empty() {
                 return Err(Error::invalid_input("attempt to apply zone maps to a field encoder that generated zero columns of data".to_string(), location!()))
             }
@@ -547,12 +652,12 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
             let final_pages = items_column.final_pages;
             let mut column_buffers = items_column.column_buffers;
             let zone_buffer_index = column_buffers.len();
-            column_buffers.push(self.maps_to_metadata().await?);
+            column_buffers.push(Self::maps_to_metadata(maps).await?);
             let column_encoding = pb::ColumnEncoding {
                 column_encoding: Some(pb::column_encoding::ColumnEncoding::ZoneIndex(Box::new(
                     pb::ZoneIndex {
                         inner: Some(Box::new(items_column.encoding)),
-                        rows_per_zone: self.rows_per_map,
+                        rows_per_zone,
                         zone_map_buffer: Some(pb::Buffer {
                             buffer_index: zone_buffer_index as u32,
                             buffer_type: i32::from(pb::buffer::BufferType::Column),
@@ -582,21 +687,16 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_expr::{col, BinaryExpr, Expr, Operator};
     use lance_datagen::{BatchCount, RowCount};
-    use lance_encoding::decoder::{
-        CoreFieldDecoderStrategy, DecoderMiddlewareChain, FilterExpression,
-    };
+    use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
     use lance_file::v2::{
         testing::{count_lance_file, write_lance_file, FsFixture},
         writer::FileWriterOptions,
     };
 
-    use crate::{
-        substrait::FilterExpressionExt, LanceDfFieldDecoderStrategy, LanceDfFieldEncodingStrategy,
-    };
+    use crate::{substrait::FilterExpressionExt, LanceDfFieldEncodingStrategy};
 
+    #[ignore]
     #[test_log::test(tokio::test)]
-    #[ignore] // Stats currently disabled until https://github.com/lancedb/lance/issues/2605
-              // is addressed
     async fn test_basic_stats() {
         let data = lance_datagen::gen()
             .col("0", lance_datagen::array::step::<Int32Type>())
@@ -609,13 +709,15 @@ mod tests {
             ..Default::default()
         };
 
-        let (schema, data) = write_lance_file(data, &fs, options).await;
+        let written_file = write_lance_file(data, &fs, options).await;
 
-        let decoder_middleware = DecoderMiddlewareChain::new()
-            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
+        let decoder_middleware: Arc<DecoderPlugins> = Arc::default();
 
-        let num_rows = data.iter().map(|rb| rb.num_rows()).sum::<usize>();
+        let num_rows = written_file
+            .data
+            .iter()
+            .map(|rb| rb.num_rows())
+            .sum::<usize>();
 
         let result = count_lance_file(
             &fs,
@@ -625,29 +727,21 @@ mod tests {
         .await;
         assert_eq!(num_rows, result);
 
-        let decoder_middleware = DecoderMiddlewareChain::new()
-            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
-
         let result = count_lance_file(
             &fs,
-            decoder_middleware,
+            decoder_middleware.clone(),
             FilterExpression::df_to_substrait(
                 Expr::BinaryExpr(BinaryExpr {
                     left: Box::new(col("0")),
                     op: Operator::Gt,
                     right: Box::new(Expr::Literal(ScalarValue::Int32(Some(50000)))),
                 }),
-                schema.as_ref(),
+                written_file.schema.as_ref(),
             )
             .unwrap(),
         )
         .await;
         assert_eq!(0, result);
-
-        let decoder_middleware = DecoderMiddlewareChain::new()
-            .add_strategy(Arc::new(LanceDfFieldDecoderStrategy::new(schema.clone())))
-            .add_strategy(Arc::new(CoreFieldDecoderStrategy::default()));
 
         let result = count_lance_file(
             &fs,
@@ -658,7 +752,7 @@ mod tests {
                     op: Operator::Gt,
                     right: Box::new(Expr::Literal(ScalarValue::Int32(Some(20000)))),
                 }),
-                schema.as_ref(),
+                written_file.schema.as_ref(),
             )
             .unwrap(),
         )

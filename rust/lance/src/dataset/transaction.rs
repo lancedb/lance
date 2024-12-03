@@ -22,21 +22,28 @@
 //! a conflict. Some operations have additional conditions that must be met for
 //! them to be compatible.
 //!
-//! |                  | Append | Delete | Overwrite/Create | Create Index | Rewrite | Merge | Project |
-//! |------------------|--------|--------|------------------|--------------|---------|-------|---------|
-//! | Append           | ✅     | ✅     | ❌               | ✅           | ✅      | ❌    | ❌      |
-//! | Delete           | ❌     | (1)    | ❌               | ✅           | (1)     | ❌    | ❌      |
-//! | Overwrite/Create | ✅     | ✅     | ✅               | ✅           | ✅      | ✅    | ✅      |
-//! | Create index     | ✅     | ✅     | ❌               | ✅           | ✅      | ✅    | ✅      |
-//! | Rewrite          | ✅     | (1)    | ❌               | ❌           | (1)     | ❌    | ❌      |
-//! | Merge            | ❌     | ❌     | ❌               | ❌           | ✅      | ❌    | ❌      |
-//! | Project          | ✅     | ✅     | ❌               | ❌           | ✅      | ❌    | ✅      |
+//! |                  | Append | Delete / Update | Overwrite/Create | Create Index | Rewrite | Merge | Project | UpdateConfig |
+//! |------------------|--------|-----------------|------------------|--------------|---------|-------|---------|-------------|
+//! | Append           | ✅     | ✅              | ❌               | ✅           | ✅      | ❌    | ❌      | ✅           |
+//! | Delete / Update  | ✅     | (1)             | ❌               | ✅           | (1)     | ❌    | ❌      | ✅           |
+//! | Overwrite/Create | ✅     | ✅              | ✅               | ✅           | ✅      | ✅    | ✅      | (2)          |
+//! | Create index     | ✅     | ✅              | ❌               | ✅           | ✅      | ✅    | ✅      | ✅           |
+//! | Rewrite          | ✅     | (1)             | ❌               | ❌           | (1)     | ❌    | ❌      | ✅           |
+//! | Merge            | ❌     | ❌              | ❌               | ❌           | ✅      | ❌    | ❌      | ✅           |
+//! | Project          | ✅     | ✅              | ❌               | ❌           | ✅      | ❌    | ✅      | ✅           |
+//! | UpdateConfig     | ✅     | ✅              | (2)              | ✅           | ✅      | ✅    | ✅      | (2)          |
 //!
-//! (1) Delete and rewrite are compatible with each other and themselves only if
+//! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
+//! (2) Operations that mutate the config conflict if one of the operations upserts a key
+//! that if referenced by another concurrent operation.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
+use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_io::object_store::ObjectStore;
@@ -64,18 +71,31 @@ use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct Transaction {
     /// The version of the table this transaction is based off of. If this is
     /// the first transaction, this should be 0.
     pub read_version: u64,
     pub uuid: String,
     pub operation: Operation,
+    /// If the transaction modified the blobs dataset, this is the operation
+    /// to apply to the blobs dataset.
+    ///
+    /// If this is `None`, then the blobs dataset was not modified
+    pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BlobsOperation {
+    /// The operation did not modify the blobs dataset
+    Unchanged,
+    /// The operation modified the blobs dataset, contains the new version of the blobs dataset
+    Updated(u64),
+}
+
 /// An operation on a dataset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
@@ -93,6 +113,7 @@ pub enum Operation {
     Overwrite {
         fragments: Vec<Fragment>,
         schema: Schema,
+        config_upsert_values: Option<HashMap<String, String>>,
     },
     /// A new index has been created.
     CreateIndex {
@@ -139,6 +160,12 @@ pub enum Operation {
 
     /// Project to a new schema. This only changes the schema, not the data.
     Project { schema: Schema },
+
+    /// Update the dataset configuration.
+    UpdateConfig {
+        upsert_values: Option<HashMap<String, String>>,
+        delete_keys: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +174,13 @@ pub struct RewrittenIndex {
     pub new_id: Uuid,
 }
 
-#[derive(Debug, Clone)]
+impl DeepSizeOf for RewrittenIndex {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        0
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
@@ -165,6 +198,7 @@ impl Operation {
             | Self::CreateIndex { .. }
             | Self::ReserveFragments { .. }
             | Self::Project { .. }
+            | Self::UpdateConfig { .. }
             | Self::Restore { .. } => Box::new(std::iter::empty()),
             Self::Delete {
                 updated_fragments,
@@ -195,11 +229,59 @@ impl Operation {
         }
     }
 
+    /// Returns the config keys that have been upserted by this operation.
+    fn get_upsert_config_keys(&self) -> Vec<String> {
+        match self {
+            Self::Overwrite {
+                config_upsert_values: Some(upsert_values),
+                ..
+            } => {
+                let vec: Vec<String> = upsert_values.keys().cloned().collect();
+                vec
+            }
+            Self::UpdateConfig {
+                upsert_values: Some(uv),
+                ..
+            } => {
+                let vec: Vec<String> = uv.keys().cloned().collect();
+                vec
+            }
+            _ => Vec::<String>::new(),
+        }
+    }
+
+    /// Returns the config keys that have been deleted by this operation.
+    fn get_delete_config_keys(&self) -> Vec<String> {
+        match self {
+            Self::UpdateConfig {
+                delete_keys: Some(dk),
+                ..
+            } => dk.clone(),
+            _ => Vec::<String>::new(),
+        }
+    }
+
     /// Check whether another operation modifies the same fragment IDs as this one.
     fn modifies_same_ids(&self, other: &Self) -> bool {
         let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
         let mut other_ids = other.modified_fragment_ids();
         other_ids.any(|id| self_ids.contains(&id))
+    }
+
+    /// Check whether another operation upserts a key that is referenced by another operation
+    fn upsert_key_conflict(&self, other: &Self) -> bool {
+        let self_upsert_keys = self.get_upsert_config_keys();
+        let other_upsert_keys = other.get_upsert_config_keys();
+
+        let self_delete_keys = self.get_delete_config_keys();
+        let other_delete_keys = other.get_delete_config_keys();
+
+        self_upsert_keys
+            .iter()
+            .any(|x| other_upsert_keys.contains(x) || other_delete_keys.contains(x))
+            || other_upsert_keys
+                .iter()
+                .any(|x| self_upsert_keys.contains(x) || self_delete_keys.contains(x))
     }
 
     pub fn name(&self) -> &str {
@@ -214,17 +296,24 @@ impl Operation {
             Self::Restore { .. } => "Restore",
             Self::Update { .. } => "Update",
             Self::Project { .. } => "Project",
+            Self::UpdateConfig { .. } => "UpdateConfig",
         }
     }
 }
 
 impl Transaction {
-    pub fn new(read_version: u64, operation: Operation, tag: Option<String>) -> Self {
+    pub fn new(
+        read_version: u64,
+        operation: Operation,
+        blobs_op: Option<Operation>,
+        tag: Option<String>,
+    ) -> Self {
         let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
         Self {
             read_version,
             uuid,
             operation,
+            blobs_op,
             tag,
         }
     }
@@ -245,6 +334,7 @@ impl Transaction {
                 Operation::Delete { .. } | Operation::Update { .. } => false,
                 Operation::ReserveFragments { .. } => false,
                 Operation::Project { .. } => false,
+                Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
             Operation::Rewrite { .. } => match &other.operation {
@@ -259,10 +349,10 @@ impl Transaction {
                     self.operation.modifies_same_ids(&other.operation)
                 }
                 Operation::Project { .. } => false,
+                Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
-            // Overwrite and Restore always succeed
-            Operation::Overwrite { .. } => false,
+            // Restore always succeeds
             Operation::Restore { .. } => false,
             // ReserveFragments is compatible with anything that doesn't reset the
             // max fragment id.
@@ -285,6 +375,7 @@ impl Transaction {
                 // TODO: we could be smarter here and only invalidate the index
                 // if the rewrite changed more than X% of row ids.
                 Operation::Rewrite { .. } => true,
+                Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
             Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
@@ -296,18 +387,30 @@ impl Transaction {
                 }
                 Operation::Project { .. } => false,
                 Operation::Append { .. } => false,
+                Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
+            Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+                match &other.operation {
+                    Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+                        self.operation.upsert_key_conflict(&other.operation)
+                    }
+                    _ => false,
+                }
+            }
             // Merge changes the schema, but preserves row ids, so the only operations
-            // it's compatible with is CreateIndex and ReserveFragments.
+            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
             Operation::Merge { .. } => !matches!(
                 &other.operation,
-                Operation::CreateIndex { .. } | Operation::ReserveFragments { .. }
+                Operation::CreateIndex { .. }
+                    | Operation::ReserveFragments { .. }
+                    | Operation::UpdateConfig { .. }
             ),
             Operation::Project { .. } => match &other.operation {
                 // Project is compatible with anything that doesn't change the schema
                 Operation::CreateIndex { .. } => false,
                 Operation::Overwrite { .. } => false,
+                Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
         }
@@ -329,6 +432,29 @@ impl Transaction {
         })
     }
 
+    fn data_storage_format_from_files(
+        fragments: &[Fragment],
+        user_requested: Option<LanceFileVersion>,
+    ) -> Result<DataStorageFormat> {
+        if let Some(file_version) = Fragment::try_infer_version(fragments)? {
+            // Ensure user-requested matches data files
+            if let Some(user_requested) = user_requested {
+                if user_requested != file_version {
+                    return Err(Error::invalid_input(
+                        format!("User requested data storage version ({}) does not match version in data files ({})", user_requested, file_version),
+                        location!(),
+                    ));
+                }
+            }
+            Ok(DataStorageFormat::new(file_version))
+        } else {
+            // If no files use user-requested or default
+            Ok(user_requested
+                .map(DataStorageFormat::new)
+                .unwrap_or_default())
+        }
+    }
+
     pub(crate) async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -337,13 +463,13 @@ impl Transaction {
         config: &ManifestWriteConfig,
         tx_path: &str,
     ) -> Result<(Manifest, Vec<Index>)> {
-        let path = commit_handler
-            .resolve_version(base_path, version, &object_store.inner)
+        let location = commit_handler
+            .resolve_version_location(base_path, version, &object_store.inner)
             .await?;
-        let mut manifest = read_manifest(object_store, &path).await?;
+        let mut manifest = read_manifest(object_store, &location.path, location.size).await?;
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
         manifest.transaction_file = Some(tx_path.to_string());
-        let indices = read_manifest_indexes(object_store, &path, &manifest).await?;
+        let indices = read_manifest_indexes(object_store, &location.path, &manifest).await?;
         Ok((manifest, indices))
     }
 
@@ -356,6 +482,7 @@ impl Transaction {
         current_indices: Vec<Index>,
         transaction_file_path: &str,
         config: &ManifestWriteConfig,
+        new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
         if config.use_move_stable_row_ids
             && current_manifest
@@ -452,6 +579,7 @@ impl Transaction {
                         }
                     }
                 });
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Update {
                 removed_fragment_ids,
@@ -475,6 +603,7 @@ impl Transaction {
                     Self::assign_row_ids(next_row_id, new_fragments.as_mut_slice())?;
                 }
                 final_fragments.extend(new_fragments);
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Overwrite { ref fragments, .. } => {
                 let mut new_fragments =
@@ -535,7 +664,7 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Project { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
@@ -556,32 +685,50 @@ impl Transaction {
 
                 // Some fields that have indices may have been removed, so we should
                 // remove those indices as well.
-                Self::retain_relevant_indices(&mut final_indices, &schema)
+                Self::retain_relevant_indices(&mut final_indices, &schema, &final_fragments)
             }
             Operation::Restore { .. } => {
                 unreachable!()
             }
+            Operation::UpdateConfig { .. } => {}
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
         final_fragments.sort_by_key(|frag| frag.id);
 
-        let data_storage_format = match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => storage_format.clone(),
-            (None, Some(true)) => DataStorageFormat::new(LanceFileVersion::Legacy),
-            (None, Some(false)) => DataStorageFormat::new(LanceFileVersion::V2_0),
-            (None, None) => DataStorageFormat::default(),
+        let user_requested_version = match (&config.storage_format, config.use_legacy_format) {
+            (Some(storage_format), _) => Some(storage_format.lance_file_version()?),
+            (None, Some(true)) => Some(LanceFileVersion::Legacy),
+            (None, Some(false)) => Some(LanceFileVersion::V2_0),
+            (None, None) => None,
         };
 
         let mut manifest = if let Some(current_manifest) = current_manifest {
-            let mut prev_manifest =
-                Manifest::new_from_previous(current_manifest, schema, Arc::new(final_fragments));
-            if matches!(self.operation, Operation::Overwrite { .. }) {
-                prev_manifest.data_storage_format = data_storage_format;
+            let mut prev_manifest = Manifest::new_from_previous(
+                current_manifest,
+                schema,
+                Arc::new(final_fragments),
+                new_blob_version,
+            );
+            if user_requested_version.is_some()
+                && matches!(self.operation, Operation::Overwrite { .. })
+            {
+                // If this is an overwrite operation and the user has requested a specific version
+                // then overwrite with that version.  Otherwise, if the user didn't request a specific
+                // version, then overwrite with whatever version we had before.
+                prev_manifest.data_storage_format =
+                    DataStorageFormat::new(user_requested_version.unwrap());
             }
             prev_manifest
         } else {
-            Manifest::new(schema, Arc::new(final_fragments), data_storage_format)
+            let data_storage_format =
+                Self::data_storage_format_from_files(&final_fragments, user_requested_version)?;
+            Manifest::new(
+                schema,
+                Arc::new(final_fragments),
+                data_storage_format,
+                new_blob_version,
+            )
         };
 
         manifest.tag.clone_from(&self.tag);
@@ -592,6 +739,33 @@ impl Transaction {
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
         manifest.update_max_fragment_id();
+
+        match &self.operation {
+            Operation::Overwrite {
+                config_upsert_values: Some(tm),
+                ..
+            } => manifest.update_config(tm.clone()),
+            Operation::UpdateConfig {
+                upsert_values,
+                delete_keys,
+            } => {
+                // Delete is handled first. If the same key is referenced by upsert and
+                // delete, then upserted key-value pair will remain.
+                if let Some(delete_keys) = delete_keys {
+                    manifest.delete_config_keys(
+                        delete_keys
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                    )
+                }
+                if let Some(upsert_values) = upsert_values {
+                    manifest.update_config(upsert_values.clone());
+                }
+            }
+            _ => {}
+        }
 
         if let Operation::ReserveFragments { num_fragments } = self.operation {
             manifest.max_fragment_id += num_fragments;
@@ -606,7 +780,7 @@ impl Transaction {
         Ok((manifest, final_indices))
     }
 
-    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema) {
+    fn retain_relevant_indices(indices: &mut Vec<Index>, schema: &Schema, fragments: &[Fragment]) {
         let field_ids = schema
             .fields_pre_order()
             .map(|f| f.id)
@@ -616,6 +790,17 @@ impl Transaction {
                 .fields
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
+        });
+
+        // We might have also removed all fragments that an index was covering, so
+        // we should remove those indices as well.
+        let fragment_ids = fragments.iter().map(|f| f.id).collect::<HashSet<_>>();
+        indices.retain(|existing_index| {
+            existing_index
+                .fragment_bitmap
+                .as_ref()
+                .map(|bitmap| bitmap.iter().any(|id| fragment_ids.contains(&(id as u64))))
+                .unwrap_or(true)
         });
     }
 
@@ -773,20 +958,30 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                deleted_fragment_ids: deleted_fragment_ids.clone(),
-                predicate: predicate.clone(),
+                deleted_fragment_ids,
+                predicate,
             },
             Some(pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                 fragments,
                 schema,
                 schema_metadata: _schema_metadata, // TODO: handle metadata
-            })) => Operation::Overwrite {
-                fragments: fragments
-                    .into_iter()
-                    .map(Fragment::try_from)
-                    .collect::<Result<Vec<_>>>()?,
-                schema: Schema::from(&Fields(schema.clone())),
-            },
+                config_upsert_values,
+            })) => {
+                let config_upsert_option = if config_upsert_values.is_empty() {
+                    Some(config_upsert_values)
+                } else {
+                    None
+                };
+
+                Operation::Overwrite {
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                    schema: Schema::from(&Fields(schema)),
+                    config_upsert_values: config_upsert_option,
+                }
+            }
             Some(pb::transaction::Operation::ReserveFragments(
                 pb::transaction::ReserveFragments { num_fragments },
             )) => Operation::ReserveFragments { num_fragments },
@@ -845,7 +1040,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(Fragment::try_from)
                     .collect::<Result<Vec<_>>>()?,
-                schema: Schema::from(&Fields(schema.clone())),
+                schema: Schema::from(&Fields(schema)),
             },
             Some(pb::transaction::Operation::Restore(pb::transaction::Restore { version })) => {
                 Operation::Restore { version }
@@ -855,7 +1050,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 updated_fragments,
                 new_fragments,
             })) => Operation::Update {
-                removed_fragment_ids: removed_fragment_ids.clone(),
+                removed_fragment_ids,
                 updated_fragments: updated_fragments
                     .into_iter()
                     .map(Fragment::try_from)
@@ -867,7 +1062,24 @@ impl TryFrom<pb::Transaction> for Transaction {
             },
             Some(pb::transaction::Operation::Project(pb::transaction::Project { schema })) => {
                 Operation::Project {
-                    schema: Schema::from(&Fields(schema.clone())),
+                    schema: Schema::from(&Fields(schema)),
+                }
+            }
+            Some(pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
+                upsert_values,
+                delete_keys,
+            })) => {
+                let upsert_values = match upsert_values.len() {
+                    0 => None,
+                    _ => Some(upsert_values),
+                };
+                let delete_keys = match delete_keys.len() {
+                    0 => None,
+                    _ => Some(delete_keys),
+                };
+                Operation::UpdateConfig {
+                    upsert_values,
+                    delete_keys,
                 }
             }
             None => {
@@ -877,10 +1089,45 @@ impl TryFrom<pb::Transaction> for Transaction {
                 });
             }
         };
+        let blobs_op = message
+            .blob_operation
+            .map(|blob_op| match blob_op {
+                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
+                    fragments,
+                }) => Result::Ok(Operation::Append {
+                    fragments: fragments
+                        .into_iter()
+                        .map(Fragment::try_from)
+                        .collect::<Result<Vec<_>>>()?,
+                }),
+                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
+                    fragments,
+                    schema,
+                    schema_metadata: _schema_metadata, // TODO: handle metadata
+                    config_upsert_values,
+                }) => {
+                    let config_upsert_option = if config_upsert_values.is_empty() {
+                        Some(config_upsert_values)
+                    } else {
+                        None
+                    };
+
+                    Ok(Operation::Overwrite {
+                        fragments: fragments
+                            .into_iter()
+                            .map(Fragment::try_from)
+                            .collect::<Result<Vec<_>>>()?,
+                        schema: Schema::from(&Fields(schema)),
+                        config_upsert_values: config_upsert_option,
+                    })
+                }
+            })
+            .transpose()?;
         Ok(Self {
             read_version: message.read_version,
             uuid: message.uuid.clone(),
             operation,
+            blobs_op,
             tag: if message.tag.is_empty() {
                 None
             } else {
@@ -958,11 +1205,18 @@ impl From<&Transaction> for pb::Transaction {
                 deleted_fragment_ids: deleted_fragment_ids.clone(),
                 predicate: predicate.clone(),
             }),
-            Operation::Overwrite { fragments, schema } => {
+            Operation::Overwrite {
+                fragments,
+                schema,
+                config_upsert_values,
+            } => {
                 pb::transaction::Operation::Overwrite(pb::transaction::Overwrite {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
                     schema: Fields::from(schema).0,
                     schema_metadata: Default::default(), // TODO: handle metadata
+                    config_upsert_values: config_upsert_values
+                        .clone()
+                        .unwrap_or(Default::default()),
                 })
             }
             Operation::ReserveFragments { num_fragments } => {
@@ -1018,12 +1272,43 @@ impl From<&Transaction> for pb::Transaction {
                     schema: Fields::from(schema).0,
                 })
             }
+            Operation::UpdateConfig {
+                upsert_values,
+                delete_keys,
+            } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
+                upsert_values: upsert_values.clone().unwrap_or(Default::default()),
+                delete_keys: delete_keys.clone().unwrap_or(Default::default()),
+            }),
         };
+
+        let blob_operation = value.blobs_op.as_ref().map(|op| match op {
+            Operation::Append { fragments } => {
+                pb::transaction::BlobOperation::BlobAppend(pb::transaction::Append {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                })
+            }
+            Operation::Overwrite {
+                fragments,
+                schema,
+                config_upsert_values,
+            } => {
+                pb::transaction::BlobOperation::BlobOverwrite(pb::transaction::Overwrite {
+                    fragments: fragments.iter().map(pb::DataFragment::from).collect(),
+                    schema: Fields::from(schema).0,
+                    schema_metadata: Default::default(), // TODO: handle metadata
+                    config_upsert_values: config_upsert_values
+                        .clone()
+                        .unwrap_or(Default::default()),
+                })
+            }
+            _ => panic!("Invalid blob operation: {:?}", value),
+        });
 
         Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
+            blob_operation,
             tag: value.tag.clone().unwrap_or("".to_string()),
         }
     }
@@ -1058,7 +1343,14 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
 /// Validate the operation is valid for the given manifest.
 pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
     let manifest = match (manifest, operation) {
-        (None, Operation::Overwrite { fragments, schema }) => {
+        (
+            None,
+            Operation::Overwrite {
+                fragments,
+                schema,
+                config_upsert_values: None,
+            },
+        ) => {
             // Validate here because we are going to return early.
             schema_fragments_valid(schema, fragments)?;
 
@@ -1084,9 +1376,12 @@ pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) ->
         Operation::Project { schema } => {
             schema_fragments_valid(schema, manifest.fragments.as_ref())
         }
-        Operation::Merge { fragments, schema } | Operation::Overwrite { fragments, schema } => {
-            schema_fragments_valid(schema, fragments)
-        }
+        Operation::Merge { fragments, schema }
+        | Operation::Overwrite {
+            fragments,
+            schema,
+            config_upsert_values: None,
+        } => schema_fragments_valid(schema, fragments),
         Operation::Update {
             updated_fragments,
             new_fragments,
@@ -1138,6 +1433,7 @@ mod tests {
             fields: vec![0],
             dataset_version: 1,
             fragment_bitmap: None,
+            index_details: None,
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -1163,6 +1459,10 @@ mod tests {
             Operation::Overwrite {
                 fragments: vec![fragment0.clone(), fragment2.clone()],
                 schema: Schema::default(),
+                config_upsert_values: Some(HashMap::from_iter(vec![(
+                    "overwrite-key".to_string(),
+                    "value".to_string(),
+                )])),
             },
             Operation::Rewrite {
                 groups: vec![RewriteGroup {
@@ -1177,10 +1477,17 @@ mod tests {
                 updated_fragments: vec![fragment0.clone()],
                 new_fragments: vec![fragment2.clone()],
             },
+            Operation::UpdateConfig {
+                upsert_values: Some(HashMap::from_iter(vec![(
+                    "lance.test".to_string(),
+                    "value".to_string(),
+                )])),
+                delete_keys: Some(vec!["remove-key".to_string()]),
+            },
         ];
         let other_transactions = other_operations
             .iter()
-            .map(|op| Transaction::new(0, op.clone(), None))
+            .map(|op| Transaction::new(0, op.clone(), None, None))
             .collect::<Vec<_>>();
 
         // Transactions and whether they are expected to conflict with each
@@ -1190,7 +1497,7 @@ mod tests {
                 Operation::Append {
                     fragments: vec![fragment0.clone()],
                 },
-                [false, false, false, true, true, false, false, false],
+                [false, false, false, true, true, false, false, false, false],
             ),
             (
                 Operation::Delete {
@@ -1199,7 +1506,7 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [false, false, false, true, true, false, false, true],
+                [false, false, false, true, true, false, false, true, false],
             ),
             (
                 Operation::Delete {
@@ -1208,35 +1515,38 @@ mod tests {
                     deleted_fragment_ids: vec![],
                     predicate: "x > 2".to_string(),
                 },
-                [false, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true, false],
             ),
             (
                 Operation::Overwrite {
                     fragments: vec![fragment0.clone(), fragment2.clone()],
                     schema: Schema::default(),
+                    config_upsert_values: None,
                 },
                 // No conflicts: overwrite can always happen since it doesn't
                 // depend on previous state of the table.
-                [false, false, false, false, false, false, false, false],
+                [
+                    false, false, false, false, false, false, false, false, false,
+                ],
             ),
             (
                 Operation::CreateIndex {
                     new_indices: vec![index0.clone()],
-                    removed_indices: vec![index0.clone()],
+                    removed_indices: vec![index0],
                 },
                 // Will only conflict with operations that modify row ids.
-                [false, false, false, false, true, true, false, false],
+                [false, false, false, false, true, true, false, false, false],
             ),
             (
                 // Rewrite that affects different fragments
                 Operation::Rewrite {
                     groups: vec![RewriteGroup {
-                        old_fragments: vec![fragment1.clone()],
+                        old_fragments: vec![fragment1],
                         new_fragments: vec![fragment0.clone()],
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, false, true, true, false, false, true],
+                [false, true, false, true, true, false, false, true, false],
             ),
             (
                 // Rewrite that affects the same fragments
@@ -1247,7 +1557,7 @@ mod tests {
                     }],
                     rewritten_indices: Vec::new(),
                 },
-                [false, true, true, true, true, true, false, true],
+                [false, true, true, true, true, true, false, true, false],
             ),
             (
                 Operation::Merge {
@@ -1255,26 +1565,79 @@ mod tests {
                     schema: Schema::default(),
                 },
                 // Merge conflicts with everything except CreateIndex and ReserveFragments.
-                [true, false, true, true, true, true, false, true],
+                [true, false, true, true, true, true, false, true, false],
             ),
             (
                 Operation::ReserveFragments { num_fragments: 2 },
                 // ReserveFragments only conflicts with Overwrite and Restore.
-                [false, false, false, false, true, false, false, false],
+                [false, false, false, false, true, false, false, false, false],
             ),
             (
                 Operation::Update {
                     // Update that affects same fragments as other transactions
-                    updated_fragments: vec![fragment0.clone()],
+                    updated_fragments: vec![fragment0],
                     removed_fragment_ids: vec![],
-                    new_fragments: vec![fragment2.clone()],
+                    new_fragments: vec![fragment2],
                 },
-                [false, false, true, true, true, true, false, true],
+                [false, false, true, true, true, true, false, true, false],
+            ),
+            (
+                // Update config that should not conflict with anything
+                Operation::UpdateConfig {
+                    upsert_values: Some(HashMap::from_iter(vec![(
+                        "other-key".to_string(),
+                        "new-value".to_string(),
+                    )])),
+                    delete_keys: None,
+                },
+                [
+                    false, false, false, false, false, false, false, false, false,
+                ],
+            ),
+            (
+                // Update config that conflicts with key being upserted by other UpdateConfig operation
+                Operation::UpdateConfig {
+                    upsert_values: Some(HashMap::from_iter(vec![(
+                        "lance.test".to_string(),
+                        "new-value".to_string(),
+                    )])),
+                    delete_keys: None,
+                },
+                [false, false, false, false, false, false, false, false, true],
+            ),
+            (
+                // Update config that conflicts with key being deleted by other UpdateConfig operation
+                Operation::UpdateConfig {
+                    upsert_values: Some(HashMap::from_iter(vec![(
+                        "remove-key".to_string(),
+                        "new-value".to_string(),
+                    )])),
+                    delete_keys: None,
+                },
+                [false, false, false, false, false, false, false, false, true],
+            ),
+            (
+                // Delete config keys currently being deleted by other UpdateConfig operation
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: Some(vec!["remove-key".to_string()]),
+                },
+                [
+                    false, false, false, false, false, false, false, false, false,
+                ],
+            ),
+            (
+                // Delete config keys currently being upserted by other UpdateConfig operation
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: Some(vec!["lance.test".to_string()]),
+                },
+                [false, false, false, false, false, false, false, false, true],
             ),
         ];
 
         for (operation, expected_conflicts) in &cases {
-            let transaction = Transaction::new(0, operation.clone(), None);
+            let transaction = Transaction::new(0, operation.clone(), None, None);
             for (other, expected_conflict) in other_transactions.iter().zip(expected_conflicts) {
                 assert_eq!(
                     transaction.conflicts_with(other),
@@ -1296,7 +1659,7 @@ mod tests {
     fn test_rewrite_fragments() {
         let existing_fragments: Vec<Fragment> = (0..10).map(Fragment::new).collect();
 
-        let mut final_fragments = existing_fragments.clone();
+        let mut final_fragments = existing_fragments;
         let rewrite_groups = vec![
             // Since these are contiguous, they will be put in the same location
             // as 1 and 2.

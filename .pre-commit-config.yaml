@@ -6,3 +6,12 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
       - id: ruff-format
 
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+    - id: fmt
+
+  - repo: https://github.com/crate-ci/typos
+    rev: v1.26.0
+    hooks:
+    - id: typos

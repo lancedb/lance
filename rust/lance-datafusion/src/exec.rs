@@ -18,29 +18,31 @@ use datafusion::{
         TaskContext,
     },
     physical_plan::{
-        stream::RecordBatchStreamAdapter, streaming::PartitionStream, DisplayAs, DisplayFormatType,
-        ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+        display::DisplayableExecutionPlan, stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
+use lazy_static::lazy_static;
 
 use futures::stream;
 use lance_arrow::SchemaExt;
 use lance_core::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 
 /// An source execution node created from an existing stream
 ///
 /// It can only be used once, and will return the stream.  After that the node
-/// is exhuasted.
+/// is exhausted.
 ///
 /// Note: the stream should be finite, otherwise we will report datafusion properties
 /// incorrectly.
 pub struct OneShotExec {
     stream: Mutex<Option<SendableRecordBatchStream>>,
     // We save off a copy of the schema to speed up formatting and so ExecutionPlan::schema & display_as
-    // can still function after exhuasted
+    // can still function after exhausted
     schema: Arc<ArrowSchema>,
     properties: PlanProperties,
 }
@@ -48,7 +50,7 @@ pub struct OneShotExec {
 impl OneShotExec {
     /// Create a new instance from a given stream
     pub fn new(stream: SendableRecordBatchStream) -> Self {
-        let schema = stream.schema().clone();
+        let schema = stream.schema();
         Self {
             stream: Mutex::new(Some(stream)),
             schema: schema.clone(),
@@ -89,7 +91,7 @@ impl DisplayAs for OneShotExec {
         let stream = self.stream.lock().unwrap();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                let exhausted = if stream.is_some() { "" } else { "EXHUASTED " };
+                let exhausted = if stream.is_some() { "" } else { "EXHAUSTED" };
                 let columns = self
                     .schema
                     .field_names()
@@ -208,6 +210,31 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
+lazy_static! {
+    static ref DEFAULT_SESSION_CONTEXT: SessionContext =
+        new_session_context(LanceExecutionOptions::default());
+    static ref DEFAULT_SESSION_CONTEXT_WITH_SPILLING: SessionContext = {
+        new_session_context(LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        })
+    };
+}
+
+pub fn get_session_context(options: LanceExecutionOptions) -> SessionContext {
+    let session_ctx: SessionContext;
+    if options.mem_pool_size() == DEFAULT_LANCE_MEM_POOL_SIZE {
+        if options.use_spilling() {
+            session_ctx = DEFAULT_SESSION_CONTEXT_WITH_SPILLING.clone();
+        } else {
+            session_ctx = DEFAULT_SESSION_CONTEXT.clone();
+        }
+    } else {
+        session_ctx = new_session_context(options)
+    }
+    session_ctx
+}
+
 /// Executes a plan using default session & runtime configuration
 ///
 /// Only executes a single partition.  Panics if the plan has more than one partition.
@@ -215,7 +242,13 @@ pub fn execute_plan(
     plan: Arc<dyn ExecutionPlan>,
     options: LanceExecutionOptions,
 ) -> Result<SendableRecordBatchStream> {
-    let session_ctx = new_session_context(options);
+    debug!(
+        "Executing plan:\n{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
+    );
+
+    let session_ctx = get_session_context(options);
+
     // NOTE: we are only executing the first partition here. Therefore, if
     // the plan has more than one partition, we will be missing data.
     assert_eq!(plan.properties().partitioning.partition_count(), 1);
@@ -239,7 +272,7 @@ struct OneShotPartitionStream {
 
 impl OneShotPartitionStream {
     fn new(data: SendableRecordBatchStream) -> Self {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         Self {
             data: Arc::new(Mutex::new(Some(data))),
             schema,
@@ -265,7 +298,7 @@ impl SessionContextExt for SessionContext {
         &self,
         data: SendableRecordBatchStream,
     ) -> datafusion::common::Result<DataFrame> {
-        let schema = data.schema().clone();
+        let schema = data.schema();
         let part_stream = Arc::new(OneShotPartitionStream::new(data));
         let provider = StreamingTable::try_new(schema, vec![part_stream])?;
         self.read_table(Arc::new(provider))

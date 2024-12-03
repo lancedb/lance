@@ -14,16 +14,15 @@ use lance_linalg::{
     distance::{DistanceType, MetricType},
     kmeans::{compute_partitions_arrow_array, kmeans_find_partitions_arrow_array},
 };
+use tracing::instrument;
 
 use crate::vector::ivf::transform::PartitionTransformer;
-use crate::vector::{
-    pq::{transform::PQTransformer, ProductQuantizer},
-    residual::ResidualTransform,
-    transform::Transformer,
-};
+use crate::vector::{pq::ProductQuantizer, residual::ResidualTransform, transform::Transformer};
 
+use super::pq::transform::PQTransformer;
+use super::quantizer::Quantization;
 use super::{quantizer::Quantizer, residual::compute_residual};
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, RESIDUAL_COLUMN};
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -67,6 +66,7 @@ pub fn new_ivf_transformer_with_quantizer(
             vector_column,
             pq,
             range,
+            false,
         )),
         Quantizer::Scalar(_) => Ok(IvfTransformer::with_sq(
             centroids,
@@ -129,7 +129,7 @@ impl IvfTransformer {
             dt,
             vector_column,
         ));
-        transforms.push(ivf_transform.clone());
+        transforms.push(ivf_transform);
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -152,6 +152,7 @@ impl IvfTransformer {
         vector_column: &str,
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
+        with_pq_code: bool, // Pass true for v1 index format, otherwise false.
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![];
 
@@ -169,7 +170,7 @@ impl IvfTransformer {
             mt,
             vector_column,
         ));
-        transforms.push(partition_transform.clone());
+        transforms.push(partition_transform);
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -178,24 +179,20 @@ impl IvfTransformer {
             )));
         }
 
-        if pq.use_residual() {
+        if ProductQuantizer::use_residual(distance_type) {
             transforms.push(Arc::new(ResidualTransform::new(
                 centroids.clone(),
                 PART_ID_COLUMN,
                 vector_column,
             )));
+        }
+        if with_pq_code {
             transforms.push(Arc::new(PQTransformer::new(
-                pq.clone(),
-                RESIDUAL_COLUMN,
-                PQ_CODE_COLUMN,
-            )));
-        } else {
-            transforms.push(Arc::new(PQTransformer::new(
-                pq.clone(),
+                pq,
                 vector_column,
                 PQ_CODE_COLUMN,
             )));
-        };
+        }
         Self {
             centroids,
             distance_type,
@@ -225,7 +222,7 @@ impl IvfTransformer {
             mt,
             vector_column,
         ));
-        transforms.push(partition_transformer.clone());
+        transforms.push(partition_transformer);
 
         if let Some(range) = range {
             transforms.push(Arc::new(transform::PartitionFilter::new(
@@ -262,6 +259,7 @@ impl IvfTransformer {
 }
 
 impl Transformer for IvfTransformer {
+    #[instrument(name = "IvfTransformer::transform", level = "debug", skip_all)]
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         let mut batch = batch.clone();
         for transform in self.transforms.as_slice() {

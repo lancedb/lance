@@ -158,6 +158,7 @@ message FixedSizeList {
 
 message Compression {
   string scheme = 1;
+  optional int32 level = 2;
 }
 
 // Fixed width items placed contiguously in a buffer
@@ -169,7 +170,18 @@ message Flat {
   Buffer buffer = 2;
   // The Compression message can specify the compression scheme (e.g. zstd) and any
   // other information that is needed for decompression.
+  //
+  // If this array is compressed then the bits_per_value refers to the uncompressed
+  // data.
   Compression compression = 3;
+}
+
+// Compression algorithm where all values have a constant value
+message Constant {
+  // The value (TODO: define encoding for literals?)
+  bytes value = 1;
+  // The number of values
+  uint64 num_values = 2;
 }
 
 // Items are bitpacked in a buffer
@@ -187,6 +199,23 @@ message Bitpacked {
   bool signed = 4;
 }
 
+// Items are bitpacked in a buffer
+message BitpackedForNonNeg {
+  // the number of bits used for a value in the buffer
+  uint64 compressed_bits_per_value = 1;
+
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+
+  // The items in the list
+  Buffer buffer = 3;
+}
+
+message Bitpack2 {
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+}
+
 // An array encoding for shredded structs that will never be null
 //
 // There is no actual data in this column.
@@ -199,6 +228,17 @@ message Binary {
   ArrayEncoding indices = 1;
   ArrayEncoding bytes = 2;
   uint64 null_adjustment = 3;
+}
+
+message BinaryMiniBlock {
+}
+
+message BinaryBlock {
+}
+
+message FsstMiniBlock {
+  ArrayEncoding BinaryMiniBlock = 1;
+  bytes symbol_table = 2;
 }
 
 message Fsst {
@@ -218,6 +258,11 @@ message PackedStruct {
   Buffer buffer = 2;
 }
 
+message FixedSizeBinary {
+  ArrayEncoding bytes = 1;
+  uint32 byte_width = 2;
+}
+
 // Encodings that decode into an Arrow array
 message ArrayEncoding {
     oneof array_encoding {
@@ -231,6 +276,13 @@ message ArrayEncoding {
         Fsst fsst = 8;
         PackedStruct packed_struct = 9;
         Bitpacked bitpacked = 10;
+        FixedSizeBinary fixed_size_binary = 11;
+        BitpackedForNonNeg bitpacked_for_non_neg = 12;
+        Constant constant = 13;
+        Bitpack2 bitpack2 = 14;
+        BinaryMiniBlock binary_mini_block = 15;
+        FsstMiniBlock fsst_mini_block = 16;
+        BinaryBlock binary_block = 17;
     }
 }
 
@@ -242,11 +294,63 @@ message ZoneIndex {
   ColumnEncoding inner = 3;
 }
 
+// Marks a column as blob data.  It will contain a packed struct
+// with fields position and size (u64)
+message Blob {
+  ColumnEncoding inner = 1;
+}
+
 // Encodings that describe a column of values
 message ColumnEncoding {
   oneof column_encoding {
     // No special encoding, just column values
     google.protobuf.Empty values = 1;
     ZoneIndex zone_index = 2;
+    Blob blob = 3;
+  }
+}
+
+/// A layout used for pages where the data is small
+///
+/// In this case we can fit many values into a single disk sector and transposing buffers is
+/// expensive.  As a result, we do not transpose the buffers but compress the data into small
+/// chunks (called mini blocks) which are roughly the size of a disk sector.
+message MiniBlockLayout {
+  // Description of the compression of repetition levels (e.g. how many bits per rep)
+  ArrayEncoding rep_compression = 1;
+  // Description of the compression of definition levels (e.g. how many bits per def)
+  ArrayEncoding def_compression = 2;
+  // Description of the compression of values
+  ArrayEncoding value_compression = 3;
+  ArrayEncoding dictionary = 4;
+}
+
+/// A layout used for pages where the data is large
+///
+/// In this case the cost of transposing the data is relatively small (compared to the cost of writing the data)
+/// and so we just zip the buffers together
+message FullZipLayout {
+  // The number of bits of repetition info (0 if there is no repetition)
+  uint32 bits_rep = 1;
+  // The number of bits of definition info (0 if there is no definition)
+  uint32 bits_def = 2;
+  // Description of the compression of values
+  ArrayEncoding value_compression = 3;
+}
+
+/// A layout used for pages where all values are null
+///
+/// In addition, there can be no repetition levels and only a single definition level
+///
+/// If the data is all-null but we have non-trivial rep-def then MiniBlockLayout is used
+message AllNullLayout {
+
+}
+
+message PageLayout {
+  oneof layout {
+    MiniBlockLayout mini_block_layout = 1;
+    AllNullLayout all_null_layout = 2;
+    FullZipLayout full_zip_layout = 3;
   }
 }
