@@ -12,11 +12,11 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "52.2", features = ["pyarrow"] }
-arrow-array = "52.2"
-arrow-data = "52.2"
-arrow-schema = "52.2"
-arrow-select = "52.2"
+arrow = { version = "53.2", features = ["pyarrow"] }
+arrow-array = "53.2"
+arrow-data = "53.2"
+arrow-schema = "53.2"
+arrow-select = "53.2"
 object_store = "0.10.1"
 async-trait = "0.1"
 chrono = "0.4.31"
@@ -42,11 +42,12 @@ lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
 lazy_static = "1"
 log = "0.4"
-prost = "0.12.2"
-pyo3 = { version = "0.21", features = [
+prost = "0.13.2"
+pyo3 = { version = "0.22", features = [
     "extension-module",
     "abi3-py39",
     "gil-refs",
+    "py-clone",
 ] }
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
 uuid = "1.3.0"

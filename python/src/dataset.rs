@@ -140,12 +140,13 @@ pub struct MergeInsertBuilder {
 #[pymethods]
 impl MergeInsertBuilder {
     #[new]
-    pub fn new(dataset: &PyAny, on: &PyAny) -> PyResult<Self> {
+    pub fn new(dataset: &Bound<'_, PyAny>, on: &Bound<'_, PyAny>) -> PyResult<Self> {
         let dataset: Py<Dataset> = dataset.extract()?;
         let ds = dataset.borrow(on.py()).ds.clone();
         // Either a single string, which we put in a vector or an iterator
         // of strings, which we collect into a vector
-        let on = PyAny::downcast::<PyString>(on)
+        let on = on
+            .downcast::<PyString>()
             .map(|val| vec![val.to_string()])
             .or_else(|_| {
                 let iterator = on.iter().map_err(|_| {
@@ -155,7 +156,7 @@ impl MergeInsertBuilder {
                 })?;
                 let mut keys = Vec::new();
                 for key in iterator {
-                    keys.push(PyAny::downcast::<PyString>(key?)?.to_string());
+                    keys.push(key?.downcast::<PyString>()?.to_string());
                 }
                 PyResult::Ok(keys)
             })?;
@@ -171,6 +172,7 @@ impl MergeInsertBuilder {
         Ok(Self { builder, dataset })
     }
 
+    #[pyo3(signature=(condition=None))]
     pub fn when_matched_update_all<'a>(
         mut slf: PyRefMut<'a, Self>,
         condition: Option<&str>,
@@ -191,6 +193,7 @@ impl MergeInsertBuilder {
         Ok(slf)
     }
 
+    #[pyo3(signature=(expr=None))]
     pub fn when_not_matched_by_source_delete<'a>(
         mut slf: PyRefMut<'a, Self>,
         expr: Option<&str>,
@@ -219,11 +222,11 @@ impl MergeInsertBuilder {
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        let dataset = self.dataset.as_ref(py);
+        let dataset = self.dataset.bind(py);
 
         dataset.borrow_mut().ds = new_self.0;
         let merge_stats = new_self.1;
-        let merge_dict = PyDict::new(py);
+        let merge_dict = PyDict::new_bound(py);
         merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
         merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
         merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
@@ -344,7 +347,7 @@ impl Operation {
         name: String,
         fields: Vec<i32>,
         dataset_version: u64,
-        fragment_ids: &PySet,
+        fragment_ids: &Bound<'_, PySet>,
     ) -> PyResult<Self> {
         let fragment_ids: Vec<u32> = fragment_ids
             .iter()
@@ -392,7 +395,7 @@ impl Operation {
     }
 }
 
-pub fn transforms_from_python(transforms: &PyAny) -> PyResult<NewColumnTransform> {
+pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColumnTransform> {
     if let Ok(transforms) = transforms.extract::<&PyDict>() {
         let expressions = transforms
             .iter()
@@ -449,6 +452,7 @@ pub struct Dataset {
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     #[new]
+    #[pyo3(signature=(uri, version=None, block_size=None, index_cache_size=None, metadata_cache_size=None, commit_handler=None, storage_options=None, manifest=None))]
     fn new(
         py: Python,
         uri: String,
@@ -477,10 +481,10 @@ impl Dataset {
 
         let mut builder = DatasetBuilder::from_uri(&uri).with_read_params(params);
         if let Some(ver) = version {
-            if let Ok(i) = ver.downcast::<PyInt>(py) {
+            if let Ok(i) = ver.downcast_bound::<PyInt>(py) {
                 let v: u64 = i.extract()?;
                 builder = builder.with_version(v);
-            } else if let Ok(v) = ver.downcast::<PyString>(py) {
+            } else if let Ok(v) = ver.downcast_bound::<PyString>(py) {
                 let t: &str = v.extract()?;
                 builder = builder.with_tag(t);
             } else {
@@ -545,7 +549,7 @@ impl Dataset {
 
     fn serialized_manifest(&self, py: Python) -> PyObject {
         let manifest_bytes = self.ds.manifest().serialized();
-        PyBytes::new(py, &manifest_bytes).into()
+        PyBytes::new_bound(py, &manifest_bytes).into()
     }
 
     /// Load index metadata.
@@ -559,7 +563,7 @@ impl Dataset {
         index_metadata
             .iter()
             .map(|idx| {
-                let dict = PyDict::new(py);
+                let dict = PyDict::new_bound(py);
                 let schema = self_.ds.schema();
 
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
@@ -588,7 +592,7 @@ impl Dataset {
                     .map(|f| f.name.clone())
                     .collect::<Vec<_>>();
 
-                let fragment_set = PySet::empty(py).unwrap();
+                let fragment_set = PySet::empty_bound(py).unwrap();
                 if let Some(bitmap) = &idx.fragment_bitmap {
                     for fragment_id in bitmap.iter() {
                         fragment_set.add(fragment_id).unwrap();
@@ -610,6 +614,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -630,7 +635,7 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
-        full_text_query: Option<&PyDict>,
+        full_text_query: Option<&Bound<'_, PyDict>>,
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
     ) -> PyResult<Scanner> {
@@ -673,7 +678,8 @@ impl Dataset {
                     None
                 } else {
                     Some(
-                        PyAny::downcast::<PyList>(columns)?
+                        columns
+                            .downcast::<PyList>()?
                             .iter()
                             .map(|c| c.extract::<String>())
                             .collect::<PyResult<Vec<String>>>()?,
@@ -863,12 +869,14 @@ impl Dataset {
         Ok(Scanner::new(scan))
     }
 
+    #[pyo3(signature=(filter=None))]
     fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
         RT.runtime
             .block_on(self.ds.count_rows(filter))
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
     fn take(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
@@ -895,6 +903,7 @@ impl Dataset {
         batch.to_pyarrow(self_.py())
     }
 
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
     fn take_rows(
         self_: PyRef<'_, Self>,
         row_indices: Vec<u64>,
@@ -982,7 +991,7 @@ impl Dataset {
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 
-    fn alter_columns(&mut self, alterations: &PyList) -> PyResult<()> {
+    fn alter_columns(&mut self, alterations: &Bound<'_, PyList>) -> PyResult<()> {
         let alterations = alterations
             .iter()
             .map(|obj| {
@@ -1067,7 +1076,12 @@ impl Dataset {
         Ok(())
     }
 
-    fn update(&mut self, updates: &PyDict, predicate: Option<&str>) -> PyResult<PyObject> {
+    #[pyo3(signature=(updates, predicate=None))]
+    fn update(
+        &mut self,
+        updates: &Bound<'_, PyDict>,
+        predicate: Option<&str>,
+    ) -> PyResult<PyObject> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
         if let Some(predicate) = predicate {
             builder = builder
@@ -1093,7 +1107,7 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         self.ds = new_self.new_dataset;
-        let update_dict = PyDict::new(updates.py());
+        let update_dict = PyDict::new_bound(updates.py());
         let num_rows_updated = new_self.rows_updated;
         update_dict.set_item("num_rows_updated", num_rows_updated)?;
         Ok(update_dict.into())
@@ -1112,7 +1126,7 @@ impl Dataset {
             let pyvers: Vec<PyObject> = versions
                 .iter()
                 .map(|v| {
-                    let dict = PyDict::new(py);
+                    let dict = PyDict::new_bound(py);
                     dict.set_item("version", v.version).unwrap();
                     dict.set_item(
                         "timestamp",
@@ -1120,7 +1134,8 @@ impl Dataset {
                     )
                     .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
-                    dict.set_item("metadata", tup.into_py_dict(py)).unwrap();
+                    dict.set_item("metadata", tup.into_py_dict_bound(py))
+                        .unwrap();
                     dict.to_object(py)
                 })
                 .collect::<Vec<_>>()
@@ -1141,10 +1156,10 @@ impl Dataset {
     }
 
     fn checkout_version(&self, py: Python, version: PyObject) -> PyResult<Self> {
-        if let Ok(i) = version.downcast::<PyInt>(py) {
+        if let Ok(i) = version.downcast_bound::<PyInt>(py) {
             let ref_: u64 = i.extract()?;
             self._checkout_version(ref_)
-        } else if let Ok(v) = version.downcast::<PyString>(py) {
+        } else if let Ok(v) = version.downcast_bound::<PyString>(py) {
             let ref_: &str = v.extract()?;
             self._checkout_version(ref_)
         } else {
@@ -1164,6 +1179,7 @@ impl Dataset {
     }
 
     /// Cleanup old versions from the dataset
+    #[pyo3(signature = (older_than_micros, delete_unverified = None, error_if_tagged_old_versions = None))]
     fn cleanup_old_versions(
         &self,
         older_than_micros: i64,
@@ -1192,9 +1208,9 @@ impl Dataset {
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         Python::with_gil(|py| {
-            let pytags = PyDict::new(py);
+            let pytags = PyDict::new_bound(py);
             for (k, v) in tags.iter() {
-                let dict = PyDict::new(py);
+                let dict = PyDict::new_bound(py);
                 dict.set_item("version", v.version).unwrap();
                 dict.set_item("manifest_size", v.manifest_size).unwrap();
                 dict.to_object(py);
@@ -1264,6 +1280,7 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
     fn create_index(
         &mut self,
         columns: Vec<&str>,
@@ -1409,6 +1426,7 @@ impl Dataset {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (dest, storage_options = None))]
     fn drop(dest: String, storage_options: Option<HashMap<String, String>>) -> PyResult<()> {
         RT.spawn(None, async move {
             let (object_store, path) =
@@ -1422,11 +1440,12 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
+    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit(
         dest: &Bound<PyAny>,
         operation: Operation,
         read_version: Option<u64>,
-        commit_lock: Option<&PyAny>,
+        commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
@@ -1440,7 +1459,7 @@ impl Dataset {
                     ..Default::default()
                 });
 
-        let commit_handler = commit_lock.map(|commit_lock| {
+        let commit_handler = commit_lock.as_ref().map(|commit_lock| {
             Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
                 as Arc<dyn CommitHandler>
         });
@@ -1480,10 +1499,11 @@ impl Dataset {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch<'py>(
         dest: &Bound<'py, PyAny>,
         transactions: Vec<Bound<'py, PyAny>>,
-        commit_lock: Option<&'py PyAny>,
+        commit_lock: Option<&Bound<'py, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
@@ -1503,8 +1523,8 @@ impl Dataset {
         });
 
         let py = dest.py();
-        let dest = if dest.is_instance_of::<Dataset>() {
-            let dataset: Dataset = dest.extract()?;
+        let dest = if dest.is_instance_of::<Self>() {
+            let dataset: Self = dest.extract()?;
             WriteDestination::Dataset(dataset.ds.clone())
         } else {
             WriteDestination::Uri(dest.extract()?)
@@ -1567,9 +1587,10 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (reader, batch_size = None))]
     fn add_columns_from_reader(
         &mut self,
-        reader: &Bound<PyAny>,
+        reader: &Bound<'_, PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<()> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
@@ -1588,9 +1609,10 @@ impl Dataset {
         Ok(())
     }
 
+    #[pyo3(signature = (transforms, read_columns = None, batch_size = None))]
     fn add_columns(
         &mut self,
-        transforms: &PyAny,
+        transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> PyResult<()> {
@@ -1637,11 +1659,11 @@ impl Dataset {
 
 #[pyfunction(name = "_write_dataset")]
 pub fn write_dataset(
-    reader: &Bound<PyAny>,
-    dest: &Bound<PyAny>,
-    options: &PyDict,
+    reader: &Bound<'_, PyAny>,
+    dest: &Bound<'_, PyAny>,
+    options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let params = get_write_params(options)?;
+    let params = get_write_params(options.as_gil_ref())?;
     let py = options.py();
     let dest = if dest.is_instance_of::<Dataset>() {
         let dataset: Dataset = dest.extract()?;
@@ -1928,7 +1950,7 @@ impl WriteFragmentProgress for PyWriteProgress {
 
         Python::with_gil(|py| -> PyResult<()> {
             self.py_obj
-                .call_method(py, "_do_begin", (json_str,), None)?;
+                .call_method_bound(py, "_do_begin", (json_str,), None)?;
             Ok(())
         })
         .map_err(|e| {
@@ -1945,7 +1967,7 @@ impl WriteFragmentProgress for PyWriteProgress {
 
         Python::with_gil(|py| -> PyResult<()> {
             self.py_obj
-                .call_method(py, "_do_complete", (json_str,), None)?;
+                .call_method_bound(py, "_do_complete", (json_str,), None)?;
             Ok(())
         })
         .map_err(|e| {
@@ -1960,13 +1982,13 @@ impl WriteFragmentProgress for PyWriteProgress {
 
 /// Formats a Python error just as it would in Python interpreter.
 fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
-    let sys_mod = py.import("sys")?;
+    let sys_mod = py.import_bound("sys")?;
     // the traceback is the third element of the tuple returned by sys.exc_info()
     let traceback = sys_mod.call_method0("exc_info")?.get_item(2)?;
 
-    let tracback_mod = py.import("traceback")?;
+    let tracback_mod = py.import_bound("traceback")?;
     let fmt_func = tracback_mod.getattr("format_exception")?;
-    let e_type = e.get_type(py).to_owned();
+    let e_type = e.get_type_bound(py).to_owned();
     let formatted = fmt_func.call1((e_type, &e, traceback))?;
     let lines: Vec<String> = formatted.extract()?;
     Ok(lines.join(""))

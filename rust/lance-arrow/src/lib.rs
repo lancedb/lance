@@ -5,14 +5,15 @@
 //!
 //! To improve Arrow-RS ergonomic
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::{collections::HashMap, ptr::NonNull};
 
 use arrow_array::{
     cast::AsArray, Array, ArrayRef, ArrowNumericType, FixedSizeBinaryArray, FixedSizeListArray,
     GenericListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch, StructArray, UInt32Array,
     UInt8Array,
 };
+use arrow_buffer::MutableBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema};
 use arrow_select::{interleave::interleave, take::take};
@@ -652,6 +653,68 @@ pub fn interleave_batches(
     }
 
     RecordBatch::try_new(schema, columns)
+}
+
+pub trait BufferExt {
+    /// Create an `arrow_buffer::Buffer`` from a `bytes::Bytes` object
+    ///
+    /// The alignment must be specified (as `bytes_per_value`) since we want to make
+    /// sure we can safely reinterpret the buffer.
+    ///
+    /// If the buffer is properly aligned this will be zero-copy.  If not, a copy
+    /// will be made and an owned buffer returned.
+    ///
+    /// If `bytes_per_value` is not a power of two, then we assume the buffer is
+    /// never going to be reinterpreted into another type and we can safely
+    /// ignore the alignment.
+    ///
+    /// Yes, the method name is odd.  It's because there is already a `from_bytes`
+    /// which converts from `arrow_buffer::bytes::Bytes` (not `bytes::Bytes`)
+    fn from_bytes_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self;
+
+    /// Allocates a new properly aligned arrow buffer and copies `bytes` into it
+    ///
+    /// `size_bytes` can be larger than `bytes` and, if so, the trailing bytes will
+    /// be zeroed out.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size_bytes` is less than `bytes.len()`
+    fn copy_bytes_bytes(bytes: bytes::Bytes, size_bytes: usize) -> Self;
+}
+
+fn is_pwr_two(n: u64) -> bool {
+    n & (n - 1) == 0
+}
+
+impl BufferExt for arrow_buffer::Buffer {
+    fn from_bytes_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self {
+        if is_pwr_two(bytes_per_value) && bytes.as_ptr().align_offset(bytes_per_value as usize) != 0
+        {
+            // The original buffer is not aligned, cannot zero-copy
+            let size_bytes = bytes.len();
+            Self::copy_bytes_bytes(bytes, size_bytes)
+        } else {
+            // The original buffer is aligned, can zero-copy
+            // SAFETY: the alignment is correct we can make this conversion
+            unsafe {
+                Self::from_custom_allocation(
+                    NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
+                    bytes.len(),
+                    Arc::new(bytes),
+                )
+            }
+        }
+    }
+
+    fn copy_bytes_bytes(bytes: bytes::Bytes, size_bytes: usize) -> Self {
+        assert!(size_bytes >= bytes.len());
+        let mut buf = MutableBuffer::with_capacity(size_bytes);
+        let to_fill = size_bytes - bytes.len();
+        buf.extend(bytes);
+        buf.extend(std::iter::repeat(0).take(to_fill));
+        Self::from(buf)
+    }
 }
 
 #[cfg(test)]
