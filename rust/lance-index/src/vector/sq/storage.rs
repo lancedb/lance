@@ -12,6 +12,7 @@ use arrow_array::{
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_io::object_store::ObjectStore;
@@ -19,7 +20,6 @@ use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{

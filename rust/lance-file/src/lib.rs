@@ -11,11 +11,11 @@ pub mod writer;
 use format::MAGIC;
 pub use lance_encoding::version;
 
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use snafu::{location, Location};
 
 pub async fn determine_file_version(
     store: &ObjectStore,

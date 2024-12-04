@@ -11,8 +11,8 @@ use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use lance_arrow::*;
+use lance_core::location;
 use prost::Message;
-use snafu::{location, Location};
 
 use crate::{
     encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},

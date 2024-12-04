@@ -13,11 +13,11 @@ use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_physical_expr::expressions::{in_list, lit, Column};
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
 
 use crate::{Index, IndexType};
 

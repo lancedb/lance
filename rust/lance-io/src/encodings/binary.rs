@@ -26,7 +26,8 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use snafu::{location, Location};
+use lance_core::location;
+
 use tokio::io::AsyncWriteExt;
 
 use super::ReadBatchParams;

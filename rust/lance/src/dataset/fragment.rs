@@ -19,6 +19,7 @@ use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::location;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
@@ -39,7 +40,6 @@ use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
 };
-use snafu::{location, Location};
 
 use self::write::FragmentCreateBuilder;
 

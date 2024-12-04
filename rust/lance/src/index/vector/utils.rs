@@ -7,7 +7,8 @@ use arrow_array::{cast::AsArray, FixedSizeListArray};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_select::concat::concat_batches;
 use futures::stream::TryStreamExt;
-use snafu::{location, Location};
+use lance_core::location;
+
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;

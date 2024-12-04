@@ -9,6 +9,7 @@ use futures::prelude::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
+use lance_core::location;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -49,7 +50,7 @@ use lance_linalg::distance::DistanceType;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
+
 use tempfile::{tempdir, TempDir};
 use tracing::{span, Level};
 

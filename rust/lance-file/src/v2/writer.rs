@@ -12,6 +12,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::FuturesOrdered;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema as LanceSchema};
+use lance_core::location;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::PageEncoding;
@@ -26,7 +27,7 @@ use lance_io::traits::Writer;
 use log::debug;
 use prost::Message;
 use prost_types::Any;
-use snafu::{location, Location};
+
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 

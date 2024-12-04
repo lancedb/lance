@@ -15,6 +15,7 @@ use futures::stream::Peekable;
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::*;
 use lance_core::datatypes::Schema;
+use lance_core::location;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::Error;
@@ -38,7 +39,7 @@ use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 

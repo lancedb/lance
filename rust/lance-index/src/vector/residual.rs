@@ -10,11 +10,12 @@ use arrow_array::{
 };
 use arrow_schema::DataType;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partitions;
 use num_traits::Float;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use super::transform::Transformer;

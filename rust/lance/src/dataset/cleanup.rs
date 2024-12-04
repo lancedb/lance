@@ -468,6 +468,7 @@ mod tests {
 
     use arrow_array::RecordBatchReader;
     use datafusion::common::assert_contains;
+    use lance_core::location;
     use lance_core::utils::testing::{MockClock, ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_io::object_store::{
@@ -476,7 +477,6 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
-    use snafu::{location, Location};
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},

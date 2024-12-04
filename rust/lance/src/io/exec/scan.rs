@@ -21,13 +21,13 @@ use futures::stream::{BoxStream, Stream};
 use futures::{stream, FutureExt, TryFutureExt};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
+use lance_core::location;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::StreamTracingExt;
 use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use snafu::{location, Location};
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{

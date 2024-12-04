@@ -28,7 +28,7 @@ use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMe
 use lance_table::io::deletion::deletion_file_path;
 use pyo3::prelude::*;
 use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
-use snafu::{location, Location};
+use lance_core::location;
 
 use crate::dataset::{get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;

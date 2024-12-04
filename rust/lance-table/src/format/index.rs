@@ -4,8 +4,9 @@
 //! Metadata for index
 
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+
 use uuid::Uuid;
 
 use super::pb;

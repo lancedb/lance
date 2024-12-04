@@ -4,8 +4,9 @@
 use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
+use lance_core::location;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;

@@ -49,6 +49,7 @@ use futures::{
     stream::{self},
     Stream, StreamExt, TryStreamExt,
 };
+use lance_core::location;
 use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
@@ -64,7 +65,7 @@ use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
-use snafu::{location, Location, ResultExt};
+use snafu::ResultExt;
 use tokio::task::JoinSet;
 
 use crate::{

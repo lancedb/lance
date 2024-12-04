@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
+use lance_core::location;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -34,7 +35,7 @@ use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
