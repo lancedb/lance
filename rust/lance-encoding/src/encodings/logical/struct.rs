@@ -42,21 +42,21 @@ struct SchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for SchedulingJobWithStatus<'a> {
+impl PartialEq for SchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for SchedulingJobWithStatus<'a> {}
+impl Eq for SchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for SchedulingJobWithStatus<'a> {
+impl PartialOrd for SchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for SchedulingJobWithStatus<'a> {
+impl Ord for SchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -106,7 +106,7 @@ impl<'a> SimpleStructSchedulerJob<'a> {
     }
 }
 
-impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
+impl SchedulingJob for SimpleStructSchedulerJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,

@@ -62,7 +62,7 @@ pub trait ObjectStoreExt {
         &self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>>;
+    ) -> Result<BoxStream<'life0, Result<ObjectMeta>>>;
 }
 
 #[async_trait]
@@ -71,7 +71,7 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
         &self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
+    ) -> Result<BoxStream<'life0, Result<ObjectMeta>>> {
         let mut output = self.list(Some(dir_path.into()));
         if let Some(unmodified_since_val) = unmodified_since {
             output = output
@@ -652,7 +652,7 @@ impl ObjectStore {
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<Result<Path>> {
+    ) -> BoxStream<'a, Result<Path>> {
         self.inner
             .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
             .err_into::<Error>()

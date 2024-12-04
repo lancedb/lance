@@ -15,7 +15,6 @@ use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
-use datafusion::physical_expr_common::aggregate::AggregateExprBuilder;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
