@@ -406,6 +406,62 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
     }
 }
 
+// If debug assertions are on, then we are running locally, so should use local
+// paths.
+// #[cfg(debug_assertions)]
+// #[macro_export]
+// macro_rules! location {
+//     () => {
+//         // This is the same thing as what snafu does.
+//         snafu::Location::new(file!(), line!(), column!())
+//     }
+// }
+
+// #[cfg(not(debug_assertions))]
+#[macro_export]
+macro_rules! location {
+    () => {{
+        // Goal is to get a URL to a github location:
+        // https://github.com/lancedb/lance/blob/v0.19.2/rust/lance-table/src/format.rs#L42
+        // This has two advantages:
+        // 1. All error reports have the Lance version in them.
+        // 2. We can immediately click through the line to the source code.
+        // We need these to be const because we want the final location to be &'static str
+        const GH_PREFIX: &str = concat!(
+            env!("CARGO_PKG_REPOSITORY"),
+            "/blob/v",
+            env!("CARGO_PKG_VERSION")
+        );
+
+        // Sometimes file!() returns an absolute path, sometimes a relative path.
+        // The exact value is complex, and depends whether it's being built as a
+        // dependency or not. See: https://github.com/rust-lang/rust/issues/117605
+        // To get a relative path, we use a sample path to precompute how much is
+        // necessary to chop off.
+        const PREFIX_SIZE: usize = crate::error::path_prefix_length();
+        const RELATIVE_PATH: &str = unsafe { crate::error::split_str_at(file!(), PREFIX_SIZE).1 };
+
+        const LOCATION: &str =
+            const_format::concatcp!(GH_PREFIX, "/", RELATIVE_PATH, "#L", line!());
+        snafu::Location::new(LOCATION, line!(), column!())
+    }};
+}
+
+pub(crate) const fn path_prefix_length() -> usize {
+    let this_file = file!();
+    let suffix = "rust/lance-core/src/error.rs";
+    this_file.len() - suffix.len()
+}
+
+/// SAFETY: must have determined that `at` is a valid byte boundary.
+pub(crate) const unsafe fn split_str_at(s: &str, at: usize) -> (&str, &str) {
+    let s_bytes: &[u8] = s.as_bytes();
+    let (before, after) = s_bytes.split_at(at);
+    (unsafe { std::str::from_utf8_unchecked(before) }, unsafe {
+        std::str::from_utf8_unchecked(after)
+    })
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -430,5 +486,27 @@ mod test {
             #[allow(unreachable_patterns)]
             _ => panic!("expected ObjectStore error"),
         }
+    }
+
+    #[test]
+    fn test_github_path() {
+        // These are collected from error reports from various repos
+        // let example_paths = [
+        //     // relative path
+        //     "rust/lance-core/src/error.rs",
+        //     // absolute path on a runner
+        //     "/home/runner/work/lance/lance/rust/lance-core/src/error.rs",
+        //     // relative path within a git submodule
+        //     "/src/lance/rust/lance-core/src/error.rs",
+        // ];
+
+        let expected = format!(
+            "https://github.com/lancedb/lance/blob/v{}/rust/lance-core/src/error.rs",
+            env!("CARGO_PKG_VERSION")
+        );
+        let actual = location!().to_string();
+        // Strip off the line number
+        let actual = actual.split('#').next().unwrap();
+        assert_eq!(actual, expected);
     }
 }
