@@ -25,11 +25,123 @@ message Transaction {
   // The UUID that unique identifies a transaction.
   string uuid = 2;
 
-  reserved 3; // Deprecated "tag"
+  reserved 3;  // Deprecated "tag"
 
-  // A human-readable description of the transaction.
-  // This might be the SQL query that generated the transaction, for example.
-  string description = 4;
+  // The list of operations that make up this transaction.
+  //
+  // The user operations are logical groupings of actions. These actions can be
+  // applied in sequence to the manifest to produce the final manifest.
+  //
+  // By grouping actions together, we can provide a human-readable history of
+  // the table.
+  //
+  // For example, consider the SQL query:
+  // 
+  // ```sql
+  // BEGIN TRANSACTION;
+  // CREATE TABLE t (a INT);
+  // INSERT INTO t VALUES (1);
+  // SET CONFIG ON TABLE t lance.compaction.max_rows_per_file=100000
+  // COMMIT;
+  // ```
+  // 
+  // Would be represented as:
+  //
+  // ```yaml
+  // user_operations:
+  // - description: "CREATE TABLE t (a INT);"
+  //   uuid: 123e4567-e89b-12d3-a456-426655440001
+  //   read_version: 0
+  //   actions:
+  //     - type: replace_schema
+  //       schema:
+  //         - name: a
+  //           type: leaf
+  //           logical_type: int
+  //           nullable: true
+  // - description: "INSERT INTO t VALUES (1);"
+  //   uuid: 123e4567-e89b-12d3-a456-426655440002
+  //   read_version: 0
+  //   actions:
+  //     - type: add_fragments
+  //       fragments:
+  //         - id: 0
+  //           files:
+  //             - path: data/123e4567-e89b-12d3-a456-426655440000.lance
+  //               fields: [0]
+  // - description: "SET CONFIG ON TABLE t lance.compaction.max_rows_per_file=100000"
+  //   uuid: 123e4567-e89b-12d3-a456-426655440003
+  //   read_version: 0
+  //   actions:
+  //     - type: upsert_config
+  //       upsert_values:
+  //         - key: lance.compaction.max_rows_per_file
+  //           value: 100000
+  // ```
+  message CompositeOperation {
+    repeated UserOperation user_operations = 1;
+  }
+
+  // A logical grouping of actions that correspond to a single user action.
+  message UserOperation {
+    uint64 read_version = 1;
+    string uuid = 2;
+    string description = 4;
+    repeated Action actions = 5;
+  }
+
+  // An action to apply to the manifest.
+  message Action {
+    message AddFragments {
+      repeated DataFragment fragments = 1;
+    }
+
+    message DeleteFragments {
+      repeated uint64 deleted_fragment_ids = 1;
+    }
+
+    message UpdateFragments {
+      repeated DataFragment updated_fragments = 1;
+    }
+
+    message ReplaceFragments {
+      repeated DataFragment fragments = 1;
+    }
+
+    message ReplaceSchema {
+      repeated lance.file.Field schema = 1;
+      map<string, string> schema_metadata = 2;
+    }
+
+    message UpsertConfig {
+      map<string, string> upsert_values = 1;
+      repeated string delete_keys = 2;
+    }
+
+    message AddIndices {
+      repeated IndexMetadata indices = 1;
+    }
+
+    message RemoveIndices {
+      repeated IndexMetadata indices = 1;
+    }
+
+    message ReserveFragments {
+      uint32 num_fragments = 1;
+    }
+
+    oneof action {
+      AddFragments add_fragments = 1;
+      DeleteFragments delete_fragments = 2;
+      UpdateFragments update_fragments = 3;
+      ReplaceFragments replace_fragments = 4;
+      ReplaceSchema replace_schema = 5;
+      UpsertConfig upsert_config = 6;
+      AddIndices add_indices = 8;
+      RemoveIndices remove_indices = 9;
+      ReserveFragments reserve_fragments = 10;
+    }
+  }
 
   // Add new rows to the dataset.
   message Append {
@@ -49,7 +161,7 @@ message Transaction {
     repeated uint64 deleted_fragment_ids = 2;
     // The predicate that was evaluated
     //
-    // This may be used to determine whether the delete would have affected 
+    // This may be used to determine whether the delete would have affected
     // files written by a concurrent transaction.
     string predicate = 3;
   }
@@ -161,46 +273,14 @@ message Transaction {
     // The new fragments where updated rows have been moved to.
     repeated DataFragment new_fragments = 3;
   }
-  
+
   // An operation that updates the table config.
   message UpdateConfig {
     map<string, string> upsert_values = 1;
     repeated string delete_keys = 2;
   }
 
-  message ReplaceSchemaMetadata {
-    map<string, bytes> replace_values = 1;
-  }
-
-  message UpdateSchemaMetadata {
-    map<string, bytes> upsert_values = 1;
-    repeated string delete_keys = 2;
-  }
-
-  // A generic composite operation
-  message CompositeOperation {
-    bool remove_existing_fragments = 1;
-    // Fragment changes
-    repeated DataFragment new_fragments = 2;
-    repeated DataFragment moved_row_fragments = 3;
-    repeated DataFragment modified_fragments = 4;
-    repeated uint32 deleted_fragment_ids = 5;
-    // Index changes
-    repeated IndexMetadata new_indices = 6;
-    repeated IndexMetadata removed_indices = 7;
-    // Metadata
-    // The new schema
-    repeated lance.file.Field schema = 8;
-    // Schema metadata.
-    oneof schema_metadata_update {
-      ReplaceSchemaMetadata replace_schema_metadata = 9;
-      UpdateSchemaMetadata update_schema_metadata = 10;
-    }
-    // TODO: upsert and delete in schema metadata
-    // Key-value pairs to merge with existing config.
-    UpdateConfig config_update = 11;
-  }
-
+  // TODO: deprecate operation
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -221,5 +301,6 @@ message Transaction {
   oneof blob_operation {
     Append blob_append = 200;
     Overwrite blob_overwrite = 202;
-  }  
+    CompositeOperation blob_composite = 203;
+  }
 }

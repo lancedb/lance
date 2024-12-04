@@ -43,11 +43,7 @@ use std::{
     sync::Arc,
 };
 
-use deepsize::DeepSizeOf;
-use lance_core::{datatypes::Schema, Error, Result};
-use lance_file::{datatypes::Fields, version::LanceFileVersion};
-use lance_io::object_store::ObjectStore;
-use lance_table::{
+use crate::{
     format::{
         pb::{self, IndexMetadata},
         DataStorageFormat, Fragment, Index, Manifest, RowIdMeta,
@@ -58,502 +54,91 @@ use lance_table::{
     },
     rowids::{write_row_ids, RowIdSequence},
 };
+use deepsize::DeepSizeOf;
+use lance_core::{datatypes::Schema, Error, Result};
+use lance_file::{datatypes::Fields, version::LanceFileVersion};
+use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
-use uuid::Uuid;
+use v1::operation::Operation;
+use v2::UserOperation;
 
-use super::ManifestWriteConfig;
-use crate::utils::temporal::timestamp_to_nanos;
-use lance_table::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
+use crate::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
+use crate::utils::timestamp_to_nanos;
+
+pub mod v1;
+pub mod v2;
 
 /// A change to a dataset that can be retried
 ///
 /// This contains enough information to be able to build the next manifest,
 /// given the current manifest.
 #[derive(Debug, Clone, DeepSizeOf)]
-pub struct Transaction {
-    /// The version of the table this transaction is based off of. If this is
-    /// the first transaction, this should be 0.
-    pub read_version: u64,
-    pub uuid: String,
-    pub operation: Operation,
-    /// If the transaction modified the blobs dataset, this is the operation
-    /// to apply to the blobs dataset.
-    ///
-    /// If this is `None`, then the blobs dataset was not modified
-    pub blobs_op: Option<Operation>,
-    pub tag: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum BlobsOperation {
-    /// The operation did not modify the blobs dataset
-    Unchanged,
-    /// The operation modified the blobs dataset, contains the new version of the blobs dataset
-    Updated(u64),
-}
-
-/// An operation on a dataset.
-#[derive(Debug, Clone, DeepSizeOf)]
-pub enum Operation {
-    /// Adding new fragments to the dataset. The fragments contained within
-    /// haven't yet been assigned a final ID.
-    Append { fragments: Vec<Fragment> },
-    /// Updated fragments contain those that have been modified with new deletion
-    /// files. The deleted fragment IDs are those that should be removed from
-    /// the manifest.
-    Delete {
-        updated_fragments: Vec<Fragment>,
-        deleted_fragment_ids: Vec<u64>,
-        predicate: String,
-    },
-    /// Overwrite the entire dataset with the given fragments. This is also
-    /// used when initially creating a table.
-    Overwrite {
-        fragments: Vec<Fragment>,
-        schema: Schema,
-        config_upsert_values: Option<HashMap<String, String>>,
-    },
-    /// A new index has been created.
-    CreateIndex {
-        /// The new secondary indices that are being added
-        new_indices: Vec<Index>,
-        /// The indices that have been modified.
-        removed_indices: Vec<Index>,
-    },
-    /// Data is rewritten but *not* modified. This is used for things like
-    /// compaction or re-ordering. Contains the old fragments and the new
-    /// ones that have been replaced.
-    ///
-    /// This operation will modify the row addresses of existing rows and
-    /// so any existing index covering a rewritten fragment will need to be
-    /// remapped.
-    Rewrite {
-        /// Groups of fragments that have been modified
-        groups: Vec<RewriteGroup>,
-        /// Indices that have been updated with the new row addresses
-        rewritten_indices: Vec<RewrittenIndex>,
-    },
-    /// Merge a new column in
-    Merge {
-        fragments: Vec<Fragment>,
-        schema: Schema,
-    },
-    /// Restore an old version of the database
-    Restore { version: u64 },
-    /// Reserves fragment ids for future use
-    /// This can be used when row ids need to be known before a transaction
-    /// has been committed.  It is used during a rewrite operation to allow
-    /// indices to be remapped to the new row ids as part of the operation.
-    ReserveFragments { num_fragments: u32 },
-
-    /// Update values in the dataset.
-    Update {
-        /// Ids of fragments that have been moved
-        removed_fragment_ids: Vec<u64>,
-        /// Fragments that have been updated
-        updated_fragments: Vec<Fragment>,
-        /// Fragments that have been added
-        new_fragments: Vec<Fragment>,
-    },
-
-    /// Project to a new schema. This only changes the schema, not the data.
-    Project { schema: Schema },
-
-    /// Update the dataset configuration.
-    UpdateConfig {
-        upsert_values: Option<HashMap<String, String>>,
-        delete_keys: Option<Vec<String>>,
-    },
-
-    /// An operation that is a composite of other operations.
-    Composite(CompositeOperation),
-}
-
-#[derive(Debug, Clone)]
-pub struct RewrittenIndex {
-    pub old_id: Uuid,
-    pub new_id: Uuid,
-}
-
-impl DeepSizeOf for RewrittenIndex {
-    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
-        0
-    }
-}
-
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct RewriteGroup {
-    pub old_fragments: Vec<Fragment>,
-    pub new_fragments: Vec<Fragment>,
-}
-
-#[derive(Debug, Clone, DeepSizeOf, Default)]
-pub struct CompositeOperation {
-    pub remove_existing_fragments: bool,
-    pub new_fragments: Vec<Fragment>,
-    pub moved_row_fragments: Vec<Fragment>,
-    pub modified_fragments: Vec<Fragment>,
-    pub deleted_fragment_ids: Vec<u32>,
-    pub new_indices: Vec<Index>,
-    pub removed_indices: Vec<Index>,
-    pub schema: Schema,
-    pub schema_metadata_upsert_values: HashMap<String, String>,
-    pub config_upsert_values: HashMap<String, String>,
-    pub config_delete_keys: Vec<String>,
-}
-
-impl Operation {
-    /// Returns the IDs of fragments that have been modified by this operation.
-    ///
-    /// This does not include new fragments.
-    fn modified_fragment_ids(&self) -> Box<dyn Iterator<Item = u64> + '_> {
-        match self {
-            // These operations add new fragments or don't modify any.
-            Self::Append { .. }
-            | Self::Overwrite { .. }
-            | Self::CreateIndex { .. }
-            | Self::ReserveFragments { .. }
-            | Self::Project { .. }
-            | Self::UpdateConfig { .. }
-            | Self::Restore { .. } => Box::new(std::iter::empty()),
-            Self::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                ..
-            } => Box::new(
-                updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(deleted_fragment_ids.iter().copied()),
-            ),
-            Self::Rewrite { groups, .. } => Box::new(
-                groups
-                    .iter()
-                    .flat_map(|f| f.old_fragments.iter().map(|f| f.id)),
-            ),
-            Self::Merge { fragments, .. } => Box::new(fragments.iter().map(|f| f.id)),
-            Self::Update {
-                updated_fragments,
-                removed_fragment_ids,
-                ..
-            } => Box::new(
-                updated_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(removed_fragment_ids.iter().copied()),
-            ),
-            Self::Composite(CompositeOperation {
-                modified_fragments,
-                deleted_fragment_ids: deleted_fragments,
-                ..
-            }) => Box::new(
-                modified_fragments
-                    .iter()
-                    .map(|f| f.id)
-                    .chain(deleted_fragments.iter().map(|id| *id as u64)),
-            ),
-        }
-    }
-
-    /// Returns the config keys that have been upserted by this operation.
-    fn get_upsert_config_keys(&self) -> Vec<String> {
-        match self {
-            Self::Overwrite {
-                config_upsert_values: Some(upsert_values),
-                ..
-            } => {
-                let vec: Vec<String> = upsert_values.keys().cloned().collect();
-                vec
-            }
-            Self::UpdateConfig {
-                upsert_values: Some(uv),
-                ..
-            } => {
-                let vec: Vec<String> = uv.keys().cloned().collect();
-                vec
-            }
-            _ => Vec::<String>::new(),
-        }
-    }
-
-    /// Returns the config keys that have been deleted by this operation.
-    fn get_delete_config_keys(&self) -> &[String] {
-        match self {
-            Self::UpdateConfig {
-                delete_keys: Some(dk),
-                ..
-            } => dk.as_slice(),
-            Self::Composite(CompositeOperation {
-                config_delete_keys, ..
-            }) => config_delete_keys.as_slice(),
-            _ => &[],
-        }
-    }
-
-    /// Check whether another operation modifies the same fragment IDs as this one.
-    fn modifies_same_ids(&self, other: &Self) -> bool {
-        let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
-        let mut other_ids = other.modified_fragment_ids();
-        other_ids.any(|id| self_ids.contains(&id))
-    }
-
-    /// Check whether another operation upserts a key that is referenced by another operation
-    fn upsert_key_conflict(&self, other: &Self) -> bool {
-        let self_upsert_keys = self.get_upsert_config_keys();
-        let other_upsert_keys = other.get_upsert_config_keys();
-
-        let self_delete_keys = self.get_delete_config_keys();
-        let other_delete_keys = other.get_delete_config_keys();
-
-        self_upsert_keys
-            .iter()
-            .any(|x| other_upsert_keys.contains(x) || other_delete_keys.contains(x))
-            || other_upsert_keys
-                .iter()
-                .any(|x| self_upsert_keys.contains(x) || self_delete_keys.contains(x))
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Append { .. } => "Append",
-            Self::Delete { .. } => "Delete",
-            Self::Overwrite { .. } => "Overwrite",
-            Self::CreateIndex { .. } => "CreateIndex",
-            Self::Rewrite { .. } => "Rewrite",
-            Self::Merge { .. } => "Merge",
-            Self::ReserveFragments { .. } => "ReserveFragments",
-            Self::Restore { .. } => "Restore",
-            Self::Update { .. } => "Update",
-            Self::Project { .. } => "Project",
-            Self::UpdateConfig { .. } => "UpdateConfig",
-            Self::Composite(_) => "Composite",
-        }
-    }
-
-    /// Try to convert the operation into a composite operation.
-    ///
-    /// If the operation is already a composite operation, it will be returned.
-    /// If the operation is not a composite operation, it will be converted into
-    /// a composite operation.
-    ///
-    /// However, if the operation cannot be converted into a composite operation,
-    /// the original operation will be returned as the error.
-    ///
-    /// The following operations are not yet supported:
-    ///
-    /// * ReserveFragments
-    /// * Restore
-    /// * Rewrite
-    pub fn into_composite(self) -> std::result::Result<CompositeOperation, Self> {
-        match self {
-            Self::Composite(op) => Ok(op),
-            Self::Append { fragments } => Ok(CompositeOperation {
-                new_fragments: fragments,
-                ..Default::default()
-            }),
-            Self::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values,
-            } => Ok(CompositeOperation {
-                new_fragments: fragments,
-                schema,
-                schema_metadata_upsert_values: config_upsert_values.unwrap_or_default(),
-                remove_existing_fragments: true,
-                ..Default::default()
-            }),
-            Self::Delete {
-                updated_fragments,
-                deleted_fragment_ids,
-                ..
-            } => Ok(CompositeOperation {
-                modified_fragments: updated_fragments,
-                deleted_fragment_ids: deleted_fragment_ids
-                    .into_iter()
-                    .map(|id| id as u32)
-                    .collect(),
-                ..Default::default()
-            }),
-            Self::CreateIndex {
-                new_indices,
-                removed_indices,
-            } => Ok(CompositeOperation {
-                new_indices,
-                removed_indices,
-                ..Default::default()
-            }),
-            Self::Update {
-                removed_fragment_ids,
-                updated_fragments,
-                new_fragments,
-            } => Ok(CompositeOperation {
-                deleted_fragment_ids: removed_fragment_ids
-                    .into_iter()
-                    .map(|id| id as u32)
-                    .collect(),
-                modified_fragments: updated_fragments,
-                new_fragments,
-                ..Default::default()
-            }),
-            Self::Project { schema } => Ok(CompositeOperation {
-                schema,
-                ..Default::default()
-            }),
-            Self::UpdateConfig {
-                upsert_values,
-                delete_keys,
-            } => Ok(CompositeOperation {
-                config_upsert_values: upsert_values.unwrap_or_default(),
-                config_delete_keys: delete_keys.unwrap_or_default(),
-                ..Default::default()
-            }),
-            Self::Merge { fragments, schema } => Ok(CompositeOperation {
-                new_fragments: fragments,
-                schema,
-                ..Default::default()
-            }),
-            Self::Rewrite { .. } | Self::Restore { .. } | Self::ReserveFragments { .. } => {
-                Err(self)
-            }
-        }
-    }
+pub enum Transaction {
+    /// A transaction based on a sequence of [UserOperation]s. Each
+    /// [UserOperation] contains a sequence of [v2::action::Action]s.
+    V2(v2::Transaction),
+    /// A transaction based on of an [Operation].
+    V1(v1::Transaction),
 }
 
 impl Transaction {
-    pub fn new(
-        read_version: u64,
-        operation: Operation,
-        blobs_op: Option<Operation>,
-        tag: Option<String>,
-    ) -> Self {
+    pub fn new_v1(read_version: u64, operation: Operation, blobs_op: Option<Operation>) -> Self {
         let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
-        Self {
+        Self::V1(v1::Transaction {
             read_version,
             uuid,
             operation,
             blobs_op,
-            tag,
+        })
+    }
+
+    pub fn new_v2(
+        read_version: u64,
+        operations: Vec<UserOperation>,
+        blob_ops: Vec<UserOperation>,
+    ) -> Self {
+        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
+        Self::V2(v2::Transaction {
+            read_version,
+            uuid,
+            operations,
+            blob_ops,
+        })
+    }
+
+    pub fn try_into_v2(self) -> Result<v2::Transaction> {
+        match self {
+            Self::V2(tx) => Ok(tx),
+            Self::V1(tx) => v2::Transaction::try_from(tx),
         }
     }
 
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        // This assumes IsolationLevel is Snapshot Isolation, which is more
-        // permissive than Serializable. In particular, it allows a Delete
-        // transaction to succeed after a concurrent Append, even if the Append
-        // added rows that would be deleted.
-        match &self.operation {
-            Operation::Append { .. } => match &other.operation {
-                // Append is compatible with anything that doesn't change the schema
-                Operation::Append { .. } => false,
-                Operation::Rewrite { .. } => false,
-                Operation::CreateIndex { .. } => false,
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Rewrite { .. } => match &other.operation {
-                // Rewrite is only compatible with operations that don't touch
-                // existing fragments.
-                // TODO: it could also be compatible with operations that update
-                // fragments we don't touch.
-                Operation::Append { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // As long as they rewrite disjoint fragments they shouldn't conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            // Restore always succeeds
-            Operation::Restore { .. } => false,
-            // ReserveFragments is compatible with anything that doesn't reset the
-            // max fragment id.
-            Operation::ReserveFragments { .. } => matches!(
-                &other.operation,
-                Operation::Overwrite { .. } | Operation::Restore { .. }
-            ),
-            Operation::CreateIndex { .. } => match &other.operation {
-                Operation::Append { .. } => false,
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                Operation::CreateIndex { .. } => false,
-                // Although some of the rows we indexed may have been deleted / moved,
-                // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                // Merge & reserve don't change row ids, so this should be fine.
-                Operation::Merge { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                // Rewrite likely changed many of the row ids, so our index is
-                // likely useless. It should be rebuilt.
-                // TODO: we could be smarter here and only invalidate the index
-                // if the rewrite changed more than X% of row ids.
-                Operation::Rewrite { .. } => true,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
-                Operation::CreateIndex { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // If we update the same fragments, we conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Project { .. } => false,
-                Operation::Append { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                match &other.operation {
-                    Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                        self.operation.upsert_key_conflict(&other.operation)
-                    }
-                    _ => false,
-                }
-            }
-            // Merge changes the schema, but preserves row ids, so the only operations
-            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
-            Operation::Merge { .. } => !matches!(
-                &other.operation,
-                Operation::CreateIndex { .. }
-                    | Operation::ReserveFragments { .. }
-                    | Operation::UpdateConfig { .. }
-            ),
-            Operation::Project { .. } => match &other.operation {
-                // Project is compatible with anything that doesn't change the schema
-                Operation::CreateIndex { .. } => false,
-                Operation::Overwrite { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Composite(_) => {
-                todo!()
-            }
+        match (self, other) {
+            (Self::V1(slf), Self::V1(oth)) => slf.operation.conflicts_with(oth.operation),
+            _ => todo!(),
         }
     }
 
-    fn fragments_with_ids<'a, T>(
-        new_fragments: T,
-        fragment_id: &'a mut u64,
-    ) -> impl Iterator<Item = Fragment> + 'a
-    where
-        T: IntoIterator<Item = Fragment> + 'a,
-    {
-        new_fragments.into_iter().map(move |mut f| {
-            if f.id == 0 {
-                f.id = *fragment_id;
-                *fragment_id += 1;
-            }
-            f
-        })
-    }
+    // fn fragments_with_ids<'a, T>(
+    //     new_fragments: T,
+    //     fragment_id: &'a mut u64,
+    // ) -> impl Iterator<Item = Fragment> + 'a
+    // where
+    //     T: IntoIterator<Item = Fragment> + 'a,
+    // {
+    //     new_fragments.into_iter().map(move |mut f| {
+    //         if f.id == 0 {
+    //             f.id = *fragment_id;
+    //             *fragment_id += 1;
+    //         }
+    //         f
+    //     })
+    // }
 
     fn data_storage_format_from_files(
         fragments: &[Fragment],
@@ -1145,46 +730,8 @@ impl TryFrom<pb::Transaction> for Transaction {
                 }
             }
             Some(pb::transaction::Operation::Composite(pb::transaction::CompositeOperation {
-                remove_existing_fragments,
-                new_fragments,
-                moved_row_fragments,
-                modified_fragments,
-                deleted_fragment_ids,
-                new_indices,
-                removed_indices,
-                schema,
-                schema_metadata_update,
-                config_update,
-            })) => {
-                let mut schema = Schema::from(&Fields(schema));
-                Operation::Composite(CompositeOperation {
-                    remove_existing_fragments,
-                    new_fragments: new_fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                    moved_row_fragments: moved_row_fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                    modified_fragments: modified_fragments
-                        .into_iter()
-                        .map(Fragment::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                    deleted_fragment_ids,
-                    new_indices: new_indices
-                        .into_iter()
-                        .map(Index::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                    removed_indices: removed_indices
-                        .into_iter()
-                        .map(Index::try_from)
-                        .collect::<Result<Vec<_>>>()?,
-                    schema: Schema::from(&Fields(schema)),
-                    schema_update: schema_metadata_update.map(Schema::from),
-                    config_update: config_update,
-                })
-            }
+                user_operations,
+            })) => {}
             None => {
                 return Err(Error::Internal {
                     message: "Transaction message did not contain an operation".to_string(),
@@ -1232,54 +779,6 @@ impl TryFrom<pb::Transaction> for Transaction {
             operation,
             blobs_op,
             tag: None,
-        })
-    }
-}
-
-impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
-    type Error = Error;
-
-    fn try_from(message: &pb::transaction::rewrite::RewrittenIndex) -> Result<Self> {
-        Ok(Self {
-            old_id: message
-                .old_id
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| {
-                    Error::io(
-                        "required field (old_id) missing from message".to_string(),
-                        location!(),
-                    )
-                })??,
-            new_id: message
-                .new_id
-                .as_ref()
-                .map(Uuid::try_from)
-                .ok_or_else(|| {
-                    Error::io(
-                        "required field (new_id) missing from message".to_string(),
-                        location!(),
-                    )
-                })??,
-        })
-    }
-}
-
-impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
-    type Error = Error;
-
-    fn try_from(message: pb::transaction::rewrite::RewriteGroup) -> Result<Self> {
-        Ok(Self {
-            old_fragments: message
-                .old_fragments
-                .into_iter()
-                .map(Fragment::try_from)
-                .collect::<Result<Vec<_>>>()?,
-            new_fragments: message
-                .new_fragments
-                .into_iter()
-                .map(Fragment::try_from)
-                .collect::<Result<Vec<_>>>()?,
         })
     }
 }
@@ -1378,6 +877,20 @@ impl From<&Transaction> for pb::Transaction {
                 upsert_values: upsert_values.clone().unwrap_or(Default::default()),
                 delete_keys: delete_keys.clone().unwrap_or(Default::default()),
             }),
+            Operation::Composite(CompositeOperation {
+                remove_existing_fragments,
+                new_fragments,
+                moved_row_fragments,
+                modified_fragments,
+                deleted_fragment_ids,
+                new_indices,
+                removed_indices,
+                schema,
+                config_upsert_values,
+                config_delete_keys,
+            }) => {
+                todo!()
+            }
         };
 
         let blob_operation = value.blobs_op.as_ref().map(|op| match op {
@@ -1408,115 +921,9 @@ impl From<&Transaction> for pb::Transaction {
             uuid: value.uuid.clone(),
             operation: Some(operation),
             blob_operation,
+            description: Default::default(),
         }
     }
-}
-
-impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
-    fn from(value: &RewrittenIndex) -> Self {
-        Self {
-            old_id: Some((&value.old_id).into()),
-            new_id: Some((&value.new_id).into()),
-        }
-    }
-}
-
-impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
-    fn from(value: &RewriteGroup) -> Self {
-        Self {
-            old_fragments: value
-                .old_fragments
-                .iter()
-                .map(pb::DataFragment::from)
-                .collect(),
-            new_fragments: value
-                .new_fragments
-                .iter()
-                .map(pb::DataFragment::from)
-                .collect(),
-        }
-    }
-}
-
-/// Validate the operation is valid for the given manifest.
-pub fn validate_operation(manifest: Option<&Manifest>, operation: &Operation) -> Result<()> {
-    let manifest = match (manifest, operation) {
-        (
-            None,
-            Operation::Overwrite {
-                fragments,
-                schema,
-                config_upsert_values: None,
-            },
-        ) => {
-            // Validate here because we are going to return early.
-            schema_fragments_valid(schema, fragments)?;
-
-            return Ok(());
-        }
-        (Some(manifest), _) => manifest,
-        (None, _) => {
-            return Err(Error::invalid_input(
-                format!(
-                    "Cannot apply operation {} to non-existent dataset",
-                    operation.name()
-                ),
-                location!(),
-            ));
-        }
-    };
-
-    match operation {
-        Operation::Append { fragments } => {
-            // Fragments must contain all fields in the schema
-            schema_fragments_valid(&manifest.schema, fragments)
-        }
-        Operation::Project { schema } => {
-            schema_fragments_valid(schema, manifest.fragments.as_ref())
-        }
-        Operation::Merge { fragments, schema }
-        | Operation::Overwrite {
-            fragments,
-            schema,
-            config_upsert_values: None,
-        } => schema_fragments_valid(schema, fragments),
-        Operation::Update {
-            updated_fragments,
-            new_fragments,
-            ..
-        } => {
-            schema_fragments_valid(&manifest.schema, updated_fragments)?;
-            schema_fragments_valid(&manifest.schema, new_fragments)
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Check that each fragment contains all fields in the schema.
-/// It is not required that the schema contains all fields in the fragment.
-/// There may be masked fields.
-fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()> {
-    // TODO: add additional validation. Consider consolidating with various
-    // validate() methods in the codebase.
-    for fragment in fragments {
-        for field in schema.fields_pre_order() {
-            if !fragment
-                .files
-                .iter()
-                .flat_map(|f| f.fields.iter())
-                .any(|f_id| f_id == &field.id)
-            {
-                return Err(Error::invalid_input(
-                    format!(
-                        "Fragment {} does not contain field {:?}",
-                        fragment.id, field
-                    ),
-                    location!(),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

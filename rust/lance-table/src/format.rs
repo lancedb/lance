@@ -8,6 +8,8 @@ use uuid::Uuid;
 mod fragment;
 mod index;
 mod manifest;
+mod transaction;
+mod action;
 
 pub use fragment::*;
 pub use index::Index;
