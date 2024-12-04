@@ -27,8 +27,10 @@ use std::sync::Arc;
 
 use lance_file::version::LanceFileVersion;
 use lance_table::format::{
-    is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
-    WriterVersion, DETACHED_VERSION_MASK,
+    is_detached_version, pb,
+    transaction::{ManifestWriteConfig, Operation, Transaction},
+    DataStorageFormat, DeletionFile, Fragment, Index, Manifest, WriterVersion,
+    DETACHED_VERSION_MASK,
 };
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
@@ -44,8 +46,7 @@ use prost::Message;
 
 use super::ObjectStore;
 use crate::dataset::fragment::FileFragment;
-use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::{write_manifest_file, ManifestWriteConfig, BLOB_DIR};
+use crate::dataset::{write_manifest_file, BLOB_DIR};
 use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;

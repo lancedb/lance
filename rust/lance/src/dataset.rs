@@ -23,13 +23,15 @@ use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
+    transaction::{ManifestWriteConfig, Operation, Transaction},
+    Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock, ManifestLocation,
     ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
+use lance_table::utils::timestamp_to_nanos;
 use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
@@ -65,13 +67,12 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_detached_transaction, commit_new_dataset, commit_transaction};
 use crate::session::Session;
-use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
@@ -1568,27 +1569,6 @@ impl DatasetTakeRows for Dataset {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,              // default true
-    timestamp: Option<SystemTime>,             // default None
-    use_move_stable_row_ids: bool,             // default false
-    use_legacy_format: Option<bool>,           // default None
-    storage_format: Option<DataStorageFormat>, // default None
-}
-
-impl Default for ManifestWriteConfig {
-    fn default() -> Self {
-        Self {
-            auto_set_feature_flags: true,
-            timestamp: None,
-            use_move_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-        }
-    }
-}
-
 /// Commit a manifest file and create a copy at the latest manifest path.
 pub(crate) async fn write_manifest_file(
     object_store: &ObjectStore,
@@ -2025,7 +2005,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        use lance_table::feature_flags::FLAG_UNKNOWN;
+        use lance_table::{feature_flags::FLAG_UNKNOWN, format::DataStorageFormat};
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
