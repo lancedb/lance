@@ -29,6 +29,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::ArrowError;
 #[cfg(feature = "datagen")]
 use datagen::register_datagen;
+use dataset::align::register_align;
 use dataset::blob::LanceBlobFile;
 use dataset::cleanup::CleanupStats;
 use dataset::optimize::{
@@ -153,6 +154,7 @@ fn lance(py: Python, m: &PyModule) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     register_datagen(py, m)?;
     register_indices(py, m)?;
+    register_align(py, m)?;
     Ok(())
 }
 

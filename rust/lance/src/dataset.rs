@@ -42,6 +42,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::instrument;
 
+pub mod align;
 mod blob;
 pub mod builder;
 pub mod cleanup;
@@ -456,6 +457,21 @@ impl Dataset {
         builder
             .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
             .await
+    }
+
+    /// Create an empty [Dataset] with a given [Schema].
+    ///
+    /// Utility function that calls [Self::write] with an empty reader.
+    pub async fn write_empty(
+        schema: Schema,
+        dest: impl Into<WriteDestination<'_>>,
+        params: Option<WriteParams>,
+    ) -> Result<Self> {
+        let mut builder = InsertBuilder::new(dest);
+        if let Some(params) = &params {
+            builder = builder.with_params(params);
+        }
+        builder.execute_empty(schema).await
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s

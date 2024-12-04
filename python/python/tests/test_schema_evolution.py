@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import os
+import pickle
+import random
 import uuid
 from pathlib import Path
 
@@ -12,6 +14,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceDataset
+from lance.evolution import AddColumnsJob
 from lance.file import LanceFileReader, LanceFileWriter
 
 
@@ -512,3 +515,67 @@ def test_no_checkpoint_merge_columns(tmp_path: Path):
 
     with pytest.raises(ValueError, match="A checkpoint file cannot be used"):
         frag.merge_columns(some_udf, columns=["a"])
+
+
+def test_add_columns_task_dataset_offset(tmp_path: Path):
+    # Create our initial dataset
+    tab = pa.table({"a": range(1000)})
+    dataset = lance.write_dataset(tab, tmp_path / "primary", max_rows_per_file=100)
+
+    # Create a job to add a new column named "b"
+    job = AddColumnsJob.create(
+        dataset,
+        tmp_path / "tmp",
+        new_schema=pa.schema([pa.field("b", pa.int64())]),
+        join_key="_dataset_offset",
+    )
+
+    # We divide the input into 20 tasks and only run 14 of them (in random order)
+    task_ids = list(range(20))
+    random.shuffle(task_ids)
+    task_ids = task_ids[:14]
+
+    # Note: we only populate data for 700 rows so 300 rows will have null values
+    # Each task is responsible for adding 50 rows
+    data_shards = []
+    for task_id in task_ids:
+        offset = task_id * 50
+        old_data = dataset.to_table(offset=offset, limit=50)
+        col_b = pc.add(old_data["a"], 1)
+        offsets = pa.array([offset + i for i in range(50)], pa.uint64())
+        new_data = pa.table({"_dataset_offset": offsets, "b": col_b})
+
+        # Simulate pickling and unpickling the job
+        job = pickle.loads(pickle.dumps(job))
+        shard = job.add_data(new_data)
+        shard = pickle.loads(pickle.dumps(shard))
+        data_shards.append(shard)
+
+    # Prepare for alignment
+    (alignment_plan, source) = job.finish_adding_data(data_shards)
+    target = dataset
+
+    # Run the alignment tasks in random order
+    tasks = list(alignment_plan.tasks)
+    random.shuffle(tasks)
+
+    aligned_frags = [
+        pickle.loads(pickle.dumps(task)).execute(source._ds, target._ds)
+        for task in tasks
+    ]
+
+    # Commit the aligned fragments
+    alignment_plan.commit(aligned_frags, source._ds, target._ds)
+
+    # Check the final dataset
+    data = lance.dataset(tmp_path / "primary").to_table()
+
+    a_vals = data.column("a").to_pylist()
+    b_vals = data.column("b").to_pylist()
+
+    null_count = 0
+    for a_val, b_val in zip(a_vals, b_vals):
+        if b_val is None:
+            null_count += 1
+        else:
+            assert b_val == a_val + 1
