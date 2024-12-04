@@ -507,7 +507,7 @@ impl<'a> HnswLevelView<'a> {
     }
 }
 
-impl<'a> Graph for HnswLevelView<'a> {
+impl Graph for HnswLevelView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -528,7 +528,7 @@ impl<'a> HnswBottomView<'a> {
     }
 }
 
-impl<'a> Graph for HnswBottomView<'a> {
+impl Graph for HnswBottomView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -544,7 +544,7 @@ pub struct HnswQueryParams {
     pub ef: usize,
 }
 
-impl<'a> From<&'a Query> for HnswQueryParams {
+impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {

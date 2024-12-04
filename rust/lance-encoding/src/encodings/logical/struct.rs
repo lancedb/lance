@@ -239,21 +239,21 @@ struct StructuralSchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for StructuralSchedulingJobWithStatus<'a> {
+impl PartialEq for StructuralSchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for StructuralSchedulingJobWithStatus<'a> {}
+impl Eq for StructuralSchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for StructuralSchedulingJobWithStatus<'a> {
+impl PartialOrd for StructuralSchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for StructuralSchedulingJobWithStatus<'a> {
+impl Ord for StructuralSchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -297,7 +297,7 @@ impl<'a> RepDefStructSchedulingJob<'a> {
     }
 }
 
-impl<'a> StructuralSchedulingJob for RepDefStructSchedulingJob<'a> {
+impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,

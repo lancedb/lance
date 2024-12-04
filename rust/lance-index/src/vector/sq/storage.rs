@@ -398,7 +398,7 @@ impl<'a> SQDistCalculator<'a> {
     }
 }
 
-impl<'a> DistCalculator for SQDistCalculator<'a> {
+impl DistCalculator for SQDistCalculator<'_> {
     fn distance(&self, id: u32) -> f32 {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
