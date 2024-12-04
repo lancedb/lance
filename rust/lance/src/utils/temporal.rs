@@ -25,11 +25,3 @@ pub fn utc_now() -> DateTime<Utc> {
         .naive_utc();
     Utc.from_utc_datetime(&naive)
 }
-
-pub fn timestamp_to_nanos(timestamp: Option<SystemTime>) -> u128 {
-    let timestamp = timestamp.unwrap_or_else(SystemTime::now);
-    timestamp
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos()
-}
