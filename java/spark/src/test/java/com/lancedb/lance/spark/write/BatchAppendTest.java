@@ -17,6 +17,7 @@ package com.lancedb.lance.spark.write;
 import com.lancedb.lance.Dataset;
 import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.LanceConfig;
+
 import org.apache.arrow.dataset.scanner.Scanner;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -30,7 +31,6 @@ import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
-import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.ArrowUtils;
@@ -38,15 +38,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class BatchAppendTest {
-  @TempDir
-  static Path tempDir;
+  @TempDir static Path tempDir;
 
   @Test
   public void testLanceDataWriter(TestInfo testInfo) throws Exception {
@@ -68,12 +66,12 @@ public class BatchAppendTest {
       WriterCommitMessage message;
       try (DataWriter<InternalRow> writer = factor.createWriter(0, 0)) {
         for (int i = 0; i < rows; i++) {
-          InternalRow row = new GenericInternalRow(new Object[]{i});
+          InternalRow row = new GenericInternalRow(new Object[] {i});
           writer.write(row);
         }
         message = writer.commit();
       }
-      batchAppend.commit(new WriterCommitMessage[]{message});
+      batchAppend.commit(new WriterCommitMessage[] {message});
 
       // Validate lance dataset data
       try (Dataset dataset = Dataset.open(datasetUri, allocator)) {

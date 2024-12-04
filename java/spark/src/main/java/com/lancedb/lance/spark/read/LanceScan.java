@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.arrow.util.Preconditions;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.Batch;
@@ -69,14 +70,16 @@ public class LanceScan implements Batch, Scan, Serializable {
   private class LanceReaderFactory implements PartitionReaderFactory {
     @Override
     public PartitionReader<InternalRow> createReader(InputPartition partition) {
-      Preconditions.checkArgument(partition instanceof LanceInputPartition,
+      Preconditions.checkArgument(
+          partition instanceof LanceInputPartition,
           "Unknown InputPartition type. Expecting LanceInputPartition");
       return LanceRowPartitionReader.create((LanceInputPartition) partition);
     }
 
     @Override
     public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
-      Preconditions.checkArgument(partition instanceof LanceInputPartition,
+      Preconditions.checkArgument(
+          partition instanceof LanceInputPartition,
           "Unknown InputPartition type. Expecting LanceInputPartition");
       return new LanceColumnarPartitionReader((LanceInputPartition) partition);
     }

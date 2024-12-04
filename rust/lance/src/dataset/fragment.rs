@@ -531,6 +531,21 @@ impl FileFragment {
         builder.write(source, Some(id as u64)).await
     }
 
+    /// Create a list of [`FileFragment`] from a [`StreamingWriteSource`].
+    pub async fn create_fragments(
+        dataset_uri: &str,
+        source: impl StreamingWriteSource,
+        params: Option<WriteParams>,
+    ) -> Result<Vec<Fragment>> {
+        let mut builder = FragmentCreateBuilder::new(dataset_uri);
+
+        if let Some(params) = params.as_ref() {
+            builder = builder.write_params(params);
+        }
+
+        builder.write_fragments(source).await
+    }
+
     pub async fn create_from_file(
         filename: &str,
         dataset: &Dataset,

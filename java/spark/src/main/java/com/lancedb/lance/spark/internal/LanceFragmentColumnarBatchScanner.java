@@ -15,6 +15,7 @@
 package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.spark.read.LanceInputPartition;
+
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.vectorized.ArrowColumnVector;
@@ -27,16 +28,16 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
   private final ArrowReader arrowReader;
   private ColumnarBatch currentColumnarBatch;
 
-  public LanceFragmentColumnarBatchScanner(LanceFragmentScanner fragmentScanner,
-      ArrowReader arrowReader) {
+  public LanceFragmentColumnarBatchScanner(
+      LanceFragmentScanner fragmentScanner, ArrowReader arrowReader) {
     this.fragmentScanner = fragmentScanner;
     this.arrowReader = arrowReader;
   }
 
   public static LanceFragmentColumnarBatchScanner create(
       int fragmentId, LanceInputPartition inputPartition) {
-    LanceFragmentScanner fragmentScanner = LanceDatasetAdapter
-        .getFragmentScanner(fragmentId, inputPartition);
+    LanceFragmentScanner fragmentScanner =
+        LanceDatasetAdapter.getFragmentScanner(fragmentId, inputPartition);
     return new LanceFragmentColumnarBatchScanner(fragmentScanner, fragmentScanner.getArrowReader());
   }
 
@@ -47,16 +48,18 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
     }
     if (arrowReader.loadNextBatch()) {
       VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-      currentColumnarBatch = new ColumnarBatch(root.getFieldVectors().stream()
-          .map(ArrowColumnVector::new).toArray(ArrowColumnVector[]::new), root.getRowCount());
+      currentColumnarBatch =
+          new ColumnarBatch(
+              root.getFieldVectors().stream()
+                  .map(ArrowColumnVector::new)
+                  .toArray(ArrowColumnVector[]::new),
+              root.getRowCount());
       return true;
     }
     return false;
   }
 
-  /**
-   * @return the current batch, the caller responsible for closing the batch
-   */
+  /** @return the current batch, the caller responsible for closing the batch */
   public ColumnarBatch getCurrentBatch() {
     return currentColumnarBatch;
   }

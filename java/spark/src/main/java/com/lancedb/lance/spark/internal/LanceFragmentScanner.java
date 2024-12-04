@@ -20,8 +20,9 @@ import com.lancedb.lance.ReadOptions;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.spark.LanceConfig;
-import com.lancedb.lance.spark.read.LanceInputPartition;
 import com.lancedb.lance.spark.SparkOptions;
+import com.lancedb.lance.spark.read.LanceInputPartition;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructField;
@@ -43,8 +44,8 @@ public class LanceFragmentScanner implements AutoCloseable {
     this.scanner = scanner;
   }
 
-  public static LanceFragmentScanner create(int fragmentId,
-      LanceInputPartition inputPartition, BufferAllocator allocator) {
+  public static LanceFragmentScanner create(
+      int fragmentId, LanceInputPartition inputPartition, BufferAllocator allocator) {
     Dataset dataset = null;
     DatasetFragment fragment = null;
     LanceScanner scanner = null;
@@ -79,9 +80,7 @@ public class LanceFragmentScanner implements AutoCloseable {
     return new LanceFragmentScanner(dataset, fragment, scanner);
   }
 
-  /**
-   * @return the arrow reader. The caller is responsible for closing the reader
-   */
+  /** @return the arrow reader. The caller is responsible for closing the reader */
   public ArrowReader getArrowReader() {
     return scanner.scanBatches();
   }
@@ -101,8 +100,6 @@ public class LanceFragmentScanner implements AutoCloseable {
   }
 
   private static List<String> getColumnNames(StructType schema) {
-    return Arrays.stream(schema.fields())
-        .map(StructField::name)
-        .collect(Collectors.toList());
+    return Arrays.stream(schema.fields()).map(StructField::name).collect(Collectors.toList());
   }
 }
