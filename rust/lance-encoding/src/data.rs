@@ -348,13 +348,17 @@ struct StructDataBlockBuilder {
 impl StructDataBlockBuilder {
     fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
         let mut children = vec![];
+        let total_bits: u32 = bits_per_values.iter().sum();
+        let total_bits = total_bits as u64;
+
         for bits_per_value in bits_per_values.iter() {
-            let child = FixedWidthDataBlockBuilder::new(*bits_per_value as u64, estimated_size_bytes);
+            let child = FixedWidthDataBlockBuilder::new(
+                *bits_per_value as u64,
+                estimated_size_bytes * (*bits_per_value as u64 + total_bits - 1) / total_bits,
+            );
             children.push(Box::new(child) as Box<dyn DataBlockBuilderImpl>);
         }
-        Self {
-            children,
-        }
+        Self { children }
     }
 }
 
@@ -654,7 +658,7 @@ impl StructDataBlock {
                 .into_iter()
                 .map(|c| c.remove_validity())
                 .collect(),
-            block_info: self.block_info.clone(),
+            block_info: self.block_info,
         }
     }
 
@@ -688,8 +692,10 @@ impl StructDataBlock {
     }
 
     pub fn data_size(&self) -> u64 {
-        self.children.iter()
-            .map(|data_block| data_block.data_size()).sum()
+        self.children
+            .iter()
+            .map(|data_block| data_block.data_size())
+            .sum()
     }
 }
 
@@ -950,7 +956,10 @@ impl DataBlock {
                         expect("Currently StructDataBlockBuilder is only used in packed-struct encoding, and currently in packed-struct encoding, only fixed-width fields are supported.");
                     bits_per_values.push(child.bits_per_value as u32);
                 }
-                Box::new(StructDataBlockBuilder::new(bits_per_values, estimated_size_bytes))
+                Box::new(StructDataBlockBuilder::new(
+                    bits_per_values,
+                    estimated_size_bytes,
+                ))
             }
             _ => todo!(),
         }
@@ -1411,7 +1420,10 @@ impl DataBlock {
                         .collect::<Vec<_>>();
                     children.push(Self::from_arrays(&child_vec, num_values));
                 }
-                Self::Struct(StructDataBlock { children, block_info: BlockInfo::default() })
+                Self::Struct(StructDataBlock {
+                    children,
+                    block_info: BlockInfo::default(),
+                })
             }
             DataType::FixedSizeList(_, dim) => {
                 let children = arrays

@@ -15,7 +15,13 @@ pub mod pb {
 }
 
 use pb::{
-    array_encoding::ArrayEncoding as ArrayEncodingEnum, buffer::BufferType, nullable::{AllNull, NoNull, Nullability, SomeNull}, page_layout::Layout, AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock, MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout
+    array_encoding::ArrayEncoding as ArrayEncodingEnum,
+    buffer::BufferType,
+    nullable::{AllNull, NoNull, Nullability, SomeNull},
+    page_layout::Layout,
+    AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
+    BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
+    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout,
 };
 
 use crate::encodings::physical::block_compress::CompressionConfig;

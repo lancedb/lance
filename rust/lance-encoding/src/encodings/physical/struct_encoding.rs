@@ -8,9 +8,7 @@ use snafu::{location, Location};
 
 use crate::{
     buffer::LanceBuffer,
-    data::{
-        BlockInfo, DataBlock, FixedWidthDataBlock, StructDataBlock,
-    },
+    data::{BlockInfo, DataBlock, FixedWidthDataBlock, StructDataBlock},
     decoder::MiniBlockDecompressor,
     encoder::{MiniBlockCompressed, MiniBlockCompressor},
     format::{
@@ -69,7 +67,6 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
                 let value_miniblock_compressor = Box::new(ValueEncoder::default()) as Box<dyn MiniBlockCompressor>;
                 let (value_miniblock_compressed, value_array_encoding) =
                 value_miniblock_compressor.compress(data_block)?;
-                println!("MiniBlockCompressed.num_values: {}", value_miniblock_compressed.num_values);
                 Ok((
                     value_miniblock_compressed,
                     ProtobufUtils::packed_struct_fixed_width_mini_block(value_array_encoding, bits_per_values),

@@ -824,10 +824,13 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
             }
         }
         if let DataBlock::Struct(ref struct_data_block) = data {
-            if struct_data_block.children.iter()
-                .any(|child|!matches!(child, DataBlock::FixedWidth(_))) {
-                    panic!("packed struct encoding currenlty only supports fixed-width fields.")
-                }
+            if struct_data_block
+                .children
+                .iter()
+                .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+            {
+                panic!("packed struct encoding currently only supports fixed-width fields.")
+            }
             return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
         }
         Ok(Box::new(ValueEncoder::default()))

@@ -236,15 +236,14 @@ impl ReaderProjection {
             if field_metadata
                 .get("packed")
                 .map(|v| v == "true")
-                .unwrap_or(false) {
-                    column_indices.push(curr_column_idx);
-                    curr_column_idx += 1;
-                    packed_struct_fields_num = field.children.len();
-            } else {
-                if field.children.is_empty() || !is_structural {
-                    column_indices.push(curr_column_idx);
-                    curr_column_idx += 1;
-                }
+                .unwrap_or(false)
+            {
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+                packed_struct_fields_num = field.children.len();
+            } else if field.children.is_empty() || !is_structural {
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
             }
         }
         Self {
