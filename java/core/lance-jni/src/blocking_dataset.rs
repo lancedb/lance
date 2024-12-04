@@ -227,7 +227,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_drop<'local>(
     let storage_options =
         ok_or_throw!(env, extract_storage_options(&mut env, &storage_options_obj));
     ok_or_throw!(env, BlockingDataset::drop(&path_str, storage_options));
-    return JObject::null();
+    JObject::null()
 }
 
 #[no_mangle]
