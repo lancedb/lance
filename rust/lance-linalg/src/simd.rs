@@ -42,7 +42,6 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     fn zeros() -> Self;
 
     /// Gather elements from the slice, using i32 indices.
-
     /// Load aligned data from aligned memory.
     ///
     /// # Safety

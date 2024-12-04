@@ -64,7 +64,7 @@ struct IopsReservation<'a> {
     value: Option<SemaphorePermit<'a>>,
 }
 
-impl<'a> IopsReservation<'a> {
+impl IopsReservation<'_> {
     // Forget the reservation, so it won't be released on drop
     fn forget(&mut self) {
         if let Some(value) = self.value.take() {

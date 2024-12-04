@@ -401,7 +401,7 @@ fn make_chunked_requests(
 }
 
 #[async_trait]
-impl<'a> Decoder for PlainDecoder<'a> {
+impl Decoder for PlainDecoder<'_> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }

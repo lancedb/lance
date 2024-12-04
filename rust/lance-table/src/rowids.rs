@@ -343,7 +343,7 @@ pub struct RowIdSeqSlice<'a> {
     offset_last: usize,
 }
 
-impl<'a> RowIdSeqSlice<'a> {
+impl RowIdSeqSlice<'_> {
     pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
         let mut known_size = self.segments.iter().map(|segment| segment.len()).sum();
         known_size -= self.offset_start;

@@ -152,7 +152,7 @@ pub struct Visited<'a> {
     recently_visited: Vec<u32>,
 }
 
-impl<'a> Visited<'a> {
+impl Visited<'_> {
     pub fn insert(&mut self, node_id: u32) {
         let node_id_usize = node_id as usize;
         if !self.visited[node_id_usize] {
@@ -171,7 +171,7 @@ impl<'a> Visited<'a> {
     }
 }
 
-impl<'a> Drop for Visited<'a> {
+impl Drop for Visited<'_> {
     fn drop(&mut self) {
         for node_id in self.recently_visited.iter() {
             self.visited.set(*node_id as usize, false);
