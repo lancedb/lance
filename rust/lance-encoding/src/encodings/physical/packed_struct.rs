@@ -151,7 +151,7 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
             children.push(child_block);
         }
-        Ok(DataBlock::Struct(StructDataBlock { children }))
+        Ok(DataBlock::Struct(StructDataBlock { children, block_info: BlockInfo::default() }))
     }
 }
 

@@ -587,15 +587,26 @@ pub struct StructuralStructDecoder {
 
 impl StructuralStructDecoder {
     pub fn new(fields: Fields, should_validate: bool) -> Self {
-        let children = fields
-            .iter()
-            .map(|field| Self::field_to_decoder(field, should_validate))
-            .collect();
-        let data_type = DataType::Struct(fields.clone());
-        Self {
-            data_type,
-            children,
-            child_fields: fields,
+        let field0_metadata = fields[0].metadata();
+        if field0_metadata.get("packed").map(|v| v == "true").unwrap_or(false) {
+            let data_type = DataType::Struct(fields.clone());
+            let child = StructuralPrimitiveFieldDecoder::new(&fields[0], should_validate);
+            Self {
+                data_type,
+                children: vec![Box::new(child)],
+                child_fields: fields,
+            }
+        } else {
+            let children = fields
+                .iter()
+                .map(|field| Self::field_to_decoder(field, should_validate))
+                .collect();
+            let data_type = DataType::Struct(fields.clone());
+            Self {
+                data_type,
+                children,
+                child_fields: fields,
+            }
         }
     }
 

@@ -251,6 +251,7 @@ use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
 use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
 use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
 use crate::repdef::{LevelBuffer, RepDefUnraveler};
@@ -510,6 +511,9 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::FsstMiniBlock(description) => {
                 Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
             }
+            pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
+                Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(&description)))
+            }
             _ => todo!(),
         }
     }
@@ -755,6 +759,15 @@ impl CoreFieldDecoderStrategy {
         }
         match &data_type {
             DataType::Struct(fields) => {
+                let field_metadata = &field.metadata;
+                if field_metadata.get("packed").map(|v| v == "true").unwrap_or(false) {
+                    let column_info = column_infos.expect_next()?;
+                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                        column_info.as_ref(),
+                        self.decompressor_strategy.as_ref(),
+                    )?);
+                    return Ok(scheduler);
+                }
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
                     let field_scheduler =

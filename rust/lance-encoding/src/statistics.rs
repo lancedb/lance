@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::AsArray;
+use arrow::{array::AsArray, datatypes::UInt64Type};
 use arrow_array::{Array, ArrowPrimitiveType, UInt64Array};
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
@@ -61,7 +61,7 @@ impl ComputeStat for DataBlock {
             Self::FixedSizeList(_) => {}
             Self::VariableWidth(data_block) => data_block.compute_stat(),
             Self::Opaque(data_block) => data_block.compute_stat(),
-            Self::Struct(_) => {}
+            Self::Struct(data_block) => data_block.compute_stat(),
             Self::Dictionary(_) => {}
         }
     }
@@ -371,8 +371,30 @@ impl GetStat for DictionaryDataBlock {
 }
 
 impl GetStat for StructDataBlock {
-    fn get_stat(&self, _stat: Stat) -> Option<Arc<dyn Array>> {
-        None
+    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
+        let block_info = self.block_info.0.read().unwrap();
+        if block_info.is_empty() {
+            panic!("get_stat should be called after statistics are computed.")
+        }
+        block_info.get(&stat).cloned()
+    }
+}
+
+impl ComputeStat for StructDataBlock {
+    fn compute_stat(&mut self) {
+        let data_size = self.data_size();
+        let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
+
+        let max_len = self
+            .children
+            .iter()
+            .map(|child| child.expect_single_stat::<UInt64Type>(Stat::MaxLength))
+            .sum::<u64>();
+        let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
+
+        let mut info = self.block_info.0.write().unwrap();
+        info.insert(Stat::DataSize, data_size_array);
+        info.insert(Stat::MaxLength, max_len_array);
     }
 }
 

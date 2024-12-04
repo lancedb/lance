@@ -33,6 +33,7 @@ use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
 use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
 use crate::statistics::{GetStat, Stat};
@@ -821,6 +822,13 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 }
                 return Ok(Box::new(BinaryMiniBlockEncoder::default()));
             }
+        }
+        if let DataBlock::Struct(ref struct_data_block) = data {
+            if struct_data_block.children.iter()
+                .any(|child|!matches!(child, DataBlock::FixedWidth(_))) {
+                    panic!("packed struct encoding currenlty only supports fixed-width fields.")
+                }
+            return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
         }
         Ok(Box::new(ValueEncoder::default()))
     }
