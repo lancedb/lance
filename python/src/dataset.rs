@@ -140,7 +140,7 @@ pub struct MergeInsertBuilder {
 #[pymethods]
 impl MergeInsertBuilder {
     #[new]
-    pub fn new(dataset: Bound<'_, PyAny>, on: Bound<'_, PyAny>) -> PyResult<Self> {
+    pub fn new(dataset: &Bound<'_, PyAny>, on: &Bound<'_, PyAny>) -> PyResult<Self> {
         let dataset: Py<Dataset> = dataset.extract()?;
         let ds = dataset.borrow(on.py()).ds.clone();
         // Either a single string, which we put in a vector or an iterator
@@ -347,7 +347,7 @@ impl Operation {
         name: String,
         fields: Vec<i32>,
         dataset_version: u64,
-        fragment_ids: Bound<'_, PySet>,
+        fragment_ids: &Bound<'_, PySet>,
     ) -> PyResult<Self> {
         let fragment_ids: Vec<u32> = fragment_ids
             .iter()
@@ -635,7 +635,7 @@ impl Dataset {
         use_stats: Option<bool>,
         substrait_filter: Option<Vec<u8>>,
         fast_search: Option<bool>,
-        full_text_query: Option<Bound<'_, PyDict>>,
+        full_text_query: Option<&Bound<'_, PyDict>>,
         late_materialization: Option<PyObject>,
         use_scalar_index: Option<bool>,
     ) -> PyResult<Scanner> {
@@ -991,7 +991,7 @@ impl Dataset {
         Ok(PyArrowType(Box::new(LanceReader::from_stream(stream))))
     }
 
-    fn alter_columns(&mut self, alterations: Bound<'_, PyList>) -> PyResult<()> {
+    fn alter_columns(&mut self, alterations: &Bound<'_, PyList>) -> PyResult<()> {
         let alterations = alterations
             .iter()
             .map(|obj| {
@@ -1079,7 +1079,7 @@ impl Dataset {
     #[pyo3(signature=(updates, predicate=None))]
     fn update(
         &mut self,
-        updates: Bound<'_, PyDict>,
+        updates: &Bound<'_, PyDict>,
         predicate: Option<&str>,
     ) -> PyResult<PyObject> {
         let mut builder = UpdateBuilder::new(self.ds.clone());
@@ -1089,7 +1089,7 @@ impl Dataset {
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
-        for (key, value) in &updates {
+        for (key, value) in updates {
             let column: &str = key.extract()?;
             let expr: &str = value.extract()?;
 
@@ -1426,6 +1426,7 @@ impl Dataset {
     }
 
     #[staticmethod]
+    #[pyo3(signature = (dest, storage_options = None))]
     fn drop(dest: String, storage_options: Option<HashMap<String, String>>) -> PyResult<()> {
         RT.spawn(None, async move {
             let (object_store, path) =
@@ -1444,7 +1445,7 @@ impl Dataset {
         dest: &Bound<PyAny>,
         operation: Operation,
         read_version: Option<u64>,
-        commit_lock: Option<Bound<'_, PyAny>>,
+        commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
@@ -1502,7 +1503,7 @@ impl Dataset {
     fn commit_batch<'py>(
         dest: &Bound<'py, PyAny>,
         transactions: Vec<Bound<'py, PyAny>>,
-        commit_lock: Option<Bound<'py, PyAny>>,
+        commit_lock: Option<&Bound<'py, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
@@ -1589,10 +1590,10 @@ impl Dataset {
     #[pyo3(signature = (reader, batch_size = None))]
     fn add_columns_from_reader(
         &mut self,
-        reader: Bound<'_, PyAny>,
+        reader: &Bound<'_, PyAny>,
         batch_size: Option<u32>,
     ) -> PyResult<()> {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(&reader)?;
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
 
@@ -1658,9 +1659,9 @@ impl Dataset {
 
 #[pyfunction(name = "_write_dataset")]
 pub fn write_dataset(
-    reader: Bound<'_, PyAny>,
-    dest: Bound<'_, PyAny>,
-    options: Bound<'_, PyDict>,
+    reader: &Bound<'_, PyAny>,
+    dest: &Bound<'_, PyAny>,
+    options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
     let params = get_write_params(options.as_gil_ref())?;
     let py = options.py();
@@ -1679,7 +1680,7 @@ pub fn write_dataset(
         RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
-        let batches = ArrowArrayStreamReader::from_pyarrow_bound(&reader)?;
+        let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
         RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
