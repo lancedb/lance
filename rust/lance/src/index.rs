@@ -21,7 +21,7 @@ use lance_index::scalar::expression::{
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::sq::ScalarQuantizer;
@@ -749,6 +749,16 @@ impl DatasetIndexInternalExt for Dataset {
                     "IVF_FLAT" => match value_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                             let ivf = IVFIndex::<FlatIndex, FlatQuantizer>::try_new(
+                                self.object_store.clone(),
+                                self.indices_dir(),
+                                uuid.to_owned(),
+                                Arc::downgrade(&self.session),
+                            )
+                            .await?;
+                            Ok(Arc::new(ivf) as Arc<dyn VectorIndex>)
+                        }
+                        DataType::UInt8 => {
+                            let ivf = IVFIndex::<FlatIndex, FlatBinQuantizer>::try_new(
                                 self.object_store.clone(),
                                 self.indices_dir(),
                                 uuid.to_owned(),

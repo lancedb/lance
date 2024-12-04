@@ -15,9 +15,10 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
@@ -252,18 +253,61 @@ pub(crate) async fn build_vector_index(
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
-        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
-            dataset.clone(),
-            column.to_owned(),
-            dataset.indices_dir().child(uuid),
-            params.metric_type,
-            Box::new(shuffler),
-            Some(ivf_params.clone()),
-            Some(()),
-            (),
-        )?
-        .build()
-        .await?;
+        let data_type = dataset
+            .schema()
+            .field(column)
+            .ok_or(Error::Schema {
+                message: format!("Column {} not found in schema", column),
+                location: location!(),
+            })?
+            .data_type();
+        match data_type {
+            DataType::FixedSizeList(f, _) => match f.data_type() {
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                    IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
+                        params.metric_type,
+                        Box::new(shuffler),
+                        Some(ivf_params.clone()),
+                        Some(()),
+                        (),
+                    )?
+                    .build()
+                    .await?;
+                }
+                DataType::UInt8 => {
+                    IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
+                        params.metric_type,
+                        Box::new(shuffler),
+                        Some(ivf_params.clone()),
+                        Some(()),
+                        (),
+                    )?
+                    .build()
+                    .await?;
+                }
+                _ => {
+                    return Err(Error::Index {
+                        message: format!(
+                            "Build Vector Index: invalid data type: {:?}",
+                            f.data_type()
+                        ),
+                        location: location!(),
+                    });
+                }
+            },
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid data type: {:?}", data_type),
+                    location: location!(),
+                });
+            }
+        }
     } else if is_ivf_pq(stages) {
         let len = stages.len();
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
