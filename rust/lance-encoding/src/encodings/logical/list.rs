@@ -22,9 +22,11 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, FixedWidthDataBlock},
     decoder::{
-        DecodeArrayTask, DecodeBatchScheduler, FieldScheduler, FilterExpression, ListPriorityRange,
-        LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding, PriorityRange,
-        ScheduledScanLine, SchedulerContext, SchedulingJob,
+        DecodeArrayTask, DecodeBatchScheduler, DecodedArray, FieldScheduler, FilterExpression,
+        ListPriorityRange, LogicalPageDecoder, MessageType, NextDecodeTask, PageEncoding,
+        PriorityRange, ScheduledScanLine, SchedulerContext, SchedulingJob,
+        StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+        StructuralSchedulingJob,
     },
     encoder::{
         ArrayEncoder, EncodeTask, EncodedArray, EncodedColumn, EncodedPage, FieldEncoder,
@@ -948,13 +950,18 @@ impl ListOffsetsEncoder {
     fn maybe_encode_offsets_and_validity(&mut self, list_arr: &dyn Array) -> Option<EncodeTask> {
         let offsets = Self::extract_offsets(list_arr);
         let validity = Self::extract_validity(list_arr);
+        let num_rows = offsets.len() as u64;
         // Either inserting the offsets OR inserting the validity could cause the
         // accumulation queue to fill up
-        if let Some(mut arrays) = self.accumulation_queue.insert(offsets, /*row_number=*/ 0) {
+        if let Some(mut arrays) = self
+            .accumulation_queue
+            .insert(offsets, /*row_number=*/ 0, num_rows)
+        {
             arrays.0.push(validity);
             Some(self.make_encode_task(arrays.0))
-        } else if let Some(arrays) =
-            self.accumulation_queue.insert(validity, /*row_number=*/ 0)
+        } else if let Some(arrays) = self
+            .accumulation_queue
+            .insert(validity, /*row_number=*/ 0, num_rows)
         {
             Some(self.make_encode_task(arrays.0))
         } else {
@@ -1176,6 +1183,7 @@ impl FieldEncoder for ListFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         // The list may have an offset / shorter length which means the underlying
         // values array could be longer than what we need to encode and so we need
@@ -1206,9 +1214,13 @@ impl FieldEncoder for ListFieldEncoder {
             .maybe_encode_offsets_and_validity(array.as_ref())
             .map(|task| vec![task])
             .unwrap_or_default();
-        let mut item_tasks =
-            self.items_encoder
-                .maybe_encode(items, external_buffers, repdef, row_number)?;
+        let mut item_tasks = self.items_encoder.maybe_encode(
+            items,
+            external_buffers,
+            repdef,
+            row_number,
+            num_rows,
+        )?;
         if !offsets_tasks.is_empty() && item_tasks.is_empty() {
             // An items page cannot currently be shared by two different offsets pages.  This is
             // a limitation in the current scheduler and could be addressed in the future.  As a result
@@ -1246,6 +1258,195 @@ impl FieldEncoder for ListFieldEncoder {
             Ok(columns)
         }
         .boxed()
+    }
+}
+
+/// A structural encoder for list fields
+///
+/// The list's offsets are added to the rep/def builder and the
+/// items are passed to the child.
+pub struct ListStructuralEncoder {
+    child: Box<dyn FieldEncoder>,
+}
+
+impl ListStructuralEncoder {
+    pub fn new(child: Box<dyn FieldEncoder>) -> Self {
+        Self { child }
+    }
+}
+
+impl FieldEncoder for ListStructuralEncoder {
+    fn maybe_encode(
+        &mut self,
+        array: ArrayRef,
+        external_buffers: &mut OutOfLineBuffers,
+        mut repdef: RepDefBuilder,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<Vec<EncodeTask>> {
+        if let Some(list_arr) = array.as_list_opt::<i32>() {
+            repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            self.child.maybe_encode(
+                list_arr.values().clone(),
+                external_buffers,
+                repdef,
+                row_number,
+                num_rows,
+            )
+        } else if let Some(list_arr) = array.as_list_opt::<i64>() {
+            repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            self.child.maybe_encode(
+                list_arr.values().clone(),
+                external_buffers,
+                repdef,
+                row_number,
+                num_rows,
+            )
+        } else {
+            panic!("List encoder used for non-list data")
+        }
+    }
+
+    fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
+        self.child.flush(external_buffers)
+    }
+
+    fn num_columns(&self) -> u32 {
+        self.child.num_columns()
+    }
+
+    fn finish(
+        &mut self,
+        external_buffers: &mut OutOfLineBuffers,
+    ) -> BoxFuture<'_, Result<Vec<crate::encoder::EncodedColumn>>> {
+        self.child.finish(external_buffers)
+    }
+}
+
+/// Scheduler for list data
+///
+/// All the heavy lifting is handled by the child but we need to make
+/// sure we unravel the offsets/validity after decoding the flattened
+/// items.
+#[derive(Debug)]
+pub struct StructuralListScheduler {
+    child: Box<dyn StructuralFieldScheduler>,
+}
+
+impl StructuralListScheduler {
+    pub fn new(child: Box<dyn StructuralFieldScheduler>) -> Self {
+        Self { child }
+    }
+}
+
+impl StructuralFieldScheduler for StructuralListScheduler {
+    fn schedule_ranges<'a>(
+        &'a self,
+        ranges: &[Range<u64>],
+        filter: &FilterExpression,
+    ) -> Result<Box<dyn StructuralSchedulingJob + 'a>> {
+        let child = self.child.schedule_ranges(ranges, filter)?;
+
+        Ok(Box::new(StructuralListSchedulingJob::new(child)))
+    }
+
+    fn initialize<'a>(
+        &'a mut self,
+        filter: &'a FilterExpression,
+        context: &'a SchedulerContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        self.child.initialize(filter, context)
+    }
+}
+
+#[derive(Debug)]
+struct StructuralListSchedulingJob<'a> {
+    child: Box<dyn StructuralSchedulingJob + 'a>,
+}
+
+impl<'a> StructuralListSchedulingJob<'a> {
+    fn new(child: Box<dyn StructuralSchedulingJob + 'a>) -> Self {
+        Self { child }
+    }
+}
+
+impl<'a> StructuralSchedulingJob for StructuralListSchedulingJob<'a> {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+    ) -> Result<Option<ScheduledScanLine>> {
+        self.child.schedule_next(context)
+    }
+}
+
+#[derive(Debug)]
+pub struct StructuralListDecoder {
+    child: Box<dyn StructuralFieldDecoder>,
+    data_type: DataType,
+}
+
+impl StructuralListDecoder {
+    pub fn new(child: Box<dyn StructuralFieldDecoder>, data_type: DataType) -> Self {
+        Self { child, data_type }
+    }
+}
+
+impl StructuralFieldDecoder for StructuralListDecoder {
+    fn accept_page(&mut self, child: crate::decoder::LoadedPage) -> Result<()> {
+        self.child.accept_page(child)
+    }
+
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn StructuralDecodeArrayTask>> {
+        let child_task = self.child.drain(num_rows)?;
+        Ok(Box::new(StructuralListDecodeTask::new(
+            child_task,
+            self.data_type.clone(),
+        )))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug)]
+struct StructuralListDecodeTask {
+    child_task: Box<dyn StructuralDecodeArrayTask>,
+    data_type: DataType,
+}
+
+impl StructuralListDecodeTask {
+    fn new(child_task: Box<dyn StructuralDecodeArrayTask>, data_type: DataType) -> Self {
+        Self {
+            child_task,
+            data_type,
+        }
+    }
+}
+
+impl StructuralDecodeArrayTask for StructuralListDecodeTask {
+    fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        let DecodedArray { array, mut repdef } = self.child_task.decode()?;
+        match &self.data_type {
+            DataType::List(child_field) => {
+                let (offsets, validity) = repdef.unravel_offsets::<i32>()?;
+                let list_array = ListArray::try_new(child_field.clone(), offsets, array, validity)?;
+                Ok(DecodedArray {
+                    array: Arc::new(list_array),
+                    repdef,
+                })
+            }
+            DataType::LargeList(child_field) => {
+                let (offsets, validity) = repdef.unravel_offsets::<i64>()?;
+                let list_array =
+                    LargeListArray::try_new(child_field.clone(), offsets, array, validity)?;
+                Ok(DecodedArray {
+                    array: Arc::new(list_array),
+                    repdef,
+                })
+            }
+            _ => panic!("List decoder did not have a list field"),
+        }
     }
 }
 
