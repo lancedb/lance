@@ -300,6 +300,7 @@ def test_ray_read_lance(s3_bucket: str):
     ds = ray.data.read_lance(path, storage_options=storage_options, concurrency=1)
     ds.take(1)
 
+
 @pytest.mark.integration
 def test_append_fragment(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
