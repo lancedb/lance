@@ -109,6 +109,9 @@ pub struct Dataset {
     uri: String,
     pub(crate) base: Path,
     pub(crate) manifest: Arc<Manifest>,
+    // Path for the manifest that is loaded. Used to get additional information,
+    // such as the index metadata.
+    pub(crate) manifest_file: Path,
     pub(crate) session: Arc<Session>,
     pub tags: Tags,
     pub manifest_naming_scheme: ManifestNamingScheme,
@@ -308,7 +311,9 @@ impl Dataset {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        self.manifest = Arc::new(self.latest_manifest().await?);
+        let (manifest, path) = self.latest_manifest().await?;
+        self.manifest = Arc::new(manifest);
+        self.manifest_file = path;
         Ok(())
     }
 
@@ -324,6 +329,7 @@ impl Dataset {
             base_path,
             self.uri.clone(),
             manifest,
+            manifest_location.path,
             self.session.clone(),
             self.commit_handler.clone(),
             manifest_location.naming_scheme,
@@ -402,11 +408,13 @@ impl Dataset {
         Ok(manifest)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn checkout_manifest(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         uri: String,
         manifest: Manifest,
+        manifest_file: Path,
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         manifest_naming_scheme: ManifestNamingScheme,
@@ -421,6 +429,7 @@ impl Dataset {
             base: base_path,
             uri,
             manifest: Arc::new(manifest),
+            manifest_file,
             commit_handler,
             session,
             tags,
@@ -444,7 +453,9 @@ impl Dataset {
         if let Some(params) = &params {
             builder = builder.with_params(params);
         }
-        builder.execute_stream(batches).await
+        builder
+            .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
+            .await
     }
 
     /// Append to existing [Dataset] with a stream of [RecordBatch]s
@@ -462,7 +473,7 @@ impl Dataset {
 
         let new_dataset = InsertBuilder::new(WriteDestination::Dataset(Arc::new(self.clone())))
             .with_params(&write_params)
-            .execute_stream(batches)
+            .execute_stream(Box::new(batches) as Box<dyn RecordBatchReader + Send>)
             .await?;
 
         *self = new_dataset;
@@ -488,12 +499,18 @@ impl Dataset {
                 .commit_handler
                 .resolve_version_location(&blobs_path, blobs_version, &self.object_store.inner)
                 .await?;
-            let manifest = read_manifest(&self.object_store, &blob_manifest_location.path).await?;
+            let manifest = read_manifest(
+                &self.object_store,
+                &blob_manifest_location.path,
+                blob_manifest_location.size,
+            )
+            .await?;
             let blobs_dataset = Self::checkout_manifest(
                 self.object_store.clone(),
                 blobs_path,
                 format!("{}/{}", self.uri, BLOB_DIR),
                 manifest,
+                blob_manifest_location.path,
                 self.session.clone(),
                 self.commit_handler.clone(),
                 ManifestNamingScheme::V2,
@@ -513,15 +530,26 @@ impl Dataset {
             == LanceFileVersion::Legacy
     }
 
-    pub async fn latest_manifest(&self) -> Result<Manifest> {
-        read_manifest(
-            &self.object_store,
-            &self
-                .commit_handler
-                .resolve_latest_version(&self.base, &self.object_store)
-                .await?,
-        )
-        .await
+    pub async fn latest_manifest(&self) -> Result<(Manifest, Path)> {
+        let location = self
+            .commit_handler
+            .resolve_latest_location(&self.base, &self.object_store)
+            .await?;
+        if location.version == self.manifest.version {
+            return Ok((self.manifest.as_ref().clone(), self.manifest_file.clone()));
+        }
+        let mut manifest = read_manifest(&self.object_store, &location.path, location.size).await?;
+        if manifest.schema.has_dictionary_types() {
+            let reader = if let Some(size) = location.size {
+                self.object_store
+                    .open_with_size(&location.path, size as usize)
+                    .await?
+            } else {
+                self.object_store.open(&location.path).await?
+            };
+            populate_schema_dictionary(&mut manifest.schema, reader.as_ref()).await?;
+        }
+        Ok((manifest, location.path))
     }
 
     /// Read the transaction file for this version of the dataset.
@@ -540,7 +568,7 @@ impl Dataset {
 
     /// Restore the currently checked out version of the dataset as the latest version.
     pub async fn restore(&mut self) -> Result<()> {
-        let latest_manifest = self.latest_manifest().await?;
+        let (latest_manifest, _) = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
         let transaction = Transaction::new(
@@ -552,18 +580,19 @@ impl Dataset {
             None,
         );
 
-        self.manifest = Arc::new(
-            commit_transaction(
-                self,
-                &self.object_store,
-                self.commit_handler.as_ref(),
-                &transaction,
-                &Default::default(),
-                &Default::default(),
-                self.manifest_naming_scheme,
-            )
-            .await?,
-        );
+        let (restored_manifest, path) = commit_transaction(
+            self,
+            &self.object_store,
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(restored_manifest);
+        self.manifest_file = path;
 
         Ok(())
     }
@@ -899,7 +928,7 @@ impl Dataset {
             None,
         );
 
-        let manifest = commit_transaction(
+        let (manifest, path) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -911,6 +940,7 @@ impl Dataset {
         .await?;
 
         self.manifest = Arc::new(manifest);
+        self.manifest_file = path;
 
         Ok(())
     }
@@ -927,10 +957,8 @@ impl Dataset {
         &self.object_store
     }
 
-    pub(crate) async fn manifest_file(&self, version: u64) -> Result<Path> {
-        self.commit_handler
-            .resolve_version(&self.base, version, &self.object_store.inner)
-            .await
+    pub(crate) async fn manifest_file(&self) -> Result<Path> {
+        Ok(self.manifest_file.clone())
     }
 
     pub(crate) fn data_dir(&self) -> Path {
@@ -970,7 +998,7 @@ impl Dataset {
             .list_manifests(&self.base, &self.object_store.inner)
             .await?
             .try_filter_map(|path| async move {
-                match read_manifest(&self.object_store, &path).await {
+                match read_manifest(&self.object_store, &path, None).await {
                     Ok(manifest) => Ok(Some(Version::from(&manifest))),
                     Err(e) => Err(e),
                 }
@@ -1429,7 +1457,7 @@ impl Dataset {
             None,
         );
 
-        let manifest = commit_transaction(
+        let (manifest, manifest_path) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -1441,6 +1469,7 @@ impl Dataset {
         .await?;
 
         self.manifest = Arc::new(manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -1481,7 +1510,7 @@ impl Dataset {
             None,
         );
 
-        let manifest = commit_transaction(
+        let (manifest, manifest_path) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -1493,6 +1522,7 @@ impl Dataset {
         .await?;
 
         self.manifest = Arc::new(manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -1509,7 +1539,7 @@ impl Dataset {
             None,
         );
 
-        let manifest = commit_transaction(
+        let (manifest, manifest_path) = commit_transaction(
             self,
             &self.object_store,
             self.commit_handler.as_ref(),
@@ -1521,6 +1551,7 @@ impl Dataset {
         .await?;
 
         self.manifest = Arc::new(manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -1567,7 +1598,7 @@ pub(crate) async fn write_manifest_file(
     indices: Option<Vec<Index>>,
     config: &ManifestWriteConfig,
     naming_scheme: ManifestNamingScheme,
-) -> std::result::Result<(), CommitError> {
+) -> std::result::Result<Path, CommitError> {
     if config.auto_set_feature_flags {
         apply_feature_flags(manifest, config.use_move_stable_row_ids)?;
     }
@@ -1585,9 +1616,7 @@ pub(crate) async fn write_manifest_file(
             write_manifest_file_to_path,
             naming_scheme,
         )
-        .await?;
-
-    Ok(())
+        .await
 }
 
 fn write_manifest_file_to_path<'a>(
@@ -2032,6 +2061,7 @@ mod tests {
                 .resolve_latest_version(&dataset.base, dataset.object_store())
                 .await
                 .unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -2054,6 +2084,7 @@ mod tests {
                 .resolve_latest_version(&dataset.base, dataset.object_store())
                 .await
                 .unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -4327,7 +4358,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(results.num_rows(), 2);
+        assert_eq!(results.num_rows(), 1);
     }
 
     #[tokio::test]

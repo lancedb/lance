@@ -9,7 +9,7 @@ use lance_index::{
     vector::VectorIndex,
 };
 use lance_table::format::Index;
-use moka::sync::{Cache, ConcurrentCacheExt};
+use moka::sync::Cache;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -90,14 +90,14 @@ impl IndexCache {
 
     #[allow(dead_code)]
     pub(crate) fn len_vector(&self) -> usize {
-        self.vector_cache.sync();
+        self.vector_cache.run_pending_tasks();
         self.vector_cache.entry_count() as usize
     }
 
     pub(crate) fn get_size(&self) -> usize {
-        self.scalar_cache.sync();
-        self.vector_cache.sync();
-        self.metadata_cache.sync();
+        self.scalar_cache.run_pending_tasks();
+        self.vector_cache.run_pending_tasks();
+        self.metadata_cache.run_pending_tasks();
         (self.scalar_cache.entry_count()
             + self.vector_cache.entry_count()
             + self.metadata_cache.entry_count()) as usize

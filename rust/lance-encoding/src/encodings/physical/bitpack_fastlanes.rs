@@ -1573,9 +1573,7 @@ macro_rules! chunk_data_impl {
         let data_buffer = $data.data.borrow_to_typed_slice::<$data_type>();
         let data_buffer = data_buffer.as_ref();
 
-        let bit_widths = $data
-            .get_stat(Stat::BitWidth)
-            .expect("FixedWidthDataBlock should have valid bit width statistics");
+        let bit_widths = $data.expect_stat(Stat::BitWidth);
         let bit_widths_array = bit_widths
             .as_any()
             .downcast_ref::<PrimitiveArray<UInt64Type>>()

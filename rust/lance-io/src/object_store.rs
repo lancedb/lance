@@ -400,6 +400,23 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
+        if let Some((store, path)) = params.object_store.as_ref() {
+            let mut inner = store.clone();
+            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                inner = wrapper.wrap(inner);
+            }
+            let store = Self {
+                inner,
+                scheme: path.scheme().to_string(),
+                block_size: params.block_size.unwrap_or(64 * 1024),
+                use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+                list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+            };
+            let path = Path::from(path.path());
+            return Ok((store, path));
+        }
         let (object_store, path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme

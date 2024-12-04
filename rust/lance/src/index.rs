@@ -328,7 +328,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -340,6 +340,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
 
         Ok(())
     }
@@ -354,7 +355,7 @@ impl DatasetIndexExt for Dataset {
             return Ok(indices);
         }
 
-        let manifest_file = self.manifest_file(self.version().version).await?;
+        let manifest_file = self.manifest_file().await?;
         let loaded_indices: Arc<Vec<IndexMetadata>> =
             read_manifest_indexes(&self.object_store, &manifest_file, &self.manifest)
                 .await?
@@ -403,7 +404,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, new_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -415,6 +416,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = new_path;
 
         Ok(())
     }
@@ -501,7 +503,7 @@ impl DatasetIndexExt for Dataset {
             None,
         );
 
-        let new_manifest = commit_transaction(
+        let (new_manifest, manifest_path) = commit_transaction(
             self,
             self.object_store(),
             self.commit_handler.as_ref(),
@@ -513,6 +515,7 @@ impl DatasetIndexExt for Dataset {
         .await?;
 
         self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
         Ok(())
     }
 
@@ -904,9 +907,12 @@ mod tests {
 
     use super::*;
 
+    use arrow::array::AsArray;
     use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{Field, Schema};
     use lance_arrow::*;
+    use lance_index::scalar::inverted::TokenizerConfig;
+    use lance_index::scalar::FullTextSearchQuery;
     use lance_index::vector::{
         hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
     };
@@ -1292,6 +1298,71 @@ mod tests {
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_optimize_fts() {
+        let words = ["apple", "banana", "cherry", "date"];
+
+        let dir = tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let data = StringArray::from_iter_values(words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(data)]).unwrap();
+        let batch_iterator = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let mut dataset = Dataset::write(batch_iterator, dir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+
+        let tokenizer_config = TokenizerConfig::default();
+        let params = InvertedIndexParams {
+            with_position: true,
+            tokenizer_config,
+        };
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let new_words = ["elephant", "fig", "grape", "honeydew"];
+        let new_data = StringArray::from_iter_values(new_words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
+        let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(batch_iter, None).await.unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,
+                index_names: None,
+            })
+            .await
+            .unwrap();
+
+        for &word in words.iter().chain(new_words.iter()) {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
+
+            assert_eq!(texts.len(), 1);
+            assert_eq!(texts[0], word);
+        }
     }
 
     #[tokio::test]

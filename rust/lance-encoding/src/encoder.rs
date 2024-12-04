@@ -23,7 +23,7 @@ use crate::encodings::logical::blob::BlobFieldEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
-use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
+use crate::encodings::physical::binary::{BinaryBlockEncoder, BinaryMiniBlockEncoder};
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
@@ -791,9 +791,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
-            let bit_widths = data
-                .get_stat(Stat::BitWidth)
-                .expect("FixedWidthDataBlock should have valid `Stat::BitWidth` statistics");
+            let bit_widths = data.expect_stat(Stat::BitWidth);
             // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
             // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
             let has_all_zeros = bit_widths
@@ -812,15 +810,9 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         }
         if let DataBlock::VariableWidth(ref variable_width_data) = data {
             if variable_width_data.bits_per_offset == 32 {
-                let data_size = variable_width_data.get_stat(Stat::DataSize).expect(
-                    "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                );
-                let data_size = data_size.as_primitive::<UInt64Type>().value(0);
-
-                let max_len = variable_width_data.get_stat(Stat::MaxLength).expect(
-                    "VariableWidth DataBlock should have valid `Stat::DataSize` statistics",
-                );
-                let max_len = max_len.as_primitive::<UInt64Type>().value(0);
+                let data_size =
+                    variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                let max_len = variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
 
                 if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
                     && data_size >= FSST_LEAST_INPUT_SIZE as u64
@@ -875,6 +867,15 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((encoder, encoding))
             }
+            DataBlock::VariableWidth(variable_width) => {
+                if variable_width.bits_per_offset == 32 {
+                    let encoder = Box::new(BinaryBlockEncoder::default());
+                    let encoding = ProtobufUtils::binary_block();
+                    Ok((encoder, encoding))
+                } else {
+                    todo!("Implement BlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -919,6 +920,17 @@ pub struct EncodingOptions {
     /// The encoder needs to know this so it figures the position of out-of-line
     /// buffers correctly
     pub buffer_alignment: u64,
+}
+
+impl Default for EncodingOptions {
+    fn default() -> Self {
+        Self {
+            cache_bytes_per_column: 8 * 1024 * 1024,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: 64,
+        }
+    }
 }
 
 /// A trait to pick which kind of field encoding to use for a field

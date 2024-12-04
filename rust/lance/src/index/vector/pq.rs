@@ -28,7 +28,7 @@ use lance_index::{
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
 use lance_linalg::distance::{DistanceType, MetricType};
-use log::info;
+use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
@@ -110,6 +110,10 @@ impl PQIndex {
         _num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
         let num_vectors = row_ids.len();
+        if num_vectors == 0 {
+            warn!("Filtering on empty PQ code array");
+            return Ok((code, row_ids));
+        }
         let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
@@ -488,14 +492,18 @@ pub(crate) fn build_pq_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::vector::ivf::build_ivf_model;
+
+    use std::ops::Range;
+
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
+    use tempfile::tempdir;
+
+    use crate::index::vector::ivf::build_ivf_model;
+    use lance_core::utils::mask::RowIdMask;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_testing::datagen::generate_random_array_with_range;
-    use std::ops::Range;
-    use tempfile::tempdir;
 
     const DIM: usize = 128;
     async fn generate_dataset(
@@ -617,5 +625,48 @@ mod tests {
             "distances: {:?}",
             distances
         );
+    }
+
+    struct TestPreFilter {
+        row_ids: Vec<u64>,
+    }
+
+    impl TestPreFilter {
+        fn new(row_ids: Vec<u64>) -> Self {
+            Self { row_ids }
+        }
+    }
+
+    #[async_trait]
+    impl PreFilter for TestPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            self.row_ids.is_empty()
+        }
+
+        fn mask(&self) -> Arc<RowIdMask> {
+            RowIdMask::all_rows().into()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            row_ids
+                .filter(|&row_id| self.row_ids.contains(row_id))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn test_filter_on_empty_pq_code() {
+        let pre_filter = TestPreFilter::new(vec![1, 3, 5, 7, 9]);
+        let code = Arc::new(UInt8Array::from(Vec::<u8>::new()));
+        let row_ids = Arc::new(UInt64Array::from(Vec::<u64>::new()));
+
+        let (code, row_ids) = PQIndex::filter_arrays(&pre_filter, code, row_ids, 16).unwrap();
+        assert!(code.values().is_empty());
+        assert!(row_ids.is_empty());
     }
 }

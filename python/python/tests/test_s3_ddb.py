@@ -299,3 +299,11 @@ def test_ray_read_lance(s3_bucket: str):
     lance.write_dataset(table, path, storage_options=storage_options)
     ds = ray.data.read_lance(path, storage_options=storage_options, concurrency=1)
     ds.take(1)
+
+@pytest.mark.integration
+def test_append_fragment(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
+    lance.fragment.LanceFragment.create(
+        f"s3://{s3_bucket}/test_append.lance", table, storage_options=storage_options
+    )

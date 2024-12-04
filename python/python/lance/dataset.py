@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import logging
 import os
 import random
 import time
+import uuid
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -23,6 +25,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Sequence,
     Set,
     TypedDict,
     Union,
@@ -2180,7 +2183,6 @@ class LanceDataset(pa.dataset.Dataset):
         2  3  c
         3  4  d
         """
-        # TODO: mode is never used!
         if isinstance(base_uri, Path):
             base_uri = str(base_uri)
         elif isinstance(base_uri, LanceDataset):
@@ -2195,6 +2197,14 @@ class LanceDataset(pa.dataset.Dataset):
                 raise TypeError(
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
+
+        if read_version is None and not isinstance(
+            operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+        ):
+            raise ValueError(
+                "read_version is required for all operations except "
+                "Overwrite and Restore"
+            )
 
         new_ds = _Dataset.commit(
             base_uri,
@@ -2212,6 +2222,112 @@ class LanceDataset(pa.dataset.Dataset):
         ds._uri = new_ds.uri
         ds._default_scan_options = None
         return ds
+
+    @staticmethod
+    def commit_batch(
+        dest: Union[str, Path, LanceDataset],
+        transactions: Sequence[Transaction],
+        commit_lock: Optional[CommitLock] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        enable_v2_manifest_paths: Optional[bool] = None,
+        detached: Optional[bool] = False,
+        max_retries: int = 20,
+    ) -> BulkCommitResult:
+        """Create a new version of dataset with multiple transactions.
+
+        This method is an advanced method which allows users to describe a change
+        that has been made to the data files.  This method is not needed when using
+        Lance to apply changes (e.g. when using :py:class:`LanceDataset` or
+        :py:func:`write_dataset`.)
+
+        Parameters
+        ----------
+        dest: str, Path, or LanceDataset
+            The base uri of the dataset, or the dataset object itself. Using
+            the dataset object can be more efficient because it can re-use the
+            file metadata cache.
+        transactions: Iterable[Transaction]
+            The transactions to apply to the dataset. These will be merged into
+            a single transaction and applied to the dataset. Note: Only append
+            transactions are currently supported. Other transaction types will be
+            supported in the future.
+        commit_lock : CommitLock, optional
+            A custom commit lock.  Only needed if your object store does not support
+            atomic commits.  See the user guide for more details.
+        storage_options : optional, dict
+            Extra options that make sense for a particular storage connection. This is
+            used to store connection parameters like credentials, endpoint, etc.
+        enable_v2_manifest_paths : bool, optional
+            If True, and this is a new dataset, uses the new V2 manifest paths.
+            These paths provide more efficient opening of datasets with many
+            versions on object stores. This parameter has no effect if the dataset
+            already exists. To migrate an existing dataset, instead use the
+            :meth:`migrate_manifest_paths_v2` method. Default is False. WARNING:
+            turning this on will make the dataset unreadable for older versions
+            of Lance (prior to 0.17.0).
+        detached : bool, optional
+            If True, then the commit will not be part of the dataset lineage.  It will
+            never show up as the latest dataset and the only way to check it out in the
+            future will be to specifically check it out by version.  The version will be
+            a random version that is only unique amongst detached commits.  The caller
+            should store this somewhere as there will be no other way to obtain it in
+            the future.
+        max_retries : int
+            The maximum number of retries to perform when committing the dataset.
+
+        Returns
+        -------
+        dict with keys:
+            dataset: LanceDataset
+                A new version of Lance Dataset.
+            merged: Transaction
+                The merged transaction that was applied to the dataset.
+        """
+        if isinstance(dest, Path):
+            dest = str(dest)
+        elif isinstance(dest, LanceDataset):
+            dest = dest._ds
+        elif not isinstance(dest, str):
+            raise TypeError(
+                f"base_uri must be str, Path, or LanceDataset, got {type(dest)}"
+            )
+
+        if commit_lock:
+            if not callable(commit_lock):
+                raise TypeError(
+                    f"commit_lock must be a function, got {type(commit_lock)}"
+                )
+
+        new_ds, merged = _Dataset.commit_batch(
+            dest,
+            transactions,
+            commit_lock,
+            storage_options=storage_options,
+            enable_v2_manifest_paths=enable_v2_manifest_paths,
+            detached=detached,
+            max_retries=max_retries,
+        )
+        merged = Transaction(**merged)
+        # This logic is specific to append, which is all that should
+        # be returned here.
+        # TODO: generalize this to all other transaction types.
+        merged.operation["fragments"] = [
+            FragmentMetadata.from_metadata(f) for f in merged.operation["fragments"]
+        ]
+        merged.operation = LanceOperation.Append(**merged.operation)
+        if merged.blobs_op:
+            merged.blobs_op["fragments"] = [
+                FragmentMetadata.from_metadata(f) for f in merged.blobs_op["fragments"]
+            ]
+            merged.blobs_op = LanceOperation.Append(**merged.blobs_op)
+        ds = LanceDataset.__new__(LanceDataset)
+        ds._ds = new_ds
+        ds._uri = new_ds.uri
+        ds._default_scan_options = None
+        return dict(
+            dataset=ds,
+            merged=merged,
+        )
 
     def validate(self):
         """
@@ -2246,6 +2362,19 @@ class LanceDataset(pa.dataset.Dataset):
         **Experimental API**
         """
         return LanceStats(self._ds)
+
+
+class BulkCommitResult(TypedDict):
+    dataset: LanceDataset
+    merged: Transaction
+
+
+@dataclass
+class Transaction:
+    read_version: int
+    operation: LanceOperation.BaseOperation
+    uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
+    blobs_op: Optional[LanceOperation.BaseOperation] = None
 
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.

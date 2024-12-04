@@ -127,7 +127,7 @@ impl Wand {
             threshold: 0.0,
             cur_doc: None,
             num_docs,
-            postings: postings.collect(),
+            postings: postings.filter(|posting| posting.doc().is_some()).collect(),
             candidates: BinaryHeap::new(),
         }
     }

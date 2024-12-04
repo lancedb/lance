@@ -15,15 +15,14 @@
 package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.spark.LanceConfig;
+
 import org.apache.spark.sql.connector.write.BatchWrite;
 import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite;
 import org.apache.spark.sql.types.StructType;
 
-/**
- * Spark write builder.
- */
+/** Spark write builder. */
 public class SparkWrite implements Write {
   private final LanceConfig config;
   private final StructType schema;
@@ -44,7 +43,6 @@ public class SparkWrite implements Write {
   }
 
   /** Task commit. */
-
   public static class SparkWriteBuilder implements WriteBuilder {
     private final LanceConfig options;
     private final StructType schema;

@@ -233,6 +233,9 @@ message Binary {
 message BinaryMiniBlock {
 }
 
+message BinaryBlock {
+}
+
 message FsstMiniBlock {
   ArrayEncoding BinaryMiniBlock = 1;
   bytes symbol_table = 2;
@@ -279,6 +282,7 @@ message ArrayEncoding {
         Bitpack2 bitpack2 = 14;
         BinaryMiniBlock binary_mini_block = 15;
         FsstMiniBlock fsst_mini_block = 16;
+        BinaryBlock binary_block = 17;
     }
 }
 
@@ -318,6 +322,7 @@ message MiniBlockLayout {
   ArrayEncoding def_compression = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
+  ArrayEncoding dictionary = 4;
 }
 
 /// A layout used for pages where the data is large
