@@ -34,6 +34,7 @@ public class SparkOptions {
   private static final String max_row_per_file = "max_row_per_file";
   private static final String max_rows_per_group = "max_rows_per_group";
   private static final String max_bytes_per_file = "max_bytes_per_file";
+  private static final String batch_size = "batch_size";
 
   public static ReadOptions genReadOptionFromConfig(LanceConfig config) {
     ReadOptions.Builder builder = new ReadOptions.Builder();
@@ -84,5 +85,13 @@ public class SparkOptions {
       storageOptions.put(virtual_hosted_style, maps.get(virtual_hosted_style));
     }
     return storageOptions;
+  }
+
+  public static int getBatchSize(LanceConfig config) {
+    Map<String, String> options = config.getOptions();
+    if (options.containsKey(batch_size)) {
+      return Integer.parseInt(options.get(batch_size));
+    }
+    return 512;
   }
 }

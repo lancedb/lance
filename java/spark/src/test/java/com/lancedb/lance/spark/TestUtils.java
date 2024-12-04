@@ -37,6 +37,12 @@ public class TestUtils {
             Arrays.asList(1L, 2L, 3L, -1L),
             Arrays.asList(2L, 4L, 6L, -2L),
             Arrays.asList(3L, 6L, 9L, -3L));
+    public static final List<List<Long>> expectedValuesWithRowId =
+        Arrays.asList(
+            Arrays.asList(0L, 0L, 0L, 0L, 0L),
+            Arrays.asList(1L, 2L, 3L, -1L, 1L),
+            Arrays.asList(2L, 4L, 6L, -2L, 4294967296L),
+            Arrays.asList(3L, 6L, 9L, -3L, 4294967297L));
     public static final LanceConfig lanceConfig;
 
     public static final StructType schema =
