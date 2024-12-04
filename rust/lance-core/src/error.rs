@@ -438,8 +438,8 @@ macro_rules! location {
         // dependency or not. See: https://github.com/rust-lang/rust/issues/117605
         // To get a relative path, we use a sample path to precompute how much is
         // necessary to chop off.
-        const PREFIX_SIZE: usize = crate::error::path_prefix_length();
-        const RELATIVE_PATH: &str = unsafe { crate::error::split_str_at(file!(), PREFIX_SIZE).1 };
+        const PREFIX_SIZE: usize = $crate::error::path_prefix_length__();
+        const RELATIVE_PATH: &str = unsafe { $crate::error::split_str_at(file!(), PREFIX_SIZE).1 };
 
         const LOCATION: &str =
             const_format::concatcp!(GH_PREFIX, "/", RELATIVE_PATH, "#L", line!());
@@ -447,14 +447,16 @@ macro_rules! location {
     }};
 }
 
-pub(crate) const fn path_prefix_length() -> usize {
+#[doc(hidden)]
+pub const fn path_prefix_length__() -> usize {
     let this_file = file!();
     let suffix = "rust/lance-core/src/error.rs";
     this_file.len() - suffix.len()
 }
 
+#[doc(hidden)]
 /// SAFETY: must have determined that `at` is a valid byte boundary.
-pub(crate) const unsafe fn split_str_at(s: &str, at: usize) -> (&str, &str) {
+pub const unsafe fn split_str_at(s: &str, at: usize) -> (&str, &str) {
     let s_bytes: &[u8] = s.as_bytes();
     let (before, after) = s_bytes.split_at(at);
     (unsafe { std::str::from_utf8_unchecked(before) }, unsafe {

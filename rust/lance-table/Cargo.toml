@@ -27,6 +27,7 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
+const_format.workspace = true
 deepsize.workspace = true
 futures.workspace = true
 lazy_static = { workspace = true, optional = true }

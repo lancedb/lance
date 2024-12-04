@@ -9,13 +9,13 @@ use datafusion::execution::SendableRecordBatchStream;
 use lance_core::datatypes::NullabilityComparison;
 use lance_core::datatypes::Schema;
 use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::location;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use snafu::{location, Location};
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::Operation;

@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 
+use crate::location;
 use arrow_array::{
     cast::AsArray,
     types::{
@@ -21,7 +22,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
-use snafu::{location, Location};
 
 use super::{
     schema::{compare_fields, explain_fields_difference},

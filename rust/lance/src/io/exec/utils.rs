@@ -12,11 +12,11 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::error::{CloneableResult, Error};
+use lance_core::location;
 use lance_core::utils::futures::{Capacity, SharedStreamExt};
 use lance_core::utils::mask::{RowIdMask, RowIdTreeMap};
 use lance_core::{Result, ROW_ID};
 use lance_index::prefilter::FilterLoader;
-use snafu::{location, Location};
 
 #[derive(Debug, Clone)]
 pub enum PreFilterSource {

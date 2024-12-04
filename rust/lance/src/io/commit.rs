@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use lance_core::location;
 use lance_file::version::LanceFileVersion;
 use lance_table::format::{
     is_detached_version, pb, DataStorageFormat, DeletionFile, Fragment, Index, Manifest,
@@ -33,7 +34,6 @@ use lance_table::format::{
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
 use rand::{thread_rng, Rng};
-use snafu::{location, Location};
 
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};

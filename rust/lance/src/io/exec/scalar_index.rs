@@ -16,6 +16,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::{stream::BoxStream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use lance_core::location;
 use lance_core::{
     utils::{
         address::RowAddress,
@@ -33,7 +34,7 @@ use lance_index::{
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+
 use tracing::{debug_span, instrument};
 
 use crate::{

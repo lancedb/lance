@@ -7,6 +7,7 @@ use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt32Array
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{traits::WriteExt, utils::read_message};
@@ -14,7 +15,6 @@ use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::pb::Ivf as PbIvf;
 

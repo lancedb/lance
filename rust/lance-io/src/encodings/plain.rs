@@ -28,8 +28,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::*;
+use lance_core::location;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+
 use tokio::io::AsyncWriteExt;
 
 use crate::encodings::{AsyncIndex, Decoder};

@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::{format::pb, rowids::bitmap::Bitmap};
+use lance_core::location;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
 
 use super::{encoded_array::EncodedU64Array, RowIdSequence, U64Segment};
 use prost::Message;

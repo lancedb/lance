@@ -12,8 +12,9 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
+use lance_core::location;
 use log::trace;
-use snafu::{location, Location};
+
 use tokio::task::JoinHandle;
 
 use lance_core::{cache::FileMetadataCache, Error, Result};

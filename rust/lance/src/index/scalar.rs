@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
@@ -23,7 +24,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use lance_table::format::Index;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use crate::session::Session;

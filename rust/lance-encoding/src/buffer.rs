@@ -6,7 +6,7 @@
 use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
-use snafu::{location, Location};
+use lance_core::location;
 
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
 

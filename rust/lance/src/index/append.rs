@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+
 use uuid::Uuid;
 
 use super::vector::ivf::optimize_vector_indices;

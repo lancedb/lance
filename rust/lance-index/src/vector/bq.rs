@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{cast::AsArray, Array, ArrayRef, UInt8Array};
+use lance_core::location;
 use lance_core::{Error, Result};
 use num_traits::Float;
-use snafu::{location, Location};
 
 #[derive(Clone, Default)]
 pub struct BinaryQuantization {}

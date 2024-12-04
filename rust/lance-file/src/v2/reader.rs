@@ -14,6 +14,7 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
+use lance_core::location;
 use lance_encoding::{
     decoder::{
         schedule_and_decode, ColumnInfo, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
@@ -25,7 +26,6 @@ use lance_encoding::{
 };
 use log::debug;
 use prost::{Message, Name};
-use snafu::{location, Location};
 
 use lance_core::{
     cache::FileMetadataCache,

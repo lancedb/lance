@@ -9,6 +9,7 @@ mod test {
 
     use async_trait::async_trait;
     use futures::{future::join_all, StreamExt, TryStreamExt};
+    use lance_core::location;
     use lance_core::{Error, Result};
     use lance_table::io::commit::external_manifest::{
         ExternalManifestCommitHandler, ExternalManifestStore,
@@ -17,7 +18,7 @@ mod test {
     use lance_testing::datagen::{BatchGenerator, IncrementingInt32};
     use object_store::local::LocalFileSystem;
     use object_store::path::Path;
-    use snafu::{location, Location};
+
     use tokio::sync::Mutex;
 
     use crate::dataset::builder::DatasetBuilder;

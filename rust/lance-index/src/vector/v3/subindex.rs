@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
 
 use crate::vector::storage::VectorStore;
 use crate::vector::{flat, hnsw};

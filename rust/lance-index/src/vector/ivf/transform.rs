@@ -10,7 +10,8 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
-use snafu::{location, Location};
+use lance_core::location;
+
 use tracing::instrument;
 
 use lance_arrow::RecordBatchExt;

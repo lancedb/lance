@@ -38,12 +38,12 @@ use lance_encoding::{
     EncodingsIo,
 };
 
+use lance_core::location;
 use lance_core::{cache::FileMetadataCache, datatypes::Schema, Error, Result};
 use lance_file::{
     v2::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt},
     version::LanceFileVersion,
 };
-use snafu::{location, Location};
 
 use crate::substrait::FilterExpressionExt;
 

@@ -15,6 +15,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use arrow_select::take::take;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
 use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
@@ -31,7 +32,7 @@ use lance_linalg::distance::{DistanceType, MetricType};
 use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+
 use tracing::{instrument, span, Level};
 
 // Re-export

@@ -38,6 +38,7 @@ byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
+const_format = { workspace = true }
 # This is already used by datafusion
 dashmap = "5"
 deepsize.workspace = true

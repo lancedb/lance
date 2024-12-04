@@ -17,6 +17,7 @@ mod fixture_test;
 
 use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
+use lance_core::location;
 use lance_file::reader::FileReader;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -38,7 +39,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tempfile::tempdir;
 use tracing::instrument;
 use uuid::Uuid;

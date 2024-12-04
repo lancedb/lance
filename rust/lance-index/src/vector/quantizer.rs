@@ -9,13 +9,13 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, FixedSizeListArray};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 

@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::Error;
 use lance_file::format::{MAJOR_VERSION, MINOR_VERSION};
 use lance_file::version::LanceFileVersion;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::format::pb;
 

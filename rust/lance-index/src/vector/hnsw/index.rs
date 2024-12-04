@@ -11,6 +11,7 @@ use std::{
 use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
@@ -18,7 +19,7 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;

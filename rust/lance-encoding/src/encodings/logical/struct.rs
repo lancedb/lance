@@ -15,8 +15,8 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
+use lance_core::location;
 use log::trace;
-use snafu::{location, Location};
 
 use crate::{
     decoder::{

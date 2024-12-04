@@ -11,8 +11,8 @@ use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field};
 use lance_arrow::RecordBatchExt;
+use lance_core::location;
 use num_traits::Float;
-use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 use lance_linalg::kernels::normalize_fsl;

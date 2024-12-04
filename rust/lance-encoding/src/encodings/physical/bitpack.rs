@@ -12,9 +12,9 @@ use arrow_array::{cast::AsArray, Array, PrimitiveArray};
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
+use lance_core::location;
 use log::trace;
 use num_traits::{AsPrimitive, PrimInt, ToPrimitive};
-use snafu::{location, Location};
 
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};

@@ -17,9 +17,10 @@ use std::os::windows::fs::FileExt;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;

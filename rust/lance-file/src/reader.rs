@@ -34,8 +34,9 @@ use lance_io::utils::{
 };
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 
+use lance_core::location;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use crate::format::metadata::Metadata;

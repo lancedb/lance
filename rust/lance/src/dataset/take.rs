@@ -15,10 +15,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
+use lance_core::location;
 use lance_core::utils::address::RowAddress;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
-use snafu::{location, Location};
 
 use super::ProjectionRequest;
 use super::{fragment::FileFragment, scanner::DatasetRecordBatchStream, Dataset};

@@ -19,9 +19,9 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::Expr;
 use deepsize::DeepSizeOf;
 use inverted::TokenizerConfig;
+use lance_core::location;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
 
 use crate::{Index, IndexParams, IndexType};
 

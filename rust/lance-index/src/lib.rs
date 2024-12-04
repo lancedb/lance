@@ -13,10 +13,11 @@ use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+
 use std::convert::TryFrom;
 
 pub mod optimize;

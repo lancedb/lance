@@ -12,9 +12,9 @@ use datafusion::execution::SendableRecordBatchStream;
 use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_core::location;
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
 
 use super::fragment::FileFragment;
 use super::{

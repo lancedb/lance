@@ -17,8 +17,9 @@ use aws_sdk_dynamodb::operation::{
 };
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
+use lance_core::location;
+
 use snafu::OptionExt;
-use snafu::{location, Location};
 use tokio::sync::RwLock;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;

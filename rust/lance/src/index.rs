@@ -11,6 +11,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::location;
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -44,7 +45,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
-use snafu::{location, Location};
+
 use tracing::instrument;
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;

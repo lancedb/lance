@@ -11,6 +11,7 @@ use arrow_array::{FixedSizeListArray, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{RecordBatchExt, SchemaExt};
+use lance_core::location;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::v2::writer::FileWriterOptions;
@@ -24,7 +25,7 @@ use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};

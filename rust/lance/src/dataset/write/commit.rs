@@ -3,13 +3,13 @@
 
 use std::sync::Arc;
 
+use lance_core::location;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::{
     format::{is_detached_version, DataStorageFormat},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
-use snafu::{location, Location};
 
 use crate::{
     dataset::{

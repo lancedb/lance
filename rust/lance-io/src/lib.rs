@@ -4,7 +4,7 @@ use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
 use arrow::datatypes::UInt32Type;
 use arrow_array::{PrimitiveArray, UInt32Array};
-use snafu::{location, Location};
+use lance_core::location;
 
 use lance_core::{Error, Result};
 

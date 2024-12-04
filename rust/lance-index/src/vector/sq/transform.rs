@@ -12,7 +12,8 @@ use arrow_array::{
     RecordBatch,
 };
 use arrow_schema::{DataType, Field};
-use snafu::{location, Location};
+use lance_core::location;
+
 use tracing::instrument;
 
 use crate::vector::transform::Transformer;

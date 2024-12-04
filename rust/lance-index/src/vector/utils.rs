@@ -7,10 +7,11 @@ use arrow::{
 };
 use arrow_array::{Array, FixedSizeListArray};
 use arrow_schema::{DataType, Field};
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_io::encodings::plain::bytes_to_array;
 use prost::bytes;
-use snafu::{location, Location};
+
 use std::{ops::Range, sync::Arc};
 
 use super::pb;
