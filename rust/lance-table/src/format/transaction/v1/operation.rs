@@ -616,6 +616,10 @@ impl TryFrom<pb::transaction::Operation> for Operation {
                     delete_keys,
                 })
             }
+            pb::transaction::Operation::CompositeOperation(_) => Err(Error::invalid_input(
+                "CompositeOperation cannot be converted to Operation".to_string(),
+                location!(),
+            )),
         }
     }
 }

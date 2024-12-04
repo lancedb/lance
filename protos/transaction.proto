@@ -28,6 +28,101 @@ message Transaction {
   // Optional version tag.
   string tag = 3;
 
+  // The list of operations that make up this transaction.
+  //
+  // The user operations are logical groupings of actions. These actions can be
+  // applied in sequence to the manifest to produce the final manifest.
+  //
+  // By grouping actions together, we can provide a human-readable history of
+  // the table.
+  //
+  // For example, consider the SQL query:
+  // 
+  // ```sql
+  // BEGIN TRANSACTION;
+  // INSERT INTO t VALUES (1);
+  // DELETE FROM t WHERE id = 32;
+  // UPDATE t SET a = 2 WHERE id = 1;
+  // COMMIT;
+  // ```
+  // 
+  // Would be represented as:
+  //
+  // ```yaml
+  // - description: "INSERT INTO t VALUES (1);"
+  //   uuid: 123e4567-e89b-12d3-a456-426655440001
+  //   read_version: 0
+  //   actions:
+  //     - type: add_fragments
+  //       fragments:
+  //         - id: 10
+  //           files:
+  //             - path: data/123e4567-e89b-12d3-a456-426655440000.lance
+  //               fields: [0]
+  // - description: "DELETE FROM t WHERE id = 32;"
+  //   uuid: 123e4567-e89b-12d3-a456-426655440002
+  //   read_version: 0
+  //   actions:
+  //     - type: updated_fragments
+  //       fragments:
+  //         - id: 0
+  //           files:
+  //             - path: data/dfdsfdsd-e89b-12d3-a456-426655440000.lance
+  //               fields: [0]
+  //               deletion_file:
+  //                 - file_type: ARROW_ARRAY
+  //                   read_version: 0
+  //                   id: 10
+  //                   num_deleted_rows: 1
+  // - description: "UPDATE t SET a = 2 WHERE id = 1;"
+  //   uuid: 123e4567-e89b-12d3-a456-426655440003
+  //   read_version: 0
+  //   actions:
+  //     - type: updated_fragments
+  //       fragments:
+  //         - id: 0
+  //           files:
+  //             - path: data/123e4567-sdfs-12d3-sdfs-426655440000.lance
+  //               fields: [0]
+  //               deletion_file:
+  //                 - file_type: ARROW_ARRAY
+  //                   read_version: 0
+  //                   id: 10
+  //                   num_deleted_rows: 1
+  // ```
+  message CompositeOperation {
+    repeated UserOperation user_operations = 1;
+  }
+
+  // A logical grouping of actions that correspond to a single user action.
+  message UserOperation {
+    uint64 read_version = 1;
+    string uuid = 2;
+    string description = 4;
+    repeated Action actions = 5;
+  }
+
+  // An action to apply to the manifest.
+  message Action {
+    message AddFragments {
+      repeated DataFragment fragments = 1;
+    }
+
+    message DeleteFragments {
+      repeated uint64 deleted_fragment_ids = 1;
+    }
+
+    message UpdateFragments {
+      repeated DataFragment updated_fragments = 1;
+    }
+
+    oneof action {
+      AddFragments add_fragments = 1;
+      DeleteFragments delete_fragments = 2;
+      UpdateFragments update_fragments = 3;
+    }
+  }
+
   // Add new rows to the dataset.
   message Append {
     // The new fragments to append.
@@ -178,6 +273,7 @@ message Transaction {
     Update update = 108;
     Project project = 109;
     UpdateConfig update_config = 110;
+    CompositeOperation composite_operation = 111;
   }
 
   // An operation to apply to the blob dataset

@@ -588,13 +588,12 @@ async fn reserve_fragment_ids(
     dataset: &Dataset,
     fragments: impl ExactSizeIterator<Item = &mut Fragment>,
 ) -> Result<()> {
-    let transaction = Transaction::new(
+    let transaction = Transaction::new_v1(
         dataset.manifest.version,
         Operation::ReserveFragments {
             num_fragments: fragments.len() as u32,
         },
         /*blob_op=*/ None,
-        None,
     );
 
     let (manifest, _) = commit_transaction(
@@ -891,7 +890,7 @@ pub async fn commit_compaction(
         Vec::new()
     };
 
-    let transaction = Transaction::new(
+    let transaction = Transaction::new_v1(
         dataset.manifest.version,
         Operation::Rewrite {
             groups: rewrite_groups,
@@ -899,7 +898,6 @@ pub async fn commit_compaction(
         },
         // TODO: Add a blob compaction pass
         /*blob_op= */ None,
-        None,
     );
 
     let (manifest, manifest_path) = commit_transaction(

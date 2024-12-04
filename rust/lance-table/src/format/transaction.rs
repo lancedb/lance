@@ -55,32 +55,16 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use snafu::{location, Location};
+use v2::UserOperation;
 
 use crate::feature_flags::{apply_feature_flags, FLAG_MOVE_STABLE_ROW_IDS};
 use crate::utils::timestamp_to_nanos;
 
-mod v1;
+pub mod v1;
+pub mod v2;
 
 pub use v1::{validate_operation, Operation, RewriteGroup, RewrittenIndex};
-
-/// A change to a dataset that can be retried
-///
-/// This contains enough information to be able to build the next manifest,
-/// given the current manifest.
-#[derive(Debug, Clone, DeepSizeOf)]
-pub struct Transaction {
-    /// The version of the table this transaction is based off of. If this is
-    /// the first transaction, this should be 0.
-    pub read_version: u64,
-    pub uuid: String,
-    pub operation: Operation,
-    /// If the transaction modified the blobs dataset, this is the operation
-    /// to apply to the blobs dataset.
-    ///
-    /// If this is `None`, then the blobs dataset was not modified
-    pub blobs_op: Option<Operation>,
-    pub tag: Option<String>,
-}
+pub use v2::Action;
 
 #[derive(Debug)]
 pub struct ManifestWriteConfig {
@@ -103,27 +87,99 @@ impl Default for ManifestWriteConfig {
     }
 }
 
+/// A change to a dataset that can be retried
+///
+/// This contains enough information to be able to build the next manifest,
+/// given the current manifest.
+#[derive(Debug, Clone, DeepSizeOf)]
+pub enum Transaction {
+    /// A transaction based on a sequence of [UserOperation]s. Each
+    /// [UserOperation] contains a sequence of [v2::action::Action]s.
+    V2(v2::Transaction),
+    /// A transaction based on of an [Operation].
+    V1(v1::Transaction),
+}
+
 impl Transaction {
-    pub fn new(
-        read_version: u64,
-        operation: Operation,
-        blobs_op: Option<Operation>,
-        tag: Option<String>,
-    ) -> Self {
+    pub fn new_v1(read_version: u64, operation: Operation, blobs_op: Option<Operation>) -> Self {
         let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
-        Self {
+        Self::V1(v1::Transaction {
             read_version,
             uuid,
             operation,
             blobs_op,
-            tag,
+            tag: None,
+        })
+    }
+
+    pub fn new_v2(
+        read_version: u64,
+        operations: Vec<UserOperation>,
+        blob_ops: Vec<UserOperation>,
+    ) -> Self {
+        let uuid = uuid::Uuid::new_v4().hyphenated().to_string();
+        Self::V2(v2::Transaction {
+            read_version,
+            uuid,
+            operations,
+            blob_ops,
+        })
+    }
+
+    pub fn read_version(&self) -> u64 {
+        match self {
+            Self::V1(v1) => v1.read_version,
+            Self::V2(v2) => v2.read_version,
+        }
+    }
+
+    pub fn uuid(&self) -> &str {
+        match self {
+            Self::V1(v1) => &v1.uuid,
+            Self::V2(v2) => &v2.uuid,
+        }
+    }
+
+    pub fn operation(&self) -> Option<&Operation> {
+        match self {
+            Self::V1(v1) => Some(&v1.operation),
+            Self::V2(_) => None,
+        }
+    }
+
+    pub fn blob_transaction(&self, read_version: u64) -> Option<Self> {
+        match self {
+            Self::V1(v1) => v1.blobs_op.clone().map(|operation| {
+                Self::V1(v1::Transaction {
+                    read_version,
+                    uuid: v1.uuid.clone(),
+                    operation,
+                    blobs_op: None,
+                    tag: None,
+                })
+            }),
+            Self::V2(v2) => {
+                if !v2.blob_ops.is_empty() {
+                    Some(Self::V2(v2::Transaction {
+                        read_version,
+                        uuid: v2.uuid.clone(),
+                        operations: v2.blob_ops.clone(),
+                        blob_ops: Vec::new(),
+                    }))
+                } else {
+                    None
+                }
+            }
         }
     }
 
     /// Returns true if the transaction cannot be committed if the other
     /// transaction is committed first.
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        self.operation.conflicts_with(&other.operation)
+        match (self, other) {
+            (Self::V1(a), Self::V1(b)) => a.operation.conflicts_with(&b.operation),
+            _ => todo!(),
+        }
     }
 
     fn fragments_with_ids<'a, T>(
@@ -195,6 +251,13 @@ impl Transaction {
         config: &ManifestWriteConfig,
         new_blob_version: Option<u64>,
     ) -> Result<(Manifest, Vec<Index>)> {
+        let Self::V1(transaction) = self else {
+            return Err(Error::NotSupported {
+                source: "Cannot build a manifest from a V2 transaction".into(),
+                location: location!(),
+            });
+        };
+
         if config.use_move_stable_row_ids
             && current_manifest
                 .map(|m| !m.uses_move_stable_row_ids())
@@ -207,7 +270,7 @@ impl Transaction {
         }
 
         // Get the schema and the final fragment list
-        let schema = match self.operation {
+        let schema = match transaction.operation {
             Operation::Overwrite { ref schema, .. } => schema.clone(),
             Operation::Merge { ref schema, .. } => schema.clone(),
             Operation::Project { ref schema, .. } => schema.clone(),
@@ -223,7 +286,7 @@ impl Transaction {
             }
         };
 
-        let mut fragment_id = if matches!(self.operation, Operation::Overwrite { .. }) {
+        let mut fragment_id = if matches!(transaction.operation, Operation::Overwrite { .. }) {
             0
         } else {
             current_manifest
@@ -259,12 +322,12 @@ impl Transaction {
                 .ok_or_else(|| Error::Internal {
                     message: format!(
                         "No current manifest was provided while building manifest for operation {}",
-                        self.operation.name()
+                        transaction.operation.name()
                     ),
                     location: location!(),
                 });
 
-        match &self.operation {
+        match &transaction.operation {
             Operation::Append { ref fragments } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
                 let mut new_fragments =
@@ -422,7 +485,7 @@ impl Transaction {
                 new_blob_version,
             );
             if user_requested_version.is_some()
-                && matches!(self.operation, Operation::Overwrite { .. })
+                && matches!(transaction.operation, Operation::Overwrite { .. })
             {
                 // If this is an overwrite operation and the user has requested a specific version
                 // then overwrite with that version.  Otherwise, if the user didn't request a specific
@@ -442,7 +505,7 @@ impl Transaction {
             )
         };
 
-        manifest.tag.clone_from(&self.tag);
+        manifest.tag.clone_from(&transaction.tag);
 
         if config.auto_set_feature_flags {
             apply_feature_flags(&mut manifest, config.use_move_stable_row_ids)?;
@@ -451,7 +514,7 @@ impl Transaction {
 
         manifest.update_max_fragment_id();
 
-        match &self.operation {
+        match &transaction.operation {
             Operation::Overwrite {
                 config_upsert_values: Some(tm),
                 ..
@@ -478,7 +541,7 @@ impl Transaction {
             _ => {}
         }
 
-        if let Operation::ReserveFragments { num_fragments } = self.operation {
+        if let Operation::ReserveFragments { num_fragments } = transaction.operation {
             manifest.max_fragment_id += num_fragments;
         }
 
@@ -651,45 +714,58 @@ impl TryFrom<pb::Transaction> for Transaction {
     type Error = Error;
 
     fn try_from(message: pb::Transaction) -> Result<Self> {
-        let operation = match message.operation {
-            Some(op) => Operation::try_from(op)?,
-            None => {
-                return Err(Error::Internal {
-                    message: "Transaction message did not contain an operation".to_string(),
-                    location: location!(),
-                });
+        match message.operation {
+            Some(pb::transaction::Operation::CompositeOperation(
+                pb::transaction::CompositeOperation { user_operations },
+            )) => {
+                let operations = user_operations
+                    .into_iter()
+                    .map(UserOperation::try_from)
+                    .collect::<Result<_>>()?;
+                if message.blob_operation.is_some() {
+                    return Err(Error::NotSupported {
+                        source: "Blob ops are not yet supported for composite operations".into(),
+                        location: location!(),
+                    });
+                }
+                Ok(Self::V2(v2::Transaction {
+                    read_version: message.read_version,
+                    uuid: message.uuid.clone(),
+                    operations,
+                    blob_ops: Vec::new(),
+                }))
             }
-        };
-        let blobs_op = message
-            .blob_operation
-            .map(|blob_op| blob_op.try_into())
-            .transpose()?;
-        Ok(Self {
-            read_version: message.read_version,
-            uuid: message.uuid.clone(),
-            operation,
-            blobs_op,
-            tag: if message.tag.is_empty() {
-                None
-            } else {
-                Some(message.tag.clone())
-            },
-        })
+            Some(op) => {
+                let operation = Operation::try_from(op)?;
+                let blobs_op = message
+                    .blob_operation
+                    .map(|blob_op| blob_op.try_into())
+                    .transpose()?;
+                Ok(Self::V1(v1::Transaction {
+                    read_version: message.read_version,
+                    uuid: message.uuid.clone(),
+                    operation,
+                    blobs_op,
+                    tag: if message.tag.is_empty() {
+                        None
+                    } else {
+                        Some(message.tag.clone())
+                    },
+                }))
+            }
+            None => Err(Error::Internal {
+                message: "Transaction message did not contain an operation".to_string(),
+                location: location!(),
+            }),
+        }
     }
 }
 
 impl From<&Transaction> for pb::Transaction {
     fn from(value: &Transaction) -> Self {
-        let operation = (&value.operation).into();
-
-        let blob_operation = value.blobs_op.as_ref().map(|op| op.into());
-
-        Self {
-            read_version: value.read_version,
-            uuid: value.uuid.clone(),
-            operation: Some(operation),
-            blob_operation,
-            tag: value.tag.clone().unwrap_or("".to_string()),
+        match value {
+            Transaction::V1(v1) => v1.into(),
+            Transaction::V2(v2) => v2.into(),
         }
     }
 }

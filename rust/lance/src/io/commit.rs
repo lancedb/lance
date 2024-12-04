@@ -28,7 +28,7 @@ use std::sync::Arc;
 use lance_file::version::LanceFileVersion;
 use lance_table::format::{
     is_detached_version, pb,
-    transaction::{ManifestWriteConfig, Operation, Transaction},
+    transaction::{v1::Transaction as V1Transaction, ManifestWriteConfig, Operation, Transaction},
     DataStorageFormat, DeletionFile, Fragment, Index, Manifest, WriterVersion,
     DETACHED_VERSION_MASK,
 };
@@ -111,7 +111,7 @@ async fn write_transaction_file(
     base_path: &Path,
     transaction: &Transaction,
 ) -> Result<String> {
-    let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
+    let file_name = format!("{}-{}.txn", transaction.read_version(), transaction.uuid());
     let path = base_path.child("_transactions").child(file_name.as_str());
 
     let message = pb::Transaction::from(transaction);
@@ -214,9 +214,8 @@ pub(crate) async fn commit_new_dataset(
     manifest_naming_scheme: ManifestNamingScheme,
     session: &Session,
 ) -> Result<(Manifest, Path)> {
-    let blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
+    let blob_version = if let Some(blob_tx) = transaction.blob_transaction(0) {
         let blob_path = base_path.child(BLOB_DIR);
-        let blob_tx = Transaction::new(0, blob_op.clone(), None, None);
         let (blob_manifest, _) = do_commit_new_dataset(
             object_store,
             commit_handler,
@@ -536,25 +535,28 @@ pub(crate) async fn do_commit_detached_transaction(
         // Pick a random u64 with the highest bit set to indicate it is detached
         let random_version = thread_rng().gen::<u64>() | DETACHED_VERSION_MASK;
 
-        let (mut manifest, mut indices) = match transaction.operation {
-            Operation::Restore { version } => {
-                Transaction::restore_old_manifest(
-                    object_store,
-                    commit_handler,
-                    &dataset.base,
-                    version,
-                    write_config,
-                    &transaction_file,
-                )
-                .await?
-            }
-            _ => transaction.build_manifest(
+        let (mut manifest, mut indices) = if let Transaction::V1(V1Transaction {
+            operation: Operation::Restore { version },
+            ..
+        }) = transaction
+        {
+            Transaction::restore_old_manifest(
+                object_store,
+                commit_handler,
+                &dataset.base,
+                *version,
+                write_config,
+                &transaction_file,
+            )
+            .await?
+        } else {
+            transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
                 new_blob_version,
-            )?,
+            )?
         };
 
         manifest.version = random_version;
@@ -622,21 +624,22 @@ pub(crate) async fn commit_detached_transaction(
     write_config: &ManifestWriteConfig,
     commit_config: &CommitConfig,
 ) -> Result<(Manifest, Path)> {
-    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
-        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
-        let blobs_tx =
-            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
-            blobs_dataset.as_ref(),
-            object_store,
-            commit_handler,
-            &blobs_tx,
-            write_config,
-            commit_config,
-            None,
-        )
-        .await?;
-        Some(blobs_manifest.version)
+    let new_blob_version = if let Some(blob_ds) = dataset.blobs_dataset().await? {
+        if let Some(blobs_tx) = transaction.blob_transaction(blob_ds.version().version) {
+            let (blobs_manifest, _) = do_commit_detached_transaction(
+                blob_ds.as_ref(),
+                object_store,
+                commit_handler,
+                &blobs_tx,
+                write_config,
+                commit_config,
+                None,
+            )
+            .await?;
+            Some(blobs_manifest.version)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -663,21 +666,22 @@ pub(crate) async fn commit_transaction(
     commit_config: &CommitConfig,
     manifest_naming_scheme: ManifestNamingScheme,
 ) -> Result<(Manifest, Path)> {
-    let new_blob_version = if let Some(blob_op) = transaction.blobs_op.as_ref() {
-        let blobs_dataset = dataset.blobs_dataset().await?.unwrap();
-        let blobs_tx =
-            Transaction::new(blobs_dataset.version().version, blob_op.clone(), None, None);
-        let (blobs_manifest, _) = do_commit_detached_transaction(
-            blobs_dataset.as_ref(),
-            object_store,
-            commit_handler,
-            &blobs_tx,
-            write_config,
-            commit_config,
-            None,
-        )
-        .await?;
-        Some(blobs_manifest.version)
+    let new_blob_version = if let Some(blob_ds) = dataset.blobs_dataset().await? {
+        if let Some(blobs_tx) = transaction.blob_transaction(blob_ds.version().version) {
+            let (blobs_manifest, _) = do_commit_detached_transaction(
+                blob_ds.as_ref(),
+                object_store,
+                commit_handler,
+                &blobs_tx,
+                write_config,
+                commit_config,
+                None,
+            )
+            .await?;
+            Some(blobs_manifest.version)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -687,7 +691,7 @@ pub(crate) async fn commit_transaction(
     let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
 
     // First, get all transactions since read_version
-    let read_version = transaction.read_version;
+    let read_version = transaction.read_version();
     let mut dataset = dataset.clone();
     // We need to checkout the latest version, because any fixes we apply
     // (like computing the new row ids) needs to be done based on the most
@@ -726,25 +730,28 @@ pub(crate) async fn commit_transaction(
 
     for attempt_i in 0..commit_config.num_retries {
         // Build an up-to-date manifest from the transaction and current manifest
-        let (mut manifest, mut indices) = match transaction.operation {
-            Operation::Restore { version } => {
-                Transaction::restore_old_manifest(
-                    object_store,
-                    commit_handler,
-                    &dataset.base,
-                    version,
-                    write_config,
-                    &transaction_file,
-                )
-                .await?
-            }
-            _ => transaction.build_manifest(
+        let (mut manifest, mut indices) = if let Transaction::V1(V1Transaction {
+            operation: Operation::Restore { version },
+            ..
+        }) = transaction
+        {
+            Transaction::restore_old_manifest(
+                object_store,
+                commit_handler,
+                &dataset.base,
+                *version,
+                write_config,
+                &transaction_file,
+            )
+            .await?
+        } else {
+            transaction.build_manifest(
                 Some(dataset.manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
                 new_blob_version,
-            )?,
+            )?
         };
 
         manifest.version = target_version;
@@ -1001,11 +1008,10 @@ mod tests {
     async fn test_roundtrip_transaction_file() {
         let object_store = ObjectStore::memory();
         let base_path = Path::from("test");
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             42,
             Operation::Append { fragments: vec![] },
             /*blobs_op= */ None,
-            Some("hello world".to_string()),
         );
 
         let file_name = write_transaction_file(&object_store, &base_path, &transaction)
@@ -1015,13 +1021,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(transaction.read_version, read_transaction.read_version);
-        assert_eq!(transaction.uuid, read_transaction.uuid);
+        assert_eq!(transaction.read_version(), read_transaction.read_version());
+        assert_eq!(transaction.uuid(), read_transaction.uuid());
         assert!(matches!(
-            read_transaction.operation,
-            Operation::Append { .. }
+            read_transaction,
+            Transaction::V1(V1Transaction {
+                operation: Operation::Append { .. },
+                ..
+            }),
         ));
-        assert_eq!(transaction.tag, read_transaction.tag);
     }
 
     #[tokio::test]

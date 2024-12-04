@@ -366,11 +366,10 @@ impl UpdateJob {
             updated_fragments,
             new_fragments,
         };
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.dataset.manifest.version,
             operation,
             /*blobs_op=*/ None,
-            None,
         );
 
         let (manifest, manifest_path) = commit_transaction(

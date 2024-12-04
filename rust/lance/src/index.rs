@@ -318,14 +318,13 @@ impl DatasetIndexExt for Dataset {
             fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
             index_details: Some(index_details),
         };
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
             /*blobs_op= */ None,
-            None,
         );
 
         let (new_manifest, manifest_path) = commit_transaction(
@@ -394,14 +393,13 @@ impl DatasetIndexExt for Dataset {
             index_details: None,
         };
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices: vec![new_idx],
                 removed_indices: vec![],
             },
             /*blobs_op= */ None,
-            None,
         );
 
         let (new_manifest, new_path) = commit_transaction(
@@ -493,14 +491,13 @@ impl DatasetIndexExt for Dataset {
             return Ok(());
         }
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,
             },
             /*blobs_op= */ None,
-            None,
         );
 
         let (new_manifest, manifest_path) = commit_transaction(

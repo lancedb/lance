@@ -572,13 +572,12 @@ impl Dataset {
         let (latest_manifest, _) = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             latest_version,
             Operation::Restore {
                 version: self.manifest.version,
             },
             /*blobs_op=*/ None,
-            None,
         );
 
         let (restored_manifest, path) = commit_transaction(
@@ -657,7 +656,7 @@ impl Dataset {
             Ok,
         )?;
 
-        let transaction = Transaction::new(read_version, operation, blobs_op, None);
+        let transaction = Transaction::new_v1(read_version, operation, blobs_op);
 
         let mut builder = CommitBuilder::new(base_uri)
             .with_object_store_registry(object_store_registry)
@@ -915,7 +914,7 @@ impl Dataset {
             })
             .await?;
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::Delete {
                 updated_fragments,
@@ -925,7 +924,6 @@ impl Dataset {
             // No change is needed to the blobs dataset.  The blobs are implicitly deleted since the
             // rows that reference them are deleted.
             /*blobs_op=*/
-            None,
             None,
         );
 
@@ -1446,7 +1444,7 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::Merge {
                 fragments: updated_fragments,
@@ -1454,7 +1452,6 @@ impl Dataset {
             },
             // It is not possible to add blob columns using merge
             /*blobs_op=*/
-            None,
             None,
         );
 
@@ -1501,14 +1498,13 @@ impl Dataset {
         &mut self,
         upsert_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(upsert_values)),
                 delete_keys: None,
             },
             /*blobs_op=*/ None,
-            None,
         );
 
         let (manifest, manifest_path) = commit_transaction(
@@ -1530,14 +1526,13 @@ impl Dataset {
 
     /// Delete keys from the config.
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::UpdateConfig {
                 upsert_values: None,
                 delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
             },
             /*blob_op=*/ None,
-            None,
         );
 
         let (manifest, manifest_path) = commit_transaction(
