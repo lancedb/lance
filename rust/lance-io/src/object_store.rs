@@ -58,20 +58,20 @@ pub trait ObjectStoreExt {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    async fn read_dir_all(
-        &self,
+    async fn read_dir_all<'a>(
+        &'a self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>>;
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>>;
 }
 
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    async fn read_dir_all(
-        &self,
+    async fn read_dir_all<'a>(
+        &'a self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
         let mut output = self.list(Some(dir_path.into()));
         if let Some(unmodified_since_val) = unmodified_since {
             output = output
@@ -652,7 +652,7 @@ impl ObjectStore {
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<Result<Path>> {
+    ) -> BoxStream<'a, Result<Path>> {
         self.inner
             .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
             .err_into::<Error>()
