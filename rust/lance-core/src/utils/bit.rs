@@ -60,7 +60,6 @@ pub fn log_2_ceil(val: u32) -> u32 {
 }
 
 #[cfg(test)]
-
 pub mod tests {
     use crate::utils::bit::log_2_ceil;
 
