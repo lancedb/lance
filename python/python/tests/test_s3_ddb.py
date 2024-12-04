@@ -287,3 +287,15 @@ def test_file_writer_reader(s3_bucket: str):
         bytes(reader.read_global_buffer(global_buffer_pos)).decode()
         == global_buffer_text
     )
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+@pytest.mark.integration
+@pytest.mark.skipif(not _RAY_AVAILABLE, reason="ray is not available")
+def test_ray_read_lance(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
+    path = f"s3://{s3_bucket}/test_ray_read.lance"
+    lance.write_dataset(table, path, storage_options=storage_options)
+    ds = ray.data.read_lance(path, storage_options=storage_options, concurrency=1)
+    ds.take(1)
