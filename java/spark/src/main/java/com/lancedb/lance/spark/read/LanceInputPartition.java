@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 
@@ -28,8 +29,12 @@ public class LanceInputPartition implements InputPartition {
   private final LanceConfig config;
   private final Optional<String> whereCondition;
 
-  public LanceInputPartition(StructType schema, int partitionId,
-      LanceSplit lanceSplit, LanceConfig config, Optional<String> whereCondition) {
+  public LanceInputPartition(
+      StructType schema,
+      int partitionId,
+      LanceSplit lanceSplit,
+      LanceConfig config,
+      Optional<String> whereCondition) {
     this.schema = schema;
     this.partitionId = partitionId;
     this.lanceSplit = lanceSplit;

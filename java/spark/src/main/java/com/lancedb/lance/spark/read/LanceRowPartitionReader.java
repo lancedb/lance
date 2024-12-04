@@ -14,8 +14,8 @@
 
 package com.lancedb.lance.spark.read;
 
-import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 import java.io.IOException;
