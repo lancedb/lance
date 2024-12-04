@@ -287,3 +287,12 @@ def test_file_writer_reader(s3_bucket: str):
         bytes(reader.read_global_buffer(global_buffer_pos)).decode()
         == global_buffer_text
     )
+
+
+@pytest.mark.integration
+def test_append_fragment(s3_bucket: str):
+    storage_options = copy.deepcopy(CONFIG)
+    table = pa.table({"a": [1, 2], "b": ["a", "b"]})
+    lance.fragment.LanceFragment.create(
+        f"s3://{s3_bucket}/test_append.lance", table, storage_options=storage_options
+    )
