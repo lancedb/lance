@@ -16,10 +16,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, SchemaRef};
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
-use snafu::{location, Location};
 
 use super::index::FlatMetadata;
 

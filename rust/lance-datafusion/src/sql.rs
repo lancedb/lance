@@ -10,8 +10,9 @@ use datafusion::sql::sqlparser::{
     tokenizer::{Token, Tokenizer},
 };
 
+use lance_core::location;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+
 #[derive(Debug, Default)]
 struct LanceDialect(GenericDialect);
 

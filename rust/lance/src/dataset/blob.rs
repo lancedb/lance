@@ -8,6 +8,7 @@ use arrow::datatypes::UInt64Type;
 use arrow_schema::DataType;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::StreamExt;
+use lance_core::location;
 use lance_core::{
     datatypes::{Schema, StorageClass, BLOB_META_KEY},
     error::CloneableResult,
@@ -19,7 +20,7 @@ use lance_core::{
 };
 use lance_io::traits::Reader;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tokio::sync::Mutex;
 
 use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};

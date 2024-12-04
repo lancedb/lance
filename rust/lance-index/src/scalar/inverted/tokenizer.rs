@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_core::location;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,9 +5,10 @@ use arrow_array::builder::Int64Builder;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_io::encodings::plain::PlainDecoder;
 use lance_io::encodings::Decoder;
-use snafu::{location, Location};
+
 use std::collections::BTreeMap;
 use tokio::io::AsyncWriteExt;
 

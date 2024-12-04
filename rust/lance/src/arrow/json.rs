@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use snafu::{location, Location};
+use lance_core::location;
 
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};

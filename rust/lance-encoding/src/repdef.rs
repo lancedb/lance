@@ -98,8 +98,8 @@ use arrow_array::OffsetSizeTrait;
 use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
+use lance_core::location;
 use lance_core::{utils::bit::log_2_ceil, Error, Result};
-use snafu::{location, Location};
 
 // We assume 16 bits is good enough for rep-def levels.  This gives us
 // 65536 levels of struct nesting and list nesting.

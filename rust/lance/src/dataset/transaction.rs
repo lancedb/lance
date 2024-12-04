@@ -44,6 +44,7 @@ use std::{
 };
 
 use deepsize::DeepSizeOf;
+use lance_core::location;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::{datatypes::Fields, version::LanceFileVersion};
 use lance_io::object_store::ObjectStore;
@@ -60,7 +61,7 @@ use lance_table::{
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+
 use uuid::Uuid;
 
 use super::ManifestWriteConfig;

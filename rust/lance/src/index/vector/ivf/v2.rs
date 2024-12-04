@@ -22,6 +22,7 @@ use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
+use lance_core::location;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -52,7 +53,7 @@ use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use crate::index::vector::builder::index_type_string;

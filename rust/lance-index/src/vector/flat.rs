@@ -7,9 +7,10 @@
 use arrow_array::{make_array, Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
+use lance_core::location;
 use lance_core::{Error, Result, ROW_ID};
 use lance_linalg::distance::DistanceType;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use super::DIST_COL;

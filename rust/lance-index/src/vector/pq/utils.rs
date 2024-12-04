@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_array::{cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray};
+use lance_core::location;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///
