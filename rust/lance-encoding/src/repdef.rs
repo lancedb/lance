@@ -110,6 +110,8 @@ use crate::buffer::LanceBuffer;
 // 65536 levels of struct nesting and list nesting.
 pub type LevelBuffer = Vec<u16>;
 
+/// Represents information that we extract from a list array as we are
+/// encoding
 #[derive(Clone, Debug)]
 struct OffsetDesc {
     offsets: Arc<[i64]>,
@@ -119,6 +121,8 @@ struct OffsetDesc {
     num_values: usize,
 }
 
+/// Represents validity information that we extract from non-list arrays (that
+/// have nulls) as we are encoding
 #[derive(Clone, Debug)]
 struct ValidityDesc {
     validity: Option<BooleanBuffer>,
@@ -126,7 +130,8 @@ struct ValidityDesc {
 }
 
 // As we build up rep/def from arrow arrays we record a
-// series of RawRepDef objects
+// series of RawRepDef objects.  Each one corresponds to layer
+// in the array structure
 #[derive(Clone, Debug)]
 enum RawRepDef {
     Offsets(OffsetDesc),
@@ -134,6 +139,7 @@ enum RawRepDef {
 }
 
 impl RawRepDef {
+    // Are there any nulls in this layer
     fn has_nulls(&self) -> bool {
         match self {
             Self::Offsets(OffsetDesc { validity, .. }) => validity.is_some(),
@@ -141,6 +147,7 @@ impl RawRepDef {
         }
     }
 
+    // How many values are in this layer
     fn num_values(&self) -> usize {
         match self {
             Self::Offsets(OffsetDesc { num_values, .. }) => *num_values,
@@ -243,8 +250,8 @@ impl SerializedRepDefs {
         // one tricky part.  If a non-special is added after a special item then it swaps its
         // repetition level with the special item.
         if let Some(def) = self.definition_levels {
-            let mut def_itr = def.into_iter();
-            let mut rep_itr = rep.into_iter();
+            let mut def_itr = def.iter();
+            let mut rep_itr = rep.iter();
             let mut special_itr = self.special_records.into_iter().peekable();
             let mut last_special = None;
 
@@ -281,7 +288,7 @@ impl SerializedRepDefs {
                 }
             }
         } else {
-            let mut rep_itr = rep.into_iter();
+            let mut rep_itr = rep.iter();
             let mut special_itr = self.special_records.into_iter().peekable();
             let mut last_special = None;
 
@@ -408,7 +415,18 @@ pub struct SpecialRecord {
     rep_level: u16,
 }
 
-/// Indicates if a definition level represents a null value or an empty list
+/// This tells us how an array handles definition.  Given a stack of
+/// these and a nested array and a set of definition levels we can calculate
+/// how we should interpret the definition levels.
+///
+/// For example, if the interpretation is [AllValidItem, NullableItem] then
+/// a 0 means "valid item" and a 1 means "null struct".  If the interpretation
+/// is [NullableItem, NullableItem] then a 0 means "valid item" and a 1 means
+/// "null item" and a 2 means "null struct".
+///
+/// Lists are tricky because we might use up to two definition levels for a
+/// single layer of list nesting because we need one value to indicate "empty list"
+/// and another value to indicate "null list".
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DefinitionInterpretation {
     AllValidItem,
@@ -420,6 +438,7 @@ pub enum DefinitionInterpretation {
 }
 
 impl DefinitionInterpretation {
+    /// How many definition levels do we need for this layer
     pub fn num_def_levels(&self) -> u16 {
         match self {
             Self::AllValidItem => 0,
@@ -431,6 +450,7 @@ impl DefinitionInterpretation {
         }
     }
 
+    /// Does this layer have nulls?
     pub fn is_all_valid(&self) -> bool {
         matches!(
             self,
@@ -438,6 +458,7 @@ impl DefinitionInterpretation {
         )
     }
 
+    /// Does this layer represent a list?
     pub fn is_list(&self) -> bool {
         matches!(
             self,
@@ -680,6 +701,8 @@ impl SerializerContext {
     }
 }
 
+/// As we are encoding we record information about "specials" which are
+/// empty lists or null lists.
 #[derive(Debug, Copy, Clone)]
 enum SpecialOffset {
     NullList(usize),
@@ -1198,15 +1221,11 @@ impl RepDefUnraveler {
             .ok_or_else(|| Error::invalid_input("A single batch had more than i32::MAX values and so a large container type is required", location!()))
         };
         self.current_rep_cmp += 1;
-        println!(
-            "Unraveling offsets (mut validity={:?}) with curlen: {} and rep: {}",
-            validity, curlen, self.current_rep_cmp
-        );
         if let Some(def_levels) = &mut self.def_levels {
             assert!(rep_levels.len() == def_levels.len());
             // It's possible validity is None even if we have def levels.  For example, we might have
             // empty lists (which require def levels) but no nulls.
-            let mut push_validity: Box<dyn FnMut(bool) -> ()> = if let Some(validity) = validity {
+            let mut push_validity: Box<dyn FnMut(bool)> = if let Some(validity) = validity {
                 Box::new(|is_valid| validity.append(is_valid))
             } else {
                 Box::new(|_| {})
@@ -1284,7 +1303,6 @@ impl RepDefUnraveler {
             if let Some(validity) = validity {
                 // Even though we don't have validity it is possible another unraveler did and so we need
                 // to push all valids
-                println!("Pushing {} auto-valids", num_new_lists);
                 validity.append_n(num_new_lists, true);
             }
             Ok(())
@@ -1322,6 +1340,19 @@ impl RepDefUnraveler {
     }
 }
 
+/// As we decode we may extract rep/def information from multiple pages (or multiple
+/// chunks within a page).
+///
+/// For each chunk we create an unraveler.  Each unraveler can have a completely different
+/// interpretation (e.g. one page might contain null items but no null structs and the next
+/// page might have null structs but no null items).
+///
+/// Concatenating these unravelers would be tricky and expensive so instead we have a
+/// composite unraveler which unravels across multiple unravelers.
+///
+/// Note: this class should be used even if there is only one page / unraveler.  This is
+/// because the `RepDefUnraveler`'s API is more complex (it's meant to be called by this
+/// class)
 #[derive(Debug)]
 pub struct CompositeRepDefUnraveler {
     unravelers: Vec<RepDefUnraveler>,
@@ -1332,6 +1363,9 @@ impl CompositeRepDefUnraveler {
         Self { unravelers }
     }
 
+    /// Unravels a layer of validity
+    ///
+    /// Returns None if there are no null items in this layer
     pub fn unravel_validity(&mut self, num_values: usize) -> Option<NullBuffer> {
         let is_all_valid = self
             .unravelers
@@ -1352,6 +1386,7 @@ impl CompositeRepDefUnraveler {
         }
     }
 
+    /// Unravels a layer of offsets (and the validity for that layer)
     pub fn unravel_offsets<T: ArrowNativeType>(
         &mut self,
     ) -> Result<(OffsetBuffer<T>, Option<NullBuffer>)> {
@@ -1362,12 +1397,9 @@ impl CompositeRepDefUnraveler {
             max_num_lists += unraveler.max_lists();
         }
 
-        println!("Is all valid: {}", is_all_valid);
-
         let mut validity = if is_all_valid {
             None
         } else {
-            println!("Making validity with up to {} elements", max_num_lists);
             // Note: This is probably an over-estimate and potentially even an under-estimate.  We only know
             // right now how many items we have and not how many rows.  (TODO: Shouldn't we know the # of rows?)
             Some(BooleanBufferBuilder::new(max_num_lists))
@@ -1481,6 +1513,13 @@ fn get_mask(width: u16) -> u16 {
     (1 << width) - 1
 }
 
+// We're really going out of our way to avoid boxing here but this will be called on a per-value basis
+// so it is in the critical path.
+type SpecificBinaryControlWordIterator<'a, T> = BinaryControlWordIterator<
+    Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
+    T,
+>;
+
 /// An iterator that generates control words from repetition and definition levels
 ///
 /// "Control word" is just a fancy term for a single u8/u16/u32 that contains both
@@ -1492,24 +1531,9 @@ fn get_mask(width: u16) -> u16 {
 /// levels of nesting which seems unlikely to encounter in practice.
 #[derive(Debug)]
 pub enum ControlWordIterator<'a> {
-    Binary8(
-        BinaryControlWordIterator<
-            Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
-            u8,
-        >,
-    ),
-    Binary16(
-        BinaryControlWordIterator<
-            Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
-            u16,
-        >,
-    ),
-    Binary32(
-        BinaryControlWordIterator<
-            Zip<Copied<std::slice::Iter<'a, u16>>, Copied<std::slice::Iter<'a, u16>>>,
-            u32,
-        >,
-    ),
+    Binary8(SpecificBinaryControlWordIterator<'a, u8>),
+    Binary16(SpecificBinaryControlWordIterator<'a, u16>),
+    Binary32(SpecificBinaryControlWordIterator<'a, u32>),
     Unary8(UnaryControlWordIterator<Copied<std::slice::Iter<'a, u16>>, u8>),
     Unary16(UnaryControlWordIterator<Copied<std::slice::Iter<'a, u16>>, u16>),
     Unary32(UnaryControlWordIterator<Copied<std::slice::Iter<'a, u16>>, u32>),
@@ -2154,8 +2178,8 @@ mod tests {
                 }
             }
 
-            assert_eq!(rep.as_ref(), rep_out.as_slice());
-            assert_eq!(def.as_ref(), def_out.as_slice());
+            assert_eq!(rep, rep_out.as_slice());
+            assert_eq!(def, def_out.as_slice());
         }
 
         // Each will need 4 bits and so we should get 1-byte control words

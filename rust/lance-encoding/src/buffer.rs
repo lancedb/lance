@@ -227,7 +227,7 @@ impl LanceBuffer {
     pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
         let slice = arc.as_ref();
         let data = NonNull::new(slice.as_ptr() as _).unwrap_or(NonNull::dangling());
-        let len = slice.len() * std::mem::size_of::<T>();
+        let len = std::mem::size_of_val(slice);
         // SAFETY: the ptr will be valid for len items if the Arc<[T]> is valid
         let buffer = unsafe { Buffer::from_custom_allocation(data, len, Arc::new(arc)) };
         Self::Borrowed(buffer)
