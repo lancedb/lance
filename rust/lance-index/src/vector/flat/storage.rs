@@ -334,6 +334,7 @@ pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     vectors: &'a [T::Native],
     query: Vec<T::Native>,
     dimension: usize,
+    #[allow(clippy::type_complexity)]
     distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
 }
 
