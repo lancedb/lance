@@ -1540,7 +1540,7 @@ pub enum ControlWordIterator<'a> {
     Nilary(NilaryControlWordIterator),
 }
 
-impl<'a> ControlWordIterator<'a> {
+impl ControlWordIterator<'_> {
     /// Appends the next control word to the buffer
     pub fn append_next(&mut self, buf: &mut Vec<u8>) {
         match self {
