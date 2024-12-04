@@ -71,7 +71,9 @@ public class LanceCatalog implements TableCatalog {
 
   @Override
   public boolean dropTable(Identifier ident) {
-    throw new UnsupportedOperationException();
+    LanceConfig config = LanceConfig.from(options, ident.name());
+    LanceDatasetAdapter.dropDataset(config);
+    return true;
   }
 
   @Override

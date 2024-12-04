@@ -68,6 +68,7 @@ public class SparkWriteTest {
     List<Row> data = Arrays.asList(row1, row2);
 
     testData = spark.createDataFrame(data, schema);
+    testData.createOrReplaceTempView("tmp_view");
   }
 
   @AfterAll
@@ -241,5 +242,14 @@ public class SparkWriteTest {
     for (Row row : data2.collectAsList()) {
       assertEquals("Bob", row.getString(0));
     }
+  }
+
+  @Test
+  public void dropAndReplaceTable(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String path = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+    spark.sql("DROP TABLE lance.`" + path + "`");
   }
 }

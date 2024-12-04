@@ -108,4 +108,10 @@ public class LanceDatasetAdapter {
             params)
         .close();
   }
+
+  public static void dropDataset(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    Dataset.drop(uri, options.getStorageOptions());
+  }
 }
