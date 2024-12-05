@@ -95,7 +95,6 @@ impl<'a> From<&'a [u8; 16]> for u8x16 {
 
 impl SIMD<u8, 16> for u8x16 {
     #[inline]
-
     fn splat(val: u8) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -184,7 +183,6 @@ impl SIMD<u8, 16> for u8x16 {
     }
 
     #[inline]
-
     unsafe fn store_unaligned(&self, ptr: *mut u8) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
