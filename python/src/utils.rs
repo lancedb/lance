@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use arrow::compute::concat;
+use arrow::datatypes::Float32Type;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use arrow_array::{cast::AsArray, Array, FixedSizeListArray, Float32Array, UInt32Array};
 use arrow_data::ArrayData;
@@ -26,7 +27,7 @@ use lance_file::writer::FileWriter;
 use lance_index::scalar::IndexWriter;
 use lance_index::vector::hnsw::{builder::HnswBuildParams, HNSW};
 use lance_index::vector::v3::subindex::IvfSubIndex;
-use lance_linalg::kmeans::compute_partitions;
+use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_linalg::{
     distance::DistanceType,
     kmeans::{KMeans as LanceKMeans, KMeansParams},
@@ -132,14 +133,15 @@ impl KMeans {
         if !matches!(fixed_size_arr.value_type(), DataType::Float32) {
             return Err(PyValueError::new_err("Must be a FixedSizeList of Float32"));
         };
-        let values: Arc<Float32Array> = fixed_size_arr.values().as_primitive().clone().into();
-        let centroids: &Float32Array = kmeans.centroids.as_primitive();
-        let cluster_ids = UInt32Array::from(compute_partitions(
-            centroids.values(),
-            values.values(),
-            kmeans.dimension,
-            kmeans.distance_type,
-        ));
+        let values = fixed_size_arr.values().as_primitive();
+        let centroids = kmeans.centroids.as_primitive();
+        let cluster_ids =
+            UInt32Array::from(compute_partitions::<
+                Float32Type,
+                KMeansAlgoFloat<Float32Type>,
+            >(
+                centroids, values, kmeans.dimension, kmeans.distance_type
+            ));
         cluster_ids.into_data().to_pyarrow(py)
     }
 
