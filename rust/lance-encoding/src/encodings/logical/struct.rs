@@ -618,7 +618,7 @@ impl StructuralStructDecoder {
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Box::new(decoder)
                 } else {
-                    Box::new(Self::new(fields.clone(), should_validate))
+                    Box::new(Self::new(fields.clone(), should_validate, false))
                 }
             }
             DataType::List(_) | DataType::LargeList(_) => todo!(),

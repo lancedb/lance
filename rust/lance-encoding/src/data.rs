@@ -343,6 +343,7 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
     }
 }
 
+#[derive(Debug)]
 struct StructDataBlockBuilder {
     children: Vec<Box<dyn DataBlockBuilderImpl>>,
 }
