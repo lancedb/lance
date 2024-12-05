@@ -532,6 +532,7 @@ mod tests {
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::DistanceType;
+    use lance_linalg::kernels::normalize_arrow;
     use lance_testing::datagen::generate_random_array_with_range;
     use rstest::rstest;
     use tempfile::tempdir;
@@ -545,6 +546,7 @@ mod tests {
         range: Range<f32>,
     ) -> (Dataset, Arc<FixedSizeListArray>) {
         let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
+        let vectors = normalize_arrow(&vectors).unwrap();
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();

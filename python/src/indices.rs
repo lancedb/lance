@@ -13,6 +13,8 @@ use lance_index::vector::{
 };
 use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::PyModuleMethods;
+use pyo3::Bound;
 use pyo3::{
     pyfunction,
     types::{PyList, PyModule},
@@ -198,6 +200,7 @@ async fn do_transform_vectors(
 
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature=(dataset, column, dimension, num_subvectors, distance_type, ivf_centroids, pq_codebook, dst_uri, fragments, partitions_ds_uri=None))]
 pub fn transform_vectors(
     py: Python<'_>,
     dataset: &Dataset,
@@ -285,7 +288,7 @@ pub fn shuffle_transformed_vectors(
 
     match result {
         Ok(partition_files) => {
-            let py_list = PyList::new(py, partition_files);
+            let py_list = PyList::new_bound(py, partition_files);
             Ok(py_list.into())
         }
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
@@ -329,6 +332,7 @@ async fn do_load_shuffled_vectors(
 }
 
 #[pyfunction]
+#[pyo3(signature=(filenames, dir_path, dataset, column, ivf_centroids, pq_codebook, pq_dimension, num_subvectors, distance_type, index_name=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn load_shuffled_vectors(
     filenames: Vec<String>,
@@ -375,13 +379,13 @@ pub fn load_shuffled_vectors(
     )?
 }
 
-pub fn register_indices(py: Python, m: &PyModule) -> PyResult<()> {
-    let indices = PyModule::new(py, "indices")?;
+pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let indices = PyModule::new_bound(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(shuffle_transformed_vectors))?;
     indices.add_wrapped(wrap_pyfunction!(load_shuffled_vectors))?;
-    m.add_submodule(indices)?;
+    m.add_submodule(&indices)?;
     Ok(())
 }

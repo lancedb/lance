@@ -146,7 +146,7 @@ pub(crate) fn extract_zone_info(
                 let mut zone_index = zone_index.clone();
                 let inner = zone_index.inner.take().unwrap();
                 let rows_per_zone = zone_index.rows_per_zone;
-                let zone_map_buffer = zone_index.zone_map_buffer.as_ref().unwrap().clone();
+                let zone_map_buffer = *zone_index.zone_map_buffer.as_ref().unwrap();
                 assert_eq!(
                     zone_map_buffer.buffer_type,
                     i32::from(pb::buffer::BufferType::Column)

@@ -362,7 +362,7 @@ impl<'a> FragIdIter<'a> {
     }
 }
 
-impl<'a> Iterator for FragIdIter<'a> {
+impl Iterator for FragIdIter<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {

@@ -87,7 +87,6 @@ impl TrainingRequest {
 // to make index types "generic" and "pluggable".  We will need to create some
 // kind of core proto for scalar indices that the scanner can read to determine
 // how and when to use a scalar index.
-
 pub trait ScalarIndexDetails {
     fn get_type(&self) -> ScalarIndexType;
 }

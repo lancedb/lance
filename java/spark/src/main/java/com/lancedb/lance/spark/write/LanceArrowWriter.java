@@ -22,6 +22,7 @@ import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.execution.arrow.ArrowWriter;
 
 import javax.annotation.concurrent.GuardedBy;
+
 import java.io.IOException;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -29,15 +30,15 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * A custom arrow reader that supports writes Spark internal rows while reading data in batches.
- */
+/** A custom arrow reader that supports writes Spark internal rows while reading data in batches. */
 public class LanceArrowWriter extends ArrowReader {
   private final Schema schema;
   private final int batchSize;
   private final Object monitor = new Object();
+
   @GuardedBy("monitor")
   private final Queue<InternalRow> rowQueue = new ConcurrentLinkedQueue<>();
+
   @GuardedBy("monitor")
   private volatile boolean finished;
 
@@ -69,7 +70,7 @@ public class LanceArrowWriter extends ArrowReader {
         loadToken.release();
       }
     } catch (InterruptedException e) {
-        throw new RuntimeException(e);
+      throw new RuntimeException(e);
     }
   }
 
@@ -109,7 +110,7 @@ public class LanceArrowWriter extends ArrowReader {
         }
       }
     } catch (InterruptedException e) {
-        throw new RuntimeException(e);
+      throw new RuntimeException(e);
     }
   }
 

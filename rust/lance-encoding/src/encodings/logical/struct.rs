@@ -42,21 +42,21 @@ struct SchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for SchedulingJobWithStatus<'a> {
+impl PartialEq for SchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for SchedulingJobWithStatus<'a> {}
+impl Eq for SchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for SchedulingJobWithStatus<'a> {
+impl PartialOrd for SchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for SchedulingJobWithStatus<'a> {
+impl Ord for SchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -106,7 +106,7 @@ impl<'a> SimpleStructSchedulerJob<'a> {
     }
 }
 
-impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
+impl SchedulingJob for SimpleStructSchedulerJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
@@ -239,21 +239,21 @@ struct StructuralSchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for StructuralSchedulingJobWithStatus<'a> {
+impl PartialEq for StructuralSchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for StructuralSchedulingJobWithStatus<'a> {}
+impl Eq for StructuralSchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for StructuralSchedulingJobWithStatus<'a> {
+impl PartialOrd for StructuralSchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for StructuralSchedulingJobWithStatus<'a> {
+impl Ord for StructuralSchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -297,7 +297,7 @@ impl<'a> RepDefStructSchedulingJob<'a> {
     }
 }
 
-impl<'a> StructuralSchedulingJob for RepDefStructSchedulingJob<'a> {
+impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
@@ -583,10 +583,12 @@ pub struct StructuralStructDecoder {
     children: Vec<Box<dyn StructuralFieldDecoder>>,
     data_type: DataType,
     child_fields: Fields,
+    // The root decoder is slightly different because it cannot have nulls
+    is_root: bool,
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool) -> Self {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Self {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -596,6 +598,7 @@ impl StructuralStructDecoder {
             data_type,
             children,
             child_fields: fields,
+            is_root,
         }
     }
 
@@ -646,6 +649,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
+            is_root: self.is_root,
         }))
     }
 
@@ -658,6 +662,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
+    is_root: bool,
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
@@ -670,15 +675,22 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         let mut children = Vec::with_capacity(arrays.len());
         let mut arrays_iter = arrays.into_iter();
         let first_array = arrays_iter.next().unwrap();
+        let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
         let mut repdef = first_array.repdef;
         children.push(first_array.array);
+
         for array in arrays_iter {
+            debug_assert_eq!(length, array.array.len());
             children.push(array.array);
         }
 
-        let validity = repdef.unravel_validity();
+        let validity = if self.is_root {
+            None
+        } else {
+            repdef.unravel_validity(length)
+        };
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),
