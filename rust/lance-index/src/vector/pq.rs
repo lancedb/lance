@@ -11,7 +11,7 @@ use arrow_array::{cast::AsArray, Array, FixedSizeListArray, UInt8Array};
 use arrow_array::{ArrayRef, Float32Array, PrimitiveArray};
 use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
-use distance::{build_distance_table_dot, compute_dot_distance};
+use distance::build_distance_table_dot;
 use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
@@ -28,7 +28,7 @@ pub mod storage;
 pub mod transform;
 pub(crate) mod utils;
 
-use self::distance::{build_distance_table_l2, compute_l2_distance};
+use self::distance::{build_distance_table_l2, compute_pq_distance};
 pub use self::utils::num_centroids;
 use super::quantizer::{
     Quantization, QuantizationMetadata, QuantizationType, Quantizer, QuantizerBuildParams,
@@ -267,7 +267,7 @@ impl ProductQuantizer {
             key.values(),
         );
 
-        let distances = compute_dot_distance(
+        let distances = compute_pq_distance(
             &distance_table,
             self.num_bits,
             self.num_sub_vectors,
@@ -327,7 +327,7 @@ impl ProductQuantizer {
     ///  The squared L2 distance.
     #[inline]
     fn compute_l2_distance(&self, distance_table: &[f32], code: &[u8]) -> Float32Array {
-        Float32Array::from(compute_l2_distance(
+        Float32Array::from(compute_pq_distance(
             distance_table,
             self.num_bits,
             self.num_sub_vectors,
