@@ -21,7 +21,8 @@ use pb::{
     page_layout::Layout,
     AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
     BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
-    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer,
+    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout,
+    RepDefLayer,
 };
 
 use crate::{
