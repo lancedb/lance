@@ -49,12 +49,7 @@ pub async fn maybe_sample_training_data(
     } else {
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
-        let batches = scanner
-            .try_into_stream()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
+        scanner.try_into_batch().await?
     };
 
     let array = batch.column_by_name(column).ok_or(Error::Index {
