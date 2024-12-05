@@ -4,9 +4,6 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
-use arrow_schema::Schema as ArrowSchema;
-use arrow_select::concat::concat_batches;
-use futures::stream::TryStreamExt;
 use snafu::{location, Location};
 use tokio::sync::Mutex;
 
