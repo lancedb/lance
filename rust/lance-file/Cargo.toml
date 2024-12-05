@@ -26,7 +26,6 @@ async-recursion.workspace = true
 async-trait.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
-const_format = { workspace = true }
 datafusion-common.workspace = true
 deepsize.workspace = true
 futures.workspace = true

@@ -72,7 +72,7 @@ use pyo3::{
     PyObject, PyResult,
 };
 use pyo3::{intern, prelude::*};
-use lance_core::location;
+use snafu::{location, Location};
 use uuid::Uuid;
 
 use crate::error::PythonErrorExt;

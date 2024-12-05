@@ -16,7 +16,6 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
-const_format.workspace = true
 lance-arrow.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
@@ -54,7 +53,9 @@ lance-testing.workspace = true
 proptest.workspace = true
 
 [features]
+default = ["error_location_github"]
 datafusion = ["datafusion-common", "datafusion-sql"]
+error_location_github = []
 
 [lints]
 workspace = true
