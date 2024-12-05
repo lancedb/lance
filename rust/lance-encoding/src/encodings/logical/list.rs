@@ -1370,7 +1370,7 @@ impl<'a> StructuralListSchedulingJob<'a> {
     }
 }
 
-impl<'a> StructuralSchedulingJob for StructuralListSchedulingJob<'a> {
+impl StructuralSchedulingJob for StructuralListSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,

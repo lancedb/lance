@@ -2132,7 +2132,7 @@ impl PrimitiveStructuralEncoder {
             // Compress blocks of levels (sized according to the chunks)
             let mut buffers = Vec::with_capacity(chunks.len());
             let mut values_counter = 0;
-            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let chunk_num_values = chunk.num_values(values_counter, num_values);
                 values_counter += chunk_num_values;
                 let mut chunk_levels = levels.slice_next(chunk_num_values as usize);
@@ -2219,6 +2219,7 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_miniblock(
         column_idx: u32,
         field: &Field,
