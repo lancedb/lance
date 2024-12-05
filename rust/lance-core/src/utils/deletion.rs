@@ -194,7 +194,6 @@ impl Extend<u32> for DeletionVector {
 ///     pub fn get(i: u32) -> bool { ... }
 /// }
 /// impl BitAnd for DeletionVector { ... }
-
 impl IntoIterator for DeletionVector {
     type IntoIter = Box<dyn Iterator<Item = Self::Item> + Send>;
     type Item = u32;

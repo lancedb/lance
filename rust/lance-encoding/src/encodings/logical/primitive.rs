@@ -141,7 +141,7 @@ impl<'a> PrimitiveFieldSchedulingJob<'a> {
     }
 }
 
-impl<'a> SchedulingJob for PrimitiveFieldSchedulingJob<'a> {
+impl SchedulingJob for PrimitiveFieldSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
@@ -1148,7 +1148,7 @@ impl<'a> StructuralPrimitiveFieldSchedulingJob<'a> {
     }
 }
 
-impl<'a> StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'a> {
+impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,

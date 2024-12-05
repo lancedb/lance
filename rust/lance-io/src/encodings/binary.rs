@@ -26,6 +26,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
+use lance_arrow::BufferExt;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
 
@@ -88,7 +89,7 @@ impl<'a> BinaryEncoder<'a> {
 }
 
 #[async_trait]
-impl<'a> Encoder for BinaryEncoder<'a> {
+impl Encoder for BinaryEncoder<'_> {
     async fn encode(&mut self, arrs: &[&dyn Array]) -> Result<usize> {
         assert!(!arrs.is_empty());
         let data_type = arrs[0].data_type();
@@ -224,7 +225,7 @@ impl<'a, T: ByteArrayType> BinaryDecoder<'a, T> {
                 .null_bit_buffer(null_buf);
         }
 
-        let buf = bytes.into();
+        let buf = Buffer::from_bytes_bytes(bytes, /*bytes_per_value=*/ 1);
         let array_data = data_builder
             .add_buffer(offset_data.buffers()[0].clone())
             .add_buffer(buf)
@@ -286,7 +287,7 @@ fn plan_take_chunks(
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> Decoder for BinaryDecoder<'_, T> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(..).await
     }
@@ -394,7 +395,7 @@ impl<'a, T: ByteArrayType> Decoder for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: usize) -> Self::Output {
@@ -403,7 +404,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<usize> for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: RangeFrom<usize>) -> Self::Output {
@@ -412,7 +413,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeFrom<usize>> for BinaryDecoder<'a, T>
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: RangeTo<usize>) -> Self::Output {
@@ -421,7 +422,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeTo<usize>> for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, _: RangeFull) -> Self::Output {
@@ -430,7 +431,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<RangeFull> for BinaryDecoder<'a, T> {
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, params: ReadBatchParams) -> Self::Output {
@@ -445,7 +446,7 @@ impl<'a, T: ByteArrayType> AsyncIndex<ReadBatchParams> for BinaryDecoder<'a, T> 
 }
 
 #[async_trait]
-impl<'a, T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'a, T> {
+impl<T: ByteArrayType> AsyncIndex<Range<usize>> for BinaryDecoder<'_, T> {
     type Output = Result<ArrayRef>;
 
     async fn get(&self, index: Range<usize>) -> Self::Output {

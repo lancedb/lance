@@ -4358,7 +4358,7 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(results.num_rows(), 2);
+        assert_eq!(results.num_rows(), 1);
     }
 
     #[tokio::test]

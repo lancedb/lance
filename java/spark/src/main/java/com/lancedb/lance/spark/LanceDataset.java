@@ -12,12 +12,10 @@
 
 package com.lancedb.lance.spark;
 
-import com.google.common.collect.ImmutableSet;
-
-import java.util.Set;
-
 import com.lancedb.lance.spark.read.LanceScanBuilder;
 import com.lancedb.lance.spark.write.SparkWrite;
+
+import com.google.common.collect.ImmutableSet;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.TableCapability;
@@ -27,9 +25,9 @@ import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
-/**
- * Lance Spark Dataset.
- */
+import java.util.Set;
+
+/** Lance Spark Dataset. */
 public class LanceDataset implements SupportsRead, SupportsWrite {
   private static final Set<TableCapability> CAPABILITIES =
       ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE);

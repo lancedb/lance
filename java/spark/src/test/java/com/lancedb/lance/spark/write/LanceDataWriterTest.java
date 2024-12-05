@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.FragmentMetadata;
 import com.lancedb.lance.spark.LanceConfig;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -38,8 +39,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 public class LanceDataWriterTest {
-  @TempDir
-  static Path tempDir;
+  @TempDir static Path tempDir;
 
   @Test
   public void testLanceDataWriter(TestInfo testInfo) throws IOException {
@@ -47,14 +47,16 @@ public class LanceDataWriterTest {
     try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       Field field = new Field("column1", FieldType.nullable(new ArrowType.Int(32, true)), null);
       Schema schema = new Schema(Collections.singletonList(field));
-      LanceConfig config = LanceConfig.from(tempDir.resolve(datasetName + LanceConfig.LANCE_FILE_SUFFIX).toString());
+      LanceConfig config =
+          LanceConfig.from(tempDir.resolve(datasetName + LanceConfig.LANCE_FILE_SUFFIX).toString());
       StructType sparkSchema = ArrowUtils.fromArrowSchema(schema);
-      LanceDataWriter.WriterFactory writerFactory = new LanceDataWriter.WriterFactory(sparkSchema, config);
+      LanceDataWriter.WriterFactory writerFactory =
+          new LanceDataWriter.WriterFactory(sparkSchema, config);
       LanceDataWriter dataWriter = (LanceDataWriter) writerFactory.createWriter(0, 0);
 
       int rows = 132;
       for (int i = 0; i < rows; i++) {
-        InternalRow row = new GenericInternalRow(new Object[]{i});
+        InternalRow row = new GenericInternalRow(new Object[] {i});
         dataWriter.write(row);
       }
 

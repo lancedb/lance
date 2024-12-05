@@ -57,7 +57,7 @@ struct BlobFieldSchedulingJob<'a> {
     descriptions_job: Box<dyn SchedulingJob + 'a>,
 }
 
-impl<'a> SchedulingJob for BlobFieldSchedulingJob<'a> {
+impl SchedulingJob for BlobFieldSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,
