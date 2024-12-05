@@ -33,13 +33,10 @@ def test_data(tmp_path_factory):
                 [
                     pc.random(NUM_ROWS).cast(pa.float32()),
                     pa.array(range(NUM_ROWS), type=pa.int32()),
-                    pa.FixedSizeListArray.from_arrays(
-                        pc.random(NUM_ROWS * 5).cast(pa.float32()), 5
-                    ),
                     pa.array(range(NUM_ROWS), type=pa.int32()),
                     pa.array(range(NUM_ROWS), type=pa.int32()),
                 ],
-                ["f", "i", "fsl", "i2", "i3"],
+                ["f", "i", "i2", "i3"],
             )
         }
     )
@@ -51,6 +48,7 @@ def test_data(tmp_path_factory):
 @pytest.fixture(scope="module")
 def random_indices():
     random_indices = [random.randint(0, NUM_ROWS) for _ in range(NUM_INDICES)]
+    random_indices.sort()
     return random_indices
 
 
@@ -127,7 +125,7 @@ def test_parquet_write(tmp_path: Path, benchmark, test_data):
 
 
 def write_lance_file(lance_path, test_data):
-    with LanceFileWriter(lance_path, test_data.schema) as writer:
+    with LanceFileWriter(lance_path, test_data.schema, version = "2.1") as writer:
         for batch in test_data.to_batches():
             writer.write_batch(batch)
 
