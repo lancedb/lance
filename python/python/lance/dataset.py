@@ -1453,6 +1453,7 @@ class LanceDataset(pa.dataset.Dataset):
             * "simple": splits tokens on whitespace and punctuation.
             * "whitespace": splits tokens on whitespace.
             * "raw": no tokenization.
+            * "jieba": a popular chinese tokenization.
         language: str, default "English"
             This is for the ``INVERTED`` index. The language for stemming
             and stop words. This is only used when `stem` or `remove_stop_words` is true
