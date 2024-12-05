@@ -276,7 +276,7 @@ pub async fn open_scalar_index(
             Ok(inverted_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {
-            let btree_index = BTreeIndex::<DEFAULT_BTREE_BATCH_SIZE>::load(index_store).await?;
+            let btree_index = BTreeIndex::load(index_store).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
     }

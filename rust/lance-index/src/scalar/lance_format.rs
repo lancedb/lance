@@ -145,7 +145,7 @@ impl IndexReader for v2::reader::FileReader {
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let start = offset * batch_size;
         let end = start + batch_size;
-        let end = end.min(self.num_rows() as u64);
+        let end = end.min(self.num_rows());
         self.read_range(start as usize..end as usize, None).await
     }
 
@@ -351,15 +351,17 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
         value_type: DataType,
+        custom_batch_size: Option<u64>,
     ) {
         let sub_index_trainer = FlatIndexMetadata::new(value_type);
 
         let data = Box::new(MockTrainingSource::new(data).await);
+        let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         train_btree_index(
             data,
             &sub_index_trainer,
             index_store.as_ref(),
-            DEFAULT_BTREE_BATCH_SIZE as u32,
+            batch_size as u32,
         )
         .await
         .unwrap();
@@ -373,10 +375,8 @@ mod tests {
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32).await;
-        let index = BTreeIndex::<DEFAULT_BTREE_BATCH_SIZE>::load(index_store)
-            .await
-            .unwrap();
+        train_index(&index_store, data, DataType::Int32, None).await;
+        let index = BTreeIndex::load(index_store).await.unwrap();
 
         let row_ids = index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
@@ -415,10 +415,8 @@ mod tests {
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32).await;
-        let index = BTreeIndex::<DEFAULT_BTREE_BATCH_SIZE>::load(index_store)
-            .await
-            .unwrap();
+        train_index(&index_store, data, DataType::Int32, None).await;
+        let index = BTreeIndex::load(index_store).await.unwrap();
 
         let data = gen()
             .col("values", array::step_custom::<Int32Type>(4096 * 100, 1))
@@ -434,9 +432,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let updated_index = BTreeIndex::<DEFAULT_BTREE_BATCH_SIZE>::load(updated_index_store)
-            .await
-            .unwrap();
+        let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
 
         let row_ids = updated_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
@@ -455,11 +451,7 @@ mod tests {
         assert!(row_ids.contains(500_000));
     }
 
-    async fn check<const BATCH_SIZE: u64>(
-        index: &BTreeIndex<BATCH_SIZE>,
-        query: SargableQuery,
-        expected: &[u64],
-    ) {
+    async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
         let expected_arr = RowIdTreeMap::from_iter(expected);
         assert_eq!(results, expected_arr);
@@ -497,8 +489,8 @@ mod tests {
             Field::new("row_ids", DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        train_index(&index_store, data, DataType::Int32).await;
-        let index = BTreeIndex::<4>::load(index_store).await.unwrap();
+        train_index(&index_store, data, DataType::Int32, Some(4)).await;
+        let index = BTreeIndex::load(index_store).await.unwrap();
 
         // The above should create four pages
         //
@@ -732,10 +724,8 @@ mod tests {
                 data.schema().clone(),
             );
 
-            train_index(&index_store, training_data, data_type.clone()).await;
-            let index = BTreeIndex::<DEFAULT_BTREE_BATCH_SIZE>::load(index_store)
-                .await
-                .unwrap();
+            train_index(&index_store, training_data, data_type.clone(), None).await;
+            let index = BTreeIndex::load(index_store).await.unwrap();
 
             let row_ids = index
                 .search(&SargableQuery::Equals(sample_value))
@@ -809,9 +799,7 @@ mod tests {
         .await
         .unwrap();
 
-        let index = BTreeIndex::<DEFAULT_BTREE_BATCH_SIZE>::load(index_store)
-            .await
-            .unwrap();
+        let index = BTreeIndex::load(index_store).await.unwrap();
 
         let row_ids = index
             .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
