@@ -12,6 +12,7 @@ pub struct TokenizerConfig {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `jieba`: a popular chinese tokenization
     ///
     /// `simple` is recommended for most cases and the default value
     base_tokenizer: String,
@@ -141,6 +142,9 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
             tantivy::tokenizer::RawTokenizer::default(),
         )
         .dynamic()),
+        "jieba" => Ok(
+            tantivy::tokenizer::TextAnalyzer::builder(tantivy_jieba::JiebaTokenizer {}).dynamic(),
+        ),
         _ => Err(Error::invalid_input(
             format!("unknown base tokenizer {}", name),
             location!(),

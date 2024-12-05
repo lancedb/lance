@@ -270,6 +270,28 @@ def test_indexed_filter_with_fts_index(tmp_path):
     assert results["_rowid"].to_pylist() == [2, 3]
 
 
+def test_indexed_filter_with_fts_index_with_jieba_tokenizer(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "李萍进了中等技术学校",
+                "张华考上了北京大学",
+                "我在百货公司当售货员",
+                "我们都有光明的前途",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="jieba")
+
+    results = ds.to_table(
+        full_text_query="北京大学",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [1]
+
+
 def test_fts_with_postfilter(tmp_path):
     tab = pa.table({"text": ["Frodo the puppy"] * 100, "id": range(100)})
     dataset = lance.write_dataset(tab, tmp_path)
