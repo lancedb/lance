@@ -485,7 +485,6 @@ impl<'a> From<&'a [f32; 16]> for f32x16 {
 
 impl SIMD<f32, 16> for f32x16 {
     #[inline]
-
     fn splat(val: f32) -> Self {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         unsafe {
@@ -602,7 +601,6 @@ impl SIMD<f32, 16> for f32x16 {
     }
 
     #[inline]
-
     unsafe fn store_unaligned(&self, ptr: *mut f32) {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
         unsafe {

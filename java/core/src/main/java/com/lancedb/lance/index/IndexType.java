@@ -30,11 +30,10 @@ public enum IndexType {
   private final int value;
 
   IndexType(int value) {
-      this.value = value;
+    this.value = value;
   }
 
   public int getValue() {
-      return value;
+    return value;
   }
 }
-

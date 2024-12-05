@@ -16,14 +16,14 @@ package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructType;
 
-public class LanceScanBuilder implements
-    SupportsPushDownRequiredColumns, SupportsPushDownFilters {
+public class LanceScanBuilder implements SupportsPushDownRequiredColumns, SupportsPushDownFilters {
   private final LanceConfig options;
   private StructType schema;
 

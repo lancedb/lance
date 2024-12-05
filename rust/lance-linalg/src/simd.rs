@@ -41,8 +41,6 @@ pub trait SIMD<T: Num + Copy, const N: usize>:
     /// Create a new instance with all lanes set to zero.
     fn zeros() -> Self;
 
-    /// Gather elements from the slice, using i32 indices.
-
     /// Load aligned data from aligned memory.
     ///
     /// # Safety

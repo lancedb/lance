@@ -424,7 +424,7 @@ impl<'a> ListFieldSchedulingJob<'a> {
     }
 }
 
-impl<'a> SchedulingJob for ListFieldSchedulingJob<'a> {
+impl SchedulingJob for ListFieldSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,

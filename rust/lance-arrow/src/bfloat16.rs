@@ -90,7 +90,7 @@ impl BFloat16Array {
     }
 }
 
-impl<'a> ArrayAccessor for &'a BFloat16Array {
+impl ArrayAccessor for &BFloat16Array {
     type Item = bf16;
 
     fn value(&self, index: usize) -> Self::Item {

@@ -17,6 +17,7 @@ package com.lancedb.lance.spark.write;
 import com.lancedb.lance.FragmentMetadata;
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
+
 import org.apache.spark.sql.connector.write.BatchWrite;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
 import org.apache.spark.sql.connector.write.PhysicalWriteInfo;
@@ -48,11 +49,12 @@ public class BatchAppend implements BatchWrite {
 
   @Override
   public void commit(WriterCommitMessage[] messages) {
-    List<FragmentMetadata> fragments = Arrays.stream(messages)
-        .map(m -> (TaskCommit) m)
-        .map(TaskCommit::getFragments)
-        .flatMap(List::stream)
-        .collect(Collectors.toList());
+    List<FragmentMetadata> fragments =
+        Arrays.stream(messages)
+            .map(m -> (TaskCommit) m)
+            .map(TaskCommit::getFragments)
+            .flatMap(List::stream)
+            .collect(Collectors.toList());
     LanceDatasetAdapter.appendFragments(config, fragments);
   }
 

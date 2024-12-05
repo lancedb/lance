@@ -299,6 +299,7 @@ fn bench_decode_packed_struct(c: &mut Criterion) {
     });
 }
 
+#[allow(dead_code)]
 fn bench_decode_str_with_fixed_size_binary_encoding(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("decode_primitive");
