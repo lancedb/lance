@@ -53,7 +53,7 @@ lance-testing.workspace = true
 proptest.workspace = true
 
 [features]
-default = ["error_location_github"]
+default = []
 datafusion = ["datafusion-common", "datafusion-sql"]
 error_location_github = []
 

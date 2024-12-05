@@ -28,7 +28,6 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::BufferExt;
 use lance_core::location;
-use snafu::Location;
 
 use tokio::io::AsyncWriteExt;
 
