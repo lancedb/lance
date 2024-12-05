@@ -609,9 +609,11 @@ impl StructuralStructDecoder {
                 if field_metadata
                     .get("packed")
                     .map(|v| v == "true")
-                    .unwrap_or(false) {
-                        let decoder = StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
-                        Box::new(decoder)
+                    .unwrap_or(false)
+                {
+                    let decoder =
+                        StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
+                    Box::new(decoder)
                 } else {
                     Box::new(Self::new(fields.clone(), should_validate))
                 }
