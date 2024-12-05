@@ -111,13 +111,7 @@ pub(crate) async fn remap_index(
 
     match generic.index_type() {
         it if it.is_scalar() => {
-            let new_store = match it {
-                IndexType::Scalar | IndexType::BTree => {
-                    LanceIndexStore::from_dataset(dataset, &new_id.to_string())
-                        .with_legacy_format(true)
-                }
-                _ => LanceIndexStore::from_dataset(dataset, &new_id.to_string()),
-            };
+            let new_store = LanceIndexStore::from_dataset(dataset, &new_id.to_string());
 
             let scalar_index = dataset
                 .open_scalar_index(&field.name, &index_id.to_string())

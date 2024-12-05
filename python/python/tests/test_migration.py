@@ -62,3 +62,19 @@ def test_fix_data_storage_version(tmp_path: Path):
         OSError, match="The dataset contains a mixture of file versions"
     ):
         ds.delete("false")
+
+
+def test_old_btree_bitmap_indices(tmp_path: Path):
+    """
+    In versions below 0.20.1 we used the legacy file format for btree and bitmap
+    indices.  In version 0.20.1 we switched to the new format.  This test ensures
+    that we can still read the old indices.
+    """
+    ds = prep_dataset(tmp_path, "v0.20.0", "old_btree_bitmap_indices.lance")
+
+    assert ds.to_table(filter="bitmap > 2") == pa.table(
+        {"bitmap": [3, 4], "btree": [3, 4]}
+    )
+    assert ds.to_table(filter="btree > 2") == pa.table(
+        {"bitmap": [3, 4], "btree": [3, 4]}
+    )

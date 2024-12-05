@@ -16,7 +16,7 @@ use lance_core::{cache::FileMetadataCache, Result};
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{array, gen, BatchCount, RowCount};
 use lance_index::scalar::{
-    btree::{train_btree_index, BTreeIndex, TrainingSource},
+    btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
     IndexStore, SargableQuery, ScalarIndex,
@@ -60,7 +60,6 @@ impl TrainingSource for BenchmarkDataSource {
 }
 
 impl BenchmarkFixture {
-    #[allow(dead_code)]
     fn test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
         let test_path = tempdir.path();
         let (object_store, test_path) =
@@ -70,16 +69,6 @@ impl BenchmarkFixture {
             test_path,
             FileMetadataCache::no_cache(),
         ))
-    }
-
-    fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path = tempdir.path();
-        let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(
-            LanceIndexStore::new(object_store, test_path, FileMetadataCache::no_cache())
-                .with_legacy_format(true),
-        )
     }
 
     async fn write_baseline_data(tempdir: &TempDir) -> Arc<Dataset> {
@@ -98,6 +87,7 @@ impl BenchmarkFixture {
             Box::new(BenchmarkDataSource {}),
             &sub_index_trainer,
             index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE as u32,
         )
         .await
         .unwrap();
@@ -105,7 +95,7 @@ impl BenchmarkFixture {
 
     async fn open() -> Self {
         let tempdir = tempfile::tempdir().unwrap();
-        let index_store = Self::legacy_test_store(&tempdir);
+        let index_store = Self::test_store(&tempdir);
         let baseline_dataset = Self::write_baseline_data(&tempdir).await;
         Self::train_scalar_index(&index_store).await;
 
