@@ -226,6 +226,16 @@ impl From<prost::EncodeError> for Error {
     }
 }
 
+impl From<prost::UnknownEnumValue> for Error {
+    #[track_caller]
+    fn from(e: prost::UnknownEnumValue) -> Self {
+        Self::IO {
+            source: box_error(e),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
 impl From<tokio::task::JoinError> for Error {
     #[track_caller]
     fn from(e: tokio::task::JoinError) -> Self {

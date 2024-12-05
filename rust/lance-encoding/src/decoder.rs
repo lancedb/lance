@@ -254,7 +254,7 @@ use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlock
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
-use crate::repdef::{LevelBuffer, RepDefUnraveler};
+use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -490,7 +490,7 @@ pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
     ) -> Result<Box<dyn BlockDecompressor>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CoreDecompressorStrategy {}
 
 impl DecompressorStrategy for CoreDecompressorStrategy {
@@ -1704,7 +1704,11 @@ pub fn create_decode_stream(
 ) -> BoxStream<'static, ReadBatchTask> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
-        let structural_decoder = StructuralStructDecoder::new(arrow_schema.fields, should_validate);
+        let structural_decoder = StructuralStructDecoder::new(
+            arrow_schema.fields,
+            should_validate,
+            /*is_root=*/ true,
+        );
         StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder).into_stream()
     } else {
         let arrow_schema = ArrowSchema::from(schema);
@@ -2324,8 +2328,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 
 pub struct DecodedPage {
     pub data: DataBlock,
-    pub repetition: Option<LevelBuffer>,
-    pub definition: Option<LevelBuffer>,
+    pub repdef: RepDefUnraveler,
 }
 
 pub trait DecodePageTask: Send + std::fmt::Debug {
@@ -2366,7 +2369,7 @@ pub struct LoadedPage {
 
 pub struct DecodedArray {
     pub array: ArrayRef,
-    pub repdef: RepDefUnraveler,
+    pub repdef: CompositeRepDefUnraveler,
 }
 
 pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {

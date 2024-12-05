@@ -21,10 +21,12 @@ use pb::{
     page_layout::Layout,
     AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
     BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
-    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout,
+    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer,
 };
 
-use crate::encodings::physical::block_compress::CompressionConfig;
+use crate::{
+    encodings::physical::block_compress::CompressionConfig, repdef::DefinitionInterpretation,
+};
 
 use self::pb::Constant;
 
@@ -243,18 +245,52 @@ impl ProtobufUtils {
         }
     }
 
+    fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
+        match def {
+            DefinitionInterpretation::AllValidItem => RepDefLayer::RepdefAllValidItem as i32,
+            DefinitionInterpretation::AllValidList => RepDefLayer::RepdefAllValidList as i32,
+            DefinitionInterpretation::NullableItem => RepDefLayer::RepdefNullableItem as i32,
+            DefinitionInterpretation::NullableList => RepDefLayer::RepdefNullableList as i32,
+            DefinitionInterpretation::EmptyableList => RepDefLayer::RepdefEmptyableList as i32,
+            DefinitionInterpretation::NullableAndEmptyableList => {
+                RepDefLayer::RepdefNullAndEmptyList as i32
+            }
+        }
+    }
+
+    pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
+        let layer = RepDefLayer::try_from(layer).unwrap();
+        match layer {
+            RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
+            RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
+            RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
+            RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
+            RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
+            RepDefLayer::RepdefNullAndEmptyList => {
+                DefinitionInterpretation::NullableAndEmptyableList
+            }
+            RepDefLayer::RepdefUnspecified => panic!("Unspecified repdef layer"),
+        }
+    }
+
     pub fn miniblock_layout(
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
         dictionary_encoding: Option<ArrayEncoding>,
+        def_meaning: &[DefinitionInterpretation],
     ) -> PageLayout {
+        assert!(!def_meaning.is_empty());
         PageLayout {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
                 dictionary: dictionary_encoding,
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
             })),
         }
     }
@@ -263,12 +299,17 @@ impl ProtobufUtils {
         bits_rep: u8,
         bits_def: u8,
         value_encoding: ArrayEncoding,
+        def_meaning: &[DefinitionInterpretation],
     ) -> PageLayout {
         PageLayout {
             layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
                 bits_rep: bits_rep as u32,
                 bits_def: bits_def as u32,
                 value_compression: Some(value_encoding),
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
             })),
         }
     }

@@ -2715,3 +2715,11 @@ def test_detached_commits(tmp_path: Path):
     )
 
     assert detached2.to_table() == pa.table({"x": [0, 1, 3]})
+
+
+def test_dataset_drop(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    lance.write_dataset(table, tmp_path)
+    assert Path(tmp_path).exists()
+    lance.LanceDataset.drop(tmp_path)
+    assert not Path(tmp_path).exists()
