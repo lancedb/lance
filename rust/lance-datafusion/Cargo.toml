@@ -17,7 +17,6 @@ arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-ord.workspace = true
 async-trait.workspace = true
-const_format.workspace = true
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-functions.workspace = true

@@ -1139,26 +1139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "const_format"
-version = "0.2.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "126f97965c8ad46d6d9163268ff28432e8f6a1196a55578867832e3049df63dd"
-dependencies = [
- "const_format_proc_macros",
-]
-
-[[package]]
-name = "const_format_proc_macros"
-version = "0.2.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d57c2eccfb16dbac1f4e61e206105db5820c9d26c3c472bc17c774259ef7744"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-xid",
-]
-
-[[package]]
 name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2768,7 +2748,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "const_format",
  "dashmap 5.5.3",
  "datafusion",
  "datafusion-expr",
@@ -2839,7 +2818,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "const_format",
  "datafusion-common",
  "datafusion-sql",
  "deepsize",
@@ -2876,7 +2854,6 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
- "const_format",
  "datafusion",
  "datafusion-common",
  "datafusion-functions",
@@ -2923,7 +2900,6 @@ dependencies = [
  "bytemuck",
  "byteorder",
  "bytes",
- "const_format",
  "fsst",
  "futures",
  "hex",
@@ -2960,7 +2936,6 @@ dependencies = [
  "async-trait",
  "byteorder",
  "bytes",
- "const_format",
  "datafusion-common",
  "deepsize",
  "futures",
@@ -2994,7 +2969,6 @@ dependencies = [
  "async-trait",
  "bitvec",
  "bytes",
- "const_format",
  "crossbeam-queue",
  "datafusion",
  "datafusion-common",
@@ -3053,7 +3027,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "const_format",
  "deepsize",
  "futures",
  "lance-arrow",
@@ -3082,7 +3055,6 @@ dependencies = [
  "arrow-schema",
  "bitvec",
  "cc",
- "const_format",
  "deepsize",
  "futures",
  "half",
@@ -3112,7 +3084,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
- "const_format",
  "deepsize",
  "futures",
  "lance-arrow",
@@ -5755,12 +5726,6 @@ name = "unicode-width"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fc81956842c57dac11422a97c3b8195a1ff727f06e85c84ed2e8aa277c9a0fd"
-
-[[package]]
-name = "unicode-xid"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "unindent"

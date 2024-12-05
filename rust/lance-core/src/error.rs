@@ -406,67 +406,100 @@ impl<T: Clone> From<Result<T>> for CloneableResult<T> {
     }
 }
 
-// If debug assertions are on, then we are running locally, so should use local
-// paths.
-// #[cfg(debug_assertions)]
-// #[macro_export]
-// macro_rules! location {
-//     () => {
-//         // This is the same thing as what snafu does.
-//         snafu::Location::new(file!(), line!(), column!())
-//     }
-// }
-
-// #[cfg(not(debug_assertions))]
+#[cfg(not(feature = "error_location_github"))]
 #[macro_export]
 macro_rules! location {
-    () => {{
-        // Goal is to get a URL to a github location:
-        // https://github.com/lancedb/lance/blob/v0.19.2/rust/lance-table/src/format.rs#L42
-        // This has two advantages:
-        // 1. All error reports have the Lance version in them.
-        // 2. We can immediately click through the line to the source code.
-        // We need these to be const because we want the final location to be &'static str
-        const GH_PREFIX: &str = concat!(
-            env!("CARGO_PKG_REPOSITORY"),
-            "/blob/v",
-            env!("CARGO_PKG_VERSION")
-        );
-
-        // Sometimes file!() returns an absolute path, sometimes a relative path.
-        // The exact value is complex, and depends whether it's being built as a
-        // dependency or not. See: https://github.com/rust-lang/rust/issues/117605
-        // To get a relative path, we use a sample path to precompute how much is
-        // necessary to chop off.
-        const PREFIX_SIZE: usize = $crate::error::path_prefix_length__();
-        const RELATIVE_PATH: &str = unsafe { $crate::error::split_str_at(file!(), PREFIX_SIZE).1 };
-
-        const LOCATION: &str =
-            const_format::concatcp!(GH_PREFIX, "/", RELATIVE_PATH, "#L", line!());
-        snafu::Location::new(LOCATION, line!(), column!())
-    }};
+    () => {
+        // This is the same thing as what snafu does.
+        snafu::Location::new(file!(), line!(), column!())
+    };
 }
 
+#[cfg(feature = "error_location_github")]
 #[doc(hidden)]
-pub const fn path_prefix_length__() -> usize {
-    let this_file = file!();
-    let suffix = "rust/lance-core/src/error.rs";
-    this_file.len() - suffix.len()
-}
+pub mod location {
+    #[macro_export]
+    macro_rules! location {
+        () => {{
+            // Goal is to get a URL to a github location:
+            // https://github.com/lancedb/lance/blob/v0.19.2/rust/lance-table/src/format.rs#L42
+            // This has two advantages:
+            // 1. All error reports have the Lance version in them.
+            // 2. We can immediately click through the line to the source code.
+            // We need these to be const because we want the final location to be &'static str
+            const GH_PREFIX: &str = concat!(
+                env!("CARGO_PKG_REPOSITORY"),
+                "/blob/v",
+                env!("CARGO_PKG_VERSION"),
+                "/"
+            );
 
-#[doc(hidden)]
-/// SAFETY: must have determined that `at` is a valid byte boundary.
-pub const unsafe fn split_str_at(s: &str, at: usize) -> (&str, &str) {
-    let s_bytes: &[u8] = s.as_bytes();
-    let (before, after) = s_bytes.split_at(at);
-    (unsafe { std::str::from_utf8_unchecked(before) }, unsafe {
-        std::str::from_utf8_unchecked(after)
-    })
+            // Sometimes file!() returns an absolute path, sometimes a relative path.
+            // The exact value is complex, and depends whether it's being built as a
+            // dependency or not. See: https://github.com/rust-lang/rust/issues/117605
+            // To get a relative path, we use a sample path to precompute how much is
+            // necessary to chop off.
+            const PREFIX_SIZE: usize = $crate::error::location::path_prefix_length__();
+            const RAW_FILE: &str = file!();
+            const RELATIVE_PATH: &str =
+                unsafe { $crate::error::location::split_str_at__(RAW_FILE, PREFIX_SIZE).1 };
+
+            const LOCATION: &str = $crate::combine_str!(GH_PREFIX, RELATIVE_PATH);
+            const LINE: &str = concat!("#L", line!());
+            const LOCATION_WITH_LINE: &str = $crate::combine_str!(LOCATION, LINE);
+            snafu::Location::new(LOCATION_WITH_LINE, line!(), column!())
+        }};
+    }
+
+    #[doc(hidden)]
+    pub const fn path_prefix_length__() -> usize {
+        let this_file = file!();
+        let suffix = "rust/lance-core/src/error.rs";
+        this_file.len() - suffix.len()
+    }
+
+    #[doc(hidden)]
+    /// SAFETY: must have determined that `at` is a valid byte boundary.
+    pub const unsafe fn split_str_at__(s: &str, at: usize) -> (&str, &str) {
+        let s_bytes: &[u8] = s.as_bytes();
+        let (before, after) = s_bytes.split_at(at);
+        (unsafe { std::str::from_utf8_unchecked(before) }, unsafe {
+            std::str::from_utf8_unchecked(after)
+        })
+    }
+
+    #[doc(hidden)]
+    #[macro_export]
+    macro_rules! combine_str {
+        ($A:expr, $B:expr) => {{
+            const LEN: usize = $A.len() + $B.len();
+            const fn combine(a: &'static str, b: &'static str) -> [u8; LEN] {
+                let mut result = [0u8; LEN];
+                result = copy_slice(a.as_bytes(), result, 0);
+                result = copy_slice(b.as_bytes(), result, a.len());
+                result
+            }
+            const fn copy_slice(input: &[u8], mut output: [u8; LEN], offset: usize) -> [u8; LEN] {
+                let mut index = 0;
+                loop {
+                    output[offset + index] = input[index];
+                    index += 1;
+                    if index == input.len() {
+                        break;
+                    }
+                }
+                output
+            }
+            const COMBINED: [u8; LEN] = combine($A, $B);
+            unsafe { std::str::from_utf8_unchecked(&COMBINED) }
+        }};
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::location;
 
     #[test]
     fn test_caller_location_capture() {

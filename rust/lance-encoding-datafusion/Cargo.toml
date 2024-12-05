@@ -22,7 +22,6 @@ arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 bytes.workspace = true
-const_format = { workspace = true }
 datafusion.workspace = true
 datafusion-common.workspace = true
 datafusion-expr.workspace = true

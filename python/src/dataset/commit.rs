@@ -15,7 +15,7 @@
 use std::fmt::Debug;
 
 use lance_table::io::commit::{CommitError, CommitLease, CommitLock};
-use lance_core::location;
+use snafu::{location, Location};
 
 use lance_core::Error;
 
