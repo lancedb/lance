@@ -22,7 +22,18 @@ import org.scalatest.funsuite.AnyFunSuite
 
 import java.time.ZoneId
 
-// this suite code was fork from apache spark ArrowUtilsSuite and add test("unsigned long")
+/**
+ SPDX-License-Identifier: Apache-2.0
+ SPDX-FileCopyrightText: Copyright The Lance Authors
+
+ The following code is originally from https://github.com/apache/spark/blob/master/sql/catalyst/src/test/scala/org/apache/spark/sql/util/ArrowUtilsSuite.scala
+ and is licensed under the Apache license:
+
+ License: Apache License 2.0, Copyright 2014 and onwards The Apache Software Foundation.
+ https://github.com/apache/spark/blob/master/LICENSE
+
+ It has been modified by the Lance developers to fit the needs of the Lance project.
+ */
 class LanceArrowUtilsSuite extends AnyFunSuite {
   def roundtrip(dt: DataType, fieldName: String = "value"): Unit = {
     dt match {

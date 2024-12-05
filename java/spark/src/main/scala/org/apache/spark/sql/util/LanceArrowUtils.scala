@@ -23,8 +23,18 @@ import org.apache.spark.sql.types._
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
 
-// This file was folk from ArrowUtils in apache spark since it has a lot of private methods.
-// In this util, we want to deal with the UINT64 and FixedSizeList
+/**
+ SPDX-License-Identifier: Apache-2.0
+ SPDX-FileCopyrightText: Copyright The Lance Authors
+
+ The following code is originally from https://github.com/apache/spark/blob/master/sql/api/src/main/scala/org/apache/spark/sql/util/ArrowUtils.scala
+ and is licensed under the Apache license:
+
+ License: Apache License 2.0, Copyright 2014 and onwards The Apache Software Foundation.
+ https://github.com/apache/spark/blob/master/LICENSE
+
+ It has been modified by the Lance developers to fit the needs of the Lance project.
+ */
 object LanceArrowUtils {
   def fromArrowField(field: Field): DataType = {
     field.getType match {
