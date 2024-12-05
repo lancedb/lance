@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
+from . import log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
     LanceDataset,
@@ -46,6 +48,7 @@ __all__ = [
     "json_to_schema",
     "dataset",
     "batch_udf",
+    "set_logger",
 ]
 
 
@@ -133,3 +136,13 @@ def dataset(
             )
     else:
         return ds
+
+
+def set_logger(
+    file_path="pylance.log",
+    name="pylance",
+    level=logging.INFO,
+    format_string=None,
+    log_handler=None,
+):
+    log.set_logger(file_path, name, level, format_string, log_handler)

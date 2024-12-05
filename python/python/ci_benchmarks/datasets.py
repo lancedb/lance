@@ -1,36 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import logging
 from functools import cache
 from pathlib import Path
 
 import requests
+from lance.log import LOGGER
 
 
 def _is_on_google() -> bool:
-    logging.info("Testing if running on Google Cloud")
+    LOGGER.info("Testing if running on Google Cloud")
     try:
         rsp = requests.get("http://metadata.google.internal", timeout=5)
-        logging.info("Metadata-Flavor: %s", rsp.headers.get("Metadata-Flavor"))
+        LOGGER.info("Metadata-Flavor: %s", rsp.headers.get("Metadata-Flavor"))
         return rsp.headers["Metadata-Flavor"] == "Google"
     except requests.exceptions.RequestException as ex:
-        logging.info("Failed to connect to metadata server: %s", ex)
+        LOGGER.info("Failed to connect to metadata server: %s", ex)
         return False
 
 
 @cache
 def _get_base_uri() -> str:
     if _is_on_google():
-        logging.info(
-            "Running on Google Cloud, using gs://lance-benchmarks-ci-datasets/"
-        )
+        LOGGER.info("Running on Google Cloud, using gs://lance-benchmarks-ci-datasets/")
         return "gs://lance-benchmarks-ci-datasets/"
     else:
         data_path = Path.home() / "lance-benchmarks-ci-datasets"
         if not data_path.exists():
             data_path.mkdir(parents=True, exist_ok=True)
-        logging.info("Running locally, using %s", data_path)
+        LOGGER.info("Running locally, using %s", data_path)
         return f"{data_path}/"
 
 
