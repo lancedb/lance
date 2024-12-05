@@ -24,7 +24,10 @@ use snafu::{location, Location};
 use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
 use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
-use crate::repdef::{build_control_word_iterator, ControlWordIterator, ControlWordParser};
+use crate::repdef::{
+    build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
+    DefinitionInterpretation,
+};
 use crate::statistics::{ComputeStat, GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
@@ -294,6 +297,7 @@ struct DecodeMiniBlockTask {
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     dictionary_data: Option<Arc<DataBlock>>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     // The mini-blocks to decode
     //
     // For each mini-block we also have the ranges of rows that we want to decode
@@ -468,6 +472,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
 
         let data = data_builder.finish();
 
+        let unraveler = RepDefUnraveler::new(repbuf, defbuf, self.def_meaning.clone());
+
         // if dictionary encoding is applied, do dictionary decode here.
         if let Some(dictionary) = &self.dictionary_data {
             // assume the indices are uniformly distributed.
@@ -488,16 +494,14 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 let data = data_builder.finish();
                 return Ok(DecodedPage {
                     data,
-                    repetition: repbuf,
-                    definition: defbuf,
+                    repdef: unraveler,
                 });
             }
         }
 
         Ok(DecodedPage {
             data,
-            repetition: repbuf,
-            definition: defbuf,
+            repdef: unraveler,
         })
     }
 }
@@ -509,6 +513,7 @@ struct MiniBlockDecoder {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     data: VecDeque<ScheduledChunk>,
     offset_in_current_chunk: u64,
     num_rows: u64,
@@ -545,6 +550,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             dictionary_data: self.dictionary.clone(),
             num_rows,
             offset_into_first_chunk,
+            def_meaning: self.def_meaning.clone(),
         }))
     }
 
@@ -586,12 +592,16 @@ struct SimpleAllNullDecodePageTask {
 }
 impl DecodePageTask for SimpleAllNullDecodePageTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let unraveler = RepDefUnraveler::new(
+            None,
+            Some(vec![1; self.num_values as usize]),
+            Arc::new([DefinitionInterpretation::NullableItem]),
+        );
         Ok(DecodedPage {
             data: DataBlock::AllNull(AllNullDataBlock {
                 num_values: self.num_values,
             }),
-            repetition: None,
-            definition: Some(vec![1; self.num_values as usize]),
+            repdef: unraveler,
         })
     }
 }
@@ -636,7 +646,7 @@ pub struct MiniBlockScheduler {
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
-
+    def_meaning: Arc<[DefinitionInterpretation]>,
     // This is set after initialization
     chunk_meta: Vec<ChunkMeta>,
 
@@ -658,6 +668,11 @@ impl MiniBlockScheduler {
             decompressors.create_block_decompressor(layout.rep_compression.as_ref().unwrap())?;
         let def_decompressor =
             decompressors.create_block_decompressor(layout.def_compression.as_ref().unwrap())?;
+        let def_meaning = layout
+            .layers
+            .iter()
+            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .collect::<Vec<_>>();
         let value_decompressor = decompressors
             .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
@@ -699,6 +714,7 @@ impl MiniBlockScheduler {
             rows_in_page,
             chunk_meta: Vec::new(),
             dictionary,
+            def_meaning: def_meaning.into(),
         })
     }
 
@@ -880,6 +896,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .dictionary
             .as_ref()
             .map(|dictionary| dictionary.dictionary_data.clone());
+        let def_meaning = self.def_meaning.clone();
 
         for scheduled_chunk in scheduled_chunks.iter_mut() {
             scheduled_chunk.vals_targeted =
@@ -895,6 +912,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 rep_decompressor,
                 def_decompressor,
                 value_decompressor,
+                def_meaning,
                 data: scheduled_chunks,
                 offset_in_current_chunk: 0,
                 num_rows,
@@ -918,6 +936,7 @@ pub struct FullZipScheduler {
     priority: u64,
     rows_in_page: u64,
     value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
 }
 
@@ -939,9 +958,15 @@ impl FullZipScheduler {
             layout.bits_rep.try_into().unwrap(),
             layout.bits_def.try_into().unwrap(),
         );
+        let def_meaning = layout
+            .layers
+            .iter()
+            .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+            .collect::<Vec<_>>();
         Ok(Self {
             data_buf_position,
             value_decompressor: value_decompressor.into(),
+            def_meaning: def_meaning.into(),
             priority,
             rows_in_page,
             ctrl_word_parser,
@@ -973,6 +998,7 @@ impl StructuralPageScheduler for FullZipScheduler {
         });
         let data = io.submit_request(byte_ranges.collect(), self.priority);
         let value_decompressor = self.value_decompressor.clone();
+        let def_meaning = self.def_meaning.clone();
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let ctrl_word_parser = self.ctrl_word_parser;
         Ok(async move {
@@ -983,6 +1009,7 @@ impl StructuralPageScheduler for FullZipScheduler {
                 .collect();
             Ok(Box::new(FixedFullZipDecoder {
                 value_decompressor,
+                def_meaning,
                 data,
                 num_rows,
                 ctrl_word_parser,
@@ -1005,6 +1032,7 @@ impl StructuralPageScheduler for FullZipScheduler {
 #[derive(Debug)]
 struct FixedFullZipDecoder {
     value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
     data: VecDeque<LanceBuffer>,
     offset_in_current: usize,
@@ -1040,6 +1068,7 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
         let num_rows = task_data.iter().map(|td| td.1).sum::<u64>() as usize;
         Ok(Box::new(FixedFullZipDecodeTask {
             value_decompressor: self.value_decompressor.clone(),
+            def_meaning: self.def_meaning.clone(),
             ctrl_word_parser: self.ctrl_word_parser,
             data: task_data,
             bytes_per_value: self.bytes_per_value,
@@ -1057,6 +1086,7 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
 #[derive(Debug)]
 struct FixedFullZipDecodeTask {
     value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
     data: Vec<(LanceBuffer, u64)>,
     num_rows: usize,
@@ -1079,10 +1109,11 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 data_builder.append(&decompressed, 0..rows_in_buf);
             }
 
+            let unraveler = RepDefUnraveler::new(None, None, self.def_meaning);
+
             Ok(DecodedPage {
                 data: data_builder.finish(),
-                repetition: None,
-                definition: None,
+                repdef: unraveler,
             })
         } else {
             // Slow path, unzipping needed
@@ -1116,10 +1147,16 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
-            Ok(DecodedPage {
-                data: data_builder.finish(),
+            let unraveler = RepDefUnraveler::new(
                 repetition,
                 definition,
+                // TODO: Fix this
+                self.def_meaning,
+            );
+
+            Ok(DecodedPage {
+                data: data_builder.finish(),
+                repdef: unraveler,
             })
         }
     }
@@ -1498,7 +1535,6 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 #[derive(Debug)]
 pub struct StructuralCompositeDecodeArrayTask {
     tasks: Vec<Box<dyn DecodePageTask>>,
-    num_values: u64,
     data_type: DataType,
     should_validate: bool,
 }
@@ -1506,27 +1542,10 @@ pub struct StructuralCompositeDecodeArrayTask {
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
         let mut arrays = Vec::with_capacity(self.tasks.len());
-        let mut all_rep = LevelBuffer::with_capacity(self.num_values as usize);
-        let mut all_def = LevelBuffer::with_capacity(self.num_values as usize);
-        let mut offset = 0;
-        let mut has_def = false;
+        let mut unravelers = Vec::with_capacity(self.tasks.len());
         for task in self.tasks {
             let decoded = task.decode()?;
-
-            if let Some(rep) = &decoded.repetition {
-                // Note: if one chunk has repetition, all chunks will have repetition
-                // and so all_rep will either end up with len=num_values or len=0
-                all_rep.extend(rep);
-            }
-            if let Some(def) = &decoded.definition {
-                if !has_def {
-                    // This is the first validity we have seen, need to backfill with all-valid
-                    // if we've processed any all-valid pages
-                    has_def = true;
-                    all_def.extend(iter::repeat(0).take(offset));
-                }
-                all_def.extend(def);
-            }
+            unravelers.push(decoded.repdef);
 
             let array = make_array(
                 decoded
@@ -1534,25 +1553,14 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
                     .into_arrow(self.data_type.clone(), self.should_validate)?,
             );
 
-            offset += array.len();
             arrays.push(array);
         }
         let array_refs = arrays.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>();
         let array = arrow_select::concat::concat(&array_refs)?;
-        let all_rep = if all_rep.is_empty() {
-            None
-        } else {
-            Some(all_rep)
-        };
-        let all_def = if all_def.is_empty() {
-            None
-        } else {
-            Some(all_def)
-        };
-        let mut repdef = RepDefUnraveler::new(all_rep, all_def);
+        let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
         // The primitive array itself has a validity
-        let mut validity = repdef.unravel_validity();
+        let mut validity = repdef.unravel_validity(array.len());
         if matches!(self.data_type, DataType::Null) {
             // Null arrays don't have a validity but we still pretend they do for consistency's sake
             // up until this point.  We need to remove it here.
@@ -1623,7 +1631,6 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
             tasks,
             data_type: self.field.data_type().clone(),
             should_validate: self.should_validate,
-            num_values: num_rows,
         }))
     }
 
@@ -2048,7 +2055,7 @@ impl PrimitiveStructuralEncoder {
     ///
     /// TODO: Use bit-packing here
     fn compress_levels(
-        levels: Option<LevelBuffer>,
+        levels: Option<Arc<[u16]>>,
         num_values: u64,
         compression_strategy: &dyn CompressionStrategy,
         chunks: &[MiniBlockChunk],
@@ -2056,7 +2063,7 @@ impl PrimitiveStructuralEncoder {
         if let Some(levels) = levels {
             debug_assert_eq!(num_values as usize, levels.len());
             // Make the levels into a FixedWidth data block
-            let mut levels_buf = LanceBuffer::reinterpret_vec(levels);
+            let mut levels_buf = LanceBuffer::reinterpret_slice(levels);
             let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: levels_buf.borrow_and_clone(),
                 bits_per_value: 16,
@@ -2171,6 +2178,7 @@ impl PrimitiveStructuralEncoder {
                 def_encoding,
                 value_encoding,
                 Some(dictionary_encoding),
+                &repdef.def_meaning,
             );
             Ok(EncodedPage {
                 num_rows: num_values,
@@ -2180,8 +2188,13 @@ impl PrimitiveStructuralEncoder {
                 row_number,
             })
         } else {
-            let description =
-                ProtobufUtils::miniblock_layout(rep_encoding, def_encoding, value_encoding, None);
+            let description = ProtobufUtils::miniblock_layout(
+                rep_encoding,
+                def_encoding,
+                value_encoding,
+                None,
+                &repdef.def_meaning,
+            );
             Ok(EncodedPage {
                 num_rows: num_values,
                 column_idx,
@@ -2289,10 +2302,11 @@ impl PrimitiveStructuralEncoder {
             .definition_levels
             .as_ref()
             .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
+
         let repdef_iter = build_control_word_iterator(
-            repdef.repetition_levels,
+            repdef.repetition_levels.as_deref(),
             max_rep,
-            repdef.definition_levels,
+            repdef.definition_levels.as_deref(),
             max_def,
         );
         let bits_rep = repdef_iter.bits_rep();
@@ -2307,7 +2321,8 @@ impl PrimitiveStructuralEncoder {
 
         let zipped = Self::serialize_full_zip(compressed_data, repdef_iter);
 
-        let description = ProtobufUtils::full_zip_layout(bits_rep, bits_def, value_encoding);
+        let description =
+            ProtobufUtils::full_zip_layout(bits_rep, bits_def, value_encoding, &repdef.def_meaning);
         Ok(EncodedPage {
             num_rows: num_values,
             column_idx,
