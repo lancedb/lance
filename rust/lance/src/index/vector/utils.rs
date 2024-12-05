@@ -40,8 +40,8 @@ pub async fn maybe_sample_training_data(
     sample_size_hint: usize,
 ) -> Result<FixedSizeListArray> {
     let num_rows = dataset.count_rows(None).await?;
-    let projection = dataset.schema().project(&[column])?;
     let batch = if num_rows > sample_size_hint {
+        let projection = dataset.schema().project(&[column])?;
         dataset.sample(sample_size_hint, &projection).await?
     } else {
         let mut scanner = dataset.scan();

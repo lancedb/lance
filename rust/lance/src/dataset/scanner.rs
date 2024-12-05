@@ -670,7 +670,7 @@ impl Scanner {
             DataType::FixedSizeList(dt, _) => {
                 if dt.data_type() == q.data_type() {
                     Box::new(q.clone())
-                } else if dt.data_type().is_floating() && *q.data_type() == DataType::Float32 {
+                } else if dt.data_type().is_floating() {
                     coerce_float_vector(
                         q.as_any().downcast_ref::<Float32Array>().unwrap(),
                         FloatType::try_from(dt.data_type())?,
