@@ -165,7 +165,7 @@ pub(super) fn compute_pq_distance_4bit(
             debug_assert_eq!(dist_table.as_array(), origin_dist_table.as_array());
 
             // compute next distances
-            let next_indices = vec_indices.right_shift(4);
+            let next_indices = vec_indices.right_shift::<4>();
             let next_dist_table = origin_next_dist_table;
             let results = results + next_dist_table.shuffle(next_indices);
 

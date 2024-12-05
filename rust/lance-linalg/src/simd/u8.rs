@@ -49,32 +49,22 @@ impl u8x16 {
     }
 
     #[inline]
-    pub fn right_shift(self, nbits: i32) -> Self {
+    pub fn right_shift<const N: i32>(self) -> Self {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let shifted = _mm_srli_epi16(self.0, nbits);
-            let mask = _mm_set1_epi8(1_i8 << (8 - nbits) - 1);
+            let shifted = _mm_srli_epi16(self.0, N);
+            let mask = _mm_set1_epi8((1_i8 << (8 - nbits)) - 1);
             Self(_mm_and_si128(shifted, mask))
         }
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            match nbits {
-                1 => Self(vshrq_n_u8::<1>(self.0)),
-                2 => Self(vshrq_n_u8::<2>(self.0)),
-                3 => Self(vshrq_n_u8::<3>(self.0)),
-                4 => Self(vshrq_n_u8::<4>(self.0)),
-                5 => Self(vshrq_n_u8::<5>(self.0)),
-                6 => Self(vshrq_n_u8::<6>(self.0)),
-                7 => Self(vshrq_n_u8::<7>(self.0)),
-                8 => Self(vshrq_n_u8::<8>(self.0)),
-                _ => unreachable!(),
-            }
+            Self(vshrq_n_u8::<N>(self.0))
         }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let mut result = [0u8; 16];
             for i in 0..16 {
-                result[i] = self.0[i] >> 4;
+                result[i] = self.0[i] >> N;
             }
             Self(result)
         }
