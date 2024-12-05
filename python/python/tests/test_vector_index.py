@@ -778,6 +778,20 @@ def test_f16_index(tmp_path: Path):
     assert rst.schema.field("vector").type.value_type == pa.float16()
     assert len(rst) == 10
 
+    q = q.tolist()
+    print(type(q))
+    print(type(q[0]))
+    rst = dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": q,
+            "k": 10,
+        }
+    )
+
+    assert rst.schema.field("vector").type.value_type == pa.float16()
+    assert len(rst) == 10
+
 
 def test_vector_with_nans(tmp_path: Path):
     DIM = 32

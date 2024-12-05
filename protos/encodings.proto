@@ -387,7 +387,8 @@ message FullZipLayout {
 ///
 /// If the data is all-null but we have non-trivial rep-def then MiniBlockLayout is used
 message AllNullLayout {
-
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 5;
 }
 
 message PageLayout {
