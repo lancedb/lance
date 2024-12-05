@@ -125,6 +125,7 @@ impl FileFragment {
         FragmentMetadata::new(self.fragment.metadata().clone())
     }
 
+    #[pyo3(signature=(_filter=None))]
     fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
         RT.runtime.block_on(async {
             self.fragment
@@ -134,6 +135,7 @@ impl FileFragment {
         })
     }
 
+    #[pyo3(signature=(row_indices, columns=None))]
     fn take(
         self_: PyRef<'_, Self>,
         row_indices: Vec<usize>,
@@ -159,6 +161,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, batch_readahead=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -215,6 +218,7 @@ impl FileFragment {
         Ok(Scanner::new(scn))
     }
 
+    #[pyo3(signature=(reader, batch_size=None))]
     fn add_columns_from_reader(
         &mut self,
         reader: &Bound<PyAny>,
@@ -234,9 +238,10 @@ impl FileFragment {
         Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
     }
 
+    #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
     fn add_columns(
         &mut self,
-        transforms: &PyAny,
+        transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
     ) -> PyResult<(FragmentMetadata, LanceSchema)> {

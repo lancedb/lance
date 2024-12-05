@@ -486,7 +486,7 @@ fn get_boolean_statistics(arrays: &[&ArrayRef]) -> StatisticsRow {
 
 fn cast_dictionary_arrays<'a, T: ArrowDictionaryKeyType + 'static>(
     arrays: &'a [&'a ArrayRef],
-) -> Vec<&Arc<dyn Array>> {
+) -> Vec<&'a Arc<dyn Array>> {
     arrays
         .iter()
         .map(|x| x.as_dictionary::<T>().values())

@@ -13,20 +13,20 @@ use crate::{Dataset, FragmentMetadata, RT};
 ///
 /// This can be used to view the field ids and types in the schema.
 #[pyfunction]
-pub fn format_schema(dataset: &PyAny) -> PyResult<String> {
+pub fn format_schema(dataset: &Bound<'_, PyAny>) -> PyResult<String> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let schema = dataset_ref.schema();
     Ok(format!("{:#?}", schema))
 }
 
 /// Print the full Lance manifest of the dataset.
 #[pyfunction]
-pub fn format_manifest(dataset: &PyAny) -> PyResult<String> {
+pub fn format_manifest(dataset: &Bound<'_, PyAny>) -> PyResult<String> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let manifest = dataset_ref.manifest();
     Ok(format!("{:#?}", manifest))
 }
@@ -81,17 +81,20 @@ impl PrettyPrintableFragment {
 
 /// Debug print a LanceFragment.
 #[pyfunction]
-pub fn format_fragment(fragment: &PyAny, dataset: &PyAny) -> PyResult<String> {
+pub fn format_fragment(
+    fragment: &Bound<'_, PyAny>,
+    dataset: &Bound<'_, PyAny>,
+) -> PyResult<String> {
     let py = fragment.py();
     let fragment = fragment
         .getattr("_metadata")?
         .extract::<Py<FragmentMetadata>>()?;
 
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let schema = dataset_ref.schema();
 
-    let meta = fragment.as_ref(py).borrow().inner.clone();
+    let meta = fragment.bind(py).borrow().inner.clone();
     let pp_meta = PrettyPrintableFragment::new(&meta, schema);
     Ok(format!("{:#?}", pp_meta))
 }
@@ -104,12 +107,12 @@ pub fn format_fragment(fragment: &PyAny, dataset: &PyAny) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(signature = (dataset, /, max_transactions = 10))]
 pub fn list_transactions(
-    dataset: &PyAny,
+    dataset: &Bound<'_, PyAny>,
     max_transactions: usize,
 ) -> PyResult<Vec<Option<String>>> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let mut dataset = dataset.as_ref(py).borrow().ds.clone();
+    let mut dataset = dataset.bind(py).borrow().ds.clone();
 
     RT.block_on(Some(py), async move {
         let mut transactions = vec![];

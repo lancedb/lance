@@ -14,19 +14,16 @@
 
 package com.lancedb.lance;
 
+import org.apache.arrow.util.Preconditions;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.apache.arrow.util.Preconditions;
-import org.json.JSONArray;
-import org.json.JSONObject;
-import org.apache.commons.lang3.builder.ToStringBuilder;
-
-/**
- * Metadata of a Fragment in the dataset.
- * Matching to lance Fragment.
- */
+/** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
 public class FragmentMetadata implements Serializable {
   private static final long serialVersionUID = -5886811251944130460L;
   private static final String ID_KEY = "id";
@@ -73,11 +70,14 @@ public class FragmentMetadata implements Serializable {
     JSONObject metadata = new JSONObject(jsonMetadata);
     if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
       throw new IllegalArgumentException(
-          String.format("Fragment metadata must have {} and {} but is {}",
-              ID_KEY, PHYSICAL_ROWS_KEY, jsonMetadata));
+          String.format(
+              "Fragment metadata must have {} and {} but is {}",
+              ID_KEY,
+              PHYSICAL_ROWS_KEY,
+              jsonMetadata));
     }
-    return new FragmentMetadata(jsonMetadata, metadata.getInt(ID_KEY),
-        metadata.getLong(PHYSICAL_ROWS_KEY));
+    return new FragmentMetadata(
+        jsonMetadata, metadata.getInt(ID_KEY), metadata.getLong(PHYSICAL_ROWS_KEY));
   }
 
   /**
@@ -94,11 +94,15 @@ public class FragmentMetadata implements Serializable {
       JSONObject metadata = (JSONObject) object;
       if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
         throw new IllegalArgumentException(
-                String.format("Fragment metadata must have {} and {} but is {}",
-                        ID_KEY, PHYSICAL_ROWS_KEY, jsonMetadata));
+            String.format(
+                "Fragment metadata must have {} and {} but is {}",
+                ID_KEY,
+                PHYSICAL_ROWS_KEY,
+                jsonMetadata));
       }
-      fragmentMetadataList.add(new FragmentMetadata(metadata.toString(), metadata.getInt(ID_KEY),
-              metadata.getLong(PHYSICAL_ROWS_KEY)));
+      fragmentMetadataList.add(
+          new FragmentMetadata(
+              metadata.toString(), metadata.getInt(ID_KEY), metadata.getLong(PHYSICAL_ROWS_KEY)));
     }
     return fragmentMetadataList;
   }

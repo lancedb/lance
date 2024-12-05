@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.TestUtils;
 import com.lancedb.lance.spark.internal.LanceFragmentColumnarBatchScanner;
+
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.Test;
@@ -28,15 +29,16 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 public class LanceFragmentColumnarBatchScannerTest {
-  
+
   @Test
   public void scanner() throws IOException {
     List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues;
     int rowIndex = 0;
     int fragmentId = 0;
     while (fragmentId <= 1) {
-      try (LanceFragmentColumnarBatchScanner scanner = LanceFragmentColumnarBatchScanner.create(
-          fragmentId, TestUtils.TestTable1Config.inputPartition)) {
+      try (LanceFragmentColumnarBatchScanner scanner =
+          LanceFragmentColumnarBatchScanner.create(
+              fragmentId, TestUtils.TestTable1Config.inputPartition)) {
         while (scanner.loadNextBatch()) {
           try (ColumnarBatch batch = scanner.getCurrentBatch()) {
             Iterator<InternalRow> rows = batch.rowIterator();
@@ -46,10 +48,13 @@ public class LanceFragmentColumnarBatchScannerTest {
               for (int colIndex = 0; colIndex < row.numFields(); colIndex++) {
                 long actualValue = row.getLong(colIndex);
                 long expectedValue = expectedValues.get(rowIndex).get(colIndex);
-                assertEquals(expectedValue, actualValue, "Mismatch at row " + rowIndex + " column " + colIndex);
+                assertEquals(
+                    expectedValue,
+                    actualValue,
+                    "Mismatch at row " + rowIndex + " column " + colIndex);
               }
               rowIndex++;
-            } 
+            }
           }
         }
       }

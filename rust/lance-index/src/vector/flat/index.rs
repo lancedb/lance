@@ -4,7 +4,7 @@
 //! Flat Vector Index.
 //!
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;

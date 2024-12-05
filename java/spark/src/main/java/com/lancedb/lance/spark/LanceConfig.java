@@ -14,13 +14,12 @@
 
 package com.lancedb.lance.spark;
 
-import java.io.Serializable;
-import java.util.Map;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
-/**
- * Lance Configuration.
- */
+import java.io.Serializable;
+import java.util.Map;
+
+/** Lance Configuration. */
 public class LanceConfig implements Serializable {
   private static final long serialVersionUID = 827364827364823764L;
   public static final String CONFIG_DATASET_URI = "path"; // Path is default spark option key
@@ -35,8 +34,12 @@ public class LanceConfig implements Serializable {
   private final boolean pushDownFilters;
   private final Map<String, String> options;
 
-  private LanceConfig(String dbPath, String datasetName,
-      String datasetUri, boolean pushDownFilters, CaseInsensitiveStringMap options) {
+  private LanceConfig(
+      String dbPath,
+      String datasetName,
+      String datasetUri,
+      boolean pushDownFilters,
+      CaseInsensitiveStringMap options) {
     this.dbPath = dbPath;
     this.datasetName = datasetName;
     this.datasetUri = datasetUri;
@@ -64,8 +67,8 @@ public class LanceConfig implements Serializable {
   }
 
   public static LanceConfig from(CaseInsensitiveStringMap options, String datasetUri) {
-    boolean pushDownFilters = options.getBoolean(CONFIG_PUSH_DOWN_FILTERS,
-        DEFAULT_PUSH_DOWN_FILTERS);
+    boolean pushDownFilters =
+        options.getBoolean(CONFIG_PUSH_DOWN_FILTERS, DEFAULT_PUSH_DOWN_FILTERS);
     String[] paths = extractDbPathAndDatasetName(datasetUri);
     return new LanceConfig(paths[0], paths[1], datasetUri, pushDownFilters, options);
   }
@@ -89,9 +92,11 @@ public class LanceConfig implements Serializable {
     }
 
     String datasetNameWithSuffix = datasetUri.substring(lastSlashIndex + 1);
-    return new String[]{datasetUri.substring(0, lastSlashIndex + 1),
-        datasetNameWithSuffix.substring(0,
-            datasetNameWithSuffix.length() - LANCE_FILE_SUFFIX.length())};
+    return new String[] {
+      datasetUri.substring(0, lastSlashIndex + 1),
+      datasetNameWithSuffix.substring(
+          0, datasetNameWithSuffix.length() - LANCE_FILE_SUFFIX.length())
+    };
   }
 
   public String getDbPath() {

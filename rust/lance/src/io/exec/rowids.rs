@@ -240,8 +240,8 @@ impl ExecutionPlan for AddRowAddrExec {
             DataFusionError::Internal("RowAddrExec: rowid column stats not found".into())
         })?;
         let row_addr_col_stats = ColumnStatistics {
-            null_count: row_id_col_stats.null_count.clone(),
-            distinct_count: row_id_col_stats.distinct_count.clone(),
+            null_count: row_id_col_stats.null_count,
+            distinct_count: row_id_col_stats.distinct_count,
             max_value: Precision::Absent,
             min_value: Precision::Absent,
         };
@@ -251,7 +251,6 @@ impl ExecutionPlan for AddRowAddrExec {
         // is a minimum size of 64 bytes.
         let mut added_byte_size = stats
             .num_rows
-            .clone()
             .map(|n| (n * 8).max(64))
             .add(&Precision::Exact(base_size));
         if row_id_col_stats
@@ -261,8 +260,7 @@ impl ExecutionPlan for AddRowAddrExec {
             .unwrap_or_default()
         {
             // Account for null buffer.
-            added_byte_size =
-                added_byte_size.add(&stats.num_rows.clone().map(|n| n.div_ceil(8).max(64)));
+            added_byte_size = added_byte_size.add(&stats.num_rows.map(|n| n.div_ceil(8).max(64)));
         }
         stats.total_byte_size = stats.total_byte_size.add(&added_byte_size);
         stats
