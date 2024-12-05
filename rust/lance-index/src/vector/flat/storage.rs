@@ -368,7 +368,7 @@ impl<'a> FlatDistanceCal<'a, UInt8Type> {
     }
 }
 
-impl<'a, T: ArrowPrimitiveType> FlatDistanceCal<'a, T> {
+impl<T: ArrowPrimitiveType> FlatDistanceCal<'_, T> {
     #[inline]
     fn get_vector(&self, id: u32) -> &[T::Native] {
         &self.vectors[self.dimension * id as usize..self.dimension * (id + 1) as usize]
