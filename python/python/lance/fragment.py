@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import json
 import warnings
 from pathlib import Path
 from typing import (
@@ -66,7 +65,7 @@ class FragmentMetadata:
 
     def to_json(self) -> str:
         """Serialize :class:`FragmentMetadata` to a JSON blob"""
-        return json.loads(self._metadata.json())
+        return self._metadata.json()
 
     @staticmethod
     def from_json(json_data: str) -> FragmentMetadata:
