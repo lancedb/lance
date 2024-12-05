@@ -13,7 +13,7 @@ from lance.tracing import trace_to_chrome
 trace_to_chrome(level="debug", file="/tmp/trace.json")
 
 NUM_ROWS = 10_000_000
-RANDOM_ACCESS = "indices"
+RANDOM_ACCESS = "full"
 NUM_INDICES = 100
 NUM_ROUNDS = 10
 
@@ -125,7 +125,7 @@ def test_parquet_write(tmp_path: Path, benchmark, test_data):
 
 
 def write_lance_file(lance_path, test_data):
-    with LanceFileWriter(lance_path, test_data.schema, version = "2.1") as writer:
+    with LanceFileWriter(lance_path, test_data.schema, version="2.1") as writer:
         for batch in test_data.to_batches():
             writer.write_batch(batch)
 
