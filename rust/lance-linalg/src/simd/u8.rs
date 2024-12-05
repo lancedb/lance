@@ -53,7 +53,7 @@ impl u8x16 {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             let shifted = _mm_srli_epi16(self.0, N);
-            let mask = _mm_set1_epi8((1_i8 << (8 - nbits)) - 1);
+            let mask = _mm_set1_epi8((1_i8 << (8 - N)) - 1);
             Self(_mm_and_si128(shifted, mask))
         }
         #[cfg(target_arch = "aarch64")]
