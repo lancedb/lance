@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 import tempfile
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Tuple, Union
@@ -21,6 +20,7 @@ from .dependencies import (
     torch,
 )
 from .dependencies import numpy as np
+from .log import LOGGER
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -173,7 +173,7 @@ def train_pq_codebook_on_accelerator(
     )
 
     for sub_vector in range(num_sub_vectors):
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
         if num_sub_vectors == 1:
             # sampler has different behaviour with one column
             init_centroids_slice = init_centroids
@@ -238,7 +238,7 @@ def train_ivf_centroids_on_accelerator(
     else:
         filt = None
 
-    logging.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
+    LOGGER.info("Randomly select %s centroids from %s (filt=%s)", k, dataset, filt)
 
     ds = TorchDataset(
         dataset,
@@ -249,7 +249,7 @@ def train_ivf_centroids_on_accelerator(
     )
 
     init_centroids = next(iter(ds))
-    logging.info("Done sampling: centroids shape: %s", init_centroids.shape)
+    LOGGER.info("Done sampling: centroids shape: %s", init_centroids.shape)
 
     ds = TorchDataset(
         dataset,
@@ -261,10 +261,10 @@ def train_ivf_centroids_on_accelerator(
     )
 
     if accelerator == "cuvs":
-        logging.info("Training IVF partitions using cuVS+GPU")
+        LOGGER.info("Training IVF partitions using cuVS+GPU")
         print("Training IVF partitions using cuVS+GPU")
         if not (_CAGRA_AVAILABLE and _RAFT_COMMON_AVAILABLE):
-            logging.error(
+            LOGGER.error(
                 "Missing cuvs and pylibraft - "
                 "please install cuvs-cu11 and pylibraft-cu11 or "
                 "cuvs-cu12 and pylibraft-cu12 using --extra-index-url "
@@ -279,7 +279,7 @@ def train_ivf_centroids_on_accelerator(
             centroids=init_centroids,
         )
     else:
-        logging.info("Training IVF partitions using GPU(%s)", accelerator)
+        LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
         kmeans = KMeans(
             k,
             max_iters=max_iters,
@@ -293,7 +293,7 @@ def train_ivf_centroids_on_accelerator(
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         np.save(f, centroids)
-    logging.info("Saved centroids to %s", f.name)
+    LOGGER.info("Saved centroids to %s", f.name)
 
     return centroids, kmeans
 
@@ -409,7 +409,7 @@ def compute_pq_codes(
 
     progress.close()
 
-    logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
         data_file.path()
@@ -561,7 +561,7 @@ def compute_partitions(
                     schema=output_schema,
                 )
                 if len(part_batch) < len(ids):
-                    logging.warning(
+                    LOGGER.warning(
                         "%s vectors are ignored during partition assignment",
                         len(part_batch) - len(ids),
                     )
@@ -582,7 +582,7 @@ def compute_partitions(
 
     progress.close()
 
-    logging.info("Saved precomputed partitions to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed partitions to %s", dst_dataset_uri)
     return str(dst_dataset_uri)
 
 
@@ -716,7 +716,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 # cast centroids to the same dtype as vecs
                 if first_iter:
                     first_iter = False
-                    logging.info("Residual shape: %s", residual_vecs.shape)
+                    LOGGER.info("Residual shape: %s", residual_vecs.shape)
                     for kmeans in pq_kmeans_list:
                         cents: torch.Tensor = kmeans.centroids
                         kmeans.centroids = cents.to(
@@ -743,7 +743,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
                 )
 
                 if len(part_batch) < len(ids):
-                    logging.warning(
+                    LOGGER.warning(
                         "%s vectors are ignored during partition assignment",
                         len(part_batch) - len(ids),
                     )
@@ -765,7 +765,7 @@ def one_pass_assign_ivf_pq_on_accelerator(
 
     progress.close()
 
-    logging.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
         data_file.path()

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 
-import logging
 import time
 from typing import Literal, Optional, Tuple, Union
 
@@ -10,6 +9,7 @@ import pyarrow as pa
 
 from lance.dependencies import cagra, raft_common, torch
 from lance.dependencies import numpy as np
+from lance.log import LOGGER
 from lance.torch.kmeans import KMeans as KMeansTorch
 
 __all__ = ["KMeans"]
@@ -91,8 +91,8 @@ class KMeans(KMeansTorch):
         self.time_rebuild = 0.0
         self.time_search = 0.0
         super().fit(data)
-        logging.info("Total search time: %s", self.time_search)
-        logging.info("Total rebuild time: %s", self.time_rebuild)
+        LOGGER.info("Total search time: %s", self.time_search)
+        LOGGER.info("Total rebuild time: %s", self.time_rebuild)
 
     def rebuild_index(self):
         rebuild_time_start = time.time()

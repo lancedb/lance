@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-import logging
 import time
 from typing import List, Literal, Optional, Tuple, Union
 
@@ -14,6 +13,7 @@ from lance.dependencies import (
     torch,
 )
 from lance.dependencies import numpy as np
+from lance.log import LOGGER
 
 from . import preferred_device
 from .data import TensorDataset
@@ -113,7 +113,7 @@ class KMeans:
     def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
         """Random centroid initialization."""
         if self.centroids is not None:
-            logging.debug("KMeans centroids already initialized")
+            LOGGER.debug("KMeans centroids already initialized")
             return
 
         is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
@@ -154,7 +154,7 @@ class KMeans:
         assert self.centroids is not None
         self.centroids = self.centroids.to(self.device)
 
-        logging.info(
+        LOGGER.info(
             "Start kmean training, metric: %s, iters: %s", self.metric, self.max_iters
         )
         self.total_distance = 0
@@ -166,8 +166,8 @@ class KMeans:
             except StopIteration:
                 break
             if i % 10 == 0:
-                logging.debug("Total distance: %s, iter: %s", self.total_distance, i)
-        logging.info("Finish KMean training in %s", time.time() - start)
+                LOGGER.debug("Total distance: %s, iter: %s", self.total_distance, i)
+        LOGGER.info("Finish KMean training in %s", time.time() - start)
 
     def _updated_centroids(
         self, centroids: torch.Tensor, counts: torch.Tensor
@@ -234,7 +234,7 @@ class KMeans:
         self.rebuild_index()
         for idx, chunk in enumerate(data):
             if idx % 50 == 0:
-                logging.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
+                LOGGER.info("Kmeans::train: epoch %s, chunk %s", epoch, idx)
             if column is not None:
                 chunk = chunk[column]
             chunk: torch.Tensor = chunk
@@ -264,7 +264,7 @@ class KMeans:
         # vectors repeated over and over. Performance may be bad but we don't
         # want to crash.
         if total_dist == 0:
-            logging.warning(
+            LOGGER.warning(
                 "Kmeans::train: total_dist is 0, this is unusual."
                 " This could result in bad performance during search."
             )
