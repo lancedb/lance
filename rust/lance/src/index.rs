@@ -270,8 +270,15 @@ impl DatasetIndexExt for Dataset {
                         location: location!(),
                     })?;
 
-                build_vector_index(self, column, &index_name, &index_id.to_string(), vec_params)
-                    .await?;
+                // this is a large future so move it to heap
+                Box::pin(build_vector_index(
+                    self,
+                    column,
+                    &index_name,
+                    &index_id.to_string(),
+                    vec_params,
+                ))
+                .await?;
                 vector_index_details()
             }
             // Can't use if let Some(...) here because it's not stable yet.
