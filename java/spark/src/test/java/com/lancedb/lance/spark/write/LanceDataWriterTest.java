@@ -26,7 +26,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.util.ArrowUtils;
+import org.apache.spark.sql.util.LanceArrowUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
@@ -49,7 +49,7 @@ public class LanceDataWriterTest {
       Schema schema = new Schema(Collections.singletonList(field));
       LanceConfig config =
           LanceConfig.from(tempDir.resolve(datasetName + LanceConfig.LANCE_FILE_SUFFIX).toString());
-      StructType sparkSchema = ArrowUtils.fromArrowSchema(schema);
+      StructType sparkSchema = LanceArrowUtils.fromArrowSchema(schema);
       LanceDataWriter.WriterFactory writerFactory =
           new LanceDataWriter.WriterFactory(sparkSchema, config);
       LanceDataWriter dataWriter = (LanceDataWriter) writerFactory.createWriter(0, 0);

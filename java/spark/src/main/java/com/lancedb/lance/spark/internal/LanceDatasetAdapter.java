@@ -27,7 +27,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.util.ArrowUtils;
+import org.apache.spark.sql.util.LanceArrowUtils;
 
 import java.time.ZoneId;
 import java.util.List;
@@ -40,7 +40,7 @@ public class LanceDatasetAdapter {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
-      return Optional.of(ArrowUtils.fromArrowSchema(dataset.getSchema()));
+      return Optional.of(LanceArrowUtils.fromArrowSchema(dataset.getSchema()));
     } catch (IllegalArgumentException e) {
       // dataset not found
       return Optional.empty();
@@ -49,7 +49,7 @@ public class LanceDatasetAdapter {
 
   public static Optional<StructType> getSchema(String datasetUri) {
     try (Dataset dataset = Dataset.open(datasetUri, allocator)) {
-      return Optional.of(ArrowUtils.fromArrowSchema(dataset.getSchema()));
+      return Optional.of(LanceArrowUtils.fromArrowSchema(dataset.getSchema()));
     } catch (IllegalArgumentException e) {
       // dataset not found
       return Optional.empty();
@@ -89,7 +89,7 @@ public class LanceDatasetAdapter {
 
   public static LanceArrowWriter getArrowWriter(StructType sparkSchema, int batchSize) {
     return new LanceArrowWriter(
-        allocator, ArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false), batchSize);
+        allocator, LanceArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false), batchSize);
   }
 
   public static List<FragmentMetadata> createFragment(
@@ -104,7 +104,7 @@ public class LanceDatasetAdapter {
     Dataset.create(
             allocator,
             datasetUri,
-            ArrowUtils.toArrowSchema(sparkSchema, ZoneId.systemDefault().getId(), true, false),
+            LanceArrowUtils.toArrowSchema(sparkSchema, ZoneId.systemDefault().getId(), true, false),
             params)
         .close();
   }

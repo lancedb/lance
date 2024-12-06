@@ -33,7 +33,7 @@ import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
 import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.util.ArrowUtils;
+import org.apache.spark.sql.util.LanceArrowUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
@@ -58,7 +58,7 @@ public class BatchAppendTest {
 
       // Append data to lance dataset
       LanceConfig config = LanceConfig.from(datasetUri);
-      StructType sparkSchema = ArrowUtils.fromArrowSchema(schema);
+      StructType sparkSchema = LanceArrowUtils.fromArrowSchema(schema);
       BatchAppend batchAppend = new BatchAppend(sparkSchema, config);
       DataWriterFactory factor = batchAppend.createBatchWriterFactory(() -> 1);
 
