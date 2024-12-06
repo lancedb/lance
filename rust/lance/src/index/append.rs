@@ -98,15 +98,7 @@ pub async fn merge_indices<'a>(
 
             let new_uuid = Uuid::new_v4();
 
-            // The BTree index implementation leverages the legacy format's batch offset,
-            // which has been removed from new format, so keep using the legacy format for now.
-            let new_store = match index.index_type() {
-                IndexType::Scalar | IndexType::BTree => {
-                    LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string())
-                        .with_legacy_format(true)
-                }
-                _ => LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string()),
-            };
+            let new_store = LanceIndexStore::from_dataset(&dataset, &new_uuid.to_string());
             index.update(new_data_stream.into(), &new_store).await?;
 
             Ok((new_uuid, 1))
