@@ -678,9 +678,10 @@ impl Scanner {
                 } else {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column {} is not a vector column (type: {})",
+                            "Column {} has element type {} and the query vector is {}",
                             column,
-                            field.data_type()
+                            dt.data_type(),
+                            q.data_type(),
                         ),
                         location!(),
                     ));
