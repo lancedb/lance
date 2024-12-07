@@ -213,10 +213,7 @@ def train_ivf_centroids_on_accelerator(
     from .torch.kmeans import KMeans
 
     if isinstance(accelerator, str) and (
-        not (
-            CUDA_REGEX.match(accelerator)
-            or accelerator == "mps"
-        )
+        not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
     ):
         raise ValueError(
             "Train ivf centroids on accelerator: "
