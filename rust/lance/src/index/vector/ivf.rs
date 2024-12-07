@@ -1131,6 +1131,7 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
 pub async fn build_ivf_model(
     dataset: &Dataset,
     column: &str,
+    modal_index: Option<usize>,
     dim: usize,
     metric_type: MetricType,
     params: &IvfBuildParams,
@@ -1156,7 +1157,8 @@ pub async fn build_ivf_model(
         "Loading training data for IVF. Sample size: {}",
         sample_size_hint
     );
-    let training_data = maybe_sample_training_data(dataset, column, sample_size_hint).await?;
+    let training_data =
+        maybe_sample_training_data(dataset, column, modal_index, sample_size_hint).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1181,6 +1183,8 @@ pub async fn build_ivf_model(
     Ok(ivf)
 }
 
+// Build PQ model from the dataset.
+// this is used for only v1 index
 async fn build_ivf_model_and_pq(
     dataset: &Dataset,
     column: &str,
@@ -1208,7 +1212,7 @@ async fn build_ivf_model_and_pq(
         });
     };
 
-    let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
+    let ivf_model = build_ivf_model(dataset, column, None, dim, metric_type, ivf_params).await?;
 
     let ivf_residual = if matches!(metric_type, MetricType::Cosine | MetricType::L2) {
         Some(&ivf_model)
@@ -2277,7 +2281,7 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
         let ivf_params = IvfBuildParams::new(2);
-        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::L2, &ivf_params)
+        let ivf_model = build_ivf_model(&dataset, "vector", None, DIM, MetricType::L2, &ivf_params)
             .await
             .unwrap();
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
@@ -2305,9 +2309,16 @@ mod tests {
         let (dataset, _) = generate_test_dataset(test_uri, 1000.0..1100.0).await;
 
         let ivf_params = IvfBuildParams::new(2);
-        let ivf_model = build_ivf_model(&dataset, "vector", DIM, MetricType::Cosine, &ivf_params)
-            .await
-            .unwrap();
+        let ivf_model = build_ivf_model(
+            &dataset,
+            "vector",
+            None,
+            DIM,
+            MetricType::Cosine,
+            &ivf_params,
+        )
+        .await
+        .unwrap();
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
         assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());

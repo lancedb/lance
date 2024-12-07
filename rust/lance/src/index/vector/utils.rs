@@ -19,17 +19,17 @@ pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
         message: format!("Column {} does not exist in schema {}", column, schema),
         location: location!(),
     })?;
-    let data_type = field.data_type();
-    if let arrow_schema::DataType::FixedSizeList(_, dim) = data_type {
-        Ok(dim as usize)
-    } else {
-        Err(Error::Index {
-            message: format!(
-                "Column {} is not a FixedSizeListArray, but {:?}",
-                column, data_type
-            ),
+    infer_vector_dim(&field.data_type())
+}
+
+fn infer_vector_dim(data_type: &arrow_schema::DataType) -> Result<usize> {
+    match data_type {
+        arrow_schema::DataType::FixedSizeList(_, dim) => Ok(*dim as usize),
+        arrow_schema::DataType::List(field) => infer_vector_dim(field.data_type()),
+        _ => Err(Error::Index {
+            message: format!("Column is not a FixedSizeListArray, but {:?}", data_type),
             location: location!(),
-        })
+        }),
     }
 }
 
@@ -40,15 +40,20 @@ pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
 pub async fn maybe_sample_training_data(
     dataset: &Dataset,
     column: &str,
+    modal_index: Option<usize>,
     sample_size_hint: usize,
 ) -> Result<FixedSizeListArray> {
     let num_rows = dataset.count_rows(None).await?;
-    let projection = dataset.schema().project(&[column])?;
+    let vector_column = match modal_index {
+        Some(index) => format!("{}[{}]", column, index),
+        None => column.to_string(),
+    };
+    let projection = dataset.schema().project(&[&vector_column])?;
     let batch = if num_rows > sample_size_hint {
         dataset.sample(sample_size_hint, &projection).await?
     } else {
         let mut scanner = dataset.scan();
-        scanner.project(&[column])?;
+        scanner.project(&[vector_column])?;
         let batches = scanner
             .try_into_stream()
             .await?
@@ -57,13 +62,7 @@ pub async fn maybe_sample_training_data(
         concat_batches(&Arc::new(ArrowSchema::from(&projection)), &batches)?
     };
 
-    let array = batch.column_by_name(column).ok_or(Error::Index {
-        message: format!(
-            "Sample training data: column {} does not exist in return",
-            column
-        ),
-        location: location!(),
-    })?;
+    let array = batch.column(0);
     Ok(array.as_fixed_size_list().clone())
 }
 
