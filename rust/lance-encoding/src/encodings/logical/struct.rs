@@ -607,7 +607,20 @@ impl StructuralStructDecoder {
         should_validate: bool,
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
-            DataType::Struct(fields) => Box::new(Self::new(fields.clone(), should_validate, false)),
+            DataType::Struct(fields) => {
+                let field_metadata = field.metadata();
+                if field_metadata
+                    .get("packed")
+                    .map(|v| v == "true")
+                    .unwrap_or(false)
+                {
+                    let decoder =
+                        StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
+                    Box::new(decoder)
+                } else {
+                    Box::new(Self::new(fields.clone(), should_validate, false))
+                }
+            }
             DataType::List(_) | DataType::LargeList(_) => todo!(),
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),

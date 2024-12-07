@@ -343,6 +343,48 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
     }
 }
 
+#[derive(Debug)]
+struct StructDataBlockBuilder {
+    children: Vec<Box<dyn DataBlockBuilderImpl>>,
+}
+
+impl StructDataBlockBuilder {
+    fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
+        let mut children = vec![];
+        let total_bits: u32 = bits_per_values.iter().sum();
+        let total_bits = total_bits as u64;
+
+        for bits_per_value in bits_per_values.iter() {
+            let child = FixedWidthDataBlockBuilder::new(
+                *bits_per_value as u64,
+                estimated_size_bytes * (*bits_per_value as u64 + total_bits - 1) / total_bits,
+            );
+            children.push(Box::new(child) as Box<dyn DataBlockBuilderImpl>);
+        }
+        Self { children }
+    }
+}
+
+impl DataBlockBuilderImpl for StructDataBlockBuilder {
+    fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) {
+        let data_block = data_block.as_struct_ref().unwrap();
+        for i in 0..self.children.len() {
+            self.children[i].append(&data_block.children[i], selection.clone());
+        }
+    }
+
+    fn finish(self: Box<Self>) -> DataBlock {
+        let mut children_data_block = Vec::new();
+        for child in self.children {
+            let child_data_block = child.finish();
+            children_data_block.push(child_data_block);
+        }
+        DataBlock::Struct(StructDataBlock {
+            children: children_data_block,
+            block_info: BlockInfo::new(),
+        })
+    }
+}
 /// A data block to represent a fixed size list
 #[derive(Debug)]
 pub struct FixedSizeListBlock {
@@ -586,6 +628,7 @@ impl VariableWidthBlock {
 pub struct StructDataBlock {
     /// The child arrays
     pub children: Vec<DataBlock>,
+    pub block_info: BlockInfo,
 }
 
 impl StructDataBlock {
@@ -619,6 +662,7 @@ impl StructDataBlock {
                 .into_iter()
                 .map(|c| c.remove_validity())
                 .collect(),
+            block_info: self.block_info,
         }
     }
 
@@ -636,6 +680,7 @@ impl StructDataBlock {
                 .iter_mut()
                 .map(|c| c.borrow_and_clone())
                 .collect(),
+            block_info: self.block_info.clone(),
         }
     }
 
@@ -646,7 +691,15 @@ impl StructDataBlock {
                 .iter()
                 .map(|c| c.try_clone())
                 .collect::<Result<_>>()?,
+            block_info: self.block_info.clone(),
         })
+    }
+
+    pub fn data_size(&self) -> u64 {
+        self.children
+            .iter()
+            .map(|data_block| data_block.data_size())
+            .sum()
     }
 }
 
@@ -898,6 +951,18 @@ impl DataBlock {
                 Box::new(FixedSizeListBlockBuilder::new(
                     inner_builder,
                     inner.dimension,
+                ))
+            }
+            Self::Struct(struct_data_block) => {
+                let mut bits_per_values = vec![];
+                for child in struct_data_block.children.iter() {
+                    let child = child.as_fixed_width_ref().
+                        expect("Currently StructDataBlockBuilder is only used in packed-struct encoding, and currently in packed-struct encoding, only fixed-width fields are supported.");
+                    bits_per_values.push(child.bits_per_value as u32);
+                }
+                Box::new(StructDataBlockBuilder::new(
+                    bits_per_values,
+                    estimated_size_bytes,
                 ))
             }
             _ => todo!(),
@@ -1359,7 +1424,10 @@ impl DataBlock {
                         .collect::<Vec<_>>();
                     children.push(Self::from_arrays(&child_vec, num_values));
                 }
-                Self::Struct(StructDataBlock { children })
+                Self::Struct(StructDataBlock {
+                    children,
+                    block_info: BlockInfo::default(),
+                })
             }
             DataType::FixedSizeList(_, dim) => {
                 let children = arrays

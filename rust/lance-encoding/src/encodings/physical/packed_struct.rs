@@ -151,7 +151,10 @@ impl PrimitivePageDecoder for PackedStructPageDecoder {
             let child_block = FixedSizeListBlock::from_flat(child_block, field.data_type());
             children.push(child_block);
         }
-        Ok(DataBlock::Struct(StructDataBlock { children }))
+        Ok(DataBlock::Struct(StructDataBlock {
+            children,
+            block_info: BlockInfo::default(),
+        }))
     }
 }
 
@@ -266,9 +269,13 @@ pub mod tests {
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
         version::LanceFileVersion,
     };
+    use rstest::rstest;
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_random_packed_struct() {
+    async fn test_random_packed_struct(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let data_type = DataType::Struct(Fields::from(vec![
             Field::new("a", DataType::UInt64, false),
             Field::new("b", DataType::UInt32, false),
@@ -278,11 +285,14 @@ pub mod tests {
 
         let field = Field::new("", data_type, false).with_metadata(metadata);
 
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_specific_packed_struct() {
+    async fn test_specific_packed_struct(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let array1 = Arc::new(UInt64Array::from(vec![1, 2, 3, 4]));
         let array2 = Arc::new(Int32Array::from(vec![5, 6, 7, 8]));
         let array3 = Arc::new(UInt8Array::from(vec![9, 10, 11, 12]));
@@ -325,7 +335,8 @@ pub mod tests {
             .with_range(0..2)
             .with_range(0..6)
             .with_range(1..4)
-            .with_indices(vec![1, 3, 7]);
+            .with_indices(vec![1, 3, 7])
+            .with_file_version(version);
 
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
@@ -338,8 +349,12 @@ pub mod tests {
         .await;
     }
 
+    // the current Lance V2.1 `packed-struct encoding` doesn't support `fixed size list`.
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_fsl_packed_struct() {
+    async fn test_fsl_packed_struct(
+        #[values(LanceFileVersion::V2_0, /*LanceFileVersion::V2_1)*/)] version: LanceFileVersion,
+    ) {
         let int_array = Arc::new(Int32Array::from(vec![12, 13, 14, 15]));
 
         let list_data_type =
@@ -367,7 +382,8 @@ pub mod tests {
             .with_range(1..3)
             .with_range(0..1)
             .with_range(2..4)
-            .with_indices(vec![0, 2, 3]);
+            .with_indices(vec![0, 2, 3])
+            .with_file_version(version);
 
         let mut metadata = HashMap::new();
         metadata.insert("packed".to_string(), "true".to_string());
