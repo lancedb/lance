@@ -60,8 +60,6 @@ tests = [
 dev = ["ruff==0.4.1"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
-cuvs-cu11 = ["cuvs-cu11", "pylibraft-cu11"]
-cuvs-cu12 = ["cuvs-cu12", "pylibraft-cu12"]
 ray = ["ray[data]<2.38; python_version<'3.12'"]
 
 [tool.ruff]
