@@ -14,8 +14,6 @@ from tqdm.auto import tqdm
 
 from . import write_dataset
 from .dependencies import (
-    _CAGRA_AVAILABLE,
-    _RAFT_COMMON_AVAILABLE,
     _check_for_numpy,
     torch,
 )
