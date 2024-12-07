@@ -144,10 +144,6 @@ def train_pq_codebook_on_accelerator(
     from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
 
-    # cuvs not particularly useful for only 256 centroids without more work
-    if accelerator == "cuvs":
-        accelerator = "cuda"
-
     centroids_list = []
     kmeans_list = []
 
@@ -213,7 +209,6 @@ def train_ivf_centroids_on_accelerator(
 ) -> Tuple[np.ndarray, Any]:
     """Use accelerator (GPU or MPS) to train kmeans."""
 
-    from .cuvs.kmeans import KMeans as KMeansCuVS
     from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
 
@@ -221,7 +216,6 @@ def train_ivf_centroids_on_accelerator(
         not (
             CUDA_REGEX.match(accelerator)
             or accelerator == "mps"
-            or accelerator == "cuvs"
         )
     ):
         raise ValueError(
@@ -260,33 +254,14 @@ def train_ivf_centroids_on_accelerator(
         cache=True,
     )
 
-    if accelerator == "cuvs":
-        LOGGER.info("Training IVF partitions using cuVS+GPU")
-        print("Training IVF partitions using cuVS+GPU")
-        if not (_CAGRA_AVAILABLE and _RAFT_COMMON_AVAILABLE):
-            LOGGER.error(
-                "Missing cuvs and pylibraft - "
-                "please install cuvs-cu11 and pylibraft-cu11 or "
-                "cuvs-cu12 and pylibraft-cu12 using --extra-index-url "
-                "https://pypi.nvidia.com/"
-            )
-            raise Exception("Missing cuvs or pylibraft dependency.")
-        kmeans = KMeansCuVS(
-            k,
-            max_iters=max_iters,
-            metric=metric_type,
-            device="cuda",
-            centroids=init_centroids,
-        )
-    else:
-        LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
-        kmeans = KMeans(
-            k,
-            max_iters=max_iters,
-            metric=metric_type,
-            device=accelerator,
-            centroids=init_centroids,
-        )
+    LOGGER.info("Training IVF partitions using GPU(%s)", accelerator)
+    kmeans = KMeans(
+        k,
+        max_iters=max_iters,
+        metric=metric_type,
+        device=accelerator,
+        centroids=init_centroids,
+    )
     kmeans.fit(ds)
 
     centroids = kmeans.centroids.cpu().numpy()
