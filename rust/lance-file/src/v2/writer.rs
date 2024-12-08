@@ -309,11 +309,13 @@ impl FileWriter {
                         location: location!(),
                     })?;
                 let repdef = RepDefBuilder::default();
+                let num_rows = array.len() as u64;
                 column_writer.maybe_encode(
                     array.clone(),
                     external_buffers,
                     repdef,
                     self.rows_written,
+                    num_rows,
                 )
             })
             .collect::<Result<Vec<_>>>()

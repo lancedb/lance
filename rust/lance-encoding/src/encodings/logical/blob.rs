@@ -371,10 +371,16 @@ impl FieldEncoder for BlobFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let descriptions = Self::write_bins(array, external_buffers)?;
-        self.description_encoder
-            .maybe_encode(descriptions, external_buffers, repdef, row_number)
+        self.description_encoder.maybe_encode(
+            descriptions,
+            external_buffers,
+            repdef,
+            row_number,
+            num_rows,
+        )
     }
 
     // If there is any data left in the buffer then create an encode task from it
