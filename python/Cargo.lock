@@ -3024,6 +3024,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-sql",
  "deepsize",
+ "dirs",
  "futures",
  "lance-arrow",
  "lazy_static",
