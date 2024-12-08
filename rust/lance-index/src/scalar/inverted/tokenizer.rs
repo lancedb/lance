@@ -12,8 +12,8 @@ pub struct TokenizerConfig {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
-    /// - `lindera-tantivy-ipadic`: Japanese tokenizer
-    /// - `lindera-tantivy-ko-dic`: Korea tokenizer
+    /// - `lindera-ipadic`: Japanese tokenizer
+    /// - `lindera-ko-dic`: Korea tokenizer
     ///
     /// `simple` is recommended for most cases and the default value
     base_tokenizer: String,
@@ -144,15 +144,19 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
         )
         .dynamic()),
         #[cfg(feature = "lindera-tantivy-ipadic")]
-        "lindera-ipadic" => build_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::IPADIC),
+        "lindera-ipadic" => build_builtin_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::IPADIC),
         #[cfg(feature = "lindera-tantivy-ipadic-neologd")]
-        "lindera-ipadic-neologd" => build_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::IPADICNEologd),
+        "lindera-ipadic-neologd" => build_builtin_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::IPADICNEologd),
         #[cfg(feature = "lindera-tantivy-unidic")]
-        "lindera-unidic" => build_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::UniDic),
+        "lindera-unidic" => build_builtin_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::UniDic),
         #[cfg(feature = "lindera-tantivy-ko-dic")]
-        "lindera-ko-dic" => build_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::KoDic),
+        "lindera-ko-dic" => build_builtin_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::KoDic),
         #[cfg(feature = "lindera-tantivy-cc-cedict")]
-        "lindera-cc-cedict" => build_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::CcCedict),
+        "lindera-cc-cedict" => build_builtin_lindera_tokenizer_builder(lindera::dictionary::DictionaryKind::CcCedict),
+        #[cfg(feature = "lindera-tantivy-custom")]
+        s if s.starts_with("lindera-") => {
+            return build_custom_lindera_tokenizer_builder(s);
+        }
         _ => Err(Error::invalid_input(
             format!("unknown base tokenizer {}", name),
             location!(),
@@ -160,8 +164,10 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
     }
 }
 
-#[cfg(feature = "lindera-tantivy")]
-fn build_lindera_tokenizer_builder(dic: lindera::dictionary::DictionaryKind) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+#[cfg(feature = "lindera-tantivy-builtin-dic")]
+fn build_builtin_lindera_tokenizer_builder(
+    dic: lindera::dictionary::DictionaryKind
+) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
     use lindera::{dictionary::load_dictionary_from_kind, mode::Mode, segmenter::Segmenter};
     use lindera_tantivy::tokenizer::LinderaTokenizer;
     let mode = Mode::Normal;
@@ -173,3 +179,19 @@ fn build_lindera_tokenizer_builder(dic: lindera::dictionary::DictionaryKind) -> 
         tokenizer,
     ).dynamic())
 }
+
+#[cfg(feature = "lindera-tantivy-custom")]
+fn build_custom_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+    use lindera::{dictionary::load_dictionary_from_path, mode::Mode, segmenter::Segmenter};
+    use lindera_tantivy::tokenizer::LinderaTokenizer;
+    let dic = std::path::Path::new(dic);
+    let mode = Mode::Normal;
+    let dictionary = load_dictionary_from_path(dic).unwrap();
+    let user_dictionary = None;
+    let segmenter = Segmenter::new(mode, dictionary, user_dictionary);
+    let tokenizer = LinderaTokenizer::from_segmenter(segmenter);
+    Ok(tantivy::tokenizer::TextAnalyzer::builder(
+        tokenizer,
+    ).dynamic())
+}
+

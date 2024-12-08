@@ -71,11 +71,13 @@ datafusion-sql.workspace = true
 random_word = { version = "0.4.3", features = ["en"] }
 
 [features]
-lindera-tantivy-ipadic = ["lindera", "lindera-tantivy", "lindera-tantivy/ipadic"]
-lindera-tantivy-ipadic-neologd = ["lindera", "lindera-tantivy", "lindera-tantivy/ipadic-neologd"]
-lindera-tantivy-unidic = ["lindera", "lindera-tantivy", "lindera-tantivy/unidic"]
+lindera-tantivy-custom = ["lindera", "lindera-tantivy", "lindera-tantivy/compress"]
+lindera-tantivy-builtin-dic = ["lindera", "lindera-tantivy", "lindera-tantivy/compress"]
+lindera-tantivy-ipadic = ["lindera-tantivy-builtin-dic", "lindera-tantivy/ipadic"]
+lindera-tantivy-ipadic-neologd = ["lindera-tantivy-builtin-dic", "lindera-tantivy/ipadic-neologd"]
+lindera-tantivy-unidic = ["lindera-tantivy-builtin-dic", "lindera-tantivy/unidic"]
 lindera-tantivy-ko-dic = ["lindera", "lindera-tantivy", "lindera-tantivy/ko-dic"]
-lindera-tantivy-cc-cedict = ["lindera", "lindera-tantivy", "lindera-tantivy/cc-cedict"]
+lindera-tantivy-cc-cedict = ["lindera-tantivy-builtin-dic", "lindera-tantivy/cc-cedict"]
 
 [build-dependencies]
 prost-build.workspace = true
