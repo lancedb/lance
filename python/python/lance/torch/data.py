@@ -50,6 +50,8 @@ def _to_tensor(
     *,
     uint64_as_int64: bool = True,
     hf_converter: Optional[dict] = None,
+    use_blob_api: bool = False,
+    **kwargs,
 ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
     """Convert a pyarrow RecordBatch to torch Tensor."""
     ret = {}
@@ -60,7 +62,12 @@ def _to_tensor(
     for col in cols:
         arr: pa.Array = batch[col]
 
-        if isinstance(arr, list) and arr and isinstance(arr[0], lance.BlobFile):
+        if (
+            use_blob_api
+            and isinstance(arr, list)
+            and arr
+            and isinstance(arr[0], lance.BlobFile)
+        ):
             raise NotImplementedError(
                 'Need user-provided "to_tensor_fn" for Blob files'
             )
@@ -334,8 +341,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 self.cached_ds = CachedDataset(stream, cache=self.cache)
                 stream = self.cached_ds
 
+        use_blob_api = bool(self._blob_columns)
         for batch in stream:
-            if self._blob_columns:
+            if use_blob_api:
                 dict_batch = {}
                 assert "_rowid" in batch.column_names
                 row_ids = batch["_rowid"]
@@ -347,7 +355,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
                     )
                 batch = dict_batch
             if self._to_tensor_fn is not None:
-                batch = self._to_tensor_fn(batch, hf_converter=self._hf_converter)
+                batch = self._to_tensor_fn(
+                    batch, hf_converter=self._hf_converter, use_blob_api=use_blob_api
+                )
             yield batch
             del batch
 
