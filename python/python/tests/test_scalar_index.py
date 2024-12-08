@@ -307,6 +307,44 @@ def test_fts_all_deleted(dataset):
     dataset.to_table(full_text_query=first_row_doc)
 
 
+def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(tmp_path):
+    data = pa.table(
+        {
+            "text": [
+                "成田国際空港",
+                "東京国際空港",
+                "羽田空港",
+            ],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera-ipadic")
+
+    results = ds.to_table(
+        full_text_query="成田",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0]
+
+
+def test_indexed_filter_with_fts_index_with_lindera_ko_tokenizer(tmp_path):
+    data = pa.table(
+        {
+            "text": ["하네다공항한정토트백", "나리타공항한정토트백"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera-ko-dic")
+
+    results = ds.to_table(
+        full_text_query="나리타",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [1]
+
+
 def test_bitmap_index(tmp_path: Path):
     """Test create bitmap index"""
     tbl = pa.Table.from_arrays(

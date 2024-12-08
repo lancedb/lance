@@ -50,6 +50,8 @@ serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
 tantivy.workspace = true
+lindera = { workspace = true, optional = true }
+lindera-tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
@@ -67,6 +69,13 @@ tempfile.workspace = true
 test-log.workspace = true
 datafusion-sql.workspace = true
 random_word = { version = "0.4.3", features = ["en"] }
+
+[features]
+lindera-tantivy-ipadic = ["lindera", "lindera-tantivy", "lindera-tantivy/ipadic"]
+lindera-tantivy-ipadic-neologd = ["lindera", "lindera-tantivy", "lindera-tantivy/ipadic-neologd"]
+lindera-tantivy-unidic = ["lindera", "lindera-tantivy", "lindera-tantivy/unidic"]
+lindera-tantivy-ko-dic = ["lindera", "lindera-tantivy", "lindera-tantivy/ko-dic"]
+lindera-tantivy-cc-cedict = ["lindera", "lindera-tantivy", "lindera-tantivy/cc-cedict"]
 
 [build-dependencies]
 prost-build.workspace = true
