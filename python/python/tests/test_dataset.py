@@ -261,6 +261,41 @@ def test_asof_checkout(tmp_path: Path):
     assert len(ds.to_table()) == 9
 
 
+def test_enable_move_stable_row_ids(tmp_path: Path):
+    table = pa.Table.from_pylist(
+        [{"name": "Alice", "age": 20}, {"name": "Bob", "age": 30}]
+    )
+    lance.write_dataset(table, tmp_path, enable_move_stable_row_ids=True)
+    ds = lance.write_dataset(
+        table, tmp_path, enable_move_stable_row_ids=True, mode="append"
+    )
+    table_before = ds.scanner(with_row_id=True, with_row_address=True).to_table()
+    assert len(table_before) == 4
+    assert table_before["_rowid"][0].as_py() == 0
+    assert table_before["_rowid"][1].as_py() == 1
+    assert table_before["_rowid"][2].as_py() == 2
+    assert table_before["_rowid"][3].as_py() == 3
+
+    assert table_before["_rowaddr"][0].as_py() == 0
+    assert table_before["_rowaddr"][1].as_py() == 1
+    assert table_before["_rowaddr"][2].as_py() == (1 << 32) + 0
+    assert table_before["_rowaddr"][3].as_py() == (1 << 32) + 1
+
+    ds.optimize.compact_files()
+
+    table_after = ds.scanner(with_row_id=True, with_row_address=True).to_table()
+    assert len(table_after) == 4
+    assert table_after["_rowid"][0].as_py() == 0
+    assert table_after["_rowid"][1].as_py() == 1
+    assert table_after["_rowid"][2].as_py() == 2
+    assert table_after["_rowid"][3].as_py() == 3
+
+    assert table_after["_rowaddr"][0].as_py() == (2 << 32) + 0
+    assert table_after["_rowaddr"][1].as_py() == (2 << 32) + 1
+    assert table_after["_rowaddr"][2].as_py() == (2 << 32) + 2
+    assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
+
+
 def test_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True

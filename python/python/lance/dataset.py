@@ -217,9 +217,13 @@ class LanceDataset(pa.dataset.Dataset):
         )
 
     def __setstate__(self, state):
-        self._uri, self._storage_options, version, manifest, default_scan_options = (
-            state
-        )
+        (
+            self._uri,
+            self._storage_options,
+            version,
+            manifest,
+            default_scan_options,
+        ) = state
         self._ds = _Dataset(
             self._uri,
             version,
@@ -3409,6 +3413,7 @@ def write_dataset(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
+    enable_move_stable_row_ids: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -3462,6 +3467,11 @@ def write_dataset(
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
+    enable_move_stable_row_ids : bool, optional
+        Experimental parameter: if set to true, the writer will use move-stable row ids.
+        These row ids are stable after compaction operations, but not after updates.
+        This makes compaction more efficient, since with stable row ids no
+        secondary indices need to be updated to point to new row ids.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -3495,6 +3505,7 @@ def write_dataset(
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
+        "enable_move_stable_row_ids": enable_move_stable_row_ids,
     }
 
     if commit_lock:
