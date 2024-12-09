@@ -13,14 +13,15 @@ use snafu::{location, Location};
 
 use crate::{
     dataset::{
-        builder::DatasetBuilder,
-        commit_detached_transaction, commit_new_dataset, commit_transaction,
-        refs::Tags,
-        transaction::{Operation, Transaction},
-        ManifestWriteConfig, ReadParams,
+        builder::DatasetBuilder, commit_detached_transaction, commit_new_dataset,
+        commit_transaction, refs::Tags, ReadParams,
     },
     session::Session,
     Dataset, Error, Result,
+};
+
+use lance_table::format::transaction::{
+    v1::Transaction as V1Transaction, ManifestWriteConfig, Operation, Transaction,
 };
 
 use super::{resolve_commit_handler, WriteDestination};
@@ -211,8 +212,8 @@ impl<'a> CommitBuilder<'a> {
                 // If we are using a detached version, we need to load the dataset.
                 // Otherwise, we are writing to the main history, and need to check
                 // out the latest version.
-                if is_detached_version(transaction.read_version) {
-                    builder = builder.with_version(transaction.read_version)
+                if is_detached_version(transaction.read_version()) {
+                    builder = builder.with_version(transaction.read_version())
                 }
 
                 match builder.load().await {
@@ -225,8 +226,15 @@ impl<'a> CommitBuilder<'a> {
             }
         };
 
-        if dest.dataset().is_none() && !matches!(transaction.operation, Operation::Overwrite { .. })
-        {
+        let is_overwrite = matches!(
+            transaction,
+            Transaction::V1(V1Transaction {
+                operation: Operation::Overwrite { .. },
+                ..
+            })
+        );
+
+        if dest.dataset().is_none() && !is_overwrite {
             return Err(Error::DatasetNotFound {
                 path: base_path.to_string(),
                 source: "The dataset must already exist unless the operation is Overwrite".into(),
@@ -252,9 +260,7 @@ impl<'a> CommitBuilder<'a> {
         if let Some(ds) = dest.dataset() {
             if let Some(storage_format) = self.storage_format {
                 let passed_storage_format = DataStorageFormat::new(storage_format);
-                if ds.manifest.data_storage_format != passed_storage_format
-                    && !matches!(transaction.operation, Operation::Overwrite { .. })
-                {
+                if ds.manifest.data_storage_format != passed_storage_format && !is_overwrite {
                     return Err(Error::InvalidInput {
                         source: format!(
                             "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
@@ -361,6 +367,18 @@ impl<'a> CommitBuilder<'a> {
                 location: location!(),
             });
         }
+
+        // TODO: support V2 transactions
+        let transactions = transactions
+            .into_iter()
+            .map(|t| match t {
+                Transaction::V1(t) => Ok(t),
+                _ => Err(Error::NotSupported {
+                    source: "Only v1 transactions are supported in batch commits".into(),
+                    location: location!(),
+                }),
+            })
+            .collect::<Result<Vec<_>>>()?;
         if transactions
             .iter()
             .any(|t| !matches!(t.operation, Operation::Append { .. }))
@@ -388,21 +406,16 @@ impl<'a> CommitBuilder<'a> {
             })
         };
 
-        let merged = Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
-            operation: Operation::Append {
-                fragments: transactions
-                    .iter()
-                    .flat_map(|t| match &t.operation {
-                        Operation::Append { fragments } => fragments.clone(),
-                        _ => unreachable!(),
-                    })
-                    .collect(),
-            },
-            read_version,
-            blobs_op,
-            tag: None,
+        let operation = Operation::Append {
+            fragments: transactions
+                .iter()
+                .flat_map(|t| match &t.operation {
+                    Operation::Append { fragments } => fragments.clone(),
+                    _ => unreachable!(),
+                })
+                .collect(),
         };
+        let merged = Transaction::new_v1(read_version, operation, blobs_op);
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
     }
@@ -448,15 +461,13 @@ mod tests {
     }
 
     fn sample_transaction(read_version: u64) -> Transaction {
-        Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
-            operation: Operation::Append {
+        Transaction::new_v1(
+            read_version,
+            Operation::Append {
                 fragments: vec![sample_fragment()],
             },
-            read_version,
-            blobs_op: None,
-            tag: None,
-        }
+            None,
+        )
     }
 
     #[tokio::test]
@@ -586,17 +597,15 @@ mod tests {
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Attempting to commit update gives error
-        let update_transaction = Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
-            operation: Operation::Update {
+        let update_transaction = Transaction::new_v1(
+            1, // read version
+            Operation::Update {
                 updated_fragments: vec![],
                 new_fragments: vec![],
                 removed_fragment_ids: vec![],
             },
-            read_version: 1,
-            blobs_op: None,
-            tag: None,
-        };
+            None, // no blobs
+        );
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])
             .await;
@@ -606,10 +615,10 @@ mod tests {
         let append1 = sample_transaction(1);
         let append2 = sample_transaction(2);
         let mut expected_fragments = vec![];
-        if let Operation::Append { fragments } = &append1.operation {
+        if let Operation::Append { fragments } = &append1.operation().unwrap() {
             expected_fragments.extend(fragments.clone());
         }
-        if let Operation::Append { fragments } = &append2.operation {
+        if let Operation::Append { fragments } = &append2.operation().unwrap() {
             expected_fragments.extend(fragments.clone());
         }
         let res = CommitBuilder::new(dataset.clone())
@@ -618,9 +627,9 @@ mod tests {
             .unwrap();
         let transaction = res.merged;
         assert!(
-            matches!(transaction.operation, Operation::Append { fragments } if fragments == expected_fragments)
+            matches!(transaction.operation().unwrap(), Operation::Append { fragments } if fragments == &expected_fragments)
         );
-        assert_eq!(transaction.read_version, 1);
-        assert!(transaction.blobs_op.is_none());
+        assert_eq!(transaction.read_version(), 1);
+        assert!(transaction.blob_transaction(0).is_none());
     }
 }

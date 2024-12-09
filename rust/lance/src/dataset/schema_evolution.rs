@@ -262,12 +262,11 @@ pub(super) async fn add_columns(
     .await?;
 
     let operation = Operation::Merge { fragments, schema };
-    let transaction = Transaction::new(
+    let transaction = Transaction::new_v1(
         dataset.manifest.version,
         operation,
         // TODO: Make it possible to add new blob columns
         /*blob_op= */ None,
-        None,
     );
     let (new_manifest, new_path) = commit_transaction(
         dataset,
@@ -506,12 +505,11 @@ pub(super) async fn alter_columns(
 
     // If we aren't casting a column, we don't need to touch the fragments.
     let transaction = if cast_fields.is_empty() {
-        Transaction::new(
+        Transaction::new_v1(
             dataset.manifest.version,
             Operation::Project { schema: new_schema },
             // TODO: Make it possible to alter blob columns
             /*blob_op= */ None,
-            None,
         )
     } else {
         // Otherwise, we need to re-write the relevant fields.
@@ -578,14 +576,13 @@ pub(super) async fn alter_columns(
             })
             .collect::<Vec<_>>();
 
-        Transaction::new(
+        Transaction::new_v1(
             dataset.manifest.version,
             Operation::Merge {
                 schema: new_schema,
                 fragments,
             },
             /*blob_op= */ None,
-            None,
         )
     };
 
@@ -646,11 +643,10 @@ pub(super) async fn drop_columns(dataset: &mut Dataset, columns: &[&str]) -> Res
         ));
     }
 
-    let transaction = Transaction::new(
+    let transaction = Transaction::new_v1(
         dataset.manifest.version,
         Operation::Project { schema: new_schema },
         /*blob_op= */ None,
-        None,
     );
 
     let (manifest, manifest_path) = commit_transaction(

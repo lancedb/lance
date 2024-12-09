@@ -223,7 +223,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        Ok(Transaction::new(
+        Ok(Transaction::new_v1(
             context
                 .dest
                 .dataset()
@@ -231,7 +231,6 @@ impl<'a> InsertBuilder<'a> {
                 .unwrap_or(0),
             operation,
             blobs_op,
-            None,
         ))
     }
 

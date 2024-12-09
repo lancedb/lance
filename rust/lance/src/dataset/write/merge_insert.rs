@@ -992,12 +992,8 @@ impl MergeInsertJob {
             updated_fragments,
             new_fragments,
         };
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
+        let transaction =
+            Transaction::new_v1(dataset.manifest.version, operation, /*blobs_op=*/ None);
 
         let (manifest, manifest_path) = commit_transaction(
             dataset.as_ref(),
