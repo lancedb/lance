@@ -29,6 +29,7 @@ pub mod fixed_size_binary;
 pub mod fixed_size_list;
 pub mod fsst;
 pub mod packed_struct;
+pub mod struct_encoding;
 pub mod value;
 
 /// These contain the file buffers shared across the entire file
@@ -287,6 +288,7 @@ pub fn decoder_from_array_encoding(
         pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => unreachable!(),
         pb::array_encoding::ArrayEncoding::FsstMiniBlock(_) => unreachable!(),
         pb::array_encoding::ArrayEncoding::BinaryBlock(_) => unreachable!(),
+        pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(_) => unreachable!(),
     }
 }
 
