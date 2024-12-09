@@ -756,7 +756,10 @@ impl CoreFieldDecoderStrategy {
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
             )?);
+
+            // advance to the next top level column
             column_infos.next_top_level();
+
             return Ok(scheduler);
         }
         match &data_type {
@@ -772,7 +775,10 @@ impl CoreFieldDecoderStrategy {
                         column_info.as_ref(),
                         self.decompressor_strategy.as_ref(),
                     )?);
+
+                    // advance to the next top level column
                     column_infos.next_top_level();
+
                     return Ok(scheduler);
                 }
                 let mut child_schedulers = Vec::with_capacity(field.children.len());

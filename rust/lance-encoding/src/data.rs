@@ -350,7 +350,7 @@ struct StructDataBlockBuilder {
 
 impl StructDataBlockBuilder {
     // Currently only Struct with fixed-width fields are supported.
-    // And the assumption that all fields have `bits_per_value % 8 == 0` is made here. 
+    // And the assumption that all fields have `bits_per_value % 8 == 0` is made here.
     fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
         let mut children = vec![];
 
@@ -358,11 +358,10 @@ impl StructDataBlockBuilder {
         let bytes_per_row = bytes_per_row as u64;
 
         for bits_per_value in bits_per_values.iter() {
-            let this_estimated_size_bytes = estimated_size_bytes / bytes_per_row * (*bits_per_value as u64) / 8;
-            let child = FixedWidthDataBlockBuilder::new(
-                *bits_per_value as u64,
-                this_estimated_size_bytes,
-            );
+            let this_estimated_size_bytes =
+                estimated_size_bytes / bytes_per_row * (*bits_per_value as u64) / 8;
+            let child =
+                FixedWidthDataBlockBuilder::new(*bits_per_value as u64, this_estimated_size_bytes);
             children.push(Box::new(child) as Box<dyn DataBlockBuilderImpl>);
         }
         Self { children }

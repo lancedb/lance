@@ -21,7 +21,7 @@ use lance_core::utils::hash::U8SliceKey;
 use log::{debug, trace};
 use snafu::{location, Location};
 
-use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
+use crate::data::{AllNullDataBlock, DataBlock, StructDataBlock, VariableWidthBlock};
 use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{
@@ -2466,6 +2466,18 @@ impl PrimitiveStructuralEncoder {
                 Self::encode_simple_all_null(column_idx, num_values, row_number)
             } else {
                 let data_block = DataBlock::from_arrays(&arrays, num_values);
+
+                // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
+                if let DataBlock::Struct(ref struct_data_block) = data_block {
+                    if struct_data_block
+                        .children
+                        .iter()
+                        .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+                    {
+                        panic!("packed struct encoding currently only supports fixed-width fields.")
+                    }
+                }
+
                 const DICTIONARY_ENCODING_THRESHOLD: u64 = 100;
                 let cardinality =
                     if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
