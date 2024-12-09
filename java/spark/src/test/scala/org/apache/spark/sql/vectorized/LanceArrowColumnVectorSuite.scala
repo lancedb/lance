@@ -22,6 +22,7 @@
 package org.apache.spark.sql.vectorized
 
 import com.lancedb.lance.spark.LanceConstant
+
 import org.apache.arrow.vector._
 import org.apache.arrow.vector.complex._
 import org.apache.spark.sql.types._

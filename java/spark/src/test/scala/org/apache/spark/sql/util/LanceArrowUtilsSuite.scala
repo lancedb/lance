@@ -21,13 +21,14 @@
 
 package org.apache.spark.sql.util
 
-import java.time.ZoneId
-
 import com.lancedb.lance.spark.LanceConstant
+
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.types._
 import org.scalatest.funsuite.AnyFunSuite
+
+import java.time.ZoneId
 
 class LanceArrowUtilsSuite extends AnyFunSuite {
   def roundtrip(dt: DataType, fieldName: String = "value"): Unit = {

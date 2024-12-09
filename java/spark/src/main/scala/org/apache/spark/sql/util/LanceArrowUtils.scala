@@ -21,15 +21,16 @@
 
 package org.apache.spark.sql.util
 
-import java.util.concurrent.atomic.AtomicInteger
-
-import scala.collection.JavaConverters._
-
 import com.lancedb.lance.spark.LanceConstant
+
 import org.apache.arrow.vector.complex.MapVector
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
 import org.apache.spark.sql.errors.ExecutionErrors
 import org.apache.spark.sql.types._
+
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.collection.JavaConverters._
 
 object LanceArrowUtils {
   def fromArrowField(field: Field): DataType = {
