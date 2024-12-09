@@ -27,13 +27,14 @@ class BatchUDF:
     Use :func:`lance.add_columns_udf` decorator to wrap a function with this class.
     """
 
-    def __init__(self, func, output_schema=None, checkpoint_file=None):
+    def __init__(self, func, output_schema=None, checkpoint_file=None, **kwargs):
         self.func = func
         self.output_schema = output_schema
         if checkpoint_file is not None:
             self.cache = BatchUDFCheckpoint(checkpoint_file)
         else:
             self.cache = None
+        self.kwargs = kwargs
 
     def __call__(self, batch: pa.RecordBatch):
         # Directly call inner function. This is to allow the user to test the
@@ -46,7 +47,7 @@ class BatchUDF:
                 "output_schema must be provided when using a function that "
                 "returns a RecordBatch"
             )
-        result = self.func(batch)
+        result = self.func(batch, **self.kwargs)
 
         if _check_for_pandas(result):
             if isinstance(result, pd.DataFrame):
@@ -58,7 +59,7 @@ class BatchUDF:
         return result
 
 
-def batch_udf(output_schema=None, checkpoint_file=None):
+def batch_udf(output_schema=None, checkpoint_file=None, **kwargs):
     """
     Create a user defined function (UDF) that adds columns to a dataset.
 
@@ -88,7 +89,7 @@ def batch_udf(output_schema=None, checkpoint_file=None):
     """
 
     def inner(func):
-        return BatchUDF(func, output_schema, checkpoint_file)
+        return BatchUDF(func, output_schema, checkpoint_file, **kwargs)
 
     return inner
 
