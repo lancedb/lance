@@ -824,7 +824,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
             }
         }
         if let DataBlock::Struct(ref struct_data_block) = data {
-            // this condition is actually checked at `PrimitiveStructualEncoder::do_flush`,
+            // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
             // just being cautious here.
             if struct_data_block
                 .children

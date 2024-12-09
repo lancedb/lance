@@ -14,8 +14,10 @@ trace_to_chrome(level="debug", file="/tmp/trace.json")
 
 NUM_ROWS = 10_000_000
 RANDOM_ACCESS = "indices"
-NUM_INDICES = 100
+NUM_INDICES = 1000
 NUM_ROUNDS = 10
+#BATCH_SIZE = 16 * 1024
+BATCH_SIZE = 1000
 
 # This file compares benchmarks for reading and writing a StructArray column using
 # (i) parquet
@@ -31,10 +33,10 @@ def test_data(tmp_path_factory):
         {
             "struct_col": pa.StructArray.from_arrays(
                 [
-                    pc.random(NUM_ROWS).cast(pa.float32()),
-                    pa.array(range(NUM_ROWS), type=pa.int32()),
-                    pa.array(range(NUM_ROWS), type=pa.int32()),
-                    pa.array(range(NUM_ROWS), type=pa.int32()),
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f
+                    pc.random(NUM_ROWS).cast(pa.float32()),     # i
+                    pc.random(NUM_ROWS).cast(pa.float32()),     # i2
+                    pc.random(NUM_ROWS).cast(pa.float32()),     # i3
                 ],
                 ["f", "i", "i2", "i3"],
             )
@@ -57,12 +59,18 @@ def test_parquet_read(tmp_path: Path, benchmark, test_data, random_indices):
     parquet_path = tmp_path / "data.parquet"
     pq.write_table(test_data, parquet_path)
 
+    def read_parquet():
+        parquet_file = pq.ParquetFile(parquet_path)
+        batches = parquet_file.iter_batches(batch_size=BATCH_SIZE)
+        tab_parquet = pa.Table.from_batches(batches)
+        return tab_parquet
+
     if RANDOM_ACCESS == "indices":
         benchmark.pedantic(
             lambda: pq.read_table(parquet_path).take(random_indices), rounds=5
         )
     elif RANDOM_ACCESS == "full":
-        benchmark.pedantic(lambda: pq.read_table(parquet_path), rounds=5)
+        benchmark.pedantic(lambda: read_parquet(), rounds=5)
 
 
 def read_lance_file_random(lance_path, random_indices):
@@ -73,7 +81,7 @@ def read_lance_file_random(lance_path, random_indices):
 
 
 def read_lance_file_full(lance_path):
-    for batch in LanceFileReader(lance_path).read_all(batch_size=1000).to_batches():
+    for batch in LanceFileReader(lance_path).read_all(batch_size= BATCH_SIZE).to_batches():
         pass
 
 

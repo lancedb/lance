@@ -20,6 +20,9 @@ use crate::{
 
 use super::value::{ValueDecompressor, ValueEncoder};
 
+// Transforms a `StructDataBlock` into a row major `FixedWidthDataBlock`.
+// Only fields with fixed-width fields are supported for now, and the
+// assumption that all fields has `bits_per_value % 8 == 0` is made.
 fn struct_data_block_to_fixed_width_data_block(
     struct_data_block: StructDataBlock,
     bits_per_values: &[u32],
