@@ -13,7 +13,7 @@ from lance.tracing import trace_to_chrome
 trace_to_chrome(level="debug", file="/tmp/trace.json")
 
 NUM_ROWS = 10_000_000
-RANDOM_ACCESS = "full"
+RANDOM_ACCESS = "indices"
 NUM_INDICES = 100
 NUM_ROUNDS = 10
 
