@@ -16,8 +16,7 @@ NUM_ROWS = 10_000_000
 RANDOM_ACCESS = "indices"
 NUM_INDICES = 1000
 NUM_ROUNDS = 10
-#BATCH_SIZE = 16 * 1024
-BATCH_SIZE = 1000
+BATCH_SIZE = 16 * 1024
 
 # This file compares benchmarks for reading and writing a StructArray column using
 # (i) parquet
@@ -34,11 +33,11 @@ def test_data(tmp_path_factory):
             "struct_col": pa.StructArray.from_arrays(
                 [
                     pc.random(NUM_ROWS).cast(pa.float32()),  # f
-                    pc.random(NUM_ROWS).cast(pa.float32()),     # i
-                    pc.random(NUM_ROWS).cast(pa.float32()),     # i2
-                    pc.random(NUM_ROWS).cast(pa.float32()),     # i3
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # i
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # i2
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # i3
                 ],
-                ["f", "i", "i2", "i3"],
+                ["f1", "f2", "f3", "f4"],
             )
         }
     )
@@ -81,7 +80,9 @@ def read_lance_file_random(lance_path, random_indices):
 
 
 def read_lance_file_full(lance_path):
-    for batch in LanceFileReader(lance_path).read_all(batch_size= BATCH_SIZE).to_batches():
+    for batch in (
+        LanceFileReader(lance_path).read_all(batch_size=BATCH_SIZE).to_batches()
+    ):
         pass
 
 
