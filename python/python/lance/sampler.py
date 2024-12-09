@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import gc
-import logging
 import math
 import random
 import warnings
@@ -20,6 +19,7 @@ import pyarrow.compute as pc
 
 import lance
 from lance.dependencies import numpy as np
+from lance.log import LOGGER
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -94,7 +94,7 @@ def _efficient_sample(
             ).to_batches()
         )
         if idx % 50 == 0:
-            logging.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
+            LOGGER.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
@@ -241,7 +241,7 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
             vic = heappushpop(heap, entry)
             del vic
         if idx % 10240 == 0:
-            logging.info("Force Python GC")
+            LOGGER.info("Force Python GC")
             gc.collect()
     samples = [i.item for i in heap]
     del heap

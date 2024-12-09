@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 # Creates a dataset containing the TPC-H lineitems table using a prebuilt Parquet file
-import logging
 
 import duckdb
 import lance
+from lance.log import LOGGER
 
 from ci_benchmarks.datasets import get_dataset_uri
 
@@ -13,7 +13,7 @@ NUM_ROWS = 59986052
 
 
 def _gen_data():
-    logging.info("Using DuckDB to generate TPC-H dataset")
+    LOGGER.info("Using DuckDB to generate TPC-H dataset")
     con = duckdb.connect(database=":memory:")
     con.execute("INSTALL tpch; LOAD tpch")
     con.execute("CALL dbgen(sf=10)")

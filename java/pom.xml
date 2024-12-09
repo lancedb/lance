@@ -6,7 +6,7 @@
 
     <groupId>com.lancedb</groupId>
     <artifactId>lance-parent</artifactId>
-    <version>0.20.1</version>
+    <version>0.21.0</version>
     <packaging>pom</packaging>
 
     <name>Lance Parent</name>
@@ -33,6 +33,10 @@
         <spotless.skip>false</spotless.skip>
         <spotless.version>2.30.0</spotless.version>
         <spotless.java.googlejavaformat.version>1.7</spotless.java.googlejavaformat.version>
+        <scala.version>2.12.19</scala.version>
+        <scala.binary.version>2.12</scala.binary.version>
+        <!-- Please also update .scalafmt.conf when you change it here -->
+        <spotless.scala.scalafmt.version>3.7.5</spotless.scala.scalafmt.version>
         <spotless.delimiter>package</spotless.delimiter>
         <spotless.license.header>
         /*
@@ -233,6 +237,19 @@
 
                             <removeUnusedImports />
                         </java>
+                        <scala>
+                            <includes>
+                                <include>src/main/scala/**/*.scala</include>
+                                <include>src/main/scala-*/**/*.scala</include>
+                                <include>src/test/scala/**/*.scala</include>
+                                <include>src/test/scala-*/**/*.scala</include>
+                            </includes>
+                            <scalafmt>
+                                <version>${spotless.scala.scalafmt.version}</version>
+                                <scalaMajorVersion>${scala.binary.version}</scalaMajorVersion>
+                                <file>${maven.multiModuleProjectDirectory}/.scalafmt.conf</file>
+                            </scalafmt>
+                        </scala>
                     </configuration>
                     <executions>
                         <execution>

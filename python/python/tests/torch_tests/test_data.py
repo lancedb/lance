@@ -277,3 +277,49 @@ def test_convert_int_tensors(tmp_path: Path, dtype):
     first = next(iter(torch_ds))
     assert first["vec"].dtype == torch.uint8 if dtype == np.uint8 else torch.int64
     assert first["vec"].shape == (4, 32)
+
+
+def test_blob_api(tmp_path: Path):
+    ints = pa.array(range(100), type=pa.int64())
+    vals = pa.array([b"0" * 1024 for _ in range(100)], pa.large_binary())
+    schema = pa.schema(
+        [
+            pa.field("int", ints.type),
+            pa.field(
+                "val", pa.large_binary(), metadata={"lance-encoding:blob": "true"}
+            ),
+        ]
+    )
+    tbl = pa.Table.from_arrays([ints, vals], schema=schema)
+
+    ds = lance.write_dataset(tbl, tmp_path / "data.lance")
+    torch_ds = LanceDataset(
+        ds,
+        batch_size=4,
+    )
+    with pytest.raises(NotImplementedError):
+        next(iter(torch_ds))
+
+    def to_tensor_fn(batch, *args, **kwargs):
+        ints = torch.tensor(batch["int"].to_numpy())
+        vals = []
+        for blob in batch["val"]:
+            blob.seek(100)
+            data = blob.read(100)
+            tensor = torch.tensor(np.frombuffer(data, dtype=np.uint8))
+            vals.append(tensor)
+
+            # vals.append(torch.tensor(blob))
+        vals = torch.stack(vals)
+        return {"int": ints, "val": vals}
+
+    torch_ds = LanceDataset(
+        ds,
+        batch_size=4,
+        to_tensor_fn=to_tensor_fn,
+    )
+    first = next(iter(torch_ds))
+    assert first["int"].dtype == torch.int64
+    assert first["int"].shape == (4,)
+    assert first["val"].dtype == torch.uint8
+    assert first["val"].shape == (4, 100)
