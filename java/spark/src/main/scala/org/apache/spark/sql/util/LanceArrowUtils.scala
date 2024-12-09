@@ -21,20 +21,21 @@
 
 package org.apache.spark.sql.util
 
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.collection.JavaConverters._
+
 import com.lancedb.lance.spark.LanceConstant
 import org.apache.arrow.vector.complex.MapVector
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
 import org.apache.spark.sql.errors.ExecutionErrors
 import org.apache.spark.sql.types._
 
-import java.util.concurrent.atomic.AtomicInteger
-import scala.collection.JavaConverters._
-
 object LanceArrowUtils {
   def fromArrowField(field: Field): DataType = {
     field.getType match {
       case int: ArrowType.Int if !int.getIsSigned && int.getBitWidth == 8 * 8 => LongType
-      case _ =>  ArrowUtils.fromArrowField(field)
+      case _ => ArrowUtils.fromArrowField(field)
     }
   }
 
@@ -61,28 +62,34 @@ object LanceArrowUtils {
   }
 
   def toArrowField(
-     name: String,
-     dt: DataType,
-     nullable: Boolean,
-     timeZoneId: String,
-     largeVarTypes: Boolean = false): Field = {
+      name: String,
+      dt: DataType,
+      nullable: Boolean,
+      timeZoneId: String,
+      largeVarTypes: Boolean = false): Field = {
     dt match {
       case ArrayType(elementType, containsNull) =>
         val fieldType = new FieldType(nullable, ArrowType.List.INSTANCE, null)
-        new Field(name, fieldType,
-          Seq(toArrowField("element", elementType, containsNull, timeZoneId,
-            largeVarTypes)).asJava)
+        new Field(
+          name,
+          fieldType,
+          Seq(toArrowField("element", elementType, containsNull, timeZoneId, largeVarTypes)).asJava)
       case StructType(fields) =>
         val fieldType = new FieldType(nullable, ArrowType.Struct.INSTANCE, null)
-        new Field(name, fieldType,
+        new Field(
+          name,
+          fieldType,
           fields.map { field =>
             toArrowField(field.name, field.dataType, field.nullable, timeZoneId, largeVarTypes)
           }.toSeq.asJava)
       case MapType(keyType, valueType, valueContainsNull) =>
         val mapType = new FieldType(nullable, new ArrowType.Map(false), null)
         // Note: Map Type struct can not be null, Struct Type key field can not be null
-        new Field(name, mapType,
-          Seq(toArrowField(MapVector.DATA_VECTOR_NAME,
+        new Field(
+          name,
+          mapType,
+          Seq(toArrowField(
+            MapVector.DATA_VECTOR_NAME,
             new StructType()
               .add(MapVector.KEY_NAME, keyType, nullable = false)
               .add(MapVector.VALUE_NAME, valueType, nullable = valueContainsNull),
@@ -92,8 +99,8 @@ object LanceArrowUtils {
       case udt: UserDefinedType[_] =>
         toArrowField(name, udt.sqlType, nullable, timeZoneId, largeVarTypes)
       case dataType =>
-        val fieldType = new FieldType(nullable, toArrowType(dataType, timeZoneId,
-          largeVarTypes, name), null)
+        val fieldType =
+          new FieldType(nullable, toArrowType(dataType, timeZoneId, largeVarTypes, name), null)
         new Field(name, fieldType, Seq.empty[Field].asJava)
     }
   }
@@ -108,7 +115,8 @@ object LanceArrowUtils {
   }
 
   private def deduplicateFieldNames(
-      dt: DataType, errorOnDuplicatedFieldNames: Boolean): DataType = dt match {
+      dt: DataType,
+      errorOnDuplicatedFieldNames: Boolean): DataType = dt match {
     case udt: UserDefinedType[_] => deduplicateFieldNames(udt.sqlType, errorOnDuplicatedFieldNames)
     case st @ StructType(fields) =>
       val newNames = if (st.names.toSet.size == st.names.length) {
@@ -128,7 +136,10 @@ object LanceArrowUtils {
       val newFields =
         fields.zip(newNames).map { case (StructField(_, dataType, nullable, metadata), name) =>
           StructField(
-            name, deduplicateFieldNames(dataType, errorOnDuplicatedFieldNames), nullable, metadata)
+            name,
+            deduplicateFieldNames(dataType, errorOnDuplicatedFieldNames),
+            nullable,
+            metadata)
         }
       StructType(newFields)
     case ArrayType(elementType, containsNull) =>

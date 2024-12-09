@@ -22,12 +22,12 @@
 package org.apache.spark.sql.vectorized
 
 import com.lancedb.lance.spark.LanceConstant
-import org.apache.spark.sql.util.{ArrowUtils, LanceArrowUtils}
-import org.apache.spark.sql.types._
 import org.apache.arrow.vector._
 import org.apache.arrow.vector.complex._
-import org.scalatest.funsuite.AnyFunSuite
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.{ArrowUtils, LanceArrowUtils}
 import org.apache.spark.unsafe.types.UTF8String
+import org.scalatest.funsuite.AnyFunSuite
 
 class LanceArrowColumnVectorSuite extends AnyFunSuite {
   test("boolean") {
@@ -57,7 +57,6 @@ class LanceArrowColumnVectorSuite extends AnyFunSuite {
     columnVector.close()
     allocator.close()
   }
-
 
   test("byte") {
     val allocator = ArrowUtils.rootAllocator.newChildAllocator("byte", 0, Long.MaxValue)
@@ -365,8 +364,9 @@ class LanceArrowColumnVectorSuite extends AnyFunSuite {
 
   test("array") {
     val allocator = ArrowUtils.rootAllocator.newChildAllocator("array", 0, Long.MaxValue)
-    val vector = LanceArrowUtils.toArrowField("array", ArrayType(IntegerType), nullable = true, null)
-      .createVector(allocator).asInstanceOf[ListVector]
+    val vector =
+      LanceArrowUtils.toArrowField("array", ArrayType(IntegerType), nullable = true, null)
+        .createVector(allocator).asInstanceOf[ListVector]
     vector.allocateNew()
     val elementVector = vector.getDataVector().asInstanceOf[IntVector]
 
