@@ -21,7 +21,8 @@ use pb::{
     page_layout::Layout,
     AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
     BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
-    MiniBlockLayout, Nullable, PackedStruct, PageLayout, RepDefLayer,
+    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout,
+    RepDefLayer,
 };
 
 use crate::{
@@ -171,6 +172,20 @@ impl ProtobufUtils {
                     buffer_type: BufferType::Page as i32,
                 }),
             })),
+        }
+    }
+
+    pub fn packed_struct_fixed_width_mini_block(
+        data: ArrayEncoding,
+        bits_per_values: Vec<u32>,
+    ) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::PackedStructFixedWidthMiniBlock(
+                Box::new(PackedStructFixedWidthMiniBlock {
+                    flat: Some(Box::new(data)),
+                    bits_per_values,
+                }),
+            )),
         }
     }
 

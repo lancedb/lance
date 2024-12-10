@@ -258,6 +258,11 @@ message PackedStruct {
   Buffer buffer = 2;
 }
 
+message PackedStructFixedWidthMiniBlock {
+  ArrayEncoding Flat = 1;
+  repeated uint32 bits_per_values = 2;
+}
+
 message FixedSizeBinary {
   ArrayEncoding bytes = 1;
   uint32 byte_width = 2;
@@ -283,6 +288,7 @@ message ArrayEncoding {
         BinaryMiniBlock binary_mini_block = 15;
         FsstMiniBlock fsst_mini_block = 16;
         BinaryBlock binary_block = 17;
+        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 18;
     }
 }
 
