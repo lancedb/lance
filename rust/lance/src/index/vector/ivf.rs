@@ -35,7 +35,7 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
@@ -1397,6 +1397,14 @@ pub(crate) async fn remap_index_file_v3(
         IndexType::IvfFlat => {
             if element_type.is_floating() {
                 let mut remapper = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                    dataset.clone(),
+                    column,
+                    index_dir,
+                    index,
+                )?;
+                remapper.remap(mapping).await?;
+            } else {
+                let mut remapper = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
                     dataset.clone(),
                     column,
                     index_dir,
