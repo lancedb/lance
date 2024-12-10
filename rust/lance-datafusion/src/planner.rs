@@ -40,7 +40,7 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::{
     common::Column,
-    logical_expr::{col, BinaryExpr, Like, Operator, Between},
+    logical_expr::{col, Between, BinaryExpr, Like, Operator},
     physical_expr::execution_props::ExecutionProps,
     physical_plan::PhysicalExpr,
     prelude::Expr,
@@ -758,10 +758,10 @@ impl Planner {
                 let high = self.parse_sql_expr(high)?;
 
                 let foo = Expr::Between(Between::new(
-                Box::new(expr),
+                    Box::new(expr),
                     *negated,
-                Box::new(low),
-                Box::new(high),
+                    Box::new(low),
+                    Box::new(high),
                 ));
                 Ok(foo)
             }
@@ -1482,90 +1482,97 @@ mod tests {
         }
     }
 
-
     #[test]
-fn test_sql_between() {
-    use arrow_array::{Float64Array, Int32Array, TimestampMicrosecondArray};
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
-    use std::sync::Arc;
+    fn test_sql_between() {
+        use arrow_array::{Float64Array, Int32Array, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use std::sync::Arc;
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("x", DataType::Int32, false),
-        Field::new("y", DataType::Float64, false),
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-    ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Float64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
 
-    let planner = Planner::new(schema.clone());
+        let planner = Planner::new(schema.clone());
 
-    // Test integer BETWEEN
-    let expr = planner.parse_filter("x BETWEEN CAST(3 AS INT) AND CAST(7 AS INT)").unwrap();
-    let physical_expr = planner.create_physical_expr(&expr).unwrap();
+        // Test integer BETWEEN
+        let expr = planner
+            .parse_filter("x BETWEEN CAST(3 AS INT) AND CAST(7 AS INT)")
+            .unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
-    // Create timestamp array with values representing:
-    // 2024-01-01 00:00:00 to 2024-01-01 00:00:09 (in microseconds)
-    let base_ts = 1704067200000000_i64; // 2024-01-01 00:00:00
-    let ts_array = TimestampMicrosecondArray::from_iter_values(
-        (0..10).map(|i| base_ts + i * 1_000_000) // Each value is 1 second apart
-    );
+        // Create timestamp array with values representing:
+        // 2024-01-01 00:00:00 to 2024-01-01 00:00:09 (in microseconds)
+        let base_ts = 1704067200000000_i64; // 2024-01-01 00:00:00
+        let ts_array = TimestampMicrosecondArray::from_iter_values(
+            (0..10).map(|i| base_ts + i * 1_000_000), // Each value is 1 second apart
+        );
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
-            Arc::new(Float64Array::from_iter_values((0..10).map(|v| v as f64))),
-            Arc::new(ts_array),
-        ],
-    )
-    .unwrap();
-
-    let predicates = physical_expr.evaluate(&batch).unwrap();
-    assert_eq!(
-        predicates.into_array(0).unwrap().as_ref(),
-        &BooleanArray::from(vec![
-            false, false, false, true, true, true, true, true, false, false
-        ])
-    );
-
-    // Test NOT BETWEEN
-    let expr = planner.parse_filter("x NOT BETWEEN CAST(3 AS INT) AND CAST(7 AS INT)").unwrap();
-    let physical_expr = planner.create_physical_expr(&expr).unwrap();
-
-    let predicates = physical_expr.evaluate(&batch).unwrap();
-    assert_eq!(
-        predicates.into_array(0).unwrap().as_ref(),
-        &BooleanArray::from(vec![
-            true, true, true, false, false, false, false, false, true, true
-        ])
-    );
-
-    // Test floating point BETWEEN
-    let expr = planner.parse_filter("y BETWEEN 2.5 AND 6.5").unwrap();
-    let physical_expr = planner.create_physical_expr(&expr).unwrap();
-
-    let predicates = physical_expr.evaluate(&batch).unwrap();
-    assert_eq!(
-        predicates.into_array(0).unwrap().as_ref(),
-        &BooleanArray::from(vec![
-            false, false, false, true, true, true, true, false, false, false
-        ])
-    );
-
-    // Test timestamp BETWEEN
-    let expr = planner
-        .parse_filter(
-            "ts BETWEEN timestamp '2024-01-01 00:00:03' AND timestamp '2024-01-01 00:00:07'"
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
+                Arc::new(Float64Array::from_iter_values((0..10).map(|v| v as f64))),
+                Arc::new(ts_array),
+            ],
         )
         .unwrap();
-    let physical_expr = planner.create_physical_expr(&expr).unwrap();
 
-    let predicates = physical_expr.evaluate(&batch).unwrap();
-    assert_eq!(
-        predicates.into_array(0).unwrap().as_ref(),
-        &BooleanArray::from(vec![
-            false, false, false, true, true, true, true, true, false, false
-        ])
-    );
-}
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, true, false, false
+            ])
+        );
+
+        // Test NOT BETWEEN
+        let expr = planner
+            .parse_filter("x NOT BETWEEN CAST(3 AS INT) AND CAST(7 AS INT)")
+            .unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                true, true, true, false, false, false, false, false, true, true
+            ])
+        );
+
+        // Test floating point BETWEEN
+        let expr = planner.parse_filter("y BETWEEN 2.5 AND 6.5").unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, false, false, false
+            ])
+        );
+
+        // Test timestamp BETWEEN
+        let expr = planner
+            .parse_filter(
+                "ts BETWEEN timestamp '2024-01-01 00:00:03' AND timestamp '2024-01-01 00:00:07'",
+            )
+            .unwrap();
+        let physical_expr = planner.create_physical_expr(&expr).unwrap();
+
+        let predicates = physical_expr.evaluate(&batch).unwrap();
+        assert_eq!(
+            predicates.into_array(0).unwrap().as_ref(),
+            &BooleanArray::from(vec![
+                false, false, false, true, true, true, true, true, false, false
+            ])
+        );
+    }
 
     #[test]
     fn test_sql_comparison() {
