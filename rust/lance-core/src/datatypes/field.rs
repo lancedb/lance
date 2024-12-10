@@ -731,6 +731,15 @@ impl Field {
         }
         None
     }
+
+    // Check if field has metadata `packed` set to true, this check is case insensitive.
+    pub fn is_packed_struct(&self) -> bool {
+        let field_metadata = &self.metadata;
+        field_metadata
+            .get("packed")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
+    }
 }
 
 impl fmt::Display for Field {

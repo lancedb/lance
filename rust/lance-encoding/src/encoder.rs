@@ -1221,12 +1221,7 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
                     todo!()
                 }
                 DataType::Struct(_) => {
-                    let field_metadata = &field.metadata;
-                    if field_metadata
-                        .get("packed")
-                        .map(|v| v == "true")
-                        .unwrap_or(false)
-                    {
+                    if field.is_packed_struct() {
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),

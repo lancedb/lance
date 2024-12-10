@@ -354,6 +354,8 @@ impl StructDataBlockBuilder {
     fn new(bits_per_values: Vec<u32>, estimated_size_bytes: u64) -> Self {
         let mut children = vec![];
 
+        debug_assert!(bits_per_values.iter().all(|bpv| bpv % 8 == 0));
+
         let bytes_per_row: u32 = bits_per_values.iter().sum::<u32>() / 8;
         let bytes_per_row = bytes_per_row as u64;
 

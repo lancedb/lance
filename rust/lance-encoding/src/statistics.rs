@@ -13,8 +13,8 @@ use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
 use crate::data::{
-    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedSizeListBlock, FixedWidthDataBlock,
-    NullableDataBlock, OpaqueBlock, StructDataBlock, VariableWidthBlock,
+    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
+    OpaqueBlock, StructDataBlock, VariableWidthBlock,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,24 +156,11 @@ impl GetStat for DataBlock {
             Self::AllNull(data_block) => data_block.get_stat(stat),
             Self::Nullable(data_block) => data_block.get_stat(stat),
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
-            Self::FixedSizeList(data_block) => data_block.get_stat(stat),
+            Self::FixedSizeList(_) => None,
             Self::VariableWidth(data_block) => data_block.get_stat(stat),
             Self::Opaque(data_block) => data_block.get_stat(stat),
             Self::Struct(data_block) => data_block.get_stat(stat),
             Self::Dictionary(data_block) => data_block.get_stat(stat),
-        }
-    }
-}
-
-impl GetStat for FixedSizeListBlock {
-    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
-        match stat {
-            Stat::MaxLength => {
-                let max_len = self.dimension * self.child.expect_single_stat::<UInt64Type>(stat);
-                Some(Arc::new(UInt64Array::from(vec![max_len])))
-            }
-            Stat::DataSize => self.child.get_stat(stat),
-            _ => None,
         }
     }
 }

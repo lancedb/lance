@@ -21,7 +21,7 @@ use lance_core::utils::hash::U8SliceKey;
 use log::{debug, trace};
 use snafu::{location, Location};
 
-use crate::data::{AllNullDataBlock, DataBlock, StructDataBlock, VariableWidthBlock};
+use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
 use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{

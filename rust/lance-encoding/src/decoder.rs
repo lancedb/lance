@@ -764,12 +764,7 @@ impl CoreFieldDecoderStrategy {
         }
         match &data_type {
             DataType::Struct(fields) => {
-                let field_metadata = &field.metadata;
-                if field_metadata
-                    .get("packed")
-                    .map(|v| v == "true")
-                    .unwrap_or(false)
-                {
+                if field.is_packed_struct() {
                     let column_info = column_infos.expect_next()?;
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),

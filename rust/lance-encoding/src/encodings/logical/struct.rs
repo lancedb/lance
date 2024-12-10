@@ -15,6 +15,7 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
+use lance_arrow::FieldExt;
 use log::trace;
 use snafu::{location, Location};
 
@@ -608,12 +609,7 @@ impl StructuralStructDecoder {
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                let field_metadata = field.metadata();
-                if field_metadata
-                    .get("packed")
-                    .map(|v| v == "true")
-                    .unwrap_or(false)
-                {
+                if field.is_packed_struct() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Box::new(decoder)

@@ -65,11 +65,15 @@ impl MiniBlockCompressor for PackedStructFixedWidthMiniBlockEncoder {
         match data {
             DataBlock::Struct(struct_data_block) => {
                 let bits_per_values = struct_data_block.children.iter().map(|data_block| data_block.as_fixed_width_ref().unwrap().bits_per_value as u32).collect::<Vec<_>>();
+
+                // transform struct datablock to fixed-width data block.
                 let data_block = struct_data_block_to_fixed_width_data_block(struct_data_block, &bits_per_values);
 
+                // store and transformed fixed-width data block.
                 let value_miniblock_compressor = Box::new(ValueEncoder::default()) as Box<dyn MiniBlockCompressor>;
                 let (value_miniblock_compressed, value_array_encoding) =
                 value_miniblock_compressor.compress(data_block)?;
+
                 Ok((
                     value_miniblock_compressed,
                     ProtobufUtils::packed_struct_fixed_width_mini_block(value_array_encoding, bits_per_values),
@@ -104,7 +108,7 @@ impl PackedStructFixedWidthMiniBlockDecompressor {
             .unwrap()
         {
             pb::array_encoding::ArrayEncoding::Flat(flat) => Box::new(ValueDecompressor::new(flat)),
-            _ => panic!("Unsupported array encoding"),
+            _ => panic!("Currently only `ArrayEncoding::Flat` is supported in packed struct encoding in Lance 2.1."),
         };
         Self {
             bits_per_values: description.bits_per_values.clone(),
@@ -127,10 +131,11 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
             .collect::<Vec<_>>();
 
         assert!(encoded_data_block.bits_per_value % 8 == 0);
-
         let encoded_bytes_per_row = (encoded_data_block.bits_per_value / 8) as usize;
-        let mut prefix_sum = vec![0; self.bits_per_values.len() + 1];
-        for i in 0..self.bits_per_values.len() {
+
+        // use a prefix_sum vector as a helper to reconstruct to `StructDataBlock`.
+        let mut prefix_sum = vec![0; self.bits_per_values.len()];
+        for i in 0..(self.bits_per_values.len() - 1) {
             prefix_sum[i + 1] = prefix_sum[i] + bytes_per_values[i];
         }
 
@@ -140,10 +145,12 @@ impl MiniBlockDecompressor for PackedStructFixedWidthMiniBlockDecompressor {
             let mut child_buf: Vec<u8> = Vec::with_capacity(child_buf_size);
 
             for j in 0..num_values as usize {
+                // the start of the data at this row is `j * encoded_bytes_per_row`, and the offset for this field is `prefix_sum[i]`, this field has length `bytes_per_values[i]`.
                 let this_value = encoded_data_block.data.slice_with_length(
                     prefix_sum[i] + (j * encoded_bytes_per_row),
                     bytes_per_values[i],
                 );
+
                 child_buf.extend_from_slice(&this_value);
             }
 

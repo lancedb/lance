@@ -228,16 +228,11 @@ impl ReaderProjection {
         let mut curr_column_idx = 0;
         let mut packed_struct_fields_num = 0;
         for field in schema.fields_pre_order() {
-            let field_metadata = &field.metadata;
             if packed_struct_fields_num > 0 {
                 packed_struct_fields_num -= 1;
                 continue;
             }
-            if field_metadata
-                .get("packed")
-                .map(|v| v == "true")
-                .unwrap_or(false)
-            {
+            if field.is_packed_struct() {
                 column_indices.push(curr_column_idx);
                 curr_column_idx += 1;
                 packed_struct_fields_num = field.children.len();
