@@ -78,6 +78,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
+use super::utils::get_vector_element_type;
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
@@ -1378,6 +1379,57 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
     }
 
     Ok(tasks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remap_index_file_v3(
+    dataset: &Dataset,
+    new_uuid: &str,
+    index: Arc<dyn VectorIndex>,
+    mapping: &HashMap<u64, Option<u64>>,
+    column: String,
+) -> Result<()> {
+    let index_dir = dataset.indices_dir().child(new_uuid);
+    let element_type = get_vector_element_type(dataset, &column)?;
+    match index.index_type() {
+        IndexType::IvfFlat => {
+            if element_type.is_floating() {
+                let mut remapper = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
+                    dataset.clone(),
+                    column,
+                    index_dir,
+                    index,
+                )?;
+                remapper.remap(mapping).await?;
+            }
+        }
+        IndexType::IvfPq => {
+            let mut remapper = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
+                dataset.clone(),
+                column,
+                index_dir,
+                index,
+            )?;
+            remapper.remap(mapping).await?;
+        }
+        IndexType::IvfSq => {
+            let mut remapper = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
+                dataset.clone(),
+                column,
+                index_dir,
+                index,
+            )?;
+            remapper.remap(mapping).await?;
+        }
+        _ => {
+            return Err(Error::invalid_input(
+                format!("Remapping is not support for {}", index.index_type()),
+                location!(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

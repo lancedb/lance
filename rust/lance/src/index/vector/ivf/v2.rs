@@ -66,9 +66,9 @@ use crate::{
 use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
 
 #[derive(Debug)]
-struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
-    index: S,
-    storage: Q::Storage,
+pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
+    pub index: S,
+    pub storage: Q::Storage,
 }
 
 /// IVF Index.
@@ -409,19 +409,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
         self.ivf.find_partitions(&query.key, query.nprobes, dt)
     }
-
-    // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()> {
-    //     IvfIndexBuilder::new(
-    //         dataset,
-    //         column,
-    //         index_dir,
-    //         distance_type,
-    //         shuffler,
-    //         ivf_params,
-    //         sub_index_params,
-    //         quantizer_params,
-    //     )
-    // }
 
     #[instrument(level = "debug", skip(self, pre_filter))]
     async fn search_in_partition(

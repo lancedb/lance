@@ -373,30 +373,34 @@ pub(crate) async fn remap_vector_index(
         .await?;
     old_index.check_can_remap()?;
 
-    let ivf_index: &IVFIndex =
-        old_index
-            .as_any()
-            .downcast_ref()
-            .ok_or_else(|| Error::NotSupported {
-                source: "Only IVF indexes can be remapped currently".into(),
-                location: location!(),
-            })?;
+    if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
+        remap_index_file(
+            dataset.as_ref(),
+            &old_uuid.to_string(),
+            &new_uuid.to_string(),
+            old_metadata.dataset_version,
+            ivf_index,
+            mapping,
+            old_metadata.name.clone(),
+            column.to_string(),
+            // We can safely assume there are no transforms today.  We assert above that the
+            // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
+            // will be fixed in the future.
+            vec![],
+        )
+        .await?;
+    } else {
+        // it's v3 index
+        remap_index_file_v3(
+            dataset.as_ref(),
+            &new_uuid.to_string(),
+            old_index,
+            mapping,
+            column.to_string(),
+        )
+        .await?;
+    }
 
-    remap_index_file(
-        dataset.as_ref(),
-        &old_uuid.to_string(),
-        &new_uuid.to_string(),
-        old_metadata.dataset_version,
-        ivf_index,
-        mapping,
-        old_metadata.name.clone(),
-        column.to_string(),
-        // We can safely assume there are no transforms today.  We assert above that the
-        // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
-        // will be fixed in the future.
-        vec![],
-    )
-    .await?;
     Ok(())
 }
 

@@ -33,6 +33,26 @@ pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
     }
 }
 
+pub fn get_vector_element_type(dataset: &Dataset, column: &str) -> Result<arrow_schema::DataType> {
+    let schema = dataset.schema();
+    let field = schema.field(column).ok_or(Error::Index {
+        message: format!("Column {} does not exist in schema {}", column, schema),
+        location: location!(),
+    })?;
+    let data_type = field.data_type();
+    if let arrow_schema::DataType::FixedSizeList(element_field, _) = data_type {
+        Ok(element_field.data_type().clone())
+    } else {
+        Err(Error::Index {
+            message: format!(
+                "Column {} is not a FixedSizeListArray, but {:?}",
+                column, data_type
+            ),
+            location: location!(),
+        })
+    }
+}
+
 /// Maybe sample training data from dataset, specified by column name.
 ///
 /// Returns a [FixedSizeListArray], containing the training dataset.

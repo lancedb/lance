@@ -259,6 +259,10 @@ impl IvfQuantizationStorage {
         Q::from_metadata(&metadata, self.distance_type)
     }
 
+    pub fn schema(&self) -> SchemaRef {
+        Arc::new(self.reader.schema().as_ref().into())
+    }
+
     /// Get the number of partitions in the storage.
     pub fn num_partitions(&self) -> usize {
         self.ivf.num_partitions()

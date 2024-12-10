@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
+use futures::stream;
 use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
+use lance_core::datatypes::Schema;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -70,11 +73,11 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     column: String,
     index_dir: Path,
     distance_type: DistanceType,
-    shuffler: Arc<dyn Shuffler>,
     // build params, only needed for building new IVF, quantizer
+    shuffler: Option<Arc<dyn Shuffler>>,
     ivf_params: Option<IvfBuildParams>,
     quantizer_params: Option<Q::BuildParams>,
-    sub_index_params: S::BuildParams,
+    sub_index_params: Option<S::BuildParams>,
     _temp_dir: TempDir, // store this for keeping the temp dir alive and clean up after build
     temp_dir: Path,
 
@@ -84,7 +87,7 @@ pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization + Clone> {
     shuffle_reader: Option<Box<dyn ShuffleReader>>,
     partition_sizes: Vec<(usize, usize)>,
 
-    // fields for merging indices
+    // fields for merging indices / remapping
     existing_indices: Vec<Arc<dyn VectorIndex>>,
 }
 
@@ -107,10 +110,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             column,
             index_dir,
             distance_type,
-            shuffler: shuffler.into(),
+            shuffler: Some(shuffler.into()),
             ivf_params,
             quantizer_params,
-            sub_index_params,
+            sub_index_params: Some(sub_index_params),
             _temp_dir: temp_dir,
             temp_dir: temp_dir_path,
             // fields will be set during build
@@ -142,6 +145,42 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         )
     }
 
+    pub fn new_remapper(
+        dataset: Dataset,
+        column: String,
+        index_dir: Path,
+        index: Arc<dyn VectorIndex>,
+    ) -> Result<Self> {
+        let ivf_index =
+            index
+                .as_any()
+                .downcast_ref::<IVFIndex<S, Q>>()
+                .ok_or(Error::invalid_input(
+                    "existing index is not IVF index",
+                    location!(),
+                ))?;
+
+        let temp_dir = tempdir()?;
+        let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+        Ok(Self {
+            dataset,
+            column,
+            index_dir,
+            distance_type: ivf_index.metric_type(),
+            shuffler: None,
+            ivf_params: None,
+            quantizer_params: None,
+            sub_index_params: None,
+            _temp_dir: temp_dir,
+            temp_dir: temp_dir_path,
+            ivf: Some(ivf_index.ivf_model()),
+            quantizer: Some(ivf_index.quantizer().try_into()?),
+            shuffle_reader: None,
+            partition_sizes: Vec::new(),
+            existing_indices: vec![index],
+        })
+    }
+
     // build the index with the all data in the dataset,
     pub async fn build(&mut self) -> Result<()> {
         // step 1. train IVF & quantizer
@@ -163,6 +202,45 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         // step 4. merge all partitions
         self.merge_partitions().await?;
 
+        Ok(())
+    }
+
+    pub async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        debug_assert_eq!(self.existing_indices.len(), 1);
+        let ivf_index = self.existing_indices[0]
+            .as_any()
+            .downcast_ref::<IVFIndex<S, Q>>()
+            .ok_or(Error::invalid_input(
+                "existing index is not IVF index",
+                location!(),
+            ))?;
+
+        let model = ivf_index.ivf_model();
+        let mapped = stream::iter(0..model.num_partitions())
+            .map(|part_id| async move {
+                let part = ivf_index.load_partition(part_id, false).await?;
+                Result::Ok((part.storage.remap(mapping)?, part.index.remap(mapping)?))
+            })
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        self.partition_sizes = vec![(0, 0); model.num_partitions()];
+        for (part_id, (store, index)) in mapped.into_iter().enumerate() {
+            let path = self.temp_dir.child(format!("storage_part{}", part_id));
+            let batches = store.to_batches()?;
+            let schema = store.schema().as_ref().try_into()?;
+            let store_len = Self::write_batches(path, batches, schema).await?;
+
+            let path = self.temp_dir.child(format!("index_part{}", part_id));
+            let batch = index.to_batch()?;
+            let schema = batch.schema().as_ref().try_into()?;
+            let index_len = Self::write_batches(path, std::iter::once(batch), schema).await?;
+
+            self.partition_sizes[part_id] = (store_len, index_len);
+        }
+
+        self.merge_partitions().await?;
         Ok(())
     }
 
@@ -284,6 +362,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             "quantizer not set before shuffle data",
             location!(),
         ))?;
+        let shuffler = self.shuffler.as_ref().ok_or(Error::invalid_input(
+            "shuffler not set before shuffle data",
+            location!(),
+        ))?;
 
         let transformer = Arc::new(
             lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
@@ -320,7 +402,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         };
 
         self.shuffle_reader = Some(
-            self.shuffler
+            shuffler
                 .shuffle(Box::new(RecordBatchStreamAdapter::new(
                     schema,
                     transformed_stream,
@@ -412,43 +494,46 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
             "quantizer not set before building partition",
             location!(),
         ))?;
+        let sub_index_params = self.sub_index_params.clone().ok_or(Error::invalid_input(
+            "sub index params not set before building partition",
+            location!(),
+        ))?;
 
         // build quantized vector storage
-        let object_store = ObjectStore::local();
         let storage_len = {
             let storage = StorageBuilder::new(self.column.clone(), self.distance_type, quantizer)
                 .build(batch)?;
             let path = self.temp_dir.child(format!("storage_part{}", part_id));
-            let writer = object_store.create(&path).await?;
-            let mut writer = FileWriter::try_new(
-                writer,
-                storage.schema().as_ref().try_into()?,
-                Default::default(),
-            )?;
-            for batch in storage.to_batches()? {
-                writer.write_batch(&batch).await?;
-            }
-            writer.finish().await? as usize
+            let batches = storage.to_batches()?;
+            Self::write_batches(path, batches, storage.schema().as_ref().try_into()?).await?
         };
 
         // build the sub index, with in-memory storage
         let index_len = {
             let vectors = batch[&self.column].as_fixed_size_list();
             let flat_storage = FlatStorage::new(vectors.clone(), self.distance_type);
-            let sub_index = S::index_vectors(&flat_storage, self.sub_index_params.clone())?;
+            let sub_index = S::index_vectors(&flat_storage, sub_index_params)?;
             let path = self.temp_dir.child(format!("index_part{}", part_id));
-            let writer = object_store.create(&path).await?;
             let index_batch = sub_index.to_batch()?;
-            let mut writer = FileWriter::try_new(
-                writer,
-                index_batch.schema_ref().as_ref().try_into()?,
-                Default::default(),
-            )?;
-            writer.write_batch(&index_batch).await?;
-            writer.finish().await? as usize
+            let schema = index_batch.schema().as_ref().try_into()?;
+            Self::write_batches(path, std::iter::once(index_batch), schema).await?
         };
 
         Ok((storage_len, index_len))
+    }
+
+    async fn write_batches(
+        path: Path,
+        batches: impl Iterator<Item = RecordBatch>,
+        schema: Schema,
+    ) -> Result<usize> {
+        let object_store = ObjectStore::local();
+        let writer = object_store.create(&path).await?;
+        let mut writer = FileWriter::try_new(writer, schema, Default::default())?;
+        for batch in batches {
+            writer.write_batch(&batch).await?;
+        }
+        Ok(writer.finish().await? as usize)
     }
 
     async fn merge_partitions(&mut self) -> Result<()> {

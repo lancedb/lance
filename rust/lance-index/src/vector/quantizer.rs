@@ -23,7 +23,9 @@ use super::flat::index::FlatQuantizer;
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 
-pub trait Quantization: Send + Sync + Debug + DeepSizeOf + Into<Quantizer> {
+pub trait Quantization:
+    Send + Sync + Debug + DeepSizeOf + Into<Quantizer> + TryFrom<Quantizer, Error = lance_core::Error>
+{
     type BuildParams: QuantizerBuildParams;
     type Metadata: QuantizerMetadata + Send + Sync;
     type Storage: QuantizerStorage<Metadata = Self::Metadata> + VectorStore + Debug;
