@@ -1514,7 +1514,7 @@ mod tests {
         );
 
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            schema,
             vec![
                 Arc::new(Int32Array::from_iter_values(0..10)) as ArrayRef,
                 Arc::new(Float64Array::from_iter_values((0..10).map(|v| v as f64))),
