@@ -318,7 +318,7 @@ def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(tmp_path
         }
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
-    ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera-ipadic")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/ipadic")
 
     results = ds.to_table(
         full_text_query="成田",
@@ -335,7 +335,7 @@ def test_indexed_filter_with_fts_index_with_lindera_ko_tokenizer(tmp_path):
         }
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
-    ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera-ko-dic")
+    ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/ko-dic")
 
     results = ds.to_table(
         full_text_query="나리타",

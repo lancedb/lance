@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
-use lance_core::{Error, Result, LANCE_HOME};
+use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
@@ -156,8 +156,24 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
     }
 }
 
+pub const LANCE_TOKENIZERS_HOME_ENV_KEY: &str = "LANCE_TOKENIZERS_HOME";
+
+pub const LANCE_HOME_DEFAULT_DIRECTORY: &str = "lance/tokenizers";
+
 lazy_static::lazy_static! {
-    pub static ref LANCE_TOKENIZER_HOME: Option<PathBuf> = LANCE_HOME.as_ref().map(|p| p.join("tokenizers"));
+    /// default directory that stores lance tokenizer related files, e.g. tokenizer model.
+    pub static ref LANCE_TOKENIZER_HOME: Option<PathBuf> = match env::var(LANCE_TOKENIZERS_HOME_ENV_KEY) {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_HOME_DEFAULT_DIRECTORY))
+    };
+}
+
+#[cfg(feature = "tokenizer-lindera")]
+#[derive(Serialize, Deserialize)]
+struct LinderaConfig{
+    main: String,
+    user: Option<String>,
+    user_kind: Option<String>
 }
 
 #[cfg(feature = "tokenizer-lindera")]
@@ -172,35 +188,55 @@ fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::Text
         segmenter::Segmenter,
     };
     use lindera_tantivy::tokenizer::LinderaTokenizer;
-    use serde_json::from_reader;
+    use serde_json::Value;
 
     match LANCE_TOKENIZER_HOME.as_ref() {
         Some(p) => {
             let dic_dir = p.join(dic);
-            let main_dir = dic_dir.join("main");
-            let user_config_path = dic_dir.join("user_config.json");
-            let user_dictionary = if user_config_path.exists() {
-                let file = File::open(user_config_path)?;
-                let reader = BufReader::new(file);
-                let user_dictionary_config: UserDictionaryConfig = from_reader(reader)?;
-                Some(
-                    load_user_dictionary_from_config(&user_dictionary_config).map_err(|e| {
-                        Error::io(
-                            format!("load lindera tokenizer user dictionary err: {e}"),
-                            location!(),
-                        )
-                    })?,
-                )
-            } else {
-                None
-            };
-            let mode = Mode::Normal;
-            let dictionary = load_dictionary_from_path(main_dir.as_path()).map_err(|e| {
+            let config_path = dic_dir.join("config.json");
+            let file = File::open(config_path)?;
+            let reader = BufReader::new(file);
+            let config: LinderaConfig = serde_json::from_reader(reader)?;
+            let main_path = dic_dir.join(config.main);
+            let dictionary = load_dictionary_from_path(main_path.as_path()).map_err(|e| {
                 Error::io(
                     format!("load lindera tokenizer main dictionary err: {e}"),
                     location!(),
                 )
             })?;
+            let user_dictionary = match config.user {
+                Some(user) =>  {
+                    let mut conf = serde_json::Map::<String, Value>::new();
+                    let user_path = dic_dir.join(user);
+                    match user_path.to_str() {
+                        Some(p) => {
+                            conf.insert(String::from("path"), Value::String(String::from(p)));
+                            Ok(())
+                        },
+                        None => {
+                            let p = user_path.display();
+                            Err(Error::io(
+                                format!("invalid lindera tokenizer user dictionary path: {p}"),
+                                location!(),
+                            ))
+                        }
+                    }?;
+                    if let Some(kind) = config.user_kind {
+                        conf.insert(String::from("kind"), Value::String(kind));
+                    }
+                    let user_dictionary_config: UserDictionaryConfig = Value::Object(conf);
+                    let user_dictionary = load_user_dictionary_from_config(&user_dictionary_config).map_err(|e| {
+                        Error::io(
+                            format!("load lindera tokenizer user dictionary err: {e}"),
+                            location!(),
+                        )
+                    })?;
+                    Some(user_dictionary)
+                },
+                None => None
+
+            };
+            let mode = Mode::Normal;
             let segmenter = Segmenter::new(mode, dictionary, user_dictionary);
             let tokenizer = LinderaTokenizer::from_segmenter(segmenter);
             Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
@@ -208,7 +244,7 @@ fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::Text
         None => Err(Error::invalid_input(
             format!(
                 "{} is undefined",
-                String::from(lance_core::LANCE_HOME_ENV_KEY)
+                String::from(LANCE_TOKENIZERS_HOME_ENV_KEY)
             ),
             location!(),
         )),
