@@ -72,7 +72,7 @@ datafusion-sql.workspace = true
 random_word = { version = "0.4.3", features = ["en"] }
 
 [features]
-tokenizer-lindera = ["lindera", "lindera-tantivy", "lindera-tantivy/compress"]
+tokenizer-lindera = ["lindera", "lindera-tantivy"]
 
 [build-dependencies]
 prost-build.workspace = true

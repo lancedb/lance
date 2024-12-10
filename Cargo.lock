@@ -3860,12 +3860,7 @@ dependencies = [
  "byteorder",
  "csv",
  "kanaria",
- "lindera-cc-cedict",
  "lindera-dictionary",
- "lindera-ipadic",
- "lindera-ipadic-neologd",
- "lindera-ko-dic",
- "lindera-unidic",
  "once_cell",
  "regex",
  "serde",
@@ -3877,19 +3872,6 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "yada",
-]
-
-[[package]]
-name = "lindera-cc-cedict"
-version = "0.38.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a891e53b4fac346b314dcd60e4337b6deec7d972f338c004cfb9e0fe9868893"
-dependencies = [
- "bincode",
- "byteorder",
- "lindera-dictionary",
- "once_cell",
- "tokio",
 ]
 
 [[package]]
@@ -3918,45 +3900,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lindera-ipadic"
-version = "0.38.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74d2b997fa2aeee8adccea2e4cb0ade771132f6e32093ed0beda8409e9a44018"
-dependencies = [
- "bincode",
- "byteorder",
- "lindera-dictionary",
- "once_cell",
- "tokio",
-]
-
-[[package]]
-name = "lindera-ipadic-neologd"
-version = "0.38.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "084c4e7b63500b235af2c7cbf8ee23735ae452971ac29bbd9a7f55a10eae50c4"
-dependencies = [
- "bincode",
- "byteorder",
- "lindera-dictionary",
- "once_cell",
- "tokio",
-]
-
-[[package]]
-name = "lindera-ko-dic"
-version = "0.38.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d921a5c39a634316125fc1572f00bc78f4351baeacaff2cf39953b2fc8493a55"
-dependencies = [
- "bincode",
- "byteorder",
- "lindera-dictionary",
- "once_cell",
- "tokio",
-]
-
-[[package]]
 name = "lindera-tantivy"
 version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3965,19 +3908,6 @@ dependencies = [
  "lindera",
  "tantivy",
  "tantivy-tokenizer-api",
-]
-
-[[package]]
-name = "lindera-unidic"
-version = "0.38.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b95e25975448fa10f2bec61bfd012d8b0a1740d92ac7fc43e725edb1568ff7e"
-dependencies = [
- "bincode",
- "byteorder",
- "lindera-dictionary",
- "once_cell",
- "tokio",
 ]
 
 [[package]]
