@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use deepsize::DeepSizeOf;
 use lance_core::cache::FileMetadataCache;
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
-use snafu::{location, Location};
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;

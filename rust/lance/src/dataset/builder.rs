@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use lance_core::location;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptions,
@@ -13,7 +14,7 @@ use lance_table::{
 };
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
-use snafu::{location, Location};
+
 use tracing::instrument;
 use url::Url;
 

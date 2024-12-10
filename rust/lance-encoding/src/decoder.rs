@@ -226,8 +226,9 @@ use futures::{FutureExt, StreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::cache::{CapacityMode, FileMetadataCache};
 use lance_core::datatypes::{Field, Schema, BLOB_DESC_LANCE_FIELD};
+use lance_core::location;
 use log::{debug, trace, warn};
-use snafu::{location, Location};
+
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{self, unbounded_channel};
 

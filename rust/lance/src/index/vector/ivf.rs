@@ -27,6 +27,7 @@ use futures::{
 };
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
+use lance_core::location;
 use lance_core::{
     datatypes::Field, traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error,
     Result, ROW_ID_FIELD,
@@ -75,7 +76,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use snafu::{location, Location};
+
 use tracing::instrument;
 use uuid::Uuid;
 

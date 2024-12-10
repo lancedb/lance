@@ -11,8 +11,8 @@ use arrow_schema::DataType;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
+use lance_core::location;
 use log::trace;
-use snafu::{location, Location};
 
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};

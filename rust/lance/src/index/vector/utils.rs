@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
-use snafu::{location, Location};
+use lance_core::location;
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;

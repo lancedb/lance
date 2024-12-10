@@ -6,13 +6,13 @@
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
+use crate::location;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use deepsize::DeepSizeOf;
 use lance_arrow::bfloat16::{
     is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
 };
-use snafu::{location, Location};
 
 mod field;
 mod schema;

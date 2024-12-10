@@ -11,11 +11,11 @@ use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
 use itertools::Itertools;
+use lance_core::location;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use crate::{
     prefilter::PreFilter,

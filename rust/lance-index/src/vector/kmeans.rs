@@ -3,9 +3,9 @@
 
 use arrow_array::{types::ArrowPrimitiveType, ArrayRef, FixedSizeListArray, PrimitiveArray};
 use lance_arrow::FixedSizeListArrayExt;
+use lance_core::location;
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
-use snafu::{location, Location};
 
 use lance_core::{Error, Result};
 use lance_linalg::{

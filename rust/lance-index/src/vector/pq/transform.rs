@@ -7,8 +7,9 @@ use std::sync::Arc;
 use arrow_array::{cast::AsArray, Array, RecordBatch};
 use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
+use lance_core::location;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use super::ProductQuantizer;

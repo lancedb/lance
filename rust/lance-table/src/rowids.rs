@@ -29,7 +29,7 @@ use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use lance_io::ReadBatchParams;
 pub use serde::{read_row_ids, write_row_ids};
 
-use snafu::{location, Location};
+use lance_core::location;
 
 use segment::U64Segment;
 

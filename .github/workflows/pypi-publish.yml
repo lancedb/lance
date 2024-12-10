@@ -17,7 +17,7 @@ jobs:
             extra_args: ""
           - platform: x86_64
             manylinux: "2_28"
-            extra_args: "--features fp16kernels"
+            extra_args: "--features fp16kernels,error_location_github"
           - platform: aarch64
             manylinux: "2_24"
             extra_args: ""
@@ -96,7 +96,7 @@ jobs:
     - uses: ./.github/workflows/build_mac_wheel
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
-        args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
+        args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels,error_location_github"
     - uses: ./.github/workflows/upload_wheel
       with:
         pypi_token: ${{ secrets.PYPI_TOKEN }}

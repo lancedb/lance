@@ -17,10 +17,11 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
+use lance_core::location;
 use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
 use serde::Serialize;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use crate::{Index, IndexType};

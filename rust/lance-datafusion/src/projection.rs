@@ -11,7 +11,8 @@ use datafusion::{
 use datafusion_common::DFSchema;
 use datafusion_physical_expr::{expressions, PhysicalExpr};
 use futures::TryStreamExt;
-use snafu::{location, Location};
+use lance_core::location;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

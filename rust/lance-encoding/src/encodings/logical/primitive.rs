@@ -16,10 +16,10 @@ use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
 use lance_arrow::deepcopy::deep_copy_array;
+use lance_core::location;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::utils::hash::U8SliceKey;
 use log::{debug, trace};
-use snafu::{location, Location};
 
 use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
 use crate::decoder::PerValueDecompressor;
