@@ -31,7 +31,7 @@ use crate::{
 };
 use lance_core::{Error, Result};
 
-use super::primitive::StructuralPrimitiveFieldDecoder;
+use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
 #[derive(Debug)]
 struct SchedulingJobWithStatus<'a> {
@@ -583,10 +583,12 @@ pub struct StructuralStructDecoder {
     children: Vec<Box<dyn StructuralFieldDecoder>>,
     data_type: DataType,
     child_fields: Fields,
+    // The root decoder is slightly different because it cannot have nulls
+    is_root: bool,
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool) -> Self {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Self {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -596,6 +598,7 @@ impl StructuralStructDecoder {
             data_type,
             children,
             child_fields: fields,
+            is_root,
         }
     }
 
@@ -604,8 +607,14 @@ impl StructuralStructDecoder {
         should_validate: bool,
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
-            DataType::Struct(fields) => Box::new(Self::new(fields.clone(), should_validate)),
-            DataType::List(_) | DataType::LargeList(_) => todo!(),
+            DataType::Struct(fields) => Box::new(Self::new(fields.clone(), should_validate, false)),
+            DataType::List(child_field) | DataType::LargeList(child_field) => {
+                let child_decoder = Self::field_to_decoder(child_field, should_validate);
+                Box::new(StructuralListDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                ))
+            }
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
             DataType::Map(_, _) => todo!(),
@@ -633,6 +642,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
+            is_root: self.is_root,
         }))
     }
 
@@ -645,6 +655,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
+    is_root: bool,
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
@@ -657,15 +668,22 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         let mut children = Vec::with_capacity(arrays.len());
         let mut arrays_iter = arrays.into_iter();
         let first_array = arrays_iter.next().unwrap();
+        let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
         let mut repdef = first_array.repdef;
         children.push(first_array.array);
+
         for array in arrays_iter {
+            debug_assert_eq!(length, array.array.len());
             children.push(array.array);
         }
 
-        let validity = repdef.unravel_validity();
+        let validity = if self.is_root {
+            None
+        } else {
+            repdef.unravel_validity(length)
+        };
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),
@@ -836,6 +854,7 @@ impl FieldEncoder for StructStructuralEncoder {
         external_buffers: &mut OutOfLineBuffers,
         mut repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
         if let Some(validity) = struct_array.nulls() {
@@ -848,7 +867,13 @@ impl FieldEncoder for StructStructuralEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
@@ -913,6 +938,7 @@ impl FieldEncoder for StructFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
@@ -921,7 +947,13 @@ impl FieldEncoder for StructFieldEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())

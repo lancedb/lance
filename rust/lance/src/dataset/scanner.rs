@@ -7,7 +7,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, ArrowPrimitiveType, Float32Array, Int64Array, PrimitiveArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -631,7 +633,12 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest<T: ArrowPrimitiveType>(
+        &mut self,
+        column: &str,
+        q: &PrimitiveArray<T>,
+        k: usize,
+    ) -> Result<&mut Self> {
         if !self.prefilter {
             // We can allow fragment scan if the input to nearest is a prefilter.
             // The fragment scan will be performed by the prefilter.
@@ -661,14 +668,20 @@ impl Scanner {
             ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
-                if dt.data_type().is_floating() {
-                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                if dt.data_type() == q.data_type() {
+                    Box::new(q.clone())
+                } else if dt.data_type().is_floating() {
+                    coerce_float_vector(
+                        q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                        FloatType::try_from(dt.data_type())?,
+                    )?
                 } else {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column {} is not a vector column (type: {})",
+                            "Column {} has element type {} and the query vector is {}",
                             column,
-                            field.data_type()
+                            dt.data_type(),
+                            q.data_type(),
                         ),
                         location!(),
                     ));
@@ -1574,7 +1587,9 @@ impl Scanner {
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
-                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
+                DataType::FixedSizeList(subfield, _)
+                    if subfield.data_type().is_floating()
+                        || *subfield.data_type() == DataType::UInt8 => {}
                 _ => {
                     return Err(Error::invalid_input(
                         format!(

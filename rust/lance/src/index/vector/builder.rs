@@ -17,7 +17,7 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
-use lance_index::vector::flat::storage::FlatStorage;
+use lance_index::vector::flat::storage::FlatFloatStorage;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::quantizer::{
     QuantizationMetadata, QuantizationType, QuantizerBuildParams,
@@ -511,7 +511,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + Clone + 'static> IvfIndexBuilde
         // build the sub index, with in-memory storage
         let index_len = {
             let vectors = batch[&self.column].as_fixed_size_list();
-            let flat_storage = FlatStorage::new(vectors.clone(), self.distance_type);
+            let flat_storage = FlatFloatStorage::new(vectors.clone(), self.distance_type);
             let sub_index = S::index_vectors(&flat_storage, sub_index_params)?;
             let path = self.temp_dir.child(format!("index_part{}", part_id));
             let index_batch = sub_index.to_batch()?;

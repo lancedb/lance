@@ -18,8 +18,8 @@ import com.lancedb.lance.spark.read.LanceInputPartition;
 
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
-import org.apache.spark.sql.vectorized.ArrowColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
+import org.apache.spark.sql.vectorized.LanceArrowColumnVector;
 
 import java.io.IOException;
 
@@ -51,8 +51,8 @@ public class LanceFragmentColumnarBatchScanner implements AutoCloseable {
       currentColumnarBatch =
           new ColumnarBatch(
               root.getFieldVectors().stream()
-                  .map(ArrowColumnVector::new)
-                  .toArray(ArrowColumnVector[]::new),
+                  .map(LanceArrowColumnVector::new)
+                  .toArray(LanceArrowColumnVector[]::new),
               root.getRowCount());
       return true;
     }

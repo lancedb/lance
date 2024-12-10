@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import warnings
 from pathlib import Path
@@ -45,16 +46,31 @@ def _fsl_to_tensor(arr: pa.FixedSizeListArray, dimension: int) -> torch.Tensor:
 
 
 def _to_tensor(
-    batch: pa.RecordBatch,
+    batch: Union[pa.RecordBatch, Dict[str, pa.Array]],
     *,
     uint64_as_int64: bool = True,
     hf_converter: Optional[dict] = None,
+    use_blob_api: bool = False,
+    **kwargs,
 ) -> Union[dict[str, torch.Tensor], torch.Tensor]:
     """Convert a pyarrow RecordBatch to torch Tensor."""
     ret = {}
 
-    for col in batch.schema.names:
+    cols = (
+        batch.column_names if isinstance(batch, pa.RecordBatch) else list(batch.keys())
+    )
+    for col in cols:
         arr: pa.Array = batch[col]
+
+        if (
+            use_blob_api
+            and isinstance(arr, list)
+            and arr
+            and isinstance(arr[0], lance.BlobFile)
+        ):
+            raise NotImplementedError(
+                'Need user-provided "to_tensor_fn" for Blob files'
+            )
 
         tensor: torch.Tensor = None
         if (isinstance(arr.type, pa.FixedShapeTensorType)) and (
@@ -234,6 +250,10 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self._to_tensor_fn = to_tensor_fn
         self._hf_converter = None
 
+        self._blob_columns = self._blob_columns()
+        if self._blob_columns:
+            self.with_row_id = True
+
         # As Shared Dataset
         self.shard_granularity = shard_granularity
         self.rank = rank
@@ -258,6 +278,13 @@ class LanceDataset(torch.utils.data.IterableDataset):
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
+    @property
+    def schema(self) -> pa.Schema:
+        if not self.columns:
+            return self.dataset.schema
+        fields = [self.dataset.schema.field(col) for col in self.columns]
+        return pa.schema(fields, metadata=self.dataset.schema.metadata)
+
     def __iter__(self):
         if self.sampler is None:
             if self.rank is not None and self.world_size is not None:
@@ -280,6 +307,12 @@ class LanceDataset(torch.utils.data.IterableDataset):
         else:
             sampler = self.sampler
 
+        projected_columns = self.columns or self.dataset.schema.names
+        if self._blob_columns:
+            projected_columns = [
+                c for c in projected_columns if c not in self._blob_columns
+            ]
+
         stream: Iterable[pa.RecordBatch]
         if self.cached_ds:
             stream = self.cached_ds
@@ -288,14 +321,14 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 raw_stream = maybe_sample(
                     self.dataset,
                     n=self.samples,
-                    columns=self.columns,
+                    columns=projected_columns,
                     batch_size=self.batch_size,
                     filt=self.filter,
                 )
             else:
                 raw_stream = sampler(
                     self.dataset,
-                    columns=self.columns,
+                    columns=projected_columns,
                     filter=self.filter,
                     batch_size=self.batch_size,
                     with_row_id=self.with_row_id,
@@ -308,8 +341,39 @@ class LanceDataset(torch.utils.data.IterableDataset):
                 self.cached_ds = CachedDataset(stream, cache=self.cache)
                 stream = self.cached_ds
 
+        use_blob_api = bool(self._blob_columns)
         for batch in stream:
+            if use_blob_api:
+                dict_batch = {}
+                assert "_rowid" in batch.column_names
+                row_ids = batch["_rowid"]
+                for col in batch.column_names:
+                    dict_batch[col] = batch[col]
+                for col in self._blob_columns:
+                    dict_batch[col] = self.dataset.take_blobs(
+                        row_ids=row_ids.to_pylist(), blob_column=col
+                    )
+                batch = dict_batch
             if self._to_tensor_fn is not None:
-                batch = self._to_tensor_fn(batch, hf_converter=self._hf_converter)
+                batch = self._to_tensor_fn(
+                    batch, hf_converter=self._hf_converter, use_blob_api=use_blob_api
+                )
             yield batch
             del batch
+
+    def _blob_columns(self) -> List[str]:
+        """Returns True if one of the projected column is Large Blob encoded."""
+        cols = self.columns
+        if not cols:
+            cols = self.dataset.schema.names
+        blob_cols = []
+        for col in cols:
+            field = self.dataset.schema.field(col)
+            if (
+                field.type == pa.large_binary()
+                and field.metadata is not None
+                and field.metadata.get(b"lance-encoding:blob") == b"true"
+            ):
+                logging.debug("Column %s is a Large Blob column", col)
+                blob_cols.append(col)
+        return blob_cols

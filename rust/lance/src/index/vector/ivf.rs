@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
@@ -639,6 +640,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     // Write the metadata of quantizer
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
+        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -1656,6 +1658,7 @@ async fn write_ivf_hnsw_file(
     // For PQ, we need to store the codebook
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
+        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -1777,6 +1780,15 @@ async fn train_ivf_model(
         (DataType::Float64, _) => {
             do_train_ivf_model::<Float64Type>(
                 values.as_primitive::<Float64Type>().values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
+        }
+        (DataType::UInt8, DistanceType::Hamming) => {
+            do_train_ivf_model::<UInt8Type>(
+                values.as_primitive::<UInt8Type>().values(),
                 dim,
                 distance_type,
                 params,
@@ -2802,7 +2814,7 @@ mod tests {
             true,
         )]));
 
-        let arr = generate_random_array_with_range(1000 * DIM, 1000.0..1001.0);
+        let arr = generate_random_array_with_range::<Float32Type>(1000 * DIM, 1000.0..1001.0);
         let fsl = FixedSizeListArray::try_new_from_values(arr.clone(), DIM as i32).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());

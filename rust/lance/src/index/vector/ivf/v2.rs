@@ -501,9 +501,11 @@ mod tests {
     use std::collections::HashSet;
     use std::{collections::HashMap, ops::Range, sync::Arc};
 
-    use arrow::datatypes::UInt64Type;
+    use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
-    use arrow_array::{Array, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{
+        Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
 
@@ -514,8 +516,10 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
+    use lance_linalg::distance::hamming::hamming;
     use lance_linalg::distance::DistanceType;
     use lance_testing::datagen::generate_random_array_with_range;
+    use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
     use tempfile::tempdir;
 
@@ -523,27 +527,32 @@ mod tests {
 
     const DIM: usize = 32;
 
-    async fn generate_test_dataset(
+    async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
-        range: Range<f32>,
-    ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
+        range: Range<T::Native>,
+    ) -> (Dataset, Arc<FixedSizeListArray>)
+    where
+        T::Native: SampleUniform,
+    {
+        let vectors = generate_random_array_with_range::<T>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
-
+        let data_type = vectors.data_type().clone();
         let schema: Arc<_> = Schema::new(vec![Field::new(
             "vector",
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
+                Arc::new(Field::new("item", data_type.clone(), true)),
                 DIM as i32,
             ),
             true,
         )])
         .with_metadata(metadata)
         .into();
-        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
-        let fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        if data_type != DataType::UInt8 {
+            fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        }
         let array = Arc::new(fsl);
         let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
 
@@ -555,16 +564,22 @@ mod tests {
     #[allow(dead_code)]
     fn ground_truth(
         vectors: &FixedSizeListArray,
-        query: &[f32],
+        query: &dyn Array,
         k: usize,
         distance_type: DistanceType,
     ) -> Vec<(f32, u64)> {
         let mut dists = vec![];
         for i in 0..vectors.len() {
-            let dist = distance_type.func()(
-                query,
-                vectors.value(i).as_primitive::<Float32Type>().values(),
-            );
+            let dist = match distance_type {
+                DistanceType::Hamming => hamming(
+                    query.as_primitive::<UInt8Type>().values(),
+                    vectors.value(i).as_primitive::<UInt8Type>().values(),
+                ),
+                _ => distance_type.func()(
+                    query.as_primitive::<Float32Type>().values(),
+                    vectors.value(i).as_primitive::<Float32Type>().values(),
+                ),
+            };
             dists.push((dist, i as u64));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -573,12 +588,31 @@ mod tests {
     }
 
     async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2).await;
+            }
+            _ => {
+                test_index_impl::<Float32Type>(params, nlist, recall_requirement, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_index_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        recall_requirement: f32,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
 
+        let vector_column = "vector";
         dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
@@ -586,7 +620,7 @@ mod tests {
         let k = 100;
         let result = dataset
             .scan()
-            .nearest("vector", query.as_primitive::<Float32Type>(), k)
+            .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .nprobs(nlist)
             .with_row_id()
@@ -608,12 +642,7 @@ mod tests {
             .collect::<Vec<_>>();
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
 
-        let gt = ground_truth(
-            &vectors,
-            query.as_primitive::<Float32Type>().values(),
-            k,
-            params.metric_type,
-        );
+        let gt = ground_truth(&vectors, query.as_ref(), k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
@@ -630,6 +659,7 @@ mod tests {
     #[case(4, DistanceType::L2, 1.0)]
     #[case(4, DistanceType::Cosine, 1.0)]
     #[case(4, DistanceType::Dot, 1.0)]
+    #[case(4, DistanceType::Hamming, 0.9)]
     #[tokio::test]
     async fn test_build_ivf_flat(
         #[case] nlist: usize,
@@ -764,7 +794,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 4;
-        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
@@ -807,7 +837,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 1000;
-        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();
