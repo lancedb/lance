@@ -354,7 +354,8 @@ pub mod tests {
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_fsl_packed_struct(
-    #[values(/*LanceFileVersion::V2_0,*/ /*LanceFileVersion::V2_1)*/)] version: LanceFileVersion,
+        #[values(/*LanceFileVersion::V2_0,*/ /*LanceFileVersion::V2_1)*/)]
+        version: LanceFileVersion,
     ) {
         let int_array = Arc::new(Int32Array::from(vec![12, 13, 14, 15]));
 
