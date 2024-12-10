@@ -278,8 +278,10 @@ impl ProtobufUtils {
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
+        repetition_index_depth: u32,
         dictionary_encoding: Option<ArrayEncoding>,
         def_meaning: &[DefinitionInterpretation],
+        num_items: u64,
     ) -> PageLayout {
         assert!(!def_meaning.is_empty());
         PageLayout {
@@ -287,11 +289,13 @@ impl ProtobufUtils {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
+                repetition_index_depth,
                 dictionary: dictionary_encoding,
                 layers: def_meaning
                     .iter()
                     .map(|&def| Self::def_inter_to_repdef_layer(def))
                     .collect(),
+                num_items,
             })),
         }
     }

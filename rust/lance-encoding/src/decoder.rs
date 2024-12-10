@@ -239,7 +239,9 @@ use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::blob::BlobFieldScheduler;
-use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
+use crate::encodings::logical::list::{
+    ListFieldScheduler, OffsetPageInfo, StructuralListScheduler,
+};
 use crate::encodings::logical::primitive::{
     PrimitiveFieldScheduler, StructuralPrimitiveFieldScheduler,
 };
@@ -802,6 +804,16 @@ impl CoreFieldDecoderStrategy {
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)
+            }
+            DataType::List(_) | DataType::LargeList(_) => {
+                let child = field
+                    .children
+                    .first()
+                    .expect("List field must have a child");
+                let child_scheduler =
+                    self.create_structural_field_scheduler(child, column_infos)?;
+                Ok(Box::new(StructuralListScheduler::new(child_scheduler))
+                    as Box<dyn StructuralFieldScheduler>)
             }
             _ => todo!(),
         }

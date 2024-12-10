@@ -611,6 +611,7 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<lance_encoding::encoder::EncodeTask>> {
         // TODO: If we do the zone map calculation as part of the encoding task then we can
         // parallelize statistics gathering.  Could be faster too since the encoding task is
@@ -619,7 +620,7 @@ impl FieldEncoder for ZoneMapsFieldEncoder {
         // to improve write speed.
         self.update(&array)?;
         self.items_encoder
-            .maybe_encode(array, external_buffers, repdef, row_number)
+            .maybe_encode(array, external_buffers, repdef, row_number, num_rows)
     }
 
     fn flush(
