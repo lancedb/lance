@@ -23,5 +23,4 @@ lazy_static::lazy_static! {
     /// Row address field. This is nullable because its validity bitmap is sometimes used
     /// as a selection vector.
     pub static ref ROW_ADDR_FIELD: ArrowField = ArrowField::new(ROW_ADDR, DataType::UInt64, true);
-
 }
