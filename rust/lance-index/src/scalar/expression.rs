@@ -16,6 +16,7 @@ use datafusion_expr::{
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
+use log::warn;
 use tracing::instrument;
 
 use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
@@ -564,9 +565,67 @@ fn visit_comparison(
         let scalar = maybe_scalar(&expr.right, col_type)?;
         query_parser.visit_comparison(column, scalar, &expr.op)
     } else {
-        let (column, col_type, query_parser) = maybe_indexed_column(&expr.right, index_info)?;
-        let scalar = maybe_scalar(&expr.left, col_type)?;
-        query_parser.visit_comparison(column, scalar, &expr.op)
+        // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
+        // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
+        warn!("Unexpected comparison encountered (DF simplifier should have removed this case).  Scalar indices will not be applied");
+        None
+    }
+}
+
+fn maybe_between(expr: &BinaryExpr) -> Option<Between> {
+    let left_comparison = match expr.left.as_ref() {
+        Expr::BinaryExpr(binary_expr) => Some(binary_expr),
+        _ => None,
+    }?;
+    let right_comparison = match expr.right.as_ref() {
+        Expr::BinaryExpr(binary_expr) => Some(binary_expr),
+        _ => None,
+    }?;
+
+    match (left_comparison.op, right_comparison.op) {
+        (Operator::GtEq, Operator::LtEq) => {
+            // We have x >= y && a <= b.
+            // If x == a then it is a between query
+            // if y == b then it is a between query
+            if left_comparison.left == right_comparison.left {
+                Some(Between {
+                    expr: left_comparison.left.clone(),
+                    low: left_comparison.right.clone(),
+                    high: right_comparison.right.clone(),
+                    negated: false,
+                })
+            } else if left_comparison.right == right_comparison.right {
+                Some(Between {
+                    expr: left_comparison.right.clone(),
+                    low: right_comparison.left.clone(),
+                    high: left_comparison.left.clone(),
+                    negated: false,
+                })
+            } else {
+                None
+            }
+        }
+        (Operator::LtEq, Operator::GtEq) => {
+            // Same logic as above we just switch the low/high
+            if left_comparison.left == right_comparison.left {
+                Some(Between {
+                    expr: left_comparison.left.clone(),
+                    low: right_comparison.right.clone(),
+                    high: left_comparison.right.clone(),
+                    negated: false,
+                })
+            } else if left_comparison.right == right_comparison.right {
+                Some(Between {
+                    expr: left_comparison.right.clone(),
+                    low: left_comparison.left.clone(),
+                    high: right_comparison.left.clone(),
+                    negated: false,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -574,6 +633,17 @@ fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
 ) -> Option<IndexedExpression> {
+    // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
+    // can be much more efficient than two separate range queries.  As an optimization we check
+    // to see if this is a between query and, if so, we handle it as a single query
+    //
+    // Note: We can't rely on users writing the SQL BETWEEN operator because:
+    //   * Some users won't realize it's an option or a good idea
+    //   * Datafusion's simplifier will rewrite the BETWEEN operator into two separate range queries
+    if let Some(between) = maybe_between(expr) {
+        return visit_between(&between, index_info);
+    }
+
     let left = visit_node(&expr.left, index_info);
     let right = visit_node(&expr.right, index_info);
     match (left, right) {
@@ -912,9 +982,49 @@ mod tests {
         ]);
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
+        // 5 different ways of writing BETWEEN (all should be recognized)
         check_simple(
             &index_info,
             "aisle BETWEEN 5 AND 10",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+        check_simple(
+            &index_info,
+            "aisle >= 5 AND aisle <= 10",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+
+        check_simple(
+            &index_info,
+            "aisle <= 10 AND aisle >= 5",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+
+        check_simple(
+            &index_info,
+            "5 <= aisle AND 10 >= aisle",
+            "aisle",
+            SargableQuery::Range(
+                Bound::Included(ScalarValue::UInt32(Some(5))),
+                Bound::Included(ScalarValue::UInt32(Some(10))),
+            ),
+        );
+
+        check_simple(
+            &index_info,
+            "10 >= aisle AND 5 <= aisle",
             "aisle",
             SargableQuery::Range(
                 Bound::Included(ScalarValue::UInt32(Some(5))),
@@ -1023,6 +1133,10 @@ mod tests {
                 Bound::Unbounded,
             ),
         );
+        // In the future we can handle this case if we need to.  For
+        // now let's make sure we don't accidentally do the wrong thing
+        // (we were getting this backwards in the past)
+        check_no_index(&index_info, "10 > aisle");
         check_simple(
             &index_info,
             "aisle >= 10",
