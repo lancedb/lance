@@ -32,10 +32,10 @@ def test_data(tmp_path_factory):
         {
             "struct_col": pa.StructArray.from_arrays(
                 [
-                    pc.random(NUM_ROWS).cast(pa.float32()),  # f
-                    pc.random(NUM_ROWS).cast(pa.float32()),  # i
-                    pc.random(NUM_ROWS).cast(pa.float32()),  # i2
-                    pc.random(NUM_ROWS).cast(pa.float32()),  # i3
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f1
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f2
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f3
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f4
                 ],
                 ["f1", "f2", "f3", "f4"],
             )
