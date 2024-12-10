@@ -103,7 +103,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
                 Ok(RecordBatch::try_new(
                     self.schema().clone(),
-                    vec![new_row_ids.clone() as ArrayRef, new_vectors.clone()],
+                    vec![new_row_ids, new_vectors],
                 )?)
             })
             .collect::<Result<Vec<_>>>()?;

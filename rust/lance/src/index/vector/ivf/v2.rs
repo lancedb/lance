@@ -659,9 +659,42 @@ mod tests {
             results,
             gt,
         );
+    }
 
-        // test remap
-        dataset.delete("id = 0").await.unwrap();
+    async fn test_remap(params: VectorIndexParams, nlist: usize) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_remap_impl::<UInt8Type>(params, nlist, 0..2).await;
+            }
+            _ => {
+                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_remap_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let k = 100;
+        // delete half rows to trigger compact
+        dataset.delete("id < 500").await.unwrap();
+        let num_rows = dataset.count_rows(None).await.unwrap();
+        assert_eq!(num_rows, 500);
         compact_files(&mut dataset, CompactionOptions::default(), None)
             .await
             .unwrap();
@@ -691,7 +724,8 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -707,7 +741,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -725,7 +760,8 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -743,7 +779,8 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
