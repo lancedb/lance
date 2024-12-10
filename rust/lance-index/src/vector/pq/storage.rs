@@ -18,6 +18,7 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::location;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::{reader::FileReader, writer::FileWriter};
 use lance_io::{
@@ -30,7 +31,6 @@ use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescri
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
 
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;

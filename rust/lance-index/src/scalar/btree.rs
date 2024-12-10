@@ -29,6 +29,7 @@ use futures::{
     stream::{self},
     FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt,
 };
+use lance_core::location;
 use lance_core::{
     utils::{mask::RowIdTreeMap, tokio::get_num_compute_intensive_cpus},
     Error, Result,
@@ -39,7 +40,6 @@ use lance_datafusion::{
 };
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
-use snafu::{location, Location};
 
 use crate::{Index, IndexType};
 

@@ -32,9 +32,10 @@ use futures::{
     stream::BoxStream,
     StreamExt, TryStreamExt,
 };
+use lance_core::location;
 use log::warn;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use snafu::{location, Location};
+
 use url::Url;
 
 #[cfg(feature = "dynamodb")]

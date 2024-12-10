@@ -27,7 +27,9 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use snafu::{location, Location};
+use lance_core::location;
+use snafu::Location;
+
 use tfrecord::protobuf::feature::Kind;
 use tfrecord::protobuf::{DataType as TensorDataType, TensorProto};
 use tfrecord::record_reader::RecordStream;

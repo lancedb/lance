@@ -12,9 +12,10 @@ use datafusion::physical_plan::{stream::RecordBatchStreamAdapter, SendableRecord
 use datafusion_common::ScalarValue;
 use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
+use lance_core::location;
 use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+
 use tracing::instrument;
 
 use crate::{Index, IndexType};

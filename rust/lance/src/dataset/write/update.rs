@@ -18,11 +18,12 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::error::{box_error, InvalidInputSnafu};
+use lance_core::location;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::expr::safe_coerce_scalar;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
-use snafu::{location, Location, ResultExt};
+use snafu::ResultExt;
 
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::io::commit::commit_transaction;

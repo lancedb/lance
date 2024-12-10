@@ -22,9 +22,10 @@ use datafusion_substrait::substrait::proto::{
     rel, Expression, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel,
     RelRoot, Type,
 };
+use lance_core::location;
 use lance_core::{Error, Result};
 use prost::Message;
-use snafu::{location, Location};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -17,6 +17,7 @@ use async_recursion::async_recursion;
 use async_trait::async_trait;
 use lance_arrow::*;
 use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_io::encodings::{
     binary::BinaryEncoder, dictionary::DictionaryEncoder, plain::PlainEncoder, Encoder,
@@ -25,7 +26,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tokio::io::AsyncWriteExt;
 
 use crate::format::metadata::{Metadata, StatisticsMetadata};

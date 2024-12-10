@@ -10,13 +10,14 @@ use arrow_ipc::CompressionType;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use bytes::Buf;
 use lance_core::error::{box_error, CorruptFileSnafu};
+use lance_core::location;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, Location, ResultExt};
+use snafu::ResultExt;
 use tracing::instrument;
 
 use crate::format::{DeletionFile, DeletionFileType, Fragment};

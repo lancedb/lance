@@ -9,8 +9,8 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
+use lance_core::location;
 use object_store::path::Path;
-use snafu::{location, Location};
 
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;

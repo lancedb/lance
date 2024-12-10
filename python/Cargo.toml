@@ -64,6 +64,7 @@ bytes = "1.4"
 [features]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
+error_location_github = ["lance-core/error_location_github"]
 
 [build-dependencies]
 prost-build = "0.11"

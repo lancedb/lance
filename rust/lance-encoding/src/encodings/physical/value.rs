@@ -5,8 +5,9 @@ use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
+use lance_core::location;
 use log::trace;
-use snafu::{location, Location};
+
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 

@@ -13,12 +13,13 @@ use arrow_schema::DataType;
 use deepsize::DeepSizeOf;
 use distance::build_distance_table_dot;
 use lance_arrow::*;
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
 use num_traits::Float;
 use prost::Message;
-use snafu::{location, Location};
+
 use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADATA_KEY};
 use tracing::instrument;
 

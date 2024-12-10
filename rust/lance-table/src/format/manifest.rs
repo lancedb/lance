@@ -20,10 +20,10 @@ use crate::feature_flags::{has_deprecated_v2_feature_flag, FLAG_MOVE_STABLE_ROW_
 use crate::format::pb;
 use lance_core::cache::FileMetadataCache;
 use lance_core::datatypes::{Schema, StorageClass};
+use lance_core::location;
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_struct;
-use snafu::{location, Location};
 
 /// Manifest of a dataset
 ///

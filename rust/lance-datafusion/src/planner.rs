@@ -49,7 +49,7 @@ use datafusion::{
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::cast::cast_with_options;
 use lance_core::datatypes::Schema;
-use snafu::{location, Location};
+use lance_core::location;
 
 use lance_core::{Error, Result};
 

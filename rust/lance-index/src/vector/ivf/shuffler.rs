@@ -28,6 +28,7 @@ use futures::stream::repeat_with;
 use futures::{stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::{CapacityMode, FileMetadataCache};
+use lance_core::location;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -43,7 +44,7 @@ use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tempfile::TempDir;
 
 use crate::vector::ivf::IvfTransformer;

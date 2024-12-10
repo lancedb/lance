@@ -7,6 +7,7 @@ use arrow_array::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
+use lance_core::location;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -19,7 +20,7 @@ use lance_table::format::{DataFile, Fragment};
 use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
+
 use tracing::instrument;
 use uuid::Uuid;
 
