@@ -505,6 +505,7 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
@@ -523,6 +524,7 @@ mod tests {
     use rstest::rstest;
     use tempfile::tempdir;
 
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::{index::vector::VectorIndexParams, Dataset};
 
     const DIM: usize = 32;
@@ -534,19 +536,23 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
+        let ids = Arc::new(UInt64Array::from_iter_values(0..1000));
         let vectors = generate_random_array_with_range::<T>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
         let data_type = vectors.data_type().clone();
-        let schema: Arc<_> = Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", data_type.clone(), true)),
-                DIM as i32,
+        let schema: Arc<_> = Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
             ),
-            true,
-        )])
+        ])
         .with_metadata(metadata)
         .into();
         let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
@@ -554,7 +560,7 @@ mod tests {
             fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
         }
         let array = Arc::new(fsl);
-        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
@@ -653,6 +659,24 @@ mod tests {
             results,
             gt,
         );
+
+        // test remap
+        dataset.delete("id = 0").await.unwrap();
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        // query again, the result should not include the deleted row
+        let result = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = result["id"].as_primitive::<UInt64Type>();
+        assert_ne!(row_ids.values()[0], 0);
     }
 
     #[rstest]
