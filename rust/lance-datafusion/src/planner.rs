@@ -757,13 +757,13 @@ impl Planner {
                 let low = self.parse_sql_expr(low)?;
                 let high = self.parse_sql_expr(high)?;
 
-                let foo = Expr::Between(Between::new(
+                let between = Expr::Between(Between::new(
                     Box::new(expr),
                     *negated,
                     Box::new(low),
                     Box::new(high),
                 ));
-                Ok(foo)
+                Ok(between)
             }
             _ => Err(Error::invalid_input(
                 format!("Expression '{expr}' is not supported SQL in lance"),
