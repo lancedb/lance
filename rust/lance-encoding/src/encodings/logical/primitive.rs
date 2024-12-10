@@ -26,7 +26,7 @@ use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
-    DefinitionInterpretation,
+    DefinitionInterpretation, RepDefSlicer,
 };
 use crate::statistics::{ComputeStat, GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
@@ -1647,6 +1647,8 @@ pub struct AccumulationQueue {
     current_bytes: u64,
     // Row number of the first item in buffered_arrays, reset on flush
     row_number: u64,
+    // Number of top level rows represented in buffered_arrays, reset on flush
+    num_rows: u64,
     // This is only for logging / debugging purposes
     column_index: u32,
 }
@@ -1660,15 +1662,22 @@ impl AccumulationQueue {
             column_index,
             keep_original_array,
             row_number: u64::MAX,
+            num_rows: 0,
         }
     }
 
     /// Adds an array to the queue, if there is enough data then the queue is flushed
     /// and returned
-    pub fn insert(&mut self, array: ArrayRef, row_number: u64) -> Option<(Vec<ArrayRef>, u64)> {
+    pub fn insert(
+        &mut self,
+        array: ArrayRef,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.row_number == u64::MAX {
             self.row_number = row_number;
         }
+        self.num_rows += num_rows;
         self.current_bytes += array.get_array_memory_size() as u64;
         if self.current_bytes > self.cache_bytes {
             debug!(
@@ -1680,7 +1689,13 @@ impl AccumulationQueue {
             self.current_bytes = 0;
             let row_number = self.row_number;
             self.row_number = u64::MAX;
-            Some((std::mem::take(&mut self.buffered_arrays), row_number))
+            let num_rows = self.num_rows;
+            self.num_rows = 0;
+            Some((
+                std::mem::take(&mut self.buffered_arrays),
+                row_number,
+                num_rows,
+            ))
         } else {
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
@@ -1696,7 +1711,7 @@ impl AccumulationQueue {
         }
     }
 
-    pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64)> {
+    pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.buffered_arrays.is_empty() {
             trace!(
                 "No final flush since no data at column {}",
@@ -1711,8 +1726,14 @@ impl AccumulationQueue {
             );
             self.current_bytes = 0;
             let row_number = self.row_number;
-            self.row_number = 0;
-            Some((std::mem::take(&mut self.buffered_arrays), row_number))
+            self.row_number = u64::MAX;
+            let num_rows = self.num_rows;
+            self.num_rows = 0;
+            Some((
+                std::mem::take(&mut self.buffered_arrays),
+                row_number,
+                num_rows,
+            ))
         }
     }
 }
@@ -1815,9 +1836,10 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         array: ArrayRef,
         _external_buffers: &mut OutOfLineBuffers,
         _repdef: RepDefBuilder,
-        _row_number: u64,
+        row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(arrays) = self.accumulation_queue.insert(array, /*row_number=*/ 0) {
+        if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
             Ok(self.do_flush(arrays.0)?)
         } else {
             Ok(vec![])
@@ -1947,7 +1969,8 @@ impl PrimitiveStructuralEncoder {
 
     // Converts value data, repetition levels, and definition levels into a single
     // buffer of mini-blocks.  In addition, creates a buffer of mini-block metadata
-    // which tells us the size of each block.
+    // which tells us the size of each block.  Finally, if repetition is present then
+    // we also create a buffer for the repetition index.
     //
     // Each chunk is serialized as:
     // | rep_len (2 bytes) | def_len (2 bytes) | values_len (2 bytes) | rep | P1 | def | P2 | values | P3 |
@@ -1975,6 +1998,28 @@ impl PrimitiveStructuralEncoder {
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
+    //
+    // If there is repetition then we also create a repetition index.  This is a
+    // single buffer of integer vectors (stored in row major order).  There is one
+    // entry for each chunk.  The size of the vector is based on the depth of random
+    // access we want to support.
+    //
+    // A vector of size 2 is the minimum and will support row-based random access (e.g.
+    // "take the 57th row").  A vector of size 3 will support 1 level of nested access
+    // (e.g. "take the 3rd item in the 57th row").  A vector of size 4 will support 2
+    // levels of nested access and so on.
+    //
+    // The first number in the vector is the number of top-level rows that complete in
+    // the chunk.  The second number is the number of second-level rows that complete
+    // after the final top-level row completed (or beginning of the chunk if no top-level
+    // row completes in the chunk).  And so on.  The final number in the vector is always
+    // the number of leftover items not covered by earlier entries in the vector.
+    //
+    // Currently we are limited to 0 levels of nested access but that will change in the
+    // future.
+    //
+    // The repetition index and the chunk metadata are read at initialization time and
+    // cached in memory.
     fn serialize_miniblocks(
         miniblocks: MiniBlockCompressed,
         rep: Vec<LanceBuffer>,
@@ -2054,20 +2099,30 @@ impl PrimitiveStructuralEncoder {
     /// Compresses a buffer of levels into chunks
     ///
     /// TODO: Use bit-packing here
+    ///
+    /// If these are repetition levels then we also calculate the repetition index here (that
+    /// is the third return value)
     fn compress_levels(
-        levels: Option<Arc<[u16]>>,
+        levels: Option<RepDefSlicer<'_>>,
         num_values: u64,
         compression_strategy: &dyn CompressionStrategy,
         chunks: &[MiniBlockChunk],
-    ) -> Result<(Vec<LanceBuffer>, pb::ArrayEncoding)> {
-        if let Some(levels) = levels {
-            debug_assert_eq!(num_values as usize, levels.len());
+        // This will be 0 if we are compressing def levels
+        max_rep: u16,
+    ) -> Result<(Vec<LanceBuffer>, pb::ArrayEncoding, LanceBuffer)> {
+        if let Some(mut levels) = levels {
+            let mut rep_index = if max_rep > 0 {
+                Vec::with_capacity(chunks.len())
+            } else {
+                vec![]
+            };
             // Make the levels into a FixedWidth data block
-            let mut levels_buf = LanceBuffer::reinterpret_slice(levels);
+            let num_levels = levels.num_levels() as u64;
+            let mut levels_buf = levels.all_levels().try_clone().unwrap();
             let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: levels_buf.borrow_and_clone(),
                 bits_per_value: 16,
-                num_values,
+                num_values: num_levels,
                 block_info: BlockInfo::new(),
             });
             let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
@@ -2076,31 +2131,76 @@ impl PrimitiveStructuralEncoder {
                 compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
             // Compress blocks of levels (sized according to the chunks)
             let mut buffers = Vec::with_capacity(chunks.len());
-            let mut off = 0;
             let mut values_counter = 0;
-            for chunk in chunks {
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let chunk_num_values = chunk.num_values(values_counter, num_values);
                 values_counter += chunk_num_values;
-                let level_bytes = chunk_num_values as usize * 2;
-                let chunk_levels = levels_buf.slice_with_length(off, level_bytes);
+                let mut chunk_levels = levels.slice_next(chunk_num_values as usize);
+                let num_chunk_levels = (chunk_levels.len() / 2) as u64;
+                if max_rep > 0 {
+                    // If max_rep > 0 then we are working with rep levels and we need
+                    // to calculate the repetition index.  The repetition index for a
+                    // chunk is currently 2 values (in the future it may be more).
+                    //
+                    // The first value is the number of rows that _finish_ in the
+                    // chunk.
+                    //
+                    // The second value is the number of "leftovers" after the last
+                    // finished row in the chunk.
+                    let rep_values = chunk_levels.borrow_to_typed_slice::<u16>();
+                    let rep_values = rep_values.as_ref();
+
+                    let mut num_rows = rep_values.iter().filter(|v| **v == max_rep).count();
+                    let num_leftovers = if chunk_idx < chunks.len() - 1 {
+                        rep_values
+                            .iter()
+                            .rev()
+                            .position(|v| *v == max_rep)
+                            // # of leftovers includes the max_rep spot
+                            .map(|pos| pos + 1)
+                            .unwrap_or(rep_values.len())
+                    } else {
+                        // Last chunk can't have leftovers
+                        0
+                    };
+
+                    if chunk_idx != 0 && rep_values[0] == max_rep {
+                        // This chunk starts with a new row and so, if we thought we had leftovers
+                        // in the previous chunk, we were mistaken
+                        *rep_index.last_mut().unwrap() = 0;
+                    }
+
+                    // The rep index records "completed lists" and so the first max_rep doesn't count
+                    // and we add one to the last chunk (since we don't have a rep val for the last row)
+                    //
+                    // Note: both cases are true if there is only one chunk and they cancel out
+                    if chunk_idx == 0 {
+                        num_rows -= 1;
+                    }
+                    if chunk_idx == chunks.len() - 1 {
+                        num_rows += 1;
+                    }
+                    rep_index.push(num_rows as u64);
+                    rep_index.push(num_leftovers as u64);
+                }
                 let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                     data: chunk_levels,
                     bits_per_value: 16,
-                    num_values: chunk_num_values,
+                    num_values: num_chunk_levels,
                     block_info: BlockInfo::new(),
                 });
                 let compressed_levels = compressor.compress(chunk_levels_block)?;
-                off += level_bytes;
                 buffers.push(compressed_levels);
             }
-            Ok((buffers, compressor_desc))
+            let rep_index = LanceBuffer::reinterpret_vec(rep_index);
+            Ok((buffers, compressor_desc, rep_index))
         } else {
             // Everything is valid or we have no repetition so we encode as a constant
             // array of 0
             let data = chunks.iter().map(|_| LanceBuffer::empty()).collect();
             let scalar = 0_u16.to_le_bytes().to_vec();
             let encoding = ProtobufUtils::constant(scalar, num_values);
-            Ok((data, encoding))
+            Ok((data, encoding, LanceBuffer::empty()))
         }
     }
 
@@ -2119,6 +2219,7 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_miniblock(
         column_idx: u32,
         field: &Field,
@@ -2127,6 +2228,7 @@ impl PrimitiveStructuralEncoder {
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
         dictionary_data: Option<DataBlock>,
+        num_rows: u64,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
 
@@ -2136,25 +2238,36 @@ impl PrimitiveStructuralEncoder {
             todo!()
         }
 
-        let num_values = data.num_values();
+        let num_items = data.num_values();
         // The validity is encoded in repdef so we can remove it
         let data = data.remove_validity();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
-        let (compressed_rep, rep_encoding) = Self::compress_levels(
-            repdef.repetition_levels,
-            num_values,
+        let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
+
+        let (compressed_rep, rep_encoding, rep_index) = Self::compress_levels(
+            repdef.rep_slicer(),
+            num_items,
             compression_strategy,
             &compressed_data.chunks,
+            max_rep,
         )?;
 
-        let (compressed_def, def_encoding) = Self::compress_levels(
-            repdef.definition_levels,
-            num_values,
+        let (rep_index, rep_index_depth) = if rep_index.is_empty() {
+            (None, 0)
+        } else {
+            // TODO: Support repetition index depth > 1
+            (Some(rep_index), 1)
+        };
+
+        let (compressed_def, def_encoding, _) = Self::compress_levels(
+            repdef.def_slicer(),
+            num_items,
             compression_strategy,
             &compressed_data.chunks,
+            /*max_rep=*/ 0,
         )?;
 
         // TODO: Parquet sparsely encodes values here.  We could do the same but
@@ -2165,6 +2278,11 @@ impl PrimitiveStructuralEncoder {
         let (block_value_buffer, block_meta_buffer) =
             Self::serialize_miniblocks(compressed_data, compressed_rep, compressed_def);
 
+        // Metadata, Data, Dictionary, (maybe) Repetition Index
+        let mut data = Vec::with_capacity(4);
+        data.push(block_meta_buffer);
+        data.push(block_value_buffer);
+
         if let Some(dictionary_data) = dictionary_data {
             // field in `create_block_compressor` is not used currently.
             let dummy_dictionary_field = Field::new_arrow("", DataType::UInt16, false)?;
@@ -2173,17 +2291,24 @@ impl PrimitiveStructuralEncoder {
                 .create_block_compressor(&dummy_dictionary_field, &dictionary_data)?;
             let dictionary_buffer = compressor.compress(dictionary_data)?;
 
+            data.push(dictionary_buffer);
+            if let Some(rep_index) = rep_index {
+                data.push(rep_index);
+            }
+
             let description = ProtobufUtils::miniblock_layout(
                 rep_encoding,
                 def_encoding,
                 value_encoding,
+                rep_index_depth,
                 Some(dictionary_encoding),
                 &repdef.def_meaning,
+                num_items,
             );
             Ok(EncodedPage {
-                num_rows: num_values,
+                num_rows,
                 column_idx,
-                data: vec![block_meta_buffer, block_value_buffer, dictionary_buffer],
+                data,
                 description: PageEncoding::Structural(description),
                 row_number,
             })
@@ -2192,13 +2317,20 @@ impl PrimitiveStructuralEncoder {
                 rep_encoding,
                 def_encoding,
                 value_encoding,
+                rep_index_depth,
                 None,
                 &repdef.def_meaning,
+                num_items,
             );
+
+            if let Some(rep_index) = rep_index {
+                data.push(rep_index);
+            }
+
             Ok(EncodedPage {
-                num_rows: num_values,
+                num_rows,
                 column_idx,
-                data: vec![block_meta_buffer, block_value_buffer],
+                data,
                 description: PageEncoding::Structural(description),
                 row_number,
             })
@@ -2446,6 +2578,7 @@ impl PrimitiveStructuralEncoder {
         arrays: Vec<ArrayRef>,
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let column_idx = self.column_index;
         let compression_strategy = self.compression_strategy.clone();
@@ -2488,6 +2621,7 @@ impl PrimitiveStructuralEncoder {
                         repdefs,
                         row_number,
                         Some(dictionary_data_block),
+                        num_rows,
                     )
                 } else if Self::is_narrow(&data_block) {
                     log::debug!(
@@ -2503,6 +2637,7 @@ impl PrimitiveStructuralEncoder {
                         repdefs,
                         row_number,
                         None,
+                        num_rows,
                     )
                 } else {
                     log::debug!(
@@ -2554,13 +2689,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         _external_buffers: &mut OutOfLineBuffers,
         mut repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         Self::extract_validity(array.as_ref(), &mut repdef);
         self.accumulated_repdefs.push(repdef);
 
-        if let Some((arrays, row_number)) = self.accumulation_queue.insert(array, row_number) {
+        if let Some((arrays, row_number, num_rows)) =
+            self.accumulation_queue.insert(array, row_number, num_rows)
+        {
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number)?)
+            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
         } else {
             Ok(vec![])
         }
@@ -2568,9 +2706,9 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
-        if let Some((arrays, row_number)) = self.accumulation_queue.flush() {
+        if let Some((arrays, row_number, num_rows)) = self.accumulation_queue.flush() {
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number)?)
+            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
         } else {
             Ok(vec![])
         }

@@ -1668,6 +1668,9 @@ class LanceDataset(pa.dataset.Dataset):
         Optional parameters for "IVF_PQ":
             ivf_centroids :
                 K-mean centroids for IVF clustering.
+            num_bits : int, optional
+                The number of bits for PQ (Product Quantization). Default is 8.
+                Only 4, 8 are supported.
 
         Optional parameters for "IVF_HNSW_*":
             max_level : int
