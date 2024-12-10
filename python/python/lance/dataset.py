@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import json
-import logging
 import os
 import random
 import time
@@ -34,6 +33,8 @@ from typing import (
 import pyarrow as pa
 import pyarrow.dataset
 from pyarrow import RecordBatch, Schema
+
+from lance.log import LOGGER
 
 from .blob import BlobFile
 from .dependencies import (
@@ -216,9 +217,13 @@ class LanceDataset(pa.dataset.Dataset):
         )
 
     def __setstate__(self, state):
-        self._uri, self._storage_options, version, manifest, default_scan_options = (
-            state
-        )
+        (
+            self._uri,
+            self._storage_options,
+            version,
+            manifest,
+            default_scan_options,
+        ) = state
         self._ds = _Dataset(
             self._uri,
             version,
@@ -1790,7 +1795,7 @@ class LanceDataset(pa.dataset.Dataset):
                 one_pass_train_ivf_pq_on_accelerator,
             )
 
-            logging.info("Doing one-pass ivfpq accelerated computations")
+            LOGGER.info("Doing one-pass ivfpq accelerated computations")
 
             timers["ivf+pq_train:start"] = time.time()
             (
@@ -1810,7 +1815,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
             timers["ivf+pq_train:end"] = time.time()
             ivfpq_train_time = timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-            logging.info("ivf+pq training time: %ss", ivfpq_train_time)
+            LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
             timers["ivf+pq_assign:start"] = time.time()
             shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
                 self,
@@ -1826,7 +1831,7 @@ class LanceDataset(pa.dataset.Dataset):
             ivfpq_assign_time = (
                 timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
             )
-            logging.info("ivf+pq transform time: %ss", ivfpq_assign_time)
+            LOGGER.info("ivf+pq transform time: %ss", ivfpq_assign_time)
 
             kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
             kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
@@ -1866,7 +1871,7 @@ class LanceDataset(pa.dataset.Dataset):
                     " precomputed_partition_dataset is provided"
                 )
             if precomputed_partition_dataset is not None:
-                logging.info("Using provided precomputed partition dataset")
+                LOGGER.info("Using provided precomputed partition dataset")
                 precomputed_ds = LanceDataset(
                     precomputed_partition_dataset, storage_options=storage_options
                 )
@@ -1891,7 +1896,7 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["precomputed_partitions_file"] = precomputed_partition_dataset
 
             if accelerator is not None and ivf_centroids is None and not one_pass_ivfpq:
-                logging.info("Computing new precomputed partition dataset")
+                LOGGER.info("Computing new precomputed partition dataset")
                 # Use accelerator to train ivf centroids
                 from .vector import (
                     compute_partitions,
@@ -1909,7 +1914,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 timers["ivf_train:end"] = time.time()
                 ivf_train_time = timers["ivf_train:end"] - timers["ivf_train:start"]
-                logging.info("ivf training time: %ss", ivf_train_time)
+                LOGGER.info("ivf training time: %ss", ivf_train_time)
                 timers["ivf_assign:start"] = time.time()
                 num_sub_vectors_cur = None
                 if "PQ" in index_type and pq_codebook is None:
@@ -1925,7 +1930,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 timers["ivf_assign:end"] = time.time()
                 ivf_assign_time = timers["ivf_assign:end"] - timers["ivf_assign:start"]
-                logging.info("ivf transform time: %ss", ivf_assign_time)
+                LOGGER.info("ivf transform time: %ss", ivf_assign_time)
                 kwargs["precomputed_partitions_file"] = partitions_file
 
             if (ivf_centroids is None) and (pq_codebook is not None):
@@ -1973,7 +1978,7 @@ class LanceDataset(pa.dataset.Dataset):
                 and "precomputed_partitions_file" in kwargs
                 and not one_pass_ivfpq
             ):
-                logging.info("Computing new precomputed shuffle buffers for PQ.")
+                LOGGER.info("Computing new precomputed shuffle buffers for PQ.")
                 partitions_file = kwargs["precomputed_partitions_file"]
                 del kwargs["precomputed_partitions_file"]
 
@@ -1993,7 +1998,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 timers["pq_train:end"] = time.time()
                 pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
-                logging.info("pq training time: %ss", pq_train_time)
+                LOGGER.info("pq training time: %ss", pq_train_time)
                 timers["pq_assign:start"] = time.time()
                 shuffle_output_dir, shuffle_buffers = compute_pq_codes(
                     partitions_ds,
@@ -2002,12 +2007,12 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 timers["pq_assign:end"] = time.time()
                 pq_assign_time = timers["pq_assign:end"] - timers["pq_assign:start"]
-                logging.info("pq transform time: %ss", pq_assign_time)
+                LOGGER.info("pq transform time: %ss", pq_assign_time)
                 # Save disk space
                 if precomputed_partition_dataset is not None and os.path.exists(
                     partitions_file
                 ):
-                    logging.info(
+                    LOGGER.info(
                         "Temporary partitions file stored at %s,"
                         "you may want to delete it.",
                         partitions_file,
@@ -2059,12 +2064,12 @@ class LanceDataset(pa.dataset.Dataset):
         final_create_index_time = (
             timers["final_create_index:end"] - timers["final_create_index:start"]
         )
-        logging.info("Final create_index rust time: %ss", final_create_index_time)
+        LOGGER.info("Final create_index rust time: %ss", final_create_index_time)
         # Save disk space
         if "precomputed_shuffle_buffers_path" in kwargs.keys() and os.path.exists(
             kwargs["precomputed_shuffle_buffers_path"]
         ):
-            logging.info(
+            LOGGER.info(
                 "Temporary shuffle buffers stored at %s, you may want to delete it.",
                 kwargs["precomputed_shuffle_buffers_path"],
             )
@@ -3408,6 +3413,7 @@ def write_dataset(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
+    enable_move_stable_row_ids: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -3461,6 +3467,11 @@ def write_dataset(
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
+    enable_move_stable_row_ids : bool, optional
+        Experimental parameter: if set to true, the writer will use move-stable row ids.
+        These row ids are stable after compaction operations, but not after updates.
+        This makes compaction more efficient, since with stable row ids no
+        secondary indices need to be updated to point to new row ids.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -3494,6 +3505,7 @@ def write_dataset(
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
+        "enable_move_stable_row_ids": enable_move_stable_row_ids,
     }
 
     if commit_lock:

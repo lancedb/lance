@@ -737,7 +737,7 @@ mod tests {
         let dataset = Dataset::open(test_uri).await.unwrap();
         let stream = dataset
             .scan()
-            .nearest("vector", q.as_primitive(), 10)
+            .nearest("vector", q.as_primitive::<Float32Type>(), 10)
             .unwrap()
             .try_into_stream()
             .await

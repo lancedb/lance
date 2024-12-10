@@ -19,7 +19,7 @@ use snafu::{location, Location};
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 
-use super::flat::index::FlatQuantizer;
+use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
 use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
 
@@ -98,6 +98,7 @@ impl QuantizerBuildParams for () {
 #[derive(Debug, Clone, DeepSizeOf)]
 pub enum Quantizer {
     Flat(FlatQuantizer),
+    FlatBin(FlatBinQuantizer),
     Product(ProductQuantizer),
     Scalar(ScalarQuantizer),
 }
@@ -106,6 +107,7 @@ impl Quantizer {
     pub fn code_dim(&self) -> usize {
         match self {
             Self::Flat(fq) => fq.code_dim(),
+            Self::FlatBin(fq) => fq.code_dim(),
             Self::Product(pq) => pq.code_dim(),
             Self::Scalar(sq) => sq.code_dim(),
         }
@@ -114,6 +116,7 @@ impl Quantizer {
     pub fn column(&self) -> &'static str {
         match self {
             Self::Flat(fq) => fq.column(),
+            Self::FlatBin(fq) => fq.column(),
             Self::Product(pq) => pq.column(),
             Self::Scalar(sq) => sq.column(),
         }
@@ -122,6 +125,7 @@ impl Quantizer {
     pub fn metadata_key(&self) -> &'static str {
         match self {
             Self::Flat(_) => FlatQuantizer::metadata_key(),
+            Self::FlatBin(_) => FlatBinQuantizer::metadata_key(),
             Self::Product(_) => ProductQuantizer::metadata_key(),
             Self::Scalar(_) => ScalarQuantizer::metadata_key(),
         }
@@ -130,6 +134,7 @@ impl Quantizer {
     pub fn quantization_type(&self) -> QuantizationType {
         match self {
             Self::Flat(_) => QuantizationType::Flat,
+            Self::FlatBin(_) => QuantizationType::Flat,
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
         }
@@ -138,6 +143,7 @@ impl Quantizer {
     pub fn metadata(&self, args: Option<QuantizationMetadata>) -> Result<serde_json::Value> {
         match self {
             Self::Flat(fq) => fq.metadata(args),
+            Self::FlatBin(fq) => fq.metadata(args),
             Self::Product(pq) => pq.metadata(args),
             Self::Scalar(sq) => sq.metadata(args),
         }

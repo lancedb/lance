@@ -1673,7 +1673,7 @@ mod tests {
             let mut scanner = dataset.scan();
 
             scanner
-                .nearest("vec", &vec![0.0; 128].into(), 10)
+                .nearest("vec", &vec![0.0f32; 128].into(), 10)
                 .unwrap()
                 .project(&["i"])
                 .unwrap();

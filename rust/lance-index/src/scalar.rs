@@ -165,7 +165,7 @@ pub trait IndexWriter: Send {
 #[async_trait]
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
-    async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.
