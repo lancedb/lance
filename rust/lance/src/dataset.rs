@@ -23,13 +23,15 @@ use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
-    DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
+    transaction::{ManifestWriteConfig, Operation, Transaction},
+    Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
 };
 use lance_table::io::commit::{
     migrate_scheme_to_v2, CommitError, CommitHandler, CommitLock, ManifestLocation,
     ManifestNamingScheme,
 };
 use lance_table::io::manifest::{read_manifest, write_manifest};
+use lance_table::utils::timestamp_to_nanos;
 use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
@@ -65,13 +67,12 @@ use self::cleanup::RemovalStats;
 use self::fragment::FileFragment;
 use self::refs::Tags;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
-use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
 use crate::io::commit::{commit_detached_transaction, commit_new_dataset, commit_transaction};
 use crate::session::Session;
-use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
+use crate::utils::temporal::utc_now;
 use crate::{Error, Result};
 pub use blob::BlobFile;
 use hash_joiner::HashJoiner;
@@ -571,13 +572,12 @@ impl Dataset {
         let (latest_manifest, _) = self.latest_manifest().await?;
         let latest_version = latest_manifest.version;
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             latest_version,
             Operation::Restore {
                 version: self.manifest.version,
             },
             /*blobs_op=*/ None,
-            None,
         );
 
         let (restored_manifest, path) = commit_transaction(
@@ -656,7 +656,7 @@ impl Dataset {
             Ok,
         )?;
 
-        let transaction = Transaction::new(read_version, operation, blobs_op, None);
+        let transaction = Transaction::new_v1(read_version, operation, blobs_op);
 
         let mut builder = CommitBuilder::new(base_uri)
             .with_object_store_registry(object_store_registry)
@@ -914,7 +914,7 @@ impl Dataset {
             })
             .await?;
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::Delete {
                 updated_fragments,
@@ -924,7 +924,6 @@ impl Dataset {
             // No change is needed to the blobs dataset.  The blobs are implicitly deleted since the
             // rows that reference them are deleted.
             /*blobs_op=*/
-            None,
             None,
         );
 
@@ -1445,7 +1444,7 @@ impl Dataset {
             .try_collect::<Vec<_>>()
             .await?;
 
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::Merge {
                 fragments: updated_fragments,
@@ -1453,7 +1452,6 @@ impl Dataset {
             },
             // It is not possible to add blob columns using merge
             /*blobs_op=*/
-            None,
             None,
         );
 
@@ -1500,14 +1498,13 @@ impl Dataset {
         &mut self,
         upsert_values: impl IntoIterator<Item = (String, String)>,
     ) -> Result<()> {
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::UpdateConfig {
                 upsert_values: Some(HashMap::from_iter(upsert_values)),
                 delete_keys: None,
             },
             /*blobs_op=*/ None,
-            None,
         );
 
         let (manifest, manifest_path) = commit_transaction(
@@ -1529,14 +1526,13 @@ impl Dataset {
 
     /// Delete keys from the config.
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        let transaction = Transaction::new(
+        let transaction = Transaction::new_v1(
             self.manifest.version,
             Operation::UpdateConfig {
                 upsert_values: None,
                 delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
             },
             /*blob_op=*/ None,
-            None,
         );
 
         let (manifest, manifest_path) = commit_transaction(
@@ -1565,27 +1561,6 @@ impl DatasetTakeRows for Dataset {
 
     async fn take_rows(&self, row_ids: &[u64], projection: &Schema) -> Result<RecordBatch> {
         Self::take_rows(self, row_ids, projection.clone()).await
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ManifestWriteConfig {
-    auto_set_feature_flags: bool,              // default true
-    timestamp: Option<SystemTime>,             // default None
-    use_move_stable_row_ids: bool,             // default false
-    use_legacy_format: Option<bool>,           // default None
-    storage_format: Option<DataStorageFormat>, // default None
-}
-
-impl Default for ManifestWriteConfig {
-    fn default() -> Self {
-        Self {
-            auto_set_feature_flags: true,
-            timestamp: None,
-            use_move_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-        }
     }
 }
 
@@ -2025,7 +2000,7 @@ mod tests {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
     ) {
-        use lance_table::feature_flags::FLAG_UNKNOWN;
+        use lance_table::{feature_flags::FLAG_UNKNOWN, format::DataStorageFormat};
 
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
