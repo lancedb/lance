@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
     TypedDict,
     Union,
 )
@@ -105,9 +106,37 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         return super(MergeInsertBuilder, self).execute(reader)
 
+    def execute_uncommitted(
+        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
+    ) -> Tuple[Transaction, Dict[str, Any]]:
+        """Executes the merge insert operation without committing
+
+        This function updates the original dataset and returns a dictionary with
+        information about merge statistics - i.e. the number of inserted, updated,
+        and deleted rows.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
+        reader = _coerce_reader(data_obj, schema)
+
+        transaction, stats = super(MergeInsertBuilder, self).execute_uncommitted(reader)
+        transaction = Transaction(**transaction)
+        return transaction, stats
+
     # These next three overrides exist only to document the methods
 
-    def when_matched_update_all(self, condition: Optional[str] = None):
+    def when_matched_update_all(
+        self, condition: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to update matched rows
 
@@ -128,7 +157,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
-    def when_not_matched_insert_all(self):
+    def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows
 
@@ -138,7 +167,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_not_matched_insert_all()
 
-    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+    def when_not_matched_by_source_delete(
+        self, expr: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to delete source rows that do not match
 
@@ -2101,7 +2132,7 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def commit(
         base_uri: Union[str, Path, LanceDataset],
-        operation: LanceOperation.BaseOperation,
+        operation: Union[LanceOperation.BaseOperation, Transaction],
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -2214,16 +2245,32 @@ class LanceDataset(pa.dataset.Dataset):
                 "Overwrite and Restore"
             )
 
-        new_ds = _Dataset.commit(
-            base_uri,
-            operation._to_inner(),
-            read_version,
-            commit_lock,
-            storage_options=storage_options,
-            enable_v2_manifest_paths=enable_v2_manifest_paths,
-            detached=detached,
-            max_retries=max_retries,
-        )
+        if isinstance(operation, Transaction):
+            new_ds = _Dataset.commit_transaction(
+                base_uri,
+                operation,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        elif isinstance(operation, LanceOperation.BaseOperation):
+            new_ds = _Dataset.commit(
+                base_uri,
+                operation._to_inner(),
+                read_version,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        else:
+            raise TypeError(
+                "operation must be a LanceOperation.BaseOperation or Transaction, "
+                f"got {type(operation)}"
+            )
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
         ds._ds = new_ds
@@ -2596,6 +2643,36 @@ class LanceOperation:
             raw_updated_fragments = [f._metadata for f in self.updated_fragments]
             return _Operation.delete(
                 raw_updated_fragments, self.deleted_fragment_ids, self.predicate
+            )
+
+    @dataclass
+    class Update(BaseOperation):
+        """
+        Operation that updates rows in the dataset.
+
+        Attributes
+        ----------
+        removed_fragment_ids: list[int]
+            The ids of the fragments that have been removed entirely.
+        updated_fragments: list[FragmentMetadata]
+            The fragments that have been updated with new deletion vectors.
+        new_fragments: list[FragmentMetadata]
+            The fragments that contain the new rows.
+        """
+
+        removed_fragment_ids: List[int]
+        updated_fragments: List[FragmentMetadata]
+        new_fragments: List[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.updated_fragments)
+            LanceOperation._validate_fragments(self.new_fragments)
+
+        def _to_inner(self):
+            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
+            raw_new_fragments = [f._metadata for f in self.new_fragments]
+            return _Operation.update(
+                self.removed_fragment_ids, raw_updated_fragments, raw_new_fragments
             )
 
     @dataclass
