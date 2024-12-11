@@ -86,6 +86,25 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         assert actual_price == expected_price
 
 
+def test_indexed_between(tmp_path):
+    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset.create_scalar_index("val", index_type="BTREE")
+
+    scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+    scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+
 def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
