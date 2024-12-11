@@ -133,7 +133,7 @@ impl LanceFileStatistics {
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnStatistics {
     num_pages: usize,
-    size_bytes: usize,
+    size_bytes: u64,
 }
 
 #[pymethods]
