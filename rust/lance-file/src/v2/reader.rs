@@ -57,15 +57,21 @@ pub struct BufferDescriptor {
     pub size: u64,
 }
 
+/// Statistics summarize some of the file metadata for quick summary info
 #[derive(Debug)]
 pub struct FileStatistics {
+    /// Statistics about each of the columns in the file
     pub columns: Vec<ColumnStatistics>,
 }
 
-// Currently we report the `num_pages` and `size_bytes` of each column in Lance file.
+/// Summary information describing a column
 #[derive(Debug)]
 pub struct ColumnStatistics {
+    /// The number of pages in the column
     pub num_pages: usize,
+    /// The total number of data & metadata bytes in the column
+    ///
+    /// This is the compressed on-disk size
     pub size_bytes: u64,
 }
 
