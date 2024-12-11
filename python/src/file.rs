@@ -23,7 +23,7 @@ use lance_core::cache::FileMetadataCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::{
     v2::{
-        reader::{BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions},
+        reader::{BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics},
         writer::{FileWriter, FileWriterOptions},
     },
     version::LanceFileVersion,
@@ -110,6 +110,33 @@ impl LanceColumnMetadata {
             column_buffers,
             pages: inner.pages.iter().map(LancePageMetadata::new).collect(),
         }
+    }
+}
+
+#[pyclass(get_all)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceFileStatistics {
+    columns: Vec<LanceColumnStatistics>,
+}
+
+#[pyclass(get_all)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceColumnStatistics {
+    num_pages: usize,
+    size_bytes: usize,
+}
+
+impl LanceFileStatistics {
+    fn new(inner: &FileStatistics) -> Self {
+        let columns = inner
+            .columns
+            .iter()
+            .map(|column_stat| LanceColumnStatistics {
+                num_pages: column_stat.num_pages,
+                size_bytes: column_stat.size_bytes,
+            })
+            .collect();
+        Self { columns }
     }
 }
 
@@ -443,6 +470,11 @@ impl LanceFileReader {
     pub fn metadata(&mut self, py: Python) -> LanceFileMetadata {
         let inner_meta = self.inner.metadata();
         LanceFileMetadata::new(inner_meta, py)
+    }
+
+    pub fn file_statistics(&self) -> LanceFileStatistics {
+        let inner_stat = self.inner.file_statistics();
+        LanceFileStatistics::new(inner_stat)
     }
 
     pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {

@@ -3,6 +3,7 @@
 
 import os
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -213,6 +214,33 @@ def test_metadata(tmp_path):
 
     assert len(page.encoding) > 0
 
+def test_file_stat(tmp_path):
+    path = tmp_path / "foo.lance"
+    schema = pa.schema([
+        pa.field("a", pa.int64()),
+        pa.field("b", pa.list_(pa.float64(), 8))
+    ])
+
+    num_rows = 1_000_000
+
+    data1 = pa.array(range(num_rows))
+
+    # Create a fixed-size list of float64 with dimension 8
+    fixed_size_list = [np.random.rand(8).tolist() for _ in range(num_rows)]
+    data2 = pa.array(fixed_size_list, type=pa.list_(pa.float64(), 8))
+
+    with LanceFileWriter(str(path), schema) as writer:
+        writer.write_batch(pa.table({"a": data1, "b": data2}))
+    reader = LanceFileReader(str(path))
+    file_stat = reader.file_statistics()
+
+    assert(len(file_stat.columns) == 2)
+
+    assert(file_stat.columns[0].num_pages == 1)
+    assert(file_stat.columns[0].size_bytes == 8_000_000)
+
+    assert(file_stat.columns[1].num_pages == 2)
+    assert(file_stat.columns[1].size_bytes == 64_000_000)
 
 def test_round_trip_parquet(tmp_path):
     pq_path = tmp_path / "foo.parquet"

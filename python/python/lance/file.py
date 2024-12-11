@@ -11,6 +11,7 @@ from .lance import (
     LanceColumnMetadata,
     LanceFileMetadata,
     LancePageMetadata,
+    LanceFileStatistics,
 )
 from .lance import (
     LanceFileReader as _LanceFileReader,
@@ -145,6 +146,9 @@ class LanceFileReader:
         Return metadata describing the file contents
         """
         return self._reader.metadata()
+    
+    def file_statistics(self) -> LanceFileStatistics:
+        return self._reader.file_statistics()
 
     def read_global_buffer(self, index: int) -> bytes:
         """
@@ -289,4 +293,5 @@ __all__ = [
     "LanceColumnMetadata",
     "LancePageMetadata",
     "LanceBufferDescriptor",
+    "LanceFileStatistics"
 ]

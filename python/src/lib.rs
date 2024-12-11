@@ -37,7 +37,7 @@ use dataset::optimize::{
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use file::{
-    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader, LanceFileStatistics,
     LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
@@ -120,6 +120,7 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileMetadata>()?;
+    m.add_class::<LanceFileStatistics>()?;
     m.add_class::<LanceColumnMetadata>()?;
     m.add_class::<LancePageMetadata>()?;
     m.add_class::<LanceBufferDescriptor>()?;
