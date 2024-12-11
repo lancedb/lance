@@ -47,6 +47,20 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 };
                 Ok(Self(op))
             }
+            "Update" => {
+                let removed_fragment_ids = ob.getattr("removed_fragment_ids")?.extract()?;
+
+                let updated_fragments = extract_vec(&ob.getattr("updated_fragments")?)?;
+
+                let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
+
+                let op = Operation::Update {
+                    removed_fragment_ids,
+                    updated_fragments,
+                    new_fragments,
+                };
+                Ok(Self(op))
+            }
             "Merge" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
 
@@ -141,6 +155,21 @@ impl ToPyObject for PyLance<&Operation> {
 
                 cls.call1((schema_py, fragments_py))
                     .expect("Failed to create Overwrite instance")
+                    .to_object(py)
+            }
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            } => {
+                let removed_fragment_ids = removed_fragment_ids.to_object(py);
+                let updated_fragments = export_vec(py, updated_fragments.as_slice());
+                let new_fragments = export_vec(py, new_fragments.as_slice());
+                let cls = namespace
+                    .getattr("Update")
+                    .expect("Failed to get Update class");
+                cls.call1((removed_fragment_ids, updated_fragments, new_fragments))
+                    .unwrap()
                     .to_object(py)
             }
             _ => todo!(),
