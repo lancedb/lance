@@ -36,7 +36,7 @@ use lance::dataset::transaction::{
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
     scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
-    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
+    Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, MergeStats, ReadParams,
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
 };
@@ -218,20 +218,46 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let new_self = RT
+        let (new_dataset, stats) = RT
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         let dataset = self.dataset.bind(py);
+        dataset.borrow_mut().ds = new_dataset;
 
-        dataset.borrow_mut().ds = new_self.0;
-        let merge_stats = new_self.1;
-        let merge_dict = PyDict::new_bound(py);
-        merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
-        merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
-        merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
 
-        Ok(merge_dict.into())
+    pub fn execute_uncommitted<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<Bound<'a, PyTuple>> {
+        let py = new_data.py();
+        let new_data = convert_reader(new_data)?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (transaction, stats) = RT
+            .spawn(Some(py), job.execute_uncommitted(new_data))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+        let transaction = export_transaction(&transaction, py)?;
+
+        Ok(PyTuple::new_bound(py, [transaction, stats]))
+    }
+}
+
+impl MergeInsertBuilder {
+    fn build_stats<'a>(stats: &MergeStats, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("num_inserted_rows", stats.num_inserted_rows)?;
+        dict.set_item("num_updated_rows", stats.num_updated_rows)?;
+        dict.set_item("num_deleted_rows", stats.num_deleted_rows)?;
+        Ok(dict)
     }
 }
 
@@ -314,6 +340,22 @@ impl Operation {
     }
 
     #[staticmethod]
+    fn update(
+        removed_fragment_ids: Vec<u64>,
+        updated_fragments: Vec<FragmentMetadata>,
+        new_fragments: Vec<FragmentMetadata>,
+    ) -> PyResult<Self> {
+        let updated_fragments = into_fragments(updated_fragments);
+        let new_fragments = into_fragments(new_fragments);
+        let op = LanceOperation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+        };
+        Ok(Self(op))
+    }
+
+    #[staticmethod]
     fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
         let schema = schema.0;
         let fragments = into_fragments(fragments);
@@ -382,6 +424,29 @@ impl Operation {
                     .map(|f| f.into_py(py))
                     .collect::<Vec<_>>();
                 dict.set_item("fragments", fragments).unwrap();
+            }
+            LanceOperation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+            } => {
+                let updated_fragments = updated_fragments
+                    .iter()
+                    .cloned()
+                    .map(FragmentMetadata::new)
+                    .map(|f| f.into_py(py))
+                    .collect::<Vec<_>>();
+                let new_fragments = new_fragments
+                    .iter()
+                    .cloned()
+                    .map(FragmentMetadata::new)
+                    .map(|f| f.into_py(py))
+                    .collect::<Vec<_>>();
+                dict.set_item("removed_fragment_ids", removed_fragment_ids)
+                    .unwrap();
+                dict.set_item("updated_fragments", updated_fragments)
+                    .unwrap();
+                dict.set_item("new_fragments", new_fragments).unwrap();
             }
             _ => {
                 return Err(PyNotImplementedError::new_err(format!(
@@ -1451,6 +1516,36 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<Self> {
+        let transaction =
+            Transaction::new(read_version.unwrap_or_default(), operation.0, None, None);
+
+        let py_transaction = export_transaction(&transaction, dest.py())?;
+
+        Self::commit_transaction(
+            dest,
+            &py_transaction,
+            commit_lock,
+            storage_options,
+            enable_v2_manifest_paths,
+            detached,
+            max_retries,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    fn commit_transaction(
+        dest: &Bound<PyAny>,
+        transaction: &Bound<PyAny>,
+        commit_lock: Option<&Bound<'_, PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
+        max_retries: Option<u32>,
+    ) -> PyResult<Self> {
+        let transaction = extract_transaction(transaction)?;
+
         let object_store_params =
             storage_options
                 .as_ref()
@@ -1470,9 +1565,6 @@ impl Dataset {
         } else {
             WriteDestination::Uri(dest.extract()?)
         };
-
-        let transaction =
-            Transaction::new(read_version.unwrap_or_default(), operation.0, None, None);
 
         let mut builder = CommitBuilder::new(dest)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
