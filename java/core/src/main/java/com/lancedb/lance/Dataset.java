@@ -286,6 +286,11 @@ public class Dataset implements Closeable {
     }
   }
 
+  /**
+   * Gets the URI of the dataset.
+   *
+   * @return the URI of the dataset
+   */
   public String uri() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");

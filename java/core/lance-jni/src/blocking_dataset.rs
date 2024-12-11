@@ -584,12 +584,17 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUri<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
 ) -> JString<'local> {
-    ok_or_throw_with_return!(env, inner_uri(&mut env, java_dataset).map_err(|err| Error::input_error(err.to_string())), JString::from(JObject::null()))
+    ok_or_throw_with_return!(
+        env,
+        inner_uri(&mut env, java_dataset).map_err(|err| Error::input_error(err.to_string())),
+        JString::from(JObject::null())
+    )
 }
 
 fn inner_uri<'local>(env: &mut JNIEnv<'local>, java_dataset: JObject) -> Result<JString<'local>> {
     let uri = {
-        let dataset_guard = unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
         dataset_guard.inner.uri().to_string()
     };
 
