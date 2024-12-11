@@ -37,8 +37,8 @@ use dataset::optimize::{
 use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use file::{
-    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader, LanceFileStatistics,
-    LanceFileWriter, LancePageMetadata,
+    LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
+    LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
