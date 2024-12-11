@@ -57,6 +57,24 @@ pub struct BufferDescriptor {
     pub size: u64,
 }
 
+/// Statistics summarize some of the file metadata for quick summary info
+#[derive(Debug)]
+pub struct FileStatistics {
+    /// Statistics about each of the columns in the file
+    pub columns: Vec<ColumnStatistics>,
+}
+
+/// Summary information describing a column
+#[derive(Debug)]
+pub struct ColumnStatistics {
+    /// The number of pages in the column
+    pub num_pages: usize,
+    /// The total number of data & metadata bytes in the column
+    ///
+    /// This is the compressed on-disk size
+    pub size_bytes: u64,
+}
+
 // TODO: Caching
 #[derive(Debug)]
 pub struct CachedFileMetadata {
@@ -311,6 +329,30 @@ impl FileReader {
 
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
         &self.metadata
+    }
+
+    pub fn file_statistics(&self) -> FileStatistics {
+        let column_metadatas = &self.metadata().column_metadatas;
+
+        let column_stats = column_metadatas
+            .iter()
+            .map(|col_metadata| {
+                let num_pages = col_metadata.pages.len();
+                let size_bytes = col_metadata
+                    .pages
+                    .iter()
+                    .map(|page| page.buffer_sizes.iter().sum::<u64>())
+                    .sum::<u64>();
+                ColumnStatistics {
+                    num_pages,
+                    size_bytes,
+                }
+            })
+            .collect();
+
+        FileStatistics {
+            columns: column_stats,
+        }
     }
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {

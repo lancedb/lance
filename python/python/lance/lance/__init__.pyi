@@ -82,6 +82,13 @@ class LanceFileMetadata:
     global_buffers: List[LanceBufferDescriptor]
     columns: List[LanceColumnMetadata]
 
+class LanceFileStatistics:
+    columns: List[LanceColumnStatistics]
+
+class LanceColumnStatistics:
+    num_pages: int
+    size_bytes: int
+
 class _Session:
     def size_bytes(self) -> int: ...
 

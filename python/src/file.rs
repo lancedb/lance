@@ -23,7 +23,9 @@ use lance_core::cache::FileMetadataCache;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::{
     v2::{
-        reader::{BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions},
+        reader::{
+            BufferDescriptor, CachedFileMetadata, FileReader, FileReaderOptions, FileStatistics,
+        },
         writer::{FileWriter, FileWriterOptions},
     },
     version::LanceFileVersion,
@@ -110,6 +112,58 @@ impl LanceColumnMetadata {
             column_buffers,
             pages: inner.pages.iter().map(LancePageMetadata::new).collect(),
         }
+    }
+}
+
+/// Statistics summarize some of the file metadata for quick summary info
+#[pyclass(get_all)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceFileStatistics {
+    /// Statistics about each of the columns in the file
+    columns: Vec<LanceColumnStatistics>,
+}
+
+#[pymethods]
+impl LanceFileStatistics {
+    fn __repr__(&self) -> String {
+        let column_reprs: Vec<String> = self.columns.iter().map(|col| col.__repr__()).collect();
+        format!("FileStatistics(columns=[{}])", column_reprs.join(", "))
+    }
+}
+
+/// Summary information describing a column
+#[pyclass(get_all)]
+#[derive(Clone, Debug, Serialize)]
+pub struct LanceColumnStatistics {
+    /// The number of pages in the column
+    num_pages: usize,
+    /// The total number of data & metadata bytes in the column
+    ///
+    /// This is the compressed on-disk size
+    size_bytes: u64,
+}
+
+#[pymethods]
+impl LanceColumnStatistics {
+    fn __repr__(&self) -> String {
+        format!(
+            "ColumnStatistics(num_pages={}, size_bytes={})",
+            self.num_pages, self.size_bytes
+        )
+    }
+}
+
+impl LanceFileStatistics {
+    fn new(inner: &FileStatistics) -> Self {
+        let columns = inner
+            .columns
+            .iter()
+            .map(|column_stat| LanceColumnStatistics {
+                num_pages: column_stat.num_pages,
+                size_bytes: column_stat.size_bytes,
+            })
+            .collect();
+        Self { columns }
     }
 }
 
@@ -445,11 +499,78 @@ impl LanceFileReader {
         LanceFileMetadata::new(inner_meta, py)
     }
 
+    pub fn file_statistics(&self) -> LanceFileStatistics {
+        let inner_stat = self.inner.file_statistics();
+        LanceFileStatistics::new(&inner_stat)
+    }
+
     pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {
         let buffer_bytes = RT
             .runtime
             .block_on(self.inner.read_global_buffer(index))
             .infer_error()?;
         Ok(buffer_bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lance_file_statistics_repr_empty() {
+        let stats = LanceFileStatistics { columns: vec![] };
+
+        let repr_str = stats.__repr__();
+        assert_eq!(repr_str, "FileStatistics(columns=[])");
+    }
+
+    #[test]
+    fn test_lance_file_statistics_repr_single_column() {
+        let stats = LanceFileStatistics {
+            columns: vec![LanceColumnStatistics {
+                num_pages: 5,
+                size_bytes: 1024,
+            }],
+        };
+
+        let repr_str = stats.__repr__();
+        assert_eq!(
+            repr_str,
+            "FileStatistics(columns=[ColumnStatistics(num_pages=5, size_bytes=1024)])"
+        );
+    }
+
+    #[test]
+    fn test_lance_file_statistics_repr_multiple_columns() {
+        let stats = LanceFileStatistics {
+            columns: vec![
+                LanceColumnStatistics {
+                    num_pages: 5,
+                    size_bytes: 1024,
+                },
+                LanceColumnStatistics {
+                    num_pages: 3,
+                    size_bytes: 512,
+                },
+            ],
+        };
+
+        let repr_str = stats.__repr__();
+        assert_eq!(
+            repr_str,
+            "FileStatistics(columns=[ColumnStatistics(num_pages=5, size_bytes=1024), ColumnStatistics(num_pages=3, size_bytes=512)])"
+        );
+    }
+
+    #[test]
+    fn test_lance_column_statistics_repr() {
+        let column_stats = LanceColumnStatistics {
+            num_pages: 10,
+            size_bytes: 2048,
+        };
+
+        let repr_str = column_stats.__repr__();
+        assert_eq!(repr_str, "ColumnStatistics(num_pages=10, size_bytes=2048)");
     }
 }
