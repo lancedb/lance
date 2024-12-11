@@ -501,7 +501,7 @@ impl LanceFileReader {
 
     pub fn file_statistics(&self) -> LanceFileStatistics {
         let inner_stat = self.inner.file_statistics();
-        LanceFileStatistics::new(inner_stat)
+        LanceFileStatistics::new(&inner_stat)
     }
 
     pub fn read_global_buffer(&mut self, index: u32) -> PyResult<Vec<u8>> {
@@ -571,9 +571,6 @@ mod tests {
         };
 
         let repr_str = column_stats.__repr__();
-        assert_eq!(
-            repr_str,
-            "ColumnStatistics(num_pages=10, size_bytes=2048)"
-        );
+        assert_eq!(repr_str, "ColumnStatistics(num_pages=10, size_bytes=2048)");
     }
 }
