@@ -129,8 +129,11 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_complete(
         self,
-        write_results: List[List[Tuple[str, str]]],
+        write_result_blocks: List[Union[pa.Table, "pd.DataFrame"]],
     ):
+        write_results = [
+            result["write_result"].iloc[0]["result"] for result in write_result_blocks
+        ]
         fragments = []
         schema = None
         for batch in write_results:
