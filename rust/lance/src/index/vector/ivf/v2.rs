@@ -587,7 +587,8 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
-        let vectors = generate_random_array_with_range::<T>(1000 * 3 * DIM, range);
+        const VECTOR_NUM_PER_ROW: usize = 5;
+        let vectors = generate_random_array_with_range::<T>(1000 * VECTOR_NUM_PER_ROW * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
@@ -620,7 +621,7 @@ mod tests {
                 ),
                 true,
             )),
-            OffsetBuffer::from_lengths(std::iter::repeat(3).take(1000)),
+            OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(1000)),
             Arc::new(fsl),
             None,
         ));
@@ -900,16 +901,7 @@ mod tests {
         let (mut dataset, vectors) =
             generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
-        let ivf_params = IvfBuildParams::new(nlist);
-        let pq_params = PQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_pq_params(
-            DistanceType::L2,
-            ivf_params,
-            hnsw_params,
-            pq_params,
-        );
-
+        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
         dataset
             .create_index(
                 &["vector"],
@@ -954,7 +946,7 @@ mod tests {
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
         assert!(
-            recall >= 0.9,
+            recall >= 1.0,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
