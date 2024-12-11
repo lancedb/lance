@@ -148,6 +148,9 @@ class LanceFileReader:
         return self._reader.metadata()
 
     def file_statistics(self) -> LanceFileStatistics:
+        """
+        Return file statistics of the file
+        """
         return self._reader.file_statistics()
 
     def read_global_buffer(self, index: int) -> bytes:

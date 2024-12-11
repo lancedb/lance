@@ -115,9 +115,11 @@ impl LanceColumnMetadata {
     }
 }
 
+/// Statistics summarize some of the file metadata for quick summary info
 #[pyclass(get_all)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceFileStatistics {
+    /// Statistics about each of the columns in the file
     columns: Vec<LanceColumnStatistics>,
 }
 
@@ -125,14 +127,19 @@ pub struct LanceFileStatistics {
 impl LanceFileStatistics {
     fn __repr__(&self) -> String {
         let column_reprs: Vec<String> = self.columns.iter().map(|col| col.__repr__()).collect();
-        format!("LanceFileStatistics(columns=[{}])", column_reprs.join(", "))
+        format!("FileStatistics(columns=[{}])", column_reprs.join(", "))
     }
 }
 
+/// Summary information describing a column
 #[pyclass(get_all)]
 #[derive(Clone, Debug, Serialize)]
 pub struct LanceColumnStatistics {
+    /// The number of pages in the column
     num_pages: usize,
+    /// The total number of data & metadata bytes in the column
+    ///
+    /// This is the compressed on-disk size
     size_bytes: u64,
 }
 
@@ -140,7 +147,7 @@ pub struct LanceColumnStatistics {
 impl LanceColumnStatistics {
     fn __repr__(&self) -> String {
         format!(
-            "LanceColumnStatistics(num_pages={}, size_bytes={})",
+            "ColumnStatistics(num_pages={}, size_bytes={})",
             self.num_pages, self.size_bytes
         )
     }
@@ -515,7 +522,7 @@ mod tests {
         let stats = LanceFileStatistics { columns: vec![] };
 
         let repr_str = stats.__repr__();
-        assert_eq!(repr_str, "LanceFileStatistics(columns=[])");
+        assert_eq!(repr_str, "FileStatistics(columns=[])");
     }
 
     #[test]
@@ -530,7 +537,7 @@ mod tests {
         let repr_str = stats.__repr__();
         assert_eq!(
             repr_str,
-            "LanceFileStatistics(columns=[LanceColumnStatistics(num_pages=5, size_bytes=1024)])"
+            "FileStatistics(columns=[ColumnStatistics(num_pages=5, size_bytes=1024)])"
         );
     }
 
@@ -552,7 +559,7 @@ mod tests {
         let repr_str = stats.__repr__();
         assert_eq!(
             repr_str,
-            "LanceFileStatistics(columns=[LanceColumnStatistics(num_pages=5, size_bytes=1024), LanceColumnStatistics(num_pages=3, size_bytes=512)])"
+            "FileStatistics(columns=[ColumnStatistics(num_pages=5, size_bytes=1024), ColumnStatistics(num_pages=3, size_bytes=512)])"
         );
     }
 
@@ -566,7 +573,7 @@ mod tests {
         let repr_str = column_stats.__repr__();
         assert_eq!(
             repr_str,
-            "LanceColumnStatistics(num_pages=10, size_bytes=2048)"
+            "ColumnStatistics(num_pages=10, size_bytes=2048)"
         );
     }
 }
