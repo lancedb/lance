@@ -4,29 +4,64 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
+use lance_core::datatypes::Schema;
 use snafu::{location, Location};
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
-pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
-    let schema = dataset.schema();
+pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
     let field = schema.field(column).ok_or(Error::Index {
         message: format!("Column {} does not exist in schema {}", column, schema),
         location: location!(),
     })?;
-    let data_type = field.data_type();
-    if let arrow_schema::DataType::FixedSizeList(_, dim) = data_type {
-        Ok(dim as usize)
-    } else {
-        Err(Error::Index {
-            message: format!(
-                "Column {} is not a FixedSizeListArray, but {:?}",
-                column, data_type
-            ),
+    infer_vector_dim(&field.data_type())
+}
+
+fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
+    match data_type {
+        arrow::datatypes::DataType::FixedSizeList(_, dim) => Ok(*dim as usize),
+        arrow::datatypes::DataType::List(inner) => infer_vector_dim(inner.data_type()),
+        _ => Err(Error::Index {
+            message: format!("Data type is not a FixedSizeListArray, but {:?}", data_type),
             location: location!(),
-        })
+        }),
+    }
+}
+
+pub fn get_vector_element_type(schema: &Schema, column: &str) -> Result<arrow_schema::DataType> {
+    let field = schema.field(column).ok_or(Error::Index {
+        message: format!("column {} does not exist in schema {}", column, schema),
+        location: location!(),
+    })?;
+    infer_vector_element_type(&field.data_type())
+}
+
+fn infer_vector_element_type(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<arrow_schema::DataType> {
+    match data_type {
+        arrow::datatypes::DataType::FixedSizeList(element_field, _) => {
+            match element_field.data_type() {
+                arrow::datatypes::DataType::Float16
+                | arrow::datatypes::DataType::Float32
+                | arrow::datatypes::DataType::Float64
+                | arrow::datatypes::DataType::UInt8 => Ok(element_field.data_type().clone()),
+                _ => Err(Error::Index {
+                    message: format!(
+                        "Data type is not a FixedSizeListArray of Float32 or Float64, but {:?}",
+                        element_field.data_type()
+                    ),
+                    location: location!(),
+                }),
+            }
+        }
+        arrow::datatypes::DataType::List(inner) => infer_vector_element_type(inner.data_type()),
+        _ => Err(Error::Index {
+            message: format!("Data type is not a FixedSizeListArray, but {:?}", data_type),
+            location: location!(),
+        }),
     }
 }
 
@@ -56,7 +91,25 @@ pub async fn maybe_sample_training_data(
         ),
         location: location!(),
     })?;
-    Ok(array.as_fixed_size_list().clone())
+
+    match array.data_type() {
+        arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
+        // for multivector, flatten the vectors into a FixedSizeListArray
+        arrow::datatypes::DataType::List(_) => {
+            let list_array = array.as_list::<i32>();
+            let vectors = list_array.values().as_fixed_size_list();
+            Ok(vectors.clone())
+        }
+        _ => {
+            return Err(Error::Index {
+                message: format!(
+                    "Sample training data: column {} is not a FixedSizeListArray",
+                    column
+                ),
+                location: location!(),
+            });
+        }
+    }
 }
 
 #[derive(Debug)]

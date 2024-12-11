@@ -3,6 +3,7 @@
 
 //! In-memory graph representations.
 
+use core::f32;
 use std::sync::Arc;
 
 use crate::vector::quantizer::QuantizerStorage;
