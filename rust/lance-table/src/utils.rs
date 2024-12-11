@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::time::SystemTime;
+
 pub mod stream;
 
 pub trait LanceIteratorExtension {
@@ -44,4 +46,12 @@ impl<I: Iterator> Iterator for ExactSize<I> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.size, Some(self.size))
     }
+}
+
+pub fn timestamp_to_nanos(timestamp: Option<SystemTime>) -> u128 {
+    let timestamp = timestamp.unwrap_or_else(SystemTime::now);
+    timestamp
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
