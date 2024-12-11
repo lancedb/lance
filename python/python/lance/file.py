@@ -10,8 +10,8 @@ from .lance import (
     LanceBufferDescriptor,
     LanceColumnMetadata,
     LanceFileMetadata,
-    LancePageMetadata,
     LanceFileStatistics,
+    LancePageMetadata,
 )
 from .lance import (
     LanceFileReader as _LanceFileReader,
