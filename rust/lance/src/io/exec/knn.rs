@@ -33,42 +33,12 @@ use snafu::{location, Location};
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
+use crate::index::vector::utils::get_vector_element_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
 
 use super::utils::{FilteredRowIdsToPrefilter, PreFilterSource, SelectionVectorToPrefilter};
-
-/// Check vector column exists and has the correct data type.
-fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
-    let field = schema.field_with_name(column).map_err(|_| {
-        Error::io(
-            format!("Query column '{}' not found in input schema", column),
-            location!(),
-        )
-    })?;
-    check_vector_column_impl(column, field.data_type())
-}
-
-fn check_vector_column_impl(column: &str, data_type: &DataType) -> Result<()> {
-    match data_type {
-        DataType::FixedSizeList(list_field, _)
-            if matches!(
-                list_field.data_type(),
-                DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
-            ) => Ok(()),
-        DataType::List(inner) => check_vector_column_impl(column,inner.data_type()),
-        _ => {
-            Err(Error::io(
-                format!(
-                    "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
-                    column, data_type
-                ),
-                location!(),
-            ))
-        }
-    }
-}
 
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
@@ -112,7 +82,7 @@ impl KNNVectorDistanceExec {
         distance_type: DistanceType,
     ) -> Result<Self> {
         let mut output_schema = input.schema().as_ref().clone();
-        check_vector_column(&output_schema, column)?;
+        get_vector_element_type(&(&output_schema).try_into()?, column)?;
 
         // FlatExec appends a distance column to the input schema. The input
         // may already have a distance column (possibly in the wrong position), so
@@ -295,7 +265,7 @@ pub struct ANNIvfPartitionExec {
 impl ANNIvfPartitionExec {
     pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
-        check_vector_column(&dataset_schema.into(), &query.column)?;
+        get_vector_element_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
             return Err(Error::Execution {
                 message: "ANNIVFPartitionExec node: no index found for query".to_string(),

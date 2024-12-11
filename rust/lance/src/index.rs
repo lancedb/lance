@@ -739,7 +739,7 @@ impl DatasetIndexInternalExt for Dataset {
                     location: location!(),
                 })?;
 
-                let value_type = get_vector_element_type(&self, column)?;
+                let value_type = get_vector_element_type(self.schema(), column)?;
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match value_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
