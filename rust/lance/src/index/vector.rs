@@ -41,7 +41,6 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::tempdir;
 use tracing::instrument;
-use utils::get_vector_dim;
 use uuid::Uuid;
 
 use self::{ivf::*, pq::PQIndex};

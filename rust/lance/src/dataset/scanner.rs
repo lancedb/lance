@@ -659,7 +659,7 @@ impl Scanner {
             ));
         }
         // make sure the field exists
-        let element_type = get_vector_element_type(self.dataset.as_ref(), column)?;
+        let element_type = get_vector_element_type(self.dataset.schema(), column)?;
         let key = match element_type {
             dt if dt == *q.data_type() => Box::new(q.clone()),
             dt if dt.is_floating() => coerce_float_vector(
@@ -1564,7 +1564,7 @@ impl Scanner {
         };
 
         // Sanity check
-        let element_type = get_vector_element_type(self.dataset.as_ref(), &q.column)?;
+        let element_type = get_vector_element_type(self.dataset.schema(), &q.column)?;
         if element_type != DataType::UInt8 && !element_type.is_floating() {
             return Err(Error::invalid_input(
                 format!(

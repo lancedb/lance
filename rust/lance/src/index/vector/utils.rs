@@ -4,14 +4,14 @@
 use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
+use lance_core::datatypes::Schema;
 use snafu::{location, Location};
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
-pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
-    let schema = dataset.schema();
+pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
     let field = schema.field(column).ok_or(Error::Index {
         message: format!("Column {} does not exist in schema {}", column, schema),
         location: location!(),
@@ -30,8 +30,7 @@ fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
     }
 }
 
-pub fn get_vector_element_type(dataset: &Dataset, column: &str) -> Result<arrow_schema::DataType> {
-    let schema = dataset.schema();
+pub fn get_vector_element_type(schema: &Schema, column: &str) -> Result<arrow_schema::DataType> {
     let field = schema.field(column).ok_or(Error::Index {
         message: format!("column {} does not exist in schema {}", column, schema),
         location: location!(),
@@ -44,7 +43,19 @@ fn infer_vector_element_type(
 ) -> Result<arrow_schema::DataType> {
     match data_type {
         arrow::datatypes::DataType::FixedSizeList(element_field, _) => {
-            Ok(element_field.data_type().clone())
+            match element_field.data_type() {
+                arrow::datatypes::DataType::Float16
+                | arrow::datatypes::DataType::Float32
+                | arrow::datatypes::DataType::Float64
+                | arrow::datatypes::DataType::UInt8 => Ok(element_field.data_type().clone()),
+                _ => Err(Error::Index {
+                    message: format!(
+                        "Data type is not a FixedSizeListArray of Float32 or Float64, but {:?}",
+                        element_field.data_type()
+                    ),
+                    location: location!(),
+                }),
+            }
         }
         arrow::datatypes::DataType::List(inner) => infer_vector_element_type(inner.data_type()),
         _ => Err(Error::Index {

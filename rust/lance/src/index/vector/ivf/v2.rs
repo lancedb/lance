@@ -518,17 +518,13 @@ mod tests {
     use std::collections::HashSet;
     use std::{collections::HashMap, ops::Range, sync::Arc};
 
-    use arrow::array::{FixedSizeListBuilder, ListBuilder};
     use arrow::datatypes::{UInt64Type, UInt8Type};
-    use arrow::ipc::List;
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrowPrimitiveType, FixedSizeListArray, ListArray, RecordBatch, RecordBatchIterator,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema};
-    use half::vec;
-    use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
     use lance_core::ROW_ID;
