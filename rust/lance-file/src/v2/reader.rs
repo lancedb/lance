@@ -57,6 +57,18 @@ pub struct BufferDescriptor {
     pub size: u64,
 }
 
+#[derive(Debug)]
+pub struct FileStatistics {
+    pub columns: Vec<ColumnStatistics>,
+}
+
+// Currently we report the `num_pages` and `size_bytes` of each column in Lance file.
+#[derive(Debug)]
+pub struct ColumnStatistics {
+    pub num_pages: usize,
+    pub size_bytes: usize,
+}
+
 // TODO: Caching
 #[derive(Debug)]
 pub struct CachedFileMetadata {
@@ -79,6 +91,9 @@ pub struct CachedFileMetadata {
     pub num_footer_bytes: u64,
     pub major_version: u16,
     pub minor_version: u16,
+
+    // The file statistics.
+    pub file_statistics: Arc<FileStatistics>,
 }
 
 impl DeepSizeOf for CachedFileMetadata {
@@ -313,6 +328,10 @@ impl FileReader {
         &self.metadata
     }
 
+    pub fn file_statistics(&self) -> &Arc<FileStatistics> {
+        &self.metadata().file_statistics
+    }
+
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {
         let buffer_desc = self.metadata.file_buffers.get(index as usize).ok_or_else(||Error::invalid_input(format!("request for global buffer at index {} but there were only {} global buffers in the file", index, self.metadata.file_buffers.len()), location!()))?;
         self.scheduler
@@ -545,6 +564,26 @@ impl FileReader {
 
         let column_infos = Self::meta_to_col_infos(column_metadatas.as_slice(), file_version);
 
+        let column_stats = column_metadatas
+            .iter()
+            .map(|col_metadata| {
+                let num_pages = col_metadata.pages.len();
+                let size_bytes = col_metadata
+                    .pages
+                    .iter()
+                    .map(|page| page.buffer_sizes.iter().sum::<u64>())
+                    .sum::<u64>();
+                ColumnStatistics {
+                    num_pages,
+                    size_bytes: size_bytes as usize,
+                }
+            })
+            .collect();
+
+        let file_stat = FileStatistics {
+            columns: column_stats,
+        };
+
         Ok(CachedFileMetadata {
             file_schema: Arc::new(schema),
             column_metadatas,
@@ -557,6 +596,7 @@ impl FileReader {
             file_buffers: gbo_table,
             major_version: footer.major_version,
             minor_version: footer.minor_version,
+            file_statistics: Arc::new(file_stat),
         })
     }
 
