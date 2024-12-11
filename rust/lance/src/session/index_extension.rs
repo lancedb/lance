@@ -165,7 +165,7 @@ mod test {
             unimplemented!()
         }
 
-        fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
         }
 
