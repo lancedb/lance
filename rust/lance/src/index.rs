@@ -48,6 +48,7 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
+use vector::utils::get_vector_element_type;
 
 pub(crate) mod append;
 pub(crate) mod cache;
@@ -738,14 +739,7 @@ impl DatasetIndexInternalExt for Dataset {
                     location: location!(),
                 })?;
 
-                let value_type = if let DataType::FixedSizeList(df, _) = field.data_type() {
-                    Result::Ok(df.data_type().to_owned())
-                } else {
-                    return Err(Error::Index {
-                        message: format!("Column {} is not a vector column", column),
-                        location: location!(),
-                    });
-                }?;
+                let value_type = get_vector_element_type(&self, column)?;
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match value_type {
                         DataType::Float16 | DataType::Float32 | DataType::Float64 => {

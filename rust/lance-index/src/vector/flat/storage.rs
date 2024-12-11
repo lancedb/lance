@@ -312,136 +312,136 @@ impl VectorStore for FlatBinStorage {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FlatMultiVecStorage {
-    batch: RecordBatch,
-    distance_type: DistanceType,
+// #[derive(Debug, Clone)]
+// pub struct FlatMultiVecStorage {
+//     batch: RecordBatch,
+//     distance_type: DistanceType,
 
-    // helper fields
-    pub(super) row_ids: Arc<UInt64Array>,
-    vectors: Arc<ListArray>,
-}
+//     // helper fields
+//     pub(super) row_ids: Arc<UInt64Array>,
+//     vectors: Arc<ListArray>,
+// }
 
-impl DeepSizeOf for FlatMultiVecStorage {
-    fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.batch.get_array_memory_size()
-    }
-}
+// impl DeepSizeOf for FlatMultiVecStorage {
+//     fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
+//         self.batch.get_array_memory_size()
+//     }
+// }
 
-#[async_trait::async_trait]
-impl QuantizerStorage for FlatMultiVecStorage {
-    type Metadata = FlatMetadata;
-    async fn load_partition(
-        _: &FileReader,
-        _: std::ops::Range<usize>,
-        _: DistanceType,
-        _: &Self::Metadata,
-    ) -> Result<Self> {
-        unimplemented!("Flat will be used in new index builder which doesn't require this")
-    }
-}
+// #[async_trait::async_trait]
+// impl QuantizerStorage for FlatMultiVecStorage {
+//     type Metadata = FlatMetadata;
+//     async fn load_partition(
+//         _: &FileReader,
+//         _: std::ops::Range<usize>,
+//         _: DistanceType,
+//         _: &Self::Metadata,
+//     ) -> Result<Self> {
+//         unimplemented!("Flat will be used in new index builder which doesn't require this")
+//     }
+// }
 
-impl FlatMultiVecStorage {
-    pub fn vector(&self, id: u32) -> ArrayRef {
-        self.vectors.value(id as usize)
-    }
-}
+// impl FlatMultiVecStorage {
+//     pub fn vector(&self, id: u32) -> ArrayRef {
+//         self.vectors.value(id as usize)
+//     }
+// }
 
-impl VectorStore for FlatMultiVecStorage {
-    type DistanceCalculator<'a> = FlatDistanceCal<'a, Float32Type>;
+// impl VectorStore for FlatMultiVecStorage {
+//     type DistanceCalculator<'a> = FlatDistanceCal<'a, Float32Type>;
 
-    fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
-        let row_ids = Arc::new(
-            batch
-                .column_by_name(ROW_ID)
-                .ok_or(Error::Schema {
-                    message: format!("column {} not found", ROW_ID),
-                    location: location!(),
-                })?
-                .as_primitive::<UInt64Type>()
-                .clone(),
-        );
-        let vectors = Arc::new(
-            batch
-                .column_by_name(FLAT_COLUMN)
-                .ok_or(Error::Schema {
-                    message: "column flat not found".to_string(),
-                    location: location!(),
-                })?
-                .as_list()
-                .clone(),
-        );
-        Ok(Self {
-            batch,
-            distance_type,
-            row_ids,
-            vectors,
-        })
-    }
+//     fn try_from_batch(batch: RecordBatch, distance_type: DistanceType) -> Result<Self> {
+//         let row_ids = Arc::new(
+//             batch
+//                 .column_by_name(ROW_ID)
+//                 .ok_or(Error::Schema {
+//                     message: format!("column {} not found", ROW_ID),
+//                     location: location!(),
+//                 })?
+//                 .as_primitive::<UInt64Type>()
+//                 .clone(),
+//         );
+//         let vectors = Arc::new(
+//             batch
+//                 .column_by_name(FLAT_COLUMN)
+//                 .ok_or(Error::Schema {
+//                     message: "column flat not found".to_string(),
+//                     location: location!(),
+//                 })?
+//                 .as_list()
+//                 .clone(),
+//         );
+//         Ok(Self {
+//             batch,
+//             distance_type,
+//             row_ids,
+//             vectors,
+//         })
+//     }
 
-    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
-        Ok([self.batch.clone()].into_iter())
-    }
+//     fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>> {
+//         Ok([self.batch.clone()].into_iter())
+//     }
 
-    fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
-        // TODO: use chunked storage
-        let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
-        let mut storage = self.clone();
-        storage.batch = new_batch;
-        Ok(storage)
-    }
+//     fn append_batch(&self, batch: RecordBatch, _vector_column: &str) -> Result<Self> {
+//         // TODO: use chunked storage
+//         let new_batch = concat_batches(&batch.schema(), vec![&self.batch, &batch].into_iter())?;
+//         let mut storage = self.clone();
+//         storage.batch = new_batch;
+//         Ok(storage)
+//     }
 
-    fn schema(&self) -> &SchemaRef {
-        self.batch.schema_ref()
-    }
+//     fn schema(&self) -> &SchemaRef {
+//         self.batch.schema_ref()
+//     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+//     fn as_any(&self) -> &dyn std::any::Any {
+//         self
+//     }
 
-    fn len(&self) -> usize {
-        self.vectors.len()
-    }
+//     fn len(&self) -> usize {
+//         self.vectors.len()
+//     }
 
-    fn distance_type(&self) -> DistanceType {
-        self.distance_type
-    }
+//     fn distance_type(&self) -> DistanceType {
+//         self.distance_type
+//     }
 
-    fn row_id(&self, id: u32) -> u64 {
-        self.row_ids.values()[id as usize]
-    }
+//     fn row_id(&self, id: u32) -> u64 {
+//         self.row_ids.values()[id as usize]
+//     }
 
-    fn row_ids(&self) -> impl Iterator<Item = &u64> {
-        self.row_ids.values().iter()
-    }
+//     fn row_ids(&self) -> impl Iterator<Item = &u64> {
+//         self.row_ids.values().iter()
+//     }
 
-    fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        Self::DistanceCalculator::new(self.vectors.as_ref(), query, self.distance_type)
-    }
+//     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_> {
+//         Self::DistanceCalculator::new(self.vectors.as_ref(), query, self.distance_type)
+//     }
 
-    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
-        Self::DistanceCalculator::new(
-            self.vectors.as_ref(),
-            self.vectors.value(id as usize),
-            self.distance_type,
-        )
-    }
+//     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
+//         Self::DistanceCalculator::new(
+//             self.vectors.as_ref(),
+//             self.vectors.value(id as usize),
+//             self.distance_type,
+//         )
+//     }
 
-    /// Distance between two vectors.
-    fn distance_between(&self, a: u32, b: u32) -> f32 {
-        match self.vectors.value_type() {
-            DataType::Float32 => {
-                let vector1 = self.vectors.value(a as usize);
-                let vector2 = self.vectors.value(b as usize);
-                self.distance_type.func()(
-                    vector1.as_primitive::<Float32Type>().values(),
-                    vector2.as_primitive::<Float32Type>().values(),
-                )
-            }
-            _ => unimplemented!(),
-        }
-    }
-}
+//     /// Distance between two vectors.
+//     fn distance_between(&self, a: u32, b: u32) -> f32 {
+//         match self.vectors.value_type() {
+//             DataType::Float32 => {
+//                 let vector1 = self.vectors.value(a as usize);
+//                 let vector2 = self.vectors.value(b as usize);
+//                 self.distance_type.func()(
+//                     vector1.as_primitive::<Float32Type>().values(),
+//                     vector2.as_primitive::<Float32Type>().values(),
+//                 )
+//             }
+//             _ => unimplemented!(),
+//         }
+//     }
+// }
 
 pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     vectors: &'a [T::Native],
@@ -510,90 +510,90 @@ impl<T: ArrowPrimitiveType> DistCalculator for FlatDistanceCal<'_, T> {
     }
 }
 
-pub struct FlatMultiVectorDistanceCal<T: ArrowPrimitiveType> {
-    multi_vectors: ListArray,
-    query: Vec<T::Native>,
-    dimension: usize,
-    #[allow(clippy::type_complexity)]
-    distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
-}
+// pub struct FlatMultiVectorDistanceCal<T: ArrowPrimitiveType> {
+//     multi_vectors: ListArray,
+//     query: Vec<T::Native>,
+//     dimension: usize,
+//     #[allow(clippy::type_complexity)]
+//     distance_fn: fn(&[T::Native], &[T::Native]) -> f32,
+// }
 
-impl FlatMultiVectorDistanceCal<Float32Type> {
-    fn new(multi_vectors: ListArray, query: ArrayRef, distance_type: DistanceType) -> Self {
-        let dimension = if let DataType::FixedSizeList(_, dim) = multi_vectors.value_type() {
-            dim as usize
-        } else {
-            unreachable!()
-        };
-        Self {
-            multi_vectors: multi_vectors,
-            query: query.as_primitive::<Float32Type>().values().to_vec(),
-            dimension,
-            distance_fn: distance_type.func(),
-        }
-    }
-}
+// impl FlatMultiVectorDistanceCal<Float32Type> {
+//     fn new(multi_vectors: ListArray, query: ArrayRef, distance_type: DistanceType) -> Self {
+//         let dimension = if let DataType::FixedSizeList(_, dim) = multi_vectors.value_type() {
+//             dim as usize
+//         } else {
+//             unreachable!()
+//         };
+//         Self {
+//             multi_vectors: multi_vectors,
+//             query: query.as_primitive::<Float32Type>().values().to_vec(),
+//             dimension,
+//             distance_fn: distance_type.func(),
+//         }
+//     }
+// }
 
-impl FlatMultiVectorDistanceCal<UInt8Type> {
-    fn new(multi_vectors: ListArray, query: ArrayRef, _distance_type: DistanceType) -> Self {
-        let dimension = if let DataType::FixedSizeList(_, dim) = multi_vectors.value_type() {
-            dim as usize
-        } else {
-            unreachable!()
-        };
-        Self {
-            multi_vectors: multi_vectors,
-            query: query.as_primitive::<UInt8Type>().values().to_vec(),
-            dimension,
-            distance_fn: hamming,
-        }
-    }
-}
+// impl FlatMultiVectorDistanceCal<UInt8Type> {
+//     fn new(multi_vectors: ListArray, query: ArrayRef, _distance_type: DistanceType) -> Self {
+//         let dimension = if let DataType::FixedSizeList(_, dim) = multi_vectors.value_type() {
+//             dim as usize
+//         } else {
+//             unreachable!()
+//         };
+//         Self {
+//             multi_vectors: multi_vectors,
+//             query: query.as_primitive::<UInt8Type>().values().to_vec(),
+//             dimension,
+//             distance_fn: hamming,
+//         }
+//     }
+// }
 
-impl<T: ArrowPrimitiveType> FlatMultiVectorDistanceCal<T> {
-    #[inline]
-    fn get_vector(&self, id: u32) -> PrimitiveArray<T> {
-        let multi_vector = self.multi_vectors.value(id as usize);
-        multi_vector
-            .as_fixed_size_list()
-            .values()
-            .as_primitive::<T>()
-            .clone()
-    }
-}
+// impl<T: ArrowPrimitiveType> FlatMultiVectorDistanceCal<T> {
+//     #[inline]
+//     fn get_vector(&self, id: u32) -> PrimitiveArray<T> {
+//         let multi_vector = self.multi_vectors.value(id as usize);
+//         multi_vector
+//             .as_fixed_size_list()
+//             .values()
+//             .as_primitive::<T>()
+//             .clone()
+//     }
+// }
 
-impl<T: ArrowPrimitiveType> DistCalculator for FlatMultiVectorDistanceCal<T> {
-    #[inline]
-    fn distance(&self, id: u32) -> f32 {
-        let multi_vector = self.get_vector(id);
-        if multi_vector.len() == 0 {
-            return f32::MAX;
-        }
+// impl<T: ArrowPrimitiveType> DistCalculator for FlatMultiVectorDistanceCal<T> {
+//     #[inline]
+//     fn distance(&self, id: u32) -> f32 {
+//         let multi_vector = self.get_vector(id);
+//         if multi_vector.len() == 0 {
+//             return f32::MAX;
+//         }
 
-        // score = sum(min(distance(qi, vj) for vj in vector) for qi in query
-        self.query
-            .chunks_exact(self.dimension)
-            .map(|query| {
-                multi_vector
-                    .values()
-                    .chunks_exact(self.dimension)
-                    .map(|vector| (self.distance_fn)(query, vector))
-                    .min()
-                    .unwrap()
-            })
-            .sum()
-    }
+//         // score = sum(min(distance(qi, vj) for vj in vector) for qi in query
+//         self.query
+//             .chunks_exact(self.dimension)
+//             .map(|query| {
+//                 multi_vector
+//                     .values()
+//                     .chunks_exact(self.dimension)
+//                     .map(|vector| (self.distance_fn)(query, vector))
+//                     .min()
+//                     .unwrap()
+//             })
+//             .sum()
+//     }
 
-    fn distance_all(&self) -> Vec<f32> {
-        // the number of vectors for each row can be different, so we need to calculate the distance for each row
-        (0..self.multi_vectors.len())
-            .map(|id| self.distance(id as u32))
-            .collect()
-    }
+//     fn distance_all(&self) -> Vec<f32> {
+//         // the number of vectors for each row can be different, so we need to calculate the distance for each row
+//         (0..self.multi_vectors.len())
+//             .map(|id| self.distance(id as u32))
+//             .collect()
+//     }
 
-    #[inline]
-    fn prefetch(&self, id: u32) {
-        let vector = self.get_vector(id);
-        do_prefetch(vector.values().as_ptr_range())
-    }
-}
+//     #[inline]
+//     fn prefetch(&self, id: u32) {
+//         let vector = self.get_vector(id);
+//         do_prefetch(vector.values().as_ptr_range())
+//     }
+// }

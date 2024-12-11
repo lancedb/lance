@@ -47,17 +47,22 @@ fn check_vector_column(schema: &Schema, column: &str) -> Result<()> {
             location!(),
         )
     })?;
-    match field.data_type() {
+    check_vector_column_impl(column, field.data_type())
+}
+
+fn check_vector_column_impl(column: &str, data_type: &DataType) -> Result<()> {
+    match data_type {
         DataType::FixedSizeList(list_field, _)
             if matches!(
                 list_field.data_type(),
                 DataType::UInt8 | DataType::Float16 | DataType::Float32 | DataType::Float64
             ) => Ok(()),
+        DataType::List(inner) => check_vector_column_impl(column,inner.data_type()),
         _ => {
-           Err(Error::io(
+            Err(Error::io(
                 format!(
                     "KNNFlatExec node: query column {} is not a vector. Expect FixedSizeList<Float32>, got {}",
-                    column, field.data_type()
+                    column, data_type
                 ),
                 location!(),
             ))

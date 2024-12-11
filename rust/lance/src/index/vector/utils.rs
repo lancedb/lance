@@ -16,18 +16,7 @@ pub fn get_vector_dim(dataset: &Dataset, column: &str) -> Result<usize> {
         message: format!("Column {} does not exist in schema {}", column, schema),
         location: location!(),
     })?;
-    let data_type = field.data_type();
-    if let arrow_schema::DataType::FixedSizeList(_, dim) = data_type {
-        Ok(dim as usize)
-    } else {
-        Err(Error::Index {
-            message: format!(
-                "Column {} is not a FixedSizeListArray, but {:?}",
-                column, data_type
-            ),
-            location: location!(),
-        })
-    }
+    infer_vector_dim(&field.data_type())
 }
 
 fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
@@ -93,10 +82,10 @@ pub async fn maybe_sample_training_data(
     })?;
 
     match array.data_type() {
-        arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list()),
+        arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
         // for multivector, flatten the vectors into a FixedSizeListArray
-        arrow::datatypes::DataType::List(f) => {
-            let list_array = array.as_list();
+        arrow::datatypes::DataType::List(_) => {
+            let list_array = array.as_list::<i32>();
             let vectors = list_array.values().as_fixed_size_list();
             Ok(vectors.clone())
         }

@@ -58,6 +58,7 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
+use crate::index::vector::utils::get_vector_element_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -658,41 +659,20 @@ impl Scanner {
             ));
         }
         // make sure the field exists
-        let field = self
-            .dataset
-            .schema()
-            .field(column)
-            .ok_or(Error::invalid_input(
-                format!("Column {} not found", column),
-                location!(),
-            ))?;
-        let key = match field.data_type() {
-            DataType::FixedSizeList(dt, _) => {
-                if dt.data_type() == q.data_type() {
-                    Box::new(q.clone())
-                } else if dt.data_type().is_floating() {
-                    coerce_float_vector(
-                        q.as_any().downcast_ref::<Float32Array>().unwrap(),
-                        FloatType::try_from(dt.data_type())?,
-                    )?
-                } else {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Column {} has element type {} and the query vector is {}",
-                            column,
-                            dt.data_type(),
-                            q.data_type(),
-                        ),
-                        location!(),
-                    ));
-                }
-            }
+        let element_type = get_vector_element_type(self.dataset.as_ref(), column)?;
+        let key = match element_type {
+            dt if dt == *q.data_type() => Box::new(q.clone()),
+            dt if dt.is_floating() => coerce_float_vector(
+                q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                FloatType::try_from(&dt)?,
+            )?,
             _ => {
                 return Err(Error::invalid_input(
                     format!(
-                        "Column {} is not a vector column (type: {})",
+                        "Column {} has element type {} and the query vector is {}",
                         column,
-                        field.data_type()
+                        element_type,
+                        q.data_type(),
                     ),
                     location!(),
                 ));
@@ -1584,25 +1564,13 @@ impl Scanner {
         };
 
         // Sanity check
-        let schema = self.dataset.schema();
-        if let Some(field) = schema.field(&q.column) {
-            match field.data_type() {
-                DataType::FixedSizeList(subfield, _)
-                    if subfield.data_type().is_floating()
-                        || *subfield.data_type() == DataType::UInt8 => {}
-                _ => {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
-                            q.column, field.data_type(),
-                        ),
-                        location!(),
-                    ));
-                }
-            }
-        } else {
+        let element_type = get_vector_element_type(self.dataset.as_ref(), &q.column)?;
+        if element_type != DataType::UInt8 && !element_type.is_floating() {
             return Err(Error::invalid_input(
-                format!("Vector search error: column {} not found", q.column),
+                format!(
+                    "Vector search error: column {} vector in {} type is not supported",
+                    q.column, element_type,
+                ),
                 location!(),
             ));
         }
