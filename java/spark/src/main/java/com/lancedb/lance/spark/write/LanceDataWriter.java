@@ -19,6 +19,7 @@ import com.lancedb.lance.WriteParams;
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.SparkOptions;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
+
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.write.DataWriter;
 import org.apache.spark.sql.connector.write.DataWriterFactory;
@@ -26,18 +27,20 @@ import org.apache.spark.sql.connector.write.WriterCommitMessage;
 import org.apache.spark.sql.types.StructType;
 
 import java.io.IOException;
-import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 
 public class LanceDataWriter implements DataWriter<InternalRow> {
   private LanceArrowWriter arrowWriter;
-  private FutureTask<FragmentMetadata> fragmentCreationTask;
+  private FutureTask<List<FragmentMetadata>> fragmentCreationTask;
   private Thread fragmentCreationThread;
 
-  private LanceDataWriter(LanceArrowWriter arrowWriter,
-      FutureTask<FragmentMetadata> fragmentCreationTask, Thread fragmentCreationThread) {
+  private LanceDataWriter(
+      LanceArrowWriter arrowWriter,
+      FutureTask<List<FragmentMetadata>> fragmentCreationTask,
+      Thread fragmentCreationThread) {
     // TODO support write to multiple fragments
     this.arrowWriter = arrowWriter;
     this.fragmentCreationThread = fragmentCreationThread;
@@ -53,8 +56,8 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
   public WriterCommitMessage commit() throws IOException {
     arrowWriter.setFinished();
     try {
-      FragmentMetadata fragmentMetadata = fragmentCreationTask.get();
-      return new BatchAppend.TaskCommit(Arrays.asList(fragmentMetadata));
+      List<FragmentMetadata> fragmentMetadata = fragmentCreationTask.get();
+      return new BatchAppend.TaskCommit(fragmentMetadata);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted while waiting for reader thread to finish", e);
@@ -91,11 +94,12 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
 
     @Override
     public DataWriter<InternalRow> createWriter(int partitionId, long taskId) {
-      LanceArrowWriter arrowWriter = LanceDatasetAdapter.getArrowWriter(schema, 1024);
+      int batch_size = SparkOptions.getBatchSize(config);
+      LanceArrowWriter arrowWriter = LanceDatasetAdapter.getArrowWriter(schema, batch_size);
       WriteParams params = SparkOptions.genWriteParamsFromConfig(config);
-      Callable<FragmentMetadata> fragmentCreator
-          = () -> LanceDatasetAdapter.createFragment(config.getDatasetUri(), arrowWriter, params);
-      FutureTask<FragmentMetadata> fragmentCreationTask = new FutureTask<>(fragmentCreator);
+      Callable<List<FragmentMetadata>> fragmentCreator =
+          () -> LanceDatasetAdapter.createFragment(config.getDatasetUri(), arrowWriter, params);
+      FutureTask<List<FragmentMetadata>> fragmentCreationTask = new FutureTask<>(fragmentCreator);
       Thread fragmentCreationThread = new Thread(fragmentCreationTask);
       fragmentCreationThread.start();
 

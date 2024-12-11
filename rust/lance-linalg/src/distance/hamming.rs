@@ -3,6 +3,14 @@
 
 //! Hamming distance.
 
+use std::sync::Arc;
+
+use crate::{Error, Result};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt8Type;
+use arrow_array::{Array, Float32Array};
+use arrow_schema::DataType;
+
 pub trait Hamming {
     /// Hamming distance between two vectors.
     fn hamming(x: &[u8], y: &[u8]) -> f32;
@@ -42,6 +50,37 @@ pub fn hamming_scalar(x: &[u8], y: &[u8]) -> f32 {
         .zip(y.iter())
         .map(|(xi, yi)| (xi ^ yi).count_ones())
         .sum::<u32>() as f32
+}
+
+pub fn hamming_distance_batch<'a>(
+    from: &'a [u8],
+    to: &'a [u8],
+    dimension: usize,
+) -> Box<dyn Iterator<Item = f32> + 'a> {
+    debug_assert_eq!(from.len(), dimension);
+    debug_assert_eq!(to.len() % dimension, 0);
+    Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
+}
+
+pub fn hamming_distance_arrow_batch(from: &dyn Array, to: &dyn Array) -> Result<Arc<Float32Array>> {
+    let dists = match *from.data_type() {
+        DataType::UInt8 => hamming_distance_batch(
+            from.as_primitive::<UInt8Type>().values(),
+            to.as_primitive::<UInt8Type>().values(),
+            from.len(),
+        ),
+        _ => {
+            return Err(Error::InvalidArgumentError(format!(
+                "Unsupported data type: {:?}",
+                from.data_type()
+            )))
+        }
+    };
+
+    Ok(Arc::new(Float32Array::new(
+        dists.collect(),
+        to.nulls().cloned(),
+    )))
 }
 
 #[cfg(test)]

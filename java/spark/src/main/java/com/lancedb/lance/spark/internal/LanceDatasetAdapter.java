@@ -16,32 +16,31 @@ package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.*;
 import com.lancedb.lance.spark.LanceConfig;
-import com.lancedb.lance.spark.read.LanceInputPartition;
 import com.lancedb.lance.spark.SparkOptions;
+import com.lancedb.lance.spark.read.LanceInputPartition;
 import com.lancedb.lance.spark.utils.Optional;
 import com.lancedb.lance.spark.write.LanceArrowWriter;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructType;
-import org.apache.spark.sql.util.ArrowUtils;
+import org.apache.spark.sql.util.LanceArrowUtils;
 
 import java.time.ZoneId;
 import java.util.List;
 import java.util.stream.Collectors;
 
 public class LanceDatasetAdapter {
-  private static final BufferAllocator allocator = new RootAllocator(
-      RootAllocator.configBuilder().from(RootAllocator.defaultConfig())
-          .maxAllocation(64 * 1024 * 1024).build());
+  private static final BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
 
   public static Optional<StructType> getSchema(LanceConfig config) {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
-      return Optional.of(ArrowUtils.fromArrowSchema(dataset.getSchema()));
+      return Optional.of(LanceArrowUtils.fromArrowSchema(dataset.getSchema()));
     } catch (IllegalArgumentException e) {
       // dataset not found
       return Optional.empty();
@@ -50,7 +49,7 @@ public class LanceDatasetAdapter {
 
   public static Optional<StructType> getSchema(String datasetUri) {
     try (Dataset dataset = Dataset.open(datasetUri, allocator)) {
-      return Optional.of(ArrowUtils.fromArrowSchema(dataset.getSchema()));
+      return Optional.of(LanceArrowUtils.fromArrowSchema(dataset.getSchema()));
     } catch (IllegalArgumentException e) {
       // dataset not found
       return Optional.empty();
@@ -62,12 +61,13 @@ public class LanceDatasetAdapter {
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
       return dataset.getFragments().stream()
-          .map(DatasetFragment::getId).collect(Collectors.toList());
+          .map(DatasetFragment::getId)
+          .collect(Collectors.toList());
     }
   }
 
-  public static LanceFragmentScanner getFragmentScanner(int fragmentId,
-      LanceInputPartition inputPartition) {
+  public static LanceFragmentScanner getFragmentScanner(
+      int fragmentId, LanceInputPartition inputPartition) {
     return LanceFragmentScanner.create(fragmentId, inputPartition, allocator);
   }
 
@@ -77,29 +77,41 @@ public class LanceDatasetAdapter {
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset datasetRead = Dataset.open(allocator, uri, options)) {
 
-      Dataset.commit(allocator, config.getDatasetUri(),
-          appendOp, java.util.Optional.of(datasetRead.version()), options.getStorageOptions())
-              .close();
+      Dataset.commit(
+              allocator,
+              config.getDatasetUri(),
+              appendOp,
+              java.util.Optional.of(datasetRead.version()),
+              options.getStorageOptions())
+          .close();
     }
   }
 
   public static LanceArrowWriter getArrowWriter(StructType sparkSchema, int batchSize) {
-    return new LanceArrowWriter(allocator,
-        ArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false), batchSize);
+    return new LanceArrowWriter(
+        allocator, LanceArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false), batchSize);
   }
 
-  public static FragmentMetadata createFragment(String datasetUri, ArrowReader reader,
-                                                WriteParams params) {
+  public static List<FragmentMetadata> createFragment(
+      String datasetUri, ArrowReader reader, WriteParams params) {
     try (ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
       Data.exportArrayStream(allocator, reader, arrowStream);
-      return Fragment.create(datasetUri, arrowStream,
-          java.util.Optional.empty(), params);
+      return Fragment.create(datasetUri, arrowStream, params);
     }
   }
 
   public static void createDataset(String datasetUri, StructType sparkSchema, WriteParams params) {
-    Dataset.create(allocator, datasetUri,
-        ArrowUtils.toArrowSchema(sparkSchema, ZoneId.systemDefault().getId(), true, false),
-            params).close();
+    Dataset.create(
+            allocator,
+            datasetUri,
+            LanceArrowUtils.toArrowSchema(sparkSchema, ZoneId.systemDefault().getId(), true, false),
+            params)
+        .close();
+  }
+
+  public static void dropDataset(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    Dataset.drop(uri, options.getStorageOptions());
   }
 }

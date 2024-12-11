@@ -258,6 +258,11 @@ message PackedStruct {
   Buffer buffer = 2;
 }
 
+message PackedStructFixedWidthMiniBlock {
+  ArrayEncoding Flat = 1;
+  repeated uint32 bits_per_values = 2;
+}
+
 message FixedSizeBinary {
   ArrayEncoding bytes = 1;
   uint32 byte_width = 2;
@@ -283,6 +288,7 @@ message ArrayEncoding {
         BinaryMiniBlock binary_mini_block = 15;
         FsstMiniBlock fsst_mini_block = 16;
         BinaryBlock binary_block = 17;
+        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 18;
     }
 }
 
@@ -310,6 +316,23 @@ message ColumnEncoding {
   }
 }
 
+enum RepDefLayer {
+  // Should never be used, included for debugging purporses and general protobuf best practice
+  REPDEF_UNSPECIFIED = 0;
+  // All values are valid (can be primitive or struct)
+  REPDEF_ALL_VALID_ITEM = 1;
+  // All list values are valid
+  REPDEF_ALL_VALID_LIST = 2;
+  // There are one or more null items (can be primitive or struct)
+  REPDEF_NULLABLE_ITEM = 3;
+  // A list layer with null lists but no empty lists
+  REPDEF_NULLABLE_LIST = 4;
+  // A list layer with empty lists but no null lists
+  REPDEF_EMPTYABLE_LIST = 5;
+  // A list layer with both empty lists and null lists
+  REPDEF_NULL_AND_EMPTY_LIST = 6;
+}
+
 /// A layout used for pages where the data is small
 ///
 /// In this case we can fit many values into a single disk sector and transposing buffers is
@@ -322,7 +345,25 @@ message MiniBlockLayout {
   ArrayEncoding def_compression = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
+  // Dictionary data
   ArrayEncoding dictionary = 4;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 5;
+  // The depth of the repetition index.
+  //
+  // If there is repetition then the depth must be at least 1.  If there are many layers
+  // of repetition then deeper repetition indices will support deeper nested random access.  For
+  // example, given 5 layers of repetition then the repetition index depth must be at least
+  // 3 to support access like rows[50][17][3].
+  //
+  // We require `repetition_index_depth + 1` u64 values per mini-block to store the repetition
+  // index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store
+  // the number of "leftover items" at the end of the chunk.  Otherwise, we wouldn't have any way
+  // to know if the final item in a chunk is valid or not.
+  uint32 repetition_index_depth = 6;
+  // The page already records how many rows are in the page.  For mini-block we also need to know how
+  // many "items" are in the page.  A row and an item are the same thing unless the page has lists.
+  uint64 num_items = 7;
 }
 
 /// A layout used for pages where the data is large
@@ -336,6 +377,8 @@ message FullZipLayout {
   uint32 bits_def = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 4;
 }
 
 /// A layout used for pages where all values are null

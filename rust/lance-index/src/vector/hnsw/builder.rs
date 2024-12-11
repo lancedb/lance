@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::super::graph::beam_search;
 use super::{select_neighbors_heuristic, HnswMetadata, HNSW_TYPE, VECTOR_ID_COL, VECTOR_ID_FIELD};
 use crate::prefilter::PreFilter;
-use crate::vector::flat::storage::FlatStorage;
+use crate::vector::flat::storage::FlatFloatStorage;
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{greedy_search, Visited};
 use crate::vector::graph::{
@@ -100,7 +100,7 @@ impl HnswBuildParams {
     /// - `data`: A FixedSizeList to build the HNSW.
     /// - `distance_type`: The distance type to use.
     pub async fn build(self, data: ArrayRef, distance_type: DistanceType) -> Result<HNSW> {
-        let vec_store = Arc::new(FlatStorage::new(
+        let vec_store = Arc::new(FlatFloatStorage::new(
             data.as_fixed_size_list().clone(),
             distance_type,
         ));
@@ -507,7 +507,7 @@ impl<'a> HnswLevelView<'a> {
     }
 }
 
-impl<'a> Graph for HnswLevelView<'a> {
+impl Graph for HnswLevelView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -528,7 +528,7 @@ impl<'a> HnswBottomView<'a> {
     }
 }
 
-impl<'a> Graph for HnswBottomView<'a> {
+impl Graph for HnswBottomView<'_> {
     fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -544,7 +544,7 @@ pub struct HnswQueryParams {
     pub ef: usize,
 }
 
-impl<'a> From<&'a Query> for HnswQueryParams {
+impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
@@ -819,7 +819,7 @@ mod tests {
     use crate::scalar::IndexWriter;
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
-        flat::storage::FlatStorage,
+        flat::storage::FlatFloatStorage,
         graph::{DISTS_FIELD, NEIGHBORS_FIELD},
         hnsw::{builder::HnswBuildParams, HNSW, VECTOR_ID_FIELD},
     };
@@ -831,7 +831,7 @@ mod tests {
         const NUM_EDGES: usize = 20;
         let data = generate_random_array(TOTAL * DIM);
         let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
-        let store = Arc::new(FlatStorage::new(fsl.clone(), DistanceType::L2));
+        let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
             HnswBuildParams::default()

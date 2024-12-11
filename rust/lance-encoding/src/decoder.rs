@@ -239,7 +239,9 @@ use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::blob::BlobFieldScheduler;
-use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
+use crate::encodings::logical::list::{
+    ListFieldScheduler, OffsetPageInfo, StructuralListScheduler,
+};
 use crate::encodings::logical::primitive::{
     PrimitiveFieldScheduler, StructuralPrimitiveFieldScheduler,
 };
@@ -250,10 +252,11 @@ use crate::encodings::physical::binary::{BinaryBlockDecompressor, BinaryMiniBloc
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
 use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
 use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
-use crate::repdef::{LevelBuffer, RepDefUnraveler};
+use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
 use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
 
@@ -489,7 +492,7 @@ pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
     ) -> Result<Box<dyn BlockDecompressor>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CoreDecompressorStrategy {}
 
 impl DecompressorStrategy for CoreDecompressorStrategy {
@@ -509,6 +512,11 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             }
             pb::array_encoding::ArrayEncoding::FsstMiniBlock(description) => {
                 Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
+            }
+            pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
+                Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(
+                    description,
+                )))
             }
             _ => todo!(),
         }
@@ -750,11 +758,26 @@ impl CoreFieldDecoderStrategy {
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
             )?);
+
+            // advance to the next top level column
             column_infos.next_top_level();
+
             return Ok(scheduler);
         }
         match &data_type {
             DataType::Struct(fields) => {
+                if field.is_packed_struct() {
+                    let column_info = column_infos.expect_next()?;
+                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                        column_info.as_ref(),
+                        self.decompressor_strategy.as_ref(),
+                    )?);
+
+                    // advance to the next top level column
+                    column_infos.next_top_level();
+
+                    return Ok(scheduler);
+                }
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
                     let field_scheduler =
@@ -776,6 +799,16 @@ impl CoreFieldDecoderStrategy {
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)
+            }
+            DataType::List(_) | DataType::LargeList(_) => {
+                let child = field
+                    .children
+                    .first()
+                    .expect("List field must have a child");
+                let child_scheduler =
+                    self.create_structural_field_scheduler(child, column_infos)?;
+                Ok(Box::new(StructuralListScheduler::new(child_scheduler))
+                    as Box<dyn StructuralFieldScheduler>)
             }
             _ => todo!(),
         }
@@ -1685,7 +1718,11 @@ pub fn create_decode_stream(
 ) -> BoxStream<'static, ReadBatchTask> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
-        let structural_decoder = StructuralStructDecoder::new(arrow_schema.fields, should_validate);
+        let structural_decoder = StructuralStructDecoder::new(
+            arrow_schema.fields,
+            should_validate,
+            /*is_root=*/ true,
+        );
         StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder).into_stream()
     } else {
         let arrow_schema = ArrowSchema::from(schema);
@@ -2305,8 +2342,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 
 pub struct DecodedPage {
     pub data: DataBlock,
-    pub repetition: Option<LevelBuffer>,
-    pub definition: Option<LevelBuffer>,
+    pub repdef: RepDefUnraveler,
 }
 
 pub trait DecodePageTask: Send + std::fmt::Debug {
@@ -2347,7 +2383,7 @@ pub struct LoadedPage {
 
 pub struct DecodedArray {
     pub array: ArrayRef,
-    pub repdef: RepDefUnraveler,
+    pub repdef: CompositeRepDefUnraveler,
 }
 
 pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {

@@ -37,6 +37,8 @@ pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 #[derive(Clone, Debug)]
 pub struct BitmapIndex {
     index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
+    // We put null in its own map to avoid it matching range queries (arrow-rs considers null to come before minval)
+    null_map: RowIdTreeMap,
     // Memoized index_map size for DeepSizeOf
     index_map_size_bytes: usize,
     store: Arc<dyn IndexStore>,
@@ -45,11 +47,13 @@ pub struct BitmapIndex {
 impl BitmapIndex {
     fn new(
         index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
+        null_map: RowIdTreeMap,
         index_map_size_bytes: usize,
         store: Arc<dyn IndexStore>,
     ) -> Self {
         Self {
             index_map,
+            null_map,
             index_map_size_bytes,
             store,
         }
@@ -74,6 +78,7 @@ impl BitmapIndex {
         let mut index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap> = BTreeMap::new();
 
         let mut index_map_size_bytes = 0;
+        let mut null_map = RowIdTreeMap::default();
         for idx in 0..data.num_rows() {
             let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
             let bitmap_bytes = bitmap_binary_array.value(idx);
@@ -82,10 +87,14 @@ impl BitmapIndex {
             index_map_size_bytes += key.deep_size_of();
             // This should be a reasonable approximation of the RowIdTreeMap size
             index_map_size_bytes += bitmap_bytes.len();
-            index_map.insert(key, bitmap);
+            if key.0.is_null() {
+                null_map = bitmap;
+            } else {
+                index_map.insert(key, bitmap);
+            }
         }
 
-        Ok(Self::new(index_map, index_map_size_bytes, store))
+        Ok(Self::new(index_map, null_map, index_map_size_bytes, store))
     }
 }
 
@@ -152,8 +161,12 @@ impl ScalarIndex for BitmapIndex {
 
         let row_ids = match query {
             SargableQuery::Equals(val) => {
-                let key = OrderableScalarValue(val.clone());
-                self.index_map.get(&key).cloned().unwrap_or_default()
+                if val.is_null() {
+                    self.null_map.clone()
+                } else {
+                    let key = OrderableScalarValue(val.clone());
+                    self.index_map.get(&key).cloned().unwrap_or_default()
+                }
             }
             SargableQuery::Range(start, end) => {
                 let range_start = match start {
@@ -179,26 +192,19 @@ impl ScalarIndex for BitmapIndex {
             SargableQuery::IsIn(values) => {
                 let mut union_bitmap = RowIdTreeMap::default();
                 for val in values {
-                    let key = OrderableScalarValue(val.clone());
-                    if let Some(bitmap) = self.index_map.get(&key) {
-                        union_bitmap |= bitmap.clone();
+                    if val.is_null() {
+                        union_bitmap |= self.null_map.clone();
+                    } else {
+                        let key = OrderableScalarValue(val.clone());
+                        if let Some(bitmap) = self.index_map.get(&key) {
+                            union_bitmap |= bitmap.clone();
+                        }
                     }
                 }
 
                 union_bitmap
             }
-            SargableQuery::IsNull() => {
-                if let Some(array) = self
-                    .index_map
-                    .iter()
-                    .find(|(key, _)| key.0.is_null())
-                    .map(|(_, value)| value)
-                {
-                    array.clone()
-                } else {
-                    RowIdTreeMap::default()
-                }
-            }
+            SargableQuery::IsNull() => self.null_map.clone(),
             SargableQuery::FullTextSearch(_) => {
                 return Err(Error::NotSupported {
                     source: "full text search is not supported for bitmap indexes".into(),

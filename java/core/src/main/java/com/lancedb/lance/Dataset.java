@@ -16,12 +16,7 @@ import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import java.io.Closeable;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.stream.Collectors;
+
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
@@ -29,6 +24,13 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.types.pojo.Schema;
+
+import java.io.Closeable;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * Class representing a Lance dataset, interfacing with the native lance library. This class
@@ -59,8 +61,8 @@ public class Dataset implements Closeable {
    * @param params write params
    * @return Dataset
    */
-  public static Dataset create(BufferAllocator allocator, String path, Schema schema,
-      WriteParams params) {
+  public static Dataset create(
+      BufferAllocator allocator, String path, Schema schema, WriteParams params) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(schema);
@@ -68,8 +70,13 @@ public class Dataset implements Closeable {
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
       Data.exportSchema(allocator, schema, null, arrowSchema);
       Dataset dataset =
-          createWithFfiSchema(arrowSchema.memoryAddress(), path, params.getMaxRowsPerFile(),
-              params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode(),
+          createWithFfiSchema(
+              arrowSchema.memoryAddress(),
+              path,
+              params.getMaxRowsPerFile(),
+              params.getMaxRowsPerGroup(),
+              params.getMaxBytesPerFile(),
+              params.getMode(),
               params.getStorageOptions());
       dataset.allocator = allocator;
       return dataset;
@@ -85,26 +92,42 @@ public class Dataset implements Closeable {
    * @param params write parameters
    * @return Dataset
    */
-  public static Dataset create(BufferAllocator allocator, ArrowArrayStream stream, String path,
-      WriteParams params) {
+  public static Dataset create(
+      BufferAllocator allocator, ArrowArrayStream stream, String path, WriteParams params) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(params);
-    Dataset dataset = createWithFfiStream(stream.memoryAddress(), path, params.getMaxRowsPerFile(),
-        params.getMaxRowsPerGroup(), params.getMaxBytesPerFile(), params.getMode(),
-        params.getStorageOptions());
+    Dataset dataset =
+        createWithFfiStream(
+            stream.memoryAddress(),
+            path,
+            params.getMaxRowsPerFile(),
+            params.getMaxRowsPerGroup(),
+            params.getMaxBytesPerFile(),
+            params.getMode(),
+            params.getStorageOptions());
     dataset.allocator = allocator;
     return dataset;
   }
 
-  private static native Dataset createWithFfiSchema(long arrowSchemaMemoryAddress, String path,
-      Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode, Map<String, String> storageOptions);
+  private static native Dataset createWithFfiSchema(
+      long arrowSchemaMemoryAddress,
+      String path,
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<String> mode,
+      Map<String, String> storageOptions);
 
-  private static native Dataset createWithFfiStream(long arrowStreamMemoryAddress, String path,
-      Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<String> mode, Map<String, String> storageOptions);
+  private static native Dataset createWithFfiStream(
+      long arrowStreamMemoryAddress,
+      String path,
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<String> mode,
+      Map<String, String> storageOptions);
 
   /**
    * Open a dataset from the specified path.
@@ -157,20 +180,30 @@ public class Dataset implements Closeable {
    * @param options the open options
    * @return Dataset
    */
-  private static Dataset open(BufferAllocator allocator, boolean selfManagedAllocator, String path,
-      ReadOptions options) {
+  private static Dataset open(
+      BufferAllocator allocator, boolean selfManagedAllocator, String path, ReadOptions options) {
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(options);
-    Dataset dataset = openNative(path, options.getVersion(), options.getBlockSize(),
-        options.getIndexCacheSize(), options.getMetadataCacheSize(), options.getStorageOptions());
+    Dataset dataset =
+        openNative(
+            path,
+            options.getVersion(),
+            options.getBlockSize(),
+            options.getIndexCacheSize(),
+            options.getMetadataCacheSize(),
+            options.getStorageOptions());
     dataset.allocator = allocator;
     dataset.selfManagedAllocator = selfManagedAllocator;
     return dataset;
   }
 
-  private static native Dataset openNative(String path, Optional<Integer> version,
-      Optional<Integer> blockSize, int indexCacheSize, int metadataCacheSize,
+  private static native Dataset openNative(
+      String path,
+      Optional<Integer> version,
+      Optional<Integer> blockSize,
+      int indexCacheSize,
+      int metadataCacheSize,
       Map<String, String> storageOptions);
 
   /**
@@ -180,16 +213,23 @@ public class Dataset implements Closeable {
    * @param path The file path of the dataset to open.
    * @param operation The operation to apply to the dataset.
    * @param readVersion The version of the dataset that was used as the base for the changes. This
-   *        is not needed for overwrite or restore operations.
+   *     is not needed for overwrite or restore operations.
    * @return A new instance of {@link Dataset} linked to the opened dataset.
    */
-  public static Dataset commit(BufferAllocator allocator, String path, FragmentOperation operation,
-                               Optional<Long> readVersion) {
+  public static Dataset commit(
+      BufferAllocator allocator,
+      String path,
+      FragmentOperation operation,
+      Optional<Long> readVersion) {
     return commit(allocator, path, operation, readVersion, new HashMap<>());
   }
 
-  public static Dataset commit(BufferAllocator allocator, String path, FragmentOperation operation,
-      Optional<Long> readVersion, Map<String, String> storageOptions) {
+  public static Dataset commit(
+      BufferAllocator allocator,
+      String path,
+      FragmentOperation operation,
+      Optional<Long> readVersion,
+      Map<String, String> storageOptions) {
     Preconditions.checkNotNull(allocator);
     Preconditions.checkNotNull(path);
     Preconditions.checkNotNull(operation);
@@ -199,8 +239,19 @@ public class Dataset implements Closeable {
     return dataset;
   }
 
-  public static native Dataset commitAppend(String path, Optional<Long> readVersion,
-      List<String> fragmentsMetadata, Map<String, String> storageOptions);
+  public static native Dataset commitAppend(
+      String path,
+      Optional<Long> readVersion,
+      List<String> fragmentsMetadata,
+      Map<String, String> storageOptions);
+
+  /**
+   * Drop a Dataset.
+   *
+   * @param path The file path of the dataset
+   * @param storageOptions Storage options
+   */
+  public static native void drop(String path, Map<String, String> storageOptions);
 
   /**
    * Create a new Dataset Scanner.
@@ -249,9 +300,7 @@ public class Dataset implements Closeable {
 
   private native long nativeVersion();
 
-  /**
-   * @return the latest version of the dataset.
-   */
+  /** @return the latest version of the dataset. */
   public long latestVersion() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
@@ -270,16 +319,24 @@ public class Dataset implements Closeable {
    * @param params index params
    * @param replace whether to replace the existing index
    */
-  public void createIndex(List<String> columns, IndexType indexType, Optional<String> name,
-      IndexParams params, boolean replace) {
+  public void createIndex(
+      List<String> columns,
+      IndexType indexType,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace) {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       nativeCreateIndex(columns, indexType.getValue(), name, params, replace);
     }
   }
 
-  private native void nativeCreateIndex(List<String> columns, int indexTypeCode,
-      Optional<String> name, IndexParams params, boolean replace);
+  private native void nativeCreateIndex(
+      List<String> columns,
+      int indexTypeCode,
+      Optional<String> name,
+      IndexParams params,
+      boolean replace);
 
   /**
    * Count the number of rows in the dataset.
@@ -332,9 +389,7 @@ public class Dataset implements Closeable {
 
   private native void importFfiSchema(long arrowSchemaMemoryAddress);
 
-  /**
-   * @return all the created indexes names
-   */
+  /** @return all the created indexes names */
   public List<String> listIndexes() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");

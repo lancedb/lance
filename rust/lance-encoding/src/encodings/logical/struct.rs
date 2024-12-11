@@ -15,6 +15,7 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
+use lance_arrow::FieldExt;
 use log::trace;
 use snafu::{location, Location};
 
@@ -31,7 +32,7 @@ use crate::{
 };
 use lance_core::{Error, Result};
 
-use super::primitive::StructuralPrimitiveFieldDecoder;
+use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
 #[derive(Debug)]
 struct SchedulingJobWithStatus<'a> {
@@ -42,21 +43,21 @@ struct SchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for SchedulingJobWithStatus<'a> {
+impl PartialEq for SchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for SchedulingJobWithStatus<'a> {}
+impl Eq for SchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for SchedulingJobWithStatus<'a> {
+impl PartialOrd for SchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for SchedulingJobWithStatus<'a> {
+impl Ord for SchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -106,7 +107,7 @@ impl<'a> SimpleStructSchedulerJob<'a> {
     }
 }
 
-impl<'a> SchedulingJob for SimpleStructSchedulerJob<'a> {
+impl SchedulingJob for SimpleStructSchedulerJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
@@ -239,21 +240,21 @@ struct StructuralSchedulingJobWithStatus<'a> {
     rows_remaining: u64,
 }
 
-impl<'a> PartialEq for StructuralSchedulingJobWithStatus<'a> {
+impl PartialEq for StructuralSchedulingJobWithStatus<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.col_idx == other.col_idx
     }
 }
 
-impl<'a> Eq for StructuralSchedulingJobWithStatus<'a> {}
+impl Eq for StructuralSchedulingJobWithStatus<'_> {}
 
-impl<'a> PartialOrd for StructuralSchedulingJobWithStatus<'a> {
+impl PartialOrd for StructuralSchedulingJobWithStatus<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<'a> Ord for StructuralSchedulingJobWithStatus<'a> {
+impl Ord for StructuralSchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
@@ -297,7 +298,7 @@ impl<'a> RepDefStructSchedulingJob<'a> {
     }
 }
 
-impl<'a> StructuralSchedulingJob for RepDefStructSchedulingJob<'a> {
+impl StructuralSchedulingJob for RepDefStructSchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         mut context: &mut SchedulerContext,
@@ -583,10 +584,12 @@ pub struct StructuralStructDecoder {
     children: Vec<Box<dyn StructuralFieldDecoder>>,
     data_type: DataType,
     child_fields: Fields,
+    // The root decoder is slightly different because it cannot have nulls
+    is_root: bool,
 }
 
 impl StructuralStructDecoder {
-    pub fn new(fields: Fields, should_validate: bool) -> Self {
+    pub fn new(fields: Fields, should_validate: bool, is_root: bool) -> Self {
         let children = fields
             .iter()
             .map(|field| Self::field_to_decoder(field, should_validate))
@@ -596,6 +599,7 @@ impl StructuralStructDecoder {
             data_type,
             children,
             child_fields: fields,
+            is_root,
         }
     }
 
@@ -604,8 +608,22 @@ impl StructuralStructDecoder {
         should_validate: bool,
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
-            DataType::Struct(fields) => Box::new(Self::new(fields.clone(), should_validate)),
-            DataType::List(_) | DataType::LargeList(_) => todo!(),
+            DataType::Struct(fields) => {
+                if field.is_packed_struct() {
+                    let decoder =
+                        StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
+                    Box::new(decoder)
+                } else {
+                    Box::new(Self::new(fields.clone(), should_validate, false))
+                }
+            }
+            DataType::List(child_field) | DataType::LargeList(child_field) => {
+                let child_decoder = Self::field_to_decoder(child_field, should_validate);
+                Box::new(StructuralListDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                ))
+            }
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
             DataType::Map(_, _) => todo!(),
@@ -633,6 +651,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
+            is_root: self.is_root,
         }))
     }
 
@@ -645,6 +664,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
+    is_root: bool,
 }
 
 impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
@@ -657,15 +677,22 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
         let mut children = Vec::with_capacity(arrays.len());
         let mut arrays_iter = arrays.into_iter();
         let first_array = arrays_iter.next().unwrap();
+        let length = first_array.array.len();
 
         // The repdef should be identical across all children at this point
         let mut repdef = first_array.repdef;
         children.push(first_array.array);
+
         for array in arrays_iter {
+            debug_assert_eq!(length, array.array.len());
             children.push(array.array);
         }
 
-        let validity = repdef.unravel_validity();
+        let validity = if self.is_root {
+            None
+        } else {
+            repdef.unravel_validity(length)
+        };
         let array = StructArray::new(self.child_fields, children, validity);
         Ok(DecodedArray {
             array: Arc::new(array),
@@ -836,6 +863,7 @@ impl FieldEncoder for StructStructuralEncoder {
         external_buffers: &mut OutOfLineBuffers,
         mut repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
         if let Some(validity) = struct_array.nulls() {
@@ -848,7 +876,13 @@ impl FieldEncoder for StructStructuralEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
@@ -913,6 +947,7 @@ impl FieldEncoder for StructFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
@@ -921,7 +956,13 @@ impl FieldEncoder for StructFieldEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())

@@ -7,12 +7,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
+use arrow_array::{
+    Array, ArrowPrimitiveType, Float32Array, Int64Array, PrimitiveArray, RecordBatch,
+};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
+use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
-use datafusion::logical_expr::{lit, Expr};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -26,11 +29,11 @@ use datafusion::physical_plan::{
     filter::FilterExec,
     limit::GlobalLimitExec,
     repartition::RepartitionExec,
-    udaf::create_aggregate_expr,
     union::UnionExec,
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
+use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::{Partitioning, PhysicalExpr};
 use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
@@ -630,7 +633,12 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest(&mut self, column: &str, q: &Float32Array, k: usize) -> Result<&mut Self> {
+    pub fn nearest<T: ArrowPrimitiveType>(
+        &mut self,
+        column: &str,
+        q: &PrimitiveArray<T>,
+        k: usize,
+    ) -> Result<&mut Self> {
         if !self.prefilter {
             // We can allow fragment scan if the input to nearest is a prefilter.
             // The fragment scan will be performed by the prefilter.
@@ -660,14 +668,20 @@ impl Scanner {
             ))?;
         let key = match field.data_type() {
             DataType::FixedSizeList(dt, _) => {
-                if dt.data_type().is_floating() {
-                    coerce_float_vector(q, FloatType::try_from(dt.data_type())?)?
+                if dt.data_type() == q.data_type() {
+                    Box::new(q.clone())
+                } else if dt.data_type().is_floating() {
+                    coerce_float_vector(
+                        q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                        FloatType::try_from(dt.data_type())?,
+                    )?
                 } else {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column {} is not a vector column (type: {})",
+                            "Column {} has element type {} and the query vector is {}",
                             column,
-                            field.data_type()
+                            dt.data_type(),
+                            q.data_type(),
                         ),
                         location!(),
                     ));
@@ -958,17 +972,16 @@ impl Scanner {
         let plan = self.create_plan().await?;
         // Datafusion interprets COUNT(*) as COUNT(1)
         let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
-        let count_expr = create_aggregate_expr(
-            &count_udaf(),
-            &[one],
-            &[lit(1)],
-            &[],
-            &[],
-            &plan.schema(),
-            None,
-            false,
-            false,
-        )?;
+
+        let input_phy_exprs: &[Arc<dyn PhysicalExpr>] = &[one];
+        let schema = plan.schema();
+
+        let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
+        builder = builder.schema(schema);
+        builder = builder.alias("count_rows".to_string());
+
+        let count_expr = builder.build()?;
+
         let plan_schema = plan.schema();
         let count_plan = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
@@ -1530,6 +1543,24 @@ impl Scanner {
             fts_node,
             Partitioning::RoundRobinBatch(1),
         )?);
+
+        // group by rowid to dedup results from multiple indices
+        let schema = fts_node.schema();
+        let group_expr = vec![(expressions::col(ROW_ID, &schema)?, ROW_ID.to_string())];
+        let fts_node = Arc::new(AggregateExec::try_new(
+            AggregateMode::Final,
+            PhysicalGroupBy::new_single(group_expr),
+            vec![AggregateExprBuilder::new(
+                functions_aggregate::min_max::max_udaf(),
+                vec![expressions::col(SCORE_COL, &schema)?],
+            )
+            .schema(schema.clone())
+            .alias(SCORE_COL)
+            .build()?],
+            vec![None],
+            fts_node,
+            schema,
+        )?);
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(SCORE_COL, fts_node.schema().as_ref())?,
             options: SortOptions {
@@ -1556,7 +1587,9 @@ impl Scanner {
         let schema = self.dataset.schema();
         if let Some(field) = schema.field(&q.column) {
             match field.data_type() {
-                DataType::FixedSizeList(subfield, _) if subfield.data_type().is_floating() => {}
+                DataType::FixedSizeList(subfield, _)
+                    if subfield.data_type().is_floating()
+                        || *subfield.data_type() == DataType::UInt8 => {}
                 _ => {
                     return Err(Error::invalid_input(
                         format!(
@@ -5061,11 +5094,12 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-            FlatFts: query=hello
-              EmptyExec"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+              FlatFts: query=hello
+                EmptyExec"#,
         )
         .await?;
 
@@ -5084,12 +5118,13 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-              ScalarIndexQuery: query=i > 10
-            FlatFts: query=hello
-              EmptyExec"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+                ScalarIndexQuery: query=i > 10
+              FlatFts: query=hello
+                EmptyExec"#,
         )
         .await?;
 
@@ -5106,11 +5141,12 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-            FlatFts: query=hello
-              LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+              FlatFts: query=hello
+                LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=false"#,
         )
         .await?;
 
@@ -5128,13 +5164,14 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
-          UnionExec
-            Fts: query=hello
-              ScalarIndexQuery: query=i > 10
-            FlatFts: query=hello
-              FilterExec: i@1 > 10
-                LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,
+        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+          RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
+            UnionExec
+              Fts: query=hello
+                ScalarIndexQuery: query=i > 10
+              FlatFts: query=hello
+                FilterExec: i@1 > 10
+                  LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false"#,
         )
         .await?;
 

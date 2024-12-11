@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.TestUtils;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.Test;
 
@@ -29,8 +30,13 @@ public class LanceColumnarPartitionReaderTest {
   @Test
   public void test() throws Exception {
     LanceSplit split = new LanceSplit(Arrays.asList(0, 1));
-    LanceInputPartition partition = new LanceInputPartition(
-        TestUtils.TestTable1Config.schema, 0, split, TestUtils.TestTable1Config.lanceConfig, Optional.empty());
+    LanceInputPartition partition =
+        new LanceInputPartition(
+            TestUtils.TestTable1Config.schema,
+            0,
+            split,
+            TestUtils.TestTable1Config.lanceConfig,
+            Optional.empty());
     try (LanceColumnarPartitionReader reader = new LanceColumnarPartitionReader(partition)) {
       List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues;
       int rowIndex = 0;
@@ -43,7 +49,8 @@ public class LanceColumnarPartitionReaderTest {
           for (int j = 0; j < batch.numCols(); j++) {
             long actualValue = batch.column(j).getLong(i);
             long expectedValue = expectedValues.get(rowIndex).get(j);
-            assertEquals(expectedValue, actualValue, "Mismatch at row " + rowIndex + " column " + j);
+            assertEquals(
+                expectedValue, actualValue, "Mismatch at row " + rowIndex + " column " + j);
           }
           rowIndex++;
         }

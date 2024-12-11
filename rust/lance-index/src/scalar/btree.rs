@@ -50,6 +50,8 @@ use super::{
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
+pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
+const BATCH_SIZE_META_KEY: &str = "batch_size";
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -573,7 +575,11 @@ impl BTreeLookup {
 
     // All pages that could have a value equal to val
     fn pages_eq(&self, query: &OrderableScalarValue) -> Vec<u32> {
-        self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+        if query.0.is_null() {
+            self.pages_null()
+        } else {
+            self.pages_between((Bound::Included(query), Bound::Excluded(query)))
+        }
     }
 
     // All pages that could have a value equal to one of the values
@@ -673,6 +679,7 @@ pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
+    batch_size: u64,
 }
 
 impl BTreeIndex {
@@ -681,12 +688,14 @@ impl BTreeIndex {
         null_pages: Vec<u32>,
         store: Arc<dyn IndexStore>,
         sub_index: Arc<dyn BTreeSubIndex>,
+        batch_size: u64,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
         Self {
             page_lookup,
             store,
             sub_index,
+            batch_size,
         }
     }
 
@@ -696,7 +705,9 @@ impl BTreeIndex {
         page_number: u32,
         index_reader: Arc<dyn IndexReader>,
     ) -> Result<RowIdTreeMap> {
-        let serialized_page = index_reader.read_record_batch(page_number).await?;
+        let serialized_page = index_reader
+            .read_record_batch(page_number as u64, self.batch_size)
+            .await?;
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
@@ -705,7 +716,11 @@ impl BTreeIndex {
         subindex.search(query).await
     }
 
-    fn try_from_serialized(data: RecordBatch, store: Arc<dyn IndexStore>) -> Result<Self> {
+    fn try_from_serialized(
+        data: RecordBatch,
+        store: Arc<dyn IndexStore>,
+        batch_size: u64,
+    ) -> Result<Self> {
         let mut map = BTreeMap::<OrderableScalarValue, Vec<PageRecord>>::new();
         let mut null_pages = Vec::<u32>::new();
 
@@ -735,9 +750,13 @@ impl BTreeIndex {
             let null_count = null_counts.values()[idx];
             let page_number = page_numbers.values()[idx];
 
-            map.entry(min)
-                .or_default()
-                .push(PageRecord { max, page_number });
+            // If the page is entirely null don't even bother putting it in the tree
+            if !max.0.is_null() {
+                map.entry(min)
+                    .or_default()
+                    .push(PageRecord { max, page_number });
+            }
+
             if null_count > 0 {
                 null_pages.push(page_number);
             }
@@ -751,7 +770,7 @@ impl BTreeIndex {
         // TODO: Support other page types?
         let sub_index = Arc::new(FlatIndexMetadata::new(data_type.clone()));
 
-        Ok(Self::new(map, null_pages, store, sub_index))
+        Ok(Self::new(map, null_pages, store, sub_index, batch_size))
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
@@ -844,7 +863,9 @@ impl Index for BTreeIndex {
 
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         for page_number in self.page_lookup.all_page_ids() {
-            let serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let serialized = sub_index_reader
+                .read_record_batch(page_number as u64, self.batch_size)
+                .await?;
             let page = self.sub_index.load_subindex(serialized).await?;
             frag_ids |= page.calculate_included_frags().await?;
         }
@@ -891,10 +912,20 @@ impl ScalarIndex for BTreeIndex {
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let page_lookup_file = store.open_index_file(BTREE_LOOKUP_NAME).await?;
-        let serialized_lookup = page_lookup_file.read_record_batch(0).await?;
+        let num_rows_in_lookup = page_lookup_file.num_rows();
+        let serialized_lookup = page_lookup_file
+            .read_range(0..num_rows_in_lookup, None)
+            .await?;
+        let file_schema = page_lookup_file.schema();
+        let batch_size = file_schema
+            .metadata
+            .get(BATCH_SIZE_META_KEY)
+            .map(|bs| bs.parse().unwrap_or(DEFAULT_BTREE_BATCH_SIZE))
+            .unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
         Ok(Arc::new(Self::try_from_serialized(
             serialized_lookup,
             store,
+            batch_size,
         )?))
     }
 
@@ -911,7 +942,9 @@ impl ScalarIndex for BTreeIndex {
         let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
 
         for page_number in self.page_lookup.all_page_ids() {
-            let old_serialized = sub_index_reader.read_record_batch(page_number).await?;
+            let old_serialized = sub_index_reader
+                .read_record_batch(page_number as u64, self.batch_size)
+                .await?;
             let remapped = self
                 .sub_index
                 .remap_subindex(old_serialized, mapping)
@@ -934,7 +967,13 @@ impl ScalarIndex for BTreeIndex {
     ) -> Result<()> {
         // Merge the existing index data with the new data and then retrain the index on the merged stream
         let merged_data_source = Box::new(BTreeUpdater::new(self.clone(), new_data));
-        train_btree_index(merged_data_source, self.sub_index.as_ref(), dest_store).await
+        train_btree_index(
+            merged_data_source,
+            self.sub_index.as_ref(),
+            dest_store,
+            DEFAULT_BTREE_BATCH_SIZE as u32,
+        )
+        .await
     }
 }
 
@@ -1092,13 +1131,14 @@ pub async fn train_btree_index(
     data_source: Box<dyn TrainingSource + Send>,
     sub_index_trainer: &dyn BTreeSubIndex,
     index_store: &dyn IndexStore,
+    batch_size: u32,
 ) -> Result<()> {
     let mut sub_index_file = index_store
         .new_index_file(BTREE_PAGES_NAME, sub_index_trainer.schema().clone())
         .await?;
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
-    let mut batches_source = data_source.scan_ordered_chunks(4096).await?;
+    let mut batches_source = data_source.scan_ordered_chunks(batch_size).await?;
     while let Some(batch) = batches_source.try_next().await? {
         debug_assert_eq!(batch.num_columns(), 2);
         debug_assert_eq!(*batch.column(1).data_type(), DataType::UInt64);
@@ -1109,8 +1149,12 @@ pub async fn train_btree_index(
     }
     sub_index_file.finish().await?;
     let record_batch = btree_stats_as_batch(encoded_batches)?;
+    let mut file_schema = record_batch.schema().as_ref().clone();
+    file_schema
+        .metadata
+        .insert(BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
     let mut btree_index_file = index_store
-        .new_index_file(BTREE_LOOKUP_NAME, record_batch.schema())
+        .new_index_file(BTREE_LOOKUP_NAME, Arc::new(file_schema))
         .await?;
     btree_index_file.write_record_batch(record_batch).await?;
     btree_index_file.finish().await?;
@@ -1204,7 +1248,12 @@ impl Stream for IndexReaderStream {
         let page_number = this.pages[idx];
         this.idx += 1;
         let reader_copy = this.reader.clone();
-        let read_task = async move { reader_copy.read_record_batch(page_number).await }.boxed();
+        let read_task = async move {
+            reader_copy
+                .read_record_batch(page_number as u64, DEFAULT_BTREE_BATCH_SIZE)
+                .await
+        }
+        .boxed();
         std::task::Poll::Ready(Some(read_task))
     }
 }

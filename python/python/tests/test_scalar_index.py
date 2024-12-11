@@ -86,6 +86,25 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         assert actual_price == expected_price
 
 
+def test_indexed_between(tmp_path):
+    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset.create_scalar_index("val", index_type="BTREE")
+
+    scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+    scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+
 def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
@@ -317,6 +336,36 @@ def test_bitmap_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "Bitmap"
+
+
+def test_null_handling(tmp_path: Path):
+    tbl = pa.table(
+        {
+            "x": [1, 2, None, 3],
+        }
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    def check(has_index: bool):
+        assert dataset.to_table(filter="x IS NULL").num_rows == 1
+        assert dataset.to_table(filter="x IS NOT NULL").num_rows == 3
+        assert dataset.to_table(filter="x > 0").num_rows == 3
+        assert dataset.to_table(filter="x < 5").num_rows == 3
+        assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
+        # Note: there is a bit of discrepancy here.  Datafusion does not consider
+        # NULL==NULL when doing an IN operation due to classic SQL shenanigans.
+        # We should decide at some point which behavior we want and make this
+        # consistent.
+        if has_index:
+            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 3
+        else:
+            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+
+    check(False)
+    dataset.create_scalar_index("x", index_type="BITMAP")
+    check(True)
+    dataset.create_scalar_index("x", index_type="BTREE")
+    check(True)
 
 
 def test_label_list_index(tmp_path: Path):

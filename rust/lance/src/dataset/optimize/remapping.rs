@@ -95,7 +95,7 @@ impl<'a, I: Iterator<Item = u64>> MissingIds<'a, I> {
     }
 }
 
-impl<'a, I: Iterator<Item = u64>> Iterator for MissingIds<'a, I> {
+impl<I: Iterator<Item = u64>> Iterator for MissingIds<'_, I> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {

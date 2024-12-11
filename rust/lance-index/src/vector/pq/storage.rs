@@ -32,8 +32,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-use super::distance::{build_distance_table_dot, compute_l2_distance};
-use super::distance::{build_distance_table_l2, compute_dot_distance};
+use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
@@ -626,7 +625,7 @@ impl DistCalculator for PQDistCalculator {
 
     fn distance_all(&self) -> Vec<f32> {
         match self.distance_type {
-            DistanceType::L2 => compute_l2_distance(
+            DistanceType::L2 => compute_pq_distance(
                 &self.distance_table,
                 self.num_bits,
                 self.num_sub_vectors,
@@ -642,7 +641,7 @@ impl DistCalculator for PQDistCalculator {
                 // L2 over normalized vectors:  ||x - y|| = x^2 + y^2 - 2 * xy = 1 + 1 - 2 * xy = 2 * (1 - xy)
                 // Cosine distance: 1 - |xy| / (||x|| * ||y||) = 1 - xy / (x^2 * y^2) = 1 - xy / (1 * 1) = 1 - xy
                 // Therefore, Cosine = L2 / 2
-                let l2_dists = compute_l2_distance(
+                let l2_dists = compute_pq_distance(
                     &self.distance_table,
                     self.num_bits,
                     self.num_sub_vectors,
@@ -650,7 +649,7 @@ impl DistCalculator for PQDistCalculator {
                 );
                 l2_dists.into_iter().map(|v| v / 2.0).collect()
             }
-            DistanceType::Dot => compute_dot_distance(
+            DistanceType::Dot => compute_pq_distance(
                 &self.distance_table,
                 self.num_bits,
                 self.num_sub_vectors,

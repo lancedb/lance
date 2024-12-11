@@ -15,7 +15,7 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::FromJString;
-use crate::utils::{extract_write_params, get_index_params};
+use crate::utils::{extract_storage_options, extract_write_params, get_index_params};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
@@ -30,7 +30,7 @@ use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
 use lance::dataset::{Dataset, ReadParams, WriteParams};
-use lance::io::ObjectStoreParams;
+use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
 use lance_index::DatasetIndexExt;
@@ -48,6 +48,23 @@ pub struct BlockingDataset {
 }
 
 impl BlockingDataset {
+    pub fn drop(uri: &str, storage_options: HashMap<String, String>) -> Result<()> {
+        RT.block_on(async move {
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let object_store_params = ObjectStoreParams {
+                storage_options: Some(storage_options.clone()),
+                ..Default::default()
+            };
+            let (object_store, path) =
+                ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
+                    .await
+                    .map_err(|e| Error::io_error(e.to_string()))?;
+            object_store
+                .remove_dir_all(path)
+                .await
+                .map_err(|e| Error::io_error(e.to_string()))
+        })
+    }
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
@@ -197,6 +214,20 @@ fn inner_create_with_ffi_schema<'local>(
         storage_options_obj,
         reader,
     )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_drop<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString<'local>,
+    storage_options_obj: JObject<'local>,
+) -> JObject<'local> {
+    let path_str = ok_or_throw!(env, path.extract(&mut env));
+    let storage_options =
+        ok_or_throw!(env, extract_storage_options(&mut env, &storage_options_obj));
+    ok_or_throw!(env, BlockingDataset::drop(&path_str, storage_options));
+    JObject::null()
 }
 
 #[no_mangle]

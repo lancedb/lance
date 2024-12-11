@@ -11,12 +11,6 @@
  */
 package com.lancedb.lance;
 
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
-import java.io.IOException;
-import java.net.URISyntaxException;
-import java.nio.file.Path;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.AfterAll;
@@ -24,9 +18,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.file.Path;
+import java.util.HashMap;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 public class DatasetTest {
-  @TempDir
-  static Path tempDir; // Temporary directory for the tests
+  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
@@ -75,9 +76,11 @@ public class DatasetTest {
   @Test
   void testOpenInvalidPath() {
     String validPath = tempDir.resolve("Invalid_dataset").toString();
-    assertThrows(RuntimeException.class, () -> {
-      dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
-    });
+    assertThrows(
+        RuntimeException.class,
+        () -> {
+          dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
+        });
   }
 
   @Test
@@ -135,9 +138,11 @@ public class DatasetTest {
   void testOpenNonExist() throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      assertThrows(IllegalArgumentException.class, () -> {
-        Dataset.open(datasetPath, allocator);
-      });
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> {
+            Dataset.open(datasetPath, allocator);
+          });
     }
   }
 
@@ -148,9 +153,11 @@ public class DatasetTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      assertThrows(IllegalArgumentException.class, () -> {
-        testDataset.createEmptyDataset();
-      });
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> {
+            testDataset.createEmptyDataset();
+          });
     }
   }
 
@@ -164,9 +171,11 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         assertEquals(1, dataset.latestVersion());
-        assertThrows(IllegalArgumentException.class, () -> {
-          testDataset.write(0, 5);
-        });
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              testDataset.write(0, 5);
+            });
       }
     }
   }
@@ -181,6 +190,18 @@ public class DatasetTest {
       Dataset dataset = testDataset.createEmptyDataset();
       dataset.close();
       assertThrows(RuntimeException.class, dataset::getSchema);
+    }
+  }
+
+  @Test
+  void testDropPath() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      Dataset.drop(datasetPath, new HashMap<>());
     }
   }
 }

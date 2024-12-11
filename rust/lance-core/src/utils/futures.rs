@@ -74,7 +74,7 @@ impl<'a, T: Clone> SharedStream<'a, T> {
     }
 }
 
-impl<'a, T: Clone> Stream for SharedStream<'a, T> {
+impl<T: Clone> Stream for SharedStream<'_, T> {
     type Item = T;
 
     fn poll_next(

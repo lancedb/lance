@@ -14,8 +14,9 @@ trace_to_chrome(level="debug", file="/tmp/trace.json")
 
 NUM_ROWS = 10_000_000
 RANDOM_ACCESS = "indices"
-NUM_INDICES = 100
+NUM_INDICES = 1000
 NUM_ROUNDS = 10
+BATCH_SIZE = 16 * 1024
 
 # This file compares benchmarks for reading and writing a StructArray column using
 # (i) parquet
@@ -31,15 +32,12 @@ def test_data(tmp_path_factory):
         {
             "struct_col": pa.StructArray.from_arrays(
                 [
-                    pc.random(NUM_ROWS).cast(pa.float32()),
-                    pa.array(range(NUM_ROWS), type=pa.int32()),
-                    pa.FixedSizeListArray.from_arrays(
-                        pc.random(NUM_ROWS * 5).cast(pa.float32()), 5
-                    ),
-                    pa.array(range(NUM_ROWS), type=pa.int32()),
-                    pa.array(range(NUM_ROWS), type=pa.int32()),
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f1
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f2
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f3
+                    pc.random(NUM_ROWS).cast(pa.float32()),  # f4
                 ],
-                ["f", "i", "fsl", "i2", "i3"],
+                ["f1", "f2", "f3", "f4"],
             )
         }
     )
@@ -51,6 +49,7 @@ def test_data(tmp_path_factory):
 @pytest.fixture(scope="module")
 def random_indices():
     random_indices = [random.randint(0, NUM_ROWS) for _ in range(NUM_INDICES)]
+    random_indices.sort()
     return random_indices
 
 
@@ -59,12 +58,18 @@ def test_parquet_read(tmp_path: Path, benchmark, test_data, random_indices):
     parquet_path = tmp_path / "data.parquet"
     pq.write_table(test_data, parquet_path)
 
+    def read_parquet():
+        parquet_file = pq.ParquetFile(parquet_path)
+        batches = parquet_file.iter_batches(batch_size=BATCH_SIZE)
+        tab_parquet = pa.Table.from_batches(batches)
+        return tab_parquet
+
     if RANDOM_ACCESS == "indices":
         benchmark.pedantic(
             lambda: pq.read_table(parquet_path).take(random_indices), rounds=5
         )
     elif RANDOM_ACCESS == "full":
-        benchmark.pedantic(lambda: pq.read_table(parquet_path), rounds=5)
+        benchmark.pedantic(lambda: read_parquet(), rounds=5)
 
 
 def read_lance_file_random(lance_path, random_indices):
@@ -75,7 +80,9 @@ def read_lance_file_random(lance_path, random_indices):
 
 
 def read_lance_file_full(lance_path):
-    for batch in LanceFileReader(lance_path).read_all(batch_size=1000).to_batches():
+    for batch in (
+        LanceFileReader(lance_path).read_all(batch_size=BATCH_SIZE).to_batches()
+    ):
         pass
 
 
@@ -127,7 +134,7 @@ def test_parquet_write(tmp_path: Path, benchmark, test_data):
 
 
 def write_lance_file(lance_path, test_data):
-    with LanceFileWriter(lance_path, test_data.schema) as writer:
+    with LanceFileWriter(lance_path, test_data.schema, version="2.1") as writer:
         for batch in test_data.to_batches():
             writer.write_batch(batch)
 

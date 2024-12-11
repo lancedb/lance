@@ -33,6 +33,7 @@ use super::{AnyQuery, SargableQuery};
 #[derive(Debug)]
 pub struct FlatIndex {
     data: Arc<RecordBatch>,
+    has_nulls: bool,
 }
 
 impl DeepSizeOf for FlatIndex {
@@ -132,8 +133,10 @@ impl BTreeSubIndex for FlatIndexMetadata {
     }
 
     async fn load_subindex(&self, serialized: RecordBatch) -> Result<Arc<dyn ScalarIndex>> {
+        let has_nulls = serialized.column(0).null_count() > 0;
         Ok(Arc::new(FlatIndex {
             data: Arc::new(serialized),
+            has_nulls,
         }))
     }
 
@@ -196,13 +199,23 @@ impl ScalarIndex for FlatIndex {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
-        let predicate = match query {
-            SargableQuery::Equals(value) => arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?,
+        let mut predicate = match query {
+            SargableQuery::Equals(value) => {
+                if value.is_null() {
+                    arrow::compute::is_null(self.values())?
+                } else {
+                    arrow_ord::cmp::eq(self.values(), &value.to_scalar()?)?
+                }
+            }
             SargableQuery::IsNull() => arrow::compute::is_null(self.values())?,
             SargableQuery::IsIn(values) => {
+                let mut has_null = false;
                 let choices = values
                     .iter()
-                    .map(|val| lit(val.clone()))
+                    .map(|val| {
+                        has_null |= val.is_null();
+                        lit(val.clone())
+                    })
                     .collect::<Vec<_>>();
                 let in_list_expr = in_list(
                     Arc::new(Column::new("values", 0)),
@@ -211,12 +224,20 @@ impl ScalarIndex for FlatIndex {
                     &self.data.schema(),
                 )?;
                 let result_col = in_list_expr.evaluate(&self.data)?;
-                result_col
+                let predicate = result_col
                     .into_array(self.data.num_rows())?
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .expect("InList evaluation should return boolean array")
-                    .clone()
+                    .clone();
+
+                // Arrow's in_list does not handle nulls so we need to join them in here if user asked for them
+                if has_null && self.has_nulls {
+                    let nulls = arrow::compute::is_null(self.values())?;
+                    arrow::compute::or(&predicate, &nulls)?
+                } else {
+                    predicate
+                }
             }
             SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
@@ -256,6 +277,12 @@ impl ScalarIndex for FlatIndex {
                 location!(),
             )),
         };
+        if self.has_nulls && matches!(query, SargableQuery::Range(_, _)) {
+            // Arrow's comparison kernels do not return false for nulls.  They consider nulls to
+            // be less than any value.  So we need to filter out the nulls manually.
+            let valid_values = arrow::compute::is_not_null(self.values())?;
+            predicate = arrow::compute::and(&valid_values, &predicate)?;
+        }
         let matching_ids = arrow_select::filter::filter(self.ids(), &predicate)?;
         let matching_ids = matching_ids
             .as_any()
@@ -269,9 +296,12 @@ impl ScalarIndex for FlatIndex {
     // data as a single batch named data.lance
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
         let batches = store.open_index_file("data.lance").await?;
-        let batch = batches.read_record_batch(0).await?;
+        let num_rows = batches.num_rows();
+        let batch = batches.read_range(0..num_rows, None).await?;
+        let has_nulls = batch.column(0).null_count() > 0;
         Ok(Arc::new(Self {
             data: Arc::new(batch),
+            has_nulls,
         }))
     }
 
@@ -319,6 +349,7 @@ mod tests {
 
         FlatIndex {
             data: Arc::new(batch),
+            has_nulls: false,
         }
     }
 

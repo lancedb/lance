@@ -204,7 +204,7 @@ pub fn compute_compressed_bit_width_for_non_neg(arrays: &[ArrayRef]) -> u64 {
 // It outputs an fastlanes bitpacked EncodedArray
 macro_rules! encode_fixed_width {
     ($self:expr, $unpacked:expr, $data_type:ty, $buffer_index:expr) => {{
-        let num_chunks = ($unpacked.num_values + ELEMS_PER_CHUNK - 1) / ELEMS_PER_CHUNK;
+        let num_chunks = $unpacked.num_values.div_ceil(ELEMS_PER_CHUNK);
         let num_full_chunks = $unpacked.num_values / ELEMS_PER_CHUNK;
         let uncompressed_bit_width = std::mem::size_of::<$data_type>() as u64 * 8;
 

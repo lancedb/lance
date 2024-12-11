@@ -16,7 +16,6 @@ use lance_core::{cache::FileMetadataCache, Error, Result};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
-use lance_file::writer::FileWriterOptions;
 use lance_file::{
     reader::FileReader,
     writer::{FileWriter, ManifestProvider},
@@ -24,7 +23,6 @@ use lance_file::{
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::{object_store::ObjectStore, ReadBatchParams};
 use lance_table::format::SelfDescribingFileReader;
-use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 
 use super::{IndexReader, IndexStore, IndexWriter};
@@ -40,7 +38,6 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: FileMetadataCache,
     scheduler: Arc<ScanScheduler>,
-    use_legacy_format: bool,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -68,13 +65,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            use_legacy_format: false,
         }
-    }
-
-    pub fn with_legacy_format(mut self, use_legacy_format: bool) -> Self {
-        self.use_legacy_format = use_legacy_format;
-        self
     }
 }
 
@@ -119,7 +110,7 @@ impl IndexWriter for v2::writer::FileWriter {
 
 #[async_trait]
 impl IndexReader for FileReader {
-    async fn read_record_batch(&self, offset: u32) -> Result<RecordBatch> {
+    async fn read_record_batch(&self, offset: u64, _batch_size: u64) -> Result<RecordBatch> {
         self.read_batch(offset as i32, ReadBatchParams::RangeFull, self.schema())
             .await
     }
@@ -151,8 +142,11 @@ impl IndexReader for FileReader {
 
 #[async_trait]
 impl IndexReader for v2::reader::FileReader {
-    async fn read_record_batch(&self, _offset: u32) -> Result<RecordBatch> {
-        unimplemented!("v2 format has no concept of row groups")
+    async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
+        let start = offset * batch_size;
+        let end = start + batch_size;
+        let end = end.min(self.num_rows());
+        self.read_range(start as usize..end as usize, None).await
     }
 
     async fn read_range(
@@ -219,24 +213,13 @@ impl IndexStore for LanceIndexStore {
     ) -> Result<Box<dyn IndexWriter>> {
         let path = self.index_dir.child(name);
         let schema = schema.as_ref().try_into()?;
-        if self.use_legacy_format {
-            let writer = FileWriter::<ManifestDescribing>::try_new(
-                &self.object_store,
-                &path,
-                schema,
-                &FileWriterOptions::default(),
-            )
-            .await?;
-            Ok(Box::new(writer))
-        } else {
-            let writer = self.object_store.create(&path).await?;
-            let writer = v2::writer::FileWriter::try_new(
-                writer,
-                schema,
-                v2::writer::FileWriterOptions::default(),
-            )?;
-            Ok(Box::new(writer))
-        }
+        let writer = self.object_store.create(&path).await?;
+        let writer = v2::writer::FileWriter::try_new(
+            writer,
+            schema,
+            v2::writer::FileWriterOptions::default(),
+        )?;
+        Ok(Box::new(writer))
     }
 
     async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
@@ -305,7 +288,7 @@ mod tests {
 
     use crate::scalar::{
         bitmap::{train_bitmap_index, BitmapIndex},
-        btree::{train_btree_index, BTreeIndex, TrainingSource},
+        btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
         flat::FlatIndexMetadata,
         label_list::{train_label_list_index, LabelListIndex},
         LabelListQuery, SargableQuery, ScalarIndex,
@@ -333,14 +316,6 @@ mod tests {
             ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
         let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
-    }
-
-    fn legacy_test_store(tempdir: &TempDir) -> Arc<dyn IndexStore> {
-        let test_path: &Path = tempdir.path();
-        let cache = FileMetadataCache::with_capacity(128 * 1024 * 1024, CapacityMode::Bytes);
-        let (object_store, test_path) =
-            ObjectStore::from_path(test_path.as_os_str().to_str().unwrap()).unwrap();
-        Arc::new(LanceIndexStore::new(object_store, test_path, cache).with_legacy_format(true))
     }
 
     struct MockTrainingSource {
@@ -376,24 +351,31 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
         value_type: DataType,
+        custom_batch_size: Option<u64>,
     ) {
         let sub_index_trainer = FlatIndexMetadata::new(value_type);
 
         let data = Box::new(MockTrainingSource::new(data).await);
-        train_btree_index(data, &sub_index_trainer, index_store.as_ref())
-            .await
-            .unwrap();
+        let batch_size = custom_batch_size.unwrap_or(DEFAULT_BTREE_BATCH_SIZE);
+        train_btree_index(
+            data,
+            &sub_index_trainer,
+            index_store.as_ref(),
+            batch_size as u32,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_basic_btree() {
         let tempdir = tempdir().unwrap();
-        let index_store = legacy_test_store(&tempdir);
+        let index_store = test_store(&tempdir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32).await;
+        train_index(&index_store, data, DataType::Int32, None).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let row_ids = index
@@ -428,12 +410,12 @@ mod tests {
     #[tokio::test]
     async fn test_btree_update() {
         let index_dir = tempdir().unwrap();
-        let index_store = legacy_test_store(&index_dir);
+        let index_store = test_store(&index_dir);
         let data = gen()
             .col("values", array::step::<Int32Type>())
             .col("row_ids", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
-        train_index(&index_store, data, DataType::Int32).await;
+        train_index(&index_store, data, DataType::Int32, None).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         let data = gen()
@@ -442,7 +424,7 @@ mod tests {
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
 
         let updated_index_dir = tempdir().unwrap();
-        let updated_index_store = legacy_test_store(&updated_index_dir);
+        let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
                 lance_datafusion::utils::reader_to_stream(Box::new(data)),
@@ -478,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn test_btree_with_gaps() {
         let tempdir = tempdir().unwrap();
-        let index_store = legacy_test_store(&tempdir);
+        let index_store = test_store(&tempdir);
         let batch_one = gen()
             .col("values", array::cycle::<Int32Type>(vec![0, 1, 4, 5]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
@@ -507,7 +489,7 @@ mod tests {
             Field::new("row_ids", DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        train_index(&index_store, data, DataType::Int32).await;
+        train_index(&index_store, data, DataType::Int32, Some(4)).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
 
         // The above should create four pages
@@ -703,7 +685,7 @@ mod tests {
             // DataType::Duration(TimeUnit::Nanosecond),
         ] {
             let tempdir = tempdir().unwrap();
-            let index_store = legacy_test_store(&tempdir);
+            let index_store = test_store(&tempdir);
             let data: RecordBatch = gen()
                 .col("values", array::rand_type(data_type))
                 .col("row_ids", array::step::<UInt64Type>())
@@ -742,7 +724,7 @@ mod tests {
                 data.schema().clone(),
             );
 
-            train_index(&index_store, training_data, data_type.clone()).await;
+            train_index(&index_store, training_data, data_type.clone(), None).await;
             let index = BTreeIndex::load(index_store).await.unwrap();
 
             let row_ids = index
@@ -761,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn btree_reject_nan() {
         let tempdir = tempdir().unwrap();
-        let index_store = legacy_test_store(&tempdir);
+        let index_store = test_store(&tempdir);
         let batch = gen()
             .col("values", array::cycle::<Float32Type>(vec![0.0, f32::NAN]))
             .col("row_ids", array::cycle::<UInt64Type>(vec![0, 1]))
@@ -777,17 +759,20 @@ mod tests {
         let data = Box::new(MockTrainingSource::new(data).await);
         // Until DF handles NaN reliably we need to make sure we reject input
         // containing NaN
-        assert!(
-            train_btree_index(data, &sub_index_trainer, index_store.as_ref())
-                .await
-                .is_err()
-        );
+        assert!(train_btree_index(
+            data,
+            &sub_index_trainer,
+            index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE as u32
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]
     async fn btree_entire_null_page() {
         let tempdir = tempdir().unwrap();
-        let index_store = legacy_test_store(&tempdir);
+        let index_store = test_store(&tempdir);
         let batch = gen()
             .col(
                 "values",
@@ -805,9 +790,14 @@ mod tests {
         let sub_index_trainer = FlatIndexMetadata::new(DataType::Utf8);
 
         let data = Box::new(MockTrainingSource::new(data).await);
-        train_btree_index(data, &sub_index_trainer, index_store.as_ref())
-            .await
-            .unwrap();
+        train_btree_index(
+            data,
+            &sub_index_trainer,
+            index_store.as_ref(),
+            DEFAULT_BTREE_BATCH_SIZE as u32,
+        )
+        .await
+        .unwrap();
 
         let index = BTreeIndex::load(index_store).await.unwrap();
 

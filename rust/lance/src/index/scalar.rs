@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
+use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
@@ -87,7 +88,6 @@ impl TrainingRequest {
 // to make index types "generic" and "pluggable".  We will need to create some
 // kind of core proto for scalar indices that the scanner can read to determine
 // how and when to use a scalar index.
-
 pub trait ScalarIndexDetails {
     fn get_type(&self) -> ScalarIndexType;
 }
@@ -225,11 +225,14 @@ pub(super) async fn build_scalar_index(
             Ok(inverted_index_details())
         }
         _ => {
-            // The BTree index implementation leverages the legacy format's batch offset,
-            // which has been removed from new format, so keep using the legacy format for now.
-            let index_store = index_store.with_legacy_format(true);
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
-            train_btree_index(training_request, &flat_index_trainer, &index_store).await?;
+            train_btree_index(
+                training_request,
+                &flat_index_trainer,
+                &index_store,
+                DEFAULT_BTREE_BATCH_SIZE as u32,
+            )
+            .await?;
             Ok(btree_index_details())
         }
     }
