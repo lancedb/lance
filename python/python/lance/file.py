@@ -146,7 +146,7 @@ class LanceFileReader:
         Return metadata describing the file contents
         """
         return self._reader.metadata()
-    
+
     def file_statistics(self) -> LanceFileStatistics:
         return self._reader.file_statistics()
 
@@ -293,5 +293,5 @@ __all__ = [
     "LanceColumnMetadata",
     "LancePageMetadata",
     "LanceBufferDescriptor",
-    "LanceFileStatistics"
+    "LanceFileStatistics",
 ]

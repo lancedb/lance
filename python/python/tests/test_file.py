@@ -214,12 +214,12 @@ def test_metadata(tmp_path):
 
     assert len(page.encoding) > 0
 
+
 def test_file_stat(tmp_path):
     path = tmp_path / "foo.lance"
-    schema = pa.schema([
-        pa.field("a", pa.int64()),
-        pa.field("b", pa.list_(pa.float64(), 8))
-    ])
+    schema = pa.schema(
+        [pa.field("a", pa.int64()), pa.field("b", pa.list_(pa.float64(), 8))]
+    )
 
     num_rows = 1_000_000
 
@@ -234,13 +234,14 @@ def test_file_stat(tmp_path):
     reader = LanceFileReader(str(path))
     file_stat = reader.file_statistics()
 
-    assert(len(file_stat.columns) == 2)
+    assert len(file_stat.columns) == 2
 
-    assert(file_stat.columns[0].num_pages == 1)
-    assert(file_stat.columns[0].size_bytes == 8_000_000)
+    assert file_stat.columns[0].num_pages == 1
+    assert file_stat.columns[0].size_bytes == 8_000_000
 
-    assert(file_stat.columns[1].num_pages == 2)
-    assert(file_stat.columns[1].size_bytes == 64_000_000)
+    assert file_stat.columns[1].num_pages == 2
+    assert file_stat.columns[1].size_bytes == 64_000_000
+
 
 def test_round_trip_parquet(tmp_path):
     pq_path = tmp_path / "foo.parquet"
