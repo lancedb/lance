@@ -66,7 +66,7 @@ pub struct FileStatistics {
 #[derive(Debug)]
 pub struct ColumnStatistics {
     pub num_pages: usize,
-    pub size_bytes: usize,
+    pub size_bytes: u64,
 }
 
 // TODO: Caching
@@ -575,7 +575,7 @@ impl FileReader {
                     .sum::<u64>();
                 ColumnStatistics {
                     num_pages,
-                    size_bytes: size_bytes as usize,
+                    size_bytes,
                 }
             })
             .collect();
