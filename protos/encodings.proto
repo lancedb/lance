@@ -197,6 +197,9 @@ message Bitpacked {
 
   // Whether or not a sign bit is included in the bitpacked value
   bool signed = 4;
+
+  // Whether or not all value is negative
+  bool all_negative = 5;
 }
 
 // Items are bitpacked in a buffer
