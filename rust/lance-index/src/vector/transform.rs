@@ -7,7 +7,9 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow::array::ArrayBuilder;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::ListArray;
 use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field};
 use lance_arrow::RecordBatchExt;
@@ -66,20 +68,37 @@ impl Transformer for NormalizeTransformer {
                 ),
                 location: location!(),
             })?;
-        let data = arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "Normalize Transform: column {} is not a fixed size list: {}",
-                self.input_column,
-                arr.data_type()
-            ),
-            location: location!(),
-        })?;
-        let norm = normalize_fsl(data)?;
+
+        let transformed = match arr.data_type() {
+            DataType::FixedSizeList(_, _) => {
+                let data = arr.as_fixed_size_list();
+                let norm = normalize_fsl(data)?;
+                Arc::new(norm)
+            }
+            DataType::List(f) => {
+                let data = arr.as_list();
+                let values = data.values().as_fixed_size_list();
+                let norm = normalize_fsl(data)?;
+                let norm_list = ListArray::from_iter_primitive(norm.iter());
+                Arc::new(norm_list)
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "Normalize Transform: column {} is not vector: {}",
+                        self.input_column,
+                        arr.data_type()
+                    ),
+                    location: location!(),
+                });
+            }
+        };
+
         if let Some(output_column) = &self.output_column {
             let field = Field::new(output_column, norm.data_type().clone(), true);
-            Ok(batch.try_with_column(field, Arc::new(norm))?)
+            Ok(batch.try_with_column(field, transformed)?)
         } else {
-            Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?)
+            Ok(batch.replace_column_by_name(&self.input_column, transformed)?)
         }
     }
 }

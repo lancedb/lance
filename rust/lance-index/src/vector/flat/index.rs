@@ -28,7 +28,7 @@ use crate::{
     },
 };
 
-use super::storage::{FlatBinStorage, FlatFloatStorage, FLAT_COLUMN};
+use super::storage::{FlatBinStorage, FlatFloatStorage, FlatMultiVecStorage, FLAT_COLUMN};
 
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
@@ -301,6 +301,83 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
             Quantizer::FlatBin(quantizer) => Ok(quantizer),
             _ => Err(Error::invalid_input(
                 "quantizer is not FlatBinQuantizer",
+                location!(),
+            )),
+        }
+    }
+}
+
+pub struct FlatMultiVecQuantizer {
+    dim: usize,
+    distance_type: DistanceType,
+}
+
+impl FlatMultiVecQuantizer {
+    pub fn new(dim: usize, distance_type: DistanceType) -> Self {
+        Self { dim, distance_type }
+    }
+}
+
+impl Quantization for FlatMultiVecQuantizer {
+    type BuildParams = ();
+    type Metadata = FlatMetadata;
+    type Storage = FlatMultiVecStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        FLAT_COLUMN
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::FlatMultiVec(Self {
+            dim: metadata.dim,
+            distance_type,
+        }))
+    }
+
+    fn metadata(
+        &self,
+        _: Option<crate::vector::quantizer::QuantizationMetadata>,
+    ) -> Result<serde_json::Value> {
+        let metadata = FlatMetadata { dim: self.dim };
+        Ok(serde_json::to_value(metadata)?)
+    }
+
+    fn metadata_key() -> &'static str {
+        "flat"
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::FlatMultiVec
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        Ok(vectors.slice(0, vectors.len()))
+    }
+}
+
+impl From<FlatMultiVecQuantizer> for Quantizer {
+    fn from(value: FlatMultiVecQuantizer) -> Self {
+        Self::FlatMultiVec(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatMultiVecQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::FlatMultiVec(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input(
+                "quantizer is not FlatMultiVecQuantizer",
                 location!(),
             )),
         }

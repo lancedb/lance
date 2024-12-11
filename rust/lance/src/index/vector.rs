@@ -234,33 +234,6 @@ pub(crate) async fn build_vector_index(
     uuid: &str,
     params: &VectorIndexParams,
 ) -> Result<()> {
-    let dim = get_vector_dim(dataset, column)?;
-    let schema = dataset.schema();
-    match schema.field(column) {
-        Some(field) => {
-            if let arrow::datatypes::DataType::List(inner_field) = field.data_type() {
-                // we don't need to verify the inner field type, as it is already verified in get_vector_dim
-            }
-        }
-        None => {
-            return Err(Error::Index {
-                message: format!(
-                    "Build Vector Index: column {} does not exist in the dataset",
-                    column
-                ),
-                location: location!(),
-            });
-        }
-    }
-}
-
-async fn build_vector_index_impl(
-    dataset: &Dataset,
-    column: &str,
-    name: &str,
-    uuid: &str,
-    params: &VectorIndexParams,
-) -> Result<()> {
     let stages = &params.stages;
 
     if stages.is_empty() {

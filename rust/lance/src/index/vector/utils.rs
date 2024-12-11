@@ -41,6 +41,30 @@ fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
     }
 }
 
+pub fn get_vector_element_type(dataset: &Dataset, column: &str) -> Result<arrow_schema::DataType> {
+    let schema = dataset.schema();
+    let field = schema.field(column).ok_or(Error::Index {
+        message: format!("column {} does not exist in schema {}", column, schema),
+        location: location!(),
+    })?;
+    infer_vector_element_type(&field.data_type())
+}
+
+fn infer_vector_element_type(
+    data_type: &arrow::datatypes::DataType,
+) -> Result<arrow_schema::DataType> {
+    match data_type {
+        arrow::datatypes::DataType::FixedSizeList(element_field, _) => {
+            Ok(element_field.data_type().clone())
+        }
+        arrow::datatypes::DataType::List(inner) => infer_vector_element_type(inner.data_type()),
+        _ => Err(Error::Index {
+            message: format!("Data type is not a FixedSizeListArray, but {:?}", data_type),
+            location: location!(),
+        }),
+    }
+}
+
 /// Maybe sample training data from dataset, specified by column name.
 ///
 /// Returns a [FixedSizeListArray], containing the training dataset.
@@ -67,7 +91,25 @@ pub async fn maybe_sample_training_data(
         ),
         location: location!(),
     })?;
-    Ok(array.as_fixed_size_list().clone())
+
+    match array.data_type() {
+        arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list()),
+        // for multivector, flatten the vectors into a FixedSizeListArray
+        arrow::datatypes::DataType::List(f) => {
+            let list_array = array.as_list();
+            let vectors = list_array.values().as_fixed_size_list();
+            Ok(vectors.clone())
+        }
+        _ => {
+            return Err(Error::Index {
+                message: format!(
+                    "Sample training data: column {} is not a FixedSizeListArray",
+                    column
+                ),
+                location: location!(),
+            });
+        }
+    }
 }
 
 #[derive(Debug)]
