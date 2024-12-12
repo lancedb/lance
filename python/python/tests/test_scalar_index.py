@@ -349,6 +349,36 @@ def test_null_handling(tmp_path: Path):
     check(True)
 
 
+def test_scalar_index_with_nulls(tmp_path):
+    # Create a test dataframe with 50% null values.
+    test_table_size = 10_000
+    test_table = pa.table(
+        {
+            "item_id": list(range(test_table_size)),
+            "inner_id": list(range(test_table_size)),
+            "category": ["a", None] * (test_table_size // 2),
+            "numeric_int": [1, None] * (test_table_size // 2),
+            "numeric_float": [0.1, None] * (test_table_size // 2),
+            "boolean_col": [True, None] * (test_table_size // 2),
+            "timestamp_col": [datetime(2023, 1, 1), None] * (test_table_size // 2),
+        }
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("inner_id", index_type="BTREE")
+    ds.create_scalar_index("category", index_type="BTREE")
+    ds.create_scalar_index("boolean_col", index_type="BTREE")
+    ds.create_scalar_index("timestamp_col", index_type="BTREE")
+    # Test querying with filters on columns with nulls.
+    k = test_table_size // 2
+    result = ds.to_table(filter="category = 'a'", limit=k)
+    assert len(result) == k
+    # Booleans should be stored as strings in the table for backwards compatibility.
+    result = ds.to_table(filter="boolean_col IS TRUE", limit=k)
+    assert len(result) == k
+    result = ds.to_table(filter="timestamp_col IS NOT NULL", limit=k)
+    assert len(result) == k
+
+
 def test_label_list_index(tmp_path: Path):
     tags = pa.array(["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"])
     tag_list = pa.ListArray.from_arrays([0, 2, 4], tags)
