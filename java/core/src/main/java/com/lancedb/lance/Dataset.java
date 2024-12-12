@@ -254,6 +254,20 @@ public class Dataset implements Closeable {
   public static native void drop(String path, Map<String, String> storageOptions);
 
   /**
+   * Drop columns from the dataset.
+   *
+   * @param columns The columns to drop
+   */
+  public void dropColumns(List<String> columns) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDropColumns(columns);
+    }
+  }
+
+  private native void nativeDropColumns(List<String> columns);
+
+  /**
    * Create a new Dataset Scanner.
    *
    * @return a dataset scanner
