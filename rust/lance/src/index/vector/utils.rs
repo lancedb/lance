@@ -100,15 +100,13 @@ pub async fn maybe_sample_training_data(
             let vectors = list_array.values().as_fixed_size_list();
             Ok(vectors.clone())
         }
-        _ => {
-            return Err(Error::Index {
-                message: format!(
-                    "Sample training data: column {} is not a FixedSizeListArray",
-                    column
-                ),
-                location: location!(),
-            });
-        }
+        _ => Err(Error::Index {
+            message: format!(
+                "Sample training data: column {} is not a FixedSizeListArray",
+                column
+            ),
+            location: location!(),
+        }),
     }
 }
 
