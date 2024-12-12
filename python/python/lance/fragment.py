@@ -38,6 +38,24 @@ DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
 
 @dataclass
 class FragmentMetadata:
+    """Metaata for a fragment.
+
+    Attributes
+    ----------
+    id : int
+        The ID of the fragment.
+    files : List[DataFile]
+        The data files of the fragment. Each data file must have the same number
+        of rows. Each file stores a different subset of the columns.
+    physical_rows : int
+        The number of rows originally in this fragment. This is the number of rows
+        in the data files before deletions.
+    deletion_file : Optional[DeletionFile]
+        The deletion file, if any.
+    row_id_meta : Optional[RowIdMeta]
+        The row id metadata, if any.
+    """
+
     id: int
     files: List[DataFile]
     physical_rows: int
@@ -46,6 +64,7 @@ class FragmentMetadata:
 
     @property
     def num_deletions(self) -> int:
+        """The number of rows that have been deleted from this fragment."""
         if self.deletion_file is None:
             return 0
         else:
@@ -53,6 +72,7 @@ class FragmentMetadata:
 
     @property
     def num_rows(self) -> int:
+        """The number of rows in this fragment after deletions."""
         return self.physical_rows - self.num_deletions
 
     def data_files(self) -> List[DataFile]:
@@ -63,6 +83,7 @@ class FragmentMetadata:
         return self.files
 
     def to_json(self) -> dict:
+        """Get this as a simple JSON-serializable dictionary."""
         return dict(
             id=self.id,
             files=[asdict(f) for f in self.files],
@@ -98,6 +119,23 @@ class FragmentMetadata:
 
 @dataclass
 class DataFile:
+    """
+    A data file in a fragment.
+
+    Attributes
+    ----------
+    path : str
+        The path to the data file.
+    fields : List[int]
+        The field ids of the columns in this file.
+    column_indices : List[int]
+        The column indices in the original schema.
+    file_major_version : int
+        The major version of the data storage format.
+    file_minor_version : int
+        The minor version of the data storage format.
+    """
+
     path: str
     fields: List[int]
     column_indices: List[int] = field(default_factory=list)
@@ -110,55 +148,6 @@ class DataFile:
             DeprecationWarning,
         )
         return self.fields
-
-
-# class FragmentMetadata:
-#     """Metadata of a Fragment in the dataset."""
-
-#     def __init__(self, metadata: str):
-#         """Construct a FragmentMetadata from a JSON representation of the metadata.
-
-#         Internal use only.
-#         """
-#         self._metadata = _FragmentMetadata.from_json(metadata)
-
-#     @classmethod
-#     def from_metadata(cls, metadata: _FragmentMetadata):
-#         instance = cls.__new__(cls)
-#         instance._metadata = metadata
-#         return instance
-
-#     def __repr__(self):
-#         return self._metadata.__repr__()
-
-#     def __reduce__(self):
-#         return (FragmentMetadata, (self._metadata.json(),))
-
-#     def __eq__(self, other: object) -> bool:
-#         if not isinstance(other, FragmentMetadata):
-#             return False
-#         return self._metadata.__eq__(other._metadata)
-
-#     def to_json(self) -> str:
-#         """Serialize :class:`FragmentMetadata` to a JSON blob"""
-#         return json.loads(self._metadata.json())
-
-#     @staticmethod
-#     def from_json(json_data: str) -> FragmentMetadata:
-#         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
-#         return FragmentMetadata(json_data)
-
-#     def data_files(self) -> Iterable[str]:
-#         """Return the data files of the fragment"""
-#         return self._metadata.data_files()
-
-#     def deletion_file(self):
-#         """Return the deletion file, if any"""
-#         return self._metadata.deletion_file()
-
-#     @property
-#     def id(self) -> int:
-#         return self._metadata.id
 
 
 class LanceFragment(pa.dataset.Fragment):

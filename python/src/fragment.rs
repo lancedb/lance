@@ -432,6 +432,16 @@ impl PyDeletionFile {
     }
 
     #[getter]
+    fn read_version(&self) -> u64 {
+        self.0.read_version
+    }
+
+    #[getter]
+    fn id(&self) -> u64 {
+        self.0.id
+    }
+
+    #[getter]
     fn num_deleted_rows(&self) -> Option<usize> {
         self.0.num_deleted_rows
     }

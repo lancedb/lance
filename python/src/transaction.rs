@@ -47,20 +47,6 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 };
                 Ok(Self(op))
             }
-            "Update" => {
-                let removed_fragment_ids = ob.getattr("removed_fragment_ids")?.extract()?;
-
-                let updated_fragments = extract_vec(&ob.getattr("updated_fragments")?)?;
-
-                let new_fragments = extract_vec(&ob.getattr("new_fragments")?)?;
-
-                let op = Operation::Update {
-                    removed_fragment_ids,
-                    updated_fragments,
-                    new_fragments,
-                };
-                Ok(Self(op))
-            }
             "Merge" => {
                 let schema = extract_schema(&ob.getattr("schema")?)?;
 

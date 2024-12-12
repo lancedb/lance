@@ -75,13 +75,17 @@ use crate::{
         write::open_writer,
     },
     index::DatasetIndexInternalExt,
-    io::exec::{
-        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
+    io::{
+        commit::commit_transaction,
+        exec::{
+            project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner,
+            TakeExec,
+        },
     },
     Dataset,
 };
 
-use super::{write_fragments_internal, CommitBuilder, WriteParams};
+use super::{write_fragments_internal, WriteParams};
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -854,27 +858,6 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let ds = self.dataset.clone();
-        let (transaction, stats) = self.execute_uncommitted_impl(source).await?;
-        let dataset = CommitBuilder::new(ds).execute(transaction).await?;
-        Ok((Arc::new(dataset), stats))
-    }
-
-    /// Execute the merge insert job without committing the changes.
-    ///
-    /// Use [`CommitBuilder`] to commit the returned transaction.
-    pub async fn execute_uncommitted(
-        self,
-        source: impl StreamingWriteSource,
-    ) -> Result<(Transaction, MergeStats)> {
-        let stream = source.into_stream();
-        self.execute_uncommitted_impl(stream).await
-    }
-
-    async fn execute_uncommitted_impl(
-        self,
-        source: SendableRecordBatchStream,
-    ) -> Result<(Transaction, MergeStats)> {
         let schema = source.schema();
 
         let full_schema = Schema::from(self.dataset.local_schema());
@@ -890,7 +873,7 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
-        let operation = if !is_full_schema {
+        let committed_ds = if !is_full_schema {
             if self.params.insert_not_matched {
                 return Err(Error::NotSupported {
                     source: "The merge insert operation is configured to not insert new rows, but the source data has a different schema than the target data".into(),
@@ -911,11 +894,7 @@ impl MergeInsertJob {
             let updated_fragments =
                 Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
-            Operation::Update {
-                removed_fragment_ids: Vec::new(),
-                updated_fragments,
-                new_fragments: Vec::new(),
-            }
+            Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
         } else {
             let written = write_fragments_internal(
                 Some(&self.dataset),
@@ -937,11 +916,13 @@ impl MergeInsertJob {
                 Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
             // Commit updated and new fragments
-            Operation::Update {
+            Self::commit(
+                self.dataset,
                 removed_fragment_ids,
-                updated_fragments: old_fragments,
+                old_fragments,
                 new_fragments,
-            }
+            )
+            .await?
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -949,14 +930,7 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        let transaction = Transaction::new(
-            self.dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
-
-        Ok((transaction, stats))
+        Ok((committed_ds, stats))
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -1004,6 +978,43 @@ impl MergeInsertJob {
         }
 
         Ok((updated_fragments, removed_fragments))
+    }
+
+    // Commit the operation
+    async fn commit(
+        dataset: Arc<Dataset>,
+        removed_fragment_ids: Vec<u64>,
+        updated_fragments: Vec<Fragment>,
+        new_fragments: Vec<Fragment>,
+    ) -> Result<Arc<Dataset>> {
+        let operation = Operation::Update {
+            removed_fragment_ids,
+            updated_fragments,
+            new_fragments,
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
+
+        let (manifest, manifest_path) = commit_transaction(
+            dataset.as_ref(),
+            dataset.object_store(),
+            dataset.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            dataset.manifest_naming_scheme,
+        )
+        .await?;
+
+        let mut dataset = dataset.as_ref().clone();
+        dataset.manifest = Arc::new(manifest);
+        dataset.manifest_file = manifest_path;
+
+        Ok(Arc::new(dataset))
     }
 }
 
