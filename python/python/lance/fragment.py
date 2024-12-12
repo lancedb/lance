@@ -24,7 +24,7 @@ import pyarrow as pa
 
 from .dependencies import _check_for_pandas
 from .dependencies import pandas as pd
-from .lance import _Fragment, _write_fragments
+from .lance import _Fragment, _write_fragments, _write_fragments_with_blobs
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .udf import BatchUDF, normalize_transform
@@ -498,6 +498,7 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    with_blobs: bool = False,
 ) -> List[FragmentMetadata]:
     """
     Write data into one or more fragments.
@@ -581,6 +582,23 @@ def write_fragments(
             data_storage_version = "legacy"
         else:
             data_storage_version = "stable"
+
+    if with_blobs:
+        default_fragments, blob_fragments = _write_fragments_with_blobs(
+            dataset_uri,
+            reader,
+            mode=mode,
+            max_rows_per_file=max_rows_per_file,
+            max_rows_per_group=max_rows_per_group,
+            max_bytes_per_file=max_bytes_per_file,
+            progress=progress,
+            data_storage_version=data_storage_version,
+            storage_options=storage_options,
+        )
+
+        return [FragmentMetadata.from_metadata(frag) for frag in default_fragments], [
+            FragmentMetadata.from_metadata(frag) for frag in blob_fragments
+        ]
 
     fragments = _write_fragments(
         dataset_uri,
