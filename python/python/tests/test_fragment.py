@@ -253,7 +253,8 @@ def test_fragment_meta():
 
     assert meta.id == 0
     assert len(meta.files) == 2
-    assert meta.files[0].path == "0.lance"
+    with pytest.warns(DeprecationWarning):
+        assert meta.files[0].path() == "0.lance"
     assert meta.files[1].path == "1.lance"
 
     assert repr(meta) == (

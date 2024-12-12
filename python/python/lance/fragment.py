@@ -38,7 +38,7 @@ DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
 
 @dataclass
 class FragmentMetadata:
-    """Metaata for a fragment.
+    """Metadata for a fragment.
 
     Attributes
     ----------
@@ -141,6 +141,18 @@ class DataFile:
     column_indices: List[int] = field(default_factory=list)
     file_major_version: int = 0
     file_minor_version: int = 0
+
+    def __post_init__(self):
+        # path used to be a method. This is for backwards compatibility.
+        class CallableStr(str):
+            def __call__(self):
+                warnings.warn(
+                    "DataFile.path() is deprecated, use DataFile.path instead",
+                    DeprecationWarning,
+                )
+                return self
+
+        self.path = CallableStr(self.path)
 
     def field_ids(self) -> List[int]:
         warnings.warn(
@@ -506,7 +518,7 @@ class LanceFragment(pa.dataset.Fragment):
         >>> dataset = lance.write_dataset(tab, "dataset")
         >>> frag = dataset.get_fragment(0)
         >>> frag.delete("a > 1")
-        Fragment { id: 0, files: ..., deletion_file: Some(...), ...}
+        FragmentMetadata(id=0, files=[DataFile(path='...', fields=[0, 1], ...), ...)
         >>> frag.delete("a > 0") is None
         True
 
