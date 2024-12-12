@@ -1469,7 +1469,7 @@ mod tests {
     use lance_datagen::{array, ArrayGeneratorExt, RowCount, DEFAULT_SEED};
     use rand::SeedableRng;
 
-    use crate::{buffer::LanceBuffer, data};
+    use crate::buffer::LanceBuffer;
 
     use super::{AllNullDataBlock, DataBlock};
 
