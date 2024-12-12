@@ -16,7 +16,6 @@ use datafusion_expr::{
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use log::warn;
 use tracing::instrument;
 
 use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
