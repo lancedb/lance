@@ -116,14 +116,21 @@ impl Transformer for KeepFiniteVectors {
             ),
             location: location!(),
         })?;
-        let data = arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "KeepFiniteVectors: column {} is not a fixed size list: {}",
-                self.column,
-                arr.data_type()
-            ),
-            location: location!(),
-        })?;
+
+        let data = match arr.data_type() {
+            DataType::FixedSizeList(_, _) => arr.as_fixed_size_list(),
+            DataType::List(_) => arr.as_list::<i32>().values().as_fixed_size_list(),
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "KeepFiniteVectors: column {} is not a fixed size list: {}",
+                        self.column,
+                        arr.data_type()
+                    ),
+                    location: location!(),
+                })
+            }
+        };
 
         let valid = data
             .iter()

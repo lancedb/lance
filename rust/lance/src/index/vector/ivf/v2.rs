@@ -671,19 +671,29 @@ mod tests {
             let multivector = multivector.as_fixed_size_list();
             let dim = multivector.value_length() as usize;
 
-            let dist = multivector
-                .values()
-                .as_primitive::<Float32Type>()
-                .values()
-                .chunks_exact(dim)
-                .map(|v| {
-                    OrderedFloat(distance_type.func()(
-                        query.as_primitive::<Float32Type>().values(),
-                        v,
-                    ))
-                })
-                .min()
-                .unwrap();
+            let dist = match distance_type {
+                DistanceType::Hamming => multivector
+                    .values()
+                    .as_primitive::<UInt8Type>()
+                    .values()
+                    .chunks_exact(dim)
+                    .map(|v| OrderedFloat(hamming(query.as_primitive::<UInt8Type>().values(), v)))
+                    .min()
+                    .unwrap(),
+                _ => multivector
+                    .values()
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .chunks_exact(dim)
+                    .map(|v| {
+                        OrderedFloat(distance_type.func()(
+                            query.as_primitive::<Float32Type>().values(),
+                            v,
+                        ))
+                    })
+                    .min()
+                    .unwrap(),
+            };
             dists.push((dist.0, i as u64));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -771,7 +781,8 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index_multivec(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -787,7 +798,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index_multivec(params, nlist, recall_requirement).await;
     }
 
     #[rstest]
@@ -892,16 +904,37 @@ mod tests {
         test_index(params, nlist, recall_requirement).await;
     }
 
-    #[tokio::test]
-    async fn test_multivector() {
+    async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2)
+                    .await;
+            }
+            _ => {
+                test_index_multivec_impl::<Float32Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0.0..1.0,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn test_index_multivec_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        recall_requirement: f32,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let nlist = 4;
-        let (mut dataset, vectors) =
-            generate_multivec_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
 
-        let params = VectorIndexParams::ivf_flat(nlist, DistanceType::L2);
         dataset
             .create_index(
                 &["vector"],
@@ -915,7 +948,7 @@ mod tests {
 
         let multivector = vectors.value(0);
         let first_vector = multivector.as_fixed_size_list().value(0);
-        let query = first_vector.as_primitive::<Float32Type>();
+        let query = first_vector.as_primitive::<T>();
         let k = 100;
 
         let result = dataset
@@ -941,12 +974,12 @@ mod tests {
             .collect::<Vec<_>>();
         let row_ids = row_ids.into_iter().collect::<HashSet<_>>();
 
-        let gt = multivec_ground_truth(&vectors, query, k, DistanceType::L2);
+        let gt = multivec_ground_truth(&vectors, query, k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
         assert!(
-            recall >= 1.0,
+            recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
             recall,
             results,
