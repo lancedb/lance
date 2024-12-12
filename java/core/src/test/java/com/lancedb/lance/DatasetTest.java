@@ -140,6 +140,18 @@ public class DatasetTest {
   }
 
   @Test
+  void testDatasetUri() {
+    String datasetPath = tempDir.resolve("dataset_uri").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(datasetPath, dataset.uri());
+      }
+    }
+  }
+
+  @Test
   void testOpenNonExist() throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
