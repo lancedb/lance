@@ -285,6 +285,7 @@ struct ChunkMeta {
     offset_bytes: u64,
 }
 
+/// A mini-block chunk that has been decoded and decompressed
 #[derive(Debug)]
 struct DecodedMiniBlockChunk {
     rep: Option<ScalarBuffer<u16>>,
@@ -368,6 +369,8 @@ impl DecodeMiniBlockTask {
         }
     }
 
+    /// Maps a range of rows to a range of items and a range of levels
+    ///
     /// If there is no repetition information this just returns the range as-is.
     ///
     /// If there is repetition information then we need to do some work to figure out what
@@ -393,6 +396,15 @@ impl DecodeMiniBlockTask {
     /// Rep: 1 0 0 1 0 1 1 0 0
     /// Def: 0 0 0 0 0 1 0 0 0
     /// Itm: 1 2 3 4 5 6 7 8
+    ///
+    /// Finally, we have to contend with the fact that chunks may or may not start with a "preamble" of
+    /// trailing values that finish up a list from the previous chunk.  In this case the first item does
+    /// not start at max_rep because it is a continuation of the previous chunk.  For our purposes we do
+    /// not consider this a "row" and so the range 0..1 will refer to the first row AFTER the preamble.
+    ///
+    /// We have a separate parameter (`preamble_action`) to control whether we want the preamble or not.
+    ///
+    /// Note that the "trailer" is considered a "row" and if we want it we should include it in the range.
     fn map_range(
         range: Range<u64>,
         rep: Option<&impl AsRef<[u16]>>,
@@ -406,8 +418,6 @@ impl DecodeMiniBlockTask {
     ) -> (Range<u64>, Range<u64>) {
         if let Some(rep) = rep {
             let mut rep = rep.as_ref();
-            // levels to figure out what range of items corresponds to that range of rows
-
             // If there is a preamble and we need to skip it then do that first.  The work is the same
             // whether there is def information or not
             let mut items_in_preamble = 0;
@@ -451,14 +461,11 @@ impl DecodeMiniBlockTask {
                 debug_assert!(preamble_action == PreambleAction::Take);
                 return (0..items_in_preamble as u64, 0..first_row_start);
             }
+            assert!(range.start < range.end);
 
             let mut rows_seen = 0;
             let mut new_start = 0;
             let mut new_levels_start = 0;
-
-            // Empty ranges will break the below code and we shouldn't be getting them anyways (but if
-            // we need to handle them in the future it's doable)
-            assert!(range.start < range.end);
 
             if let Some(def) = def {
                 let def = &def.as_ref()[first_row_start as usize..];
@@ -520,6 +527,8 @@ impl DecodeMiniBlockTask {
 
                 // Adjust for any skipped preamble
                 if preamble_action == PreambleAction::Skip {
+                    // TODO: Should this be items_in_preamble?  If so, add a
+                    // unit test for this case
                     new_start += first_row_start;
                     new_end += first_row_start;
                     new_levels_start += first_row_start;
@@ -534,7 +543,8 @@ impl DecodeMiniBlockTask {
                 (new_start..new_end, new_levels_start..new_levels_end)
             } else {
                 // Easy case, there are no invisible items, so we don't need to check for them
-                // The items range and levels range will be the same
+                // The items range and levels range will be the same.  We do still need to walk
+                // the rep levels to find the row boundaries
 
                 // range.start == 0 always maps to 0, otherwise we need to walk
                 if range.start > 0 {
@@ -638,8 +648,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
         let mut level_offset = 0;
         // Now we iterate through each instruction and process it
         for (instructions, chunk) in self.instructions.iter() {
-            // FIXME: It's very possible that we have duplicate `buf` in self.instructions and we
-            // don't want to decode the buf again and again
+            // TODO: It's very possible that we have duplicate `buf` in self.instructions and we
+            // don't want to decode the buf again and again on the same thread.
 
             let DecodedMiniBlockChunk { rep, def, values } =
                 self.decode_miniblock_chunk(&chunk.data, chunk.items_in_chunk)?;
@@ -703,6 +713,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
     }
 }
 
+/// A chunk that has been loaded by the miniblock scheduler (but not
+/// yet decoded)
 #[derive(Debug)]
 struct LoadedChunk {
     data: LanceBuffer,
@@ -738,6 +750,8 @@ struct MiniBlockDecoder {
     dictionary: Option<Arc<DataBlock>>,
 }
 
+/// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
+/// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let mut rows_desired = num_rows;
@@ -762,7 +776,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
             }
         }
         // We can throw away need_preamble here because it must be false.  If it were true it would mean
-        // we were in the middle of loading rows still
+        // we were still in the middle of loading rows.  We do need to latch skip_in_chunk though.
         self.offset_in_current_chunk = skip_in_chunk;
 
         let max_visible_level = self
@@ -794,7 +808,8 @@ impl StructuralPageDecoder for MiniBlockDecoder {
 /// are dealing with (null list, null struct, what level null struct, etc.)
 ///
 /// TODO: Right now we just load the entire rep/def at initialization time and cache it.  This is a touch
-/// RAM aggressive and maybe we want something more lazy in the future.
+/// RAM aggressive and maybe we want something more lazy in the future.  On the other hand, it's simple
+/// and fast so...maybe not :)
 #[derive(Debug, Default)]
 pub struct ComplexAllNullScheduler {
     // Set from protobuf
@@ -820,6 +835,7 @@ impl ComplexAllNullScheduler {
 
 impl StructuralPageScheduler for ComplexAllNullScheduler {
     fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+        // Fully load the rep & def buffers, as needed
         let (rep_pos, rep_size) = self.buffer_offsets_and_sizes[0];
         let (def_pos, def_size) = self.buffer_offsets_and_sizes[1];
         let has_rep = rep_size > 0;
@@ -913,6 +929,8 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         // TODO: This is going to need to be more complicated to deal with nested lists of nulls
         // because the row ranges might not map directly to item ranges
+        //
+        // We should add test cases and handle this later
         let drained_ranges = self.drain_ranges(num_rows);
         Ok(Box::new(DecodeComplexAllNullTask {
             ranges: drained_ranges,
@@ -927,6 +945,8 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
     }
 }
 
+/// We use `ranges` to slice into `rep` and `def` and create rep/def buffers
+/// for the null data.
 #[derive(Debug)]
 pub struct DecodeComplexAllNullTask {
     ranges: Vec<Range<u64>>,
@@ -1045,6 +1065,31 @@ struct MiniBlockSchedulerDictionary {
 }
 
 /// A scheduler for a page that has been encoded with the mini-block layout
+///
+/// Scheduling mini-block encoded data is simple in concept and somewhat complex
+/// in practice.
+///
+/// First, during initialization, we load the chunk metadata, the repetition index,
+/// and the dictionary (these last two may not be present)
+///
+/// Then, during scheduling, we use the user's requested row ranges and the repetition
+/// index to determine which chunks we need and which rows we need from those chunks.
+///
+/// For example, if the repetition index is: [50, 3], [50, 0], [10, 0] and the range
+/// from the user is 40..60 then we need to:
+///
+///  - Read the first chunk and skip the first 40 rows, then read 10 full rows, and
+///    then read 3 items for the 11th row of our range.
+///  - Read the second chunk and read the remaining items in our 11th row and then read
+///    the remaining 9 full rows.
+///
+/// Then, if we are going to decode that in batches of 5, we need to make decode tasks.
+/// The first two decode tasks will just need the first chunk.  The third decode task will
+/// need the first chunk (for the trailer which has the 11th row in our range) and the second
+/// chunk.  The final decode task will just need the second chunk.
+///
+/// The above prose descriptions are what are represented by [`ChunkInstructions`] and
+/// [`ChunkDrainInstructions`].
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     // These come from the protobuf
@@ -1150,9 +1195,11 @@ enum PreambleAction {
     Absent,
 }
 
+// TODO: Add test cases for the all-preamble and all-trailer cases
+
 // When we schedule a chunk we use the repetition index (or, if none exists, just the # of items
 // in each chunk) to map a user requested range into a set of ChunkInstruction objects which tell
-// us how exactly to ready from the chunk.
+// us how exactly to read from the chunk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChunkInstructions {
     // The index of the chunk to read
@@ -1163,11 +1210,11 @@ struct ChunkInstructions {
     // It's possible for a chunk to be entirely premable.  For example, if there is a really large list
     // that spans several chunks.
     preamble: PreambleAction,
-    // How many complete rows (not including the preamble) to skip
+    // How many complete rows (not including the preamble or trailer) to skip
     //
     // If this is non-zero then premable must not be Take
     rows_to_skip: u64,
-    // How many complete (non-preamble non-trailer) rows to take
+    // How many complete (non-preamble / non-trailer) rows to take
     rows_to_take: u64,
     // A "trailer" is when a chunk ends with a partial list.  If there is no repetition index there is
     // never a trailer.
@@ -1188,6 +1235,12 @@ struct ChunkInstructions {
 // batches of size 10 we might have a `ChunkDrainInstructions` that targets that chunk and has its own
 // skip of 17 and take of 10.  This would mean we decode the chunk, skip the preamble and 27 rows, and
 // then take 10 rows.
+//
+// One very confusing bit is that `rows_to_take` includes the trailer.  So if we have:
+// "no preamble, skip 5, take 10, take trailer" and we are draining 20 rows then the
+// first drain instructions will have no preamble, skip 0, take 11 and the second chunk
+// instructions will have take preamble, skip 0, take 9 (assuming the second chunk has at
+// least 9 rows)
 #[derive(Debug, PartialEq, Eq)]
 struct ChunkDrainInstructions {
     chunk_instructions: ChunkInstructions,
@@ -2860,7 +2913,10 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
-    fn encode_listy_all_null(
+    // Encodes a page where all values are null but we have rep/def
+    // information that we need to store (e.g. to distinguish between
+    // different kinds of null)
+    fn encode_complex_all_null(
         column_idx: u32,
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
@@ -3265,7 +3321,7 @@ impl PrimitiveStructuralEncoder {
                 // We should not encode empty arrays.  So if we get here that should mean that we
                 // either have all empty lists or all null lists (or a mix).  We still need to encode
                 // the rep/def information but we can skip the data encoding.
-                return Self::encode_listy_all_null(column_idx, repdefs, row_number, num_rows);
+                return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
             }
             let num_nulls = arrays
                 .iter()

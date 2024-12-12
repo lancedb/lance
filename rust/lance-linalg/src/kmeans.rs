@@ -200,6 +200,7 @@ where
 {
     phantom_data: std::marker::PhantomData<T>,
 }
+
 impl<T: ArrowNumericType> KMeansAlgo<T::Native> for KMeansAlgoFloat<T>
 where
     T::Native: Float + Dot + L2 + DivAssign + AddAssign + FromPrimitive + Sync,

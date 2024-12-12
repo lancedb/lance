@@ -336,6 +336,13 @@ impl SerializedRepDefs {
     }
 }
 
+/// Slices a level buffer into pieces
+///
+/// This is needed to handle the fact that a level buffer may have more
+/// levels than values due to special (empty/null) lists.
+///
+/// As a result, a call to `slice_next(10)` may return 10 levels or it may
+/// return more than 10 levels if any special values are encountered.
 #[derive(Debug)]
 pub struct RepDefSlicer<'a> {
     repdef: &'a SerializedRepDefs,
@@ -343,6 +350,7 @@ pub struct RepDefSlicer<'a> {
     current: usize,
 }
 
+// TODO: All of this logic will need some changing when we compress rep/def levels.
 impl<'a> RepDefSlicer<'a> {
     fn new(repdef: &'a SerializedRepDefs, levels: Arc<[u16]>) -> Self {
         Self {
@@ -364,6 +372,14 @@ impl<'a> RepDefSlicer<'a> {
         &self.to_slice
     }
 
+    /// Returns the rest of the levels not yet sliced
+    ///
+    /// This must be called instead of `slice_next` on the final iteration.
+    /// This is because anytime we slice there may be empty/null lists on the
+    /// boundary that are "free" and the current behavior in `slice_next` is to
+    /// leave them for the next call.
+    ///
+    /// `slice_rest` will slice all remaining levels and return them.
     pub fn slice_rest(&mut self) -> LanceBuffer {
         let start = self.current;
         let remaining = self.num_levels_remaining();
@@ -371,6 +387,7 @@ impl<'a> RepDefSlicer<'a> {
         self.to_slice.slice_with_length(start * 2, remaining * 2)
     }
 
+    /// Returns enough levels to satisfy the next `num_values` values
     pub fn slice_next(&mut self, num_values: usize) -> LanceBuffer {
         let start = self.current;
         let Some(max_visible_level) = self.repdef.max_visible_level else {
@@ -822,11 +839,10 @@ impl RepDefBuilder {
 
     /// Adds a layer of offsets
     ///
-    /// Note: a List/LargeList/etc. array has both offsets and validity.  The
-    /// caller should register the validity before registering the offsets
-    ///
-    /// Returns true if the offsets contained non-empty null lists.  This is a flag
-    /// to the caller that the list contains garbage values that must be filtered out.
+    /// Offsets are casted to a common type (i64) and also normalized.  Null lists are
+    /// always represented by a zero-length (identical) pair of offsets and so the caller
+    /// should filter out any garbage items before encoding them.  To assist with this the
+    /// method will return true if any non-empty null lists were found.
     pub fn add_offsets<O: OffsetSizeTrait>(
         &mut self,
         offsets: OffsetBuffer<O>,
@@ -2002,6 +2018,7 @@ mod tests {
 
     #[test]
     fn test_repdef_empty_list_at_end() {
+        // Regresses a failure we encountered when the last item was an empty list
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(offsets_32(&[0, 2, 5, 5]), None);
         builder.add_validity_bitmap(validity(&[true, true, true, false, true]));
@@ -2026,6 +2043,7 @@ mod tests {
     #[test]
     fn test_repdef_abnormal_nulls() {
         // List nulls are allowed to have non-empty offsets and garbage values
+        // and the add_offsets call should normalize this
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(
             offsets_32(&[0, 2, 5, 8]),
@@ -2052,7 +2070,8 @@ mod tests {
 
     #[test]
     fn test_repdef_sliced_offsets() {
-        // List nulls are allowed to have non-empty offsets and garbage values
+        // Sliced lists may have offsets that don't start with zero.  The
+        // add_offsets call needs to normalize these to operate correctly.
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(
             offsets_32(&[5, 7, 7, 10]),

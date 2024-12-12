@@ -1264,7 +1264,11 @@ impl FieldEncoder for ListFieldEncoder {
 
 /// A structural encoder for list fields
 ///
-/// The list's offsets are added to the rep/def builder and the items are passed to the child.
+/// The list's offsets are added to the rep/def builder
+/// and the list array's values are passed to the child encoder
+///
+/// The values will have any garbage values removed and will be trimmed
+/// to only include the values that are actually used.
 pub struct ListStructuralEncoder {
     child: Box<dyn FieldEncoder>,
 }

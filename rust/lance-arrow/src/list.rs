@@ -5,7 +5,20 @@ use arrow_buffer::{BooleanBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::Field;
 
 pub trait ListArrayExt {
+    /// Filters out masked null items from the list array
+    ///
+    /// It is legal for a list array to have a null entry with a non-zero length.  The
+    /// values inside the entry are "garbage" and should be ignored.  This function
+    /// filters the values array to remove the garbage values.
+    ///
+    /// The output list will always have zero-length nulls.
     fn filter_garbage_nulls(&self) -> Self;
+    /// Returns a copy of the list's values array that has been sliced to size
+    ///
+    /// It is legal for a list array's offsets to not start with zero.  It's also legal
+    /// for a list array's offsets to not extend to the entire values array.  This function
+    /// behaves similarly to `values()` except it slices the array so that it starts at
+    /// the first list offset and ends at the last list offset.
     fn trimmed_values(&self) -> Arc<dyn Array>;
 }
 
