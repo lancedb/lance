@@ -671,30 +671,43 @@ mod tests {
             let multivector = multivector.as_fixed_size_list();
             let dim = multivector.value_length() as usize;
 
-            let dist = match distance_type {
-                DistanceType::Hamming => multivector
-                    .values()
-                    .as_primitive::<UInt8Type>()
-                    .values()
-                    .chunks_exact(dim)
-                    .map(|v| OrderedFloat(hamming(query.as_primitive::<UInt8Type>().values(), v)))
-                    .min()
-                    .unwrap(),
-                _ => multivector
-                    .values()
-                    .as_primitive::<Float32Type>()
-                    .values()
-                    .chunks_exact(dim)
-                    .map(|v| {
-                        OrderedFloat(distance_type.func()(
-                            query.as_primitive::<Float32Type>().values(),
-                            v,
-                        ))
-                    })
-                    .min()
-                    .unwrap(),
+            let dist: f32 = match distance_type {
+                DistanceType::Hamming => {
+                    let query = query.as_primitive::<UInt8Type>().values();
+                    query
+                        .chunks_exact(dim)
+                        .map(|q| {
+                            multivector
+                                .values()
+                                .as_primitive::<UInt8Type>()
+                                .values()
+                                .chunks_exact(dim)
+                                .map(|v| OrderedFloat(hamming(q, v)))
+                                .min()
+                                .unwrap()
+                        })
+                        .map(|v| v.0)
+                        .sum()
+                }
+                _ => {
+                    let query = query.as_primitive::<Float32Type>().values();
+                    query
+                        .chunks_exact(dim)
+                        .map(|q| {
+                            multivector
+                                .values()
+                                .as_primitive::<Float32Type>()
+                                .values()
+                                .chunks_exact(dim)
+                                .map(|v| OrderedFloat(distance_type.func()(q, v)))
+                                .min()
+                                .unwrap()
+                        })
+                        .map(|v| v.0)
+                        .sum()
+                }
             };
-            dists.push((dist.0, i as u64));
+            dists.push((dist, i as u64));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         dists.truncate(k);
@@ -952,8 +965,13 @@ mod tests {
             .unwrap();
 
         let multivector = vectors.value(0);
-        let first_vector = multivector.as_fixed_size_list().value(0);
-        let query = first_vector.as_primitive::<T>();
+        let query = multivector
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<T>();
+        // we don't support query with multivector yet, so we just use the first vector in the multivector
+        let query = query.slice(0, DIM);
+        let query = &query;
         let k = 100;
 
         let result = dataset
