@@ -167,7 +167,7 @@ async fn do_transform_vectors(
     partitions_ds_uri: Option<&str>,
 ) -> PyResult<()> {
     let num_rows = dataset.ds.count_rows(None).await.infer_error()?;
-    let fragments = fragments.iter().map(|item| item.metadata().inner).collect();
+    let fragments = fragments.iter().map(|item| item.metadata().0).collect();
     let transform_input = dataset
         .ds
         .scan()

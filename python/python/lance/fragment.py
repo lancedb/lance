@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import json
 import warnings
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Callable,
     Dict,
-    Iterable,
     Iterator,
     List,
     Optional,
@@ -24,8 +24,7 @@ import pyarrow as pa
 
 from .dependencies import _check_for_pandas
 from .dependencies import pandas as pd
-from .lance import _Fragment, _write_fragments
-from .lance import _FragmentMetadata as _FragmentMetadata
+from .lance import DeletionFile, RowIdMeta, _Fragment, _write_fragments
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .udf import BatchUDF, normalize_transform
 
@@ -37,53 +36,129 @@ if TYPE_CHECKING:
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
 
 
+@dataclass
 class FragmentMetadata:
-    """Metadata of a Fragment in the dataset."""
+    id: int
+    files: List[DataFile]
+    physical_rows: int
+    deletion_file: Optional[DeletionFile] = None
+    row_id_meta: Optional[RowIdMeta] = None
 
-    def __init__(self, metadata: str):
-        """Construct a FragmentMetadata from a JSON representation of the metadata.
+    @property
+    def num_deletions(self) -> int:
+        if self.deletion_file is None:
+            return 0
+        else:
+            return self.deletion_file.num_deleted_rows
 
-        Internal use only.
-        """
-        self._metadata = _FragmentMetadata.from_json(metadata)
+    @property
+    def num_rows(self) -> int:
+        return self.physical_rows - self.num_deletions
 
-    @classmethod
-    def from_metadata(cls, metadata: _FragmentMetadata):
-        instance = cls.__new__(cls)
-        instance._metadata = metadata
-        return instance
+    def data_files(self) -> List[DataFile]:
+        warnings.warn(
+            "FragmentMetadata.data_files is deprecated. Use .files instead.",
+            DeprecationWarning,
+        )
+        return self.files
 
-    def __repr__(self):
-        return self._metadata.__repr__()
-
-    def __reduce__(self):
-        return (FragmentMetadata, (self._metadata.json(),))
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, FragmentMetadata):
-            return False
-        return self._metadata.__eq__(other._metadata)
-
-    def to_json(self) -> str:
-        """Serialize :class:`FragmentMetadata` to a JSON blob"""
-        return json.loads(self._metadata.json())
+    def to_json(self) -> dict:
+        return dict(
+            id=self.id,
+            files=[asdict(f) for f in self.files],
+            physical_rows=self.physical_rows,
+            deletion_file=(
+                self.deletion_file.asdict() if self.deletion_file is not None else None
+            ),
+            row_id_meta=(
+                self.row_id_meta.asdict() if self.row_id_meta is not None else None
+            ),
+        )
 
     @staticmethod
     def from_json(json_data: str) -> FragmentMetadata:
-        """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
-        return FragmentMetadata(json_data)
+        json_data = json.loads(json_data)
 
-    def data_files(self) -> Iterable[str]:
-        """Return the data files of the fragment"""
-        return self._metadata.data_files()
+        deletion_file = json_data.get("deletion_file")
+        if deletion_file is not None:
+            deletion_file = DeletionFile(**deletion_file)
 
-    def deletion_file(self):
-        """Return the deletion file, if any"""
-        return self._metadata.deletion_file()
+        row_id_meta = json_data.get("row_id_meta")
+        if row_id_meta is not None:
+            row_id_meta = RowIdMeta(**row_id_meta)
 
-    @property
-    def id(self) -> int:
-        return self._metadata.id
+        return FragmentMetadata(
+            id=json_data["id"],
+            files=[DataFile(**f) for f in json_data["files"]],
+            physical_rows=json_data["physical_rows"],
+            deletion_file=deletion_file,
+            row_id_meta=row_id_meta,
+        )
+
+
+@dataclass
+class DataFile:
+    path: str
+    fields: List[int]
+    column_indices: List[int] = field(default_factory=list)
+    file_major_version: int = 0
+    file_minor_version: int = 0
+
+    def field_ids(self) -> List[int]:
+        warnings.warn(
+            "DataFile.field_ids is deprecated, use DataFile.fields instead",
+            DeprecationWarning,
+        )
+        return self.fields
+
+
+# class FragmentMetadata:
+#     """Metadata of a Fragment in the dataset."""
+
+#     def __init__(self, metadata: str):
+#         """Construct a FragmentMetadata from a JSON representation of the metadata.
+
+#         Internal use only.
+#         """
+#         self._metadata = _FragmentMetadata.from_json(metadata)
+
+#     @classmethod
+#     def from_metadata(cls, metadata: _FragmentMetadata):
+#         instance = cls.__new__(cls)
+#         instance._metadata = metadata
+#         return instance
+
+#     def __repr__(self):
+#         return self._metadata.__repr__()
+
+#     def __reduce__(self):
+#         return (FragmentMetadata, (self._metadata.json(),))
+
+#     def __eq__(self, other: object) -> bool:
+#         if not isinstance(other, FragmentMetadata):
+#             return False
+#         return self._metadata.__eq__(other._metadata)
+
+#     def to_json(self) -> str:
+#         """Serialize :class:`FragmentMetadata` to a JSON blob"""
+#         return json.loads(self._metadata.json())
+
+#     @staticmethod
+#     def from_json(json_data: str) -> FragmentMetadata:
+#         """Reconstruct :class:`FragmentMetadata` from a JSON blob"""
+#         return FragmentMetadata(json_data)
+
+#     def data_files(self) -> Iterable[str]:
+#         """Return the data files of the fragment"""
+#         return self._metadata.data_files()
+
+#     def deletion_file(self):
+#         """Return the deletion file, if any"""
+#         return self._metadata.deletion_file()
+
+#     @property
+#     def id(self) -> int:
+#         return self._metadata.id
 
 
 class LanceFragment(pa.dataset.Fragment):
@@ -135,8 +210,7 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: int
             The ID of the fragment.
         """
-        fragment = _Fragment.create_from_file(filename, dataset._ds, fragment_id)
-        return FragmentMetadata(fragment.json())
+        return _Fragment.create_from_file(filename, dataset._ds, fragment_id)
 
     @staticmethod
     def create(
@@ -231,7 +305,7 @@ class LanceFragment(pa.dataset.Fragment):
         if progress is None:
             progress = NoopFragmentWriteProgress()
 
-        inner_meta = _Fragment.create(
+        return _Fragment.create(
             dataset_uri,
             fragment_id,
             reader,
@@ -241,7 +315,6 @@ class LanceFragment(pa.dataset.Fragment):
             data_storage_version=data_storage_version,
             storage_options=storage_options,
         )
-        return FragmentMetadata(inner_meta.json())
 
     @property
     def fragment_id(self):
@@ -413,7 +486,7 @@ class LanceFragment(pa.dataset.Fragment):
                 transforms, columns, batch_size
             )
 
-        return FragmentMetadata.from_metadata(metadata), schema
+        return metadata, schema
 
     def delete(self, predicate: str) -> FragmentMetadata | None:
         """Delete rows from this Fragment.
@@ -457,7 +530,7 @@ class LanceFragment(pa.dataset.Fragment):
         raw_fragment = self._fragment.delete(predicate)
         if raw_fragment is None:
             return None
-        return FragmentMetadata.from_metadata(raw_fragment.metadata())
+        return raw_fragment.metadata()
 
     @property
     def schema(self) -> pa.Schema:
@@ -482,7 +555,7 @@ class LanceFragment(pa.dataset.Fragment):
         -------
         FragmentMetadata
         """
-        return FragmentMetadata.from_metadata(self._fragment.metadata())
+        return self._fragment.metadata()
 
 
 def write_fragments(
@@ -582,7 +655,7 @@ def write_fragments(
         else:
             data_storage_version = "stable"
 
-    fragments = _write_fragments(
+    return _write_fragments(
         dataset_uri,
         reader,
         mode=mode,
@@ -593,4 +666,3 @@ def write_fragments(
         data_storage_version=data_storage_version,
         storage_options=storage_options,
     )
-    return [FragmentMetadata.from_metadata(frag) for frag in fragments]
