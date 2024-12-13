@@ -84,9 +84,12 @@ class FragmentMetadata:
 
     def to_json(self) -> dict:
         """Get this as a simple JSON-serializable dictionary."""
+        files = [asdict(f) for f in self.files]
+        for f in files:
+            f["path"] = f.pop("_path")
         return dict(
             id=self.id,
-            files=[asdict(f) for f in self.files],
+            files=files,
             physical_rows=self.physical_rows,
             deletion_file=(
                 self.deletion_file.asdict() if self.deletion_file is not None else None
@@ -156,6 +159,15 @@ class DataFile:
         self.column_indices = column_indices or []
         self.file_major_version = file_major_version
         self.file_minor_version = file_minor_version
+
+    def __repr__(self):
+        # pretend we have a 'path' attribute
+        return (
+            f"DataFile(path='{self._path}', fields={self.fields}, "
+            f"column_indices={self.column_indices}, "
+            f"file_major_version={self.file_major_version}, "
+            f"file_minor_version={self.file_minor_version})"
+        )
 
     @property
     def path(self) -> str:
