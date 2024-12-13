@@ -136,13 +136,29 @@ class DataFile:
         The minor version of the data storage format.
     """
 
-    path: str
+    _path: str
     fields: List[int]
     column_indices: List[int] = field(default_factory=list)
     file_major_version: int = 0
     file_minor_version: int = 0
 
-    def __post_init__(self):
+    def __init__(
+        self,
+        path: str,
+        fields: List[int],
+        column_indices: List[int] = None,
+        file_major_version: int = 0,
+        file_minor_version: int = 0,
+    ):
+        # TODO: only we eliminate the path method, we can remove this
+        self._path = path
+        self.fields = fields
+        self.column_indices = column_indices or []
+        self.file_major_version = file_major_version
+        self.file_minor_version = file_minor_version
+
+    @property
+    def path(self) -> str:
         # path used to be a method. This is for backwards compatibility.
         class CallableStr(str):
             def __call__(self):
@@ -152,7 +168,10 @@ class DataFile:
                 )
                 return self
 
-        self.path = CallableStr(self.path)
+            def __reduce__(self):
+                return (str, (str(self),))
+
+        return CallableStr(self._path)
 
     def field_ids(self) -> List[int]:
         warnings.warn(

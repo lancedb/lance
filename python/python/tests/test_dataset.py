@@ -1074,7 +1074,7 @@ def test_deletion_file(tmp_path: Path):
     # New fragment has deletion file
     assert new_fragment.deletion_file is not None
     assert re.match(
-        "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file().path(0)
+        "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
     )
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
     dataset = lance.LanceDataset.commit(base_dir, operation)
@@ -1094,6 +1094,9 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     pickled = pickle.dumps(fragment_metadata)
     unpickled = pickle.loads(pickled)
     assert fragment_metadata == unpickled
+    with pytest.warns(DeprecationWarning):
+        path = fragment_metadata.files[0].path()
+        assert path == unpickled.files[0].path()
 
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment_metadata])
     dataset = lance.LanceDataset.commit(base_dir, operation)
@@ -1367,8 +1370,7 @@ def test_merge_insert_subcols(tmp_path: Path):
 
     assert len(fragments[0].data_files()) == 2
     assert (
-        fragments[0].data_files()[0].file_path
-        == original_fragments[0].data_files()[0].file_path
+        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
     )
     assert len(fragments[1].data_files()) == 1
     assert str(fragments[1].data_files()[0]) == str(
