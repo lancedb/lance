@@ -126,21 +126,6 @@ impl ToPyObject for PyLance<&Operation> {
                     .expect("Failed to get Append class");
                 cls.call1((fragments,)).unwrap().to_object(py)
             }
-            Operation::Update {
-                removed_fragment_ids,
-                updated_fragments,
-                new_fragments,
-            } => {
-                let removed_fragment_ids = removed_fragment_ids.to_object(py);
-                let updated_fragments = export_vec(py, updated_fragments.as_slice());
-                let new_fragments = export_vec(py, new_fragments.as_slice());
-                let cls = namespace
-                    .getattr("Update")
-                    .expect("Failed to get Update class");
-                cls.call1((removed_fragment_ids, updated_fragments, new_fragments))
-                    .unwrap()
-                    .to_object(py)
-            }
             _ => todo!(),
         }
     }

@@ -26,7 +26,6 @@ from typing import (
     Optional,
     Sequence,
     Set,
-    Tuple,
     TypedDict,
     Union,
 )
@@ -102,30 +101,6 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
 
         return super(MergeInsertBuilder, self).execute(reader)
-
-    def execute_uncommitted(
-        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
-    ) -> Tuple[Transaction, Dict[str, Any]]:
-        """Executes the merge insert operation without committing
-
-        This function updates the original dataset and returns a dictionary with
-        information about merge statistics - i.e. the number of inserted, updated,
-        and deleted rows.
-
-        Parameters
-        ----------
-
-        data_obj: ReaderLike
-            The new data to use as the source table for the operation.  This parameter
-            can be any source of data (e.g. table / dataset) that
-            :func:`~lance.write_dataset` accepts.
-        schema: Optional[pa.Schema]
-            The schema of the data.  This only needs to be supplied whenever the data
-            source is some kind of generator.
-        """
-        reader = _coerce_reader(data_obj, schema)
-
-        return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
     # These next three overrides exist only to document the methods
 
