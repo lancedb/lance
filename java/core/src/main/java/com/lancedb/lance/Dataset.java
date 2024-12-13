@@ -254,6 +254,20 @@ public class Dataset implements Closeable {
   public static native void drop(String path, Map<String, String> storageOptions);
 
   /**
+   * Drop columns from the dataset.
+   *
+   * @param columns The columns to drop
+   */
+  public void dropColumns(List<String> columns) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDropColumns(columns);
+    }
+  }
+
+  private native void nativeDropColumns(List<String> columns);
+
+  /**
    * Create a new Dataset Scanner.
    *
    * @return a dataset scanner
@@ -285,6 +299,20 @@ public class Dataset implements Closeable {
       return LanceScanner.create(this, options, allocator);
     }
   }
+
+  /**
+   * Gets the URI of the dataset.
+   *
+   * @return the URI of the dataset
+   */
+  public String uri() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeUri();
+    }
+  }
+
+  private native String nativeUri();
 
   /**
    * Gets the currently checked out version of the dataset.
