@@ -886,7 +886,7 @@ async fn configure_store(
             let store = builder.build()?;
 
             Ok(ObjectStore {
-                inner: Arc::new(store),
+                inner: Arc::new(store).traced(),
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts,
@@ -902,7 +902,7 @@ async fn configure_store(
                 builder = builder.with_config(key, value);
             }
             let store = builder.build()?;
-            let store = Arc::new(store);
+            let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
                 inner: store,
@@ -917,7 +917,7 @@ async fn configure_store(
         "az" => {
             storage_options.with_env_azure();
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
-            let store = Arc::new(store);
+            let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
                 inner: store,
