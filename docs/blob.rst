@@ -1,24 +1,23 @@
 Blob As Files
 =============
 
-Unlike other data format, Large multimodal data is first class citizen in Lance
-columnar format.
+Unlike other data formats, large multimodal data is a first-class citizen in the Lance columnar format.
 Lance provides a high-level API to store and retrieve large binary objects (blobs) in Lance datasets.
 
 .. image:: _static/blob.png
     :scale: 50%
 
 Lance serves large binary data using :py:class:`lance.BlobFile`, which
-is a file-like object that lazily read large binary objects.
+is a file-like object that lazily reads large binary objects.
 
 .. autoclass:: lance.BlobFile
     :members:
     :show-inheritance:
     :noindex:
 
-To fetch blobs from Lance dataset, you can use :py:meth:`lance.dataset.LanceDataset.take_blobs`.
+To fetch blobs from a Lance dataset, you can use :py:meth:`lance.dataset.LanceDataset.take_blobs`.
 
-For example, it is easy to use `BlobFile` to extra frames from a video file without
+For example, it's easy to use `BlobFile` to extract frames from a video file without
 loading the entire video into memory.
 
 .. code-block:: python
