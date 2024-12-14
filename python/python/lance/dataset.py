@@ -734,11 +734,11 @@ class LanceDataset(pa.dataset.Dataset):
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
         **kwargs : dict, optional
-            See scanner() method for full parameter description.
+            See :py:method::scanner method for full parameter description.
 
         Returns
         -------
-        table : Table
+        table : pyarrow.Table
         """
         columns_with_transform = None
         if isinstance(columns, dict):
@@ -789,9 +789,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Select blobs by row IDs.
 
-        Instead of reading large blob binary data into memory before processing it.
-        This API allows you to open blob binary data as a regular Python File object,
-        see :py:class:`BlobFile` for more details.
+        Instead of loading large binary blob data into memory before processing it,
+        this API allows you to open binary blob data as a regular Python file-like
+        object. For more details, see :py:class:`lance.BlobFile`.
 
         Parameters
         ----------

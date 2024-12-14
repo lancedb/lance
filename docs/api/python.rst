@@ -34,6 +34,12 @@ Lance stands out with its super fast random access, unlike other columnar format
 Schema Evolution
 ~~~~~~~~~~~~~~~~
 
+Lance supports schema evolution, which means that you can add new columns to the dataset
+cheaply.
+
+.. automethod:: lance.dataset.LanceDataset.add_columns
+.. automethod:: lance.dataset.LanceDataset.drop_columns
+
 
 API Reference
 ~~~~~~~~~~~~~
