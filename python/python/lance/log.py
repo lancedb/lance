@@ -8,6 +8,13 @@ from typing import Optional
 ENV_NAME_PYLANCE_LOGGING_LEVEL = "LANCE_LOG"
 
 
+# Rust has 'trace' and Python does not so we map it to 'debug'
+def get_python_log_level(rust_log_level: str) -> str:
+    if rust_log_level.lower() == "trace":
+        return "DEBUG"
+    return rust_log_level
+
+
 def get_log_level():
     lance_log_level = os.environ.get(ENV_NAME_PYLANCE_LOGGING_LEVEL, "INFO").upper()
     if lance_log_level == "":
@@ -17,7 +24,7 @@ def get_log_level():
         entry for entry in lance_log_level.split(",") if "=" not in entry
     ]
     if len(lance_log_level) > 0:
-        return lance_log_level[0]
+        return get_python_log_level(lance_log_level[0])
     else:
         return "INFO"
 
