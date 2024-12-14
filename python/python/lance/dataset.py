@@ -152,7 +152,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
 
 class LanceDataset(pa.dataset.Dataset):
-    """A dataset in Lance format where the data is stored at the given uri."""
+    """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
     def __init__(
         self,
@@ -787,7 +787,11 @@ class LanceDataset(pa.dataset.Dataset):
         blob_column: str,
     ) -> List[BlobFile]:
         """
-        Select blobs by row_ids.
+        Select blobs by row IDs.
+
+        Instead of reading large blob binary data into memory before processing it.
+        This API allows you to open blob binary data as a regular Python File object,
+        see :py:class:`BlobFile` for more details.
 
         Parameters
         ----------

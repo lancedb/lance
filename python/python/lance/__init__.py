@@ -77,7 +77,7 @@ def dataset(
         argument value. If a version is already specified, this arg is ignored.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
-    commit_handler : optional, CommitLock
+    commit_handler : optional, lance.commit.CommitLock
         If specified, use the provided commit handler to lock the table while
         committing a new version. Not necessary on object stores other than S3
         or when there are no concurrent writers.
