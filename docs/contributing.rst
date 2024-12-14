@@ -127,13 +127,6 @@ Example Notebooks
 
 Example notebooks are under `examples`. These are standalone notebooks you should be able to download and run.
 
-DuckDB Extension
-~~~~~~~~~~~~~~~~
-
-In python, Lance integrates with DuckDB via Apache Arrow. Outside of python, the highly experimental duckdb extension for Lance
-lives under `integration/duckdb_lance`. This uses the DuckDB `Rust extension framework <https://github.com/Mause/duckdb-extension-framework>`_.
-The main code lives under `integration/duckdb_lance/src`. Follow the integration README for more details.
-
 Benchmarks
 ~~~~~~~~~~
 
