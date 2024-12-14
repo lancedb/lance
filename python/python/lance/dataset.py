@@ -325,6 +325,7 @@ class LanceDataset(pa.dataset.Dataset):
                     "nprobes": 1,
                     "refine_factor": 1
                 }
+
         batch_size: int, default None
             The max size of batches returned.
         io_buffer_size: int, default None
@@ -366,7 +367,7 @@ class LanceDataset(pa.dataset.Dataset):
             If True, then all columns are late materialized.
             If False, then all columns are early materialized.
             If a list of strings, then only the columns in the list are
-              late materialized.
+            late materialized.
 
             The default uses a heuristic that assumes filters will select about 0.1%
             of the rows.  If your filter is more selective (e.g. find by id) you may
@@ -376,6 +377,7 @@ class LanceDataset(pa.dataset.Dataset):
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents containing "hello" or "world".
             or a dictionary with the following keys:
+
             - columns: list[str]
                 The columns to search,
                 currently only supports a single column in the columns list.
@@ -389,6 +391,7 @@ class LanceDataset(pa.dataset.Dataset):
         -----
 
         For now, if BOTH filter and nearest is specified, then:
+
         1. nearest is executed first.
         2. The results are filtered afterwards.
 
@@ -506,7 +509,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
     ) -> pa.Table:
-        """Read the data into memory as a pyarrow Table.
+        """Read the data into memory as a :py:class:`pyarrow.Table`
 
         Parameters
         ----------
@@ -567,6 +570,7 @@ class LanceDataset(pa.dataset.Dataset):
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents contains "hello" or "world".
             or a dictionary with the following keys:
+
             - columns: list[str]
                 The columns to search,
                 currently only supports a single column in the columns list.
@@ -576,6 +580,7 @@ class LanceDataset(pa.dataset.Dataset):
         Notes
         -----
         If BOTH filter and nearest is specified, then:
+
         1. nearest is executed first.
         2. The results are filtered afterward, unless pre-filter sets to True.
         """
@@ -1616,8 +1621,7 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
-        or ``pyarrow.FixedShapeTensorArray``. Optional.
+        ivf_centroids : ``np.ndarray``, ``pyarrow.FixedSizeListArray`` or ``pyarrow.FixedShapeTensorArray``. optional
             A ``num_partitions x dimension`` array of K-mean centroids for IVF
             clustering. If not provided, a new Kmean model will be trained.
         pq_codebook : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
@@ -1658,7 +1662,9 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs :
             Parameters passed to the index building process.
 
-        The SQ (Scalar Quantization) is available for only "IVF_HNSW_SQ" index type,
+
+
+        The SQ (Scalar Quantization) is available for only ``IVF_HNSW_SQ`` index type,
         this quantization method is used to reduce the memory usage of the index,
         it maps the float vectors to integer vectors, each integer is of ``num_bits``,
         now only 8 bits are supported.
@@ -1669,20 +1675,21 @@ class LanceDataset(pa.dataset.Dataset):
         If ``index_type`` is with "PQ", then the following parameters are required:
             num_sub_vectors
 
-        Optional parameters for "IVF_PQ":
-            ivf_centroids :
-                K-mean centroids for IVF clustering.
-            num_bits : int, optional
+        Optional parameters for `IVF_PQ`:
+
+            - ivf_centroids
+                Existing K-mean centroids for IVF clustering.
+            - num_bits
                 The number of bits for PQ (Product Quantization). Default is 8.
                 Only 4, 8 are supported.
 
-        Optional parameters for "IVF_HNSW_*":
-            max_level : int
-                the maximum number of levels in the graph.
-            m : int
-                the number of edges per node in the graph.
-            ef_construction : int
-                the number of nodes to examine during the construction.
+        Optional parameters for `IVF_HNSW_*`:
+            max_level
+                Int, the maximum number of levels in the graph.
+            m
+                Int, the number of edges per node in the graph.
+            ef_construction
+                Int, the number of nodes to examine during the construction.
 
         Examples
         --------

@@ -68,7 +68,8 @@ def dataset(
     Parameters
     ----------
     uri : str
-        Address to the Lance dataset.
+        Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
+        or a cloud object store URI, i.e., `s3://bucket/data.lance`.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
