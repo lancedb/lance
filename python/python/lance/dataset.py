@@ -1621,14 +1621,19 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : ``np.ndarray``, ``pyarrow.FixedSizeListArray`` or ``pyarrow.FixedShapeTensorArray``. optional
-            A ``num_partitions x dimension`` array of K-mean centroids for IVF
-            clustering. If not provided, a new Kmean model will be trained.
-        pq_codebook : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
-        or ``pyarrow.FixedShapeTensorArray``. Optional.
+        ivf_centroids : optional
+            It can be either :py:class:`np.ndarray`,
+            :py:class:`pyarrow.FixedSizeListArray` or
+            :py:class:`pyarrow.FixedShapeTensorArray`.
+            A ``num_partitions x dimension`` array of existing K-mean centroids
+            for IVF clustering. If not provided, a new KMeans model will be trained.
+        pq_codebook : optional,
+            It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
+            or :py:class:`pyarrow.FixedShapeTensorArray`.
             A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
             array of K-mean centroids for PQ codebook.
-            Note: nbits is always 8 for now.
+
+            Note: ``nbits`` is always 8 for now.
             If not provided, a new PQ model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
