@@ -486,9 +486,11 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
 
     # test just limit
     assert dataset.to_table(limit=10) == table.slice(0, 10)
+    assert dataset.to_table(limit=100) == table.slice(0, 100)
 
     # test just offset
-    assert dataset.to_table(offset=10) == table.slice(10, 100)
+    assert dataset.to_table(offset=0) == table.slice(0, 100)
+    assert dataset.to_table(offset=10) == table.slice(10, 90)
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
@@ -503,7 +505,18 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
 
     # Limit past the end
-    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+    assert dataset.to_table(limit=101) == table.slice(0, 100)
+
+    # Limit with offset past the end
+    assert dataset.to_table(offset=50, limit=51) == table.slice(50, 50)
+
+    # Offset past the end
+    assert dataset.to_table(offset=100) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101) == table.slice(100, 0)  # Empty table
+
+    # Offset with limit past the end
+    assert dataset.to_table(offset=100, limit=1) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101, limit=1) == table.slice(100, 0)  # Empty table
 
     # Invalid limit / offset
     with pytest.raises(ValueError, match="Offset must be non-negative"):

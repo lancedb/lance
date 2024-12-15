@@ -1219,12 +1219,18 @@ impl Scanner {
         } else {
             match (self.limit, self.offset) {
                 (None, None) => None,
-                (Some(limit), None) => Some(0..limit as u64),
-                (None, Some(offset)) => {
-                    let num_rows = self.dataset.count_all_rows().await?;
-                    Some(offset as u64..num_rows as u64)
+                (Some(limit), None) => {
+                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    Some(0..limit.min(num_rows) as u64)
                 }
-                (Some(limit), Some(offset)) => Some(offset as u64..(offset + limit) as u64),
+                (None, Some(offset)) => {
+                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    Some(offset.min(num_rows) as u64..num_rows as u64)
+                }
+                (Some(limit), Some(offset)) => {
+                    let num_rows = self.dataset.count_all_rows().await? as i64;
+                    Some(offset.min(num_rows) as u64..(offset + limit).min(num_rows) as u64)
+                }
             }
         };
         let mut use_limit_node = true;
