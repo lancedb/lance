@@ -1598,13 +1598,13 @@ impl Scanner {
 
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let ann_node = match vector_type {
-                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
-                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
+            let (ann_node, is_multivec) = match vector_type {
+                DataType::FixedSizeList(_, _) => (self.ann(q, &deltas, filter_plan).await?, false),
+                DataType::List(_) => (self.multivec_ann(q, &deltas, filter_plan).await?, true),
                 _ => unreachable!(),
             };
 
-            let mut knn_node = if q.refine_factor.is_some() {
+            let mut knn_node = if q.refine_factor.is_some() || is_multivec {
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
                 let knn_node_with_vector =
                     self.take(ann_node, &with_vector, self.batch_readahead)?;
@@ -2004,11 +2004,15 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
         // split the query multivectors
-        let new_queries = (0..q.key.len() / dim)
+        let num_queries = q.key.len() / dim;
+        let new_queries = (0..num_queries)
             .map(|i| q.key.slice(i * dim, dim))
             .map(|query_vec| {
                 let mut new_query = q.clone();
                 new_query.key = query_vec;
+                if num_queries > 1 {
+                    new_query.k = q.k / 2;
+                }
                 new_query
             });
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
@@ -2039,14 +2043,6 @@ impl Scanner {
             vec![None],
             ann_node,
             schema,
-        )?);
-        let schema = ann_node.schema();
-        let ann_node = Arc::new(DFProjectionExec::try_new(
-            vec![
-                (expressions::col(DIST_COL, &schema)?, DIST_COL.to_string()),
-                (expressions::col(ROW_ID, &schema)?, ROW_ID.to_string()),
-            ],
-            ann_node,
         )?);
         Ok(ann_node)
     }
