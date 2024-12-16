@@ -62,6 +62,12 @@ public class LanceFragmentScanner implements AutoCloseable {
       }
       scanOptions.batchSize(SparkOptions.getBatchSize(config));
       scanOptions.withRowId(getWithRowId(inputPartition.getSchema()));
+      if (inputPartition.getLimit().isPresent()) {
+        scanOptions.limit(inputPartition.getLimit().get());
+      }
+      if (inputPartition.getOffset().isPresent()) {
+        scanOptions.offset(inputPartition.getOffset().get());
+      }
       scanner = fragment.newScan(scanOptions.build());
     } catch (Throwable t) {
       if (scanner != null) {
