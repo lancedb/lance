@@ -4586,8 +4586,9 @@ mod test {
         #[values(false, true)] stable_row_id: bool,
     ) -> Result<()> {
         // Create a vector dataset
+        let dim = 256;
         let mut dataset =
-            TestVectorDataset::new_with_dimension(data_storage_version, stable_row_id, 256).await?;
+            TestVectorDataset::new_with_dimension(data_storage_version, stable_row_id, dim).await?;
         let lance_schema = dataset.dataset.schema();
 
         // Scans
@@ -4684,7 +4685,7 @@ mod test {
 
         // KNN
         // ---------------------------------------------------------------------
-        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+        let q: Float32Array = (32..32 + dim).map(|v| v as f32).collect();
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5),
@@ -5121,7 +5122,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
@@ -5145,7 +5146,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
@@ -5168,7 +5169,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
@@ -5191,7 +5192,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
