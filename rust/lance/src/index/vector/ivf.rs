@@ -85,7 +85,7 @@ use super::{
     utils::maybe_sample_training_data,
 };
 use crate::dataset::builder::DatasetBuilder;
-use crate::index::vector::utils::{get_vector_dim, get_vector_element_type};
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
@@ -1167,7 +1167,7 @@ async fn build_ivf_model_and_pq(
     );
 
     // sanity check
-    get_vector_element_type(dataset.schema(), column)?;
+    get_vector_type(dataset.schema(), column)?;
     let dim = get_vector_dim(dataset.schema(), column)?;
 
     let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;

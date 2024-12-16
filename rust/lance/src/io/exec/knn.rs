@@ -33,7 +33,7 @@ use snafu::{location, Location};
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
-use crate::index::vector::utils::get_vector_element_type;
+use crate::index::vector::utils::get_vector_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
@@ -82,7 +82,7 @@ impl KNNVectorDistanceExec {
         distance_type: DistanceType,
     ) -> Result<Self> {
         let mut output_schema = input.schema().as_ref().clone();
-        get_vector_element_type(&(&output_schema).try_into()?, column)?;
+        get_vector_type(&(&output_schema).try_into()?, column)?;
 
         // FlatExec appends a distance column to the input schema. The input
         // may already have a distance column (possibly in the wrong position), so
@@ -265,7 +265,7 @@ pub struct ANNIvfPartitionExec {
 impl ANNIvfPartitionExec {
     pub fn try_new(dataset: Arc<Dataset>, index_uuids: Vec<String>, query: Query) -> Result<Self> {
         let dataset_schema = dataset.schema();
-        get_vector_element_type(dataset_schema, &query.column)?;
+        get_vector_type(dataset_schema, &query.column)?;
         if index_uuids.is_empty() {
             return Err(Error::Execution {
                 message: "ANNIVFPartitionExec node: no index found for query".to_string(),

@@ -4,11 +4,14 @@
 //! Flat Vector Index.
 //!
 
-use arrow_array::{make_array, Array, ArrayRef, RecordBatch};
+use std::sync::Arc;
+
+use arrow::array::AsArray;
+use arrow_array::{make_array, Array, ArrayRef, Float32Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField};
 use lance_arrow::*;
 use lance_core::{Error, Result, ROW_ID};
-use lance_linalg::distance::DistanceType;
+use lance_linalg::distance::{multivec_distance, DistanceType};
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -32,30 +35,44 @@ pub async fn compute_distance(
         // Ignore the distance calculated from inner vector index.
         batch = batch.drop_column(DIST_COL)?;
     }
-    let vectors = batch.column_by_name(column).ok_or_else(|| Error::Schema {
-        message: format!("column {} does not exist in dataset", column),
-        location: location!(),
-    })?;
+    let vectors = batch
+        .column_by_name(column)
+        .ok_or_else(|| Error::Schema {
+            message: format!("column {} does not exist in dataset", column),
+            location: location!(),
+        })?
+        .clone();
 
-    // A selection vector may have been applied to _rowid column, so we need to
-    // push that onto vectors if possible.
-    let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
     let validity_buffer = if let Some(rowids) = batch.column_by_name(ROW_ID) {
         rowids.nulls().map(|nulls| nulls.buffer().clone())
     } else {
         None
     };
 
-    let vectors = vectors
-        .into_data()
-        .into_builder()
-        .null_bit_buffer(validity_buffer)
-        .build()
-        .map(make_array)?;
-    let vectors = as_fixed_size_list_array(vectors.as_ref()).clone();
-
     tokio::task::spawn_blocking(move || {
-        let distances = dt.arrow_batch_func()(key.as_ref(), &vectors)? as ArrayRef;
+        // A selection vector may have been applied to _rowid column, so we need to
+        // push that onto vectors if possible.
+
+        let vectors = vectors
+            .into_data()
+            .into_builder()
+            .null_bit_buffer(validity_buffer)
+            .build()
+            .map(make_array)?;
+        let distances = match vectors.data_type() {
+            DataType::FixedSizeList(_, _) => {
+                let vectors = vectors.as_fixed_size_list();
+                dt.arrow_batch_func()(key.as_ref(), vectors)? as ArrayRef
+            }
+            DataType::List(_) => {
+                let vectors = vectors.as_list();
+                let dists = multivec_distance(key.as_ref(), vectors, dt)?;
+                Arc::new(Float32Array::from(dists))
+            }
+            _ => {
+                unreachable!()
+            }
+        };
 
         batch
             .try_with_column(distance_field(), distances)

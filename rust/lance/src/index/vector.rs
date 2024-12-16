@@ -41,7 +41,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::tempdir;
 use tracing::instrument;
-use utils::get_vector_element_type;
+use utils::get_vector_type;
 use uuid::Uuid;
 
 use self::{ivf::*, pq::PQIndex};
@@ -254,7 +254,7 @@ pub(crate) async fn build_vector_index(
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
-        let element_type = get_vector_element_type(dataset.schema(), column)?;
+        let (_, element_type) = get_vector_type(dataset.schema(), column)?;
         match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(

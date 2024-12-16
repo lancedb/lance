@@ -30,12 +30,21 @@ fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
     }
 }
 
-pub fn get_vector_element_type(schema: &Schema, column: &str) -> Result<arrow_schema::DataType> {
+// this checks whether the given column is with a valid vector type
+// returns the vector type (FixedSizeList for vectors, or List for multivectors),
+// and element type (Float16/Float32/Float64 or UInt8 for binary vectors).
+pub fn get_vector_type(
+    schema: &Schema,
+    column: &str,
+) -> Result<(arrow_schema::DataType, arrow_schema::DataType)> {
     let field = schema.field(column).ok_or(Error::Index {
         message: format!("column {} does not exist in schema {}", column, schema),
         location: location!(),
     })?;
-    infer_vector_element_type(&field.data_type())
+    Ok((
+        field.data_type(),
+        infer_vector_element_type(&field.data_type())?,
+    ))
 }
 
 fn infer_vector_element_type(
@@ -50,7 +59,7 @@ fn infer_vector_element_type(
                 | arrow::datatypes::DataType::UInt8 => Ok(element_field.data_type().clone()),
                 _ => Err(Error::Index {
                     message: format!(
-                        "Data type is not a FixedSizeListArray of Float32 or Float64, but {:?}",
+                        "vector element is not expected type (Float16/Float32/Float64 or UInt8) {:?}",
                         element_field.data_type()
                     ),
                     location: location!(),
@@ -59,7 +68,7 @@ fn infer_vector_element_type(
         }
         arrow::datatypes::DataType::List(inner) => infer_vector_element_type(inner.data_type()),
         _ => Err(Error::Index {
-            message: format!("Data type is not a FixedSizeListArray, but {:?}", data_type),
+            message: format!("vector is not with valid data type: {:?}", data_type),
             location: location!(),
         }),
     }

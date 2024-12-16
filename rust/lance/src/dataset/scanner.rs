@@ -58,7 +58,7 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
-use crate::index::vector::utils::get_vector_element_type;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -659,7 +659,20 @@ impl Scanner {
             ));
         }
         // make sure the field exists
-        let element_type = get_vector_element_type(self.dataset.schema(), column)?;
+        let (_, element_type) = get_vector_type(self.dataset.schema(), column)?;
+        let dim = get_vector_dim(self.dataset.schema(), column)?;
+        // make sure the query is valid
+        if q.len() % dim != 0 {
+            return Err(Error::invalid_input(
+                format!(
+                    "query dim({}) doesn't match the column {} vector dim({})",
+                    q.len(),
+                    column,
+                    dim,
+                ),
+                location!(),
+            ));
+        }
         let key = match element_type {
             dt if dt == *q.data_type() => Box::new(q.clone()),
             dt if dt.is_floating() => coerce_float_vector(
@@ -1564,16 +1577,7 @@ impl Scanner {
         };
 
         // Sanity check
-        let element_type = get_vector_element_type(self.dataset.schema(), &q.column)?;
-        if element_type != DataType::UInt8 && !element_type.is_floating() {
-            return Err(Error::invalid_input(
-                format!(
-                    "Vector search error: column {} vector in {} type is not supported",
-                    q.column, element_type,
-                ),
-                location!(),
-            ));
-        }
+        let (vector_type, _) = get_vector_type(self.dataset.schema(), &q.column)?;
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
         let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
@@ -1594,7 +1598,11 @@ impl Scanner {
 
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
+            let ann_node = match vector_type {
+                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
+                _ => unreachable!(),
+            };
 
             let mut knn_node = if q.refine_factor.is_some() {
                 let with_vector = self.dataset.schema().project(&[&q.column])?;
@@ -1973,7 +1981,6 @@ impl Scanner {
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-
         let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -1986,6 +1993,56 @@ impl Scanner {
             SortExec::new(vec![sort_expr], inner_fanout_search)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
+    }
+
+    // Create an Execution plan to do ANN over multivectors
+    async fn multivec_ann(
+        &self,
+        q: &Query,
+        index: &[Index],
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
+        // split the query multivectors
+        let new_queries = (0..q.key.len() / dim)
+            .map(|i| q.key.slice(i * dim, dim))
+            .map(|query_vec| {
+                let mut new_query = q.clone();
+                new_query.key = query_vec;
+                new_query
+            });
+        let mut ann_nodes = Vec::with_capacity(new_queries.len());
+        for query in new_queries {
+            ann_nodes.push(self.ann(&query, index, filter_plan).await?);
+        }
+        let ann_node = Arc::new(UnionExec::new(ann_nodes));
+        let ann_node = Arc::new(RepartitionExec::try_new(
+            ann_node,
+            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+        )?);
+        let schema = ann_node.schema();
+        // unique by row ids, and get the min distance although it is not used.
+        let group_expr = vec![(
+            expressions::col(ROW_ID, schema.as_ref())?,
+            ROW_ID.to_string(),
+        )];
+        println!("schema before: {:?}", schema);
+        let ann_node = Arc::new(AggregateExec::try_new(
+            AggregateMode::Final,
+            PhysicalGroupBy::new_single(group_expr),
+            vec![AggregateExprBuilder::new(
+                functions_aggregate::min_max::min_udaf(),
+                vec![expressions::col(DIST_COL, &schema)?],
+            )
+            .schema(schema.clone())
+            .alias(DIST_COL)
+            .build()?],
+            vec![None],
+            ann_node,
+            schema,
+        )?);
+        println!("schema after: {:?}", ann_node.schema());
+        Ok(ann_node)
     }
 
     /// Create prefilter source from filter plan

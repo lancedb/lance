@@ -525,10 +525,10 @@ mod tests {
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema};
+    use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
     use lance_core::ROW_ID;
-    use lance_index::vector::graph::OrderedFloat;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
@@ -536,7 +536,7 @@ mod tests {
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::hamming::hamming;
-    use lance_linalg::distance::DistanceType;
+    use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_testing::datagen::generate_random_array_with_range;
     use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
@@ -665,53 +665,14 @@ mod tests {
         k: usize,
         distance_type: DistanceType,
     ) -> Vec<(f32, u64)> {
-        let mut dists = vec![];
-        for i in 0..vectors.len() {
-            let multivector = vectors.value(i);
-            let multivector = multivector.as_fixed_size_list();
-            let dim = multivector.value_length() as usize;
-
-            let dist: f32 = match distance_type {
-                DistanceType::Hamming => {
-                    let query = query.as_primitive::<UInt8Type>().values();
-                    query
-                        .chunks_exact(dim)
-                        .map(|q| {
-                            multivector
-                                .values()
-                                .as_primitive::<UInt8Type>()
-                                .values()
-                                .chunks_exact(dim)
-                                .map(|v| OrderedFloat(hamming(q, v)))
-                                .min()
-                                .unwrap()
-                        })
-                        .map(|v| v.0)
-                        .sum()
-                }
-                _ => {
-                    let query = query.as_primitive::<Float32Type>().values();
-                    query
-                        .chunks_exact(dim)
-                        .map(|q| {
-                            multivector
-                                .values()
-                                .as_primitive::<Float32Type>()
-                                .values()
-                                .chunks_exact(dim)
-                                .map(|v| OrderedFloat(distance_type.func()(q, v)))
-                                .min()
-                                .unwrap()
-                        })
-                        .map(|v| v.0)
-                        .sum()
-                }
-            };
-            dists.push((dist, i as u64));
-        }
-        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        dists.truncate(k);
-        dists
+        multivec_distance(query, vectors, distance_type)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, dist)| (dist, i as u64))
+            .sorted_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .take(k)
+            .collect()
     }
 
     async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
@@ -970,7 +931,7 @@ mod tests {
             .values()
             .as_primitive::<T>();
         // we don't support query with multivector yet, so we just use the first vector in the multivector
-        let query = query.slice(0, DIM);
+        // let query = query.slice(0, DIM);
         let query = &query;
         let k = 100;
 
