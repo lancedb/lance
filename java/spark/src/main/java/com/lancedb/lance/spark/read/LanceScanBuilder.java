@@ -15,6 +15,7 @@
 package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
 
 import org.apache.spark.sql.connector.read.Scan;
@@ -79,7 +80,12 @@ public class LanceScanBuilder
 
   @Override
   public boolean pushOffset(int offset) {
-    this.offset = Optional.of(offset);
-    return true;
+    // Only one data file can be pushed down the offset.
+    if (LanceDatasetAdapter.getFragmentIds(config).size() == 1) {
+      this.offset = Optional.of(offset);
+      return true;
+    } else {
+      return false;
+    }
   }
 }
