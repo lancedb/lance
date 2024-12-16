@@ -1744,8 +1744,12 @@ class LanceDataset(pa.dataset.Dataset):
             if c not in self.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.schema.field(c)
+            is_multivec = False
             if pa.types.is_fixed_size_list(field.type):
                 dimension = field.type.list_size
+            elif pa.types.is_list(field.type):
+                dimension = field.type.value_type.list_size
+                is_multivec = True
             elif (
                 isinstance(field.type, pa.FixedShapeTensorType)
                 and len(field.type.shape) == 1
@@ -1763,7 +1767,12 @@ class LanceDataset(pa.dataset.Dataset):
                     f" ({num_sub_vectors})"
                 )
 
-            if not pa.types.is_floating(field.type.value_type):
+            if (
+                not is_multivec and not pa.types.is_floating(field.type.value_type)
+            ) or (
+                is_multivec
+                and not pa.types.is_floating(field.type.value_type.value_type)
+            ):
                 raise TypeError(
                     f"Vector column {c} must have floating value type, "
                     f"got {field.type.value_type}"
@@ -3004,15 +3013,6 @@ class ScannerBuilder:
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type
-        if not pa.types.is_fixed_size_list(column_type):
-            raise TypeError(
-                f"Query column {column} must be a vector. Got {column_field.type}."
-            )
-        if len(q) != column_type.list_size:
-            raise ValueError(
-                f"Query vector size {len(q)} does not match index column size"
-                f" {column_type.list_size}"
-            )
 
         if k is not None and int(k) <= 0:
             raise ValueError(f"Nearest-K must be > 0 but got {k}")

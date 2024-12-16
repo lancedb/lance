@@ -48,6 +48,48 @@ def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
     return tbl
 
 
+def create_multivec_table(
+    nvec=1000, nvec_per_row=5, ndim=128, nans=0, nullify=False, dtype=np.float32
+):
+    mat = np.random.randn(nvec, nvec_per_row, ndim)
+    if nans > 0:
+        nans_mat = np.empty((nans, ndim))
+        nans_mat[:] = np.nan
+        mat = np.concatenate((mat, nans_mat), axis=0)
+    mat = mat.astype(dtype)
+    price = np.random.rand(nvec + nans) * 100
+
+    def gen_str(n):
+        return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+
+    meta = np.array([gen_str(100) for _ in range(nvec + nans)])
+
+    multi_vec_type = pa.list_(pa.list_(pa.float32(), ndim))
+    tbl = pa.Table.from_arrays(
+        [
+            pa.array((mat[i].tolist() for i in range(nvec)), type=multi_vec_type),
+        ],
+        schema=pa.schema(
+            [
+                pa.field("vector", pa.list_(pa.list_(pa.float32(), ndim))),
+            ]
+        ),
+    )
+    tbl = (
+        tbl.append_column("price", pa.array(price))
+        .append_column("meta", pa.array(meta))
+        .append_column("id", pa.array(range(nvec + nans)))
+    )
+    if nullify:
+        idx = tbl.schema.get_field_index("vector")
+        vecs = tbl[idx].to_pylist()
+        nullified = [vec if i % 2 == 0 else None for i, vec in enumerate(vecs)]
+        field = tbl.schema.field(idx)
+        vecs = pa.array(nullified, field.type)
+        tbl = tbl.set_column(idx, field, vecs)
+    return tbl
+
+
 @pytest.fixture()
 def dataset(tmp_path):
     tbl = create_table()
@@ -57,6 +99,21 @@ def dataset(tmp_path):
 @pytest.fixture()
 def indexed_dataset(tmp_path):
     tbl = create_table()
+    dataset = lance.write_dataset(tbl, tmp_path)
+    yield dataset.create_index(
+        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    )
+
+
+@pytest.fixture()
+def multivec_dataset(tmp_path):
+    tbl = create_multivec_table()
+    yield lance.write_dataset(tbl, tmp_path)
+
+
+@pytest.fixture()
+def indexed_multivec_dataset(tmp_path):
+    tbl = create_multivec_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     yield dataset.create_index(
         "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
@@ -423,6 +480,11 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
         num_sub_vectors=16,
     )
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
+
+
+def test_multivec_ann(indexed_multivec_dataset):
+    query = np.random.randn(5 * 128)
+    indexed_multivec_dataset.scanner(nearest={"column": "vector", "q": query, "k": 100})
 
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
