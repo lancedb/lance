@@ -810,7 +810,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
 /// TODO: Right now we just load the entire rep/def at initialization time and cache it.  This is a touch
 /// RAM aggressive and maybe we want something more lazy in the future.  On the other hand, it's simple
 /// and fast so...maybe not :)
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComplexAllNullScheduler {
     // Set from protobuf
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
