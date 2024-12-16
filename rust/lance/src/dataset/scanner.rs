@@ -1541,7 +1541,7 @@ impl Scanner {
         let schema = fts_node.schema();
         let group_expr = vec![(expressions::col(ROW_ID, &schema)?, ROW_ID.to_string())];
         let fts_node = Arc::new(AggregateExec::try_new(
-            AggregateMode::Final,
+            AggregateMode::Single,
             PhysicalGroupBy::new_single(group_expr),
             vec![AggregateExprBuilder::new(
                 functions_aggregate::min_max::max_udaf(),
@@ -2026,9 +2026,8 @@ impl Scanner {
             expressions::col(ROW_ID, schema.as_ref())?,
             ROW_ID.to_string(),
         )];
-        println!("schema before: {:?}", schema);
         let ann_node = Arc::new(AggregateExec::try_new(
-            AggregateMode::Final,
+            AggregateMode::Single,
             PhysicalGroupBy::new_single(group_expr),
             vec![AggregateExprBuilder::new(
                 functions_aggregate::min_max::min_udaf(),
@@ -2041,7 +2040,14 @@ impl Scanner {
             ann_node,
             schema,
         )?);
-        println!("schema after: {:?}", ann_node.schema());
+        let schema = ann_node.schema();
+        let ann_node = Arc::new(DFProjectionExec::try_new(
+            vec![
+                (expressions::col(DIST_COL, &schema)?, DIST_COL.to_string()),
+                (expressions::col(ROW_ID, &schema)?, ROW_ID.to_string()),
+            ],
+            ann_node,
+        )?);
         Ok(ann_node)
     }
 
