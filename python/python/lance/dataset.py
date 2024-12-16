@@ -327,7 +327,9 @@ class LanceDataset(pa.dataset.Dataset):
                 }
 
         batch_size: int, default None
-            The max size of batches returned.
+            The target size of batches returned.  In some cases batches can be up to
+            twice this size (but never larger than this).  In some cases batches can
+            be smaller than this size.
         io_buffer_size: int, default None
             The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
             for more information.
