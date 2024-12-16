@@ -930,8 +930,6 @@ mod tests {
             .as_fixed_size_list()
             .values()
             .as_primitive::<T>();
-        // we don't support query with multivector yet, so we just use the first vector in the multivector
-        // let query = query.slice(0, DIM);
         let query = &query;
         let k = 100;
 

@@ -99,7 +99,6 @@ impl QuantizerBuildParams for () {
 pub enum Quantizer {
     Flat(FlatQuantizer),
     FlatBin(FlatBinQuantizer),
-    // FlatMultiVec(FlatMultiVecQuantizer),
     Product(ProductQuantizer),
     Scalar(ScalarQuantizer),
 }
@@ -109,7 +108,6 @@ impl Quantizer {
         match self {
             Self::Flat(fq) => fq.code_dim(),
             Self::FlatBin(fq) => fq.code_dim(),
-            // Self::FlatMultiVec(fq) => fq.code_dim(),
             Self::Product(pq) => pq.code_dim(),
             Self::Scalar(sq) => sq.code_dim(),
         }
@@ -119,7 +117,6 @@ impl Quantizer {
         match self {
             Self::Flat(fq) => fq.column(),
             Self::FlatBin(fq) => fq.column(),
-            // Self::FlatMultiVec(fq) => fq.column(),
             Self::Product(pq) => pq.column(),
             Self::Scalar(sq) => sq.column(),
         }
@@ -129,7 +126,6 @@ impl Quantizer {
         match self {
             Self::Flat(_) => FlatQuantizer::metadata_key(),
             Self::FlatBin(_) => FlatBinQuantizer::metadata_key(),
-            // Self::FlatMultiVec(_) => FlatMultiVecQuantizer::metadata_key(),
             Self::Product(_) => ProductQuantizer::metadata_key(),
             Self::Scalar(_) => ScalarQuantizer::metadata_key(),
         }
@@ -139,7 +135,6 @@ impl Quantizer {
         match self {
             Self::Flat(_) => QuantizationType::Flat,
             Self::FlatBin(_) => QuantizationType::Flat,
-            // Self::FlatMultiVec(_) => QuantizationType::Flat,
             Self::Product(_) => QuantizationType::Product,
             Self::Scalar(_) => QuantizationType::Scalar,
         }
@@ -149,7 +144,6 @@ impl Quantizer {
         match self {
             Self::Flat(fq) => fq.metadata(args),
             Self::FlatBin(fq) => fq.metadata(args),
-            // Self::FlatMultiVec(fq) => fq.metadata(args),
             Self::Product(pq) => pq.metadata(args),
             Self::Scalar(sq) => sq.metadata(args),
         }
