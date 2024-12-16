@@ -15,6 +15,7 @@ use itertools::Itertools;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
@@ -1395,7 +1396,7 @@ impl Dataset {
         right_on: &str,
     ) -> Result<()> {
         // Sanity check.
-        if self.schema().field(left_on).is_none() {
+        if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(
                 format!("Column {} does not exist in the left side dataset", left_on),
                 location!(),
@@ -3114,6 +3115,111 @@ mod tests {
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
 
         dataset.merge(new_data, "key", "key2").await.unwrap();
+        dataset.validate().await.unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_merge_on_row_id(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+        #[values(false, true)] use_stable_row_id: bool,
+    ) {
+        // Tests a merge that spans multiple batches within files
+
+        // This test also tests "null filling" when merging (e.g. when keys do not match
+        // we need to insert nulls)
+
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .col("value", array::fill_utf8("value".to_string()))
+            .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1024,
+            max_rows_per_group: 150,
+            enable_move_stable_row_ids: use_stable_row_id,
+            ..Default::default()
+        };
+        Dataset::write(data, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 10);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(9));
+
+        let data = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        let row_ids = data.column_by_name(ROW_ID).unwrap();
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("rowid", DataType::UInt64, false),
+            ArrowField::new("new_value", DataType::UInt64, false),
+        ]));
+        let new_batch =
+            RecordBatch::try_new(new_schema.clone(), vec![row_ids.clone(), row_ids.clone()])
+                .unwrap();
+        let new_data = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
+        dataset.merge(new_data, ROW_ID, "rowid").await.unwrap();
+        dataset.validate().await.unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_merge_on_row_addr(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
+        #[values(false, true)] use_stable_row_id: bool,
+    ) {
+        // Tests a merge that spans multiple batches within files
+
+        // This test also tests "null filling" when merging (e.g. when keys do not match
+        // we need to insert nulls)
+
+        let data = lance_datagen::gen()
+            .col("key", array::step::<Int32Type>())
+            .col("value", array::fill_utf8("value".to_string()))
+            .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let write_params = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1024,
+            max_rows_per_group: 150,
+            enable_move_stable_row_ids: use_stable_row_id,
+            ..Default::default()
+        };
+        Dataset::write(data, test_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 10);
+        assert_eq!(dataset.manifest.max_fragment_id(), Some(9));
+
+        let data = dataset
+            .scan()
+            .with_row_address()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = data.column_by_name(ROW_ADDR).unwrap();
+        let new_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("rowaddr", DataType::UInt64, false),
+            ArrowField::new("new_value", DataType::UInt64, false),
+        ]));
+        let new_batch =
+            RecordBatch::try_new(new_schema.clone(), vec![row_ids.clone(), row_ids.clone()])
+                .unwrap();
+        let new_data = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
+        dataset.merge(new_data, ROW_ADDR, "rowaddr").await.unwrap();
         dataset.validate().await.unwrap();
     }
 
