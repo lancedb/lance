@@ -1236,11 +1236,13 @@ struct ChunkInstructions {
 // skip of 17 and take of 10.  This would mean we decode the chunk, skip the preamble and 27 rows, and
 // then take 10 rows.
 //
-// One very confusing bit is that `rows_to_take` includes the trailer.  So if we have:
-// "no preamble, skip 5, take 10, take trailer" and we are draining 20 rows then the
-// first drain instructions will have no preamble, skip 0, take 11 and the second chunk
-// instructions will have take preamble, skip 0, take 9 (assuming the second chunk has at
-// least 9 rows)
+// One very confusing bit is that `rows_to_take` includes the trailer.  So if we have two chunks:
+//  -no preamble, skip 5, take 10, take trailer
+//  -take preamble, skip 0, take 50, no trailer
+//
+// and we are draining 20 rows then the drain instructions for the first batch will be:
+//  - no preamble, skip 0 (from chunk 0), take 11 (from chunk 0)
+//  - take preamble (from chunk 1), skip 0 (from chunk 1), take 9 (from chunk 1)
 #[derive(Debug, PartialEq, Eq)]
 struct ChunkDrainInstructions {
     chunk_instructions: ChunkInstructions,

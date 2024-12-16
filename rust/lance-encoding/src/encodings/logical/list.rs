@@ -1360,7 +1360,8 @@ impl StructuralFieldScheduler for StructuralListScheduler {
 
 /// Scheduling job for list data
 ///
-/// It doesn't really do anything right now because list
+/// Scheduling is handled by the primitive encoder and nothing special
+/// happens here.
 #[derive(Debug)]
 struct StructuralListSchedulingJob<'a> {
     child: Box<dyn StructuralSchedulingJob + 'a>,
