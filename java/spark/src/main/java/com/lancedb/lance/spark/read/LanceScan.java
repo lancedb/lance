@@ -35,19 +35,19 @@ public class LanceScan implements Batch, Scan, Serializable {
   private static final long serialVersionUID = 947284762748623947L;
 
   private final StructType schema;
-  private final LanceConfig options;
+  private final LanceConfig config;
   private final Optional<String> whereConditions;
   private final Optional<Integer> limit;
   private final Optional<Integer> offset;
 
   public LanceScan(
       StructType schema,
-      LanceConfig options,
+      LanceConfig config,
       Optional<String> whereConditions,
       Optional<Integer> limit,
       Optional<Integer> offset) {
     this.schema = schema;
-    this.options = options;
+    this.config = config;
     this.whereConditions = whereConditions;
     this.limit = limit;
     this.offset = offset;
@@ -60,12 +60,12 @@ public class LanceScan implements Batch, Scan, Serializable {
 
   @Override
   public InputPartition[] planInputPartitions() {
-    List<LanceSplit> splits = LanceSplit.generateLanceSplits(options);
+    List<LanceSplit> splits = LanceSplit.generateLanceSplits(config);
     return IntStream.range(0, splits.size())
         .mapToObj(
             i ->
                 new LanceInputPartition(
-                    schema, i, splits.get(i), options, whereConditions, limit, offset))
+                    schema, i, splits.get(i), config, whereConditions, limit, offset))
         .toArray(InputPartition[]::new);
   }
 
