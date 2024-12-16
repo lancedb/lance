@@ -516,6 +516,11 @@ impl Dataset {
         self.clone()
     }
 
+    #[getter(manifest_max_field_id)]
+    fn manifest_max_field_id(self_: PyRef<'_, Self>) -> PyResult<i32> {
+        Ok(self_.ds.manifest().max_field_id())
+    }
+
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());

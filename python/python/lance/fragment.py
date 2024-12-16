@@ -27,6 +27,7 @@ from .dependencies import pandas as pd
 from .lance import _Fragment, _write_fragments
 from .lance import _FragmentMetadata as _FragmentMetadata
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
+from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
@@ -291,6 +292,7 @@ class LanceFragment(pa.dataset.Fragment):
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         with_row_id: bool = False,
+        with_row_address: bool = False,
         batch_readahead: int = 16,
     ) -> "LanceScanner":
         """See Dataset::scanner for details"""
@@ -309,6 +311,7 @@ class LanceFragment(pa.dataset.Fragment):
             limit=limit,
             offset=offset,
             with_row_id=with_row_id,
+            with_row_address=with_row_address,
             batch_readahead=batch_readahead,
             **columns_arg,
         )
@@ -359,6 +362,80 @@ class LanceFragment(pa.dataset.Fragment):
             offset=offset,
             with_row_id=with_row_id,
         ).to_table()
+
+    def merge(
+        self,
+        data_obj: ReaderLike,
+        left_on: str,
+        right_on: Optional[str] = None,
+        schema=None,
+    ) -> Tuple[FragmentMetadata, LanceSchema]:
+        """
+        Merge another dataset into this fragment.
+
+        Performs a left join, where the fragment is the left side and data_obj
+        is the right side. Rows existing in the dataset but not on the left will
+        be filled with null values, unless Lance doesn't support null values for
+        some types, in which case an error will be raised.
+
+        Parameters
+        ----------
+        data_obj: Reader-like
+            The data to be merged. Acceptable types are:
+            - Pandas DataFrame, Pyarrow Table, Dataset, Scanner,
+            Iterator[RecordBatch], or RecordBatchReader
+        left_on: str
+            The name of the column in the dataset to join on.
+        right_on: str or None
+            The name of the column in data_obj to join on. If None, defaults to
+            left_on.
+
+        Examples
+        --------
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> df = pa.table({'x': [1, 2, 3], 'y': ['a', 'b', 'c']})
+        >>> dataset = lance.write_dataset(df, "dataset")
+        >>> dataset.to_table().to_pandas()
+           x  y
+        0  1  a
+        1  2  b
+        2  3  c
+        >>> fragments = dataset.get_fragments()
+        >>> new_df = pa.table({'x': [1, 2, 3], 'z': ['d', 'e', 'f']})
+        >>> merged = []
+        >>> schema = None
+        >>> for f in fragments:
+        >>>    f, schema = f.merge(new_df, 'x')
+        >>>    merged.append(f)
+        >>> merge = lance.LanceOperation.Merge(merged, schema)
+        >>> dataset = lance.LanceDataset.commit(base_dir, merge, read_version=1)
+        >>> dataset.to_table().to_pandas()
+           x  y  z
+        0  1  a  d
+        1  2  b  e
+        2  3  c  f
+
+        See Also
+        --------
+        LanceDataset.merge_columns :
+            Add columns to this Fragment.
+
+        Returns
+        -------
+        Tuple[FragmentMetadata, LanceSchema]
+            A new fragment with the merged column(s) and the final schema.
+        """
+        if right_on is None:
+            right_on = left_on
+
+        reader = _coerce_reader(data_obj, schema)
+        manifest_max_field_id = self._ds.manifest_max_field_id
+        metadata, schema = self._fragment.merge(
+            reader, left_on, right_on, manifest_max_field_id
+        )
+        return FragmentMetadata.from_metadata(metadata), schema
 
     def merge_columns(
         self,

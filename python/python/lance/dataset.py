@@ -487,6 +487,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.data_storage_version
 
+    @property
+    def manifest_max_field_id(self) -> int:
+        """
+        The max_field_id in manifest
+        """
+        return self._ds.manifest_max_field_id
+
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
