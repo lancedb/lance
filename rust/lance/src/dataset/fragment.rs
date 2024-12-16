@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
@@ -1329,12 +1331,15 @@ impl FileFragment {
         stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-        manifest_max_field_id: i32
+        manifest_max_field_id: i32,
     ) -> Result<(Fragment, Schema)> {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
             return Err(Error::invalid_input(
-                format!("Column {} does not exist in the left side fragment", left_on),
+                format!(
+                    "Column {} does not exist in the left side fragment",
+                    left_on
+                ),
                 location!(),
             ));
         };
@@ -1372,7 +1377,11 @@ impl FileFragment {
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
         new_schema.set_field_id(Some(manifest_max_field_id));
 
-        let new_fragment = self.clone().merge(left_on, &joiner).await.map(|f| f.metadata)?;
+        let new_fragment = self
+            .clone()
+            .merge(left_on, &joiner)
+            .await
+            .map(|f| f.metadata)?;
 
         Ok((new_fragment, new_schema))
     }
