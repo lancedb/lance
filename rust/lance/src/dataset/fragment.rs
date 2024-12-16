@@ -1287,11 +1287,14 @@ impl FileFragment {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
+        let mut with_row_id = false;
         if let Some(columns) = columns {
             let mut projection = Vec::new();
             for column in columns {
                 if column.as_ref() == ROW_ADDR {
                     with_row_addr = true;
+                } else if column.as_ref() == ROW_ID {
+                    with_row_id = true;
                 } else {
                     projection.push(column.as_ref());
                 }
@@ -1307,11 +1310,13 @@ impl FileFragment {
         }
 
         // If there is no projection, we at least need to read the row addresses
-        with_row_addr |= schema.fields.is_empty();
+        with_row_addr |= !with_row_id && schema.fields.is_empty();
 
         let reader = self.open(
             &schema,
-            FragReadConfig::default().with_row_address(with_row_addr),
+            FragReadConfig::default()
+                .with_row_address(with_row_addr)
+                .with_row_id(with_row_id),
             None,
         );
         let deletion_vector = read_deletion_file(
