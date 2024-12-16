@@ -828,7 +828,8 @@ impl ComplexAllNullScheduler {
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
-            ..Default::default()
+            rep: None,
+            def: None,
         }
     }
 }
