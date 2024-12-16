@@ -25,8 +25,6 @@ import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructType;
 
-import java.util.OptionalInt;
-
 public class LanceScanBuilder
     implements SupportsPushDownRequiredColumns,
         SupportsPushDownFilters,
@@ -36,8 +34,8 @@ public class LanceScanBuilder
   private StructType schema;
 
   private Filter[] pushedFilters = new Filter[0];
-  private OptionalInt limit = OptionalInt.empty();
-  private OptionalInt offset = OptionalInt.empty();
+  private Optional<Integer> limit = Optional.empty();
+  private Optional<Integer> offset = Optional.empty();
 
   public LanceScanBuilder(StructType schema, LanceConfig config) {
     this.schema = schema;
@@ -75,13 +73,13 @@ public class LanceScanBuilder
 
   @Override
   public boolean pushLimit(int limit) {
-    this.limit = OptionalInt.of(limit);
+    this.limit = Optional.of(limit);
     return true;
   }
 
   @Override
   public boolean pushOffset(int offset) {
-    this.offset = OptionalInt.of(offset);
+    this.offset = Optional.of(offset);
     return true;
   }
 }
