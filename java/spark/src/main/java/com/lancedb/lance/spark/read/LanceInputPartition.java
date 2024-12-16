@@ -20,6 +20,8 @@ import com.lancedb.lance.spark.utils.Optional;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.types.StructType;
 
+import java.util.OptionalInt;
+
 public class LanceInputPartition implements InputPartition {
   private static final long serialVersionUID = 4723894723984723984L;
 
@@ -28,6 +30,8 @@ public class LanceInputPartition implements InputPartition {
   private final LanceSplit lanceSplit;
   private final LanceConfig config;
   private final Optional<String> whereCondition;
+  private final OptionalInt limit;
+  private final OptionalInt offset;
 
   public LanceInputPartition(
       StructType schema,
@@ -40,6 +44,25 @@ public class LanceInputPartition implements InputPartition {
     this.lanceSplit = lanceSplit;
     this.config = config;
     this.whereCondition = whereCondition;
+    this.limit = OptionalInt.empty();
+    this.offset = OptionalInt.empty();
+  }
+
+  public LanceInputPartition(
+      StructType schema,
+      int partitionId,
+      LanceSplit lanceSplit,
+      LanceConfig config,
+      Optional<String> whereCondition,
+      OptionalInt limit,
+      OptionalInt offset) {
+    this.schema = schema;
+    this.partitionId = partitionId;
+    this.lanceSplit = lanceSplit;
+    this.config = config;
+    this.whereCondition = whereCondition;
+    this.limit = limit;
+    this.offset = offset;
   }
 
   public StructType getSchema() {
@@ -60,5 +83,13 @@ public class LanceInputPartition implements InputPartition {
 
   public Optional<String> getWhereCondition() {
     return whereCondition;
+  }
+
+  public OptionalInt getLimit() {
+    return limit;
+  }
+
+  public OptionalInt getOffset() {
+    return offset;
   }
 }

@@ -19,25 +19,35 @@ import com.lancedb.lance.spark.utils.Optional;
 
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
+import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
+import org.apache.spark.sql.connector.read.SupportsPushDownOffset;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructType;
 
-public class LanceScanBuilder implements SupportsPushDownRequiredColumns, SupportsPushDownFilters {
-  private final LanceConfig options;
+import java.util.OptionalInt;
+
+public class LanceScanBuilder
+    implements SupportsPushDownRequiredColumns,
+        SupportsPushDownFilters,
+        SupportsPushDownLimit,
+        SupportsPushDownOffset {
+  private final LanceConfig config;
   private StructType schema;
 
   private Filter[] pushedFilters = new Filter[0];
+  private OptionalInt limit = OptionalInt.empty();
+  private OptionalInt offset = OptionalInt.empty();
 
-  public LanceScanBuilder(StructType schema, LanceConfig options) {
+  public LanceScanBuilder(StructType schema, LanceConfig config) {
     this.schema = schema;
-    this.options = options;
+    this.config = config;
   }
 
   @Override
   public Scan build() {
     Optional<String> whereCondition = FilterPushDown.compileFiltersToSqlWhereClause(pushedFilters);
-    return new LanceScan(schema, options, whereCondition);
+    return new LanceScan(schema, config, whereCondition, limit, offset);
   }
 
   @Override
@@ -50,7 +60,7 @@ public class LanceScanBuilder implements SupportsPushDownRequiredColumns, Suppor
 
   @Override
   public Filter[] pushFilters(Filter[] filters) {
-    if (!options.isPushDownFilters()) {
+    if (!config.isPushDownFilters()) {
       return filters;
     }
     Filter[][] processFilters = FilterPushDown.processFilters(filters);
@@ -61,5 +71,17 @@ public class LanceScanBuilder implements SupportsPushDownRequiredColumns, Suppor
   @Override
   public Filter[] pushedFilters() {
     return pushedFilters;
+  }
+
+  @Override
+  public boolean pushLimit(int limit) {
+    this.limit = OptionalInt.of(limit);
+    return true;
+  }
+
+  @Override
+  public boolean pushOffset(int offset) {
+    this.offset = OptionalInt.of(offset);
+    return true;
   }
 }
