@@ -22,7 +22,8 @@ use std::{
 };
 
 use arrow_array::{
-    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, StructArray, UInt64Array,
+    cast::AsArray, types::UInt64Type, BooleanArray, RecordBatch, RecordBatchIterator, StructArray,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
@@ -42,7 +43,10 @@ use datafusion::{
 };
 
 use lance_arrow::{interleave_batches, RecordBatchExt, SchemaExt};
-use lance_datafusion::{chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context};
+use lance_datafusion::{
+    chunker::chunk_stream, dataframe::DataFrameExt, exec::get_session_context,
+    utils::reader_to_stream,
+};
 
 use datafusion_physical_expr::expressions::Column;
 use futures::{
@@ -52,7 +56,10 @@ use futures::{
 use lance_core::{
     datatypes::SchemaCompareOptions,
     error::{box_error, InvalidInputSnafu},
-    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
+    utils::{
+        futures::Capacity,
+        tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME},
+    },
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -556,8 +563,12 @@ impl MergeInsertJob {
                     .collect::<Vec<_>>();
                 let projected = existing.select_columns(&columns)?;
                 // We aren't supporting inserts or deletes right now, so we can use inner join
-                let joined =
-                    new_data.join(projected, JoinType::Inner, &join_cols, &join_cols, None)?;
+                let join_type = if self.params.insert_not_matched {
+                    JoinType::Left
+                } else {
+                    JoinType::Inner
+                };
+                let joined = new_data.join(projected, join_type, &join_cols, &join_cols, None)?;
                 Ok(joined.execute_stream().await?)
             }
         }
@@ -588,7 +599,7 @@ impl MergeInsertJob {
     async fn update_fragments(
         dataset: Arc<Dataset>,
         source: SendableRecordBatchStream,
-    ) -> Result<Vec<Fragment>> {
+    ) -> Result<(Vec<Fragment>, Vec<Fragment>)> {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(LanceExecutionOptions {
@@ -604,30 +615,13 @@ impl MergeInsertJob {
 
         // Can update the fragments in parallel.
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
+        let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let task_limit = get_num_compute_intensive_cpus();
         let mut reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
+        let handle = CPU_RUNTIME.handle();
         while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {
-            let Some(ScalarValue::UInt64(Some(frag_id))) = frag_id.first() else {
-                return Err(Error::Internal {
-                    message: format!("Got non-fragment id from merge result: {:?}", frag_id),
-                    location: location!(),
-                });
-            };
-            let frag_id = *frag_id;
-            let fragment =
-                dataset
-                    .get_fragment(frag_id as usize)
-                    .ok_or_else(|| Error::Internal {
-                        message: format!(
-                            "Got non-existent fragment id from merge result: {}",
-                            frag_id
-                        ),
-                        location: location!(),
-                    })?;
-            let metadata = fragment.metadata.clone();
-
             async fn handle_fragment(
                 dataset: Arc<Dataset>,
                 fragment: FileFragment,
@@ -787,6 +781,44 @@ impl MergeInsertJob {
                 Ok(reservation_size)
             }
 
+            async fn handle_new_fragments(
+                dataset: Arc<Dataset>,
+                batches: Vec<RecordBatch>,
+                new_fragments: Arc<Mutex<Vec<Fragment>>>,
+                reservation_size: usize,
+            ) -> Result<usize> {
+                // Batches still have _rowaddr (used elsewhere to merge with existing data)
+                // We need to remove it before writing to Lance files.
+                let num_fields = batches[0].schema().fields().len();
+                let mut projection = Vec::with_capacity(num_fields - 1);
+                for (i, field) in batches[0].schema().fields().iter().enumerate() {
+                    if field.name() != ROW_ADDR {
+                        projection.push(i);
+                    }
+                }
+                let write_schema = Arc::new(batches[0].schema().project(&projection).unwrap());
+
+                let batches = batches
+                    .into_iter()
+                    .map(move |batch| batch.project(&projection));
+                let reader = RecordBatchIterator::new(batches, write_schema.clone());
+                let stream = reader_to_stream(Box::new(reader));
+
+                let write_schema = dataset.schema().project_by_schema(write_schema.as_ref())?;
+
+                let fragments = write_fragments_internal(
+                    Some(dataset.as_ref()),
+                    dataset.object_store.clone(),
+                    &dataset.base,
+                    write_schema,
+                    stream,
+                    Default::default(), // TODO: support write params.
+                )
+                .await?;
+
+                new_fragments.lock().unwrap().extend(fragments.default.0);
+                Ok(reservation_size)
+            }
             // We shouldn't need much more memory beyond what is already in the batches.
             let mut memory_size = batches
                 .iter()
@@ -813,15 +845,47 @@ impl MergeInsertJob {
                 }
             }
 
-            let fut = handle_fragment(
-                dataset.clone(),
-                fragment,
-                metadata,
-                batches,
-                updated_fragments.clone(),
-                memory_size,
-            );
-            tasks.spawn(fut);
+            match frag_id.first() {
+                Some(ScalarValue::UInt64(Some(frag_id))) => {
+                    let frag_id = *frag_id;
+                    let fragment =
+                        dataset
+                            .get_fragment(frag_id as usize)
+                            .ok_or_else(|| Error::Internal {
+                                message: format!(
+                                    "Got non-existent fragment id from merge result: {}",
+                                    frag_id
+                                ),
+                                location: location!(),
+                            })?;
+                    let metadata = fragment.metadata.clone();
+
+                    let fut = handle_fragment(
+                        dataset.clone(),
+                        fragment,
+                        metadata,
+                        batches,
+                        updated_fragments.clone(),
+                        memory_size,
+                    );
+                    tasks.spawn_on(fut, handle);
+                }
+                Some(ScalarValue::Null | ScalarValue::UInt64(None)) => {
+                    let fut = handle_new_fragments(
+                        dataset.clone(),
+                        batches,
+                        new_fragments.clone(),
+                        memory_size,
+                    );
+                    tasks.spawn_on(fut, handle);
+                }
+                _ => {
+                    return Err(Error::Internal {
+                        message: format!("Got non-fragment id from merge result: {:?}", frag_id),
+                        location: location!(),
+                    });
+                }
+            };
         }
 
         while let Some(res) = tasks.join_next().await {
@@ -847,7 +911,12 @@ impl MergeInsertJob {
             }
         }
 
-        Ok(updated_fragments)
+        let new_fragments = Arc::try_unwrap(new_fragments)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+
+        Ok((updated_fragments, new_fragments))
     }
 
     /// Executes the merge insert job
@@ -884,10 +953,10 @@ impl MergeInsertJob {
 
             // We will have a different commit path here too, as we are modifying
             // fragments rather than writing new ones
-            let updated_fragments =
+            let (updated_fragments, new_fragments) =
                 Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
-            Self::commit(self.dataset, Vec::new(), updated_fragments, Vec::new()).await?
+            Self::commit(self.dataset, Vec::new(), updated_fragments, new_fragments).await?
         } else {
             let written = write_fragments_internal(
                 Some(&self.dataset),
@@ -1242,10 +1311,14 @@ impl Merger {
         }
         if self.params.insert_not_matched {
             let not_matched = arrow::compute::filter_record_batch(&batch, &left_only)?;
-            let not_matched = not_matched.project(&left_cols)?;
+            let left_cols_with_id = left_cols
+                .into_iter()
+                .chain(row_addr_col)
+                .collect::<Vec<_>>();
+            let not_matched = not_matched.project(&left_cols_with_id)?;
             // See comment above explaining this schema replacement
             let not_matched = RecordBatch::try_new(
-                self.schema.clone(),
+                self.output_schema.clone(),
                 Vec::from_iter(not_matched.columns().iter().cloned()),
             )?;
 
@@ -1897,7 +1970,7 @@ mod tests {
                     .map(|f| f.id)
                     .collect::<Vec<_>>()
             );
-            // Only the second fragment should be different.
+            // Only the second and third fragment should be different.
             assert_eq!(fragments_before[0], fragments_after[0]);
             assert_ne!(fragments_before[1], fragments_after[1]);
             assert_ne!(fragments_before[2], fragments_after[2]);
@@ -1944,7 +2017,7 @@ mod tests {
             assert_eq!(values.value(512), 512);
             assert_eq!(values.value(715), 1024 + new_data.num_rows() as u32 - 3);
             if insert {
-                assert_eq!(values.value(1024), 1024 + new_data.num_rows() as u32);
+                assert_eq!(values.value(1024), 1024 + new_data.num_rows() as u32 - 2);
             }
         }
     }
