@@ -14,6 +14,7 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.ipc.ColumnOrdering;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 
@@ -22,6 +23,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -393,6 +395,79 @@ public class ScannerTest {
               rowCount += reader.getVectorSchemaRoot().getRowCount();
             }
             assertEquals(totalRows, rowCount);
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testDatasetScannerSortBy() throws Exception {
+    String datasetPath = tempDir.resolve("testDatasetScannerSortBy").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.writeSortByDataset(1)) {
+        ColumnOrdering.Builder nameBuilder = new ColumnOrdering.Builder();
+        nameBuilder.setColumnName("name");
+        nameBuilder.setAscending(true);
+        nameBuilder.setNullFirst(false);
+
+        ColumnOrdering.Builder idBuilder = new ColumnOrdering.Builder();
+        idBuilder.setColumnName("id");
+        idBuilder.setAscending(false);
+        idBuilder.setNullFirst(true);
+
+        List<ColumnOrdering> columnOrderings =
+            Arrays.asList(nameBuilder.build(), idBuilder.build());
+        ScanOptions.Builder scanOptionBuilder = new ScanOptions.Builder();
+        scanOptionBuilder
+            .columns(Arrays.asList("name", "id"))
+            .limit(10)
+            .setColumnOrderings(columnOrderings);
+        ScanOptions scanOptions = scanOptionBuilder.build();
+        try (Scanner scanner = dataset.newScan(scanOptions)) {
+          try (ArrowReader reader = scanner.scanBatches()) {
+            while (reader.loadNextBatch()) {
+              List<FieldVector> fieldVectors = reader.getVectorSchemaRoot().getFieldVectors();
+              VarCharVector nameVector = (VarCharVector) fieldVectors.get(0);
+              /* dataset context
+               * i: |  id   | name | :i
+               * 1: |  1    |  P0  | :0
+               * 2: | null  |  P1  | :1
+               * 3: |  2    |  P2  | :2
+               * 5: | null  |  P3  | :3
+               * 4: |  2    |  P3  | :4
+               * 7: |  4    |  P4  | :5
+               * 9: |  5    |  P5  | :6
+               * 8: |  4    |  P5  | :7
+               * 6: |  3    | null | :8
+               * 0: |  0    | null | :9
+               */
+              assertEquals("P0", new String(nameVector.get(0)));
+              assertEquals("P1", new String(nameVector.get(1)));
+              assertEquals("P2", new String(nameVector.get(2)));
+              assertEquals("P3", new String(nameVector.get(3)));
+              assertEquals("P3", new String(nameVector.get(4)));
+              assertEquals("P4", new String(nameVector.get(5)));
+              assertEquals("P5", new String(nameVector.get(6)));
+              assertEquals("P5", new String(nameVector.get(7)));
+              assertTrue(nameVector.isNull(8));
+              assertTrue(nameVector.isNull(9));
+
+              IntVector idVector = (IntVector) fieldVectors.get(1);
+              assertEquals(1, idVector.get(0));
+              assertTrue(idVector.isNull(1));
+              assertEquals(2, idVector.get(2));
+              assertTrue(idVector.isNull(3));
+              assertEquals(2, idVector.get(4));
+              assertEquals(4, idVector.get(5));
+              assertEquals(5, idVector.get(6));
+              assertEquals(4, idVector.get(7));
+              assertEquals(3, idVector.get(8));
+              assertEquals(0, idVector.get(9));
+            }
           }
         }
       }

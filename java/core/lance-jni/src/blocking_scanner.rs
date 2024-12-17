@@ -22,7 +22,7 @@ use arrow_schema::SchemaRef;
 use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
-use lance::dataset::scanner::{DatasetRecordBatchStream, Scanner};
+use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance_io::ffi::to_ffi_arrow_array_stream;
 use lance_linalg::distance::DistanceType;
 
@@ -80,6 +80,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     query_obj: JObject,            // Optional<Query>
     with_row_id: jboolean,         // boolean
     batch_readahead: jint,         // int
+    column_orderings: JObject,     // Optional<List<ColumnOrdering>>
 ) -> JObject<'local> {
     ok_or_throw!(
         env,
@@ -95,7 +96,8 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
             offset_obj,
             query_obj,
             with_row_id,
-            batch_readahead
+            batch_readahead,
+            column_orderings
         )
     )
 }
@@ -114,6 +116,7 @@ fn inner_create_scanner<'local>(
     query_obj: JObject,
     with_row_id: jboolean,
     batch_readahead: jint,
+    column_orderings: JObject
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
@@ -205,6 +208,31 @@ fn inner_create_scanner<'local>(
         scanner.use_index(use_index);
     }
     scanner.batch_readahead(batch_readahead as usize);
+
+    let column_orders_is_present = env.call_method(&column_orderings, "isPresent", "()Z", &[])?.z()?;
+    if column_orders_is_present {
+        let java_obj = env
+            .call_method(&column_orderings, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+
+        let list = env.get_list(&java_obj)?;
+        let mut iter = list.iter(env)?;
+        let mut results = Vec::with_capacity(list.size(env)? as usize);
+        while let Some(elem) = iter.next(env)? {
+            // Set column and key for nearest search
+            let column_name = env.get_string_from_method(&elem, "getColumnName")?;
+            let nulls_first = env.get_boolean_from_method(&elem, "isNullFirst")?;
+            let ascending = env.get_boolean_from_method(&elem, "isAscending")?;
+            let col_order = ColumnOrdering {
+                ascending,
+                nulls_first,
+                column_name
+            };
+            results.push(col_order)
+        }
+        scanner.order_by(Some(results))?;
+    }
+
     let scanner = BlockingScanner::create(scanner);
     scanner.into_java(env)
 }
