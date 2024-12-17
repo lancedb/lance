@@ -31,7 +31,9 @@ use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{ColumnAlteration, Dataset, ProjectionRequest, ReadParams, WriteParams};
+use lance::dataset::{
+    ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, WriteParams,
+};
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
@@ -932,5 +934,90 @@ fn inner_alter_columns(
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
     RT.block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySqlExpressions(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    sql_expressions: JObject, // SqlExpressions
+    read_columns: JObject,    // Optional<List<String>>
+    batch_size: JObject,      // Optional<Long>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_add_columns_by_sql_expressions(
+            &mut env,
+            java_dataset,
+            sql_expressions,
+            read_columns,
+            batch_size
+        )
+    )
+}
+
+fn inner_add_columns_by_sql_expressions(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    sql_expressions: JObject, // SqlExpressions
+    read_columns: JObject,    // Optional<List<String>>
+    batch_size: JObject,      // Optional<Long>
+) -> Result<()> {
+    let sql_expressions_obj = env
+        .get_field(sql_expressions, "sqlExpressions", "Ljava/util/List;")?
+        .l()?;
+
+    let sql_expressions_obj_list = env.get_list(&sql_expressions_obj)?;
+    let mut expressions: Vec<(String, String)> = Vec::new();
+
+    for i in 0..sql_expressions_obj_list.size(env)? {
+        if let Ok(Some(item)) = sql_expressions_obj_list.get(env, i) {
+            let name = env
+                .call_method(&item, "getName", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let value = env
+                .call_method(&item, "getExpression", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let key_str: String = env.get_string(&JString::from(name))?.into();
+            let value_str: String = env.get_string(&JString::from(value))?.into();
+            expressions.push((key_str, value_str));
+        }
+    }
+
+    let rust_transform = NewColumnTransform::SqlExpressions(expressions);
+
+    let read_cols = if env
+        .call_method(&read_columns, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let columns: Vec<String> = env.get_strings(&read_columns)?;
+        Some(columns.iter().map(|s| s.to_string()).collect())
+    } else {
+        None
+    };
+
+    let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
+        let batch_size_value = env.get_long_opt(&batch_size)?;
+        match batch_size_value {
+            Some(value) => Some(
+                value
+                    .try_into()
+                    .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(
+        dataset_guard
+            .inner
+            .add_columns(rust_transform, read_cols, batch_size),
+    )?;
     Ok(())
 }

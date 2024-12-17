@@ -17,6 +17,7 @@ import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -266,6 +267,17 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  public void addColumns(
+      SqlExpressions sqlExpressions, Optional<List<String>> readColumns, Optional<Long> batchSize) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAddColumnsBySqlExpressions(sqlExpressions, readColumns, batchSize);
+    }
+  }
+
+  private native void nativeAddColumnsBySqlExpressions(
+      SqlExpressions sqlExpressions, Optional<List<String>> readColumns, Optional<Long> batchSize);
 
   /**
    * Drop columns from the dataset.
