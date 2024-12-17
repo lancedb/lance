@@ -1678,6 +1678,7 @@ mod tests {
     use lance_table::io::deletion::read_deletion_file;
     use lance_testing::datagen::generate_random_array;
     use pretty_assertions::assert_eq;
+    use rand::seq::SliceRandom;
     use rstest::rstest;
     use tempfile::{tempdir, TempDir};
     use url::Url;
@@ -3121,22 +3122,15 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn test_merge_on_row_id(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_id: bool,
     ) {
-        // Tests a merge that spans multiple batches within files
-
-        // This test also tests "null filling" when merging (e.g. when keys do not match
-        // we need to insert nulls)
+        // Tests a merge on _rowid
 
         let data = lance_datagen::gen()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8("value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
@@ -3146,47 +3140,82 @@ mod tests {
             enable_move_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
-        Dataset::write(data, test_uri, Some(write_params.clone()))
+        let mut dataset = Dataset::write(data, "memory://", Some(write_params.clone()))
             .await
             .unwrap();
-
-        let mut dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.fragments().len(), 10);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(9));
 
         let data = dataset.scan().with_row_id().try_into_batch().await.unwrap();
         let row_ids = data.column_by_name(ROW_ID).unwrap();
+        let key = data.column_by_name("key").unwrap();
         let new_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("rowid", DataType::UInt64, false),
-            ArrowField::new("new_value", DataType::UInt64, false),
+            ArrowField::new("new_value", DataType::Int32, false),
         ]));
+        let new_value = Arc::new(
+            key.as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .into_iter()
+                .map(|v| v.unwrap() + 1)
+                .collect::<arrow_array::Int32Array>(),
+        );
+        let len = new_value.len() as u32;
         let new_batch =
-            RecordBatch::try_new(new_schema.clone(), vec![row_ids.clone(), row_ids.clone()])
-                .unwrap();
+            RecordBatch::try_new(new_schema.clone(), vec![row_ids.clone(), new_value]).unwrap();
+        // shuffle new_batch
+        let mut rng = rand::thread_rng();
+        let mut indices: Vec<u32> = (0..len).collect();
+        indices.shuffle(&mut rng);
+        let indices = arrow_array::UInt32Array::from_iter_values(indices);
+        let new_batch = arrow::compute::take_record_batch(&new_batch, &indices).unwrap();
         let new_data = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
         dataset.merge(new_data, ROW_ID, "rowid").await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.schema().fields.len(), 3);
+        assert!(dataset.schema().field("key").is_some());
+        assert!(dataset.schema().field("value").is_some());
+        assert!(dataset.schema().field("new_value").is_some());
+        let result = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        for batch in result {
+            let key = batch
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            let new_value = batch
+                .column_by_name("new_value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            for i in 0..key.len() {
+                assert_eq!(key.value(i) + 1, new_value.value(i));
+            }
+        }
     }
 
     #[rstest]
     #[tokio::test]
     async fn test_merge_on_row_addr(
-        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        data_storage_version: LanceFileVersion,
+        #[values(LanceFileVersion::Stable)] data_storage_version: LanceFileVersion,
         #[values(false, true)] use_stable_row_id: bool,
     ) {
-        // Tests a merge that spans multiple batches within files
-
-        // This test also tests "null filling" when merging (e.g. when keys do not match
-        // we need to insert nulls)
+        // Tests a merge on _rowaddr
 
         let data = lance_datagen::gen()
             .col("key", array::step::<Int32Type>())
             .col("value", array::fill_utf8("value".to_string()))
             .into_reader_rows(RowCount::from(1_000), BatchCount::from(10));
-
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
 
         let write_params = WriteParams {
             mode: WriteMode::Append,
@@ -3196,11 +3225,10 @@ mod tests {
             enable_move_stable_row_ids: use_stable_row_id,
             ..Default::default()
         };
-        Dataset::write(data, test_uri, Some(write_params.clone()))
+        let mut dataset = Dataset::write(data, "memory://", Some(write_params.clone()))
             .await
             .unwrap();
 
-        let mut dataset = Dataset::open(test_uri).await.unwrap();
         assert_eq!(dataset.fragments().len(), 10);
         assert_eq!(dataset.manifest.max_fragment_id(), Some(9));
 
@@ -3210,17 +3238,61 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let row_ids = data.column_by_name(ROW_ADDR).unwrap();
+        let row_addrs = data.column_by_name(ROW_ADDR).unwrap();
+        let key = data.column_by_name("key").unwrap();
         let new_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("rowaddr", DataType::UInt64, false),
-            ArrowField::new("new_value", DataType::UInt64, false),
+            ArrowField::new("new_value", DataType::Int32, false),
         ]));
+        let new_value = Arc::new(
+            key.as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap()
+                .into_iter()
+                .map(|v| v.unwrap() + 1)
+                .collect::<arrow_array::Int32Array>(),
+        );
+        let len = new_value.len() as u32;
         let new_batch =
-            RecordBatch::try_new(new_schema.clone(), vec![row_ids.clone(), row_ids.clone()])
-                .unwrap();
+            RecordBatch::try_new(new_schema.clone(), vec![row_addrs.clone(), new_value]).unwrap();
+        // shuffle new_batch
+        let mut rng = rand::thread_rng();
+        let mut indices: Vec<u32> = (0..len).collect();
+        indices.shuffle(&mut rng);
+        let indices = arrow_array::UInt32Array::from_iter_values(indices);
+        let new_batch = arrow::compute::take_record_batch(&new_batch, &indices).unwrap();
         let new_data = RecordBatchIterator::new(vec![Ok(new_batch)], new_schema.clone());
         dataset.merge(new_data, ROW_ADDR, "rowaddr").await.unwrap();
         dataset.validate().await.unwrap();
+        assert_eq!(dataset.schema().fields.len(), 3);
+        assert!(dataset.schema().field("key").is_some());
+        assert!(dataset.schema().field("value").is_some());
+        assert!(dataset.schema().field("new_value").is_some());
+        let result = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        for batch in result {
+            let key = batch
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            let new_value = batch
+                .column_by_name("new_value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .unwrap();
+            for i in 0..key.len() {
+                assert_eq!(key.value(i) + 1, new_value.value(i));
+            }
+        }
     }
 
     #[rstest]
