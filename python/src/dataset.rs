@@ -527,6 +527,32 @@ impl Dataset {
         LanceSchema(self_.ds.schema().clone())
     }
 
+    fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.replace_schema_metadata(metadata))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn replace_field_metadata(
+        &mut self,
+        field_name: &str,
+        metadata: HashMap<String, String>,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let field = new_self
+            .schema()
+            .field(field_name)
+            .ok_or_else(|| PyKeyError::new_err(format!("Field \"{}\" not found", field_name)))?;
+        let new_field_meta: HashMap<u32, HashMap<String, String>> =
+            HashMap::from_iter(vec![(field.id as u32, metadata)]);
+        RT.block_on(None, new_self.replace_field_metadata(new_field_meta))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[getter(data_storage_version)]
     fn data_storage_version(&self) -> PyResult<String> {
         Ok(self.ds.manifest().data_storage_format.version.clone())

@@ -377,7 +377,19 @@ impl Schema {
     }
 
     /// Get field by its id.
-    // TODO: pub(crate)
+    pub fn field_by_id_mut(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
+        let id = id.into();
+        for field in self.fields.iter_mut() {
+            if field.id == id {
+                return Some(field);
+            }
+            if let Some(grandchild) = field.field_by_id_mut(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
     pub fn field_by_id(&self, id: impl Into<i32>) -> Option<&Field> {
         let id = id.into();
         for field in self.fields.iter() {

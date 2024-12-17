@@ -1495,20 +1495,9 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
-    /// Update key-value pairs in config.
-    pub async fn update_config(
-        &mut self,
-        upsert_values: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<()> {
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::UpdateConfig {
-                upsert_values: Some(HashMap::from_iter(upsert_values)),
-                delete_keys: None,
-            },
-            /*blobs_op=*/ None,
-            None,
-        );
+    async fn update_op(&mut self, op: Operation) -> Result<()> {
+        let transaction =
+            Transaction::new(self.manifest.version, op, /*blobs_op=*/ None, None);
 
         let (manifest, manifest_path) = commit_transaction(
             self,
@@ -1527,33 +1516,58 @@ impl Dataset {
         Ok(())
     }
 
+    /// Update key-value pairs in config.
+    pub async fn update_config(
+        &mut self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        self.update_op(Operation::UpdateConfig {
+            upsert_values: Some(HashMap::from_iter(upsert_values)),
+            delete_keys: None,
+            schema_metadata: None,
+            field_metadata: None,
+        })
+        .await
+    }
+
     /// Delete keys from the config.
     pub async fn delete_config_keys(&mut self, delete_keys: &[&str]) -> Result<()> {
-        let transaction = Transaction::new(
-            self.manifest.version,
-            Operation::UpdateConfig {
-                upsert_values: None,
-                delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
-            },
-            /*blob_op=*/ None,
-            None,
-        );
+        self.update_op(Operation::UpdateConfig {
+            upsert_values: None,
+            delete_keys: Some(Vec::from_iter(delete_keys.iter().map(ToString::to_string))),
+            schema_metadata: None,
+            field_metadata: None,
+        })
+        .await
+    }
 
-        let (manifest, manifest_path) = commit_transaction(
-            self,
-            &self.object_store,
-            self.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            self.manifest_naming_scheme,
-        )
-        .await?;
+    /// Update schema metadata
+    pub async fn replace_schema_metadata(
+        &mut self,
+        upsert_values: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<()> {
+        self.update_op(Operation::UpdateConfig {
+            upsert_values: None,
+            delete_keys: None,
+            schema_metadata: Some(HashMap::from_iter(upsert_values)),
+            field_metadata: None,
+        })
+        .await
+    }
 
-        self.manifest = Arc::new(manifest);
-        self.manifest_file = manifest_path;
-
-        Ok(())
+    /// Update field metadata
+    pub async fn replace_field_metadata(
+        &mut self,
+        new_values: impl IntoIterator<Item = (u32, HashMap<String, String>)>,
+    ) -> Result<()> {
+        let new_values = new_values.into_iter().collect::<HashMap<_, _>>();
+        self.update_op(Operation::UpdateConfig {
+            upsert_values: None,
+            delete_keys: None,
+            schema_metadata: None,
+            field_metadata: Some(new_values),
+        })
+        .await
     }
 }
 
