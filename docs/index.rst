@@ -45,6 +45,7 @@ Preview releases receive the same level of testing as regular releases.
    ./read_and_write
    Lance Formats <./format>
    Arrays <./arrays>
+   Blob API <./blob>
    Integrations <./integrations/integrations>
    Performance Guide <./performance>
    API References <./api/api>

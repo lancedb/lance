@@ -1534,7 +1534,7 @@ mod tests {
     use arrow::datatypes::{Int32Type, Int8Type};
     use arrow_array::{
         make_array, new_null_array, ArrayRef, DictionaryArray, Int8Array, LargeBinaryArray,
-        StringArray, UInt8Array,
+        StringArray, UInt16Array, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
 
@@ -1548,6 +1548,26 @@ mod tests {
 
     use arrow::compute::concat;
     use arrow_array::Array;
+
+    #[test]
+    fn test_sliced_to_data_block() {
+        let ints = UInt16Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let ints = ints.slice(2, 4);
+        let data = DataBlock::from_array(ints);
+
+        let fixed_data = data.as_fixed_width().unwrap();
+        assert_eq!(fixed_data.num_values, 4);
+        assert_eq!(fixed_data.data.len(), 8);
+
+        let nullable_ints =
+            UInt16Array::from(vec![Some(0), None, Some(2), None, Some(4), None, Some(6)]);
+        let nullable_ints = nullable_ints.slice(1, 3);
+        let data = DataBlock::from_array(nullable_ints);
+
+        let nullable = data.as_nullable().unwrap();
+        assert_eq!(nullable.nulls, LanceBuffer::Owned(vec![0b00000010]));
+    }
+
     #[test]
     fn test_string_to_data_block() {
         // Converting string arrays that contain nulls to DataBlock

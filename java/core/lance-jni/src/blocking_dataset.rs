@@ -580,6 +580,29 @@ fn inner_import_ffi_schema(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUri<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_uri(&mut env, java_dataset).map_err(|err| Error::input_error(err.to_string())),
+        JString::from(JObject::null())
+    )
+}
+
+fn inner_uri<'local>(env: &mut JNIEnv<'local>, java_dataset: JObject) -> Result<JString<'local>> {
+    let uri = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.uri().to_string()
+    };
+
+    let jstring_uri = env.new_string(uri)?;
+    Ok(jstring_uri)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeVersion(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -656,4 +679,29 @@ fn inner_list_indexes<'local>(
     }
 
     Ok(array_list)
+}
+
+//////////////////////////////
+// Schema evolution Methods //
+//////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDropColumns(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    columns_obj: JObject, // List<String>
+) {
+    ok_or_throw_without_return!(env, inner_drop_columns(&mut env, java_dataset, columns_obj))
+}
+
+fn inner_drop_columns(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    columns_obj: JObject, // List<String>
+) -> Result<()> {
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+    let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.drop_columns(&columns_slice))?;
+    Ok(())
 }

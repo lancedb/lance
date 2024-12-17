@@ -16,7 +16,6 @@ use datafusion_expr::{
 use futures::join;
 use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use log::warn;
 use tracing::instrument;
 
 use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
@@ -567,7 +566,6 @@ fn visit_comparison(
     } else {
         // Datafusion's query simplifier will canonicalize expressions and so we shouldn't reach this case.  If, for some reason, we
         // do reach this case we can handle it in the future by inverting expr.op and swapping the left and right sides
-        warn!("Unexpected comparison encountered (DF simplifier should have removed this case).  Scalar indices will not be applied");
         None
     }
 }

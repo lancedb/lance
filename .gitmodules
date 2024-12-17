@@ -1,6 +1,0 @@
-[submodule "integration/duckdb_lance/duckdb"]
-	path = integration/duckdb_lance/duckdb
-	url = https://github.com/duckdb/duckdb.git
-[submodule "integration/duckdb_lance/duckdb-ext/duckdb"]
-	path = integration/duckdb_lance/duckdb-ext/duckdb
-	url = https://github.com/duckdb/duckdb.git

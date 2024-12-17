@@ -21,6 +21,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.junit.jupiter.api.Test;
 
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -58,6 +59,40 @@ public class LanceColumnarPartitionReaderTest {
       }
 
       assertEquals(expectedValues.size(), rowIndex);
+    }
+  }
+
+  @Test
+  public void testOffsetAndLimit() throws Exception {
+    LanceSplit split = new LanceSplit(Collections.singletonList(0));
+    LanceInputPartition partition =
+        new LanceInputPartition(
+            TestUtils.TestTable1Config.schema,
+            0,
+            split,
+            TestUtils.TestTable1Config.lanceConfig,
+            Optional.empty(),
+            Optional.of(1),
+            Optional.of(1));
+    try (LanceColumnarPartitionReader reader = new LanceColumnarPartitionReader(partition)) {
+      List<List<Long>> expectedValues = TestUtils.TestTable1Config.expectedValues;
+      int rowIndex = 1;
+
+      while (reader.next()) {
+        ColumnarBatch batch = reader.get();
+        assertNotNull(batch);
+        assertEquals(1, batch.numRows());
+        for (int i = 0; i < batch.numRows(); i++) {
+          for (int j = 0; j < batch.numCols(); j++) {
+            long actualValue = batch.column(j).getLong(i);
+            long expectedValue = expectedValues.get(rowIndex).get(j);
+            assertEquals(
+                expectedValue, actualValue, "Mismatch at row " + rowIndex + " column " + j);
+          }
+          rowIndex++;
+        }
+        batch.close();
+      }
     }
   }
 }
