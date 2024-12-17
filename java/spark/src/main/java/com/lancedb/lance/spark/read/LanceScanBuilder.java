@@ -108,7 +108,8 @@ public class LanceScanBuilder
 
   @Override
   public boolean pushTopN(SortOrder[] orders, int limit) {
-    // Oder by will use compute thread in lance. It's better to have an option to enable it.
+    // The Order by operator will use compute thread in lance.
+    // So it's better to have an option to enable it.
     if (!SparkOptions.enableTopNPushDown(this.config)) {
       return false;
     }
