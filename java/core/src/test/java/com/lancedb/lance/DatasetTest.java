@@ -24,12 +24,12 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.stream.Collectors;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class DatasetTest {
   @TempDir static Path tempDir; // Temporary directory for the tests
@@ -231,6 +231,74 @@ public class DatasetTest {
           dataset.getSchema().getFields().stream()
               .map(Field::getName)
               .collect(Collectors.toList()));
+    }
+  }
+
+  @Test
+  void testAlterColumns() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(testDataset.getSchema(), dataset.getSchema());
+      dataset.alterColumns(
+          Collections.singletonList(
+              new HashMap<String, String>() {
+                {
+                  put("path", "name");
+                  put("rename", "new_name");
+                  put("nullable", "true");
+                  put("data_type", "Utf8");
+                }
+              }));
+
+      Schema changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.notNullable("new_name", new ArrowType.Utf8())),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      dataset.alterColumns(
+          Collections.singletonList(
+              new HashMap<String, String>() {
+                {
+                  put("path", "new_name");
+                  put("rename", "new_name_2");
+                  put("data_type", "LargeUtf8");
+                }
+              }));
+      changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.notNullable("new_name_2", new ArrowType.LargeUtf8())),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      dataset.alterColumns(
+          Collections.singletonList(
+              new HashMap<String, String>() {
+                {
+                  put("path", "new_name_2");
+                }
+              }));
+      assertNotNull(dataset.getSchema().findField("new_name_2"));
     }
   }
 

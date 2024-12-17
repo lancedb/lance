@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::FromJString;
+use crate::traits::{FromJString, JMapExt};
 use crate::utils::{extract_storage_options, extract_write_params, get_index_params};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -23,13 +23,14 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
+use arrow_schema::DataType;
 use jni::objects::{JMap, JString, JValue};
 use jni::sys::jlong;
 use jni::sys::{jboolean, jint};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, ReadParams, WriteParams};
+use lance::dataset::{ColumnAlteration, Dataset, ReadParams, WriteParams};
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
@@ -38,6 +39,7 @@ use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use std::collections::HashMap;
 use std::iter::empty;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
@@ -703,5 +705,80 @@ fn inner_drop_columns(
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     RT.block_on(dataset_guard.inner.drop_columns(&columns_slice))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAlterColumns(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    column_alterations_obj: JObject, // List<Map<String, String>>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_alter_columns(&mut env, java_dataset, column_alterations_obj)
+    )
+}
+
+fn create_column_alteration_from_jni_map(env: &mut JNIEnv, map: JMap) -> Result<ColumnAlteration> {
+    let path = match map.get_string(env, "path")? {
+        Some(value) => value,
+        _ => {
+            return Err(Error::input_error(
+                "path is required and must be a string".to_string(),
+            ))
+        }
+    };
+
+    let rename = match map.get_string(env, "rename") {
+        Ok(Some(value)) => Some(value),
+        Ok(None) => None,
+        Err(_e) => None,
+    };
+
+    let nullable = match map.get_string(env, "nullable") {
+        Ok(Some(value)) => match value.parse::<bool>() {
+            Ok(parsed_value) => Some(parsed_value),
+            Err(e) => return Err(Error::input_error(e.to_string())),
+        },
+        Ok(None) => None,
+        Err(_e) => None,
+    };
+
+    let data_type = match map.get_string(env, "data_type") {
+        Ok(Some(value)) => {
+            Some(DataType::from_str(&value).map_err(|e| Error::input_error(e.to_string()))?)
+        }
+        Ok(None) => None,
+        Err(_e) => None,
+    };
+
+    Ok(ColumnAlteration {
+        path,
+        rename,
+        nullable,
+        data_type,
+    })
+}
+
+fn inner_alter_columns(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    column_alterations_obj: JObject, // List<Map<String, String>>
+) -> Result<()> {
+    let list = env.get_list(&column_alterations_obj)?;
+    let mut iter = list.iter(env)?;
+    let mut column_alterations = Vec::new();
+
+    while let Some(elem) = iter.next(env)? {
+        let map = JMap::from_env(env, &elem)?;
+        let alteration = create_column_alteration_from_jni_map(env, map)?;
+        column_alterations.push(alteration);
+    }
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
     Ok(())
 }

@@ -268,6 +268,25 @@ public class Dataset implements Closeable {
   private native void nativeDropColumns(List<String> columns);
 
   /**
+   * Alter columns in the dataset.
+   *
+   * <p>For each column, there only support 4 keys in a map: - path: Path to the existing column to
+   * be altered. - rename: The new name of the column. If None, the column name will not be changed
+   * - nullable: Whether the column is nullable. If None, the nullability will not be changed. -
+   * data_type: The new data type of the column. If None, the data type will not be changed.
+   *
+   * @param columnAlterations the list of columns need to be altered.
+   */
+  public void alterColumns(List<Map<String, String>> columnAlterations) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAlterColumns(columnAlterations);
+    }
+  }
+
+  private native void nativeAlterColumns(List<Map<String, String>> columnAlterations);
+
+  /**
    * Create a new Dataset Scanner.
    *
    * @return a dataset scanner
