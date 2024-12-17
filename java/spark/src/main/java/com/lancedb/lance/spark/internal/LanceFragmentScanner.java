@@ -68,6 +68,9 @@ public class LanceFragmentScanner implements AutoCloseable {
       if (inputPartition.getOffset().isPresent()) {
         scanOptions.offset(inputPartition.getOffset().get());
       }
+      if (inputPartition.getTopNSortOrders().isPresent()) {
+        scanOptions.setColumnOrderings(inputPartition.getTopNSortOrders().get());
+      }
       scanner = fragment.newScan(scanOptions.build());
     } catch (Throwable t) {
       if (scanner != null) {
