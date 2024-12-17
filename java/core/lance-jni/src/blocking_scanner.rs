@@ -116,7 +116,7 @@ fn inner_create_scanner<'local>(
     query_obj: JObject,
     with_row_id: jboolean,
     batch_readahead: jint,
-    column_orderings: JObject
+    column_orderings: JObject,
 ) -> Result<JObject<'local>> {
     let fragment_ids_opt = env.get_ints_opt(&fragment_ids_obj)?;
     let dataset_guard =
@@ -209,7 +209,9 @@ fn inner_create_scanner<'local>(
     }
     scanner.batch_readahead(batch_readahead as usize);
 
-    let column_orders_is_present = env.call_method(&column_orderings, "isPresent", "()Z", &[])?.z()?;
+    let column_orders_is_present = env
+        .call_method(&column_orderings, "isPresent", "()Z", &[])?
+        .z()?;
     if column_orders_is_present {
         let java_obj = env
             .call_method(&column_orderings, "get", "()Ljava/lang/Object;", &[])?
@@ -226,7 +228,7 @@ fn inner_create_scanner<'local>(
             let col_order = ColumnOrdering {
                 ascending,
                 nulls_first,
-                column_name
+                column_name,
             };
             results.push(col_order)
         }
