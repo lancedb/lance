@@ -1247,7 +1247,7 @@ class LanceDataset(pa.dataset.Dataset):
         3  4  z
 
         You are not required to provide all the columns. If you only want to
-        updated a subset of columns, you can omit columns you don't want to
+        update a subset of columns, you can omit columns you don't want to
         update. Omitted columns will keep their existing values if they are
         updated, or will be null if they are inserted.
 
