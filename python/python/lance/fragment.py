@@ -410,7 +410,7 @@ class LanceFragment(pa.dataset.Fragment):
         ...     f, schema = f.merge(new_df, 'x')
         ...     merged.append(f)
         >>> merge = lance.LanceOperation.Merge(merged, schema)
-        >>> dataset = lance.LanceDataset.commit(base_dir, merge, read_version=1)
+        >>> dataset = lance.LanceDataset.commit("dataset", merge, read_version=1)
         >>> dataset.to_table().to_pandas()
            x  y  z
         0  1  a  d
