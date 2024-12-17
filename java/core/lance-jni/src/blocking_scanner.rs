@@ -221,7 +221,6 @@ fn inner_create_scanner<'local>(
         let mut iter = list.iter(env)?;
         let mut results = Vec::with_capacity(list.size(env)? as usize);
         while let Some(elem) = iter.next(env)? {
-            // Set column and key for nearest search
             let column_name = env.get_string_from_method(&elem, "getColumnName")?;
             let nulls_first = env.get_boolean_from_method(&elem, "isNullFirst")?;
             let ascending = env.get_boolean_from_method(&elem, "isAscending")?;
