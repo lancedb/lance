@@ -1554,34 +1554,6 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     check_merge_stats(merge_dict, (0, 350, 0))
 
 
-def test_merge_insert_incompatible_schema(tmp_path: Path):
-    nrows = 1000
-    table = pa.Table.from_pydict(
-        {
-            "a": range(nrows),
-            "b": [1 for _ in range(nrows)],
-        }
-    )
-    dataset = lance.write_dataset(
-        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
-    )
-
-    new_table = pa.Table.from_pydict(
-        {
-            "a": range(300, 300 + nrows),
-        }
-    )
-
-    with pytest.raises(OSError):
-        merge_dict = (
-            dataset.merge_insert("a")
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(new_table)
-        )
-        check_merge_stats(merge_dict, (None, None, None))
-
-
 def test_merge_insert_vector_column(tmp_path: Path):
     table = pa.Table.from_pydict(
         {
