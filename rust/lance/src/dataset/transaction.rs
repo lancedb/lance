@@ -1525,8 +1525,6 @@ fn schema_fragments_valid(schema: &Schema, fragments: &[Fragment]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use half::vec;
-
     use super::*;
 
     #[test]
