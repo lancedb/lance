@@ -319,9 +319,18 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn simple_all_null_layout() -> PageLayout {
+    pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> PageLayout {
         PageLayout {
-            layout: Some(Layout::AllNullLayout(AllNullLayout {})),
+            layout: Some(Layout::AllNullLayout(AllNullLayout {
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
+            })),
         }
+    }
+
+    pub fn simple_all_null_layout() -> PageLayout {
+        Self::all_null_layout(&[DefinitionInterpretation::NullableItem])
     }
 }
