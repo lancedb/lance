@@ -617,8 +617,38 @@ class LanceDataset(pa.dataset.Dataset):
     def replace_schema(self, schema: Schema):
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
+
+        See :py:method:`replace_schema_metadata` or :py:method:`replace_field_metadata`
         """
-        raise NotImplementedError("not changing schemas yet")
+        raise NotImplementedError(
+            "Cannot replace the schema of a dataset.  This method exists for backwards"
+            " compatibility with pyarrow.  Use replace_schema_metadata or "
+            "replace_field_metadata to change the metadata"
+        )
+
+    def replace_schema_metadata(self, new_metadata: Dict[str, str]):
+        """
+        Replace the schema metadata of the dataset
+
+        Parameters
+        ----------
+        new_metadata: dict
+            The new metadata to set
+        """
+        self._ds.replace_schema_metadata(new_metadata)
+
+    def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
+        """
+        Replace the metadata of a field in the schema
+
+        Parameters
+        ----------
+        field_name: str
+            The name of the field to replace the metadata for
+        new_metadata: dict
+            The new metadata to set
+        """
+        self._ds.replace_field_metadata(field_name, new_metadata)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.

@@ -160,6 +160,39 @@ def test_dataset_from_record_batch_iterable(tmp_path: Path):
     assert list(dataset.to_batches())[0].to_pylist() == test_pylist
 
 
+def test_schema_metadata(tmp_path: Path):
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), metadata={b"thisis": "a"}),
+            pa.field("b", pa.int64(), metadata={b"thisis": "b"}),
+        ],
+        metadata={b"foo": b"bar", b"baz": b"qux"},
+    )
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    # Original schema
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace schema metadata
+    ds.replace_schema_metadata({"foo": "baz"})
+    assert ds.schema.metadata == {b"foo": b"baz"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace field metadata
+    ds.replace_field_metadata("a", {"thisis": "c"})
+    assert ds.schema.field("a").metadata == {b"thisis": b"c"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Overwrite overwrites metadata
+    ds = lance.write_dataset(table, tmp_path, mode="overwrite")
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
