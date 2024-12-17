@@ -568,23 +568,15 @@ impl Dataset {
 
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
 
-                let is_vector = idx_schema
-                    .fields
-                    .iter()
-                    .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
-
-                let idx_type = if is_vector {
-                    IndexType::Vector
-                } else {
-                    let ds = self_.ds.clone();
-                    RT.block_on(Some(self_.py()), async {
-                        let scalar_idx = ds
-                            .open_scalar_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
+                let ds = self_.ds.clone();
+                let idx_type = RT
+                    .block_on(Some(self_.py()), async {
+                        let idx = ds
+                            .open_generic_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
                             .await?;
-                        Ok::<_, lance::Error>(scalar_idx.index_type())
+                        Ok::<_, lance::Error>(idx.index_type())
                     })?
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?
-                };
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
                 let field_names = idx_schema
                     .fields
