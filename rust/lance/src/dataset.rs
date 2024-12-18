@@ -1648,7 +1648,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::TestDatasetGenerator;
 
-    use arrow::array::as_struct_array;
+    use arrow::array::{as_struct_array, AsArray};
     use arrow::compute::concat_batches;
     use arrow_array::{
         builder::StringDictionaryBuilder,
@@ -3147,23 +3147,19 @@ mod tests {
         assert_eq!(dataset.manifest.max_fragment_id(), Some(9));
 
         let data = dataset.scan().with_row_id().try_into_batch().await.unwrap();
-        let row_ids = data.column_by_name(ROW_ID).unwrap();
-        let key = data.column_by_name("key").unwrap();
+        let row_ids: Arc<dyn Array> = data[ROW_ID].clone();
+        let key = data["key"].as_primitive::<Int32Type>();
         let new_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("rowid", DataType::UInt64, false),
             ArrowField::new("new_value", DataType::Int32, false),
         ]));
         let new_value = Arc::new(
-            key.as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap()
-                .into_iter()
+            key.into_iter()
                 .map(|v| v.unwrap() + 1)
                 .collect::<arrow_array::Int32Array>(),
         );
         let len = new_value.len() as u32;
-        let new_batch =
-            RecordBatch::try_new(new_schema.clone(), vec![row_ids.clone(), new_value]).unwrap();
+        let new_batch = RecordBatch::try_new(new_schema.clone(), vec![row_ids, new_value]).unwrap();
         // shuffle new_batch
         let mut rng = rand::thread_rng();
         let mut indices: Vec<u32> = (0..len).collect();
@@ -3177,30 +3173,11 @@ mod tests {
         assert!(dataset.schema().field("key").is_some());
         assert!(dataset.schema().field("value").is_some());
         assert!(dataset.schema().field("new_value").is_some());
-        let result = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        for batch in result {
-            let key = batch
-                .column_by_name("key")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap();
-            let new_value = batch
-                .column_by_name("new_value")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap();
-            for i in 0..key.len() {
-                assert_eq!(key.value(i) + 1, new_value.value(i));
-            }
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let key = batch["key"].as_primitive::<Int32Type>();
+        let new_value = batch["new_value"].as_primitive::<Int32Type>();
+        for i in 0..key.len() {
+            assert_eq!(key.value(i) + 1, new_value.value(i));
         }
     }
 
@@ -3238,23 +3215,20 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let row_addrs = data.column_by_name(ROW_ADDR).unwrap();
-        let key = data.column_by_name("key").unwrap();
+        let row_addrs = data[ROW_ADDR].clone();
+        let key = data["key"].as_primitive::<Int32Type>();
         let new_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new("rowaddr", DataType::UInt64, false),
             ArrowField::new("new_value", DataType::Int32, false),
         ]));
         let new_value = Arc::new(
-            key.as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap()
-                .into_iter()
+            key.into_iter()
                 .map(|v| v.unwrap() + 1)
                 .collect::<arrow_array::Int32Array>(),
         );
         let len = new_value.len() as u32;
         let new_batch =
-            RecordBatch::try_new(new_schema.clone(), vec![row_addrs.clone(), new_value]).unwrap();
+            RecordBatch::try_new(new_schema.clone(), vec![row_addrs, new_value]).unwrap();
         // shuffle new_batch
         let mut rng = rand::thread_rng();
         let mut indices: Vec<u32> = (0..len).collect();
@@ -3268,30 +3242,11 @@ mod tests {
         assert!(dataset.schema().field("key").is_some());
         assert!(dataset.schema().field("value").is_some());
         assert!(dataset.schema().field("new_value").is_some());
-        let result = dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        for batch in result {
-            let key = batch
-                .column_by_name("key")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap();
-            let new_value = batch
-                .column_by_name("new_value")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<arrow_array::Int32Array>()
-                .unwrap();
-            for i in 0..key.len() {
-                assert_eq!(key.value(i) + 1, new_value.value(i));
-            }
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let key = batch["key"].as_primitive::<Int32Type>();
+        let new_value = batch["new_value"].as_primitive::<Int32Type>();
+        for i in 0..key.len() {
+            assert_eq!(key.value(i) + 1, new_value.value(i));
         }
     }
 
