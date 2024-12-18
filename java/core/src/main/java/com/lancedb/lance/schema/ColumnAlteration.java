@@ -17,9 +17,7 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import java.io.Serializable;
 import java.util.Optional;
 
-/**
- * Column alteration used to alter dataset columns.
- */
+/** Column alteration used to alter dataset columns. */
 public class ColumnAlteration implements Serializable {
 
   private String path;
