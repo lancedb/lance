@@ -267,7 +267,7 @@ fn field_structure(fragment: &Fragment) -> Vec<Vec<i32>> {
         .collect::<Vec<_>>()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct IoStats {
     pub read_iops: u64,
     pub read_bytes: u64,

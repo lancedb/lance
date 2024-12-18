@@ -95,7 +95,7 @@ pub enum BlobsOperation {
 }
 
 /// An operation on a dataset.
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub enum Operation {
     /// Adding new fragments to the dataset. The fragments contained within
     /// haven't yet been assigned a final ID.
@@ -168,7 +168,7 @@ pub enum Operation {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RewrittenIndex {
     pub old_id: Uuid,
     pub new_id: Uuid,
@@ -180,7 +180,7 @@ impl DeepSizeOf for RewrittenIndex {
     }
 }
 
-#[derive(Debug, Clone, DeepSizeOf)]
+#[derive(Debug, Clone, DeepSizeOf, PartialEq)]
 pub struct RewriteGroup {
     pub old_fragments: Vec<Fragment>,
     pub new_fragments: Vec<Fragment>,
