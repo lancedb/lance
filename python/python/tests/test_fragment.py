@@ -354,3 +354,64 @@ def test_create_from_file(tmp_path):
     assert dataset.count_rows() == 1600
     assert len(dataset.get_fragments()) == 1
     assert dataset.get_fragments()[0].fragment_id == 2
+
+
+def test_fragment_merge(tmp_path):
+    schema = pa.schema([pa.field("a", pa.string())])
+    batches = pa.RecordBatchReader.from_batches(
+        schema,
+        [
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+            pa.record_batch([pa.array(["0" * 1024] * 1024 * 8)], names=["a"]),
+        ],
+    )
+
+    progress = ProgressForTest()
+    fragments = write_fragments(
+        batches,
+        tmp_path,
+        max_rows_per_group=512,
+        max_bytes_per_file=1024,
+        progress=progress,
+    )
+
+    operation = lance.LanceOperation.Overwrite(schema, fragments)
+    dataset = lance.LanceDataset.commit(tmp_path, operation)
+    merged = []
+    schema = None
+    for fragment in dataset.get_fragments():
+        table = fragment.scanner(with_row_id=True, columns=[]).to_table()
+        table = table.add_column(0, "b", [[i for i in range(len(table))]])
+        fragment, schema = fragment.merge(table, "_rowid")
+        merged.append(fragment)
+
+    merge = lance.LanceOperation.Merge(merged, schema)
+    dataset = lance.LanceDataset.commit(
+        tmp_path, merge, read_version=dataset.latest_version
+    )
+
+    merged = []
+    schema = None
+    for fragment in dataset.get_fragments():
+        table = fragment.scanner(with_row_address=True, columns=[]).to_table()
+        table = table.add_column(0, "c", [[i + 1 for i in range(len(table))]])
+        fragment, schema = fragment.merge(table, "_rowaddr")
+        merged.append(fragment)
+
+    merge = lance.LanceOperation.Merge(merged, schema)
+    dataset = lance.LanceDataset.commit(
+        tmp_path, merge, read_version=dataset.latest_version
+    )
+
+    merged = []
+    for fragment in dataset.get_fragments():
+        table = fragment.scanner(columns=["b"]).to_table()
+        table = table.add_column(0, "d", [[i + 2 for i in range(len(table))]])
+        fragment, schema = fragment.merge(table, "b")
+        merged.append(fragment)
+
+    merge = lance.LanceOperation.Merge(merged, schema)
+    dataset = lance.LanceDataset.commit(
+        tmp_path, merge, read_version=dataset.latest_version
+    )
+    assert [f.name for f in dataset.schema] == ["a", "b", "c", "d"]
