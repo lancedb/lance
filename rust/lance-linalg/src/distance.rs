@@ -11,8 +11,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeListArray, Float32Array};
-use arrow_schema::ArrowError;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Float32Type, UInt8Type};
+use arrow_array::{Array, FixedSizeListArray, Float32Array, ListArray};
+use arrow_schema::{ArrowError, DataType};
 
 pub mod cosine;
 pub mod dot;
@@ -99,4 +101,63 @@ impl TryFrom<&str> for DistanceType {
             ))),
         }
     }
+}
+
+pub fn multivec_distance(
+    query: &dyn Array,
+    vectors: &ListArray,
+    distance_type: DistanceType,
+) -> Result<Vec<f32>> {
+    let dim = if let DataType::FixedSizeList(_, dim) = vectors.value_type() {
+        dim as usize
+    } else {
+        return Err(ArrowError::InvalidArgumentError(
+            "vectors must be a list of fixed size list".to_string(),
+        ));
+    };
+
+    let dists = vectors
+        .iter()
+        .map(|v| {
+            v.map(|v| {
+                let multivector = v.as_fixed_size_list();
+                match distance_type {
+                    DistanceType::Hamming => {
+                        let query = query.as_primitive::<UInt8Type>().values();
+                        query
+                            .chunks_exact(dim)
+                            .map(|q| {
+                                multivector
+                                    .values()
+                                    .as_primitive::<UInt8Type>()
+                                    .values()
+                                    .chunks_exact(dim)
+                                    .map(|v| hamming::hamming(q, v))
+                                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                                    .unwrap()
+                            })
+                            .sum()
+                    }
+                    _ => {
+                        let query = query.as_primitive::<Float32Type>().values();
+                        query
+                            .chunks_exact(dim)
+                            .map(|q| {
+                                multivector
+                                    .values()
+                                    .as_primitive::<Float32Type>()
+                                    .values()
+                                    .chunks_exact(dim)
+                                    .map(|v| distance_type.func()(q, v))
+                                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                                    .unwrap()
+                            })
+                            .sum()
+                    }
+                }
+            })
+            .unwrap_or(f32::NAN)
+        })
+        .collect();
+    Ok(dists)
 }
