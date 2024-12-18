@@ -2200,6 +2200,7 @@ class LanceDataset(pa.dataset.Dataset):
     def commit(
         base_uri: Union[str, Path, LanceDataset],
         operation: LanceOperation.BaseOperation,
+        blobs_operation: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -2311,10 +2312,10 @@ class LanceDataset(pa.dataset.Dataset):
                 "read_version is required for all operations except "
                 "Overwrite and Restore"
             )
-
         new_ds = _Dataset.commit(
             base_uri,
             operation._to_inner(),
+            blobs_operation._to_inner() if blobs_operation else None,
             read_version,
             commit_lock,
             storage_options=storage_options,
