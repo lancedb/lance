@@ -4,7 +4,6 @@
 import pickle
 from itertools import chain
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -17,15 +16,13 @@ from typing import (
     Union,
 )
 
+import pandas as pd
 import pyarrow as pa
 
 import lance
 from lance.fragment import DEFAULT_MAX_BYTES_PER_FILE, FragmentMetadata, write_fragments
 
 from ..dependencies import ray
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 __all__ = ["LanceDatasink", "LanceFragmentWriter", "LanceCommitter", "write_lance"]
 
@@ -129,8 +126,22 @@ class _BaseLanceDatasink(ray.data.Datasink):
 
     def on_write_complete(
         self,
-        write_results: List[List[Tuple[str, str]]],
+        write_results,
     ):
+        if not write_results:
+            import warnings
+
+            warnings.warn(
+                "write_result_blocks is empty.",
+                DeprecationWarning,
+            )
+            return "Empty list"
+
+        first_element = write_results[0]
+        if isinstance(first_element, (pa.Table, pd.DataFrame)):
+            write_results = [
+                result["write_result"].iloc[0]["result"] for result in write_results
+            ]
         fragments = []
         schema = None
         for batch in write_results:
