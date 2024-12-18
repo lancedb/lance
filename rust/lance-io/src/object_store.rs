@@ -794,7 +794,7 @@ impl StorageOptions {
         self.0
             .iter()
             .find(|(key, _)| key.to_ascii_lowercase() == "client_max_retries")
-            .map(|(_, value)| value.parse::<usize>().unwrap_or(10))
+            .and_then(|(_, value)| value.parse::<usize>().ok())
             .unwrap_or(10)
     }
 
@@ -803,7 +803,7 @@ impl StorageOptions {
         self.0
             .iter()
             .find(|(key, _)| key.to_ascii_lowercase() == "client_retry_timeout")
-            .map(|(_, value)| value.parse::<u64>().unwrap_or(180))
+            .and_then(|(_, value)| value.parse::<u64>().ok())
             .unwrap_or(180)
     }
 
