@@ -3,7 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use core::fmt;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -67,9 +66,9 @@ use crate::{
 use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
 
 #[derive(Debug)]
-struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
-    index: S,
-    storage: Q::Storage,
+pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
+    pub index: S,
+    pub storage: Q::Storage,
 }
 
 /// IVF Index.
@@ -96,7 +95,6 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// The session cache, used when fetching pages
     #[allow(dead_code)]
     session: Weak<Session>,
-
     _marker: PhantomData<Q>,
 }
 
@@ -366,9 +364,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 }
 
 #[async_trait]
-impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'static> VectorIndex
-    for IVFIndex<S, Q>
-{
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
@@ -413,19 +409,6 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 
         self.ivf.find_partitions(&query.key, query.nprobes, dt)
     }
-
-    // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()> {
-    //     IvfIndexBuilder::new(
-    //         dataset,
-    //         column,
-    //         index_dir,
-    //         distance_type,
-    //         shuffler,
-    //         ivf_params,
-    //         sub_index_params,
-    //         quantizer_params,
-    //     )
-    // }
 
     #[instrument(level = "debug", skip(self, pre_filter))]
     async fn search_in_partition(
@@ -477,7 +460,7 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -522,6 +505,7 @@ mod tests {
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
         Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
@@ -540,6 +524,7 @@ mod tests {
     use rstest::rstest;
     use tempfile::tempdir;
 
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::{index::vector::VectorIndexParams, Dataset};
 
     const DIM: usize = 32;
@@ -551,19 +536,23 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
+        let ids = Arc::new(UInt64Array::from_iter_values(0..1000));
         let vectors = generate_random_array_with_range::<T>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
         let data_type = vectors.data_type().clone();
-        let schema: Arc<_> = Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", data_type.clone(), true)),
-                DIM as i32,
+        let schema: Arc<_> = Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
             ),
-            true,
-        )])
+        ])
         .with_metadata(metadata)
         .into();
         let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
@@ -571,7 +560,7 @@ mod tests {
             fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
         }
         let array = Arc::new(fsl);
-        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
@@ -672,6 +661,57 @@ mod tests {
         );
     }
 
+    async fn test_remap(params: VectorIndexParams, nlist: usize) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_remap_impl::<UInt8Type>(params, nlist, 0..2).await;
+            }
+            _ => {
+                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_remap_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let k = 100;
+        // delete half rows to trigger compact
+        dataset.delete("id < 500").await.unwrap();
+        let num_rows = dataset.count_rows(None).await.unwrap();
+        assert_eq!(num_rows, 500);
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        // query again, the result should not include the deleted row
+        let result = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = result["id"].as_primitive::<UInt64Type>();
+        assert_ne!(row_ids.values()[0], 0);
+    }
+
     #[rstest]
     #[case(4, DistanceType::L2, 1.0)]
     #[case(4, DistanceType::Cosine, 1.0)]
@@ -684,7 +724,8 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -700,7 +741,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -718,7 +760,8 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -736,7 +779,8 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]

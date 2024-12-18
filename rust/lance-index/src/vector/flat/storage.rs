@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! In-memory graph representations.
-
 use std::sync::Arc;
 
 use crate::vector::quantizer::QuantizerStorage;
