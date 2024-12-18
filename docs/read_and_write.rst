@@ -727,7 +727,12 @@ These options apply to all object stores.
        and IP masks. Any subdomain of the provided domain will be bypassed. For 
        example, ``example.com, 192.168.1.0/24`` would bypass ``https://api.example.com``,
        ``https://www.example.com``, and any IP in the range ``192.168.1.0/24``.
-
+   * - ``client_max_retries``
+     - Number of times for a s3 client to retry the request. Default, ``10``.
+       This configuration will be set in ``RetryConfig`` in ``object_store`` client.
+   * - ``client_retry_timeout``
+     - Timeout for a s3 client to retry the request in second unit. Default, ``180``.
+       This configuration will be set in ``RetryConfig`` in ``object_store`` client.
 
 S3 Configuration
 ~~~~~~~~~~~~~~~~
