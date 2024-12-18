@@ -11,6 +11,8 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.schema.ColumnAlteration;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -27,6 +29,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -243,16 +246,11 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       dataset = testDataset.createEmptyDataset();
       assertEquals(testDataset.getSchema(), dataset.getSchema());
-      dataset.alterColumns(
-          Collections.singletonList(
-              new HashMap<String, String>() {
-                {
-                  put("path", "name");
-                  put("rename", "new_name");
-                  put("nullable", "true");
-                  put("data_type", "Utf8");
-                }
-              }));
+      ColumnAlteration nameColumnAlteration = new ColumnAlteration("name");
+      nameColumnAlteration.setRename(Optional.of("new_name"));
+      nameColumnAlteration.setNullable(Optional.of(Boolean.TRUE));
+      nameColumnAlteration.setDataType(Optional.of(new ArrowType.Utf8()));
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
 
       Schema changedSchema =
           new Schema(
@@ -268,15 +266,12 @@ public class DatasetTest {
               .map(Field::getName)
               .collect(Collectors.toList()));
 
-      dataset.alterColumns(
-          Collections.singletonList(
-              new HashMap<String, String>() {
-                {
-                  put("path", "new_name");
-                  put("rename", "new_name_2");
-                  put("data_type", "LargeUtf8");
-                }
-              }));
+      nameColumnAlteration = new ColumnAlteration();
+      nameColumnAlteration.setPath("new_name");
+      nameColumnAlteration.setRename(Optional.of("new_name_2"));
+      nameColumnAlteration.setDataType(Optional.of(new ArrowType.LargeUtf8()));
+
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       changedSchema =
           new Schema(
               Arrays.asList(
@@ -291,13 +286,8 @@ public class DatasetTest {
               .map(Field::getName)
               .collect(Collectors.toList()));
 
-      dataset.alterColumns(
-          Collections.singletonList(
-              new HashMap<String, String>() {
-                {
-                  put("path", "new_name_2");
-                }
-              }));
+      nameColumnAlteration = new ColumnAlteration();
+      nameColumnAlteration.setPath("new_name_2");
       assertNotNull(dataset.getSchema().findField("new_name_2"));
     }
   }

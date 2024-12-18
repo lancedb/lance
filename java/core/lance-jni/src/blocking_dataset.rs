@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
-use crate::traits::{FromJString, JMapExt};
+use crate::traits::FromJString;
 use crate::utils::{extract_storage_options, extract_write_params, get_index_params};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
@@ -712,7 +712,7 @@ fn inner_drop_columns(
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAlterColumns(
     mut env: JNIEnv,
     java_dataset: JObject,
-    column_alterations_obj: JObject, // List<Map<String, String>>
+    column_alterations_obj: JObject, // List<ColumnAlteration>
 ) {
     ok_or_throw_without_return!(
         env,
@@ -720,37 +720,68 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAlterColumns(
     )
 }
 
-fn create_column_alteration_from_jni_map(env: &mut JNIEnv, map: JMap) -> Result<ColumnAlteration> {
-    let path = match map.get_string(env, "path")? {
-        Some(value) => value,
-        _ => {
-            return Err(Error::input_error(
-                "path is required and must be a string".to_string(),
-            ))
-        }
+fn create_column_alteration(
+    env: &mut JNIEnv,
+    column_alteration_jobj: JObject, // ColumnAlteration
+) -> Result<ColumnAlteration> {
+    let path_obj = env
+        .get_field(&column_alteration_jobj, "path", "Ljava/lang/String;")?
+        .l()?;
+    let path_jstring: JString = path_obj.into();
+    let path: String = env.get_string(&path_jstring)?.into();
+
+    let rename_obj = env
+        .get_field(&column_alteration_jobj, "rename", "Ljava/util/Optional;")?
+        .l()?;
+    let rename = if env.call_method(&rename_obj, "isPresent", "()Z", &[])?.z()? {
+        let jstring: JObject = env
+            .call_method(rename_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let jstring: JString = jstring.into();
+        let rename_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
+        Some(rename_str)
+    } else {
+        None
     };
 
-    let rename = match map.get_string(env, "rename") {
-        Ok(Some(value)) => Some(value),
-        Ok(None) => None,
-        Err(_e) => None,
+    let nullable_obj = env
+        .get_field(&column_alteration_jobj, "nullable", "Ljava/util/Optional;")?
+        .l()?;
+    let nullable = if env
+        .call_method(&nullable_obj, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let nullable_value = env
+            .call_method(nullable_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        Some(
+            env.call_method(nullable_value, "booleanValue", "()Z", &[])?
+                .z()?,
+        )
+    } else {
+        None
     };
 
-    let nullable = match map.get_string(env, "nullable") {
-        Ok(Some(value)) => match value.parse::<bool>() {
-            Ok(parsed_value) => Some(parsed_value),
-            Err(e) => return Err(Error::input_error(e.to_string())),
-        },
-        Ok(None) => None,
-        Err(_e) => None,
-    };
-
-    let data_type = match map.get_string(env, "data_type") {
-        Ok(Some(value)) => {
-            Some(DataType::from_str(&value).map_err(|e| Error::input_error(e.to_string()))?)
-        }
-        Ok(None) => None,
-        Err(_e) => None,
+    let data_type_obj = env
+        .get_field(&column_alteration_jobj, "dataType", "Ljava/util/Optional;")?
+        .l()?;
+    let data_type = if env
+        .call_method(&data_type_obj, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let j_data_type: JObject = env
+            .call_method(data_type_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let jstring: JString = env
+            .call_method(j_data_type, "toString", "()Ljava/lang/String;", &[])?
+            .l()?
+            .into();
+        let data_type_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
+        DataType::from_str(&data_type_str)
+            .map_err(|e| Error::input_error(e.to_string()))
+            .ok()
+    } else {
+        None
     };
 
     Ok(ColumnAlteration {
@@ -764,15 +795,14 @@ fn create_column_alteration_from_jni_map(env: &mut JNIEnv, map: JMap) -> Result<
 fn inner_alter_columns(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    column_alterations_obj: JObject, // List<Map<String, String>>
+    column_alterations_obj: JObject, // List<ColumnAlteration>
 ) -> Result<()> {
     let list = env.get_list(&column_alterations_obj)?;
     let mut iter = list.iter(env)?;
     let mut column_alterations = Vec::new();
 
     while let Some(elem) = iter.next(env)? {
-        let map = JMap::from_env(env, &elem)?;
-        let alteration = create_column_alteration_from_jni_map(env, map)?;
+        let alteration = create_column_alteration(env, elem)?;
         column_alterations.push(alteration);
     }
 
