@@ -11,7 +11,7 @@ import random
 import time
 import uuid
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
     TypedDict,
     Union,
 )
@@ -49,9 +50,6 @@ from .lance import (
     CleanupStats,
     _Dataset,
     _MergeInsertBuilder,
-    _Operation,
-    _RewriteGroup,
-    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
@@ -105,9 +103,35 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         return super(MergeInsertBuilder, self).execute(reader)
 
+    def execute_uncommitted(
+        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
+    ) -> Tuple[Transaction, Dict[str, Any]]:
+        """Executes the merge insert operation without committing
+
+        This function updates the original dataset and returns a dictionary with
+        information about merge statistics - i.e. the number of inserted, updated,
+        and deleted rows.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
+        reader = _coerce_reader(data_obj, schema)
+
+        return super(MergeInsertBuilder, self).execute_uncommitted(reader)
+
     # These next three overrides exist only to document the methods
 
-    def when_matched_update_all(self, condition: Optional[str] = None):
+    def when_matched_update_all(
+        self, condition: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to update matched rows
 
@@ -128,7 +152,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
-    def when_not_matched_insert_all(self):
+    def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows
 
@@ -138,7 +162,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_not_matched_insert_all()
 
-    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+    def when_not_matched_by_source_delete(
+        self, expr: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to delete source rows that do not match
 
@@ -2149,7 +2175,7 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def commit(
         base_uri: Union[str, Path, LanceDataset],
-        operation: LanceOperation.BaseOperation,
+        operation: Union[LanceOperation.BaseOperation, Transaction],
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -2254,24 +2280,44 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        if read_version is None and not isinstance(
-            operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+        if (
+            isinstance(operation, LanceOperation.BaseOperation)
+            and read_version is None
+            and not isinstance(
+                operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+            )
         ):
             raise ValueError(
                 "read_version is required for all operations except "
                 "Overwrite and Restore"
             )
 
-        new_ds = _Dataset.commit(
-            base_uri,
-            operation._to_inner(),
-            read_version,
-            commit_lock,
-            storage_options=storage_options,
-            enable_v2_manifest_paths=enable_v2_manifest_paths,
-            detached=detached,
-            max_retries=max_retries,
-        )
+        if isinstance(operation, Transaction):
+            new_ds = _Dataset.commit_transaction(
+                base_uri,
+                operation,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        elif isinstance(operation, LanceOperation.BaseOperation):
+            new_ds = _Dataset.commit(
+                base_uri,
+                operation,
+                read_version,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        else:
+            raise TypeError(
+                "operation must be a LanceOperation.BaseOperation or Transaction, "
+                f"got {type(operation)}"
+            )
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
         ds._ds = new_ds
@@ -2363,19 +2409,6 @@ class LanceDataset(pa.dataset.Dataset):
             detached=detached,
             max_retries=max_retries,
         )
-        merged = Transaction(**merged)
-        # This logic is specific to append, which is all that should
-        # be returned here.
-        # TODO: generalize this to all other transaction types.
-        merged.operation["fragments"] = [
-            FragmentMetadata.from_metadata(f) for f in merged.operation["fragments"]
-        ]
-        merged.operation = LanceOperation.Append(**merged.operation)
-        if merged.blobs_op:
-            merged.blobs_op["fragments"] = [
-                FragmentMetadata.from_metadata(f) for f in merged.blobs_op["fragments"]
-            ]
-            merged.blobs_op = LanceOperation.Append(**merged.blobs_op)
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
@@ -2461,10 +2494,6 @@ class LanceOperation:
         See available operations under :class:`LanceOperation`.
         """
 
-        @abstractmethod
-        def _to_inner(self):
-            raise NotImplementedError()
-
     @dataclass
     class Overwrite(BaseOperation):
         """
@@ -2508,7 +2537,7 @@ class LanceOperation:
         3  4  d
         """
 
-        new_schema: pa.Schema
+        new_schema: LanceSchema | pa.Schema
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
@@ -2517,10 +2546,6 @@ class LanceOperation:
                     f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
                 )
             LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
-            return _Operation.overwrite(self.new_schema, raw_fragments)
 
     @dataclass
     class Append(BaseOperation):
@@ -2567,10 +2592,6 @@ class LanceOperation:
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
-            return _Operation.append(raw_fragments)
 
     @dataclass
     class Delete(BaseOperation):
@@ -2640,11 +2661,27 @@ class LanceOperation:
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
 
-        def _to_inner(self):
-            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
-            return _Operation.delete(
-                raw_updated_fragments, self.deleted_fragment_ids, self.predicate
-            )
+    @dataclass
+    class Update(BaseOperation):
+        """
+        Operation that updates rows in the dataset.
+        Attributes
+        ----------
+        removed_fragment_ids: list[int]
+            The ids of the fragments that have been removed entirely.
+        updated_fragments: list[FragmentMetadata]
+            The fragments that have been updated with new deletion vectors.
+        new_fragments: list[FragmentMetadata]
+            The fragments that contain the new rows.
+        """
+
+        removed_fragment_ids: List[int]
+        updated_fragments: List[FragmentMetadata]
+        new_fragments: List[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.updated_fragments)
+            LanceOperation._validate_fragments(self.new_fragments)
 
     @dataclass
     class Merge(BaseOperation):
@@ -2706,10 +2743,6 @@ class LanceOperation:
         schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
-            LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
             if isinstance(self.schema, pa.Schema):
                 warnings.warn(
                     "Passing a pyarrow.Schema to Merge is deprecated. "
@@ -2717,7 +2750,7 @@ class LanceOperation:
                     DeprecationWarning,
                 )
                 self.schema = LanceSchema.from_pyarrow(self.schema)
-            return _Operation.merge(raw_fragments, self.schema)
+            LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
     class Restore(BaseOperation):
@@ -2726,9 +2759,6 @@ class LanceOperation:
         """
 
         version: int
-
-        def _to_inner(self):
-            return _Operation.restore(self.version)
 
     @dataclass
     class RewriteGroup:
@@ -2739,11 +2769,6 @@ class LanceOperation:
         old_fragments: Iterable[FragmentMetadata]
         new_fragments: Iterable[FragmentMetadata]
 
-        def _to_inner(self):
-            old_fragments = [f._metadata for f in self.old_fragments]
-            new_fragments = [f._metadata for f in self.new_fragments]
-            return _RewriteGroup(old_fragments, new_fragments)
-
     @dataclass
     class RewrittenIndex:
         """
@@ -2752,9 +2777,6 @@ class LanceOperation:
 
         old_id: str
         new_id: str
-
-        def _to_inner(self):
-            return _RewrittenIndex(self.old_id, self.new_id)
 
     @dataclass
     class Rewrite(BaseOperation):
@@ -2782,11 +2804,6 @@ class LanceOperation:
             all_frags += [new for group in self.groups for new in group.new_fragments]
             LanceOperation._validate_fragments(all_frags)
 
-        def _to_inner(self):
-            groups = [group._to_inner() for group in self.groups]
-            rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
-            return _Operation.rewrite(groups, rewritten_indices)
-
     @dataclass
     class CreateIndex(BaseOperation):
         """
@@ -2798,15 +2815,6 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
-
-        def _to_inner(self):
-            return _Operation.create_index(
-                self.uuid,
-                self.name,
-                self.fields,
-                self.dataset_version,
-                self.fragment_ids,
-            )
 
 
 class ScannerBuilder:

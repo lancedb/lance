@@ -24,15 +24,17 @@ use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::transaction::Operation;
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
 use lance::Error;
-use lance_table::format::{DataFile as LanceDataFile, Fragment as LanceFragmentMetadata};
+use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
-use pyo3::prelude::*;
-use pyo3::{exceptions::*, pyclass::CompareOp, types::PyDict};
+use object_store::path::Path;
+use pyo3::{exceptions::*, types::PyDict};
+use pyo3::{intern, prelude::*};
 use snafu::{location, Location};
 
 use crate::dataset::{get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
+use crate::utils::{export_vec, extract_vec, PyLance};
 use crate::{Dataset, Scanner, RT};
 
 #[pyclass(name = "_Fragment", module = "_lib")]
@@ -80,13 +82,13 @@ impl FileFragment {
         filename: &str,
         dataset: &Dataset,
         fragment_id: usize,
-    ) -> PyResult<FragmentMetadata> {
+    ) -> PyResult<PyLance<Fragment>> {
         let metadata = RT.block_on(None, async {
             LanceFragment::create_from_file(filename, dataset.ds.as_ref(), fragment_id, None)
                 .await
                 .map_err(|err| PyIOError::new_err(err.to_string()))
         })??;
-        Ok(FragmentMetadata::new(metadata))
+        Ok(PyLance(metadata))
     }
 
     #[staticmethod]
@@ -96,7 +98,7 @@ impl FileFragment {
         fragment_id: Option<usize>,
         reader: &Bound<PyAny>,
         kwargs: Option<&PyDict>,
-    ) -> PyResult<FragmentMetadata> {
+    ) -> PyResult<PyLance<Fragment>> {
         let params = if let Some(kw_params) = kwargs {
             get_write_params(kw_params)?
         } else {
@@ -112,7 +114,7 @@ impl FileFragment {
                         .await
                         .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-                Ok(FragmentMetadata::new(metadata))
+                Ok(PyLance(metadata))
             })
         })
     }
@@ -121,8 +123,8 @@ impl FileFragment {
         self.fragment.id()
     }
 
-    pub fn metadata(&self) -> FragmentMetadata {
-        FragmentMetadata::new(self.fragment.metadata().clone())
+    pub fn metadata(&self) -> PyLance<Fragment> {
+        PyLance(self.fragment.metadata().clone())
     }
 
     #[pyo3(signature=(_filter=None))]
@@ -223,7 +225,7 @@ impl FileFragment {
         &mut self,
         reader: &Bound<PyAny>,
         batch_size: Option<u32>,
-    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+    ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
 
         let transforms = NewColumnTransform::Reader(Box::new(batches));
@@ -235,7 +237,7 @@ impl FileFragment {
             })?
             .infer_error()?;
 
-        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
+        Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
     #[pyo3(signature=(transforms, read_columns=None, batch_size=None))]
@@ -244,7 +246,7 @@ impl FileFragment {
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
-    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+    ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let transforms = transforms_from_python(transforms)?;
 
         let fragment = self.fragment.clone();
@@ -256,7 +258,7 @@ impl FileFragment {
             })?
             .infer_error()?;
 
-        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
+        Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
@@ -278,13 +280,13 @@ impl FileFragment {
     }
 
     /// Returns the data file objects associated with this fragment.
-    fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<DataFile>> {
-        let data_files: Vec<DataFile> = self_
+    fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<PyLance<DataFile>>> {
+        let data_files: Vec<_> = self_
             .fragment
             .metadata()
             .files
             .iter()
-            .map(|f| DataFile::new(f.clone()))
+            .map(|f| PyLance(f.clone()))
             .collect();
         Ok(data_files)
     }
@@ -314,160 +316,13 @@ impl From<FileFragment> for LanceFragment {
     }
 }
 
-/// Metadata of a DataFile.
-#[pyclass(name = "_DataFile", module = "_lib")]
-pub struct DataFile {
-    pub(crate) inner: LanceDataFile,
-}
-
-impl DataFile {
-    fn new(inner: LanceDataFile) -> Self {
-        Self { inner }
-    }
-}
-
-#[pymethods]
-impl DataFile {
-    fn __repr__(&self) -> String {
-        format!("DataFile({})", self.path())
-    }
-
-    fn path(&self) -> String {
-        self.inner.path.clone()
-    }
-
-    fn field_ids(&self) -> Vec<i32> {
-        self.inner.fields.clone()
-    }
-
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
-        match op {
-            CompareOp::Eq => Ok(self.inner == other.inner),
-            CompareOp::Ne => Ok(self.inner != other.inner),
-            _ => Err(PyNotImplementedError::new_err(
-                "Only == and != are supported for DataFile",
-            )),
-        }
-    }
-}
-
-#[pyclass(name = "_FragmentMetadata", module = "lance")]
-#[derive(Clone, Debug)]
-pub struct FragmentMetadata {
-    pub(crate) inner: LanceFragmentMetadata,
-}
-
-impl FragmentMetadata {
-    pub(crate) fn new(inner: LanceFragmentMetadata) -> Self {
-        Self { inner }
-    }
-}
-
-#[pymethods]
-impl FragmentMetadata {
-    #[new]
-    fn init() -> Self {
-        Self {
-            inner: LanceFragmentMetadata::new(0),
-        }
-    }
-
-    #[staticmethod]
-    fn from_json(json: &str) -> PyResult<Self> {
-        let metadata = LanceFragmentMetadata::from_json(json).map_err(|err| {
-            PyValueError::new_err(format!("Invalid metadata json payload: {json}: {}", err))
-        })?;
-
-        Ok(Self { inner: metadata })
-    }
-
-    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
-        match op {
-            CompareOp::Lt => Ok(self.inner.id < other.inner.id),
-            CompareOp::Le => Ok(self.inner.id <= other.inner.id),
-            CompareOp::Eq => Ok(self.inner == other.inner),
-            CompareOp::Ne => self.__richcmp__(other, CompareOp::Eq).map(|v| !v),
-            CompareOp::Gt => self.__richcmp__(other, CompareOp::Le).map(|v| !v),
-            CompareOp::Ge => self.__richcmp__(other, CompareOp::Lt).map(|v| !v),
-        }
-    }
-
-    fn __repr__(&self) -> String {
-        format!("{:?}", self.inner)
-    }
-
-    fn json(self_: PyRef<'_, Self>) -> PyResult<String> {
-        let json = serde_json::to_string(&self_.inner).map_err(|e| {
-            PyValueError::new_err(format!("Unable to serialize FragmentMetadata: {}", e))
-        })?;
-        Ok(json)
-    }
-
-    /// Returns the data file objects associated with this fragment.
-    fn data_files(self_: PyRef<'_, Self>) -> PyResult<Vec<DataFile>> {
-        let data_files: Vec<DataFile> = self_
-            .inner
-            .files
-            .iter()
-            .map(|f| DataFile::new(f.clone()))
-            .collect();
-        Ok(data_files)
-    }
-
-    fn deletion_file(&self) -> PyResult<Option<String>> {
-        let deletion = self.inner.deletion_file.clone();
-        Ok(
-            deletion
-                .map(|d| deletion_file_path(&Default::default(), self.inner.id, &d).to_string()),
-        )
-    }
-
-    /// Get the physical rows statistic.
-    ///
-    /// This represents the original number of rows in the fragment
-    /// before any deletions.
-    ///
-    /// If this is None, it is unavailable.
-    #[getter]
-    fn physical_rows(&self) -> Option<usize> {
-        self.inner.physical_rows
-    }
-
-    /// Get the number of tombstoned rows in the fragment.
-    ///
-    /// If this is None, this statistic is unavailable. It does not necessarily
-    /// mean there are no deletions.
-    #[getter]
-    fn num_deletions(&self) -> Option<usize> {
-        self.inner
-            .deletion_file
-            .as_ref()
-            .and_then(|d| d.num_deleted_rows)
-    }
-
-    /// Get the number of rows in the fragment.
-    ///
-    /// This is equivalent to physical_rows minus num_deletions.
-    ///
-    /// If this is None, this statistic is unavailable.
-    #[getter]
-    fn num_rows(&self) -> Option<usize> {
-        self.inner.num_rows()
-    }
-
-    #[getter]
-    fn id(&self) -> u64 {
-        self.inner.id
-    }
-}
-
 #[pyfunction(name = "_write_fragments")]
 #[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
     dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
-) -> PyResult<Vec<FragmentMetadata>> {
+) -> PyResult<Vec<PyObject>> {
     let batches = convert_reader(reader)?;
 
     let params = kwargs
@@ -507,10 +362,7 @@ pub fn write_fragments(
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
-    fragments
-        .into_iter()
-        .map(|f| Ok(FragmentMetadata::new(f)))
-        .collect()
+    Ok(export_vec(reader.py(), &fragments))
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -527,5 +379,193 @@ fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader +
         Ok(Box::new(ArrowArrayStreamReader::from_pyarrow_bound(
             reader,
         )?))
+    }
+}
+
+#[pyclass(name = "DeletionFile", module = "lance.fragment")]
+pub struct PyDeletionFile(pub DeletionFile);
+
+#[pymethods]
+impl PyDeletionFile {
+    #[new]
+    fn new(read_version: u64, id: u64, file_type: &str, num_deleted_rows: usize) -> PyResult<Self> {
+        let file_type = match file_type {
+            "array" => DeletionFileType::Array,
+            "bitmap" => DeletionFileType::Bitmap,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "file_type must be either 'array' or 'bitmap', got '{}'",
+                    file_type
+                )))
+            }
+        };
+        Ok(Self(DeletionFile {
+            read_version,
+            id,
+            file_type,
+            num_deleted_rows: Some(num_deleted_rows),
+        }))
+    }
+
+    fn asdict(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyDict>> {
+        let dict = PyDict::new_bound(slf.py());
+
+        dict.set_item(intern!(slf.py(), "read_version"), slf.0.read_version)?;
+        dict.set_item(intern!(slf.py(), "id"), slf.0.id)?;
+        dict.set_item(intern!(slf.py(), "file_type"), slf.file_type())?;
+        dict.set_item(
+            intern!(slf.py(), "num_deleted_rows"),
+            slf.0.num_deleted_rows,
+        )?;
+
+        Ok(dict)
+    }
+
+    fn __repr__(&self) -> String {
+        let mut repr = "DeletionFile(".to_string();
+        write!(repr, "type='{}'", self.file_type()).unwrap();
+        if let Some(num_deleted_rows) = self.0.num_deleted_rows {
+            write!(repr, ", num_deleted_rows={}", num_deleted_rows).unwrap();
+        }
+        write!(repr, ")").unwrap();
+        repr
+    }
+
+    #[getter]
+    fn read_version(&self) -> u64 {
+        self.0.read_version
+    }
+
+    #[getter]
+    fn id(&self) -> u64 {
+        self.0.id
+    }
+
+    #[getter]
+    fn num_deleted_rows(&self) -> Option<usize> {
+        self.0.num_deleted_rows
+    }
+
+    #[getter]
+    fn file_type(&self) -> &str {
+        match self.0.file_type {
+            DeletionFileType::Array => "array",
+            DeletionFileType::Bitmap => "bitmap",
+        }
+    }
+
+    #[pyo3(signature = (fragment_id, base_uri=None))]
+    fn path(&self, fragment_id: u64, base_uri: Option<&str>) -> PyResult<String> {
+        let base_path = if let Some(base_uri) = base_uri {
+            Path::from_url_path(base_uri).map_err(|e| {
+                PyValueError::new_err(format!("Invalid base URI: {}: {}", base_uri, e))
+            })?
+        } else {
+            Path::default()
+        };
+        Ok(deletion_file_path(&base_path, fragment_id, &self.0).to_string())
+    }
+}
+
+#[pyclass(name = "RowIdMeta", module = "lance.fragment")]
+pub struct PyRowIdMeta(pub RowIdMeta);
+
+#[pymethods]
+impl PyRowIdMeta {
+    fn asdict(&self) -> PyResult<Bound<'_, PyDict>> {
+        Err(PyNotImplementedError::new_err(
+            "PyRowIdMeta.asdict is not yet supported.s",
+        ))
+    }
+}
+
+impl FromPyObject<'_> for PyLance<Fragment> {
+    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+        let files = extract_vec(&ob.getattr("files")?)?;
+
+        let deletion_file: Option<PyRef<PyDeletionFile>> =
+            ob.getattr("deletion_file")?.extract()?;
+        let deletion_file = deletion_file.map(|f| f.0.clone());
+
+        let row_id_meta: Option<PyRef<PyRowIdMeta>> = ob.getattr("row_id_meta")?.extract()?;
+        let row_id_meta = row_id_meta.map(|r| r.0.clone());
+
+        Ok(Self(Fragment {
+            id: ob.getattr("id")?.extract()?,
+            files,
+            deletion_file,
+            physical_rows: ob.getattr("physical_rows")?.extract()?,
+            row_id_meta,
+        }))
+    }
+}
+
+impl ToPyObject for PyLance<&Fragment> {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        let cls = py
+            .import_bound(intern!(py, "lance.fragment"))
+            .and_then(|m| m.getattr("FragmentMetadata"))
+            .expect("FragmentMetadata class not found");
+
+        let files = export_vec(py, &self.0.files);
+        let deletion_file = self
+            .0
+            .deletion_file
+            .as_ref()
+            .map(|f| PyDeletionFile(f.clone()));
+        let row_id_meta = self.0.row_id_meta.as_ref().map(|r| PyRowIdMeta(r.clone()));
+
+        cls.call1((
+            self.0.id,
+            files,
+            self.0.physical_rows,
+            deletion_file,
+            row_id_meta,
+        ))
+        .unwrap()
+        .to_object(py)
+    }
+}
+
+impl ToPyObject for PyLance<Fragment> {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        PyLance(&self.0).to_object(py)
+    }
+}
+
+impl FromPyObject<'_> for PyLance<DataFile> {
+    fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
+        Ok(Self(DataFile {
+            path: ob.getattr("path")?.extract()?,
+            fields: ob.getattr("fields")?.extract()?,
+            column_indices: ob.getattr("column_indices")?.extract()?,
+            file_major_version: ob.getattr("file_major_version")?.extract()?,
+            file_minor_version: ob.getattr("file_minor_version")?.extract()?,
+        }))
+    }
+}
+
+impl ToPyObject for PyLance<&DataFile> {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        let cls = py
+            .import_bound(intern!(py, "lance.fragment"))
+            .and_then(|m| m.getattr("DataFile"))
+            .expect("DataFile class not found");
+
+        cls.call1((
+            &self.0.path,
+            self.0.fields.clone(),
+            self.0.column_indices.clone(),
+            self.0.file_major_version,
+            self.0.file_minor_version,
+        ))
+        .unwrap()
+        .to_object(py)
+    }
+}
+
+impl ToPyObject for PyLance<DataFile> {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        PyLance(&self.0).to_object(py)
     }
 }
