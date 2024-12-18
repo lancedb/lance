@@ -1232,6 +1232,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+
+        Use `when_matched_update_all()` and `when_not_matched_insert_all()` to
+        perform an "upsert" operation.  This will update rows that already exist
+        in the dataset and insert rows that do not exist.
+
         >>> import lance
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
@@ -1249,6 +1254,51 @@ class LanceDataset(pa.dataset.Dataset):
         1  2  x
         2  3  y
         3  4  z
+
+        Use `when_not_matched_insert_all()` to perform an "insert if not exists"
+        operation.  This will only insert rows that do not already exist in the
+        dataset.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example2")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform an "insert if not exists" operation
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 0, 'num_deleted_rows': 0}
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  z
+
+        You are not required to provide all the columns. If you only want to
+        update a subset of columns, you can omit columns you don't want to
+        update. Omitted columns will keep their existing values if they are
+        updated, or will be null if they are inserted.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"], \\
+        ...                   "c": ["x", "y", "z"]})
+        >>> dataset = lance.write_dataset(table, "example3")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform an "upsert" operation, only updating column "a"
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_matched_update_all()     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b     c
+        0  1  a     x
+        1  2  x     y
+        2  3  y     z
+        3  4  z  None
         """
         return MergeInsertBuilder(self._ds, on)
 

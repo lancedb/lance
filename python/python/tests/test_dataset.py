@@ -1403,6 +1403,29 @@ def test_merge_insert_subcols(tmp_path: Path):
         original_fragments[1].data_files()[0]
     )
 
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
@@ -1562,34 +1585,6 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
     check_merge_stats(merge_dict, (0, 350, 0))
-
-
-def test_merge_insert_incompatible_schema(tmp_path: Path):
-    nrows = 1000
-    table = pa.Table.from_pydict(
-        {
-            "a": range(nrows),
-            "b": [1 for _ in range(nrows)],
-        }
-    )
-    dataset = lance.write_dataset(
-        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
-    )
-
-    new_table = pa.Table.from_pydict(
-        {
-            "a": range(300, 300 + nrows),
-        }
-    )
-
-    with pytest.raises(OSError):
-        merge_dict = (
-            dataset.merge_insert("a")
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(new_table)
-        )
-        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_merge_insert_vector_column(tmp_path: Path):
