@@ -29,7 +29,6 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -246,10 +245,14 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       dataset = testDataset.createEmptyDataset();
       assertEquals(testDataset.getSchema(), dataset.getSchema());
-      ColumnAlteration nameColumnAlteration = new ColumnAlteration("name");
-      nameColumnAlteration.setRename(Optional.of("new_name"));
-      nameColumnAlteration.setNullable(Optional.of(Boolean.TRUE));
-      nameColumnAlteration.setDataType(Optional.of(new ArrowType.Utf8()));
+
+      ColumnAlteration nameColumnAlteration =
+          new ColumnAlteration.Builder("name")
+              .rename("new_name")
+              .nullable(true)
+              .castTo(new ArrowType.Utf8())
+              .build();
+
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
 
       Schema changedSchema =
@@ -266,10 +269,11 @@ public class DatasetTest {
               .map(Field::getName)
               .collect(Collectors.toList()));
 
-      nameColumnAlteration = new ColumnAlteration();
-      nameColumnAlteration.setPath("new_name");
-      nameColumnAlteration.setRename(Optional.of("new_name_2"));
-      nameColumnAlteration.setDataType(Optional.of(new ArrowType.LargeUtf8()));
+      nameColumnAlteration =
+          new ColumnAlteration.Builder("new_name")
+              .rename("new_name_2")
+              .castTo(new ArrowType.LargeUtf8())
+              .build();
 
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       changedSchema =
@@ -286,8 +290,8 @@ public class DatasetTest {
               .map(Field::getName)
               .collect(Collectors.toList()));
 
-      nameColumnAlteration = new ColumnAlteration();
-      nameColumnAlteration.setPath("new_name_2");
+      nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       assertNotNull(dataset.getSchema().findField("new_name_2"));
     }
   }

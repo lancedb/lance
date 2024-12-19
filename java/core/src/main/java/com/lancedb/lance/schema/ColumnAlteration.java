@@ -14,22 +14,17 @@ package com.lancedb.lance.schema;
 
 import org.apache.arrow.vector.types.pojo.ArrowType;
 
-import java.io.Serializable;
 import java.util.Optional;
 
 /** Column alteration used to alter dataset columns. */
-public class ColumnAlteration implements Serializable {
+public class ColumnAlteration {
 
   private String path;
   private Optional<String> rename;
   private Optional<Boolean> nullable;
   private Optional<ArrowType> dataType;
 
-  public ColumnAlteration() {
-    this("");
-  }
-
-  public ColumnAlteration(String path) {
+  private ColumnAlteration(String path) {
     this.path = path;
     this.rename = Optional.empty();
     this.nullable = Optional.empty();
@@ -52,19 +47,30 @@ public class ColumnAlteration implements Serializable {
     return dataType;
   }
 
-  public void setPath(String path) {
-    this.path = path;
-  }
+  public static class Builder {
+    private final ColumnAlteration columnAlteration;
 
-  public void setRename(Optional<String> rename) {
-    this.rename = rename;
-  }
+    public Builder(String path) {
+      this.columnAlteration = new ColumnAlteration(path);
+    }
 
-  public void setNullable(Optional<Boolean> nullable) {
-    this.nullable = nullable;
-  }
+    public Builder rename(String rename) {
+      this.columnAlteration.rename = Optional.of(rename);
+      return this;
+    }
 
-  public void setDataType(Optional<ArrowType> dataType) {
-    this.dataType = dataType;
+    public Builder nullable(boolean nullable) {
+      this.columnAlteration.nullable = Optional.of(nullable);
+      return this;
+    }
+
+    public Builder castTo(ArrowType dataType) {
+      this.columnAlteration.dataType = Optional.of(dataType);
+      return this;
+    }
+
+    public ColumnAlteration build() {
+      return columnAlteration;
+    }
   }
 }
