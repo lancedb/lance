@@ -4,8 +4,8 @@
 //! Lance Schema Field
 
 use std::{
-    cmp::max,
-    collections::HashMap,
+    cmp::{max, Ordering},
+    collections::{HashMap, VecDeque},
     fmt::{self, Display},
     str::FromStr,
     sync::Arc,
@@ -25,7 +25,7 @@ use snafu::{location, Location};
 
 use super::{
     schema::{compare_fields, explain_fields_difference},
-    Dictionary, LogicalType,
+    Dictionary, LogicalType, Projection,
 };
 use crate::{Error, Result};
 
@@ -108,6 +108,13 @@ impl FromStr for StorageClass {
     }
 }
 
+/// What to do on a merge operation if the types of the fields don't match
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub enum OnTypeMismatch {
+    TakeSelf,
+    Error,
+}
+
 /// Lance Schema Field
 ///
 #[derive(Debug, Clone, PartialEq, DeepSizeOf)]
@@ -160,6 +167,106 @@ impl Field {
 
     pub fn storage_class(&self) -> StorageClass {
         self.storage_class
+    }
+
+    /// Merge a field with another field using a reference field to ensure
+    /// the correct order of fields
+    ///
+    /// For each child in the reference field we look for a matching child
+    /// in self and other.
+    ///
+    /// If we find a match in both we recursively merge the children.
+    /// If we find a match in one but not the other we take the matching child.
+    ///
+    /// Primitive fields we simply clone self and return.
+    ///
+    /// Matches are determined using field names and so ids are not required.
+    pub fn merge_with_reference(&self, other: &Self, reference: &Self) -> Self {
+        let mut new_children = Vec::with_capacity(reference.children.len());
+        let mut self_children_itr = self.children.iter().peekable();
+        let mut other_children_itr = other.children.iter().peekable();
+        for ref_child in &reference.children {
+            match (self_children_itr.peek(), other_children_itr.peek()) {
+                (Some(&only_child), None) => {
+                    // other is exhausted so just check if self matches
+                    if only_child.name == ref_child.name {
+                        new_children.push(only_child.clone());
+                        self_children_itr.next();
+                    }
+                }
+                (None, Some(&only_child)) => {
+                    // Self is exhausted so just check if other matches
+                    if only_child.name == ref_child.name {
+                        new_children.push(only_child.clone());
+                        other_children_itr.next();
+                    }
+                }
+                (Some(&self_child), Some(&other_child)) => {
+                    // Both iterators have potential, see if any match
+                    match (
+                        ref_child.name.cmp(&self_child.name),
+                        ref_child.name.cmp(&other_child.name),
+                    ) {
+                        (Ordering::Equal, Ordering::Equal) => {
+                            // Both match, recursively merge
+                            new_children
+                                .push(self_child.merge_with_reference(other_child, ref_child));
+                            self_children_itr.next();
+                            other_children_itr.next();
+                        }
+                        (Ordering::Equal, _) => {
+                            // Self matches, other doesn't, use self as-is
+                            new_children.push(self_child.clone());
+                            self_children_itr.next();
+                        }
+                        (_, Ordering::Equal) => {
+                            // Other matches, self doesn't, use other as-is
+                            new_children.push(other_child.clone());
+                            other_children_itr.next();
+                        }
+                        _ => {
+                            // Neither match, field is projected out
+                        }
+                    }
+                }
+                (None, None) => {
+                    // Both iterators are exhausted, we can quit, all remaining fields projected out
+                    break;
+                }
+            }
+        }
+        Self {
+            children: new_children,
+            ..self.clone()
+        }
+    }
+
+    pub fn apply_projection(&self, projection: &Projection) -> Option<Self> {
+        let children = self
+            .children
+            .iter()
+            .filter_map(|c| c.apply_projection(projection))
+            .collect::<Vec<_>>();
+
+        // The following case is invalid:
+        // - This is a nested field (has children)
+        // - All children were projected away
+        // - Caller is asking for the parent field
+        assert!(
+            // One of the following must be true
+            !children.is_empty() // Some children were projected
+                || !projection.contains_field_id(self.id) // Caller is not asking for this field
+                || self.children.is_empty() // This isn't a nested field
+        );
+
+        if children.is_empty() && !projection.contains_field_id(self.id) {
+            None
+        } else {
+            Some(Self {
+                children,
+                ..self.clone()
+            })
+        }
     }
 
     pub(crate) fn explain_differences(
@@ -456,7 +563,7 @@ impl Field {
 
     /// Project by a field.
     ///
-    pub fn project_by_field(&self, other: &Self) -> Result<Self> {
+    pub fn project_by_field(&self, other: &Self, on_type_mismatch: OnTypeMismatch) -> Result<Self> {
         if self.name != other.name {
             return Err(Error::Schema {
                 message: format!(
@@ -496,7 +603,7 @@ impl Field {
                             location: location!(),
                         });
                     };
-                    fields.push(child.project_by_field(other_field)?);
+                    fields.push(child.project_by_field(other_field, on_type_mismatch)?);
                 }
                 let mut cloned = self.clone();
                 cloned.children = fields;
@@ -504,7 +611,8 @@ impl Field {
             }
             (DataType::List(_), DataType::List(_))
             | (DataType::LargeList(_), DataType::LargeList(_)) => {
-                let projected = self.children[0].project_by_field(&other.children[0])?;
+                let projected =
+                    self.children[0].project_by_field(&other.children[0], on_type_mismatch)?;
                 let mut cloned = self.clone();
                 cloned.children = vec![projected];
                 Ok(cloned)
@@ -524,13 +632,33 @@ impl Field {
             {
                 Ok(self.clone())
             }
-            _ => Err(Error::Schema {
-                message: format!(
-                    "Attempt to project incompatible fields: {} and {}",
-                    self, other
-                ),
-                location: location!(),
-            }),
+            _ => match on_type_mismatch {
+                OnTypeMismatch::Error => Err(Error::Schema {
+                    message: format!(
+                        "Attempt to project incompatible fields: {} and {}",
+                        self, other
+                    ),
+                    location: location!(),
+                }),
+                OnTypeMismatch::TakeSelf => Ok(self.clone()),
+            },
+        }
+    }
+
+    pub(crate) fn resolve<'a>(
+        &'a self,
+        split: &mut VecDeque<&str>,
+        fields: &mut Vec<&'a Self>,
+    ) -> bool {
+        fields.push(self);
+        if split.is_empty() {
+            return true;
+        }
+        let first = split.pop_front().unwrap();
+        if let Some(child) = self.children.iter().find(|c| c.name == first) {
+            child.resolve(split, fields)
+        } else {
+            false
         }
     }
 
@@ -970,19 +1098,19 @@ mod tests {
         let f2: Field = ArrowField::new("a", DataType::Null, true)
             .try_into()
             .unwrap();
-        let p1 = f1.project_by_field(&f2).unwrap();
+        let p1 = f1.project_by_field(&f2, OnTypeMismatch::Error).unwrap();
 
         assert_eq!(p1, f1);
 
         let f3: Field = ArrowField::new("b", DataType::Null, true)
             .try_into()
             .unwrap();
-        assert!(f1.project_by_field(&f3).is_err());
+        assert!(f1.project_by_field(&f3, OnTypeMismatch::Error).is_err());
 
         let f4: Field = ArrowField::new("a", DataType::Int32, true)
             .try_into()
             .unwrap();
-        assert!(f1.project_by_field(&f4).is_err());
+        assert!(f1.project_by_field(&f4, OnTypeMismatch::Error).is_err());
     }
 
     #[test]

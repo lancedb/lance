@@ -4,8 +4,9 @@
 //! Schema
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self, Debug, Formatter},
+    sync::Arc,
 };
 
 use arrow_array::RecordBatch;
@@ -14,8 +15,8 @@ use deepsize::DeepSizeOf;
 use lance_arrow::*;
 use snafu::{location, Location};
 
-use super::field::{Field, SchemaCompareOptions, StorageClass};
-use crate::{Error, Result};
+use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
+use crate::{Error, Result, ROW_ADDR, ROW_ID};
 
 /// Lance Schema.
 #[derive(Default, Debug, Clone, DeepSizeOf)]
@@ -150,6 +151,26 @@ impl Schema {
     /// This is intended for display purposes and not for serialization.
     pub fn to_compact_string(&self, indent: Indentation) -> String {
         ArrowSchema::from(self).to_compact_string(indent)
+    }
+
+    /// Given a string column reference, resolve the path of fields
+    ///
+    /// For example, given a.b.c we will return the fields [a, b, c]
+    ///
+    /// Returns None if we can't find a segment at any point
+    pub fn resolve(&self, column: impl AsRef<str>) -> Option<Vec<&Field>> {
+        let mut split = column.as_ref().split('.').collect::<VecDeque<_>>();
+        let mut fields = Vec::with_capacity(split.len());
+        let first = split.pop_front().unwrap();
+        if let Some(field) = self.field(first) {
+            if field.resolve(&mut split, &mut fields) {
+                Some(fields)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     fn do_project<T: AsRef<str>>(&self, columns: &[T], err_on_missing: bool) -> Result<Self> {
@@ -304,13 +325,15 @@ impl Schema {
     pub fn project_by_schema<S: TryInto<Self, Error = Error>>(
         &self,
         projection: S,
+        on_missing: OnMissing,
+        on_type_mismatch: OnTypeMismatch,
     ) -> Result<Self> {
         let projection = projection.try_into()?;
         let mut new_fields = vec![];
         for field in projection.fields.iter() {
             if let Some(self_field) = self.field(&field.name) {
-                new_fields.push(self_field.project_by_field(field)?);
-            } else {
+                new_fields.push(self_field.project_by_field(field, on_type_mismatch)?);
+            } else if matches!(on_missing, OnMissing::Error) {
                 return Err(Error::Schema {
                     message: format!("Field {} not found", field.name),
                     location: location!(),
@@ -750,6 +773,248 @@ fn explain_metadata_difference(
     }
 }
 
+/// What to do when a column is missing in the schema
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnMissing {
+    Error,
+    Ignore,
+}
+
+/// A trait for something that we can project fields from.
+pub trait Projectable: Debug + Send + Sync {
+    fn schema(&self) -> &Schema;
+}
+
+impl Projectable for Schema {
+    fn schema(&self) -> &Schema {
+        self
+    }
+}
+
+/// A projection is a selection of fields in a schema
+///
+/// In addition we record whether the row_id or row_addr are
+/// selected (these fields have no field id)
+#[derive(Clone)]
+pub struct Projection {
+    base: Arc<dyn Projectable>,
+    pub field_ids: HashSet<i32>,
+    pub with_row_id: bool,
+    pub with_row_addr: bool,
+}
+
+impl Debug for Projection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Projection")
+            .field("schema", &self.to_schema())
+            .field("with_row_id", &self.with_row_id)
+            .field("with_row_addr", &self.with_row_addr)
+            .finish()
+    }
+}
+
+impl Projection {
+    /// Create a new empty projection
+    pub fn empty(base: Arc<dyn Projectable>) -> Self {
+        Self {
+            base,
+            field_ids: HashSet::new(),
+            with_row_id: false,
+            with_row_addr: false,
+        }
+    }
+
+    /// Add a column (and any of its parents) to the projection from a string reference
+    pub fn union_column(mut self, column: impl AsRef<str>, on_missing: OnMissing) -> Result<Self> {
+        let column = column.as_ref();
+        if column == ROW_ID {
+            self.with_row_id = true;
+            return Ok(self);
+        } else if column == ROW_ADDR {
+            self.with_row_addr = true;
+            return Ok(self);
+        }
+
+        if let Some(fields) = self.base.schema().resolve(column) {
+            self.field_ids.extend(fields.iter().map(|f| f.id));
+        } else if matches!(on_missing, OnMissing::Error) {
+            return Err(Error::InvalidInput {
+                source: format!("Column {} does not exist", column).into(),
+                location: location!(),
+            });
+        }
+        Ok(self)
+    }
+
+    /// True if the projection selects the given field id
+    pub fn contains_field_id(&self, id: i32) -> bool {
+        self.field_ids.contains(&id)
+    }
+
+    /// Add multiple columns (and their parents) to the projection
+    pub fn union_columns(
+        mut self,
+        columns: impl IntoIterator<Item = impl AsRef<str>>,
+        on_missing: OnMissing,
+    ) -> Result<Self> {
+        for column in columns {
+            self = self.union_column(column, on_missing)?;
+        }
+        Ok(self)
+    }
+
+    /// Adds all fields from the base schema satisfying a predicate
+    pub fn union_predicate(mut self, predicate: impl Fn(&Field) -> bool) -> Self {
+        for field in self.base.schema().fields_pre_order() {
+            if predicate(field) {
+                self.field_ids.insert(field.id);
+            }
+        }
+        self
+    }
+
+    /// Removes all fields in the base schema satisfying a predicate
+    pub fn subtract_predicate(mut self, predicate: impl Fn(&Field) -> bool) -> Self {
+        for field in self.base.schema().fields_pre_order() {
+            if predicate(field) {
+                self.field_ids.remove(&field.id);
+            }
+        }
+        self
+    }
+
+    /// Creates a new projection that is the intersection of this projection and another
+    pub fn intersect(mut self, other: &Self) -> Self {
+        self.field_ids = HashSet::from_iter(self.field_ids.intersection(&other.field_ids).copied());
+        self.with_row_id = self.with_row_id && other.with_row_id;
+        self.with_row_addr = self.with_row_addr && other.with_row_addr;
+        self
+    }
+
+    /// Adds all fields from the provided schema to the projection
+    ///
+    /// Fields are only added if they exist in the base schema, otherwise they
+    /// are ignored.
+    ///
+    /// Will panic if a field in the given schema has a non-negative id and is not in the base schema.
+    pub fn union_schema(mut self, other: &Schema) -> Self {
+        for field in other.fields_pre_order() {
+            if field.id >= 0 {
+                self.field_ids.insert(field.id);
+            } else if field.name == ROW_ID {
+                self.with_row_id = true;
+            } else if field.name == ROW_ADDR {
+                self.with_row_addr = true;
+            } else {
+                // If a field is not in our schema then it should probably have an id of -1.  If it isn't -1
+                // that probably implies some kind of weird schema mixing is going on and we should panic.
+                debug_assert_eq!(field.id, -1);
+            }
+        }
+        self
+    }
+
+    /// Creates a new projection that is the union of this projection and another
+    pub fn union_projection(mut self, other: &Self) -> Self {
+        self.field_ids.extend(&other.field_ids);
+        self.with_row_id = self.with_row_id || other.with_row_id;
+        self.with_row_addr = self.with_row_addr || other.with_row_addr;
+        self
+    }
+
+    /// Adds all fields from the given schema to the projection
+    ///
+    /// on_missing controls what happen to fields that are not in the base schema
+    ///
+    /// Name based matching is used to determine if a field is in the base schema.
+    pub fn union_arrow_schema(
+        mut self,
+        other: &ArrowSchema,
+        on_missing: OnMissing,
+    ) -> Result<Self> {
+        self.with_row_id |= other.fields().iter().any(|f| f.name() == ROW_ID);
+        self.with_row_addr |= other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        let other =
+            self.base
+                .schema()
+                .project_by_schema(other, on_missing, OnTypeMismatch::TakeSelf)?;
+        Ok(self.union_schema(&other))
+    }
+
+    /// Removes all fields from the projection that are in the given schema
+    ///
+    /// on_missing controls what happen to fields that are not in the base schema
+    ///
+    /// Name based matching is used to determine if a field is in the base schema.
+    pub fn subtract_arrow_schema(
+        mut self,
+        other: &ArrowSchema,
+        on_missing: OnMissing,
+    ) -> Result<Self> {
+        self.with_row_id &= !other.fields().iter().any(|f| f.name() == ROW_ID);
+        self.with_row_addr &= !other.fields().iter().any(|f| f.name() == ROW_ADDR);
+        let other =
+            self.base
+                .schema()
+                .project_by_schema(other, on_missing, OnTypeMismatch::TakeSelf)?;
+        Ok(self.subtract_schema(&other))
+    }
+
+    /// Removes all fields from this projection that are present in the given projection
+    pub fn subtract_projection(mut self, other: &Self) -> Self {
+        self.field_ids = self
+            .field_ids
+            .difference(&other.field_ids)
+            .copied()
+            .collect();
+        self.with_row_addr = self.with_row_addr && !other.with_row_addr;
+        self.with_row_id = self.with_row_id && !other.with_row_id;
+        self
+    }
+
+    /// Removes all fields from the projection that are in the given schema
+    ///
+    /// Fields are only removed if they exist in the base schema, otherwise they
+    /// are ignored.
+    ///
+    /// Will panic if a field in the given schema has a non-negative id and is not in the base schema.
+    pub fn subtract_schema(mut self, other: &Schema) -> Self {
+        for field in other.fields_pre_order() {
+            if field.id >= 0 {
+                self.field_ids.remove(&field.id);
+            } else if field.name == ROW_ID {
+                self.with_row_id = false;
+            } else if field.name == ROW_ADDR {
+                self.with_row_addr = false;
+            } else {
+                debug_assert_eq!(field.id, -1);
+            }
+        }
+        self
+    }
+
+    /// True if the projection does not select any fields
+    pub fn is_empty(&self) -> bool {
+        self.field_ids.is_empty()
+    }
+
+    /// Convert the projection to a schema
+    pub fn to_schema(&self) -> Schema {
+        let field_ids = self.field_ids.iter().copied().collect::<Vec<_>>();
+        self.base.schema().project_by_ids(&field_ids, false)
+    }
+
+    /// Convert the projection to a schema
+    pub fn into_schema(self) -> Schema {
+        self.to_schema()
+    }
+
+    /// Convert the projection to a schema reference
+    pub fn into_schema_ref(self) -> Arc<Schema> {
+        Arc::new(self.into_schema())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -921,7 +1186,9 @@ mod tests {
                 false,
             ),
         ]);
-        let projected = schema.project_by_schema(&projection).unwrap();
+        let projected = schema
+            .project_by_schema(&projection, OnMissing::Error, OnTypeMismatch::TakeSelf)
+            .unwrap();
 
         assert_eq!(ArrowSchema::from(&projected), projection);
     }
