@@ -167,8 +167,8 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 | Directory          | Description                               |
 |--------------------|-------------------------------------------|
 | [rust](./rust)     | Core Rust implementation                  |
-| [python](./python) | Python bindings (pyo3)                    |
-| [java](./java)     | Java bindings (jni) and spark integration |
+| [python](./python) | Python bindings (PyO3)                    |
+| [java](./java)     | Java bindings (JNI) and Spark integration |
 | [docs](./docs)     | Documentation source                      |
 
 ## What makes Lance different
