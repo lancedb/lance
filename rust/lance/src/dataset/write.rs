@@ -6,7 +6,9 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::datatypes::{NullabilityComparison, SchemaCompareOptions, StorageClass};
+use lance_core::datatypes::{
+    NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions, StorageClass,
+};
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -335,7 +337,11 @@ pub async fn write_fragments_internal(
                     },
                 )?;
                 // Project from the dataset schema, because it has the correct field ids.
-                let write_schema = dataset.schema().project_by_schema(&schema)?;
+                let write_schema = dataset.schema().project_by_schema(
+                    &schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 // Use the storage version from the dataset, ignoring any version from the user.
                 let data_storage_version = dataset
                     .manifest()
@@ -362,7 +368,11 @@ pub async fn write_fragments_internal(
         (schema, params.storage_version_or_default())
     };
 
-    let data_schema = schema.project_by_schema(data.schema().as_ref())?;
+    let data_schema = schema.project_by_schema(
+        data.schema().as_ref(),
+        OnMissing::Error,
+        OnTypeMismatch::Error,
+    )?;
 
     let (data, blob_data) = data.extract_blob_stream(&data_schema);
 

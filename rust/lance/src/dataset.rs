@@ -12,6 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
 use itertools::Itertools;
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -270,7 +271,11 @@ impl ProjectionRequest {
     pub fn into_projection_plan(self, dataset_schema: &Schema) -> Result<ProjectionPlan> {
         match self {
             Self::Schema(schema) => Ok(ProjectionPlan::new_empty(
-                Arc::new(dataset_schema.project_by_schema(schema.as_ref())?),
+                Arc::new(dataset_schema.project_by_schema(
+                    schema.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?),
                 /*load_blobs=*/ false,
             )),
             Self::Sql(columns) => {
@@ -1036,6 +1041,11 @@ impl Dataset {
         &self.manifest.local_schema
     }
 
+    /// Creates a new empty projection into the dataset schema
+    pub fn empty_projection(self: &Arc<Self>) -> Projection {
+        Projection::empty(self.clone())
+    }
+
     /// Get fragments.
     ///
     /// If `filter` is provided, only fragments with the given name will be returned.
@@ -1649,6 +1659,12 @@ fn write_manifest_file_to_path<'a>(
         object_writer.shutdown().await?;
         Ok(())
     })
+}
+
+impl Projectable for Dataset {
+    fn schema(&self) -> &Schema {
+        self.schema()
+    }
 }
 
 #[cfg(test)]
