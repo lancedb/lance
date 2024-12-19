@@ -16,6 +16,7 @@ import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
+import com.lancedb.lance.schema.ColumnAlteration;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -266,6 +267,20 @@ public class Dataset implements Closeable {
   }
 
   private native void nativeDropColumns(List<String> columns);
+
+  /**
+   * Alter columns in the dataset.
+   *
+   * @param columnAlterations The list of columns need to be altered.
+   */
+  public void alterColumns(List<ColumnAlteration> columnAlterations) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAlterColumns(columnAlterations);
+    }
+  }
+
+  private native void nativeAlterColumns(List<ColumnAlteration> columnAlterations);
 
   /**
    * Create a new Dataset Scanner.

@@ -23,13 +23,14 @@ use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow::record_batch::RecordBatchIterator;
+use arrow_schema::DataType;
 use jni::objects::{JMap, JString, JValue};
 use jni::sys::jlong;
 use jni::sys::{jboolean, jint};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, ReadParams, WriteParams};
+use lance::dataset::{ColumnAlteration, Dataset, ReadParams, WriteParams};
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
@@ -38,6 +39,7 @@ use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use std::collections::HashMap;
 use std::iter::empty;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
@@ -703,5 +705,110 @@ fn inner_drop_columns(
     let mut dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     RT.block_on(dataset_guard.inner.drop_columns(&columns_slice))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAlterColumns(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    column_alterations_obj: JObject, // List<ColumnAlteration>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_alter_columns(&mut env, java_dataset, column_alterations_obj)
+    )
+}
+
+fn create_column_alteration(
+    env: &mut JNIEnv,
+    column_alteration_jobj: JObject, // ColumnAlteration
+) -> Result<ColumnAlteration> {
+    let path_obj = env
+        .get_field(&column_alteration_jobj, "path", "Ljava/lang/String;")?
+        .l()?;
+    let path_jstring: JString = path_obj.into();
+    let path: String = env.get_string(&path_jstring)?.into();
+
+    let rename_obj = env
+        .get_field(&column_alteration_jobj, "rename", "Ljava/util/Optional;")?
+        .l()?;
+    let rename = if env.call_method(&rename_obj, "isPresent", "()Z", &[])?.z()? {
+        let jstring: JObject = env
+            .call_method(rename_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let jstring: JString = jstring.into();
+        let rename_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
+        Some(rename_str)
+    } else {
+        None
+    };
+
+    let nullable_obj = env
+        .get_field(&column_alteration_jobj, "nullable", "Ljava/util/Optional;")?
+        .l()?;
+    let nullable = if env
+        .call_method(&nullable_obj, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let nullable_value = env
+            .call_method(nullable_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        Some(
+            env.call_method(nullable_value, "booleanValue", "()Z", &[])?
+                .z()?,
+        )
+    } else {
+        None
+    };
+
+    let data_type_obj = env
+        .get_field(&column_alteration_jobj, "dataType", "Ljava/util/Optional;")?
+        .l()?;
+    let data_type = if env
+        .call_method(&data_type_obj, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let j_data_type: JObject = env
+            .call_method(data_type_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let jstring: JString = env
+            .call_method(j_data_type, "toString", "()Ljava/lang/String;", &[])?
+            .l()?
+            .into();
+        let data_type_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
+        DataType::from_str(&data_type_str)
+            .map_err(|e| Error::input_error(e.to_string()))
+            .ok()
+    } else {
+        None
+    };
+
+    Ok(ColumnAlteration {
+        path,
+        rename,
+        nullable,
+        data_type,
+    })
+}
+
+fn inner_alter_columns(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    column_alterations_obj: JObject, // List<ColumnAlteration>
+) -> Result<()> {
+    let list = env.get_list(&column_alterations_obj)?;
+    let mut iter = list.iter(env)?;
+    let mut column_alterations = Vec::new();
+
+    while let Some(elem) = iter.next(env)? {
+        let alteration = create_column_alteration(env, elem)?;
+        column_alterations.push(alteration);
+    }
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
     Ok(())
 }
