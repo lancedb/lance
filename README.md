@@ -164,11 +164,12 @@ rs = [dataset.to_table(nearest={"column": "vector", "k": 10, "q": q})
 
 ## Directory structure
 
-| Directory          | Description              |
-|--------------------|--------------------------|
-| [rust](./rust)     | Core Rust implementation |
-| [python](./python) | Python bindings (pyo3)   |
-| [docs](./docs)     | Documentation source     |
+| Directory          | Description                               |
+|--------------------|-------------------------------------------|
+| [rust](./rust)     | Core Rust implementation                  |
+| [python](./python) | Python bindings (pyo3)                    |
+| [java](./java)     | Java bindings (jni) and spark integration |
+| [docs](./docs)     | Documentation source                      |
 
 ## What makes Lance different
 
