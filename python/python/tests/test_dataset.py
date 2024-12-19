@@ -1094,12 +1094,14 @@ def test_data_files(tmp_path: Path):
     base_dir = tmp_path / "test"
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
-    data_files = fragment.data_files()
+    data_files = fragment.files
     assert len(data_files) == 1
     # it is a valid uuid
-    uuid.UUID(os.path.splitext(data_files[0].path())[0])
+    with pytest.warns(DeprecationWarning):
+        path = data_files[0].path()
+    uuid.UUID(os.path.splitext(path)[0])
 
-    assert fragment.deletion_file() is None
+    assert fragment.deletion_file is None
 
 
 def test_deletion_file(tmp_path: Path):
@@ -1116,8 +1118,10 @@ def test_deletion_file(tmp_path: Path):
     assert fragment.deletion_file() is None
 
     # New fragment has deletion file
-    assert new_fragment.deletion_file() is not None
-    assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
+    assert new_fragment.deletion_file is not None
+    assert re.match(
+        "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
+    )
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
     dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.count_rows() == 90
@@ -1136,6 +1140,9 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     pickled = pickle.dumps(fragment_metadata)
     unpickled = pickle.loads(pickled)
     assert fragment_metadata == unpickled
+    with pytest.warns(DeprecationWarning):
+        path = fragment_metadata.files[0].path()
+        assert path == unpickled.files[0].path()
 
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment_metadata])
     dataset = lance.LanceDataset.commit(base_dir, operation)
@@ -1408,8 +1415,8 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert fragments[1].fragment_id == original_fragments[1].fragment_id
 
     assert len(fragments[0].data_files()) == 2
-    assert str(fragments[0].data_files()[0]) == str(
-        original_fragments[0].data_files()[0]
+    assert (
+        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
     )
     assert len(fragments[1].data_files()) == 1
     assert str(fragments[1].data_files()[0]) == str(
@@ -2729,17 +2736,17 @@ def test_default_storage_version(tmp_path: Path):
     assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
 
     frag = lance.LanceFragment.create(dataset.uri, table)
-    sample_file = frag.to_json()["files"][0]
-    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
-    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+    sample_file = frag.files[0]
+    assert sample_file.file_major_version == EXPECTED_MAJOR_VERSION
+    assert sample_file.file_minor_version == EXPECTED_MINOR_VERSION
 
     from lance.fragment import write_fragments
 
     frags = write_fragments(table, dataset.uri)
     frag = frags[0]
-    sample_file = frag.to_json()["files"][0]
-    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
-    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+    sample_file = frag.files[0]
+    assert sample_file.file_major_version == EXPECTED_MAJOR_VERSION
+    assert sample_file.file_minor_version == EXPECTED_MINOR_VERSION
 
 
 def test_no_detached_v1(tmp_path: Path):
