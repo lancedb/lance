@@ -224,7 +224,7 @@ def validate_vector_index(
 
 
 class HNSW:
-    _hnsw = None
+    _hnsw: _Hnsw
 
     def __init__(self, hnsw) -> None:
         self._hnsw = hnsw

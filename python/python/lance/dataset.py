@@ -46,6 +46,7 @@ from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
+    _FragmentMetadata,
     CleanupStats,
     _Dataset,
     _MergeInsertBuilder,
@@ -55,7 +56,7 @@ from .lance import (
     _Scanner,
     _write_dataset,
 )
-from .lance import CompactionMetrics as CompactionMetrics
+from .optimize import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .optimize import Compaction
@@ -254,7 +255,7 @@ class LanceDataset(pa.dataset.Dataset):
     def tags(self) -> Tags:
         return Tags(self._ds)
 
-    def list_indices(self) -> List[Dict[str, Any]]:
+    def list_indices(self) -> List[Index]:
         return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
@@ -284,15 +285,15 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = None,
+        scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         *,
-        prefilter: bool = None,
-        with_row_id: bool = None,
-        with_row_address: bool = None,
-        use_stats: bool = None,
-        fast_search: bool = None,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
+        fast_search: Optional[bool] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
@@ -900,7 +901,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
-    def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
+    def alter_columns(self, *alterations: Iterable[AlterColumn]):
         """Alter column name, data type, and nullability.
 
         Columns that are renamed can keep any indices that are on them. If a
@@ -1306,7 +1307,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> UpdateResult:
         """
         Update column values for rows matching where.
 
@@ -2430,7 +2431,7 @@ class LanceDataset(pa.dataset.Dataset):
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
-        return dict(
+        return BulkCommitResult(
             dataset=ds,
             merged=merged,
         )
@@ -2487,6 +2488,41 @@ class Transaction:
     operation: LanceOperation.BaseOperation
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     blobs_op: Optional[LanceOperation.BaseOperation] = None
+
+class Tag(TypedDict):
+    version: int
+    manifest_size: int
+
+class Version(TypedDict):
+    version: int
+    timestamp: int | datetime
+    metadata: Dict[str, str]
+
+class UpdateResult(TypedDict):
+    num_rows_updated: int
+
+
+class AlterColumn(TypedDict):
+    path: str
+    name: Optional[str]
+    nullable: Optional[bool]
+    data_type: Optional[pa.DataType]
+
+class ExecuteResult(TypedDict):
+    num_inserted_rows: int
+    num_updated_rows: int
+    num_deleted_rows: int
+
+class Index(TypedDict):
+    name: str
+    type: str
+    uuid: str
+    fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+
+class OperationDict(TypedDict):
+    fragments: List[_FragmentMetadata]
 
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.
@@ -2890,6 +2926,7 @@ class ScannerBuilder:
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
             setter(value)
+        return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -3411,13 +3448,13 @@ class Tags:
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
 
-    def list(self) -> dict[str, int]:
+    def list(self) -> dict[str, Tag]:
         """
         List all dataset tags.
 
         Returns
         -------
-        dict[str, int]
+        dict[str, Tag]
             A dictionary mapping tag names to version numbers.
         """
         return self._ds.tags()

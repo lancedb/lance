@@ -6,7 +6,7 @@ from typing import IO, Iterator, Optional, Union
 
 import pyarrow as pa
 
-from lance.lance import LanceBlobFile
+from .lance import LanceBlobFile
 
 
 class BlobIterator:

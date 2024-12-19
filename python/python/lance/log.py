@@ -34,7 +34,7 @@ LOGGER.setLevel(get_log_level())
 
 
 def set_logger(
-    file_path: Optional[str] = "pylance.log",
+    file_path: str = "pylance.log",
     name="pylance",
     level=logging.INFO,
     format_string=None,

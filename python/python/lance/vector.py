@@ -293,8 +293,8 @@ def compute_pq_codes(
 
     Returns
     -------
-    str
-        The absolute path of the pq codes dataset.
+    Tuple[Union[str, Path], List[str]]
+        The absolute path of the pq codes dataset and shuffle buffers
     """
     from .torch.data import LanceDataset as TorchDataset
 

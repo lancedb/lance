@@ -5,6 +5,7 @@
 An internal module for generating Arrow data for use in testing and benchmarking.
 """
 
+from typing import Optional
 import pyarrow as pa
 
 from .lance import datagen
@@ -15,7 +16,7 @@ def is_datagen_supported():
 
 
 def rand_batches(
-    schema: pa.Schema, *, num_batches: int = None, batch_size_bytes: int = None
+    schema: pa.Schema, *, num_batches: Optional[int] = None, batch_size_bytes: Optional[int] = None
 ):
     if not datagen.is_datagen_supported():
         raise NotImplementedError(
