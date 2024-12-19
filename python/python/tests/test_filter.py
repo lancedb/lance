@@ -257,3 +257,12 @@ def test_duckdb(tmp_path):
     expected = duckdb.query("SELECT id, meta, price FROM ds").to_df()
     expected = expected[expected.meta == "aa"].reset_index(drop=True)
     tm.assert_frame_equal(actual, expected)
+
+
+def test_struct_field_order(tmp_path):
+    data = pa.table({"struct": [{"x": i, "y": i} for i in range(10)]})
+    dataset = lance.write_dataset(data, tmp_path)
+    result = dataset.to_table(filter="struct.y > 5")
+
+    expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
+    assert result == expected

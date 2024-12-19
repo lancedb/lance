@@ -17,6 +17,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
+use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projection};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 use tracing::{instrument, Instrument};
@@ -33,7 +34,6 @@ use crate::{arrow::*, Error};
 pub struct Take {
     rx: Receiver<Result<RecordBatch>>,
     bg_thread: Option<JoinHandle<()>>,
-
     output_schema: SchemaRef,
 }
 
@@ -55,15 +55,18 @@ impl Take {
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
+        let output_schema_copy = output_schema.clone();
         let bg_thread = tokio::spawn(
             async move {
                 if let Err(e) = child
                     .zip(stream::repeat_with(|| {
                         (dataset.clone(), projection.clone())
                     }))
-                    .map(|(batch, (dataset, extra))| async move {
-                        Self::take_batch(batch?, dataset, extra).await
-                    })
+                    .map(|(batch, (dataset, extra))| {
+                        let output_schema_copy = output_schema_copy.clone();
+                        async move {
+                            Self::take_batch(batch?, dataset, extra, output_schema_copy).await
+                        }})
                     .buffered(batch_readahead)
                     .map(|r| r.map_err(|e| DataFusionError::Execution(e.to_string())))
                     .try_for_each(|b| async {
@@ -110,6 +113,7 @@ impl Take {
         batch: RecordBatch,
         dataset: Arc<Dataset>,
         extra: Arc<Schema>,
+        output_schema: SchemaRef,
     ) -> impl Future<Output = Result<RecordBatch, Error>> + Send {
         async move {
             let row_id_arr = batch.column_by_name(ROW_ID).unwrap();
@@ -121,7 +125,7 @@ impl Take {
                     .take_rows(row_ids.values(), ProjectionRequest::Schema(extra))
                     .await?;
                 debug_assert_eq!(batch.num_rows(), new_columns.num_rows());
-                batch.merge(&new_columns)?
+                batch.merge_with_schema(&new_columns, &output_schema)?
             };
             Ok::<RecordBatch, Error>(rows)
         }
@@ -175,12 +179,18 @@ pub struct TakeExec {
     /// Dataset to read from.
     dataset: Arc<Dataset>,
 
-    pub(crate) extra_schema: Arc<Schema>,
+    /// The original projection is kept to recalculate `with_new_children`.
+    original_projection: Arc<Schema>,
+
+    /// The schema to pass to dataset.take, this should be the original projection
+    /// minus any fields in the input schema.
+    schema_to_take: Arc<Schema>,
 
     input: Arc<dyn ExecutionPlan>,
 
-    /// Output schema is the merged schema between input schema and extra schema.
-    output_schema: Schema,
+    /// Output schema is the merged schema between input schema and extra schema and
+    /// tells us how to merge the input and extra columns.
+    output_schema: Arc<Schema>,
 
     batch_readahead: usize,
 
@@ -190,7 +200,7 @@ pub struct TakeExec {
 impl DisplayAs for TakeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let extra_fields = self
-            .extra_schema
+            .original_projection
             .fields
             .iter()
             .map(|f| f.name.clone())
@@ -221,11 +231,11 @@ impl TakeExec {
     ///
     /// - dataset: the dataset to read from
     /// - input: the upstream [`ExecutionPlan`] to feed data in.
-    /// - extra_schema: the extra schema to take / read from the dataset.
+    /// - projection: the desired output projection, can overlap with the input schema if desired
     pub fn try_new(
         dataset: Arc<Dataset>,
         input: Arc<dyn ExecutionPlan>,
-        extra_schema: Arc<Schema>,
+        projection: Projection,
         batch_readahead: usize,
     ) -> Result<Self> {
         if input.schema().column_with_name(ROW_ID).is_none() {
@@ -233,13 +243,28 @@ impl TakeExec {
                 "TakeExec requires the input plan to have a column named '_rowid'".to_string(),
             ));
         }
+        let original_projection = projection.clone().into_schema_ref();
+        let input_projection = dataset.schema().project_by_schema(
+            input.schema().as_ref(),
+            OnMissing::Ignore,
+            OnTypeMismatch::Error,
+        )?;
 
-        let input_schema = Schema::try_from(input.schema().as_ref())?;
-        let output_schema = input_schema.merge(extra_schema.as_ref())?;
+        let projection = projection.subtract_schema(&input_projection);
 
-        let remaining_schema = extra_schema.exclude(&input_schema)?;
+        // Can't use take if we don't want any fields and we can't use take to add row_id or row_addr
+        assert!(
+            !projection.is_empty() && !projection.with_row_id && !projection.with_row_addr,
+            "invalid take projection: {:#?}",
+            projection
+        );
 
-        let output_arrow = Arc::new(ArrowSchema::from(&output_schema));
+        let output_schema = Arc::new(Self::calculate_output_schema(
+            dataset.schema(),
+            &input.schema(),
+            &projection,
+        ));
+        let output_arrow = Arc::new(ArrowSchema::from(output_schema.as_ref()));
         let properties = input
             .properties()
             .clone()
@@ -247,12 +272,65 @@ impl TakeExec {
 
         Ok(Self {
             dataset,
-            extra_schema: Arc::new(remaining_schema),
+            original_projection,
+            schema_to_take: projection.into_schema_ref(),
             input,
             output_schema,
             batch_readahead,
             properties,
         })
+    }
+
+    /// The output of a take operation will be all columns from the input schema followed
+    /// by any new columns from the dataset.
+    ///
+    /// There is no meaningful order to the new columns that one can expect
+    ///
+    /// Nested columns in the input schema may have new fields inserted into them.
+    ///
+    /// If this happens the order of the new nested fields will match the order defined in
+    /// the dataset schema.
+    fn calculate_output_schema(
+        dataset_schema: &Schema,
+        input_schema: &ArrowSchema,
+        projection: &Projection,
+    ) -> Schema {
+        // TakeExec doesn't reorder top-level fields and so the first thing we need to do is determine the
+        // top-level field order.
+        let mut top_level_fields_added = HashSet::with_capacity(input_schema.fields.len());
+        let projected_schema = projection.to_schema();
+
+        let mut output_fields =
+            Vec::with_capacity(input_schema.fields.len() + projected_schema.fields.len());
+        // TakeExec always moves the _rowid to the start of the output schema
+        output_fields.extend(input_schema.fields.iter().map(|f| {
+            let f = Field::try_from(f.as_ref()).unwrap();
+            if let Some(ds_field) = dataset_schema.field(&f.name) {
+                top_level_fields_added.insert(ds_field.id);
+                // Field is in the dataset, it might have new fields added to it
+                if let Some(projected_field) = ds_field.apply_projection(projection) {
+                    f.merge_with_reference(&projected_field, ds_field)
+                } else {
+                    // No new fields added, keep as-is
+                    f
+                }
+            } else {
+                // Field not in dataset, not possible to add extra fields, use as-is
+                f
+            }
+        }));
+
+        // Now we add to the end any brand new top-level fields
+        output_fields.extend(
+            projected_schema
+                .fields
+                .into_iter()
+                .filter(|f| !top_level_fields_added.contains(&f.id)),
+        );
+        Schema {
+            fields: output_fields,
+            metadata: dataset_schema.metadata.clone(),
+        }
     }
 
     /// Get the dataset.
@@ -273,7 +351,7 @@ impl ExecutionPlan for TakeExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        ArrowSchema::from(&self.output_schema).into()
+        Arc::new(self.output_schema.as_ref().into())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -291,14 +369,15 @@ impl ExecutionPlan for TakeExec {
             ));
         }
 
-        let child = &children[0];
-
-        let extra_schema = self.output_schema.exclude(child.schema().as_ref())?;
+        let projection = self
+            .dataset
+            .empty_projection()
+            .union_schema(&self.original_projection);
 
         let plan = Self::try_new(
             self.dataset.clone(),
             children[0].clone(),
-            Arc::new(extra_schema),
+            projection,
             self.batch_readahead,
         )?;
 
@@ -311,10 +390,11 @@ impl ExecutionPlan for TakeExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
+        let output_schema_arrow = Arc::new(ArrowSchema::from(self.output_schema.as_ref()));
         Ok(Box::pin(Take::new(
             self.dataset.clone(),
-            self.extra_schema.clone(),
-            self.schema(),
+            self.schema_to_take.clone(),
+            output_schema_arrow,
             input_stream,
             self.batch_readahead,
         )))
@@ -336,20 +416,35 @@ impl ExecutionPlan for TakeExec {
 mod tests {
     use super::*;
 
-    use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray};
-    use arrow_schema::{DataType, Field};
-    use tempfile::tempdir;
+    use arrow_array::{
+        ArrayRef, Float32Array, Int32Array, RecordBatchIterator, StringArray, StructArray,
+    };
+    use arrow_schema::{DataType, Field, Fields};
+    use datafusion::execution::TaskContext;
+    use lance_core::datatypes::OnMissing;
+    use tempfile::{tempdir, TempDir};
 
     use crate::{
         dataset::WriteParams,
         io::exec::{LanceScanConfig, LanceScanExec},
     };
 
-    async fn create_dataset() -> Arc<Dataset> {
+    struct TestFixture {
+        dataset: Arc<Dataset>,
+        _tmp_dir_guard: TempDir,
+    }
+
+    async fn test_fixture() -> TestFixture {
+        let struct_fields = Fields::from(vec![
+            Arc::new(Field::new("x", DataType::Int32, false)),
+            Arc::new(Field::new("y", DataType::Int32, false)),
+        ]);
+
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
             Field::new("f", DataType::Float32, false),
             Field::new("s", DataType::Utf8, false),
+            Field::new("struct", DataType::Struct(struct_fields.clone()), false),
         ]));
 
         // Write 3 batches.
@@ -362,7 +457,15 @@ mod tests {
                         value_range.clone().map(|v| v as f32),
                     )),
                     Arc::new(StringArray::from_iter_values(
-                        value_range.map(|v| format!("str-{v}")),
+                        value_range.clone().map(|v| format!("str-{v}")),
+                    )),
+                    Arc::new(StructArray::new(
+                        struct_fields.clone(),
+                        vec![
+                            Arc::new(Int32Array::from_iter(value_range.clone())),
+                            Arc::new(Int32Array::from_iter(value_range)),
+                        ],
+                        None,
                     )),
                 ];
                 RecordBatch::try_new(schema.clone(), columns).unwrap()
@@ -381,18 +484,18 @@ mod tests {
             .await
             .unwrap();
 
-        Arc::new(Dataset::open(test_uri).await.unwrap())
+        TestFixture {
+            dataset: Arc::new(Dataset::open(test_uri).await.unwrap()),
+            _tmp_dir_guard: test_dir,
+        }
     }
 
     #[tokio::test]
     async fn test_take_schema() {
-        let dataset = create_dataset().await;
+        let TestFixture { dataset, .. } = test_fixture().await;
 
         let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
         let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
-
-        let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
-        let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
 
         // With row id
         let config = LanceScanConfig {
@@ -406,7 +509,12 @@ mod tests {
             scan_schema,
             config,
         ));
-        let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection, 10).unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -415,18 +523,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_take_no_extra_columns() {
-        let dataset = create_dataset().await;
+    async fn test_take_struct() {
+        // When taking fields into an existing struct, the field order should be maintained
+        // according the the schema of the struct.
+        let TestFixture {
+            dataset,
+            _tmp_dir_guard,
+        } = test_fixture().await;
 
-        let scan_arrow_schema = ArrowSchema::new(vec![
-            Field::new("i", DataType::Int32, false),
-            Field::new("s", DataType::Int32, false),
-        ]);
-        let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
-
-        // Extra column is already read.
-        let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
-        let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
+        let scan_schema = Arc::new(dataset.schema().project(&["struct.y"]).unwrap());
 
         let config = LanceScanConfig {
             with_row_id: true,
@@ -439,17 +544,40 @@ mod tests {
             scan_schema,
             config,
         ));
-        let take_exec = TakeExec::try_new(dataset, input, extra_schema, 10).unwrap();
+
+        let projection = dataset
+            .empty_projection()
+            .union_column("struct.x", OnMissing::Error)
+            .unwrap();
+
+        let take_exec = TakeExec::try_new(dataset, input, projection, 10).unwrap();
+
+        let expected_schema = ArrowSchema::new(vec![
+            Field::new(
+                "struct",
+                DataType::Struct(Fields::from(vec![
+                    Arc::new(Field::new("x", DataType::Int32, false)),
+                    Arc::new(Field::new("y", DataType::Int32, false)),
+                ])),
+                false,
+            ),
+            Field::new(ROW_ID, DataType::UInt64, true),
+        ]);
         let schema = take_exec.schema();
-        assert_eq!(
-            schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
-            vec!["i", "s", ROW_ID]
-        );
+        assert_eq!(schema.as_ref(), &expected_schema);
+
+        let mut stream = take_exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap();
+
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            assert_eq!(batch.schema().as_ref(), &expected_schema);
+        }
     }
 
     #[tokio::test]
     async fn test_take_no_row_id() {
-        let dataset = create_dataset().await;
+        let TestFixture { dataset, .. } = test_fixture().await;
 
         let scan_arrow_schema = ArrowSchema::new(vec![
             Field::new("i", DataType::Int32, false),
@@ -457,8 +585,10 @@ mod tests {
         ]);
         let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
 
-        let extra_arrow_schema = ArrowSchema::new(vec![Field::new("s", DataType::Int32, false)]);
-        let extra_schema = Arc::new(Schema::try_from(&extra_arrow_schema).unwrap());
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
 
         // No row ID
         let input = Arc::new(LanceScanExec::new(
@@ -468,36 +598,45 @@ mod tests {
             scan_schema,
             LanceScanConfig::default(),
         ));
-        assert!(TakeExec::try_new(dataset, input, extra_schema, 10).is_err());
+        assert!(TakeExec::try_new(dataset, input, projection, 10).is_err());
     }
 
     #[tokio::test]
     async fn test_with_new_children() -> Result<()> {
-        let dataset = create_dataset().await;
+        let TestFixture { dataset, .. } = test_fixture().await;
 
         let config = LanceScanConfig {
             with_row_id: true,
             ..Default::default()
         };
+
+        let input_schema = Arc::new(dataset.schema().project(&["i"])?);
+        let projection = dataset
+            .empty_projection()
+            .union_column("s", OnMissing::Error)
+            .unwrap();
+
         let input = Arc::new(LanceScanExec::new(
             dataset.clone(),
             dataset.fragments().clone(),
             None,
-            Arc::new(dataset.schema().project(&["i"])?),
+            input_schema,
             config,
         ));
+
         assert_eq!(input.schema().field_names(), vec!["i", ROW_ID],);
-        let take_exec = TakeExec::try_new(
-            dataset.clone(),
-            input.clone(),
-            Arc::new(dataset.schema().project(&["s"])?),
-            10,
-        )?;
+        let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), projection, 10)?;
         assert_eq!(take_exec.schema().field_names(), vec!["i", ROW_ID, "s"],);
+
+        let projection = dataset
+            .empty_projection()
+            .union_columns(["s", "f"], OnMissing::Error)
+            .unwrap();
+
         let outer_take = Arc::new(TakeExec::try_new(
-            dataset.clone(),
+            dataset,
             Arc::new(take_exec),
-            Arc::new(dataset.schema().project(&["f"])?),
+            projection,
             10,
         )?);
         assert_eq!(
@@ -507,7 +646,7 @@ mod tests {
 
         // with_new_children should preserve the output schema.
         let edited = outer_take.with_new_children(vec![input])?;
-        assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "s", "f"],);
+        assert_eq!(edited.schema().field_names(), vec!["i", ROW_ID, "f", "s"],);
         Ok(())
     }
 }

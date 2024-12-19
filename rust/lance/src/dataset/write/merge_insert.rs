@@ -54,7 +54,7 @@ use futures::{
     Stream, StreamExt, TryStreamExt,
 };
 use lance_core::{
-    datatypes::SchemaCompareOptions,
+    datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
     utils::{
         futures::Capacity,
@@ -454,10 +454,14 @@ impl MergeInsertJob {
         }
 
         // 4 - Take the mapped row ids
+        let projection = self
+            .dataset
+            .empty_projection()
+            .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
         let mut target = Arc::new(TakeExec::try_new(
             self.dataset.clone(),
             index_mapper,
-            Arc::new(self.dataset.schema().project_by_schema(schema.as_ref())?),
+            projection,
             get_num_compute_intensive_cpus(),
         )?) as Arc<dyn ExecutionPlan>;
 
@@ -632,7 +636,11 @@ impl MergeInsertJob {
             ) -> Result<usize> {
                 // batches still have _rowaddr
                 let write_schema = batches[0].schema().as_ref().without_column(ROW_ADDR);
-                let write_schema = dataset.local_schema().project_by_schema(&write_schema)?;
+                let write_schema = dataset.local_schema().project_by_schema(
+                    &write_schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
 
                 let updated_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
                 if Some(updated_rows) == metadata.physical_rows {
@@ -804,7 +812,11 @@ impl MergeInsertJob {
                 let reader = RecordBatchIterator::new(batches, write_schema.clone());
                 let stream = reader_to_stream(Box::new(reader));
 
-                let write_schema = dataset.schema().project_by_schema(write_schema.as_ref())?;
+                let write_schema = dataset.schema().project_by_schema(
+                    write_schema.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
 
                 let fragments = write_fragments_internal(
                     Some(dataset.as_ref()),
