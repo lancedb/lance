@@ -35,7 +35,7 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
@@ -79,7 +79,6 @@ use snafu::{location, Location};
 use tracing::instrument;
 use uuid::Uuid;
 
-use super::utils::get_vector_element_type;
 use super::{builder::IvfIndexBuilder, utils::PartitionLoadLock};
 use super::{
     pq::{build_pq_model, PQIndex},
@@ -1398,7 +1397,9 @@ pub(crate) async fn remap_index_file_v3(
     column: String,
 ) -> Result<()> {
     let index_dir = dataset.indices_dir().child(new_uuid);
-    index.remap_to(mapping, column, index_dir).await
+    index
+        .remap_to(dataset.object_store().clone(), mapping, column, index_dir)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

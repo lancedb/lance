@@ -11,6 +11,7 @@ use arrow_schema::Field;
 use async_trait::async_trait;
 use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
+use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lazy_static::lazy_static;
@@ -191,6 +192,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// this is available for only v3 index
     async fn remap_to(
         self: Arc<Self>,
+        _store: ObjectStore,
         _mapping: &HashMap<u64, Option<u64>>,
         _column: String,
         _index_dir: Path,

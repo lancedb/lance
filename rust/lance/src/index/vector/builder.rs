@@ -68,6 +68,7 @@ use super::v2::IVFIndex;
 // To build the index for given IVF, quantizer, data stream,
 // call `with_ivf`, `with_quantizer`, `shuffle_data`, and `build` in order.
 pub struct IvfIndexBuilder<S: IvfSubIndex, Q: Quantization> {
+    store: ObjectStore,
     column: String,
     index_dir: Path,
     distance_type: DistanceType,
@@ -105,10 +106,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir = tempdir()?;
         let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
         Ok(Self {
-            dataset: Some(dataset),
+            store: dataset.object_store().clone(),
             column,
             index_dir,
             distance_type,
+            dataset: Some(dataset),
             shuffler: Some(shuffler.into()),
             ivf_params,
             quantizer_params,
@@ -145,6 +147,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     pub fn new_remapper(
+        store: ObjectStore,
         column: String,
         index_dir: Path,
         index: Arc<dyn VectorIndex>,
@@ -161,6 +164,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let temp_dir = tempdir()?;
         let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
         Ok(Self {
+            store,
             column,
             index_dir,
             distance_type: ivf_index.metric_type(),
@@ -370,10 +374,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         }
         let data = data.unwrap();
 
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before shuffle data",
-            location!(),
-        ))?;
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before shuffle data",
             location!(),
@@ -413,7 +413,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             None => {
                 log::info!("no data to shuffle");
                 self.shuffle_reader = Some(Box::new(IvfShufflerReader::new(
-                    dataset.object_store.clone(),
+                    Arc::new(self.store.clone()),
                     self.temp_dir.clone(),
                     vec![0; ivf.num_partitions()],
                 )));
@@ -510,10 +510,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     async fn build_partition(&self, part_id: usize, batch: &RecordBatch) -> Result<(usize, usize)> {
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before building partition",
-            location!(),
-        ))?;
         let quantizer = self.quantizer.clone().ok_or(Error::invalid_input(
             "quantizer not set before building partition",
             location!(),
@@ -523,6 +519,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             location!(),
         ))?;
 
+        let local_store = ObjectStore::local();
         // build quantized vector storage
         let storage_len = {
             let storage = StorageBuilder::new(self.column.clone(), self.distance_type, quantizer)
@@ -530,7 +527,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let path = self.temp_dir.child(format!("storage_part{}", part_id));
             let batches = storage.to_batches()?;
             FileWriter::create_file_with_batches(
-                dataset.object_store().clone(),
+                local_store.clone(),
                 &path,
                 storage.schema().as_ref().try_into()?,
                 batches,
@@ -548,7 +545,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let index_batch = sub_index.to_batch()?;
             let schema = index_batch.schema().as_ref().try_into()?;
             FileWriter::create_file_with_batches(
-                dataset.object_store().clone(),
+                local_store,
                 &path,
                 schema,
                 std::iter::once(index_batch),
@@ -561,10 +558,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     }
 
     async fn merge_partitions(&mut self) -> Result<()> {
-        let dataset = self.dataset.as_ref().ok_or(Error::invalid_input(
-            "dataset not set before merge partitions",
-            location!(),
-        ))?;
         let ivf = self.ivf.as_ref().ok_or(Error::invalid_input(
             "IVF not set before merge partitions",
             location!(),
@@ -583,7 +576,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let index_path = self.index_dir.child(INDEX_FILE_NAME);
         let mut storage_writer = None;
         let mut index_writer = FileWriter::try_new(
-            dataset.object_store().create(&index_path).await?,
+            self.store.create(&index_path).await?,
             S::schema().as_ref().try_into()?,
             Default::default(),
         )?;
@@ -621,7 +614,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
                 if storage_writer.is_none() {
                     storage_writer = Some(FileWriter::try_new(
-                        dataset.object_store().create(&storage_path).await?,
+                        self.store.create(&storage_path).await?,
                         batch.schema_ref().as_ref().try_into()?,
                         Default::default(),
                     )?);
@@ -720,11 +713,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             location!(),
         ))?;
         let column = self.column.clone();
-        let object_store = dataset.object_store().clone();
         let projection = Arc::new(dataset.schema().project(&[column.as_str()])?);
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let mut batches = Vec::new();
-        for chunk in row_ids.chunks(object_store.block_size()) {
+        for chunk in row_ids.chunks(self.store.block_size()) {
             let batch = dataset
                 .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))
                 .await?;

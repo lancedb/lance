@@ -469,13 +469,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
 
     async fn remap_to(
         self: Arc<Self>,
+        store: ObjectStore,
         mapping: &HashMap<u64, Option<u64>>,
         column: String,
         index_dir: Path,
     ) -> Result<()> {
         match self.sub_index_type() {
             (SubIndexType::Flat, _) => {
-                let mut remapper = IvfIndexBuilder::<S, Q>::new_remapper(column, index_dir, self)?;
+                let mut remapper =
+                    IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
                 remapper.remap(mapping).await
             }
             _ => Err(Error::Index {
@@ -540,6 +542,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::UpdateBuilder;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
     const DIM: usize = 32;
@@ -705,9 +708,22 @@ mod tests {
             .unwrap();
 
         let query = vectors.value(0);
-        let k = 100;
         // delete half rows to trigger compact
         dataset.delete("id < 500").await.unwrap();
+        // update the other half rows
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 500 and id<600")
+            .unwrap()
+            .set("id", "500+id")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = Dataset::open(update_result.new_dataset.uri())
+            .await
+            .unwrap();
         let num_rows = dataset.count_rows(None).await.unwrap();
         assert_eq!(num_rows, 500);
         compact_files(&mut dataset, CompactionOptions::default(), None)
@@ -716,7 +732,7 @@ mod tests {
         // query again, the result should not include the deleted row
         let result = dataset
             .scan()
-            .nearest(vector_column, query.as_primitive::<T>(), k)
+            .nearest(vector_column, query.as_primitive::<T>(), 500)
             .unwrap()
             .nprobs(nlist)
             .with_row_id()
@@ -724,7 +740,10 @@ mod tests {
             .await
             .unwrap();
         let row_ids = result["id"].as_primitive::<UInt64Type>();
-        assert_ne!(row_ids.values()[0], 0);
+        assert_eq!(row_ids.len(), 500);
+        row_ids.values().iter().for_each(|id| {
+            assert!(*id >= 600);
+        });
     }
 
     #[rstest]
