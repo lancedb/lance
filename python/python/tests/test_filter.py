@@ -260,9 +260,16 @@ def test_duckdb(tmp_path):
 
 
 def test_struct_field_order(tmp_path):
+    """
+    This test regresses some old behavior where the order of struct fields would get
+    messed up due to late materialization and we would get {y,x} instead of {x,y}
+    """
     data = pa.table({"struct": [{"x": i, "y": i} for i in range(10)]})
     dataset = lance.write_dataset(data, tmp_path)
-    result = dataset.to_table(filter="struct.y > 5")
 
-    expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
-    assert result == expected
+    for late_materialization in [True, False]:
+        result = dataset.to_table(
+            filter="struct.y > 5", late_materialization=late_materialization
+        )
+        expected = pa.table({"struct": [{"x": i, "y": i} for i in range(6, 10)]})
+        assert result == expected

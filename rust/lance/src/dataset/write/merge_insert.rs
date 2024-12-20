@@ -458,12 +458,15 @@ impl MergeInsertJob {
             .dataset
             .empty_projection()
             .union_arrow_schema(schema.as_ref(), OnMissing::Error)?;
-        let mut target = Arc::new(TakeExec::try_new(
-            self.dataset.clone(),
-            index_mapper,
-            projection,
-            get_num_compute_intensive_cpus(),
-        )?) as Arc<dyn ExecutionPlan>;
+        let mut target = Arc::new(
+            TakeExec::try_new(
+                self.dataset.clone(),
+                index_mapper,
+                projection,
+                get_num_compute_intensive_cpus(),
+            )?
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
 
         // 5 - Take puts the row id and row addr at the beginning.  A full scan (used when there is
         //     no scalar index) puts the row id and addr at the end.  We need to match these up so

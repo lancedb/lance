@@ -11,7 +11,10 @@ use datafusion::{
     config::ConfigOptions,
     error::Result as DFResult,
     physical_optimizer::{optimizer::PhysicalOptimizer, PhysicalOptimizerRule},
-    physical_plan::{projection::ProjectionExec as DFProjectionExec, ExecutionPlan},
+    physical_plan::{
+        coalesce_batches::CoalesceBatchesExec, projection::ProjectionExec as DFProjectionExec,
+        ExecutionPlan,
+    },
 };
 use datafusion_physical_expr::expressions::Column;
 
@@ -31,6 +34,16 @@ impl PhysicalOptimizerRule for CoalesceTake {
                     if let Some(exec_child) = child.as_any().downcast_ref::<TakeExec>() {
                         let inner_child = exec_child.children()[0].clone();
                         return Ok(Transformed::yes(plan.with_new_children(vec![inner_child])?));
+                    } else if let Some(exec_child) =
+                        child.as_any().downcast_ref::<CoalesceBatchesExec>()
+                    {
+                        let inner_child = exec_child.children()[0].clone();
+                        if let Some(exec_child) = inner_child.as_any().downcast_ref::<TakeExec>() {
+                            let inner_inner_child = exec_child.children()[0].clone();
+                            return Ok(Transformed::yes(
+                                plan.with_new_children(vec![inner_inner_child])?,
+                            ));
+                        }
                     }
                 }
                 Ok(Transformed::no(plan))

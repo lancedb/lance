@@ -17,7 +17,7 @@ use datafusion::physical_plan::{
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{self, Stream, StreamExt, TryStreamExt};
 use futures::{Future, FutureExt};
-use lance_core::datatypes::{Field, OnMissing, OnTypeMismatch, Projection};
+use lance_core::datatypes::{Field, OnMissing, Projection};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::JoinHandle;
 use tracing::{instrument, Instrument};
@@ -177,10 +177,10 @@ impl RecordBatchStream for Take {
 #[derive(Debug)]
 pub struct TakeExec {
     /// Dataset to read from.
-    dataset: Arc<Dataset>,
+    pub(crate) dataset: Arc<Dataset>,
 
     /// The original projection is kept to recalculate `with_new_children`.
-    original_projection: Arc<Schema>,
+    pub(crate) original_projection: Arc<Schema>,
 
     /// The schema to pass to dataset.take, this should be the original projection
     /// minus any fields in the input schema.
@@ -200,7 +200,7 @@ pub struct TakeExec {
 impl DisplayAs for TakeExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let extra_fields = self
-            .original_projection
+            .schema_to_take
             .fields
             .iter()
             .map(|f| f.name.clone())
@@ -232,30 +232,32 @@ impl TakeExec {
     /// - dataset: the dataset to read from
     /// - input: the upstream [`ExecutionPlan`] to feed data in.
     /// - projection: the desired output projection, can overlap with the input schema if desired
+    ///
+    /// Returns None if no extra columns are required (everything in the projection exists in the input schema).
     pub fn try_new(
         dataset: Arc<Dataset>,
         input: Arc<dyn ExecutionPlan>,
         projection: Projection,
         batch_readahead: usize,
-    ) -> Result<Self> {
+    ) -> Result<Option<Self>> {
+        let original_projection = projection.clone().into_schema_ref();
+        let projection =
+            projection.subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
+        if projection.is_empty() {
+            return Ok(None);
+        }
+
+        // We actually need a take so lets make sure we have a row id
         if input.schema().column_with_name(ROW_ID).is_none() {
             return Err(DataFusionError::Plan(
                 "TakeExec requires the input plan to have a column named '_rowid'".to_string(),
             ));
         }
-        let original_projection = projection.clone().into_schema_ref();
-        let input_projection = dataset.schema().project_by_schema(
-            input.schema().as_ref(),
-            OnMissing::Ignore,
-            OnTypeMismatch::Error,
-        )?;
-
-        let projection = projection.subtract_schema(&input_projection);
 
         // Can't use take if we don't want any fields and we can't use take to add row_id or row_addr
         assert!(
-            !projection.is_empty() && !projection.with_row_id && !projection.with_row_addr,
-            "invalid take projection: {:#?}",
+            !projection.with_row_id && !projection.with_row_addr,
+            "Take cannot insert row_id / row_addr: {:#?}",
             projection
         );
 
@@ -270,7 +272,7 @@ impl TakeExec {
             .clone()
             .with_eq_properties(EquivalenceProperties::new(output_arrow));
 
-        Ok(Self {
+        Ok(Some(Self {
             dataset,
             original_projection,
             schema_to_take: projection.into_schema_ref(),
@@ -278,7 +280,7 @@ impl TakeExec {
             output_schema,
             batch_readahead,
             properties,
-        })
+        }))
     }
 
     /// The output of a take operation will be all columns from the input schema followed
@@ -381,7 +383,12 @@ impl ExecutionPlan for TakeExec {
             self.batch_readahead,
         )?;
 
-        Ok(Arc::new(plan))
+        if let Some(plan) = plan {
+            Ok(Arc::new(plan))
+        } else {
+            // Is this legal or do we need to insert a no-op node?
+            Ok(children[0].clone())
+        }
     }
 
     fn execute(
@@ -514,7 +521,9 @@ mod tests {
             .empty_projection()
             .union_column("s", OnMissing::Error)
             .unwrap();
-        let take_exec = TakeExec::try_new(dataset, input, projection, 10).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection, 10)
+            .unwrap()
+            .unwrap();
         let schema = take_exec.schema();
         assert_eq!(
             schema.fields.iter().map(|f| f.name()).collect::<Vec<_>>(),
@@ -550,7 +559,9 @@ mod tests {
             .union_column("struct.x", OnMissing::Error)
             .unwrap();
 
-        let take_exec = TakeExec::try_new(dataset, input, projection, 10).unwrap();
+        let take_exec = TakeExec::try_new(dataset, input, projection, 10)
+            .unwrap()
+            .unwrap();
 
         let expected_schema = ArrowSchema::new(vec![
             Field::new(
@@ -625,7 +636,7 @@ mod tests {
         ));
 
         assert_eq!(input.schema().field_names(), vec!["i", ROW_ID],);
-        let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), projection, 10)?;
+        let take_exec = TakeExec::try_new(dataset.clone(), input.clone(), projection, 10)?.unwrap();
         assert_eq!(take_exec.schema().field_names(), vec!["i", ROW_ID, "s"],);
 
         let projection = dataset
@@ -633,12 +644,8 @@ mod tests {
             .union_columns(["s", "f"], OnMissing::Error)
             .unwrap();
 
-        let outer_take = Arc::new(TakeExec::try_new(
-            dataset,
-            Arc::new(take_exec),
-            projection,
-            10,
-        )?);
+        let outer_take =
+            Arc::new(TakeExec::try_new(dataset, Arc::new(take_exec), projection, 10)?.unwrap());
         assert_eq!(
             outer_take.schema().field_names(),
             vec!["i", ROW_ID, "s", "f"],

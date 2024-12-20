@@ -2097,23 +2097,20 @@ impl Scanner {
         output_projection: Projection,
         batch_readahead: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let cur_projection = self
-            .dataset
-            .empty_projection()
-            .union_arrow_schema(&input.schema(), OnMissing::Ignore)?;
-
-        let missing = output_projection.subtract_projection(&cur_projection);
-        if missing.is_empty() {
-            Ok(input)
+        let coalesced = Arc::new(CoalesceBatchesExec::new(
+            input.clone(),
+            self.get_batch_size(),
+        ));
+        if let Some(take_plan) = TakeExec::try_new(
+            self.dataset.clone(),
+            coalesced,
+            output_projection,
+            batch_readahead,
+        )? {
+            Ok(Arc::new(take_plan))
         } else {
-            let coalesced = Arc::new(CoalesceBatchesExec::new(input, self.get_batch_size()));
-            let output = Arc::new(TakeExec::try_new(
-                self.dataset.clone(),
-                coalesced,
-                missing,
-                batch_readahead,
-            )?);
-            Ok(output)
+            // No new columns needed
+            Ok(input)
         }
     }
 
