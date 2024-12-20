@@ -286,7 +286,7 @@ impl TakeExec {
     /// The output of a take operation will be all columns from the input schema followed
     /// by any new columns from the dataset.
     ///
-    /// There is no meaningful order to the new columns that one can expect
+    /// The output fields will always be added in dataset schema order
     ///
     /// Nested columns in the input schema may have new fields inserted into them.
     ///
@@ -322,7 +322,8 @@ impl TakeExec {
             }
         }));
 
-        // Now we add to the end any brand new top-level fields
+        // Now we add to the end any brand new top-level fields.  These will be added
+        // dataset schema order.
         output_fields.extend(
             projected_schema
                 .fields
@@ -590,10 +591,7 @@ mod tests {
     async fn test_take_no_row_id() {
         let TestFixture { dataset, .. } = test_fixture().await;
 
-        let scan_arrow_schema = ArrowSchema::new(vec![
-            Field::new("i", DataType::Int32, false),
-            Field::new("s", DataType::Int32, false),
-        ]);
+        let scan_arrow_schema = ArrowSchema::new(vec![Field::new("i", DataType::Int32, false)]);
         let scan_schema = Arc::new(Schema::try_from(&scan_arrow_schema).unwrap());
 
         let projection = dataset
