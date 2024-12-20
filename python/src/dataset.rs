@@ -270,6 +270,31 @@ impl RewrittenIndex {
     }
 }
 
+fn update_schema(schema: &Schema, fragments: &[Fragment]) -> Option<Schema> {
+    // 收集所有的 field.id 并去重
+    let mut all_field_ids: Vec<&i32> = fragments
+        .iter()
+        .flat_map(|fragment| &fragment.files)
+        .flat_map(|file| &file.fields)
+        .collect();
+
+    all_field_ids.sort_unstable();
+    all_field_ids.dedup();
+
+    if all_field_ids.len() != schema.fields.len() {
+        return None;
+    }
+
+    let mut min_field_id = *all_field_ids.iter().min().copied().unwrap_or(&0);
+    let mut new_schema = schema.clone();
+    new_schema.fields.iter_mut().for_each(|field| {
+        field.id = min_field_id;
+        min_field_id += 1;
+    });
+
+    Some(new_schema)
+}
+
 #[pymethods]
 impl Operation {
     fn __repr__(&self) -> String {
@@ -283,9 +308,14 @@ impl Operation {
     ) -> PyResult<Self> {
         let schema = convert_schema(&schema.0)?;
         let fragments = into_fragments(fragments);
+        let final_schema = match update_schema(&schema, &fragments) {
+            Some(updated) => updated,
+            None => schema.clone(),
+        };
+
         let op = LanceOperation::Overwrite {
             fragments,
-            schema,
+            schema: final_schema,
             config_upsert_values: None,
         };
         Ok(Self(op))
@@ -1458,10 +1488,11 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, operation, blob_operation = None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit(
         dest: &Bound<PyAny>,
         operation: Operation,
+        blob_operation: Option<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
@@ -1489,8 +1520,12 @@ impl Dataset {
             WriteDestination::Uri(dest.extract()?)
         };
 
-        let transaction =
-            Transaction::new(read_version.unwrap_or_default(), operation.0, None, None);
+        let transaction = Transaction::new(
+            read_version.unwrap_or_default(),
+            operation.0,
+            blob_operation.map(|op| op.0),
+            None,
+        );
 
         let mut builder = CommitBuilder::new(dest)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))

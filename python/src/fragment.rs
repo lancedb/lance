@@ -513,6 +513,67 @@ pub fn write_fragments(
         .collect()
 }
 
+#[pyfunction(name = "_write_fragments_with_blobs")]
+#[pyo3(signature = (dest, reader, **kwargs))]
+pub fn write_fragments_with_blobs(
+    dest: &Bound<PyAny>,
+    reader: &Bound<PyAny>,
+    kwargs: Option<&PyDict>,
+) -> PyResult<(Vec<FragmentMetadata>, Vec<FragmentMetadata>)> {
+    let batches = convert_reader(reader)?;
+
+    let params = kwargs
+        .and_then(|params| get_write_params(params).transpose())
+        .transpose()?
+        .unwrap_or_default();
+
+    let dest = if dest.is_instance_of::<Dataset>() {
+        let dataset: Dataset = dest.extract()?;
+        WriteDestination::Dataset(dataset.ds.clone())
+    } else {
+        WriteDestination::Uri(dest.extract()?)
+    };
+
+    let written = RT
+        .block_on(
+            Some(reader.py()),
+            InsertBuilder::new(dest)
+                .with_params(&params)
+                .execute_uncommitted_stream(batches),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+    let get_fragments = |operation: Operation| match operation {
+        Operation::Overwrite { fragments, .. } => Ok(fragments),
+        Operation::Append { fragments, .. } => Ok(fragments),
+        _ => Err(Error::Internal {
+            message: "Unexpected operation".into(),
+            location: location!(),
+        }),
+    };
+
+    let default_fragments =
+        get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
+
+    let blob_fragments = if let Some(blob_op) = written.blobs_op {
+        get_fragments(blob_op).map_err(|err| PyRuntimeError::new_err(err.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    let default_meta: Vec<_> = default_fragments
+        .into_iter()
+        .map(FragmentMetadata::new)
+        .collect();
+
+    let blob_meta: Vec<_> = blob_fragments
+        .into_iter()
+        .map(FragmentMetadata::new)
+        .collect();
+
+    Ok((default_meta, blob_meta))
+}
+
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
     if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
