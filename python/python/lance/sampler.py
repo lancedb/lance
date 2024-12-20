@@ -12,7 +12,16 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Generic, Iterable, List, Optional, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    TypeVar,
+    Union,
+)
 
 import pyarrow as pa
 import pyarrow.compute as pc

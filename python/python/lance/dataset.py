@@ -46,9 +46,9 @@ from .dependencies import numpy as np
 from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
-    _FragmentMetadata,
     CleanupStats,
     _Dataset,
+    _FragmentMetadata,
     _MergeInsertBuilder,
     _Operation,
     _RewriteGroup,
@@ -56,10 +56,10 @@ from .lance import (
     _Scanner,
     _write_dataset,
 )
-from .optimize import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Session as Session
 from .optimize import Compaction
+from .optimize import CompactionMetrics as CompactionMetrics
 from .schema import LanceSchema
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
@@ -2489,14 +2489,17 @@ class Transaction:
     uuid: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
     blobs_op: Optional[LanceOperation.BaseOperation] = None
 
+
 class Tag(TypedDict):
     version: int
     manifest_size: int
+
 
 class Version(TypedDict):
     version: int
     timestamp: int | datetime
     metadata: Dict[str, str]
+
 
 class UpdateResult(TypedDict):
     num_rows_updated: int
@@ -2508,10 +2511,12 @@ class AlterColumn(TypedDict):
     nullable: Optional[bool]
     data_type: Optional[pa.DataType]
 
+
 class ExecuteResult(TypedDict):
     num_inserted_rows: int
     num_updated_rows: int
     num_deleted_rows: int
+
 
 class Index(TypedDict):
     name: str
@@ -2520,6 +2525,7 @@ class Index(TypedDict):
     fields: List[str]
     version: int
     fragment_ids: Set[int]
+
 
 class OperationDict(TypedDict):
     fragments: List[_FragmentMetadata]
