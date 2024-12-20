@@ -1689,6 +1689,15 @@ impl Scanner {
         // Check if we've created new versions since the index was built.
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
+            // need to set the metric type to be the same as the index
+            // to make sure the distance is comparable.
+            let idx = self
+                .dataset
+                .open_vector_index(q.column.as_str(), &index.uuid.to_string())
+                .await?;
+            let mut q = q.clone();
+            q.metric_type = idx.metric_type();
+
             // If the vector column is not present, we need to take the vector column, so
             // that the distance value is comparable with the flat search ones.
             if knn_node.schema().column_with_name(&q.column).is_none() {
@@ -1725,7 +1734,7 @@ impl Scanner {
                 scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
             }
             // first we do flat search on just the new data
-            let topk_appended = self.flat_knn(scan_node, q)?;
+            let topk_appended = self.flat_knn(scan_node, &q)?;
 
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
@@ -1740,7 +1749,7 @@ impl Scanner {
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
             )?;
             // then we do a flat search on KNN(new data) + ANN(indexed data)
-            return self.flat_knn(Arc::new(unioned), q);
+            return self.flat_knn(Arc::new(unioned), &q);
         }
 
         Ok(knn_node)

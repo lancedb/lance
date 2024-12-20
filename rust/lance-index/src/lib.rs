@@ -140,7 +140,12 @@ impl IndexType {
     pub fn is_vector(&self) -> bool {
         matches!(
             self,
-            Self::Vector | Self::IvfPq | Self::IvfHnswSq | Self::IvfHnswPq
+            Self::Vector
+                | Self::IvfPq
+                | Self::IvfHnswSq
+                | Self::IvfHnswPq
+                | Self::IvfFlat
+                | Self::IvfSq
         )
     }
 }
