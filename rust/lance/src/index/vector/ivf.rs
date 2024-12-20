@@ -730,6 +730,12 @@ fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>>
                         .iter()
                         .map(|v| *v as f32)
                         .collect::<Vec<_>>()),
+                    DataType::UInt8 => Ok(row
+                        .as_primitive::<UInt8Type>()
+                        .values()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect::<Vec<_>>()),
                     _ => Err(Error::Index {
                         message: format!(
                             "IVF centroids must be FixedSizeList of floating number, got: {}",

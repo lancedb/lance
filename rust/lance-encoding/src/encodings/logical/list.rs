@@ -12,6 +12,7 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
+use lance_arrow::list::ListArrayExt;
 use log::trace;
 use snafu::{location, Location};
 use tokio::task::JoinHandle;
@@ -1263,8 +1264,11 @@ impl FieldEncoder for ListFieldEncoder {
 
 /// A structural encoder for list fields
 ///
-/// The list's offsets are added to the rep/def builder and the
-/// items are passed to the child.
+/// The list's offsets are added to the rep/def builder
+/// and the list array's values are passed to the child encoder
+///
+/// The values will have any garbage values removed and will be trimmed
+/// to only include the values that are actually used.
 pub struct ListStructuralEncoder {
     child: Box<dyn FieldEncoder>,
 }
@@ -1284,27 +1288,27 @@ impl FieldEncoder for ListStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(list_arr) = array.as_list_opt::<i32>() {
-            repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
-            self.child.maybe_encode(
-                list_arr.values().clone(),
-                external_buffers,
-                repdef,
-                row_number,
-                num_rows,
-            )
+        let values = if let Some(list_arr) = array.as_list_opt::<i32>() {
+            let has_garbage_values =
+                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            if has_garbage_values {
+                list_arr.filter_garbage_nulls().trimmed_values()
+            } else {
+                list_arr.trimmed_values()
+            }
         } else if let Some(list_arr) = array.as_list_opt::<i64>() {
-            repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
-            self.child.maybe_encode(
-                list_arr.values().clone(),
-                external_buffers,
-                repdef,
-                row_number,
-                num_rows,
-            )
+            let has_garbage_values =
+                repdef.add_offsets(list_arr.offsets().clone(), array.nulls().cloned());
+            if has_garbage_values {
+                list_arr.filter_garbage_nulls().trimmed_values()
+            } else {
+                list_arr.trimmed_values()
+            }
         } else {
             panic!("List encoder used for non-list data")
-        }
+        };
+        self.child
+            .maybe_encode(values, external_buffers, repdef, row_number, num_rows)
     }
 
     fn flush(&mut self, external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
@@ -1323,11 +1327,6 @@ impl FieldEncoder for ListStructuralEncoder {
     }
 }
 
-/// Scheduler for list data
-///
-/// All the heavy lifting is handled by the child but we need to make
-/// sure we unravel the offsets/validity after decoding the flattened
-/// items.
 #[derive(Debug)]
 pub struct StructuralListScheduler {
     child: Box<dyn StructuralFieldScheduler>,
@@ -1359,6 +1358,10 @@ impl StructuralFieldScheduler for StructuralListScheduler {
     }
 }
 
+/// Scheduling job for list data
+///
+/// Scheduling is handled by the primitive encoder and nothing special
+/// happens here.
 #[derive(Debug)]
 struct StructuralListSchedulingJob<'a> {
     child: Box<dyn StructuralSchedulingJob + 'a>,
@@ -1455,13 +1458,14 @@ mod tests {
 
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::{LargeListBuilder, StringBuilder};
+    use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
         Array, ArrayRef, BooleanArray, ListArray, StructArray, UInt64Array,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use rstest::rstest;
 
     use crate::{
         testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
@@ -1476,10 +1480,13 @@ mod tests {
         DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_list() {
+    async fn test_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let field = Field::new("", make_list_type(DataType::Int32), true);
-        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1533,8 +1540,11 @@ mod tests {
         .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_list() {
+    async fn test_simple_list(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         list_builder.append_value([Some(1), Some(2), Some(3)]);
@@ -1547,9 +1557,91 @@ mod tests {
             .with_range(0..2)
             .with_range(0..3)
             .with_range(1..3)
-            .with_indices(vec![1, 3]);
+            .with_indices(vec![1, 3])
+            .with_indices(vec![2])
+            .with_file_version(version);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
             .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_simple_sliced_list() {
+        let items_builder = Int32Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some(1), Some(2), Some(3)]);
+        list_builder.append_value([Some(4), Some(5)]);
+        list_builder.append_null();
+        list_builder.append_value([Some(6), Some(7), Some(8)]);
+        let list_array = list_builder.finish();
+
+        let list_array = list_array.slice(1, 2);
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(1..2)
+            .with_indices(vec![0])
+            .with_indices(vec![1])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_list_with_garbage_nulls() {
+        // In Arrow, list nulls are allowed to be non-empty, with masked garbage values
+        // Here we make a list with a null row in the middle with 3 garbage values
+        let items = UInt64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let offsets = ScalarBuffer::<i32>::from(vec![0, 5, 8, 10]);
+        let offsets = OffsetBuffer::new(offsets);
+        let list_validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true]));
+        let list_arr = ListArray::new(
+            Arc::new(Field::new("item", DataType::UInt64, true)),
+            offsets,
+            Arc::new(items),
+            Some(list_validity),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(1..2)
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_two_page_list() {
+        // This is a simple pre-defined list that spans two pages.  This test is useful for
+        // debugging the repetition index
+        let items_builder = Int64Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        for i in 0..512 {
+            list_builder.append_value([Some(i), Some(i * 2)]);
+        }
+        let list_array_1 = list_builder.finish();
+
+        let items_builder = Int64Builder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        for i in 0..512 {
+            let i = i + 512;
+            list_builder.append_value([Some(i), Some(i * 2)]);
+        }
+        let list_array_2 = list_builder.finish();
+
+        let test_cases = TestCases::default()
+            .with_file_version(LanceFileVersion::V2_1)
+            .with_page_sizes(vec![100])
+            .with_range(800..900);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array_1), Arc::new(list_array_2)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
     }
 
     #[test_log::test(tokio::test)]

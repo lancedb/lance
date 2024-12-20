@@ -210,7 +210,8 @@ async fn test_decode(
             assert_eq!(expected.data_type(), actual.data_type());
             if expected.len() != actual.len() {
                 panic!(
-                    "Mismatch in length expected {} but got {}",
+                    "Mismatch in length (at offset={}) expected {} but got {}",
+                    offset,
                     expected.len(),
                     actual.len()
                 );
@@ -223,8 +224,9 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
                             i,
+                            offset,
                             expected,
                             actual,
                             expected.slice(i, 1),

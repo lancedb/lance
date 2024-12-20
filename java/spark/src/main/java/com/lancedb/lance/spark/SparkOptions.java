@@ -35,6 +35,7 @@ public class SparkOptions {
   private static final String max_rows_per_group = "max_rows_per_group";
   private static final String max_bytes_per_file = "max_bytes_per_file";
   private static final String batch_size = "batch_size";
+  private static final String topN_push_down = "topN_push_down";
 
   public static ReadOptions genReadOptionFromConfig(LanceConfig config) {
     ReadOptions.Builder builder = new ReadOptions.Builder();
@@ -93,5 +94,9 @@ public class SparkOptions {
       return Integer.parseInt(options.get(batch_size));
     }
     return 512;
+  }
+
+  public static boolean enableTopNPushDown(LanceConfig config) {
+    return Boolean.parseBoolean(config.getOptions().getOrDefault(topN_push_down, "true"));
   }
 }

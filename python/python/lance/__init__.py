@@ -68,7 +68,8 @@ def dataset(
     Parameters
     ----------
     uri : str
-        Address to the Lance dataset.
+        Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
+        or a cloud object store URI, i.e., `s3://bucket/data.lance`.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -77,7 +78,7 @@ def dataset(
         argument value. If a version is already specified, this arg is ignored.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
-    commit_handler : optional, CommitLock
+    commit_handler : optional, lance.commit.CommitLock
         If specified, use the provided commit handler to lock the table while
         committing a new version. Not necessary on object stores other than S3
         or when there are no concurrent writers.

@@ -258,6 +258,11 @@ message PackedStruct {
   Buffer buffer = 2;
 }
 
+message PackedStructFixedWidthMiniBlock {
+  ArrayEncoding Flat = 1;
+  repeated uint32 bits_per_values = 2;
+}
+
 message FixedSizeBinary {
   ArrayEncoding bytes = 1;
   uint32 byte_width = 2;
@@ -283,6 +288,7 @@ message ArrayEncoding {
         BinaryMiniBlock binary_mini_block = 15;
         FsstMiniBlock fsst_mini_block = 16;
         BinaryBlock binary_block = 17;
+        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 18;
     }
 }
 
@@ -377,11 +383,11 @@ message FullZipLayout {
 
 /// A layout used for pages where all values are null
 ///
-/// In addition, there can be no repetition levels and only a single definition level
-///
-/// If the data is all-null but we have non-trivial rep-def then MiniBlockLayout is used
+/// There may be buffers of repetition and definition information
+/// if required in order to interpret what kind of nulls are present
 message AllNullLayout {
-
+  // The meaning of each repdef layer, used to interpret repdef buffers correctly
+  repeated RepDefLayer layers = 5;
 }
 
 message PageLayout {

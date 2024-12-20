@@ -34,6 +34,7 @@ use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
 use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
 use crate::statistics::{GetStat, Stat};
@@ -832,6 +833,18 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 return Ok(Box::new(BinaryMiniBlockEncoder::default()));
             }
         }
+        if let DataBlock::Struct(ref struct_data_block) = data {
+            // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
+            // just being cautious here.
+            if struct_data_block
+                .children
+                .iter()
+                .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+            {
+                panic!("packed struct encoding currently only supports fixed-width fields.")
+            }
+            return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
+        }
         Ok(Box::new(ValueEncoder::default()))
     }
 
@@ -1225,12 +1238,7 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
                     Ok(Box::new(ListStructuralEncoder::new(child_encoder)))
                 }
                 DataType::Struct(_) => {
-                    let field_metadata = &field.metadata;
-                    if field_metadata
-                        .get("packed")
-                        .map(|v| v == "true")
-                        .unwrap_or(false)
-                    {
+                    if field.is_packed_struct() {
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),

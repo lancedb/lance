@@ -33,6 +33,7 @@ public class ScanOptions {
   private final Optional<Query> nearest;
   private final boolean withRowId;
   private final int batchReadahead;
+  private final Optional<List<ColumnOrdering>> columnOrderings;
 
   /**
    * Constructor for LanceScanOptions.
@@ -60,7 +61,8 @@ public class ScanOptions {
       Optional<Long> offset,
       Optional<Query> nearest,
       boolean withRowId,
-      int batchReadahead) {
+      int batchReadahead,
+      Optional<List<ColumnOrdering>> columnOrderings) {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
@@ -74,6 +76,7 @@ public class ScanOptions {
     this.nearest = nearest;
     this.withRowId = withRowId;
     this.batchReadahead = batchReadahead;
+    this.columnOrderings = columnOrderings;
   }
 
   /**
@@ -166,6 +169,10 @@ public class ScanOptions {
     return batchReadahead;
   }
 
+  public Optional<List<ColumnOrdering>> getColumnOrderings() {
+    return columnOrderings;
+  }
+
   @Override
   public String toString() {
     return new ToStringBuilder(this)
@@ -181,6 +188,7 @@ public class ScanOptions {
         .append("nearest", nearest.orElse(null))
         .append("withRowId", withRowId)
         .append("batchReadahead", batchReadahead)
+        .append("columnOrdering", columnOrderings)
         .toString();
   }
 
@@ -196,6 +204,7 @@ public class ScanOptions {
     private Optional<Query> nearest = Optional.empty();
     private boolean withRowId = false;
     private int batchReadahead = 16;
+    private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
 
     public Builder() {}
 
@@ -215,6 +224,7 @@ public class ScanOptions {
       this.nearest = options.getNearest();
       this.withRowId = options.isWithRowId();
       this.batchReadahead = options.getBatchReadahead();
+      this.columnOrderings = options.getColumnOrderings();
     }
 
     /**
@@ -327,6 +337,11 @@ public class ScanOptions {
       return this;
     }
 
+    public Builder setColumnOrderings(List<ColumnOrdering> columnOrderings) {
+      this.columnOrderings = Optional.of(columnOrderings);
+      return this;
+    }
+
     /**
      * Build the LanceScanOptions instance.
      *
@@ -343,7 +358,8 @@ public class ScanOptions {
           offset,
           nearest,
           withRowId,
-          batchReadahead);
+          batchReadahead,
+          columnOrderings);
     }
   }
 }

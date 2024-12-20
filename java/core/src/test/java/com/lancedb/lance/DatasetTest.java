@@ -11,8 +11,13 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.schema.ColumnAlteration;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -21,10 +26,12 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.stream.Collectors;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class DatasetTest {
   @TempDir static Path tempDir; // Temporary directory for the tests
@@ -135,6 +142,18 @@ public class DatasetTest {
   }
 
   @Test
+  void testDatasetUri() {
+    String datasetPath = tempDir.resolve("dataset_uri").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(datasetPath, dataset.uri());
+      }
+    }
+  }
+
+  @Test
   void testOpenNonExist() throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
@@ -190,6 +209,90 @@ public class DatasetTest {
       Dataset dataset = testDataset.createEmptyDataset();
       dataset.close();
       assertThrows(RuntimeException.class, dataset::getSchema);
+    }
+  }
+
+  @Test
+  void testDropColumns() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(testDataset.getSchema(), dataset.getSchema());
+      dataset.dropColumns(Collections.singletonList("name"));
+
+      Schema changedSchema =
+          new Schema(
+              Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))), null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+    }
+  }
+
+  @Test
+  void testAlterColumns() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(testDataset.getSchema(), dataset.getSchema());
+
+      ColumnAlteration nameColumnAlteration =
+          new ColumnAlteration.Builder("name")
+              .rename("new_name")
+              .nullable(true)
+              .castTo(new ArrowType.Utf8())
+              .build();
+
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
+
+      Schema changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.notNullable("new_name", new ArrowType.Utf8())),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      nameColumnAlteration =
+          new ColumnAlteration.Builder("new_name")
+              .rename("new_name_2")
+              .castTo(new ArrowType.LargeUtf8())
+              .build();
+
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
+      changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.notNullable("new_name_2", new ArrowType.LargeUtf8())),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
+      assertNotNull(dataset.getSchema().findField("new_name_2"));
     }
   }
 

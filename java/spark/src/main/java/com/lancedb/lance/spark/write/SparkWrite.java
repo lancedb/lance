@@ -44,17 +44,17 @@ public class SparkWrite implements Write {
 
   /** Task commit. */
   public static class SparkWriteBuilder implements WriteBuilder {
-    private final LanceConfig options;
+    private final LanceConfig config;
     private final StructType schema;
 
-    public SparkWriteBuilder(StructType schema, LanceConfig options) {
+    public SparkWriteBuilder(StructType schema, LanceConfig config) {
       this.schema = schema;
-      this.options = options;
+      this.config = config;
     }
 
     @Override
     public Write build() {
-      return new SparkWrite(schema, options);
+      return new SparkWrite(schema, config);
     }
   }
 }

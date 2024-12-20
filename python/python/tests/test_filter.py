@@ -81,6 +81,7 @@ def test_sql_predicates(dataset):
         ("int >= 50", 50),
         ("int = 50", 1),
         ("int != 50", 99),
+        ("int BETWEEN 50 AND 60", 11),
         ("float < 30.0", 45),
         ("str = 'aa'", 16),
         ("str in ('aa', 'bb')", 26),

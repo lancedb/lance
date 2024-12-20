@@ -21,7 +21,8 @@ use pb::{
     page_layout::Layout,
     AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
     BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
-    MiniBlockLayout, Nullable, PackedStruct, PageLayout, RepDefLayer,
+    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout,
+    RepDefLayer,
 };
 
 use crate::{
@@ -174,6 +175,20 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn packed_struct_fixed_width_mini_block(
+        data: ArrayEncoding,
+        bits_per_values: Vec<u32>,
+    ) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::PackedStructFixedWidthMiniBlock(
+                Box::new(PackedStructFixedWidthMiniBlock {
+                    flat: Some(Box::new(data)),
+                    bits_per_values,
+                }),
+            )),
+        }
+    }
+
     pub fn binary(
         indices_encoding: ArrayEncoding,
         bytes_encoding: ArrayEncoding,
@@ -304,9 +319,18 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn simple_all_null_layout() -> PageLayout {
+    pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> PageLayout {
         PageLayout {
-            layout: Some(Layout::AllNullLayout(AllNullLayout {})),
+            layout: Some(Layout::AllNullLayout(AllNullLayout {
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
+            })),
         }
+    }
+
+    pub fn simple_all_null_layout() -> PageLayout {
+        Self::all_null_layout(&[DefinitionInterpretation::NullableItem])
     }
 }
