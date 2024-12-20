@@ -149,14 +149,14 @@ impl FileWriter {
     ///
     /// Returns the number of rows written
     pub async fn create_file_with_batches(
-        store: ObjectStore,
+        store: &ObjectStore,
         path: &Path,
         schema: lance_core::datatypes::Schema,
         batches: impl Iterator<Item = RecordBatch> + Send,
         options: FileWriterOptions,
     ) -> Result<usize> {
         let writer = store.create(path).await?;
-        let mut writer = FileWriter::try_new(writer, schema, options)?;
+        let mut writer = Self::try_new(writer, schema, options)?;
         for batch in batches {
             writer.write_batch(&batch).await?;
         }

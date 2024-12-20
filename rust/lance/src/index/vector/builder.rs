@@ -228,13 +228,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .await?;
 
         self.partition_sizes = vec![(0, 0); model.num_partitions()];
-        let object_store = ObjectStore::local();
+        let local_store = ObjectStore::local();
         for (part_id, (store, index)) in mapped.into_iter().enumerate() {
             let path = self.temp_dir.child(format!("storage_part{}", part_id));
             let batches = store.to_batches()?;
             let schema = store.schema().as_ref().try_into()?;
             let store_len = FileWriter::create_file_with_batches(
-                object_store.clone(),
+                &local_store,
                 &path,
                 schema,
                 batches,
@@ -246,7 +246,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let batch = index.to_batch()?;
             let schema = batch.schema().as_ref().try_into()?;
             let index_len = FileWriter::create_file_with_batches(
-                object_store.clone(),
+                &local_store,
                 &path,
                 schema,
                 std::iter::once(batch),
@@ -527,7 +527,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let path = self.temp_dir.child(format!("storage_part{}", part_id));
             let batches = storage.to_batches()?;
             FileWriter::create_file_with_batches(
-                local_store.clone(),
+                &local_store,
                 &path,
                 storage.schema().as_ref().try_into()?,
                 batches,
@@ -545,7 +545,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let index_batch = sub_index.to_batch()?;
             let schema = index_batch.schema().as_ref().try_into()?;
             FileWriter::create_file_with_batches(
-                local_store,
+                &local_store,
                 &path,
                 schema,
                 std::iter::once(index_batch),
