@@ -1066,37 +1066,23 @@ impl Scanner {
 
     fn calc_eager_columns(&self, filter_plan: &FilterPlan) -> Result<Arc<Schema>> {
         let columns = filter_plan.refine_columns();
-        // If the column didn't exist in the scan output schema then we wouldn't make
-        // it to this point.  However, there may be columns (like _rowid, _distance, etc.)
-        // which do not exist in the dataset schema but are added by the scan.  We can ignore
-        // those as eager columns.
-        let filter_schema = self.dataset.schema().project_or_drop(&columns)?;
-        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
+        let early_schema = self
+            .dataset
+            .empty_projection()
+            // We need the filter columns
+            .union_columns(columns, OnMissing::Error)?
+            // And also any columns that are eager
+            .union_predicate(|f| self.is_early_field(f))
+            .into_schema_ref();
+
+        if early_schema.fields.iter().any(|f| !f.is_default_storage()) {
             return Err(Error::NotSupported {
                 source: "non-default storage columns cannot be used as filters".into(),
                 location: location!(),
             });
         }
-        let physical_schema = self.projection_plan.physical_schema.clone();
-        let remaining_schema = physical_schema.exclude(&filter_schema)?;
 
-        let narrow_fields = remaining_schema
-            .fields
-            .iter()
-            .filter(|f| self.is_early_field(f))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if narrow_fields.is_empty() {
-            Ok(Arc::new(filter_schema))
-        } else {
-            let mut new_fields = filter_schema.fields;
-            new_fields.extend(narrow_fields);
-            Ok(Arc::new(Schema {
-                fields: new_fields,
-                metadata: HashMap::new(),
-            }))
-        }
+        Ok(early_schema)
     }
 
     /// Create [`ExecutionPlan`] for Scan.
@@ -4616,11 +4602,11 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.use_stats(false).filter("s IS NOT NULL"),
-            "ProjectionExec: expr=[i@1 as i, s@0 as s, vec@3 as vec]
-  Take: columns=\"s, i, _rowid, (vec)\"
+            "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
+  Take: columns=\"i, s, _rowid, (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: s@0 IS NOT NULL
-        LanceScan: uri..., projection=[s, i], row_id=true, row_addr=false, ordered=true",
+      FilterExec: s@1 IS NOT NULL
+        LanceScan: uri..., projection=[i, s], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
@@ -4632,9 +4618,9 @@ mod test {
                     .materialization_style(MaterializationStyle::AllEarly)
                     .filter("s IS NOT NULL")
             },
-            "ProjectionExec: expr=[i@1 as i, s@0 as s, vec@2 as vec]
-  FilterExec: s@0 IS NOT NULL
-    LanceScan: uri..., projection=[s, i, vec], row_id=true, row_addr=false, ordered=true",
+            "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
+  FilterExec: s@1 IS NOT NULL
+    LanceScan: uri..., projection=[i, s, vec], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
