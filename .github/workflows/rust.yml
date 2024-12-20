@@ -217,5 +217,9 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.msrv }}
+      - name: Downgrade  dependencies
+        # These packages have newer requirements for MSRV
+        run: |
+          cargo update -p substrait --precise 0.49.1
       - name: cargo +${{ matrix.msrv }} check
         run: cargo check --workspace --tests --benches --all-features
