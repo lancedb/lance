@@ -114,7 +114,7 @@ class LanceFragment(pa.dataset.Fragment):
 
     @staticmethod
     def create_from_file(
-        filename: Union[str, Path],
+        filename: str,
         dataset: LanceDataset,
         fragment_id: int,
     ) -> FragmentMetadata:

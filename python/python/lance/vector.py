@@ -131,7 +131,7 @@ CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 
 
 def train_pq_codebook_on_accelerator(
-    dataset: LanceDataset,
+    dataset: LanceDataset | Path | str,
     metric_type: Literal["l2", "cosine", "dot"],
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
@@ -274,7 +274,7 @@ def compute_pq_codes(
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
-) -> str:
+) -> Tuple[Union[str, Path], List[str]]:
     """Compute pq codes for each row using GPU kmeans and spill to disk.
 
     Parameters

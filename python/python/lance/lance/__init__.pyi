@@ -467,7 +467,7 @@ class _Fragment:
     def metadata(self) -> _FragmentMetadata:
         ...
 
-    def count_rows(self, _filter: Optional[str]) -> int:
+    def count_rows(self, _filter: Optional[str] = None) -> int:
         ...
 
     def take(self,
