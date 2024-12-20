@@ -1398,54 +1398,7 @@ pub(crate) async fn remap_index_file_v3(
     column: String,
 ) -> Result<()> {
     let index_dir = dataset.indices_dir().child(new_uuid);
-    let element_type = get_vector_element_type(dataset, &column)?;
-    match index.index_type() {
-        IndexType::IvfFlat => {
-            if element_type.is_floating() {
-                let mut remapper = IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_remapper(
-                    dataset.clone(),
-                    column,
-                    index_dir,
-                    index,
-                )?;
-                remapper.remap(mapping).await?;
-            } else {
-                let mut remapper = IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_remapper(
-                    dataset.clone(),
-                    column,
-                    index_dir,
-                    index,
-                )?;
-                remapper.remap(mapping).await?;
-            }
-        }
-        IndexType::IvfPq => {
-            let mut remapper = IvfIndexBuilder::<FlatIndex, ProductQuantizer>::new_remapper(
-                dataset.clone(),
-                column,
-                index_dir,
-                index,
-            )?;
-            remapper.remap(mapping).await?;
-        }
-        IndexType::IvfSq => {
-            let mut remapper = IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new_remapper(
-                dataset.clone(),
-                column,
-                index_dir,
-                index,
-            )?;
-            remapper.remap(mapping).await?;
-        }
-        _ => {
-            return Err(Error::invalid_input(
-                format!("Remapping is not support for {}", index.index_type()),
-                location!(),
-            ));
-        }
-    }
-
-    Ok(())
+    index.remap_to(mapping, column, index_dir).await
 }
 
 #[allow(clippy::too_many_arguments)]

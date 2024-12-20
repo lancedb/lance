@@ -54,7 +54,7 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use crate::index::vector::builder::index_type_string;
+use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
 use crate::{
     index::{
         vector::{utils::PartitionLoadLock, VectorIndex},
@@ -461,16 +461,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
     }
 
     async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        // This will be needed if we want to clean up IVF to allow more than just
-        // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
-        // remap to the lower layers.
-
-        // Currently, remapping for IVF is implemented in remap_index_file which
-        // mirrors some of the other IVF routines like build_ivf_pq_index
         Err(Error::Index {
             message: "Remapping IVF in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    async fn remap_to(
+        self: Arc<Self>,
+        mapping: &HashMap<u64, Option<u64>>,
+        column: String,
+        index_dir: Path,
+    ) -> Result<()> {
+        match self.sub_index_type() {
+            (SubIndexType::Flat, _) => {
+                let mut remapper = IvfIndexBuilder::<S, Q>::new_remapper(column, index_dir, self)?;
+                remapper.remap(mapping).await
+            }
+            _ => Err(Error::Index {
+                message: format!(
+                    "Remapping is not supported for index type {}",
+                    self.index_type(),
+                ),
+                location: location!(),
+            }),
+        }
     }
 
     fn ivf_model(&self) -> IvfModel {

@@ -21,9 +21,11 @@ use lance_encoding::encoder::{
 };
 use lance_encoding::repdef::RepDefBuilder;
 use lance_encoding::version::LanceFileVersion;
+use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::Writer;
 use log::debug;
+use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
 use snafu::{location, Location};
@@ -141,6 +143,24 @@ impl FileWriter {
             schema_metadata: HashMap::new(),
             options,
         }
+    }
+
+    /// Write a series of record batches to a new file
+    ///
+    /// Returns the number of rows written
+    pub async fn create_file_with_batches(
+        store: ObjectStore,
+        path: &Path,
+        schema: lance_core::datatypes::Schema,
+        batches: impl Iterator<Item = RecordBatch> + Send,
+        options: FileWriterOptions,
+    ) -> Result<usize> {
+        let writer = store.create(path).await?;
+        let mut writer = FileWriter::try_new(writer, schema, options)?;
+        for batch in batches {
+            writer.write_batch(&batch).await?;
+        }
+        Ok(writer.finish().await? as usize)
     }
 
     async fn do_write_buffer(writer: &mut ObjectWriter, buf: &[u8]) -> Result<()> {

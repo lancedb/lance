@@ -14,6 +14,7 @@ use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lazy_static::lazy_static;
+use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
 use v3::subindex::SubIndexType;
 
@@ -183,6 +184,19 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// If an old row id is not in the mapping then it should be
     /// left alone.
     async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+
+    /// Remap the index according to mapping
+    ///
+    /// write the remapped index to the index_dir
+    /// this is available for only v3 index
+    async fn remap_to(
+        self: Arc<Self>,
+        _mapping: &HashMap<u64, Option<u64>>,
+        _column: String,
+        _index_dir: Path,
+    ) -> Result<()> {
+        unimplemented!("only for v3 index")
+    }
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

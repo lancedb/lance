@@ -73,7 +73,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn schema(&self) -> &SchemaRef;
 
-    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch>>;
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send>;
 
     fn remap(&self, mapping: &HashMap<u64, Option<u64>>) -> Result<Self> {
         let batches = self

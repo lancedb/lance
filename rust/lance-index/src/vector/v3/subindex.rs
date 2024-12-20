@@ -16,7 +16,7 @@ use crate::{prefilter::PreFilter, vector::Query};
 /// A sub index for IVF index
 pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     type QueryParams: Send + Sync + for<'a> From<&'a Query>;
-    type BuildParams: Clone;
+    type BuildParams: Clone + Send + Sync;
 
     /// Load the sub index from a record batch with a single row
     fn load(data: RecordBatch) -> Result<Self>
