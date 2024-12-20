@@ -286,7 +286,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             location!(),
         ))?;
         let dim = utils::get_vector_dim(dataset, &self.column)?;
-        super::build_ivf_model(&dataset, &self.column, dim, self.distance_type, ivf_params).await
+        super::build_ivf_model(dataset, &self.column, dim, self.distance_type, ivf_params).await
 
         // TODO: load ivf model
     }
