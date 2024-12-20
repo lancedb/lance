@@ -260,6 +260,7 @@ where
     }
 }
 
+/// Extract a Vec of PyLance types from a Python object.
 pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
 where
     PyLance<T>: FromPyObject<'a>,
@@ -268,6 +269,7 @@ where
         .map(|v| v.into_iter().map(|t| t.0).collect())
 }
 
+/// Export a Vec of Lance types to a Python object.
 pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> Vec<PyObject>
 where
     PyLance<&'a T>: ToPyObject,

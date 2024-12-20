@@ -132,7 +132,8 @@ class DataFile:
     fields : List[int]
         The field ids of the columns in this file.
     column_indices : List[int]
-        The column indices in the original schema.
+        The column indices where the fields are stored in the file.  Will  have
+        the same length as `fields`.
     file_major_version : int
         The major version of the data storage format.
     file_minor_version : int
