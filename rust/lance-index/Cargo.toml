@@ -26,6 +26,7 @@ datafusion-physical-expr.workspace = true
 datafusion-sql.workspace = true
 datafusion.workspace = true
 deepsize.workspace = true
+dirs.workspace = true
 futures.workspace = true
 half.workspace = true
 itertools.workspace = true
@@ -50,6 +51,8 @@ serde_json.workspace = true
 serde.workspace = true
 snafu.workspace = true
 tantivy.workspace = true
+lindera = { workspace = true, optional = true }
+lindera-tantivy = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
@@ -67,6 +70,9 @@ tempfile.workspace = true
 test-log.workspace = true
 datafusion-sql.workspace = true
 random_word = { version = "0.4.3", features = ["en"] }
+
+[features]
+tokenizer-lindera = ["lindera", "lindera-tantivy"]
 
 [build-dependencies]
 prost-build.workspace = true
