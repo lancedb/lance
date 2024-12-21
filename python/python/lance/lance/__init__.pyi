@@ -73,6 +73,7 @@ from .optimize import (
     RewriteResult as RewriteResult,
 )
 from .schema import LanceSchema as LanceSchema
+from .trace import trace_to_chrome as trace_to_chrome
 
 def infer_tfrecord_schema(
     uri: str,
