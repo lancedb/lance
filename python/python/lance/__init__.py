@@ -79,9 +79,8 @@ def dataset(
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
     commit_lock : optional, lance.commit.CommitLock
-        If specified, use the provided commit handler to lock the table while
-        committing a new version. Not necessary on object stores other than S3
-        or when there are no concurrent writers.
+        A custom commit lock.  Only needed if your object store does not support
+        atomic commits.  See the user guide for more details.
     index_cache_size : optional, int
         Index cache size. Index cache is a LRU cache with TTL. This number specifies the
         number of index pages, for example, IVF partitions, to be cached in
