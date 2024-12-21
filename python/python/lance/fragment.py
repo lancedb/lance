@@ -432,9 +432,7 @@ class LanceFragment(pa.dataset.Fragment):
 
         reader = _coerce_reader(data_obj, schema)
         max_field_id = self._ds.max_field_id
-        metadata, schema = self._fragment.merge(
-            reader, left_on, right_on, max_field_id
-        )
+        metadata, schema = self._fragment.merge(reader, left_on, right_on, max_field_id)
         return FragmentMetadata.from_metadata(metadata), schema
 
     def merge_columns(
