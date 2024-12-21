@@ -14,6 +14,7 @@
 
 package com.lancedb.lance.spark.read;
 
+import com.lancedb.lance.ipc.ColumnOrdering;
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.utils.Optional;
 
@@ -24,24 +25,39 @@ import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.internal.connector.SupportsMetadata;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
+import scala.collection.immutable.Map;
+import scala.collection.mutable.HashMap;
 
 import java.io.Serializable;
 import java.util.List;
 import java.util.stream.IntStream;
 
-public class LanceScan implements Batch, Scan, Serializable {
+public class LanceScan implements Batch, Scan, SupportsMetadata, Serializable {
   private static final long serialVersionUID = 947284762748623947L;
 
   private final StructType schema;
-  private final LanceConfig options;
+  private final LanceConfig config;
   private final Optional<String> whereConditions;
+  private final Optional<Integer> limit;
+  private final Optional<Integer> offset;
+  private final Optional<List<ColumnOrdering>> topNSortOrders;
 
-  public LanceScan(StructType schema, LanceConfig options, Optional<String> whereConditions) {
+  public LanceScan(
+      StructType schema,
+      LanceConfig config,
+      Optional<String> whereConditions,
+      Optional<Integer> limit,
+      Optional<Integer> offset,
+      Optional<List<ColumnOrdering>> topNSortOrders) {
     this.schema = schema;
-    this.options = options;
+    this.config = config;
     this.whereConditions = whereConditions;
+    this.limit = limit;
+    this.offset = offset;
+    this.topNSortOrders = topNSortOrders;
   }
 
   @Override
@@ -51,9 +67,19 @@ public class LanceScan implements Batch, Scan, Serializable {
 
   @Override
   public InputPartition[] planInputPartitions() {
-    List<LanceSplit> splits = LanceSplit.generateLanceSplits(options);
+    List<LanceSplit> splits = LanceSplit.generateLanceSplits(config);
     return IntStream.range(0, splits.size())
-        .mapToObj(i -> new LanceInputPartition(schema, i, splits.get(i), options, whereConditions))
+        .mapToObj(
+            i ->
+                new LanceInputPartition(
+                    schema,
+                    i,
+                    splits.get(i),
+                    config,
+                    whereConditions,
+                    limit,
+                    offset,
+                    topNSortOrders))
         .toArray(InputPartition[]::new);
   }
 
@@ -65,6 +91,16 @@ public class LanceScan implements Batch, Scan, Serializable {
   @Override
   public StructType readSchema() {
     return schema;
+  }
+
+  @Override
+  public Map<String, String> getMetaData() {
+    HashMap<String, String> hashMap = new HashMap<>();
+    hashMap.put("whereConditions", whereConditions.toString());
+    hashMap.put("limit", limit.toString());
+    hashMap.put("offset", offset.toString());
+    hashMap.put("topNSortOrders", topNSortOrders.toString());
+    return hashMap.toMap(scala.Predef.conforms());
   }
 
   private class LanceReaderFactory implements PartitionReaderFactory {

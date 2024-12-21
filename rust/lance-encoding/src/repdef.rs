@@ -336,12 +336,21 @@ impl SerializedRepDefs {
     }
 }
 
+/// Slices a level buffer into pieces
+///
+/// This is needed to handle the fact that a level buffer may have more
+/// levels than values due to special (empty/null) lists.
+///
+/// As a result, a call to `slice_next(10)` may return 10 levels or it may
+/// return more than 10 levels if any special values are encountered.
+#[derive(Debug)]
 pub struct RepDefSlicer<'a> {
     repdef: &'a SerializedRepDefs,
     to_slice: LanceBuffer,
     current: usize,
 }
 
+// TODO: All of this logic will need some changing when we compress rep/def levels.
 impl<'a> RepDefSlicer<'a> {
     fn new(repdef: &'a SerializedRepDefs, levels: Arc<[u16]>) -> Self {
         Self {
@@ -352,13 +361,33 @@ impl<'a> RepDefSlicer<'a> {
     }
 
     pub fn num_levels(&self) -> usize {
-        self.to_slice.len()
+        self.to_slice.len() / 2
+    }
+
+    pub fn num_levels_remaining(&self) -> usize {
+        self.num_levels() - self.current
     }
 
     pub fn all_levels(&self) -> &LanceBuffer {
         &self.to_slice
     }
 
+    /// Returns the rest of the levels not yet sliced
+    ///
+    /// This must be called instead of `slice_next` on the final iteration.
+    /// This is because anytime we slice there may be empty/null lists on the
+    /// boundary that are "free" and the current behavior in `slice_next` is to
+    /// leave them for the next call.
+    ///
+    /// `slice_rest` will slice all remaining levels and return them.
+    pub fn slice_rest(&mut self) -> LanceBuffer {
+        let start = self.current;
+        let remaining = self.num_levels_remaining();
+        self.current = self.num_levels();
+        self.to_slice.slice_with_length(start * 2, remaining * 2)
+    }
+
+    /// Returns enough levels to satisfy the next `num_values` values
     pub fn slice_next(&mut self, num_values: usize) -> LanceBuffer {
         let start = self.current;
         let Some(max_visible_level) = self.repdef.max_visible_level else {
@@ -574,9 +603,10 @@ impl SerializerContext {
                 let offset_ctx = last_offsets[off[0] as usize];
                 new_last_off.push(offset_ctx);
                 new_last_off_full.push(last_offsets_full[off[0] as usize] + empties_seen);
-                self.rep_levels[offset_ctx] = rep_level;
                 if off[0] == off[1] {
                     empties_seen += 1;
+                } else {
+                    self.rep_levels[offset_ctx] = rep_level;
                 }
             }
             self.last_offsets = Some(new_last_off);
@@ -586,11 +616,12 @@ impl SerializerContext {
             let mut new_last_off_full = Vec::with_capacity(offset_desc.offsets.len());
             let mut empties_seen = 0;
             for off in offset_desc.offsets.windows(2) {
-                self.rep_levels[off[0] as usize] = rep_level;
                 new_last_off.push(off[0] as usize);
                 new_last_off_full.push(off[0] as usize + empties_seen);
                 if off[0] == off[1] {
                     empties_seen += 1;
+                } else {
+                    self.rep_levels[off[0] as usize] = rep_level;
                 }
             }
             self.last_offsets = Some(new_last_off);
@@ -808,83 +839,100 @@ impl RepDefBuilder {
 
     /// Adds a layer of offsets
     ///
-    /// Note: a List/LargeList/etc. array has both offsets and validity.  The
-    /// caller should register the validity before registering the offsets
+    /// Offsets are casted to a common type (i64) and also normalized.  Null lists are
+    /// always represented by a zero-length (identical) pair of offsets and so the caller
+    /// should filter out any garbage items before encoding them.  To assist with this the
+    /// method will return true if any non-empty null lists were found.
     pub fn add_offsets<O: OffsetSizeTrait>(
         &mut self,
-        repetition: OffsetBuffer<O>,
+        offsets: OffsetBuffer<O>,
         validity: Option<NullBuffer>,
-    ) {
-        // We should be able to zero-copy
+    ) -> bool {
+        let mut has_garbage_values = false;
         if O::IS_LARGE {
-            let inner = repetition.into_inner();
+            let inner = offsets.into_inner();
             let len = inner.len();
-            let i64_buff = ScalarBuffer::new(inner.into_inner(), 0, len);
-            let offsets = Vec::from(i64_buff);
+            let i64_buff = ScalarBuffer::<i64>::new(inner.into_inner(), 0, len);
+            let mut normalized = Vec::with_capacity(len);
+            normalized.push(0_i64);
             let mut specials = Vec::new();
             let mut has_empty_lists = false;
+            let mut last_off = 0;
             if let Some(validity) = validity.as_ref() {
-                for (idx, (_, valid)) in offsets
-                    .windows(2)
-                    .zip(validity.iter())
-                    .enumerate()
-                    .filter(|(_, (off, _))| off[0] == off[1])
-                {
-                    if valid {
-                        has_empty_lists = true;
-                        specials.push(SpecialOffset::EmptyList(idx));
-                    } else {
-                        specials.push(SpecialOffset::NullList(idx));
+                for (idx, (off, valid)) in i64_buff.windows(2).zip(validity.iter()).enumerate() {
+                    let len: i64 = off[1] - off[0];
+                    match (valid, len == 0) {
+                        (false, is_empty) => {
+                            specials.push(SpecialOffset::NullList(idx));
+                            has_garbage_values |= !is_empty;
+                        }
+                        (true, true) => {
+                            has_empty_lists = true;
+                            specials.push(SpecialOffset::EmptyList(idx));
+                        }
+                        _ => {
+                            last_off += len;
+                        }
                     }
+                    normalized.push(last_off);
                 }
             } else {
-                for (idx, _) in offsets
-                    .windows(2)
-                    .enumerate()
-                    .filter(|(_, off)| off[0] == off[1])
-                {
-                    has_empty_lists = true;
-                    specials.push(SpecialOffset::EmptyList(idx));
+                for (idx, off) in i64_buff.windows(2).enumerate() {
+                    let len: i64 = off[1] - off[0];
+                    if len == 0 {
+                        has_empty_lists = true;
+                        specials.push(SpecialOffset::EmptyList(idx));
+                    }
+                    last_off += len;
+                    normalized.push(last_off);
                 }
             };
-            self.check_offset_len(&offsets);
+            self.check_offset_len(&normalized);
             self.repdefs.push(RawRepDef::Offsets(OffsetDesc {
-                num_values: offsets.len() - 1,
-                offsets: offsets.into(),
+                num_values: normalized.len() - 1,
+                offsets: normalized.into(),
                 validity: validity.map(|v| v.into_inner()),
                 has_empty_lists,
                 specials: specials.into(),
             }));
+            has_garbage_values
         } else {
-            let inner = repetition.into_inner();
+            let inner = offsets.into_inner();
             let len = inner.len();
+            let scalar_off = ScalarBuffer::<i32>::new(inner.into_inner(), 0, len);
             let mut casted = Vec::with_capacity(len);
+            casted.push(0);
             let mut has_empty_lists = false;
             let mut specials = Vec::new();
+            let mut last_off: i64 = 0;
             if let Some(validity) = validity.as_ref() {
-                let scalar_off = ScalarBuffer::<i32>::new(inner.into_inner(), 0, len);
                 for (idx, (off, valid)) in scalar_off.windows(2).zip(validity.iter()).enumerate() {
-                    if off[0] == off[1] {
-                        if valid {
+                    let len = (off[1] - off[0]) as i64;
+                    match (valid, len == 0) {
+                        (false, is_empty) => {
+                            specials.push(SpecialOffset::NullList(idx));
+                            has_garbage_values |= !is_empty;
+                        }
+                        (true, true) => {
                             has_empty_lists = true;
                             specials.push(SpecialOffset::EmptyList(idx));
-                        } else {
-                            specials.push(SpecialOffset::NullList(idx));
+                        }
+                        _ => {
+                            last_off += len;
                         }
                     }
-                    casted.push(off[0] as i64);
+                    casted.push(last_off);
                 }
-                casted.push(*scalar_off.last().unwrap() as i64);
             } else {
-                let scalar_off = ScalarBuffer::<i32>::new(inner.into_inner(), 0, len);
                 for (idx, off) in scalar_off.windows(2).enumerate() {
-                    if off[0] == off[1] {
+                    let len = (off[1] - off[0]) as i64;
+                    if len == 0 {
                         has_empty_lists = true;
                         specials.push(SpecialOffset::EmptyList(idx));
                     }
-                    casted.push(off[0] as i64);
+                    last_off += len;
+                    casted.push(last_off);
                 }
-                casted.push(*scalar_off.last().unwrap() as i64);
             };
             self.check_offset_len(&casted);
             self.repdefs.push(RawRepDef::Offsets(OffsetDesc {
@@ -894,6 +942,7 @@ impl RepDefBuilder {
                 has_empty_lists,
                 specials: specials.into(),
             }));
+            has_garbage_values
         }
     }
 
@@ -1968,6 +2017,86 @@ mod tests {
     }
 
     #[test]
+    fn test_repdef_empty_list_at_end() {
+        // Regresses a failure we encountered when the last item was an empty list
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(offsets_32(&[0, 2, 5, 5]), None);
+        builder.add_validity_bitmap(validity(&[true, true, true, false, true]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 0, 1, 0, 0, 1], *rep);
+        assert_eq!([0, 0, 0, 1, 0, 2], *def);
+        assert!(repdefs.special_records.is_empty());
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::EmptyableList,
+            ],
+            repdefs.def_meaning
+        );
+    }
+
+    #[test]
+    fn test_repdef_abnormal_nulls() {
+        // List nulls are allowed to have non-empty offsets and garbage values
+        // and the add_offsets call should normalize this
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[0, 2, 5, 8]),
+            Some(validity(&[true, false, true])),
+        );
+        builder.add_no_null(8);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 0, 1, 1, 0, 0], *rep);
+        assert_eq!([0, 0, 1, 0, 0, 0], *def);
+
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableList,
+            ],
+            repdefs.def_meaning
+        );
+    }
+
+    #[test]
+    fn test_repdef_sliced_offsets() {
+        // Sliced lists may have offsets that don't start with zero.  The
+        // add_offsets call needs to normalize these to operate correctly.
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_32(&[5, 7, 7, 10]),
+            Some(validity(&[true, false, true])),
+        );
+        builder.add_no_null(5);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let rep = repdefs.repetition_levels.unwrap();
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([1, 0, 1, 1, 0, 0], *rep);
+        assert_eq!([0, 0, 1, 0, 0, 0], *def);
+
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableList,
+            ],
+            repdefs.def_meaning
+        );
+    }
+
+    #[test]
     fn test_repdef_complex_null_empty() {
         let mut builder = RepDefBuilder::default();
         builder.add_offsets(
@@ -2135,6 +2264,36 @@ mod tests {
 
         assert_eq!([2, 1, 0, 2, 2, 0, 1, 1, 0, 0, 0], *rep);
         assert_eq!([0, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1], *def);
+    }
+
+    #[test]
+    fn test_slicer() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_offsets(
+            offsets_64(&[0, 2, 2, 30, 30]),
+            Some(validity(&[true, false, true, true])),
+        );
+        builder.add_no_null(30);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        let mut rep_slicer = repdefs.rep_slicer().unwrap();
+
+        // First 5 items include a null list so we get 6 levels (12 bytes)
+        assert_eq!(rep_slicer.slice_next(5).len(), 12);
+        // Next 20 are all plain
+        assert_eq!(rep_slicer.slice_next(20).len(), 40);
+        // Last 5 include an empty list so we get 6 levels (12 bytes)
+        assert_eq!(rep_slicer.slice_rest().len(), 12);
+
+        let mut def_slicer = repdefs.rep_slicer().unwrap();
+
+        // First 5 items include a null list so we get 6 levels (12 bytes)
+        assert_eq!(def_slicer.slice_next(5).len(), 12);
+        // Next 20 are all plain
+        assert_eq!(def_slicer.slice_next(20).len(), 40);
+        // Last 5 include an empty list so we get 6 levels (12 bytes)
+        assert_eq!(def_slicer.slice_rest().len(), 12);
     }
 
     #[test]

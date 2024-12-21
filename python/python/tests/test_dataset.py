@@ -160,6 +160,39 @@ def test_dataset_from_record_batch_iterable(tmp_path: Path):
     assert list(dataset.to_batches())[0].to_pylist() == test_pylist
 
 
+def test_schema_metadata(tmp_path: Path):
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), metadata={b"thisis": "a"}),
+            pa.field("b", pa.int64(), metadata={b"thisis": "b"}),
+        ],
+        metadata={b"foo": b"bar", b"baz": b"qux"},
+    )
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    # Original schema
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace schema metadata
+    ds.replace_schema_metadata({"foo": "baz"})
+    assert ds.schema.metadata == {b"foo": b"baz"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace field metadata
+    ds.replace_field_metadata("a", {"thisis": "c"})
+    assert ds.schema.field("a").metadata == {b"thisis": b"c"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Overwrite overwrites metadata
+    ds = lance.write_dataset(table, tmp_path, mode="overwrite")
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -486,9 +519,11 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
 
     # test just limit
     assert dataset.to_table(limit=10) == table.slice(0, 10)
+    assert dataset.to_table(limit=100) == table.slice(0, 100)
 
     # test just offset
-    assert dataset.to_table(offset=10) == table.slice(10, 100)
+    assert dataset.to_table(offset=0) == table.slice(0, 100)
+    assert dataset.to_table(offset=10) == table.slice(10, 90)
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
@@ -503,7 +538,18 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
 
     # Limit past the end
-    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+    assert dataset.to_table(limit=101) == table.slice(0, 100)
+
+    # Limit with offset past the end
+    assert dataset.to_table(offset=50, limit=51) == table.slice(50, 50)
+
+    # Offset past the end
+    assert dataset.to_table(offset=100) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101) == table.slice(100, 0)  # Empty table
+
+    # Offset with limit past the end
+    assert dataset.to_table(offset=100, limit=1) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101, limit=1) == table.slice(100, 0)  # Empty table
 
     # Invalid limit / offset
     with pytest.raises(ValueError, match="Offset must be non-negative"):
@@ -1370,6 +1416,29 @@ def test_merge_insert_subcols(tmp_path: Path):
         original_fragments[1].data_files()[0]
     )
 
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
+
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
     table = pa.Table.from_pydict(
@@ -1529,34 +1598,6 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
     check_merge_stats(merge_dict, (0, 350, 0))
-
-
-def test_merge_insert_incompatible_schema(tmp_path: Path):
-    nrows = 1000
-    table = pa.Table.from_pydict(
-        {
-            "a": range(nrows),
-            "b": [1 for _ in range(nrows)],
-        }
-    )
-    dataset = lance.write_dataset(
-        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
-    )
-
-    new_table = pa.Table.from_pydict(
-        {
-            "a": range(300, 300 + nrows),
-        }
-    )
-
-    with pytest.raises(OSError):
-        merge_dict = (
-            dataset.merge_insert("a")
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(new_table)
-        )
-        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_merge_insert_vector_column(tmp_path: Path):

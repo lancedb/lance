@@ -241,7 +241,7 @@ impl LanceBuffer {
     /// of the data.  Lance does not support big-endian machines so this is safe.  However, if we end
     /// up supporting big-endian machines in the future, then any use of this method will need to be
     /// carefully reviewed.
-    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
+    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> ScalarBuffer<T> {
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
         if self.len() % std::mem::size_of::<T>() != 0 {

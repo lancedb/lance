@@ -51,7 +51,7 @@ public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetada
         }
       };
 
-  LanceConfig options;
+  LanceConfig config;
   private final StructType sparkSchema;
 
   /**
@@ -61,18 +61,18 @@ public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetada
    * @param sparkSchema spark struct type
    */
   public LanceDataset(LanceConfig config, StructType sparkSchema) {
-    this.options = config;
+    this.config = config;
     this.sparkSchema = sparkSchema;
   }
 
   @Override
   public ScanBuilder newScanBuilder(CaseInsensitiveStringMap caseInsensitiveStringMap) {
-    return new LanceScanBuilder(sparkSchema, options);
+    return new LanceScanBuilder(sparkSchema, config);
   }
 
   @Override
   public String name() {
-    return this.options.getDatasetName();
+    return this.config.getDatasetName();
   }
 
   @Override
@@ -87,7 +87,7 @@ public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetada
 
   @Override
   public WriteBuilder newWriteBuilder(LogicalWriteInfo logicalWriteInfo) {
-    return new SparkWrite.SparkWriteBuilder(sparkSchema, options);
+    return new SparkWrite.SparkWriteBuilder(sparkSchema, config);
   }
 
   @Override

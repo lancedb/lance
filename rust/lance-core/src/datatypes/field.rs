@@ -705,6 +705,19 @@ impl Field {
         self.children.iter_mut().for_each(Self::reset_id);
     }
 
+    pub fn field_by_id_mut(&mut self, id: impl Into<i32>) -> Option<&mut Self> {
+        let id = id.into();
+        for child in self.children.as_mut_slice() {
+            if child.id == id {
+                return Some(child);
+            }
+            if let Some(grandchild) = child.field_by_id_mut(id) {
+                return Some(grandchild);
+            }
+        }
+        None
+    }
+
     pub fn field_by_id(&self, id: impl Into<i32>) -> Option<&Self> {
         let id = id.into();
         for child in self.children.as_slice() {

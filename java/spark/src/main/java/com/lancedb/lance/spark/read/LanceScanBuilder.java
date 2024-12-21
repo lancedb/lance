@@ -14,30 +14,51 @@
 
 package com.lancedb.lance.spark.read;
 
+import com.lancedb.lance.ipc.ColumnOrdering;
 import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.SparkOptions;
+import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
 
+import org.apache.spark.sql.connector.expressions.FieldReference;
+import org.apache.spark.sql.connector.expressions.NullOrdering;
+import org.apache.spark.sql.connector.expressions.SortDirection;
+import org.apache.spark.sql.connector.expressions.SortOrder;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
+import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
+import org.apache.spark.sql.connector.read.SupportsPushDownOffset;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
+import org.apache.spark.sql.connector.read.SupportsPushDownTopN;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructType;
 
-public class LanceScanBuilder implements SupportsPushDownRequiredColumns, SupportsPushDownFilters {
-  private final LanceConfig options;
+import java.util.ArrayList;
+import java.util.List;
+
+public class LanceScanBuilder
+    implements SupportsPushDownRequiredColumns,
+        SupportsPushDownFilters,
+        SupportsPushDownLimit,
+        SupportsPushDownOffset,
+        SupportsPushDownTopN {
+  private final LanceConfig config;
   private StructType schema;
 
   private Filter[] pushedFilters = new Filter[0];
+  private Optional<Integer> limit = Optional.empty();
+  private Optional<Integer> offset = Optional.empty();
+  private Optional<List<ColumnOrdering>> topNSortOrders = Optional.empty();
 
-  public LanceScanBuilder(StructType schema, LanceConfig options) {
+  public LanceScanBuilder(StructType schema, LanceConfig config) {
     this.schema = schema;
-    this.options = options;
+    this.config = config;
   }
 
   @Override
   public Scan build() {
     Optional<String> whereCondition = FilterPushDown.compileFiltersToSqlWhereClause(pushedFilters);
-    return new LanceScan(schema, options, whereCondition);
+    return new LanceScan(schema, config, whereCondition, limit, offset, topNSortOrders);
   }
 
   @Override
@@ -50,7 +71,7 @@ public class LanceScanBuilder implements SupportsPushDownRequiredColumns, Suppor
 
   @Override
   public Filter[] pushFilters(Filter[] filters) {
-    if (!options.isPushDownFilters()) {
+    if (!config.isPushDownFilters()) {
       return filters;
     }
     Filter[][] processFilters = FilterPushDown.processFilters(filters);
@@ -61,5 +82,51 @@ public class LanceScanBuilder implements SupportsPushDownRequiredColumns, Suppor
   @Override
   public Filter[] pushedFilters() {
     return pushedFilters;
+  }
+
+  @Override
+  public boolean pushLimit(int limit) {
+    this.limit = Optional.of(limit);
+    return true;
+  }
+
+  @Override
+  public boolean pushOffset(int offset) {
+    // Only one data file can be pushed down the offset.
+    if (LanceDatasetAdapter.getFragmentIds(config).size() == 1) {
+      this.offset = Optional.of(offset);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  @Override
+  public boolean isPartiallyPushed() {
+    return true;
+  }
+
+  @Override
+  public boolean pushTopN(SortOrder[] orders, int limit) {
+    // The Order by operator will use compute thread in lance.
+    // So it's better to have an option to enable it.
+    if (!SparkOptions.enableTopNPushDown(this.config)) {
+      return false;
+    }
+    this.limit = Optional.of(limit);
+    List<ColumnOrdering> topNSortOrders = new ArrayList<>();
+    for (SortOrder sortOrder : orders) {
+      ColumnOrdering.Builder builder = new ColumnOrdering.Builder();
+      builder.setNullFirst(sortOrder.nullOrdering() == NullOrdering.NULLS_FIRST);
+      builder.setAscending(sortOrder.direction() == SortDirection.ASCENDING);
+      if (!(sortOrder.expression() instanceof FieldReference)) {
+        return false;
+      }
+      FieldReference reference = (FieldReference) sortOrder.expression();
+      builder.setColumnName(reference.fieldNames()[0]);
+      topNSortOrders.add(builder.build());
+    }
+    this.topNSortOrders = Optional.of(topNSortOrders);
+    return true;
   }
 }

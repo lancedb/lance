@@ -532,6 +532,32 @@ impl Dataset {
         LanceSchema(self_.ds.schema().clone())
     }
 
+    fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.replace_schema_metadata(metadata))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn replace_field_metadata(
+        &mut self,
+        field_name: &str,
+        metadata: HashMap<String, String>,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let field = new_self
+            .schema()
+            .field(field_name)
+            .ok_or_else(|| PyKeyError::new_err(format!("Field \"{}\" not found", field_name)))?;
+        let new_field_meta: HashMap<u32, HashMap<String, String>> =
+            HashMap::from_iter(vec![(field.id as u32, metadata)]);
+        RT.block_on(None, new_self.replace_field_metadata(new_field_meta))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     #[getter(data_storage_version)]
     fn data_storage_version(&self) -> PyResult<String> {
         Ok(self.ds.manifest().data_storage_format.version.clone())
@@ -573,23 +599,15 @@ impl Dataset {
 
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
 
-                let is_vector = idx_schema
-                    .fields
-                    .iter()
-                    .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
-
-                let idx_type = if is_vector {
-                    IndexType::Vector
-                } else {
-                    let ds = self_.ds.clone();
-                    RT.block_on(Some(self_.py()), async {
-                        let scalar_idx = ds
-                            .open_scalar_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
+                let ds = self_.ds.clone();
+                let idx_type = RT
+                    .block_on(Some(self_.py()), async {
+                        let idx = ds
+                            .open_generic_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
                             .await?;
-                        Ok::<_, lance::Error>(scalar_idx.index_type())
+                        Ok::<_, lance::Error>(idx.index_type())
                     })?
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?
-                };
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
                 let field_names = idx_schema
                     .fields
