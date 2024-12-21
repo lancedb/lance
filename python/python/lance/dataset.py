@@ -48,15 +48,13 @@ from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
     _Dataset,
-    _FragmentMetadata,
     _MergeInsertBuilder,
     _Scanner,
     _write_dataset,
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .optimize import Compaction
-from .optimize import CompactionMetrics as CompactionMetrics
+from .lance.optimize import Compaction, CompactionMetrics
 from .schema import LanceSchema
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
@@ -2513,10 +2511,6 @@ class Index(TypedDict):
     fields: List[str]
     version: int
     fragment_ids: Set[int]
-
-
-class OperationDict(TypedDict):
-    fragments: List[_FragmentMetadata]
 
 
 # LanceOperation is a namespace for operations that can be applied to a dataset.

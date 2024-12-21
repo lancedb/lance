@@ -24,13 +24,14 @@ import pyarrow as pa
 
 from .dependencies import _check_for_pandas
 from .dependencies import pandas as pd
-from .lance import DeletionFile, RowIdMeta, _Fragment, _write_fragments
+from .lance import _Fragment, _write_fragments
+from .lance.fragment import DeletionFile, RowIdMeta
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
-    from .schema import LanceSchema
+    from .lance.schema import LanceSchema
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024

@@ -4,7 +4,7 @@
 import atexit
 from typing import Optional
 
-from .lance import trace_to_chrome as lance_trace_to_chrome
+from .lance.trace import trace_to_chrome as lance_trace_to_chrome
 
 
 def trace_to_chrome(*, file: Optional[str] = None, level: Optional[str] = None):

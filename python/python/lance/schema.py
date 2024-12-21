@@ -6,7 +6,6 @@ from typing import Any, Dict
 
 import pyarrow as pa
 
-from .lance import LanceSchema as LanceSchema
 from .lance import _json_to_schema, _schema_to_json
 
 
