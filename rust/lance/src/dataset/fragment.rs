@@ -20,7 +20,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
@@ -756,9 +756,11 @@ impl FileFragment {
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
-                let initialized_schema = reader
-                    .schema()
-                    .project_by_schema(schema_per_file.as_ref())?;
+                let initialized_schema = reader.schema().project_by_schema(
+                    schema_per_file.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 let reader = V1Reader::new(reader, Arc::new(initialized_schema));
                 Ok(Some(Box::new(reader)))
             } else {

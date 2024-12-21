@@ -41,6 +41,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::tempdir;
 use tracing::instrument;
+use utils::get_vector_element_type;
 use uuid::Uuid;
 
 use self::{ivf::*, pq::PQIndex};
@@ -253,57 +254,39 @@ pub(crate) async fn build_vector_index(
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
-        let data_type = dataset
-            .schema()
-            .field(column)
-            .ok_or(Error::Schema {
-                message: format!("Column {} not found in schema", column),
-                location: location!(),
-            })?
-            .data_type();
-        match data_type {
-            DataType::FixedSizeList(f, _) => match f.data_type() {
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
-                        dataset.clone(),
-                        column.to_owned(),
-                        dataset.indices_dir().child(uuid),
-                        params.metric_type,
-                        Box::new(shuffler),
-                        Some(ivf_params.clone()),
-                        Some(()),
-                        (),
-                    )?
-                    .build()
-                    .await?;
-                }
-                DataType::UInt8 => {
-                    IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
-                        dataset.clone(),
-                        column.to_owned(),
-                        dataset.indices_dir().child(uuid),
-                        params.metric_type,
-                        Box::new(shuffler),
-                        Some(ivf_params.clone()),
-                        Some(()),
-                        (),
-                    )?
-                    .build()
-                    .await?;
-                }
-                _ => {
-                    return Err(Error::Index {
-                        message: format!(
-                            "Build Vector Index: invalid data type: {:?}",
-                            f.data_type()
-                        ),
-                        location: location!(),
-                    });
-                }
-            },
+        let element_type = get_vector_element_type(dataset, column)?;
+        match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                    dataset.clone(),
+                    column.to_owned(),
+                    dataset.indices_dir().child(uuid),
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params.clone()),
+                    Some(()),
+                    (),
+                )?
+                .build()
+                .await?;
+            }
+            DataType::UInt8 => {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                    dataset.clone(),
+                    column.to_owned(),
+                    dataset.indices_dir().child(uuid),
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params.clone()),
+                    Some(()),
+                    (),
+                )?
+                .build()
+                .await?;
+            }
             _ => {
                 return Err(Error::Index {
-                    message: format!("Build Vector Index: invalid data type: {:?}", data_type),
+                    message: format!("Build Vector Index: invalid data type: {:?}", element_type),
                     location: location!(),
                 });
             }
@@ -416,30 +399,35 @@ pub(crate) async fn remap_vector_index(
         .open_vector_index(column, &old_uuid.to_string())
         .await?;
     old_index.check_can_remap()?;
-    let ivf_index: &IVFIndex =
-        old_index
-            .as_any()
-            .downcast_ref()
-            .ok_or_else(|| Error::NotSupported {
-                source: "Only IVF indexes can be remapped currently".into(),
-                location: location!(),
-            })?;
 
-    remap_index_file(
-        dataset.as_ref(),
-        &old_uuid.to_string(),
-        &new_uuid.to_string(),
-        old_metadata.dataset_version,
-        ivf_index,
-        mapping,
-        old_metadata.name.clone(),
-        column.to_string(),
-        // We can safely assume there are no transforms today.  We assert above that the
-        // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
-        // will be fixed in the future.
-        vec![],
-    )
-    .await?;
+    if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
+        remap_index_file(
+            dataset.as_ref(),
+            &old_uuid.to_string(),
+            &new_uuid.to_string(),
+            old_metadata.dataset_version,
+            ivf_index,
+            mapping,
+            old_metadata.name.clone(),
+            column.to_string(),
+            // We can safely assume there are no transforms today.  We assert above that the
+            // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
+            // will be fixed in the future.
+            vec![],
+        )
+        .await?;
+    } else {
+        // it's v3 index
+        remap_index_file_v3(
+            dataset.as_ref(),
+            &new_uuid.to_string(),
+            old_index,
+            mapping,
+            column.to_string(),
+        )
+        .await?;
+    }
+
     Ok(())
 }
 

@@ -13,6 +13,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
+use datafusion::common::SchemaExt;
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
@@ -39,7 +40,7 @@ use futures::stream::{Stream, StreamExt};
 use futures::TryStreamExt;
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::Field;
+use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions};
@@ -945,6 +946,7 @@ impl Scanner {
     #[instrument(skip_all)]
     pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
         let plan = self.create_plan().await?;
+
         Ok(DatasetRecordBatchStream::new(execute_plan(
             plan,
             LanceExecutionOptions::default(),
@@ -1064,37 +1066,23 @@ impl Scanner {
 
     fn calc_eager_columns(&self, filter_plan: &FilterPlan) -> Result<Arc<Schema>> {
         let columns = filter_plan.refine_columns();
-        // If the column didn't exist in the scan output schema then we wouldn't make
-        // it to this point.  However, there may be columns (like _rowid, _distance, etc.)
-        // which do not exist in the dataset schema but are added by the scan.  We can ignore
-        // those as eager columns.
-        let filter_schema = self.dataset.schema().project_or_drop(&columns)?;
-        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
+        let early_schema = self
+            .dataset
+            .empty_projection()
+            // We need the filter columns
+            .union_columns(columns, OnMissing::Error)?
+            // And also any columns that are eager
+            .union_predicate(|f| self.is_early_field(f))
+            .into_schema_ref();
+
+        if early_schema.fields.iter().any(|f| !f.is_default_storage()) {
             return Err(Error::NotSupported {
                 source: "non-default storage columns cannot be used as filters".into(),
                 location: location!(),
             });
         }
-        let physical_schema = self.projection_plan.physical_schema.clone();
-        let remaining_schema = physical_schema.exclude(&filter_schema)?;
 
-        let narrow_fields = remaining_schema
-            .fields
-            .iter()
-            .filter(|f| self.is_early_field(f))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if narrow_fields.is_empty() {
-            Ok(Arc::new(filter_schema))
-        } else {
-            let mut new_fields = filter_schema.fields;
-            new_fields.extend(narrow_fields);
-            Ok(Arc::new(Schema {
-                fields: new_fields,
-                metadata: HashMap::new(),
-            }))
-        }
+        Ok(early_schema)
     }
 
     /// Create [`ExecutionPlan`] for Scan.
@@ -1331,34 +1319,33 @@ impl Scanner {
         };
 
         // Stage 1.5 load columns needed for stages 2 & 3
-        let mut additional_schema = None;
+        // Calculate the schema needed for the filter and ordering.
+        let mut pre_filter_projection = self
+            .dataset
+            .empty_projection()
+            .union_schema(&self.projection_plan.physical_schema)
+            .subtract_predicate(|field| !self.is_early_field(field));
+
         // We may need to take filter columns if we are going to refine
-        // an indexed scan.  Otherwise, the filter was applied during the scan
-        // and this should be false
+        // an indexed scan.
         if filter_plan.has_refine() {
-            let eager_schema = self.calc_eager_columns(&filter_plan)?;
-            let base_schema = Schema::try_from(plan.schema().as_ref())?;
-            let still_to_load = eager_schema.exclude(base_schema)?;
-            if still_to_load.fields.is_empty() {
-                additional_schema = None;
-            } else {
-                additional_schema = Some(still_to_load);
-            }
+            // It's ok for some filter columns to be missing (e.g. _rowid)
+            pre_filter_projection = pre_filter_projection
+                .union_columns(filter_plan.refine_columns(), OnMissing::Ignore)?;
         }
+
+        // TODO: Does it always make sense to take the ordering columns here?  If there is a filter then
+        // maybe we wait until after the filter to take the ordering columns?  Maybe it would be better to
+        // grab the ordering column in the initial scan (if it is eager) and if it isn't then we should
+        // take it after the filtering phase, if any (we already have a take there).
         if let Some(ordering) = &self.ordering {
-            additional_schema = self.calc_new_fields(
-                &additional_schema
-                    .map(Ok::<Schema, Error>)
-                    .unwrap_or_else(|| Schema::try_from(plan.schema().as_ref()))?,
-                &ordering
-                    .iter()
-                    .map(|col| &col.column_name)
-                    .collect::<Vec<_>>(),
+            pre_filter_projection = pre_filter_projection.union_columns(
+                ordering.iter().map(|col| &col.column_name),
+                OnMissing::Error,
             )?;
         }
-        if let Some(additional_schema) = additional_schema {
-            plan = self.take(plan, &additional_schema, self.batch_readahead)?;
-        }
+
+        plan = self.take(plan, pre_filter_projection, self.batch_readahead)?;
 
         // Stage 2: filter
         if let Some(refine_expr) = filter_plan.refine_expr {
@@ -1372,19 +1359,13 @@ impl Scanner {
 
         // Stage 3: sort
         if let Some(ordering) = &self.ordering {
-            let order_by_schema = Arc::new(
-                self.dataset.schema().project(
-                    &ordering
-                        .iter()
-                        .map(|col| &col.column_name)
-                        .collect::<Vec<_>>(),
-                )?,
-            );
-            let remaining_schema = order_by_schema.exclude(plan.schema().as_ref())?;
-            if !remaining_schema.fields.is_empty() {
-                // We haven't loaded the sort column yet so take it now
-                plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
-            }
+            let ordering_columns = ordering.iter().map(|col| &col.column_name);
+            let projection_with_ordering = self
+                .dataset
+                .empty_projection()
+                .union_columns(ordering_columns, OnMissing::Error)?;
+            // We haven't loaded the sort column yet so take it now
+            plan = self.take(plan, projection_with_ordering, self.batch_readahead)?;
             let col_exprs = ordering
                 .iter()
                 .map(|col| {
@@ -1408,12 +1389,14 @@ impl Scanner {
         // Stage 5: take remaining columns required for projection
         let physical_schema =
             self.scan_output_schema(&self.projection_plan.physical_schema, false)?;
-        let remaining_schema = physical_schema.exclude(plan.schema().as_ref())?;
-        if !remaining_schema.fields.is_empty() {
-            plan = self.take(plan, &remaining_schema, self.batch_readahead)?;
-        }
+        let physical_projection = self
+            .dataset
+            .empty_projection()
+            .union_schema(&physical_schema);
+        plan = self.take(plan, physical_projection, self.batch_readahead)?;
         // Stage 6: physical projection -- reorder physical columns needed before final projection
         let output_arrow_schema = physical_schema.as_ref().into();
+
         if plan.schema().as_ref() != &output_arrow_schema {
             plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
         }
@@ -1635,9 +1618,13 @@ impl Scanner {
             let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
 
             let mut knn_node = if q.refine_factor.is_some() {
-                let with_vector = self.dataset.schema().project(&[&q.column])?;
+                let vector_projection = self
+                    .dataset
+                    .empty_projection()
+                    .union_column(&q.column, OnMissing::Error)
+                    .unwrap();
                 let knn_node_with_vector =
-                    self.take(ann_node, &with_vector, self.batch_readahead)?;
+                    self.take(ann_node, vector_projection, self.batch_readahead)?;
                 // TODO: now we just open an index to get its metric type.
                 let idx = self
                     .dataset
@@ -1689,11 +1676,24 @@ impl Scanner {
         // Check if we've created new versions since the index was built.
         let unindexed_fragments = self.dataset.unindexed_fragments(&index.name).await?;
         if !unindexed_fragments.is_empty() {
+            // need to set the metric type to be the same as the index
+            // to make sure the distance is comparable.
+            let idx = self
+                .dataset
+                .open_vector_index(q.column.as_str(), &index.uuid.to_string())
+                .await?;
+            let mut q = q.clone();
+            q.metric_type = idx.metric_type();
+
             // If the vector column is not present, we need to take the vector column, so
             // that the distance value is comparable with the flat search ones.
             if knn_node.schema().column_with_name(&q.column).is_none() {
-                let with_vector = self.dataset.schema().project(&[&q.column])?;
-                knn_node = self.take(knn_node, &with_vector, self.batch_readahead)?;
+                let vector_projection = self
+                    .dataset
+                    .empty_projection()
+                    .union_column(&q.column, OnMissing::Error)
+                    .unwrap();
+                knn_node = self.take(knn_node, vector_projection, self.batch_readahead)?;
             }
 
             let mut columns = vec![q.column.clone()];
@@ -1725,13 +1725,15 @@ impl Scanner {
                 scan_node = Arc::new(FilterExec::try_new(physical_refine_expr, scan_node)?);
             }
             // first we do flat search on just the new data
-            let topk_appended = self.flat_knn(scan_node, q)?;
+            let topk_appended = self.flat_knn(scan_node, &q)?;
 
             // To do a union, we need to make the schemas match. Right now
             // knn_node: _distance, _rowid, vector
             // topk_appended: vector, <filter columns?>, _rowid, _distance
             let topk_appended = project(topk_appended, knn_node.schema().as_ref())?;
-            assert_eq!(topk_appended.schema(), knn_node.schema());
+            assert!(topk_appended
+                .schema()
+                .equivalent_names_and_types(&knn_node.schema()));
             // union
             let unioned = UnionExec::new(vec![Arc::new(topk_appended), knn_node]);
             // Enforce only 1 partition.
@@ -1740,7 +1742,7 @@ impl Scanner {
                 datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
             )?;
             // then we do a flat search on KNN(new data) + ANN(indexed data)
-            return self.flat_knn(Arc::new(unioned), q);
+            return self.flat_knn(Arc::new(unioned), &q);
         }
 
         Ok(knn_node)
@@ -1813,7 +1815,8 @@ impl Scanner {
             _ => true,
         };
         if needs_take {
-            plan = self.take(plan, projection, self.batch_readahead)?;
+            let take_projection = self.dataset.empty_projection().union_schema(projection);
+            plan = self.take(plan, take_projection, self.batch_readahead)?;
         }
 
         if self.with_row_address {
@@ -2086,16 +2089,24 @@ impl Scanner {
     fn take(
         &self,
         input: Arc<dyn ExecutionPlan>,
-        projection: &Schema,
+        output_projection: Projection,
         batch_readahead: usize,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let coalesced = Arc::new(CoalesceBatchesExec::new(input, self.get_batch_size()));
-        Ok(Arc::new(TakeExec::try_new(
+        let coalesced = Arc::new(CoalesceBatchesExec::new(
+            input.clone(),
+            self.get_batch_size(),
+        ));
+        if let Some(take_plan) = TakeExec::try_new(
             self.dataset.clone(),
             coalesced,
-            Arc::new(projection.clone()),
+            output_projection,
             batch_readahead,
-        )?))
+        )? {
+            Ok(Arc::new(take_plan))
+        } else {
+            // No new columns needed
+            Ok(input)
+        }
     }
 
     /// Global offset-limit of the result of the input plan
@@ -4600,11 +4611,11 @@ mod test {
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.use_stats(false).filter("s IS NOT NULL"),
-            "ProjectionExec: expr=[i@1 as i, s@0 as s, vec@3 as vec]
-  Take: columns=\"s, i, _rowid, (vec)\"
+            "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@3 as vec]
+  Take: columns=\"i, s, _rowid, (vec)\"
     CoalesceBatchesExec: target_batch_size=8192
-      FilterExec: s@0 IS NOT NULL
-        LanceScan: uri..., projection=[s, i], row_id=true, row_addr=false, ordered=true",
+      FilterExec: s@1 IS NOT NULL
+        LanceScan: uri..., projection=[i, s], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
@@ -4616,9 +4627,9 @@ mod test {
                     .materialization_style(MaterializationStyle::AllEarly)
                     .filter("s IS NOT NULL")
             },
-            "ProjectionExec: expr=[i@1 as i, s@0 as s, vec@2 as vec]
-  FilterExec: s@0 IS NOT NULL
-    LanceScan: uri..., projection=[s, i, vec], row_id=true, row_addr=false, ordered=true",
+            "ProjectionExec: expr=[i@0 as i, s@1 as s, vec@2 as vec]
+  FilterExec: s@1 IS NOT NULL
+    LanceScan: uri..., projection=[i, s, vec], row_id=true, row_addr=false, ordered=true",
         )
         .await?;
 
