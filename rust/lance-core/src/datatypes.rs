@@ -19,10 +19,10 @@ mod schema;
 
 use crate::{Error, Result};
 pub use field::{
-    Encoding, Field, NullabilityComparison, SchemaCompareOptions, StorageClass,
+    Encoding, Field, NullabilityComparison, OnTypeMismatch, SchemaCompareOptions, StorageClass,
     LANCE_STORAGE_CLASS_SCHEMA_META_KEY,
 };
-pub use schema::Schema;
+pub use schema::{OnMissing, Projectable, Projection, Schema};
 
 pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
 pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";

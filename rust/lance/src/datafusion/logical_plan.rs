@@ -13,6 +13,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
     prelude::Expr,
 };
+use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 
 use crate::Dataset;
 
@@ -52,7 +53,11 @@ impl TableProvider for Dataset {
             if projection.len() != schema_ref.fields.len() {
                 let arrow_schema: ArrowSchema = schema_ref.into();
                 let arrow_schema = arrow_schema.project(projection)?;
-                schema_ref.project_by_schema(&arrow_schema)?
+                schema_ref.project_by_schema(
+                    &arrow_schema,
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?
             } else {
                 schema_ref.clone()
             }

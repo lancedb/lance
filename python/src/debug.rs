@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use lance::{datatypes::Schema, Error};
-use lance_table::format::{DeletionFile, Fragment as LanceFragmentMetadata};
+use lance_table::format::{DeletionFile, Fragment};
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-use crate::{Dataset, FragmentMetadata, RT};
+use crate::{utils::PyLance, Dataset, RT};
 
 /// Format the Lance schema of a dataset as a string.
 ///
@@ -53,7 +53,7 @@ struct PrettyPrintableDataFile {
 }
 
 impl PrettyPrintableFragment {
-    fn new(fragment: &LanceFragmentMetadata, schema: &Schema) -> Self {
+    fn new(fragment: &Fragment, schema: &Schema) -> Self {
         let files = fragment
             .files
             .iter()
@@ -82,20 +82,17 @@ impl PrettyPrintableFragment {
 /// Debug print a LanceFragment.
 #[pyfunction]
 pub fn format_fragment(
-    fragment: &Bound<'_, PyAny>,
+    fragment: PyLance<Fragment>,
     dataset: &Bound<'_, PyAny>,
 ) -> PyResult<String> {
-    let py = fragment.py();
-    let fragment = fragment
-        .getattr("_metadata")?
-        .extract::<Py<FragmentMetadata>>()?;
+    let py = dataset.py();
+    let fragment = fragment.0;
 
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
     let dataset_ref = &dataset.bind(py).borrow().ds;
     let schema = dataset_ref.schema();
 
-    let meta = fragment.bind(py).borrow().inner.clone();
-    let pp_meta = PrettyPrintableFragment::new(&meta, schema);
+    let pp_meta = PrettyPrintableFragment::new(&fragment, schema);
     Ok(format!("{:#?}", pp_meta))
 }
 
