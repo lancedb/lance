@@ -271,7 +271,7 @@ impl FileFragment {
         left_on: String,
         right_on: String,
         max_field_id: i32,
-    ) -> PyResult<(FragmentMetadata, LanceSchema)> {
+    ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
         let mut fragment = self.fragment.clone();
         let (fragment, schema) = RT
             .spawn(None, async move {
@@ -281,7 +281,7 @@ impl FileFragment {
             })?
             .infer_error()?;
 
-        Ok((FragmentMetadata::new(fragment), LanceSchema(schema)))
+        Ok((PyLance(fragment), LanceSchema(schema)))
     }
 
     fn delete(&self, predicate: &str) -> PyResult<Option<Self>> {
