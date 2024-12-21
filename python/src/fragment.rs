@@ -268,13 +268,13 @@ impl FileFragment {
         reader: PyArrowType<ArrowArrayStreamReader>,
         left_on: String,
         right_on: String,
-        manifest_max_field_id: i32,
+        max_field_id: i32,
     ) -> PyResult<(FragmentMetadata, LanceSchema)> {
         let mut fragment = self.fragment.clone();
         let (fragment, schema) = RT
             .spawn(None, async move {
                 fragment
-                    .merge_columns(reader.0, &left_on, &right_on, manifest_max_field_id)
+                    .merge_columns(reader.0, &left_on, &right_on, max_field_id)
                     .await
             })?
             .infer_error()?;

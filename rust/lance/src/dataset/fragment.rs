@@ -1336,7 +1336,7 @@ impl FileFragment {
         stream: impl RecordBatchReader + Send + 'static,
         left_on: &str,
         right_on: &str,
-        manifest_max_field_id: i32,
+        max_field_id: i32,
     ) -> Result<(Fragment, Schema)> {
         let stream = Box::new(stream);
         if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
@@ -1380,7 +1380,7 @@ impl FileFragment {
         // Final schema is union of current schema, plus the RHS schema without
         // the right_on key.
         let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
-        new_schema.set_field_id(Some(manifest_max_field_id));
+        new_schema.set_field_id(Some(max_field_id));
 
         let new_fragment = self
             .clone()
