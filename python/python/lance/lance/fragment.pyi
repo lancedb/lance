@@ -28,6 +28,7 @@ class DeletionFile:
     file_type: Literal["array", "bitmap"]
 
     def __init__(
+        self,
         read_version: int,
         id: int,
         file_type: Literal["array", "bitmap"],

@@ -14,7 +14,7 @@
 
 from typing import List
 
-from lance import Dataset
+from lance import LanceDataset
 from lance.fragment import FragmentMetadata
 from lance.optimize import CompactionOptions
 
@@ -34,7 +34,7 @@ class CompactionTask:
     read_version: int
     fragments: List["FragmentMetadata"]
 
-    def execute(self, dataset: "Dataset") -> RewriteResult: ...
+    def execute(self, dataset: "LanceDataset") -> RewriteResult: ...
 
 class CompactionPlan:
     read_version: int
@@ -45,11 +45,11 @@ class CompactionPlan:
 class Compaction:
     @staticmethod
     def execute(
-        dataset: "Dataset", options: CompactionOptions
+        dataset: "LanceDataset", options: CompactionOptions
     ) -> CompactionMetrics: ...
     @staticmethod
-    def plan(dataset: "Dataset", options: CompactionOptions) -> CompactionPlan: ...
+    def plan(dataset: "LanceDataset", options: CompactionOptions) -> CompactionPlan: ...
     @staticmethod
     def commit(
-        dataset: "Dataset", rewrites: List[RewriteResult]
+        dataset: "LanceDataset", rewrites: List[RewriteResult]
     ) -> CompactionMetrics: ...
