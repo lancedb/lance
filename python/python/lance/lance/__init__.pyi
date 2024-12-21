@@ -40,11 +40,39 @@ from ..dataset import (
     UpdateResult,
     Version,
 )
-from ..fragment import DataFile, FragmentMetadata
-from ..progress import FragmentWriteProgress
-from ..schema import LanceSchema
-from ..types import ReaderLike
-from ..udf import BatchUDF
+from ..fragment import (
+    DataFile,
+    FragmentMetadata,
+)
+from ..progress import FragmentWriteProgress as FragmentWriteProgress
+from ..types import ReaderLike as ReaderLike
+from ..udf import BatchUDF as BatchUDF
+from .debug import format_fragment as format_fragment
+from .debug import format_manifest as format_manifest
+from .debug import format_schema as format_schema
+from .debug import list_transactions as list_transactions
+from .fragment import (
+    DeletionFile as DeletionFile,
+)
+from .fragment import (
+    RowIdMeta as RowIdMeta,
+)
+from .optimize import (
+    Compaction as Compaction,
+)
+from .optimize import (
+    CompactionMetrics as CompactionMetrics,
+)
+from .optimize import (
+    CompactionPlan as CompactionPlan,
+)
+from .optimize import (
+    CompactionTask as CompactionTask,
+)
+from .optimize import (
+    RewriteResult as RewriteResult,
+)
+from .schema import LanceSchema as LanceSchema
 
 def infer_tfrecord_schema(
     uri: str,

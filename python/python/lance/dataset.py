@@ -47,6 +47,9 @@ from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
+    Compaction,
+    CompactionMetrics,
+    LanceSchema,
     _Dataset,
     _MergeInsertBuilder,
     _Scanner,
@@ -54,8 +57,6 @@ from .lance import (
 )
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .lance.optimize import Compaction, CompactionMetrics
-from .schema import LanceSchema
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
