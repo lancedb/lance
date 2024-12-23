@@ -11,7 +11,7 @@ import logging
 import math
 import warnings
 from pathlib import Path
-from typing import Dict, Iterable, List, Literal, Optional, Union
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Union
 
 import pyarrow as pa
 
@@ -192,7 +192,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         shard_granularity: Optional[Literal["fragment", "batch"]] = None,
         batch_readahead: int = 16,
         to_tensor_fn: Optional[
-            callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
+            Callable[[pa.RecordBatch], Union[dict[str, torch.Tensor], torch.Tensor]]
         ] = None,
         sampler: Optional[Sampler] = None,
         **kwargs,

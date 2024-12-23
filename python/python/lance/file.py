@@ -239,7 +239,7 @@ class LanceFileWriter:
         else:
             self._writer.write_batch(batch)
 
-    def close(self) -> int:
+    def close(self) -> Optional[int]:
         """
         Write the file metadata and close the file
 

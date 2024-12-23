@@ -24,13 +24,22 @@ import pyarrow as pa
 
 from .dependencies import _check_for_pandas
 from .dependencies import pandas as pd
-from .lance import DeletionFile, RowIdMeta, _Fragment, _write_fragments
+from .lance import (
+    DeletionFile as DeletionFile,
+)
+from .lance import (
+    RowIdMeta as RowIdMeta,
+)
+from .lance import (
+    _Fragment,
+    _write_fragments,
+)
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
     from .dataset import LanceDataset, LanceScanner, ReaderLike
-    from .schema import LanceSchema
+    from .lance import LanceSchema
 
 
 DEFAULT_MAX_BYTES_PER_FILE = 90 * 1024 * 1024 * 1024
@@ -222,7 +231,7 @@ class LanceFragment(pa.dataset.Fragment):
 
     @staticmethod
     def create_from_file(
-        filename: Union[str, Path],
+        filename: str,
         dataset: LanceDataset,
         fragment_id: int,
     ) -> FragmentMetadata:
