@@ -830,7 +830,9 @@ mod tests {
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_remap(params, nlist).await;
     }
 
@@ -848,7 +850,9 @@ mod tests {
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_remap(params, nlist).await;
     }
 
@@ -868,7 +872,9 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_remap(params, nlist).await;
     }
 
@@ -888,7 +894,9 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_remap(params, nlist).await;
     }
 
@@ -912,7 +920,9 @@ mod tests {
             sq_params,
         );
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params, nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     #[rstest]
@@ -935,7 +945,9 @@ mod tests {
             pq_params,
         );
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params, nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     #[rstest]
@@ -958,7 +970,9 @@ mod tests {
             pq_params,
         );
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_index_multivec(params, nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {

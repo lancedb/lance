@@ -250,11 +250,21 @@ pub(crate) async fn build_vector_index(
         });
     };
 
+    let (vector_type, element_type) = get_vector_type(dataset.schema(), column)?;
+    if let DataType::List(_) = vector_type {
+        if params.metric_type != DistanceType::Cosine {
+            return Err(Error::Index {
+                message: "Build Vector Index: multivector type supports only cosine distance"
+                    .to_string(),
+                location: location!(),
+            });
+        }
+    }
+
     let temp_dir = tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
-        let (_, element_type) = get_vector_type(dataset.schema(), column)?;
         match element_type {
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
