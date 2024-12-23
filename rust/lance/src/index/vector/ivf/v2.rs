@@ -521,7 +521,7 @@ mod tests {
     use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        Array, ArrowPrimitiveType, FixedSizeListArray, ListArray, RecordBatch, RecordBatchIterator,
         UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
