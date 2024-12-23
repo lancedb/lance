@@ -59,6 +59,7 @@ pub(crate) mod executor;
 pub(crate) mod file;
 pub(crate) mod fragment;
 pub(crate) mod indices;
+pub(crate) mod object_store;
 pub(crate) mod reader;
 pub(crate) mod scanner;
 pub(crate) mod schema;

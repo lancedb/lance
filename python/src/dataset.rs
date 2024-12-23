@@ -59,7 +59,9 @@ use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
+use object_store::aws::AwsCredential;
 use object_store::path::Path;
+use object_store::CredentialProvider;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
@@ -71,17 +73,18 @@ use pyo3::{
 };
 use snafu::{location, Location};
 
+use self::cleanup::CleanupStats;
+use self::commit::PyCommitLock;
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
+use crate::object_store::UrlBasedCredentialProvider;
 use crate::schema::LanceSchema;
 use crate::session::Session;
 use crate::utils::PyLance;
 use crate::RT;
 use crate::{LanceReader, Scanner};
-
-use self::cleanup::CleanupStats;
-use self::commit::PyCommitLock;
+use pyo3::types::PyAny;
 
 pub mod blob;
 pub mod cleanup;
@@ -1590,8 +1593,18 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
         if let Some(storage_options) =
             get_dict_opt::<HashMap<String, String>>(options, "storage_options")?
         {
+            let credential_provider: Option<
+                Arc<dyn CredentialProvider<Credential = AwsCredential>>,
+            > = if let Some(url) = storage_options.get("assume_role_credential_url") {
+                Some(Arc::new(UrlBasedCredentialProvider::new(url.parse()?))
+                    as Arc<dyn CredentialProvider<Credential = AwsCredential>>)
+            } else {
+                None
+            };
+
             p.store_params = Some(ObjectStoreParams {
                 storage_options: Some(storage_options),
+                aws_credentials: credential_provider,
                 ..Default::default()
             });
         }
