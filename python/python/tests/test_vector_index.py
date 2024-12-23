@@ -116,7 +116,11 @@ def indexed_multivec_dataset(tmp_path):
     tbl = create_multivec_table()
     dataset = lance.write_dataset(tbl, tmp_path)
     yield dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        metric="cosine",
     )
 
 
