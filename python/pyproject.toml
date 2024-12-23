@@ -57,7 +57,7 @@ tests = [
     "tensorflow",
     "tqdm",
 ]
-dev = ["ruff==0.4.1"]
+dev = ["ruff==0.4.1", "pyright"]
 benchmarks = ["pytest-benchmark"]
 torch = ["torch"]
 ray = ["ray[data]<2.38; python_version<'3.12'"]
@@ -68,11 +68,16 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 [tool.ruff.lint.per-file-ignores]
 "*.pyi" = ["E301", "E302"]
 
-[tool.mypy]
-python_version = "3.12"
-check_untyped_defs = true
-warn_redundant_casts = true
-warn_unused_ignores = true
+[tool.pyright]
+pythonVersion = "3.12"
+# TODO: expand this list as we fix more files.
+include = ["python/lance/util.py"]
+reportMissingTypeStubs = "error"
+reportImportCycles = "error"
+reportUnusedImport = "error"
+reportPropertyTypeMismatch = "error"
+reportUnnecessaryCast = "error"
+
 
 [tool.pytest.ini_options]
 markers = [
