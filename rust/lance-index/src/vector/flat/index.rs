@@ -4,6 +4,7 @@
 //! Flat Vector Index.
 //!
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -134,6 +135,10 @@ impl IvfSubIndex for FlatIndex {
         Self: Sized,
     {
         Ok(Self {})
+    }
+
+    fn remap(&self, _: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        Ok(self.clone())
     }
 
     fn to_batch(&self) -> Result<RecordBatch> {

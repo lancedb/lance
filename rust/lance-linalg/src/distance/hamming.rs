@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::{Error, Result};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt8Type;
-use arrow_array::{Array, Float32Array};
+use arrow_array::{Array, FixedSizeListArray, Float32Array};
 use arrow_schema::DataType;
 
 pub trait Hamming {
@@ -62,11 +62,14 @@ pub fn hamming_distance_batch<'a>(
     Box::new(to.chunks_exact(dimension).map(|v| hamming(from, v)))
 }
 
-pub fn hamming_distance_arrow_batch(from: &dyn Array, to: &dyn Array) -> Result<Arc<Float32Array>> {
+pub fn hamming_distance_arrow_batch(
+    from: &dyn Array,
+    to: &FixedSizeListArray,
+) -> Result<Arc<Float32Array>> {
     let dists = match *from.data_type() {
         DataType::UInt8 => hamming_distance_batch(
             from.as_primitive::<UInt8Type>().values(),
-            to.as_primitive::<UInt8Type>().values(),
+            to.values().as_primitive::<UInt8Type>().values(),
             from.len(),
         ),
         _ => {

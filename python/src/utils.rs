@@ -34,6 +34,7 @@ use lance_linalg::{
 };
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
+use pyo3::intern;
 use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
@@ -242,5 +243,49 @@ impl Hnsw {
 
     fn vectors(&self, py: Python) -> PyResult<PyObject> {
         self.vectors.to_data().to_pyarrow(py)
+    }
+}
+
+/// A newtype wrapper for a Lance type.
+///
+/// This is used for types that have a corresponding dataclass in Python.
+pub struct PyLance<T>(pub T);
+
+impl<T> IntoPy<PyObject> for PyLance<T>
+where
+    Self: ToPyObject,
+{
+    fn into_py(self, py: Python) -> PyObject {
+        self.to_object(py)
+    }
+}
+
+/// Extract a Vec of PyLance types from a Python object.
+pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
+where
+    PyLance<T>: FromPyObject<'a>,
+{
+    ob.extract::<Vec<PyLance<T>>>()
+        .map(|v| v.into_iter().map(|t| t.0).collect())
+}
+
+/// Export a Vec of Lance types to a Python object.
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> Vec<PyObject>
+where
+    PyLance<&'a T>: ToPyObject,
+{
+    vec.iter()
+        .map(|t| PyLance(t).to_object(py))
+        .collect::<Vec<_>>()
+}
+
+pub fn class_name<'a>(ob: &'a Bound<'_, PyAny>) -> PyResult<&'a str> {
+    let full_name: &str = ob
+        .getattr(intern!(ob.py(), "__class__"))?
+        .getattr(intern!(ob.py(), "__name__"))?
+        .extract()?;
+    match full_name.rsplit_once('.') {
+        Some((_, name)) => Ok(name),
+        None => Ok(full_name),
     }
 }

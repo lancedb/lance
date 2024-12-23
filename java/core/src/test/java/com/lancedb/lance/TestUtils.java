@@ -116,6 +116,60 @@ public class TestUtils {
       return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
     }
 
+    public Dataset writeSortByDataset(long version) {
+      List<FragmentMetadata> fragmentMetas;
+      try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+        root.allocateNew();
+        IntVector idVector = (IntVector) root.getVector("id");
+        VarCharVector nameVector = (VarCharVector) root.getVector("name");
+        /* dataset context
+         * i: |  id   | name |
+         * 0: |  0    | null |
+         * 1: |  1    |  P0  |
+         * 2: | null  |  P1  |
+         * 3: |  2    |  P2  |
+         * 4: |  2    |  P3  |
+         * 5: | null  |  P3  |
+         * 6: |  3    | null |
+         * 7: |  4    |  P4  |
+         * 8: |  4    |  P5  |
+         * 9: |  5    |  P5  |
+         */
+        idVector.set(0, 0);
+        idVector.set(1, 1);
+        idVector.setNull(2);
+        idVector.set(3, 2);
+        idVector.set(4, 2);
+        idVector.setNull(5);
+        idVector.set(6, 3);
+        idVector.set(7, 4);
+        idVector.set(8, 4);
+        idVector.set(9, 5);
+
+        nameVector.setNull(0);
+        nameVector.set(1, "P0".getBytes());
+        nameVector.set(2, "P1".getBytes());
+        nameVector.set(3, "P2".getBytes());
+        nameVector.set(4, "P3".getBytes());
+        nameVector.set(5, "P3".getBytes());
+        nameVector.setNull(6);
+        nameVector.set(7, "P4".getBytes());
+        nameVector.set(8, "P5".getBytes());
+        nameVector.set(9, "P5".getBytes());
+
+        root.setRowCount(10);
+
+        fragmentMetas =
+            Fragment.create(
+                datasetPath,
+                allocator,
+                root,
+                new WriteParams.Builder().withMaxRowsPerFile(Integer.MAX_VALUE).build());
+      }
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(fragmentMetas);
+      return Dataset.commit(allocator, datasetPath, appendOp, Optional.of(version));
+    }
+
     public void validateScanResults(Dataset dataset, Scanner scanner, int totalRows, int batchRows)
         throws IOException {
       try (ArrowReader reader = scanner.scanBatches()) {

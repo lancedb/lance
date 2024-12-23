@@ -11,7 +11,7 @@ import random
 import time
 import uuid
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,9 +49,6 @@ from .lance import (
     CleanupStats,
     _Dataset,
     _MergeInsertBuilder,
-    _Operation,
-    _RewriteGroup,
-    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
@@ -107,7 +104,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
     # These next three overrides exist only to document the methods
 
-    def when_matched_update_all(self, condition: Optional[str] = None):
+    def when_matched_update_all(
+        self, condition: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to update matched rows
 
@@ -128,7 +127,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
-    def when_not_matched_insert_all(self):
+    def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows
 
@@ -138,7 +137,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_not_matched_insert_all()
 
-    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+    def when_not_matched_by_source_delete(
+        self, expr: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to delete source rows that do not match
 
@@ -617,8 +618,38 @@ class LanceDataset(pa.dataset.Dataset):
     def replace_schema(self, schema: Schema):
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
+
+        See :py:method:`replace_schema_metadata` or :py:method:`replace_field_metadata`
         """
-        raise NotImplementedError("not changing schemas yet")
+        raise NotImplementedError(
+            "Cannot replace the schema of a dataset.  This method exists for backwards"
+            " compatibility with pyarrow.  Use replace_schema_metadata or "
+            "replace_field_metadata to change the metadata"
+        )
+
+    def replace_schema_metadata(self, new_metadata: Dict[str, str]):
+        """
+        Replace the schema metadata of the dataset
+
+        Parameters
+        ----------
+        new_metadata: dict
+            The new metadata to set
+        """
+        self._ds.replace_schema_metadata(new_metadata)
+
+    def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
+        """
+        Replace the metadata of a field in the schema
+
+        Parameters
+        ----------
+        field_name: str
+            The name of the field to replace the metadata for
+        new_metadata: dict
+            The new metadata to set
+        """
+        self._ds.replace_field_metadata(field_name, new_metadata)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
@@ -1202,6 +1233,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+
+        Use `when_matched_update_all()` and `when_not_matched_insert_all()` to
+        perform an "upsert" operation.  This will update rows that already exist
+        in the dataset and insert rows that do not exist.
+
         >>> import lance
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
@@ -1219,6 +1255,51 @@ class LanceDataset(pa.dataset.Dataset):
         1  2  x
         2  3  y
         3  4  z
+
+        Use `when_not_matched_insert_all()` to perform an "insert if not exists"
+        operation.  This will only insert rows that do not already exist in the
+        dataset.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example2")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform an "insert if not exists" operation
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 0, 'num_deleted_rows': 0}
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  z
+
+        You are not required to provide all the columns. If you only want to
+        update a subset of columns, you can omit columns you don't want to
+        update. Omitted columns will keep their existing values if they are
+        updated, or will be null if they are inserted.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"], \\
+        ...                   "c": ["x", "y", "z"]})
+        >>> dataset = lance.write_dataset(table, "example3")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform an "upsert" operation, only updating column "a"
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_matched_update_all()     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b     c
+        0  1  a     x
+        1  2  x     y
+        2  3  y     z
+        3  4  z  None
         """
         return MergeInsertBuilder(self._ds, on)
 
@@ -2243,7 +2324,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         new_ds = _Dataset.commit(
             base_uri,
-            operation._to_inner(),
+            operation,
             read_version,
             commit_lock,
             storage_options=storage_options,
@@ -2342,19 +2423,6 @@ class LanceDataset(pa.dataset.Dataset):
             detached=detached,
             max_retries=max_retries,
         )
-        merged = Transaction(**merged)
-        # This logic is specific to append, which is all that should
-        # be returned here.
-        # TODO: generalize this to all other transaction types.
-        merged.operation["fragments"] = [
-            FragmentMetadata.from_metadata(f) for f in merged.operation["fragments"]
-        ]
-        merged.operation = LanceOperation.Append(**merged.operation)
-        if merged.blobs_op:
-            merged.blobs_op["fragments"] = [
-                FragmentMetadata.from_metadata(f) for f in merged.blobs_op["fragments"]
-            ]
-            merged.blobs_op = LanceOperation.Append(**merged.blobs_op)
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
@@ -2440,10 +2508,6 @@ class LanceOperation:
         See available operations under :class:`LanceOperation`.
         """
 
-        @abstractmethod
-        def _to_inner(self):
-            raise NotImplementedError()
-
     @dataclass
     class Overwrite(BaseOperation):
         """
@@ -2487,7 +2551,7 @@ class LanceOperation:
         3  4  d
         """
 
-        new_schema: pa.Schema
+        new_schema: LanceSchema | pa.Schema
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
@@ -2496,10 +2560,6 @@ class LanceOperation:
                     f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
                 )
             LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
-            return _Operation.overwrite(self.new_schema, raw_fragments)
 
     @dataclass
     class Append(BaseOperation):
@@ -2546,10 +2606,6 @@ class LanceOperation:
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
-            return _Operation.append(raw_fragments)
 
     @dataclass
     class Delete(BaseOperation):
@@ -2619,12 +2675,6 @@ class LanceOperation:
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
 
-        def _to_inner(self):
-            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
-            return _Operation.delete(
-                raw_updated_fragments, self.deleted_fragment_ids, self.predicate
-            )
-
     @dataclass
     class Merge(BaseOperation):
         """
@@ -2685,10 +2735,6 @@ class LanceOperation:
         schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
-            LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
             if isinstance(self.schema, pa.Schema):
                 warnings.warn(
                     "Passing a pyarrow.Schema to Merge is deprecated. "
@@ -2696,7 +2742,7 @@ class LanceOperation:
                     DeprecationWarning,
                 )
                 self.schema = LanceSchema.from_pyarrow(self.schema)
-            return _Operation.merge(raw_fragments, self.schema)
+            LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
     class Restore(BaseOperation):
@@ -2705,9 +2751,6 @@ class LanceOperation:
         """
 
         version: int
-
-        def _to_inner(self):
-            return _Operation.restore(self.version)
 
     @dataclass
     class RewriteGroup:
@@ -2718,11 +2761,6 @@ class LanceOperation:
         old_fragments: Iterable[FragmentMetadata]
         new_fragments: Iterable[FragmentMetadata]
 
-        def _to_inner(self):
-            old_fragments = [f._metadata for f in self.old_fragments]
-            new_fragments = [f._metadata for f in self.new_fragments]
-            return _RewriteGroup(old_fragments, new_fragments)
-
     @dataclass
     class RewrittenIndex:
         """
@@ -2731,9 +2769,6 @@ class LanceOperation:
 
         old_id: str
         new_id: str
-
-        def _to_inner(self):
-            return _RewrittenIndex(self.old_id, self.new_id)
 
     @dataclass
     class Rewrite(BaseOperation):
@@ -2761,11 +2796,6 @@ class LanceOperation:
             all_frags += [new for group in self.groups for new in group.new_fragments]
             LanceOperation._validate_fragments(all_frags)
 
-        def _to_inner(self):
-            groups = [group._to_inner() for group in self.groups]
-            rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
-            return _Operation.rewrite(groups, rewritten_indices)
-
     @dataclass
     class CreateIndex(BaseOperation):
         """
@@ -2777,15 +2807,6 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
-
-        def _to_inner(self):
-            return _Operation.create_index(
-                self.uuid,
-                self.name,
-                self.fields,
-                self.dataset_version,
-                self.fragment_ids,
-            )
 
 
 class ScannerBuilder:

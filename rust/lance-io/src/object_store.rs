@@ -26,7 +26,9 @@ use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
+use object_store::{
+    parse_url_opts, ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider,
+};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
@@ -787,6 +789,24 @@ impl StorageOptions {
             .unwrap_or(3)
     }
 
+    /// Max retry times to set in RetryConfig for s3 client
+    pub fn client_max_retries(&self) -> usize {
+        self.0
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == "client_max_retries")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(10)
+    }
+
+    /// Seconds of timeout to set in RetryConfig for s3 client
+    pub fn client_retry_timeout(&self) -> u64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == "client_retry_timeout")
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(180)
+    }
+
     /// Subset of options relevant for azure storage
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
         self.0
@@ -850,6 +870,13 @@ async fn configure_store(
             //     });
             // }
 
+            let max_retries = storage_options.client_max_retries();
+            let retry_timeout = storage_options.client_retry_timeout();
+            let retry_config = RetryConfig {
+                backoff: Default::default(),
+                max_retries,
+                retry_timeout: Duration::from_secs(retry_timeout),
+            };
             let storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
@@ -882,6 +909,7 @@ async fn configure_store(
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
+                .with_retry(retry_config)
                 .with_region(region);
             let store = builder.build()?;
 

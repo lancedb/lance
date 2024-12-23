@@ -730,6 +730,12 @@ fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>>
                         .iter()
                         .map(|v| *v as f32)
                         .collect::<Vec<_>>()),
+                    DataType::UInt8 => Ok(row
+                        .as_primitive::<UInt8Type>()
+                        .values()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect::<Vec<_>>()),
                     _ => Err(Error::Index {
                         message: format!(
                             "IVF centroids must be FixedSizeList of floating number, got: {}",
@@ -910,7 +916,7 @@ impl VectorIndex for IVFIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -1307,7 +1313,7 @@ impl RemapPageTask {
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap(mapping)?;
+        page.remap(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -1340,6 +1346,20 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
     }
 
     Ok(tasks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remap_index_file_v3(
+    dataset: &Dataset,
+    new_uuid: &str,
+    index: Arc<dyn VectorIndex>,
+    mapping: &HashMap<u64, Option<u64>>,
+    column: String,
+) -> Result<()> {
+    let index_dir = dataset.indices_dir().child(new_uuid);
+    index
+        .remap_to(dataset.object_store().clone(), mapping, column, index_dir)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -18,11 +18,11 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
@@ -754,9 +754,11 @@ impl FileFragment {
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
-                let initialized_schema = reader
-                    .schema()
-                    .project_by_schema(schema_per_file.as_ref())?;
+                let initialized_schema = reader.schema().project_by_schema(
+                    schema_per_file.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 let reader = V1Reader::new(reader, Arc::new(initialized_schema));
                 Ok(Some(Box::new(reader)))
             } else {
@@ -1285,11 +1287,14 @@ impl FileFragment {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
+        let mut with_row_id = false;
         if let Some(columns) = columns {
             let mut projection = Vec::new();
             for column in columns {
                 if column.as_ref() == ROW_ADDR {
                     with_row_addr = true;
+                } else if column.as_ref() == ROW_ID {
+                    with_row_id = true;
                 } else {
                     projection.push(column.as_ref());
                 }
@@ -1305,11 +1310,13 @@ impl FileFragment {
         }
 
         // If there is no projection, we at least need to read the row addresses
-        with_row_addr |= schema.fields.is_empty();
+        with_row_addr |= !with_row_id && schema.fields.is_empty();
 
         let reader = self.open(
             &schema,
-            FragReadConfig::default().with_row_address(with_row_addr),
+            FragReadConfig::default()
+                .with_row_address(with_row_addr)
+                .with_row_id(with_row_id),
             None,
         );
         let deletion_vector = read_deletion_file(

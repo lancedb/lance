@@ -309,7 +309,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
         let transposed_codes = self.code.as_ref().unwrap();
