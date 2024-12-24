@@ -12,6 +12,7 @@
 package com.lancedb.lance;
 
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -29,6 +30,7 @@ import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -293,6 +295,53 @@ public class DatasetTest {
       nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
       dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
       assertNotNull(dataset.getSchema().findField("new_name_2"));
+    }
+  }
+
+  @Test
+  void testAddColumnBySqlExpressions() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      SqlExpressions sqlExpressions =
+          new SqlExpressions.Builder().withExpression("double_id", "id * 2").build();
+      dataset.addColumns(sqlExpressions, Optional.empty());
+
+      Schema changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.nullable("name", new ArrowType.Utf8()),
+                  Field.nullable("double_id", new ArrowType.Int(32, true))),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      sqlExpressions = new SqlExpressions.Builder().withExpression("triple_id", "id * 3").build();
+      dataset.addColumns(sqlExpressions, Optional.empty());
+      changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.nullable("name", new ArrowType.Utf8()),
+                  Field.nullable("double_id", new ArrowType.Int(32, true)),
+                  Field.nullable("triple_id", new ArrowType.Int(32, true))),
+              null);
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
     }
   }
 
