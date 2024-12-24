@@ -516,7 +516,7 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
 
 
 def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
-    query = [np.random.randn(128)] * 5
+    query = np.random.rand(5, 128)
     results = indexed_multivec_dataset.scanner(
         nearest={"column": "vector", "q": query, "k": 100}
     ).to_table()
@@ -525,24 +525,25 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     assert len(results["vector"][0]) == 5
 
     # query with single vector also works
-    query = np.random.randn(128)
+    query = np.random.rand(128)
     results = indexed_multivec_dataset.to_table(
         nearest={"column": "vector", "q": query, "k": 100}
     )
-    assert results.num_rows == 100
+    # we don't verify the number of results here,
+    # because for multivector, it's not guaranteed to return k results
     assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
     assert len(results["vector"][0]) == 5
 
     # query with a vector that dim not match
-    query = np.random.randn(256)
+    query = np.random.rand(256)
     with pytest.raises(ValueError, match="does not match index column size"):
         indexed_multivec_dataset.to_table(
             nearest={"column": "vector", "q": query, "k": 100}
         )
 
     # query with a list of vectors that some dim not match
-    query = [np.random.randn(128)] * 5 + [np.random.randn(256)]
-    with pytest.raises(ValueError, match="does not match index column size"):
+    query = [np.random.rand(128)] * 5 + [np.random.rand(256)]
+    with pytest.raises(ValueError, match="All query vectors must have the same length"):
         indexed_multivec_dataset.to_table(
             nearest={"column": "vector", "q": query, "k": 100}
         )

@@ -3088,7 +3088,7 @@ class ScannerBuilder:
         use_index: bool = True,
         ef: Optional[int] = None,
     ) -> ScannerBuilder:
-        q = _coerce_query_vector(q)
+        q, q_dim = _coerce_query_vector(q)
 
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} is not in the dataset")
@@ -3107,7 +3107,8 @@ class ScannerBuilder:
             raise TypeError(
                 f"Query column {column} must be a vector. Got {column_field.type}."
             )
-        if len(q) % dim != 0:
+
+        if q_dim != dim:
             raise ValueError(
                 f"Query vector size {len(q)} does not match index column size" f" {dim}"
             )
@@ -3631,7 +3632,18 @@ def write_dataset(
     return ds
 
 
-def _coerce_query_vector(query: QueryVectorLike):
+def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
+    # if the query is a multivector, flatten it
+    if isinstance(query[0], (list, tuple, np.ndarray, pa.Array)):
+        dim = len(query[0])
+        for q in query:
+            if len(q) != dim:
+                raise ValueError(
+                    "All query vectors must have the same length, "
+                    f"but got {dim} and {len(q)}"
+                )
+        return (pa.concat_arrays(_coerce_query_vector(q)[0] for q in query), dim)
+
     if isinstance(query, pa.Scalar):
         if isinstance(query, pa.ExtensionScalar):
             # If it's an extension scalar then convert to storage
@@ -3664,7 +3676,7 @@ def _coerce_query_vector(query: QueryVectorLike):
                 f"but received {query.type}"
             )
 
-    return query
+    return (query, len(query))
 
 
 def _validate_schema(schema: pa.Schema):
