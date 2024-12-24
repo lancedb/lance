@@ -7,9 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{
-    Array, ArrowPrimitiveType, Float32Array, Int64Array, PrimitiveArray, RecordBatch,
-};
+use arrow::array::AsArray;
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -635,12 +634,8 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest<T: ArrowPrimitiveType>(
-        &mut self,
-        column: &str,
-        q: &PrimitiveArray<T>,
-        k: usize,
-    ) -> Result<&mut Self> {
+    /// the query can be a Float16Array, Float32Array, Float64Array, UInt8Array, or a ListArray of the above types.
+    pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
         if !self.prefilter {
             // We can allow fragment scan if the input to nearest is a prefilter.
             // The fragment scan will be performed by the prefilter.
@@ -660,22 +655,55 @@ impl Scanner {
             ));
         }
         // make sure the field exists
-        let (_, element_type) = get_vector_type(self.dataset.schema(), column)?;
+        let (vector_type, element_type) = get_vector_type(self.dataset.schema(), column)?;
         let dim = get_vector_dim(self.dataset.schema(), column)?;
-        // make sure the query is valid
-        if q.len() % dim != 0 {
-            return Err(Error::invalid_input(
-                format!(
-                    "query dim({}) doesn't match the column {} vector dim({})",
-                    q.len(),
-                    column,
-                    dim,
-                ),
-                location!(),
-            ));
-        }
+
+        let q = match q.data_type() {
+            DataType::List(_) => {
+                if !matches!(vector_type, DataType::List(_)) {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Query is multivector but column {}({})is not multivector",
+                            column, vector_type,
+                        ),
+                        location!(),
+                    ));
+                }
+                let list_array = q.as_list::<i32>();
+                for i in 0..list_array.len() {
+                    let vec = list_array.value(i);
+                    if vec.len() != dim {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "query dim({}) doesn't match the column {} vector dim({})",
+                                vec.len(),
+                                column,
+                                dim,
+                            ),
+                            location!(),
+                        ));
+                    }
+                }
+                list_array.values().clone()
+            }
+            _ => {
+                if q.len() != dim {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "query dim({}) doesn't match the column {} vector dim({})",
+                            q.len(),
+                            column,
+                            dim,
+                        ),
+                        location!(),
+                    ));
+                }
+                q.slice(0, q.len())
+            }
+        };
+
         let key = match element_type {
-            dt if dt == *q.data_type() => Box::new(q.clone()),
+            dt if dt == *q.data_type() => q,
             dt if dt.is_floating() => coerce_float_vector(
                 q.as_any().downcast_ref::<Float32Array>().unwrap(),
                 FloatType::try_from(&dt)?,
@@ -695,7 +723,7 @@ impl Scanner {
 
         self.nearest = Some(Query {
             column: column.to_string(),
-            key: key.into(),
+            key: key,
             k,
             nprobes: 1,
             ef: None,
@@ -3353,7 +3381,7 @@ mod test {
         let query_key = Arc::new(Float32Array::from_iter_values((0..2).map(|x| x as f32)));
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
-        scan.nearest("vector", &query_key, 1).unwrap();
+        scan.nearest("vector", query_key.as_ref(), 1).unwrap();
         scan.with_row_id();
 
         let batches = scan

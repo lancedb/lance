@@ -5,6 +5,7 @@
 
 use std::fmt::{Debug, Display};
 use std::iter::Sum;
+use std::sync::Arc;
 use std::{
     fmt::Formatter,
     ops::{AddAssign, DivAssign},
@@ -202,16 +203,16 @@ impl FloatArray<Float64Type> for Float64Array {
 }
 
 /// Convert a float32 array to another float array.
-pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Box<dyn Array>> {
+pub fn coerce_float_vector(input: &Float32Array, float_type: FloatType) -> Result<Arc<dyn Array>> {
     match float_type {
-        FloatType::BFloat16 => Ok(Box::new(BFloat16Array::from_iter_values(
+        FloatType::BFloat16 => Ok(Arc::new(BFloat16Array::from_iter_values(
             input.values().iter().map(|v| bf16::from_f32(*v)),
         ))),
-        FloatType::Float16 => Ok(Box::new(Float16Array::from_iter_values(
+        FloatType::Float16 => Ok(Arc::new(Float16Array::from_iter_values(
             input.values().iter().map(|v| f16::from_f32(*v)),
         ))),
-        FloatType::Float32 => Ok(Box::new(input.clone())),
-        FloatType::Float64 => Ok(Box::new(Float64Array::from_iter_values(
+        FloatType::Float32 => Ok(Arc::new(input.clone())),
+        FloatType::Float64 => Ok(Arc::new(Float64Array::from_iter_values(
             input.values().iter().map(|v| *v as f64),
         ))),
     }

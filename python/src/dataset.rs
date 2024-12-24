@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{make_array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -619,7 +619,7 @@ impl Dataset {
                 .get_item("q")?
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
             let data = ArrayData::from_pyarrow_bound(&qval)?;
-            let q = Float32Array::from(data);
+            let q = make_array(data);
 
             let k: usize = if let Some(k) = nearest.get_item("k")? {
                 if k.is_none() {

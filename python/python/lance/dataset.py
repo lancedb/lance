@@ -3633,16 +3633,19 @@ def write_dataset(
 
 
 def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
-    # if the query is a multivector, flatten it
+    # if the query is a multivector, convert it to pa.ListArray
     if isinstance(query[0], (list, tuple, np.ndarray, pa.Array)):
         dim = len(query[0])
+        multivector_query = []
         for q in query:
             if len(q) != dim:
                 raise ValueError(
                     "All query vectors must have the same length, "
                     f"but got {dim} and {len(q)}"
                 )
-        return (pa.concat_arrays(_coerce_query_vector(q)[0] for q in query), dim)
+            multivector_query.append(_coerce_query_vector(q)[0])
+        query = pa.array(multivector_query, type=pa.list_(pa.float32()))
+        return (query, dim)
 
     if isinstance(query, pa.Scalar):
         if isinstance(query, pa.ExtensionScalar):
