@@ -268,16 +268,22 @@ public class Dataset implements Closeable {
    */
   public static native void drop(String path, Map<String, String> storageOptions);
 
-  public void addColumns(
-      SqlExpressions sqlExpressions, Optional<List<String>> readColumns, Optional<Long> batchSize) {
+  /**
+   * Add columns to the dataset.
+   *
+   * @param sqlExpressions The SQL expressions to add columns
+   * @param batchSize The number of rows to read at a time from the source dataset when applying the
+   *     transform.
+   */
+  public void addColumns(SqlExpressions sqlExpressions, Optional<Long> batchSize) {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      nativeAddColumnsBySqlExpressions(sqlExpressions, readColumns, batchSize);
+      nativeAddColumnsBySqlExpressions(sqlExpressions, batchSize);
     }
   }
 
   private native void nativeAddColumnsBySqlExpressions(
-      SqlExpressions sqlExpressions, Optional<List<String>> readColumns, Optional<Long> batchSize);
+      SqlExpressions sqlExpressions, Optional<Long> batchSize);
 
   /**
    * Drop columns from the dataset.

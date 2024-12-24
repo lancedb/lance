@@ -942,18 +942,11 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySqlExpre
     mut env: JNIEnv,
     java_dataset: JObject,
     sql_expressions: JObject, // SqlExpressions
-    read_columns: JObject,    // Optional<List<String>>
     batch_size: JObject,      // Optional<Long>
 ) {
     ok_or_throw_without_return!(
         env,
-        inner_add_columns_by_sql_expressions(
-            &mut env,
-            java_dataset,
-            sql_expressions,
-            read_columns,
-            batch_size
-        )
+        inner_add_columns_by_sql_expressions(&mut env, java_dataset, sql_expressions, batch_size)
     )
 }
 
@@ -961,7 +954,6 @@ fn inner_add_columns_by_sql_expressions(
     env: &mut JNIEnv,
     java_dataset: JObject,
     sql_expressions: JObject, // SqlExpressions
-    read_columns: JObject,    // Optional<List<String>>
     batch_size: JObject,      // Optional<Long>
 ) -> Result<()> {
     let sql_expressions_obj = env
@@ -971,31 +963,21 @@ fn inner_add_columns_by_sql_expressions(
     let sql_expressions_obj_list = env.get_list(&sql_expressions_obj)?;
     let mut expressions: Vec<(String, String)> = Vec::new();
 
-    for i in 0..sql_expressions_obj_list.size(env)? {
-        if let Ok(Some(item)) = sql_expressions_obj_list.get(env, i) {
-            let name = env
-                .call_method(&item, "getName", "()Ljava/lang/String;", &[])?
-                .l()?;
-            let value = env
-                .call_method(&item, "getExpression", "()Ljava/lang/String;", &[])?
-                .l()?;
-            let key_str: String = env.get_string(&JString::from(name))?.into();
-            let value_str: String = env.get_string(&JString::from(value))?.into();
-            expressions.push((key_str, value_str));
-        }
+    let mut iterator = sql_expressions_obj_list.iter(env)?;
+
+    while let Some(item) = iterator.next(env)? {
+        let name = env
+            .call_method(&item, "getName", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let value = env
+            .call_method(&item, "getExpression", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let key_str: String = env.get_string(&JString::from(name))?.into();
+        let value_str: String = env.get_string(&JString::from(value))?.into();
+        expressions.push((key_str, value_str));
     }
 
     let rust_transform = NewColumnTransform::SqlExpressions(expressions);
-
-    let read_cols = if env
-        .call_method(&read_columns, "isPresent", "()Z", &[])?
-        .z()?
-    {
-        let columns: Vec<String> = env.get_strings(&read_columns)?;
-        Some(columns.iter().map(|s| s.to_string()).collect())
-    } else {
-        None
-    };
 
     let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
         let batch_size_value = env.get_long_opt(&batch_size)?;
@@ -1017,7 +999,7 @@ fn inner_add_columns_by_sql_expressions(
     RT.block_on(
         dataset_guard
             .inner
-            .add_columns(rust_transform, read_cols, batch_size),
+            .add_columns(rust_transform, None, batch_size),
     )?;
     Ok(())
 }

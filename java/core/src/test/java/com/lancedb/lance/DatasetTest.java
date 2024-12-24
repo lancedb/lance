@@ -311,12 +311,9 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       dataset = testDataset.createEmptyDataset();
 
-      SqlExpressions sqlExpressions = new SqlExpressions();
-      SqlExpressions.SqlExpression sqlExpression = new SqlExpressions.SqlExpression();
-      sqlExpression.setName("double_id");
-      sqlExpression.setExpression("id * 2");
-      sqlExpressions.setSqlExpressions(Collections.singletonList(sqlExpression));
-      dataset.addColumns(sqlExpressions, Optional.empty(), Optional.empty());
+      SqlExpressions sqlExpressions =
+          new SqlExpressions.Builder().withExpression("double_id", "id * 2").build();
+      dataset.addColumns(sqlExpressions, Optional.empty());
 
       Schema changedSchema =
           new Schema(
@@ -333,12 +330,8 @@ public class DatasetTest {
               .map(Field::getName)
               .collect(Collectors.toList()));
 
-      sqlExpressions = new SqlExpressions();
-      sqlExpression = new SqlExpressions.SqlExpression();
-      sqlExpression.setName("triple_id");
-      sqlExpression.setExpression("id * 3");
-      sqlExpressions.setSqlExpressions(Collections.singletonList(sqlExpression));
-      dataset.addColumns(sqlExpressions, Optional.empty(), Optional.empty());
+      sqlExpressions = new SqlExpressions.Builder().withExpression("triple_id", "id * 3").build();
+      dataset.addColumns(sqlExpressions, Optional.empty());
       changedSchema =
           new Schema(
               Arrays.asList(
