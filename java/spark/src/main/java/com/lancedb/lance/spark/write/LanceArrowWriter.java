@@ -24,8 +24,6 @@ import org.apache.spark.sql.execution.arrow.ArrowWriter;
 import javax.annotation.concurrent.GuardedBy;
 
 import java.io.IOException;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -34,10 +32,6 @@ import java.util.concurrent.atomic.AtomicLong;
 public class LanceArrowWriter extends ArrowReader {
   private final Schema schema;
   private final int batchSize;
-  private final Object monitor = new Object();
-
-  @GuardedBy("monitor")
-  private final Queue<InternalRow> rowQueue = new ConcurrentLinkedQueue<>();
 
   @GuardedBy("monitor")
   private volatile boolean finished;
@@ -53,7 +47,6 @@ public class LanceArrowWriter extends ArrowReader {
     Preconditions.checkNotNull(schema);
     Preconditions.checkArgument(batchSize > 0);
     this.schema = schema;
-    // TODO(lu) batch size as config?
     this.batchSize = batchSize;
     this.writeToken = new Semaphore(0);
     this.loadToken = new Semaphore(0);
