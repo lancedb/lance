@@ -1680,6 +1680,7 @@ mod tests {
 
     use arrow::array::{as_struct_array, AsArray};
     use arrow::compute::concat_batches;
+    use arrow::datatypes::UInt64Type;
     use arrow_array::{
         builder::StringDictionaryBuilder,
         cast::as_string_array,
@@ -4612,6 +4613,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_fts_rank() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let params = InvertedIndexParams::default();
+        let text_col =
+            GenericStringArray::<i32>::from(vec!["score", "find score", "try to find score"]);
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "text",
+                text_col.data_type().to_owned(),
+                false,
+            )])
+            .into(),
+            vec![Arc::new(text_col) as ArrayRef],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(batches, tempdir.path().to_str().unwrap(), None)
+            .await
+            .unwrap();
+        dataset
+            .create_index(&["text"], IndexType::Inverted, None, &params, true)
+            .await
+            .unwrap();
+
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("score".to_owned()))
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 3);
+        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids, &[0, 1, 2]);
+
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("score".to_owned()))
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 2);
+        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids, &[0, 1]);
+
+        let results = dataset
+            .scan()
+            .with_row_id()
+            .full_text_search(FullTextSearchQuery::new("score".to_owned()))
+            .unwrap()
+            .limit(Some(1), None)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 1);
+        let row_ids = results[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(row_ids, &[0]);
     }
 
     #[tokio::test]

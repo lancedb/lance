@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use arrow::ffi_stream::ArrowArrayStreamReader;
-use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::pyarrow::{FromPyArrow, PyArrowType, ToPyArrow};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
@@ -163,7 +163,7 @@ impl FileFragment {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, batch_readahead=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, batch_size=None, filter=None, limit=None, offset=None, with_row_id=None, with_row_address=None, batch_readahead=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -173,6 +173,7 @@ impl FileFragment {
         limit: Option<i64>,
         offset: Option<i64>,
         with_row_id: Option<bool>,
+        with_row_address: Option<bool>,
         batch_readahead: Option<usize>,
     ) -> PyResult<Scanner> {
         let mut scanner = self_.fragment.scan();
@@ -211,6 +212,9 @@ impl FileFragment {
 
         if with_row_id.unwrap_or(false) {
             scanner.with_row_id();
+        }
+        if with_row_address.unwrap_or(false) {
+            scanner.with_row_address();
         }
         if let Some(batch_readahead) = batch_readahead {
             scanner.batch_readahead(batch_readahead);
@@ -254,6 +258,25 @@ impl FileFragment {
             .spawn(None, async move {
                 fragment
                     .add_columns(transforms, read_columns, batch_size)
+                    .await
+            })?
+            .infer_error()?;
+
+        Ok((PyLance(fragment), LanceSchema(schema)))
+    }
+
+    fn merge(
+        &mut self,
+        reader: PyArrowType<ArrowArrayStreamReader>,
+        left_on: String,
+        right_on: String,
+        max_field_id: i32,
+    ) -> PyResult<(PyLance<Fragment>, LanceSchema)> {
+        let mut fragment = self.fragment.clone();
+        let (fragment, schema) = RT
+            .spawn(None, async move {
+                fragment
+                    .merge_columns(reader.0, &left_on, &right_on, max_field_id)
                     .await
             })?
             .infer_error()?;
