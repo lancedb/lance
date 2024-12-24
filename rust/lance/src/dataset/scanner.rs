@@ -723,7 +723,7 @@ impl Scanner {
 
         self.nearest = Some(Query {
             column: column.to_string(),
-            key: key,
+            key,
             k,
             nprobes: 1,
             ef: None,
