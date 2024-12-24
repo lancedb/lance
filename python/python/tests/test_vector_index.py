@@ -106,16 +106,14 @@ def indexed_dataset(tmp_path):
 
 
 @pytest.fixture()
-def multivec_dataset(tmp_path):
+def multivec_dataset():
     tbl = create_multivec_table()
-    yield lance.write_dataset(tbl, tmp_path)
+    yield lance.write_dataset(tbl, "memory://")
 
 
 @pytest.fixture()
-def indexed_multivec_dataset(tmp_path):
-    tbl = create_multivec_table()
-    dataset = lance.write_dataset(tbl, tmp_path)
-    yield dataset.create_index(
+def indexed_multivec_dataset(multivec_dataset):
+    yield multivec_dataset.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=4,
@@ -517,9 +515,37 @@ def test_create_ivf_hnsw_sq_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
-def test_multivec_ann(indexed_multivec_dataset):
-    query = np.random.randn(5 * 128)
-    indexed_multivec_dataset.scanner(nearest={"column": "vector", "q": query, "k": 100})
+def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
+    query = [np.random.randn(128)] * 5
+    results = indexed_multivec_dataset.scanner(
+        nearest={"column": "vector", "q": query, "k": 100}
+    ).to_table()
+    assert results.num_rows == 100
+    assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
+    assert len(results["vector"][0]) == 5
+
+    # query with single vector also works
+    query = np.random.randn(128)
+    results = indexed_multivec_dataset.to_table(
+        nearest={"column": "vector", "q": query, "k": 100}
+    )
+    assert results.num_rows == 100
+    assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
+    assert len(results["vector"][0]) == 5
+
+    # query with a vector that dim not match
+    query = np.random.randn(256)
+    with pytest.raises(ValueError, match="does not match index column size"):
+        indexed_multivec_dataset.to_table(
+            nearest={"column": "vector", "q": query, "k": 100}
+        )
+
+    # query with a list of vectors that some dim not match
+    query = [np.random.randn(128)] * 5 + [np.random.randn(256)]
+    with pytest.raises(ValueError, match="does not match index column size"):
+        indexed_multivec_dataset.to_table(
+            nearest={"column": "vector", "q": query, "k": 100}
+        )
 
 
 def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
