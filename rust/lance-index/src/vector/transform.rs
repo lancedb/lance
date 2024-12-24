@@ -7,14 +7,16 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use arrow::datatypes::UInt64Type;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::UInt64Array;
 use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
 use snafu::{location, Location};
 
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_linalg::kernels::normalize_fsl;
 use tracing::instrument;
 
@@ -66,20 +68,16 @@ impl Transformer for NormalizeTransformer {
                 ),
                 location: location!(),
             })?;
-        let data = arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "Normalize Transform: column {} is not a fixed size list: {}",
-                self.input_column,
-                arr.data_type()
-            ),
-            location: location!(),
-        })?;
+
+        let data = arr.as_fixed_size_list();
         let norm = normalize_fsl(data)?;
+        let transformed = Arc::new(norm);
+
         if let Some(output_column) = &self.output_column {
-            let field = Field::new(output_column, norm.data_type().clone(), true);
-            Ok(batch.try_with_column(field, Arc::new(norm))?)
+            let field = Field::new(output_column, transformed.data_type().clone(), true);
+            Ok(batch.try_with_column(field, transformed)?)
         } else {
-            Ok(batch.replace_column_by_name(&self.input_column, Arc::new(norm))?)
+            Ok(batch.replace_column_by_name(&self.input_column, transformed)?)
         }
     }
 }
@@ -118,14 +116,21 @@ impl Transformer for KeepFiniteVectors {
             ),
             location: location!(),
         })?;
-        let data = arr.as_fixed_size_list_opt().ok_or(Error::Index {
-            message: format!(
-                "KeepFiniteVectors: column {} is not a fixed size list: {}",
-                self.column,
-                arr.data_type()
-            ),
-            location: location!(),
-        })?;
+
+        let data = match arr.data_type() {
+            DataType::FixedSizeList(_, _) => arr.as_fixed_size_list(),
+            DataType::List(_) => arr.as_list::<i32>().values().as_fixed_size_list(),
+            _ => {
+                return Err(Error::Index {
+                    message: format!(
+                        "KeepFiniteVectors: column {} is not a fixed size list: {}",
+                        self.column,
+                        arr.data_type()
+                    ),
+                    location: location!(),
+                })
+            }
+        };
 
         let valid = data
             .iter()
@@ -171,6 +176,62 @@ impl DropColumn {
 impl Transformer for DropColumn {
     fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
         Ok(batch.drop_column(&self.column)?)
+    }
+}
+
+#[derive(Debug)]
+pub struct Flatten {
+    column: String,
+}
+
+impl Flatten {
+    pub fn new(column: &str) -> Self {
+        Self {
+            column: column.to_owned(),
+        }
+    }
+}
+
+impl Transformer for Flatten {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let arr = batch.column_by_name(&self.column).ok_or(Error::Index {
+            message: format!("Flatten: column {} not found in RecordBatch", self.column),
+            location: location!(),
+        })?;
+        match arr.data_type() {
+            DataType::FixedSizeList(_, _) => {
+                // do nothing
+                Ok(batch.clone())
+            }
+            DataType::List(_) => {
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let vectors = arr.as_list::<i32>();
+
+                let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
+                    |(row_id, multivector)| {
+                        std::iter::repeat(*row_id)
+                            .take(multivector.map(|multivec| multivec.len()).unwrap_or(0))
+                    },
+                );
+                let row_ids = UInt64Array::from_iter_values(row_ids);
+                let vectors = vectors.values().as_fixed_size_list().clone();
+                let schema = Arc::new(Schema::new(vec![
+                    ROW_ID_FIELD.clone(),
+                    Field::new(self.column.as_str(), vectors.data_type().clone(), true),
+                ]));
+                let batch =
+                    RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(vectors)])?;
+                Ok(batch)
+            }
+            _ => Err(Error::Index {
+                message: format!(
+                    "Flatten: column {} is not a vector: {}",
+                    self.column,
+                    arr.data_type()
+                ),
+                location: location!(),
+            }),
+        }
     }
 }
 
