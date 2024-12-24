@@ -41,7 +41,6 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
       LanceArrowWriter arrowWriter,
       FutureTask<List<FragmentMetadata>> fragmentCreationTask,
       Thread fragmentCreationThread) {
-    // TODO support write to multiple fragments
     this.arrowWriter = arrowWriter;
     this.fragmentCreationThread = fragmentCreationThread;
     this.fragmentCreationTask = fragmentCreationTask;
