@@ -75,6 +75,7 @@ pub use lance_core::{datatypes, error};
 pub use lance_core::{Error, Result};
 
 pub mod arrow;
+pub mod catalog;
 pub mod datafusion;
 pub mod dataset;
 pub mod index;
