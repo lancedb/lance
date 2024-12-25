@@ -634,7 +634,8 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    /// the query can be a Float16Array, Float32Array, Float64Array, UInt8Array, or a ListArray of the above types.
+    /// the query can be a Float16Array, Float32Array, Float64Array, UInt8Array,
+    /// or a ListArray/FixedSizeListArray of the above types.
     pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
         if !self.prefilter {
             // We can allow fragment scan if the input to nearest is a prefilter.
@@ -659,7 +660,7 @@ impl Scanner {
         let dim = get_vector_dim(self.dataset.schema(), column)?;
 
         let q = match q.data_type() {
-            DataType::List(_) => {
+            DataType::List(_) | DataType::FixedSizeList(_, _) => {
                 if !matches!(vector_type, DataType::List(_)) {
                     return Err(Error::invalid_input(
                         format!(
@@ -669,22 +670,38 @@ impl Scanner {
                         location!(),
                     ));
                 }
-                let list_array = q.as_list::<i32>();
-                for i in 0..list_array.len() {
-                    let vec = list_array.value(i);
-                    if vec.len() != dim {
+
+                if let Some(list_array) = q.as_list_opt::<i32>() {
+                    for i in 0..list_array.len() {
+                        let vec = list_array.value(i);
+                        if vec.len() != dim {
+                            return Err(Error::invalid_input(
+                                format!(
+                                    "query dim({}) doesn't match the column {} vector dim({})",
+                                    vec.len(),
+                                    column,
+                                    dim,
+                                ),
+                                location!(),
+                            ));
+                        }
+                    }
+                    list_array.values().clone()
+                } else {
+                    let fsl = q.as_fixed_size_list();
+                    if fsl.value_length() as usize != dim {
                         return Err(Error::invalid_input(
                             format!(
                                 "query dim({}) doesn't match the column {} vector dim({})",
-                                vec.len(),
+                                fsl.value_length(),
                                 column,
                                 dim,
                             ),
                             location!(),
                         ));
                     }
+                    fsl.values().clone()
                 }
-                list_array.values().clone()
             }
             _ => {
                 if q.len() != dim {

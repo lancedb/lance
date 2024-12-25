@@ -672,7 +672,12 @@ mod tests {
         k: usize,
         distance_type: DistanceType,
     ) -> Vec<(f32, u64)> {
-        multivec_distance(query, vectors, distance_type)
+        let query = if let Some(list_array) = query.as_list_opt::<i32>() {
+            list_array.values().clone()
+        } else {
+            query.as_fixed_size_list().values().clone()
+        };
+        multivec_distance(&query, vectors, distance_type)
             .unwrap()
             .into_iter()
             .enumerate()
@@ -1017,17 +1022,12 @@ mod tests {
             .await
             .unwrap();
 
-        let multivector = vectors.value(0);
-        let query = multivector
-            .as_fixed_size_list()
-            .values()
-            .as_primitive::<T>();
-        let query = &query;
+        let query = vectors.value(0);
         let k = 100;
 
         let result = dataset
             .scan()
-            .nearest("vector", query, k)
+            .nearest("vector", &query, k)
             .unwrap()
             .nprobs(nlist)
             .with_row_id()
@@ -1048,7 +1048,7 @@ mod tests {
             .collect::<Vec<_>>();
         let row_ids = row_ids.into_iter().collect::<HashSet<_>>();
 
-        let gt = multivec_ground_truth(&vectors, query, k, params.metric_type);
+        let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
