@@ -54,12 +54,13 @@ jobs:
           workspaces: python
       - name: Install linting tools
         run: |
-          pip install ruff==0.4.1 maturin tensorflow tqdm ray[data]
+          pip install ruff==0.4.1 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
           ruff format --check python
           ruff check python
+          pyright
       - name: Install dependencies
         run: |
           sudo apt update
