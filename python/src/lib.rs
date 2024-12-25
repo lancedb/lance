@@ -44,6 +44,7 @@ use futures::StreamExt;
 use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::{PyNone, PyString};
 use session::Session;
 
 #[macro_use]
@@ -151,6 +152,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    let none = PyNone::get_bound(py).into_py(py);
+    let lm_home = lance_index::scalar::inverted::LANCE_LANGUAGE_MODEL_HOME.as_ref().and_then(|p| p.to_str()).map(|p| PyString::new_bound(py, p).into_py(py)).unwrap_or(none);
+    m.add("LANGUAGE_MODEL_HOME", lm_home)?;
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())

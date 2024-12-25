@@ -156,15 +156,15 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
     }
 }
 
-pub const LANCE_TOKENIZERS_HOME_ENV_KEY: &str = "LANCE_TOKENIZERS_HOME";
+pub const LANCE_LANGUAGE_MODEL_HOME_ENV_KEY: &str = "LANCE_LANGUAGE_MODEL_HOME";
 
-pub const LANCE_HOME_DEFAULT_DIRECTORY: &str = "lance/tokenizers";
+pub const LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY: &str = "lance/language_models";
 
 lazy_static::lazy_static! {
     /// default directory that stores lance tokenizer related files, e.g. tokenizer model.
-    pub static ref LANCE_TOKENIZER_HOME: Option<PathBuf> = match env::var(LANCE_TOKENIZERS_HOME_ENV_KEY) {
+    pub static ref LANCE_LANGUAGE_MODEL_HOME: Option<PathBuf> = match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
         Ok(p) => Some(PathBuf::from(p)),
-        Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_HOME_DEFAULT_DIRECTORY))
+        Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY))
     };
 }
 
@@ -190,7 +190,7 @@ fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::Text
     use lindera_tantivy::tokenizer::LinderaTokenizer;
     use serde_json::Value;
 
-    match LANCE_TOKENIZER_HOME.as_ref() {
+    match LANCE_LANGUAGE_MODEL_HOME.as_ref() {
         Some(p) => {
             let dic_dir = p.join(dic);
             let config_path = dic_dir.join("config.json");
@@ -244,7 +244,7 @@ fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::Text
         None => Err(Error::invalid_input(
             format!(
                 "{} is undefined",
-                String::from(LANCE_TOKENIZERS_HOME_ENV_KEY)
+                String::from(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY)
             ),
             location!(),
         )),

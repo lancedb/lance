@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 import pyarrow as pa
 
+LANGUAGE_MODEL_HOME: Optional[str]
+
 def infer_tfrecord_schema(
     uri: str,
     tensor_features: Optional[List[str]] = None,
