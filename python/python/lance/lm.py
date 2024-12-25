@@ -62,7 +62,7 @@ def download_lindera(lm: str):
         with tarfile.open(fileobj=BytesIO(data)) as tar:
             tar.extractall()
             name = tar.getnames()[0]
-        cmd = ["lindera", "build", "--dictionary-kind=ipadic", os.path.join(src_dirname, name), dirname]
+        cmd = ["lindera", "build", f"--dictionary-kind={lm}", os.path.join(src_dirname, name), dirname]
         print(f"compile language model: {' '.join(cmd)}")
         subprocess.run(cmd)
     finally:
