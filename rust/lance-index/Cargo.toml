@@ -30,6 +30,7 @@ dirs.workspace = true
 futures.workspace = true
 half.workspace = true
 itertools.workspace = true
+jieba-rs = { workspace = true, optional = true }
 lance-arrow.workspace = true
 lance-core.workspace = true
 lance-datafusion.workspace = true
@@ -73,6 +74,7 @@ random_word = { version = "0.4.3", features = ["en"] }
 
 [features]
 tokenizer-lindera = ["lindera", "lindera-tantivy"]
+tokenizer-jieba = ["jieba-rs"]
 
 [build-dependencies]
 prost-build.workspace = true

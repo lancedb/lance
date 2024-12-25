@@ -149,6 +149,10 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
         s if s.starts_with("lindera/") => {
             return build_lindera_tokenizer_builder(s);
         }
+        #[cfg(feature = "tokenizer-jieba")]
+        s if s.starts_with("jieba/") || s == "jieba" => {
+            return build_jieba_tokenizer_builder(s);
+        }
         _ => Err(Error::invalid_input(
             format!("unknown base tokenizer {}", name),
             location!(),
@@ -194,9 +198,18 @@ fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::Text
         Some(p) => {
             let dic_dir = p.join(dic);
             let config_path = dic_dir.join("config.json");
-            let file = File::open(config_path)?;
-            let reader = BufReader::new(file);
-            let config: LinderaConfig = serde_json::from_reader(reader)?;
+            let config: LinderaConfig = if config_path.exists() {
+                let file = File::open(config_path)?;
+                let reader = BufReader::new(file);
+                serde_json::from_reader(reader)?
+            } else {
+                let Some(dic_dir) = dic_dir.to_str() else {
+                    return Err(Error::invalid_input("dic dir is invalid",
+                        location!(),
+                    ))
+                };
+                LinderaConfig{main: String::from(dic_dir), user: None, user_kind: None}
+            };
             let main_path = dic_dir.join(config.main);
             let dictionary = load_dictionary_from_path(main_path.as_path()).map_err(|e| {
                 Error::io(
@@ -248,5 +261,94 @@ fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::Text
             ),
             location!(),
         )),
+    }
+}
+
+
+
+#[cfg(feature = "tokenizer-jieba")]
+fn build_jieba_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
+    match LANCE_LANGUAGE_MODEL_HOME.as_ref() {
+        Some(p) => {
+            let dic = if dic == "jieba" {
+                "jieba/default"
+            } else {
+                dic
+            };
+            let dic_file = p.join(dic).join("dict.txt");
+            let file = std::fs::File::open(dic_file)?;
+            let mut f = std::io::BufReader::new(file);
+            let jieba = jieba_rs::Jieba::with_dict(&mut f).map_err(|e| {
+                Error::io(
+                    format!("load jieba tokenizer dictionary err: {e}"),
+                    location!(),
+                )
+            })?;
+            let tokenizer = JiebaTokenizer{jieba: jieba};
+            Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
+        },
+        None => Err(Error::invalid_input(
+            format!(
+                "{} is undefined",
+                String::from(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY)
+            ),
+            location!(),
+        )),
+    }
+
+}
+
+#[cfg(feature = "tokenizer-jieba")]
+#[derive(Clone)]
+struct JiebaTokenizer{
+    jieba: jieba_rs::Jieba
+}
+
+#[cfg(feature = "tokenizer-jieba")]
+struct JiebaTokenStream {
+    tokens: Vec<tantivy::tokenizer::Token>,
+    index: usize,
+}
+
+#[cfg(feature = "tokenizer-jieba")]
+impl tantivy::tokenizer::TokenStream for JiebaTokenStream {
+    fn advance(&mut self) -> bool {
+        if self.index < self.tokens.len() {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn token(&self) -> &tantivy::tokenizer::Token {
+        &self.tokens[self.index - 1]
+    }
+
+    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
+        &mut self.tokens[self.index - 1]
+    }
+}
+
+
+#[cfg(feature = "tokenizer-jieba")]
+impl tantivy::tokenizer::Tokenizer for JiebaTokenizer {
+    type TokenStream<'a> = JiebaTokenStream;
+
+    fn token_stream(&mut self, text: &str) -> JiebaTokenStream {
+        let mut indices = text.char_indices().collect::<Vec<_>>();
+        indices.push((text.len(), '\0'));
+        let orig_tokens = self.jieba.tokenize(text, jieba_rs::TokenizeMode::Search, true);
+        let mut tokens = Vec::new();
+        for token in orig_tokens {
+            tokens.push(tantivy::tokenizer::Token {
+                offset_from: indices[token.start].0,
+                offset_to: indices[token.end].0,
+                position: token.start,
+                text: String::from(&text[(indices[token.start].0)..(indices[token.end].0)]),
+                position_length: token.end - token.start,
+            });
+        }
+        JiebaTokenStream { tokens, index: 0 }
     }
 }

@@ -117,6 +117,7 @@ futures = "0.3"
 http = "1.1.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
+jieba-rs = { version = "0.7", default-features = false }
 lazy_static = "1"
 log = "0.4"
 mockall = { version = "0.13.1" }
