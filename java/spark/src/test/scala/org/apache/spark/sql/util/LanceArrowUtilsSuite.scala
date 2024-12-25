@@ -10,15 +10,7 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
- * The following code is originally from https://github.com/apache/spark/blob/master/sql/catalyst/src/test/scala/org/apache/spark/sql/util/ArrowUtilsSuite.scala
- * and is licensed under the Apache license:
- *
- * License: Apache License 2.0, Copyright 2014 and onwards The Apache Software Foundation.
- * https://github.com/apache/spark/blob/master/LICENSE
- *
- * It has been modified by the Lance developers to fit the needs of the Lance project.
  */
-
 package org.apache.spark.sql.util
 
 import com.lancedb.lance.spark.LanceConstant
