@@ -54,6 +54,7 @@ tests = [
     "pandas",
     "polars[pyarrow,pandas]",
     "pytest",
+    "pytest-xdist",
     "tensorflow",
     "tqdm",
 ]
