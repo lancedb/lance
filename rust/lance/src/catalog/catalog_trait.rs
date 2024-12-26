@@ -4,9 +4,16 @@
 use crate::catalog::dataset_identifier::DatasetIdentifier;
 use crate::catalog::namespace::Namespace;
 use crate::dataset::Dataset;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub trait Catalog {
+    /// Initialize the catalog.
+    fn initialize(&self, name: &str, properties: &HashMap<&str, &str>) -> Result<(), String>;
+
+    ///
+    /// Dataset traits
+    ///
+
     /// List all datasets under a specified namespace.
     fn list_datasets(&self, namespace: &Namespace) -> Vec<DatasetIdentifier>;
 
@@ -46,6 +53,51 @@ pub trait Catalog {
     /// Register a dataset in the catalog.
     fn register_dataset(&self, identifier: &DatasetIdentifier) -> Result<Dataset, String>;
 
-    /// Initialize the catalog.
-    fn initialize(&self, name: &str, properties: &HashMap<&str, &str>) -> Result<(), String>;
+    ///
+    /// Namespace traits
+    ///
+
+    /// Create a namespace in the catalog.
+    fn create_namespace(
+        &self,
+        namespace: &Namespace,
+        metadata: HashMap<String, String>,
+    ) -> Result<(), String>;
+
+    /// List top-level namespaces from the catalog.
+    fn list_namespaces(&self) -> Vec<Namespace> {
+        self.list_child_namespaces(&Namespace::empty())
+            .unwrap_or_default()
+    }
+
+    /// List child namespaces from the namespace.
+    fn list_child_namespaces(&self, namespace: &Namespace) -> Result<Vec<Namespace>, String>;
+
+    /// Load metadata properties for a namespace.
+    fn load_namespace_metadata(
+        &self,
+        namespace: &Namespace,
+    ) -> Result<HashMap<String, String>, String>;
+
+    /// Drop a namespace.
+    fn drop_namespace(&self, namespace: &Namespace) -> Result<bool, String>;
+
+    /// Set a collection of properties on a namespace in the catalog.
+    fn set_properties(
+        &self,
+        namespace: &Namespace,
+        properties: HashMap<String, String>,
+    ) -> Result<bool, String>;
+
+    /// Remove a set of property keys from a namespace in the catalog.
+    fn remove_properties(
+        &self,
+        namespace: &Namespace,
+        properties: HashSet<String>,
+    ) -> Result<bool, String>;
+
+    /// Checks whether the Namespace exists.
+    fn namespace_exists(&self, namespace: &Namespace) -> bool {
+        self.load_namespace_metadata(namespace).is_ok()
+    }
 }
