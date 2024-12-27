@@ -58,6 +58,32 @@ def balanced_dataset(tmp_path, big_val):
     )
 
 
+def test_write_fragments(balanced_dataset, tmp_path):
+    tbl = balanced_dataset._take_rows(range(10))
+    transaction = lance.fragment.write_fragments(
+        tbl,
+        tmp_path / "ds",
+        enable_move_stable_row_ids=True,
+        return_transaction=True,
+    )
+    operation = lance.LanceOperation.Overwrite(
+        transaction.operation.new_schema, transaction.operation.fragments
+    )
+    blob_operation = lance.LanceOperation.Overwrite(
+        transaction.blobs_op.new_schema, transaction.blobs_op.fragments
+    )
+
+    ds = lance.LanceDataset.commit(
+        tmp_path / "ds",
+        operation,
+        blobs_op=blob_operation,
+        enable_v2_manifest_paths=True,
+    )
+    dataset = lance.LanceDataset(tmp_path / "ds")
+
+    assert dataset._take_rows(range(10)) == balanced_dataset._take_rows(range(10))
+
+
 def test_append_then_take(balanced_dataset, tmp_path, big_val):
     blob_dir = tmp_path / "test_ds" / "_blobs" / "data"
     assert len(list(blob_dir.iterdir())) == 8
