@@ -22,7 +22,7 @@ pub trait FromJObject<T> {
 }
 
 pub trait FromJObjectWithEnv<T> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<T>;
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<T>;
 }
 
 /// Convert a Rust type into a Java Object.
@@ -196,7 +196,7 @@ impl IntoJava for JLance<Option<usize>> {
 }
 
 impl FromJObjectWithEnv<Option<i64>> for JObject<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<Option<i64>> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Option<i64>> {
         let ret = if self.is_null() {
             None
         } else {
@@ -208,7 +208,7 @@ impl FromJObjectWithEnv<Option<i64>> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<Vec<i32>> for JIntArray<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<Vec<i32>> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Vec<i32>> {
         let len = env.get_array_length(self)?;
         let mut ret: Vec<i32> = vec![0; len as usize];
         env.get_int_array_region(self, 0, ret.as_mut_slice())?;

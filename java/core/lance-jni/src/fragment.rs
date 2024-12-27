@@ -329,7 +329,7 @@ impl IntoJava for &Fragment {
 }
 
 impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<RowIdMeta> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<RowIdMeta> {
         let metadata = env
             .call_method(self, "getMetadata", "()Ljava/lang/String;", &[])?
             .l()?;
@@ -340,7 +340,7 @@ impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<Fragment> for JObject<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<Fragment> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<Fragment> {
         let id = env.call_method(self, "getId", "()I", &[])?.i()? as u64;
         let file_objs = env
             .call_method(self, "getFiles", "()Ljava/util/List;", &[])?
@@ -349,7 +349,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         let file_objs = import_vec(env, &file_objs)?;
         let mut files = Vec::with_capacity(file_objs.len());
         for f in file_objs {
-            files.push(f.from_object(env)?);
+            files.push(f.extract_object(env)?);
         }
         let deletion_file = env
             .call_method(
@@ -362,7 +362,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         let deletion_file = if deletion_file.is_null() {
             None
         } else {
-            Some(deletion_file.from_object(env)?)
+            Some(deletion_file.extract_object(env)?)
         };
         Ok(Fragment {
             id,
@@ -375,13 +375,13 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFile> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFile> {
         let id = env.call_method(self, "getId", "()J", &[])?.j()? as u64;
         let read_version = env.call_method(self, "getReadVersion", "()J", &[])?.j()? as u64;
         let num_deleted_rows: Option<i64> = env
             .call_method(self, "getNumDeletedRows", "()Ljava/lang/Long;", &[])?
             .l()?
-            .from_object(env)?;
+            .extract_object(env)?;
         let num_deleted_rows = num_deleted_rows.map(|r| r as usize);
         let file_type: DeletionFileType = env
             .call_method(
@@ -391,7 +391,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
                 &[],
             )?
             .l()?
-            .from_object(env)?;
+            .extract_object(env)?;
         Ok(DeletionFile {
             read_version,
             id,
@@ -402,7 +402,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFileType> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFileType> {
         let s = env
             .call_method(self, "toString", "()Ljava.lang.String;", &[])?
             .l()?;
@@ -417,17 +417,17 @@ impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<DataFile> for JObject<'_> {
-    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<DataFile> {
+    fn extract_object(&self, env: &mut JNIEnv<'_>) -> Result<DataFile> {
         let path = env
             .call_method(self, "getPath", "()Ljava/lang/String;", &[])?
             .l()?;
         let path: String = env.get_string(&JString::from(path))?.into();
         let fields = env.call_method(self, "getFields", "()[I", &[])?.l()?;
-        let fields = JIntArray::from(fields).from_object(env)?;
+        let fields = JIntArray::from(fields).extract_object(env)?;
         let column_indices = env
             .call_method(self, "getColumnIndices", "()[I", &[])?
             .l()?;
-        let column_indices = JIntArray::from(column_indices).from_object(env)?;
+        let column_indices = JIntArray::from(column_indices).extract_object(env)?;
         let file_major_version = env
             .call_method(self, "getFileMajorVersion", "()I", &[])?
             .i()? as u32;

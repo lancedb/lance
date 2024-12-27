@@ -370,7 +370,7 @@ pub fn inner_commit_append<'local>(
     let fragment_objs = import_vec(env, &fragment_objs)?;
     let mut fragments = Vec::with_capacity(fragment_objs.len());
     for f in fragment_objs {
-        fragments.push(f.from_object(env)?);
+        fragments.push(f.extract_object(env)?);
     }
     let op = Operation::Append { fragments };
     let path_str = path.extract(env)?;
