@@ -14,40 +14,66 @@
 
 package com.lancedb.lance;
 
-import org.apache.arrow.util.Preconditions;
 import org.apache.commons.lang3.builder.ToStringBuilder;
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 import java.io.Serializable;
-import java.util.ArrayList;
 import java.util.List;
 
 /** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
 public class FragmentMetadata implements Serializable {
   private static final long serialVersionUID = -5886811251944130460L;
-  private static final String ID_KEY = "id";
-  private static final String PHYSICAL_ROWS_KEY = "physical_rows";
-  private final String jsonMetadata;
-  private final int id;
-  private final long physicalRows;
+  private int id;
+  private List<DataFile> files;
+  private long physicalRows;
+  private DeletionFile deletionFile;
+  private RowIdMeta rowIdMeta;
 
-  private FragmentMetadata(String jsonMetadata, int id, long physicalRows) {
-    this.jsonMetadata = jsonMetadata;
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta) {
     this.id = id;
+    this.files = files;
     this.physicalRows = physicalRows;
+    this.deletionFile = deletionFile;
+    this.rowIdMeta = rowIdMeta;
   }
 
   public int getId() {
     return id;
   }
 
+  public List<DataFile> getFiles() {
+    return files;
+  }
+
   public long getPhysicalRows() {
     return physicalRows;
   }
 
-  public String getJsonMetadata() {
-    return jsonMetadata;
+  public DeletionFile getDeletionFile() {
+    return deletionFile;
+  }
+
+  public long getNumDeletions() {
+    if (deletionFile == null) {
+      return 0;
+    }
+    Long deleted = deletionFile.getNumDeletedRows();
+    if (deleted == null) {
+      return 0;
+    }
+    return deleted;
+  }
+
+  public long getNumRows() {
+    return getPhysicalRows() - getNumDeletions();
+  }
+
+  public RowIdMeta getRowIdMeta() {
+    return rowIdMeta;
   }
 
   @Override
@@ -55,55 +81,9 @@ public class FragmentMetadata implements Serializable {
     return new ToStringBuilder(this)
         .append("id", id)
         .append("physicalRows", physicalRows)
-        .append("jsonMetadata", jsonMetadata)
+        .append("files", files)
+        .append("deletionFile", deletionFile)
+        .append("rowIdMeta", rowIdMeta)
         .toString();
-  }
-
-  /**
-   * Creates the fragment metadata from json serialized string.
-   *
-   * @param jsonMetadata json metadata
-   * @return created fragment metadata
-   */
-  public static FragmentMetadata fromJson(String jsonMetadata) {
-    Preconditions.checkNotNull(jsonMetadata);
-    JSONObject metadata = new JSONObject(jsonMetadata);
-    if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
-      throw new IllegalArgumentException(
-          String.format(
-              "Fragment metadata must have {} and {} but is {}",
-              ID_KEY,
-              PHYSICAL_ROWS_KEY,
-              jsonMetadata));
-    }
-    return new FragmentMetadata(
-        jsonMetadata, metadata.getInt(ID_KEY), metadata.getLong(PHYSICAL_ROWS_KEY));
-  }
-
-  /**
-   * Converts a JSON array string into a list of FragmentMetadata objects.
-   *
-   * @param jsonMetadata A JSON array string containing fragment metadata.
-   * @return A list of FragmentMetadata objects.
-   */
-  public static List<FragmentMetadata> fromJsonArray(String jsonMetadata) {
-    Preconditions.checkNotNull(jsonMetadata);
-    JSONArray metadatas = new JSONArray(jsonMetadata);
-    List<FragmentMetadata> fragmentMetadataList = new ArrayList<>();
-    for (Object object : metadatas) {
-      JSONObject metadata = (JSONObject) object;
-      if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
-        throw new IllegalArgumentException(
-            String.format(
-                "Fragment metadata must have {} and {} but is {}",
-                ID_KEY,
-                PHYSICAL_ROWS_KEY,
-                jsonMetadata));
-      }
-      fragmentMetadataList.add(
-          new FragmentMetadata(
-              metadata.toString(), metadata.getInt(ID_KEY), metadata.getLong(PHYSICAL_ROWS_KEY)));
-    }
-    return fragmentMetadataList;
   }
 }

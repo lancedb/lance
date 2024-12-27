@@ -20,7 +20,6 @@ import org.apache.arrow.util.Preconditions;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 /** Fragment related operations. */
 public abstract class FragmentOperation {
@@ -54,11 +53,7 @@ public abstract class FragmentOperation {
       Preconditions.checkNotNull(allocator);
       Preconditions.checkNotNull(path);
       Preconditions.checkNotNull(readVersion);
-      return Dataset.commitAppend(
-          path,
-          readVersion,
-          fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()),
-          storageOptions);
+      return Dataset.commitAppend(path, readVersion, fragments, storageOptions);
     }
   }
 }
