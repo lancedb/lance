@@ -129,7 +129,6 @@ impl JMapExt for JMap<'_, '_, '_> {
     }
 }
 
-
 // pub fn export_vec<'a, T>(env: &mut JNIEnv<'a>, vec: &'a [T], class: JClass) -> Result<JObject<'a>>
 // where
 //     &'a T: IntoJava,
@@ -143,7 +142,8 @@ impl JMapExt for JMap<'_, '_, '_> {
 // }
 
 pub fn export_vec<'a, 'b, T>(env: &mut JNIEnv<'a>, vec: &'b [T]) -> Result<JObject<'a>>
-where &'b T: IntoJava
+where
+    &'b T: IntoJava,
 {
     let array_list_class = env.find_class("java/util/ArrayList")?;
     let array_list = env.new_object(array_list_class, "()V", &[])?;
@@ -189,7 +189,7 @@ impl IntoJava for JLance<Option<usize>> {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
         let obj = match self.0 {
             Some(v) => env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(v as i64)])?,
-            None => JObject::null()
+            None => JObject::null(),
         };
         Ok(obj)
     }
@@ -207,11 +207,10 @@ impl FromJObjectWithEnv<Option<i64>> for JObject<'_> {
     }
 }
 
-
 impl FromJObjectWithEnv<Vec<i32>> for JIntArray<'_> {
     fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<Vec<i32>> {
         let len = env.get_array_length(self)?;
-        let mut ret: Vec<i32> = vec![0;len as usize];
+        let mut ret: Vec<i32> = vec![0; len as usize];
         env.get_int_array_region(self, 0, ret.as_mut_slice())?;
         Ok(ret)
     }

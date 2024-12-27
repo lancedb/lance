@@ -230,8 +230,7 @@ const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFile$FileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/DeletionFile;Lcom/lancedb/lance/RowIdMeta;)V";
 const ROW_ID_META_CLASS: &str = "com/lancedb/lance/RowIdMeta";
-const ROW_ID_META_CONSTRUCTOR_SIG: &str ="(Ljava/lang/String;)V";
-
+const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 
 impl IntoJava for &DataFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -246,8 +245,9 @@ impl IntoJava for &DataFile {
                 JValueGen::Object(&fields),
                 JValueGen::Object(&column_indices),
                 JValueGen::Int(self.file_major_version as i32),
-                JValueGen::Int(self.file_minor_version as i32)
-            ])?)
+                JValueGen::Int(self.file_minor_version as i32),
+            ],
+        )?)
     }
 }
 
@@ -257,20 +257,22 @@ impl IntoJava for &DeletionFileType {
             lance::table::format::DeletionFileType::Array => "ARRAY",
             lance::table::format::DeletionFileType::Bitmap => "BITMAP",
         };
-        env.get_static_field(
-            DELETE_FILE_TYPE_CLASS,
-            name,
-            DELETE_FILE_TYPE_CLASS)?.l().map_err(
-            |e| Error::runtime_error(String::from(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e)))
-        )
+        env.get_static_field(DELETE_FILE_TYPE_CLASS, name, DELETE_FILE_TYPE_CLASS)?
+            .l()
+            .map_err(|e| {
+                Error::runtime_error(String::from(format!(
+                    "failed to get {}: {}",
+                    DELETE_FILE_TYPE_CLASS, e
+                )))
+            })
     }
 }
 
 impl IntoJava for &DeletionFile {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
-        let num_deleted_rows = match self.num_deleted_rows  {
+        let num_deleted_rows = match self.num_deleted_rows {
             Some(f) => JLance(f).into_java(env)?,
-            None => JObject::null()
+            None => JObject::null(),
         };
         let file_type = self.file_type.into_java(env)?;
         Ok(env.new_object(
@@ -281,7 +283,8 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Long(self.read_version as i64),
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
-            ])?)
+            ],
+        )?)
     }
 }
 
@@ -292,9 +295,8 @@ impl IntoJava for &RowIdMeta {
         Ok(env.new_object(
             ROW_ID_META_CLASS,
             ROW_ID_META_CONSTRUCTOR_SIG,
-            &[
-                JValueGen::Object(&json),
-            ])?)
+            &[JValueGen::Object(&json)],
+        )?)
     }
 }
 
@@ -302,14 +304,14 @@ impl IntoJava for &Fragment {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let files = self.files.clone();
         let files = export_vec::<DataFile>(env, &files)?;
-        let deletion_file = match &self.deletion_file  {
+        let deletion_file = match &self.deletion_file {
             Some(f) => f.into_java(env)?,
-            None => JObject::null()
+            None => JObject::null(),
         };
         let physical_rows = &JLance(self.physical_rows).into_java(env)?;
         let row_id_meta = match &self.row_id_meta {
             Some(m) => m.into_java(env)?,
-            None => JObject::null()
+            None => JObject::null(),
         };
 
         env.new_object(
@@ -321,15 +323,22 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(physical_rows),
                 JValueGen::Object(&deletion_file),
                 JValueGen::Object(&row_id_meta),
-            ]).map_err(
-                |e| Error::runtime_error(String::from(format!("failed to get {}: {}", FRAGMENT_METADATA_CLASS, e)))
-            )
+            ],
+        )
+        .map_err(|e| {
+            Error::runtime_error(String::from(format!(
+                "failed to get {}: {}",
+                FRAGMENT_METADATA_CLASS, e
+            )))
+        })
     }
 }
 
 impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
     fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<RowIdMeta> {
-        let metadata = env.call_method(self, "getMetadata", "()Ljava/lang/String;", &[])?.l()?;
+        let metadata = env
+            .call_method(self, "getMetadata", "()Ljava/lang/String;", &[])?
+            .l()?;
         let s: String = env.get_string(&JString::from(metadata))?.into();
         let meta: RowIdMeta = serde_json::from_str(&s)?;
         Ok(meta)
@@ -339,14 +348,23 @@ impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
 impl FromJObjectWithEnv<Fragment> for JObject<'_> {
     fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<Fragment> {
         let id = env.call_method(self, "getId", "()I", &[])?.i()? as u64;
-        let file_objs = env.call_method(self, "getFiles", "()Ljava/util/List;", &[])?.l()?;
+        let file_objs = env
+            .call_method(self, "getFiles", "()Ljava/util/List;", &[])?
+            .l()?;
         let physical_rows = env.call_method(self, "getPhysicalRows", "()J", &[])?.j()? as usize;
         let file_objs = import_vec(env, &file_objs)?;
         let mut files = Vec::with_capacity(file_objs.len());
         for f in file_objs {
             files.push(f.from_object(env)?);
         }
-        let deletion_file = env.call_method(self, "getDeletionFile", format!("()L{};", DELETE_FILE_CLASS), &[])?.l()?;
+        let deletion_file = env
+            .call_method(
+                self,
+                "getDeletionFile",
+                format!("()L{};", DELETE_FILE_CLASS),
+                &[],
+            )?
+            .l()?;
         let deletion_file = if deletion_file.is_null() {
             None
         } else {
@@ -366,18 +384,34 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
     fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<DeletionFile> {
         let id = env.call_method(self, "getId", "()J", &[])?.j()? as u64;
         let read_version = env.call_method(self, "getReadVersion", "()J", &[])?.j()? as u64;
-        let num_deleted_rows: Option<i64> = env.call_method(self, "getNumDeletedRows", "()Ljava/lang/Long;", &[])?.l()?.from_object(env)?;
+        let num_deleted_rows: Option<i64> = env
+            .call_method(self, "getNumDeletedRows", "()Ljava/lang/Long;", &[])?
+            .l()?
+            .from_object(env)?;
         let num_deleted_rows = num_deleted_rows.map(|r| r as usize);
-        let file_type: DeletionFileType  = env.call_method(self, "getFileType", format!("()L{};", DELETE_FILE_TYPE_CLASS), &[])?.l()?.from_object(env)?;
-        Ok(DeletionFile{
-            read_version, id, num_deleted_rows, file_type
+        let file_type: DeletionFileType = env
+            .call_method(
+                self,
+                "getFileType",
+                format!("()L{};", DELETE_FILE_TYPE_CLASS),
+                &[],
+            )?
+            .l()?
+            .from_object(env)?;
+        Ok(DeletionFile {
+            read_version,
+            id,
+            num_deleted_rows,
+            file_type,
         })
     }
 }
 
 impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
     fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<DeletionFileType> {
-        let s = env.call_method(self, "toString", "()Ljava.lang.String;", &[])?.l()?;
+        let s = env
+            .call_method(self, "toString", "()Ljava.lang.String;", &[])?
+            .l()?;
         let s: String = env.get_string(&JString::from(s))?.into();
         let t = if s == "ARRAY" {
             DeletionFileType::Array
@@ -390,18 +424,28 @@ impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
 
 impl FromJObjectWithEnv<DataFile> for JObject<'_> {
     fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<DataFile> {
-        let path = env.call_method(self, "getPath", "()Ljava/lang/String;", &[])?.l()?;
-        let path: String = env.get_string(
-            &JString::from(path)
-        )?.into();
+        let path = env
+            .call_method(self, "getPath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let path: String = env.get_string(&JString::from(path))?.into();
         let fields = env.call_method(self, "getFields", "()[I", &[])?.l()?;
         let fields = JIntArray::from(fields).from_object(env)?;
-        let column_indices = env.call_method(self, "getColumnIndices", "()[I", &[])?.l()?;
+        let column_indices = env
+            .call_method(self, "getColumnIndices", "()[I", &[])?
+            .l()?;
         let column_indices = JIntArray::from(column_indices).from_object(env)?;
-        let file_major_version = env.call_method(self, "getFileMajorVersion", "()I", &[])?.i()? as u32;
-        let file_minor_version = env.call_method(self, "getFileMinorVersion", "()I", &[])?.i()? as u32;
-        Ok(DataFile{
-            path, fields, column_indices, file_major_version, file_minor_version
+        let file_major_version = env
+            .call_method(self, "getFileMajorVersion", "()I", &[])?
+            .i()? as u32;
+        let file_minor_version = env
+            .call_method(self, "getFileMinorVersion", "()I", &[])?
+            .i()? as u32;
+        Ok(DataFile {
+            path,
+            fields,
+            column_indices,
+            file_major_version,
+            file_minor_version,
         })
     }
 }

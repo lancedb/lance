@@ -522,7 +522,10 @@ fn inner_get_fragments<'local>(
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
         dataset.inner.get_fragments()
     };
-    let fragments = fragments.iter().map(|f| f.metadata().clone()).collect::<Vec<Fragment>>();
+    let fragments = fragments
+        .iter()
+        .map(|f| f.metadata().clone())
+        .collect::<Vec<Fragment>>();
     export_vec(env, &fragments)
 }
 
@@ -530,7 +533,7 @@ fn inner_get_fragments<'local>(
 pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentNative<'a>(
     mut env: JNIEnv<'a>,
     jdataset: JObject,
-    fragment_id: jint
+    fragment_id: jint,
 ) -> JObject<'a> {
     ok_or_throw!(env, inner_get_fragment(&mut env, jdataset, fragment_id))
 }
@@ -538,7 +541,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_getFragmentNative<'a>(
 fn inner_get_fragment<'local>(
     env: &mut JNIEnv<'local>,
     jdataset: JObject,
-    fragment_id: jint
+    fragment_id: jint,
 ) -> Result<JObject<'local>> {
     let fragment = {
         let dataset =
@@ -547,7 +550,7 @@ fn inner_get_fragment<'local>(
     };
     let obj = match fragment {
         Some(f) => f.metadata().into_java(env)?,
-        None => JObject::default()
+        None => JObject::default(),
     };
     Ok(obj)
 }
