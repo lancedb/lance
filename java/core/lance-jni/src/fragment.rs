@@ -224,9 +224,9 @@ fn create_fragment<'a>(
 
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[III)V";
-const DELTE_FILE_CLASS: &str = "com/lancedb/lance/DeletionFile";
-const DELTE_FILE_CONSTRUCTOR_SIG: &str = "(JIILcom/lancedb/lance/DataFile;)V";
-const DELTE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFile$FileType";
+const DELETE_FILE_CLASS: &str = "com/lancedb/lance/DeletionFile";
+const DELETE_FILE_CONSTRUCTOR_SIG: &str = "(JIILcom/lancedb/lance/DataFile;)V";
+const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFile$FileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/DeletionFile;Lcom/lancedb/lance/RowIdMeta;)V";
 const ROW_ID_META_CLASS: &str = "com/lancedb/lance/RowIdMeta";
@@ -258,10 +258,10 @@ impl IntoJava for &DeletionFileType {
             lance::table::format::DeletionFileType::Bitmap => "BITMAP",
         };
         env.get_static_field(
-            DELTE_FILE_TYPE_CLASS,
+            DELETE_FILE_TYPE_CLASS,
             name,
-            DELTE_FILE_TYPE_CLASS)?.l().map_err(
-            |e| Error::runtime_error(String::from(format!("failed to get {}: {}", DELTE_FILE_TYPE_CLASS, e)))
+            DELETE_FILE_TYPE_CLASS)?.l().map_err(
+            |e| Error::runtime_error(String::from(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e)))
         )
     }
 }
@@ -274,8 +274,8 @@ impl IntoJava for &DeletionFile {
         };
         let file_type = self.file_type.into_java(env)?;
         Ok(env.new_object(
-            DELTE_FILE_CLASS,
-            DELTE_FILE_CONSTRUCTOR_SIG,
+            DELETE_FILE_CLASS,
+            DELETE_FILE_CONSTRUCTOR_SIG,
             &[
                 JValueGen::Long(self.id as i64),
                 JValueGen::Long(self.read_version as i64),
@@ -346,7 +346,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         for f in file_objs {
             files.push(f.from_object(env)?);
         }
-        let deletion_file = env.call_method(self, "getDeletionFile", format!("()L{};", DELTE_FILE_CLASS), &[])?.l()?;
+        let deletion_file = env.call_method(self, "getDeletionFile", format!("()L{};", DELETE_FILE_CLASS), &[])?.l()?;
         let deletion_file = if deletion_file.is_null() {
             None
         } else {
@@ -368,7 +368,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
         let read_version = env.call_method(self, "getReadVersion", "()J", &[])?.j()? as u64;
         let num_deleted_rows: Option<i64> = env.call_method(self, "getNumDeletedRows", "()Ljava/lang/Long;", &[])?.l()?.from_object(env)?;
         let num_deleted_rows = num_deleted_rows.map(|r| r as usize);
-        let file_type: DeletionFileType  = env.call_method(self, "getFileType", format!("()L{};", DELTE_FILE_TYPE_CLASS), &[])?.l()?.from_object(env)?;
+        let file_type: DeletionFileType  = env.call_method(self, "getFileType", format!("()L{};", DELETE_FILE_TYPE_CLASS), &[])?.l()?.from_object(env)?;
         Ok(DeletionFile{
             read_version, id, num_deleted_rows, file_type
         })
