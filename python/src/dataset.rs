@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 
+use arrow::array::AsArray;
+use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
 use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
@@ -43,6 +45,7 @@ use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::index::vector::utils::get_vector_element_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::InvertedIndexParams;
@@ -685,8 +688,19 @@ impl Dataset {
                 None
             };
 
+            let element_type = get_vector_element_type(&self_.ds, &column)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let scanner = match element_type {
+                DataType::UInt8 => {
+                    let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
+                        PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
+                    })?;
+                    let q = q.as_primitive::<UInt8Type>();
+                    scanner.nearest(&column, q, k)
+                }
+                _ => scanner.nearest(&column, &q, k),
+            };
             scanner
-                .nearest(column.as_str(), &q, k)
                 .map(|s| {
                     let mut s = s.nprobs(nprobes);
                     if let Some(factor) = refine_factor {
