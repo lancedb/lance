@@ -129,18 +129,6 @@ impl JMapExt for JMap<'_, '_, '_> {
     }
 }
 
-// pub fn export_vec<'a, T>(env: &mut JNIEnv<'a>, vec: &'a [T], class: JClass) -> Result<JObject<'a>>
-// where
-//     &'a T: IntoJava,
-// {
-//     let arr = env.new_object_array(vec.len() as i32, class, JObject::null())?;
-//     for (idx, e) in vec.iter().enumerate() {
-//         let obj = e.into_java(env)?;
-//         env.set_object_array_element(&arr, idx as i32, obj);
-//     }
-//     Ok(arr.into())
-// }
-
 pub fn export_vec<'a, 'b, T>(env: &mut JNIEnv<'a>, vec: &'b [T]) -> Result<JObject<'a>>
 where
     &'b T: IntoJava,
