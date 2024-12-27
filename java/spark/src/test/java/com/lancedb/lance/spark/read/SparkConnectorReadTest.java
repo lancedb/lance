@@ -177,12 +177,12 @@ public class SparkConnectorReadTest {
   @Test
   public void supportBroadcastJoin() {
     Dataset<Row> df =
-        spark
-            .read()
-            .format("lance")
-            .load(LanceConfig.getDatasetUri(dbPath, "test_dataset3"));
+        spark.read().format("lance").load(LanceConfig.getDatasetUri(dbPath, "test_dataset3"));
     df.createOrReplaceTempView("test_dataset3");
-    List<Row> desc =  spark.sql("explain select t1.* from test_dataset1 t1 join test_dataset3 t3 on t1.x = t3.x").collectAsList();
+    List<Row> desc =
+        spark
+            .sql("explain select t1.* from test_dataset1 t1 join test_dataset3 t3 on t1.x = t3.x")
+            .collectAsList();
     assertEquals(1, desc.size());
     assertTrue(desc.get(0).getString(0).contains("BroadcastHashJoin"));
   }
