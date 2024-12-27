@@ -1,6 +1,7 @@
 name: Run Regression Benchmarks
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
