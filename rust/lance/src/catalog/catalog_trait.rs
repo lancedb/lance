@@ -10,10 +10,6 @@ pub trait Catalog {
     /// Initialize the catalog.
     fn initialize(&self, name: &str, properties: &HashMap<&str, &str>) -> Result<(), String>;
 
-    ///
-    /// Dataset traits
-    ///
-
     /// List all datasets under a specified namespace.
     fn list_datasets(&self, namespace: &Namespace) -> Vec<DatasetIdentifier>;
 
@@ -52,10 +48,6 @@ pub trait Catalog {
 
     /// Register a dataset in the catalog.
     fn register_dataset(&self, identifier: &DatasetIdentifier) -> Result<Dataset, String>;
-
-    ///
-    /// Namespace traits
-    ///
 
     /// Create a namespace in the catalog.
     fn create_namespace(
