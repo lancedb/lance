@@ -260,10 +260,7 @@ impl IntoJava for &DeletionFileType {
         env.get_static_field(DELETE_FILE_TYPE_CLASS, name, DELETE_FILE_TYPE_CLASS)?
             .l()
             .map_err(|e| {
-                Error::runtime_error(String::from(format!(
-                    "failed to get {}: {}",
-                    DELETE_FILE_TYPE_CLASS, e
-                )))
+                Error::runtime_error(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e))
             })
     }
 }
@@ -326,16 +323,13 @@ impl IntoJava for &Fragment {
             ],
         )
         .map_err(|e| {
-            Error::runtime_error(String::from(format!(
-                "failed to get {}: {}",
-                FRAGMENT_METADATA_CLASS, e
-            )))
+            Error::runtime_error(format!("failed to get {}: {}", FRAGMENT_METADATA_CLASS, e))
         })
     }
 }
 
 impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
-    fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<RowIdMeta> {
+    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<RowIdMeta> {
         let metadata = env
             .call_method(self, "getMetadata", "()Ljava/lang/String;", &[])?
             .l()?;
@@ -346,7 +340,7 @@ impl FromJObjectWithEnv<RowIdMeta> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<Fragment> for JObject<'_> {
-    fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<Fragment> {
+    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<Fragment> {
         let id = env.call_method(self, "getId", "()I", &[])?.i()? as u64;
         let file_objs = env
             .call_method(self, "getFiles", "()Ljava/util/List;", &[])?
@@ -381,7 +375,7 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
-    fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<DeletionFile> {
+    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFile> {
         let id = env.call_method(self, "getId", "()J", &[])?.j()? as u64;
         let read_version = env.call_method(self, "getReadVersion", "()J", &[])?.j()? as u64;
         let num_deleted_rows: Option<i64> = env
@@ -408,7 +402,7 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
-    fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<DeletionFileType> {
+    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<DeletionFileType> {
         let s = env
             .call_method(self, "toString", "()Ljava.lang.String;", &[])?
             .l()?;
@@ -423,7 +417,7 @@ impl FromJObjectWithEnv<DeletionFileType> for JObject<'_> {
 }
 
 impl FromJObjectWithEnv<DataFile> for JObject<'_> {
-    fn from_object<'a>(&self, env: &mut JNIEnv<'a>) -> Result<DataFile> {
+    fn from_object(&self, env: &mut JNIEnv<'_>) -> Result<DataFile> {
         let path = env
             .call_method(self, "getPath", "()Ljava/lang/String;", &[])?
             .l()?;
