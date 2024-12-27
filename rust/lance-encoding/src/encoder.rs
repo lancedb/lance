@@ -20,6 +20,7 @@ use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::BlobFieldEncoder;
+use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
@@ -33,6 +34,7 @@ use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
 use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
 use crate::statistics::{GetStat, Stat};
@@ -370,12 +372,21 @@ pub trait FieldEncoder: Send {
     /// than a single disk page.
     ///
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
+    ///
+    /// The `row_number` must be passed which is the top-level row number currently being encoded
+    /// This is stored in any pages produced by this call so that we can know the priority of the
+    /// page.
+    ///
+    /// The `num_rows` is the number of top level rows.  It is initially the same as `array.len()`
+    /// however it is passed seprately because array will become flattened over time (if there is
+    /// repetition) and we need to know the original number of rows for various purposes.
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
     ///
@@ -822,6 +833,18 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 return Ok(Box::new(BinaryMiniBlockEncoder::default()));
             }
         }
+        if let DataBlock::Struct(ref struct_data_block) = data {
+            // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
+            // just being cautious here.
+            if struct_data_block
+                .children
+                .iter()
+                .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+            {
+                panic!("packed struct encoding currently only supports fixed-width fields.")
+            }
+            return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
+        }
         Ok(Box::new(ValueEncoder::default()))
     }
 
@@ -1204,16 +1227,18 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
             )?))
         } else {
             match data_type {
-                DataType::List(_child) | DataType::LargeList(_child) => {
-                    todo!()
+                DataType::List(_) | DataType::LargeList(_) => {
+                    let child = field.children.first().expect("List should have a child");
+                    let child_encoder = self.create_field_encoder(
+                        _encoding_strategy_root,
+                        child,
+                        column_index,
+                        options,
+                    )?;
+                    Ok(Box::new(ListStructuralEncoder::new(child_encoder)))
                 }
                 DataType::Struct(_) => {
-                    let field_metadata = &field.metadata;
-                    if field_metadata
-                        .get("packed")
-                        .map(|v| v == "true")
-                        .unwrap_or(false)
-                    {
+                    if field.is_packed_struct() {
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),
@@ -1369,7 +1394,9 @@ pub async fn encode_batch(
             OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let repdef = RepDefBuilder::default();
         let encoder = encoder.as_mut();
-        let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0)?;
+        let num_rows = arr.len() as u64;
+        let mut tasks =
+            encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0, num_rows)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);

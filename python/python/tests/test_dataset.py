@@ -160,6 +160,39 @@ def test_dataset_from_record_batch_iterable(tmp_path: Path):
     assert list(dataset.to_batches())[0].to_pylist() == test_pylist
 
 
+def test_schema_metadata(tmp_path: Path):
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64(), metadata={b"thisis": "a"}),
+            pa.field("b", pa.int64(), metadata={b"thisis": "b"}),
+        ],
+        metadata={b"foo": b"bar", b"baz": b"qux"},
+    )
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    # Original schema
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace schema metadata
+    ds.replace_schema_metadata({"foo": "baz"})
+    assert ds.schema.metadata == {b"foo": b"baz"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Replace field metadata
+    ds.replace_field_metadata("a", {"thisis": "c"})
+    assert ds.schema.field("a").metadata == {b"thisis": b"c"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+    # Overwrite overwrites metadata
+    ds = lance.write_dataset(table, tmp_path, mode="overwrite")
+    assert ds.schema.metadata == {b"foo": b"bar", b"baz": b"qux"}
+    assert ds.schema.field("a").metadata == {b"thisis": b"a"}
+    assert ds.schema.field("b").metadata == {b"thisis": b"b"}
+
+
 def test_versions(tmp_path: Path):
     table1 = pa.Table.from_pylist([{"a": 1, "b": 2}, {"a": 10, "b": 20}])
     base_dir = tmp_path / "test"
@@ -259,6 +292,41 @@ def test_asof_checkout(tmp_path: Path):
     ds = lance.dataset(base_dir, asof=ts_3)
     assert ds.version == 3
     assert len(ds.to_table()) == 9
+
+
+def test_enable_move_stable_row_ids(tmp_path: Path):
+    table = pa.Table.from_pylist(
+        [{"name": "Alice", "age": 20}, {"name": "Bob", "age": 30}]
+    )
+    lance.write_dataset(table, tmp_path, enable_move_stable_row_ids=True)
+    ds = lance.write_dataset(
+        table, tmp_path, enable_move_stable_row_ids=True, mode="append"
+    )
+    table_before = ds.scanner(with_row_id=True, with_row_address=True).to_table()
+    assert len(table_before) == 4
+    assert table_before["_rowid"][0].as_py() == 0
+    assert table_before["_rowid"][1].as_py() == 1
+    assert table_before["_rowid"][2].as_py() == 2
+    assert table_before["_rowid"][3].as_py() == 3
+
+    assert table_before["_rowaddr"][0].as_py() == 0
+    assert table_before["_rowaddr"][1].as_py() == 1
+    assert table_before["_rowaddr"][2].as_py() == (1 << 32) + 0
+    assert table_before["_rowaddr"][3].as_py() == (1 << 32) + 1
+
+    ds.optimize.compact_files()
+
+    table_after = ds.scanner(with_row_id=True, with_row_address=True).to_table()
+    assert len(table_after) == 4
+    assert table_after["_rowid"][0].as_py() == 0
+    assert table_after["_rowid"][1].as_py() == 1
+    assert table_after["_rowid"][2].as_py() == 2
+    assert table_after["_rowid"][3].as_py() == 3
+
+    assert table_after["_rowaddr"][0].as_py() == (2 << 32) + 0
+    assert table_after["_rowaddr"][1].as_py() == (2 << 32) + 1
+    assert table_after["_rowaddr"][2].as_py() == (2 << 32) + 2
+    assert table_after["_rowaddr"][3].as_py() == (2 << 32) + 3
 
 
 def test_v2_manifest_paths(tmp_path: Path):
@@ -451,9 +519,11 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
 
     # test just limit
     assert dataset.to_table(limit=10) == table.slice(0, 10)
+    assert dataset.to_table(limit=100) == table.slice(0, 100)
 
     # test just offset
-    assert dataset.to_table(offset=10) == table.slice(10, 100)
+    assert dataset.to_table(offset=0) == table.slice(0, 100)
+    assert dataset.to_table(offset=10) == table.slice(10, 90)
 
     # test both
     assert dataset.to_table(offset=10, limit=10) == table.slice(10, 10)
@@ -468,7 +538,18 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     assert dataset.to_table(offset=50, limit=25) == table.slice(50, 25)
 
     # Limit past the end
-    assert dataset.to_table(offset=50, limit=100) == table.slice(50, 50)
+    assert dataset.to_table(limit=101) == table.slice(0, 100)
+
+    # Limit with offset past the end
+    assert dataset.to_table(offset=50, limit=51) == table.slice(50, 50)
+
+    # Offset past the end
+    assert dataset.to_table(offset=100) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101) == table.slice(100, 0)  # Empty table
+
+    # Offset with limit past the end
+    assert dataset.to_table(offset=100, limit=1) == table.slice(100, 0)  # Empty table
+    assert dataset.to_table(offset=101, limit=1) == table.slice(100, 0)  # Empty table
 
     # Invalid limit / offset
     with pytest.raises(ValueError, match="Offset must be non-negative"):
@@ -1013,12 +1094,14 @@ def test_data_files(tmp_path: Path):
     base_dir = tmp_path / "test"
     fragment = lance.fragment.LanceFragment.create(base_dir, table)
 
-    data_files = fragment.data_files()
+    data_files = fragment.files
     assert len(data_files) == 1
     # it is a valid uuid
-    uuid.UUID(os.path.splitext(data_files[0].path())[0])
+    with pytest.warns(DeprecationWarning):
+        path = data_files[0].path()
+    uuid.UUID(os.path.splitext(path)[0])
 
-    assert fragment.deletion_file() is None
+    assert fragment.deletion_file is None
 
 
 def test_deletion_file(tmp_path: Path):
@@ -1035,8 +1118,10 @@ def test_deletion_file(tmp_path: Path):
     assert fragment.deletion_file() is None
 
     # New fragment has deletion file
-    assert new_fragment.deletion_file() is not None
-    assert re.match("_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file())
+    assert new_fragment.deletion_file is not None
+    assert re.match(
+        "_deletions/0-1-[0-9]{1,32}.arrow", new_fragment.deletion_file.path(0)
+    )
     operation = lance.LanceOperation.Overwrite(table.schema, [new_fragment])
     dataset = lance.LanceDataset.commit(base_dir, operation)
     assert dataset.count_rows() == 90
@@ -1055,6 +1140,9 @@ def test_commit_fragments_via_scanner(tmp_path: Path):
     pickled = pickle.dumps(fragment_metadata)
     unpickled = pickle.loads(pickled)
     assert fragment_metadata == unpickled
+    with pytest.warns(DeprecationWarning):
+        path = fragment_metadata.files[0].path()
+        assert path == unpickled.files[0].path()
 
     operation = lance.LanceOperation.Overwrite(table.schema, [fragment_metadata])
     dataset = lance.LanceDataset.commit(base_dir, operation)
@@ -1327,13 +1415,36 @@ def test_merge_insert_subcols(tmp_path: Path):
     assert fragments[1].fragment_id == original_fragments[1].fragment_id
 
     assert len(fragments[0].data_files()) == 2
-    assert str(fragments[0].data_files()[0]) == str(
-        original_fragments[0].data_files()[0]
+    assert (
+        fragments[0].data_files()[0].path == original_fragments[0].data_files()[0].path
     )
     assert len(fragments[1].data_files()) == 1
     assert str(fragments[1].data_files()[0]) == str(
         original_fragments[1].data_files()[0]
     )
+
+    new_values = pa.table(
+        {
+            "a": range(9, 12),
+            "b": range(30, 33),
+        }
+    )
+    (
+        dataset.merge_insert("a")
+        .when_not_matched_insert_all()
+        .when_matched_update_all()
+        .execute(new_values)
+    )
+
+    assert dataset.count_rows() == 12
+    expected = pa.table(
+        {
+            "a": range(0, 12),
+            "b": [0, 1, 2, 20, 21, 5, 6, 7, 8, 30, 31, 32],
+            "c": list(range(10, 20)) + [None] * 2,
+        }
+    )
+    assert dataset.to_table().sort_by("a") == expected
 
 
 def test_flat_vector_search_with_delete(tmp_path: Path):
@@ -1494,34 +1605,6 @@ def test_merge_insert_multiple_keys(tmp_path: Path):
     assert table.num_rows == 1000
     assert table.filter(is_new).num_rows == 350
     check_merge_stats(merge_dict, (0, 350, 0))
-
-
-def test_merge_insert_incompatible_schema(tmp_path: Path):
-    nrows = 1000
-    table = pa.Table.from_pydict(
-        {
-            "a": range(nrows),
-            "b": [1 for _ in range(nrows)],
-        }
-    )
-    dataset = lance.write_dataset(
-        table, tmp_path / "dataset", mode="create", max_rows_per_file=100
-    )
-
-    new_table = pa.Table.from_pydict(
-        {
-            "a": range(300, 300 + nrows),
-        }
-    )
-
-    with pytest.raises(OSError):
-        merge_dict = (
-            dataset.merge_insert("a")
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute(new_table)
-        )
-        check_merge_stats(merge_dict, (None, None, None))
 
 
 def test_merge_insert_vector_column(tmp_path: Path):
@@ -2653,17 +2736,17 @@ def test_default_storage_version(tmp_path: Path):
     assert dataset.data_storage_version == EXPECTED_DEFAULT_STORAGE_VERSION
 
     frag = lance.LanceFragment.create(dataset.uri, table)
-    sample_file = frag.to_json()["files"][0]
-    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
-    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+    sample_file = frag.files[0]
+    assert sample_file.file_major_version == EXPECTED_MAJOR_VERSION
+    assert sample_file.file_minor_version == EXPECTED_MINOR_VERSION
 
     from lance.fragment import write_fragments
 
     frags = write_fragments(table, dataset.uri)
     frag = frags[0]
-    sample_file = frag.to_json()["files"][0]
-    assert sample_file["file_major_version"] == EXPECTED_MAJOR_VERSION
-    assert sample_file["file_minor_version"] == EXPECTED_MINOR_VERSION
+    sample_file = frag.files[0]
+    assert sample_file.file_major_version == EXPECTED_MAJOR_VERSION
+    assert sample_file.file_minor_version == EXPECTED_MINOR_VERSION
 
 
 def test_no_detached_v1(tmp_path: Path):

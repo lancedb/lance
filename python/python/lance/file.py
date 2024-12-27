@@ -10,6 +10,7 @@ from .lance import (
     LanceBufferDescriptor,
     LanceColumnMetadata,
     LanceFileMetadata,
+    LanceFileStatistics,
     LancePageMetadata,
 )
 from .lance import (
@@ -146,6 +147,12 @@ class LanceFileReader:
         """
         return self._reader.metadata()
 
+    def file_statistics(self) -> LanceFileStatistics:
+        """
+        Return file statistics of the file
+        """
+        return self._reader.file_statistics()
+
     def read_global_buffer(self, index: int) -> bytes:
         """
         Read a global buffer from the file at a given index
@@ -232,7 +239,7 @@ class LanceFileWriter:
         else:
             self._writer.write_batch(batch)
 
-    def close(self) -> int:
+    def close(self) -> Optional[int]:
         """
         Write the file metadata and close the file
 
@@ -289,4 +296,5 @@ __all__ = [
     "LanceColumnMetadata",
     "LancePageMetadata",
     "LanceBufferDescriptor",
+    "LanceFileStatistics",
 ]

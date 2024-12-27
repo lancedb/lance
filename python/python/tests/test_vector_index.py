@@ -373,6 +373,37 @@ def test_has_index(dataset, tmp_path):
     assert ann_ds.list_indices()[0]["fields"] == ["vector"]
 
 
+def test_index_type(dataset, tmp_path):
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        replace=True,
+    )
+    assert ann_ds.list_indices()[0]["type"] == "IVF_PQ"
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_SQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        replace=True,
+    )
+    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_SQ"
+
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_PQ",
+        num_partitions=4,
+        num_sub_vectors=16,
+        replace=True,
+    )
+    assert ann_ds.list_indices()[0]["type"] == "IVF_HNSW_PQ"
+
+
 def test_create_dot_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
@@ -384,6 +415,21 @@ def test_create_dot_index(dataset, tmp_path):
         metric="dot",
     )
     assert ann_ds.has_index
+
+
+def test_create_4bit_ivf_pq_index(dataset, tmp_path):
+    assert not dataset.has_index
+    ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
+    ann_ds = ann_ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        num_partitions=1,
+        num_sub_vectors=16,
+        num_bits=4,
+        metric="l2",
+    )
+    index = ann_ds.stats.index_stats("vector_idx")
+    assert index["indices"][0]["sub_index"]["nbits"] == 4
 
 
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):

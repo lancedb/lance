@@ -54,7 +54,7 @@ pub fn new_ivf_transformer_with_quantizer(
     range: Option<Range<u32>>,
 ) -> Result<IvfTransformer> {
     match quantizer {
-        Quantizer::Flat(_) => Ok(IvfTransformer::new_flat(
+        Quantizer::Flat(_) | Quantizer::FlatBin(_) => Ok(IvfTransformer::new_flat(
             centroids,
             metric_type,
             vector_column,

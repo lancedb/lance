@@ -267,7 +267,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::Index {
             message: "Remapping HNSW in this way not supported".to_string(),
             location: location!(),

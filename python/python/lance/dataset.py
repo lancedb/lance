@@ -11,7 +11,7 @@ import random
 import time
 import uuid
 import warnings
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -47,19 +47,16 @@ from .dependencies import pandas as pd
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
+    Compaction,
+    CompactionMetrics,
+    LanceSchema,
     _Dataset,
     _MergeInsertBuilder,
-    _Operation,
-    _RewriteGroup,
-    _RewrittenIndex,
     _Scanner,
     _write_dataset,
 )
-from .lance import CompactionMetrics as CompactionMetrics
 from .lance import __version__ as __version__
 from .lance import _Session as Session
-from .optimize import Compaction
-from .schema import LanceSchema
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 from .udf import BatchUDFCheckpoint as BatchUDFCheckpoint
@@ -107,7 +104,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
     # These next three overrides exist only to document the methods
 
-    def when_matched_update_all(self, condition: Optional[str] = None):
+    def when_matched_update_all(
+        self, condition: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to update matched rows
 
@@ -128,7 +127,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_matched_update_all(condition)
 
-    def when_not_matched_insert_all(self):
+    def when_not_matched_insert_all(self) -> "MergeInsertBuilder":
         """
         Configure the operation to insert not matched rows
 
@@ -138,7 +137,9 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         """
         return super(MergeInsertBuilder, self).when_not_matched_insert_all()
 
-    def when_not_matched_by_source_delete(self, expr: Optional[str] = None):
+    def when_not_matched_by_source_delete(
+        self, expr: Optional[str] = None
+    ) -> "MergeInsertBuilder":
         """
         Configure the operation to delete source rows that do not match
 
@@ -152,7 +153,7 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
 
 class LanceDataset(pa.dataset.Dataset):
-    """A dataset in Lance format where the data is stored at the given uri."""
+    """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
     def __init__(
         self,
@@ -217,9 +218,13 @@ class LanceDataset(pa.dataset.Dataset):
         )
 
     def __setstate__(self, state):
-        self._uri, self._storage_options, version, manifest, default_scan_options = (
-            state
-        )
+        (
+            self._uri,
+            self._storage_options,
+            version,
+            manifest,
+            default_scan_options,
+        ) = state
         self._ds = _Dataset(
             self._uri,
             version,
@@ -250,7 +255,7 @@ class LanceDataset(pa.dataset.Dataset):
     def tags(self) -> Tags:
         return Tags(self._ds)
 
-    def list_indices(self) -> List[Dict[str, Any]]:
+    def list_indices(self) -> List[Index]:
         return self._ds.load_indices()
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
@@ -280,15 +285,15 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = None,
+        scan_in_order: Optional[bool] = None,
         fragments: Optional[Iterable[LanceFragment]] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         *,
-        prefilter: bool = None,
-        with_row_id: bool = None,
-        with_row_address: bool = None,
-        use_stats: bool = None,
-        fast_search: bool = None,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
+        fast_search: Optional[bool] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
@@ -321,8 +326,11 @@ class LanceDataset(pa.dataset.Dataset):
                     "nprobes": 1,
                     "refine_factor": 1
                 }
+
         batch_size: int, default None
-            The max size of batches returned.
+            The target size of batches returned.  In some cases batches can be up to
+            twice this size (but never larger than this).  In some cases batches can
+            be smaller than this size.
         io_buffer_size: int, default None
             The size of the IO buffer.  See ``ScannerBuilder.io_buffer_size``
             for more information.
@@ -362,7 +370,7 @@ class LanceDataset(pa.dataset.Dataset):
             If True, then all columns are late materialized.
             If False, then all columns are early materialized.
             If a list of strings, then only the columns in the list are
-              late materialized.
+            late materialized.
 
             The default uses a heuristic that assumes filters will select about 0.1%
             of the rows.  If your filter is more selective (e.g. find by id) you may
@@ -372,6 +380,7 @@ class LanceDataset(pa.dataset.Dataset):
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents containing "hello" or "world".
             or a dictionary with the following keys:
+
             - columns: list[str]
                 The columns to search,
                 currently only supports a single column in the columns list.
@@ -385,6 +394,7 @@ class LanceDataset(pa.dataset.Dataset):
         -----
 
         For now, if BOTH filter and nearest is specified, then:
+
         1. nearest is executed first.
         2. The results are filtered afterwards.
 
@@ -480,6 +490,13 @@ class LanceDataset(pa.dataset.Dataset):
         """
         return self._ds.data_storage_version
 
+    @property
+    def max_field_id(self) -> int:
+        """
+        The max_field_id in manifest
+        """
+        return self._ds.max_field_id
+
     def to_table(
         self,
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
@@ -502,7 +519,7 @@ class LanceDataset(pa.dataset.Dataset):
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
     ) -> pa.Table:
-        """Read the data into memory as a pyarrow Table.
+        """Read the data into memory as a :py:class:`pyarrow.Table`
 
         Parameters
         ----------
@@ -563,6 +580,7 @@ class LanceDataset(pa.dataset.Dataset):
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents contains "hello" or "world".
             or a dictionary with the following keys:
+
             - columns: list[str]
                 The columns to search,
                 currently only supports a single column in the columns list.
@@ -572,6 +590,7 @@ class LanceDataset(pa.dataset.Dataset):
         Notes
         -----
         If BOTH filter and nearest is specified, then:
+
         1. nearest is executed first.
         2. The results are filtered afterward, unless pre-filter sets to True.
         """
@@ -606,8 +625,38 @@ class LanceDataset(pa.dataset.Dataset):
     def replace_schema(self, schema: Schema):
         """
         Not implemented (just override pyarrow dataset to prevent segfault)
+
+        See :py:method:`replace_schema_metadata` or :py:method:`replace_field_metadata`
         """
-        raise NotImplementedError("not changing schemas yet")
+        raise NotImplementedError(
+            "Cannot replace the schema of a dataset.  This method exists for backwards"
+            " compatibility with pyarrow.  Use replace_schema_metadata or "
+            "replace_field_metadata to change the metadata"
+        )
+
+    def replace_schema_metadata(self, new_metadata: Dict[str, str]):
+        """
+        Replace the schema metadata of the dataset
+
+        Parameters
+        ----------
+        new_metadata: dict
+            The new metadata to set
+        """
+        self._ds.replace_schema_metadata(new_metadata)
+
+    def replace_field_metadata(self, field_name: str, new_metadata: Dict[str, str]):
+        """
+        Replace the metadata of a field in the schema
+
+        Parameters
+        ----------
+        field_name: str
+            The name of the field to replace the metadata for
+        new_metadata: dict
+            The new metadata to set
+        """
+        self._ds.replace_field_metadata(field_name, new_metadata)
 
     def get_fragments(self, filter: Optional[Expression] = None) -> List[LanceFragment]:
         """Get all fragments from the dataset.
@@ -730,11 +779,11 @@ class LanceDataset(pa.dataset.Dataset):
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
         **kwargs : dict, optional
-            See scanner() method for full parameter description.
+            See :py:method::scanner method for full parameter description.
 
         Returns
         -------
-        table : Table
+        table : pyarrow.Table
         """
         columns_with_transform = None
         if isinstance(columns, dict):
@@ -783,7 +832,11 @@ class LanceDataset(pa.dataset.Dataset):
         blob_column: str,
     ) -> List[BlobFile]:
         """
-        Select blobs by row_ids.
+        Select blobs by row IDs.
+
+        Instead of loading large binary blob data into memory before processing it,
+        this API allows you to open binary blob data as a regular Python file-like
+        object. For more details, see :py:class:`lance.BlobFile`.
 
         Parameters
         ----------
@@ -855,7 +908,7 @@ class LanceDataset(pa.dataset.Dataset):
         """
         raise NotImplementedError("Versioning not yet supported in Rust")
 
-    def alter_columns(self, *alterations: Iterable[Dict[str, Any]]):
+    def alter_columns(self, *alterations: Iterable[AlterColumn]):
         """Alter column name, data type, and nullability.
 
         Columns that are renamed can keep any indices that are on them. If a
@@ -1187,6 +1240,11 @@ class LanceDataset(pa.dataset.Dataset):
 
         Examples
         --------
+
+        Use `when_matched_update_all()` and `when_not_matched_insert_all()` to
+        perform an "upsert" operation.  This will update rows that already exist
+        in the dataset and insert rows that do not exist.
+
         >>> import lance
         >>> import pyarrow as pa
         >>> table = pa.table({"a": [2, 1, 3], "b": ["a", "b", "c"]})
@@ -1204,6 +1262,51 @@ class LanceDataset(pa.dataset.Dataset):
         1  2  x
         2  3  y
         3  4  z
+
+        Use `when_not_matched_insert_all()` to perform an "insert if not exists"
+        operation.  This will only insert rows that do not already exist in the
+        dataset.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"]})
+        >>> dataset = lance.write_dataset(table, "example2")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform an "insert if not exists" operation
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 0, 'num_deleted_rows': 0}
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b
+        0  1  a
+        1  2  b
+        2  3  c
+        3  4  z
+
+        You are not required to provide all the columns. If you only want to
+        update a subset of columns, you can omit columns you don't want to
+        update. Omitted columns will keep their existing values if they are
+        updated, or will be null if they are inserted.
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> table = pa.table({"a": [1, 2, 3], "b": ["a", "b", "c"], \\
+        ...                   "c": ["x", "y", "z"]})
+        >>> dataset = lance.write_dataset(table, "example3")
+        >>> new_table = pa.table({"a": [2, 3, 4], "b": ["x", "y", "z"]})
+        >>> # Perform an "upsert" operation, only updating column "a"
+        >>> dataset.merge_insert("a")     \\
+        ...             .when_matched_update_all()     \\
+        ...             .when_not_matched_insert_all() \\
+        ...             .execute(new_table)
+        {'num_inserted_rows': 1, 'num_updated_rows': 2, 'num_deleted_rows': 0}
+        >>> dataset.to_table().sort_by("a").to_pandas()
+           a  b     c
+        0  1  a     x
+        1  2  x     y
+        2  3  y     z
+        3  4  z  None
         """
         return MergeInsertBuilder(self._ds, on)
 
@@ -1211,7 +1314,7 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         updates: Dict[str, str],
         where: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> UpdateResult:
         """
         Update column values for rows matching where.
 
@@ -1608,15 +1711,19 @@ class LanceDataset(pa.dataset.Dataset):
             Replace the existing index if it exists.
         num_partitions : int, optional
             The number of partitions of IVF (Inverted File Index).
-        ivf_centroids : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
-        or ``pyarrow.FixedShapeTensorArray``. Optional.
-            A ``num_partitions x dimension`` array of K-mean centroids for IVF
-            clustering. If not provided, a new Kmean model will be trained.
-        pq_codebook : ``np.ndarray``, ``pyarrow.FixedSizeListArray``
-        or ``pyarrow.FixedShapeTensorArray``. Optional.
+        ivf_centroids : optional
+            It can be either :py:class:`np.ndarray`,
+            :py:class:`pyarrow.FixedSizeListArray` or
+            :py:class:`pyarrow.FixedShapeTensorArray`.
+            A ``num_partitions x dimension`` array of existing K-mean centroids
+            for IVF clustering. If not provided, a new KMeans model will be trained.
+        pq_codebook : optional,
+            It can be :py:class:`np.ndarray`, :py:class:`pyarrow.FixedSizeListArray`,
+            or :py:class:`pyarrow.FixedShapeTensorArray`.
             A ``num_sub_vectors x (2 ^ nbits * dimensions // num_sub_vectors)``
             array of K-mean centroids for PQ codebook.
-            Note: nbits is always 8 for now.
+
+            Note: ``nbits`` is always 8 for now.
             If not provided, a new PQ model will be trained.
         num_sub_vectors : int, optional
             The number of sub-vectors for PQ (Product Quantization).
@@ -1650,7 +1757,9 @@ class LanceDataset(pa.dataset.Dataset):
         kwargs :
             Parameters passed to the index building process.
 
-        The SQ (Scalar Quantization) is available for only "IVF_HNSW_SQ" index type,
+
+
+        The SQ (Scalar Quantization) is available for only ``IVF_HNSW_SQ`` index type,
         this quantization method is used to reduce the memory usage of the index,
         it maps the float vectors to integer vectors, each integer is of ``num_bits``,
         now only 8 bits are supported.
@@ -1661,17 +1770,21 @@ class LanceDataset(pa.dataset.Dataset):
         If ``index_type`` is with "PQ", then the following parameters are required:
             num_sub_vectors
 
-        Optional parameters for "IVF_PQ":
-            ivf_centroids :
-                K-mean centroids for IVF clustering.
+        Optional parameters for `IVF_PQ`:
 
-        Optional parameters for "IVF_HNSW_*":
-            max_level : int
-                the maximum number of levels in the graph.
-            m : int
-                the number of edges per node in the graph.
-            ef_construction : int
-                the number of nodes to examine during the construction.
+            - ivf_centroids
+                Existing K-mean centroids for IVF clustering.
+            - num_bits
+                The number of bits for PQ (Product Quantization). Default is 8.
+                Only 4, 8 are supported.
+
+        Optional parameters for `IVF_HNSW_*`:
+            max_level
+                Int, the maximum number of levels in the graph.
+            m
+                Int, the number of edges per node in the graph.
+            ef_construction
+                Int, the number of nodes to examine during the construction.
 
         Examples
         --------
@@ -2209,7 +2322,7 @@ class LanceDataset(pa.dataset.Dataset):
 
         new_ds = _Dataset.commit(
             base_uri,
-            operation._to_inner(),
+            operation,
             read_version,
             commit_lock,
             storage_options=storage_options,
@@ -2308,24 +2421,11 @@ class LanceDataset(pa.dataset.Dataset):
             detached=detached,
             max_retries=max_retries,
         )
-        merged = Transaction(**merged)
-        # This logic is specific to append, which is all that should
-        # be returned here.
-        # TODO: generalize this to all other transaction types.
-        merged.operation["fragments"] = [
-            FragmentMetadata.from_metadata(f) for f in merged.operation["fragments"]
-        ]
-        merged.operation = LanceOperation.Append(**merged.operation)
-        if merged.blobs_op:
-            merged.blobs_op["fragments"] = [
-                FragmentMetadata.from_metadata(f) for f in merged.blobs_op["fragments"]
-            ]
-            merged.blobs_op = LanceOperation.Append(**merged.blobs_op)
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri
         ds._default_scan_options = None
-        return dict(
+        return BulkCommitResult(
             dataset=ds,
             merged=merged,
         )
@@ -2384,6 +2484,43 @@ class Transaction:
     blobs_op: Optional[LanceOperation.BaseOperation] = None
 
 
+class Tag(TypedDict):
+    version: int
+    manifest_size: int
+
+
+class Version(TypedDict):
+    version: int
+    timestamp: int | datetime
+    metadata: Dict[str, str]
+
+
+class UpdateResult(TypedDict):
+    num_rows_updated: int
+
+
+class AlterColumn(TypedDict):
+    path: str
+    name: Optional[str]
+    nullable: Optional[bool]
+    data_type: Optional[pa.DataType]
+
+
+class ExecuteResult(TypedDict):
+    num_inserted_rows: int
+    num_updated_rows: int
+    num_deleted_rows: int
+
+
+class Index(TypedDict):
+    name: str
+    type: str
+    uuid: str
+    fields: List[str]
+    version: int
+    fragment_ids: Set[int]
+
+
 # LanceOperation is a namespace for operations that can be applied to a dataset.
 class LanceOperation:
     @staticmethod
@@ -2405,10 +2542,6 @@ class LanceOperation:
 
         See available operations under :class:`LanceOperation`.
         """
-
-        @abstractmethod
-        def _to_inner(self):
-            raise NotImplementedError()
 
     @dataclass
     class Overwrite(BaseOperation):
@@ -2453,7 +2586,7 @@ class LanceOperation:
         3  4  d
         """
 
-        new_schema: pa.Schema
+        new_schema: LanceSchema | pa.Schema
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
@@ -2462,10 +2595,6 @@ class LanceOperation:
                     f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
                 )
             LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
-            return _Operation.overwrite(self.new_schema, raw_fragments)
 
     @dataclass
     class Append(BaseOperation):
@@ -2512,10 +2641,6 @@ class LanceOperation:
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
-            return _Operation.append(raw_fragments)
 
     @dataclass
     class Delete(BaseOperation):
@@ -2585,12 +2710,6 @@ class LanceOperation:
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
 
-        def _to_inner(self):
-            raw_updated_fragments = [f._metadata for f in self.updated_fragments]
-            return _Operation.delete(
-                raw_updated_fragments, self.deleted_fragment_ids, self.predicate
-            )
-
     @dataclass
     class Merge(BaseOperation):
         """
@@ -2651,10 +2770,6 @@ class LanceOperation:
         schema: LanceSchema | pa.Schema
 
         def __post_init__(self):
-            LanceOperation._validate_fragments(self.fragments)
-
-        def _to_inner(self):
-            raw_fragments = [f._metadata for f in self.fragments]
             if isinstance(self.schema, pa.Schema):
                 warnings.warn(
                     "Passing a pyarrow.Schema to Merge is deprecated. "
@@ -2662,7 +2777,7 @@ class LanceOperation:
                     DeprecationWarning,
                 )
                 self.schema = LanceSchema.from_pyarrow(self.schema)
-            return _Operation.merge(raw_fragments, self.schema)
+            LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
     class Restore(BaseOperation):
@@ -2671,9 +2786,6 @@ class LanceOperation:
         """
 
         version: int
-
-        def _to_inner(self):
-            return _Operation.restore(self.version)
 
     @dataclass
     class RewriteGroup:
@@ -2684,11 +2796,6 @@ class LanceOperation:
         old_fragments: Iterable[FragmentMetadata]
         new_fragments: Iterable[FragmentMetadata]
 
-        def _to_inner(self):
-            old_fragments = [f._metadata for f in self.old_fragments]
-            new_fragments = [f._metadata for f in self.new_fragments]
-            return _RewriteGroup(old_fragments, new_fragments)
-
     @dataclass
     class RewrittenIndex:
         """
@@ -2697,9 +2804,6 @@ class LanceOperation:
 
         old_id: str
         new_id: str
-
-        def _to_inner(self):
-            return _RewrittenIndex(self.old_id, self.new_id)
 
     @dataclass
     class Rewrite(BaseOperation):
@@ -2727,11 +2831,6 @@ class LanceOperation:
             all_frags += [new for group in self.groups for new in group.new_fragments]
             LanceOperation._validate_fragments(all_frags)
 
-        def _to_inner(self):
-            groups = [group._to_inner() for group in self.groups]
-            rewritten_indices = [index._to_inner() for index in self.rewritten_indices]
-            return _Operation.rewrite(groups, rewritten_indices)
-
     @dataclass
     class CreateIndex(BaseOperation):
         """
@@ -2743,15 +2842,6 @@ class LanceOperation:
         fields: List[int]
         dataset_version: int
         fragment_ids: Set[int]
-
-        def _to_inner(self):
-            return _Operation.create_index(
-                self.uuid,
-                self.name,
-                self.fields,
-                self.dataset_version,
-                self.fragment_ids,
-            )
 
 
 class ScannerBuilder:
@@ -2785,6 +2875,7 @@ class ScannerBuilder:
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
             setter(value)
+        return self
 
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set batch size for Scanner"""
@@ -3306,13 +3397,13 @@ class Tags:
     def __init__(self, dataset: _Dataset):
         self._ds = dataset
 
-    def list(self) -> dict[str, int]:
+    def list(self) -> dict[str, Tag]:
         """
         List all dataset tags.
 
         Returns
         -------
-        dict[str, int]
+        dict[str, Tag]
             A dictionary mapping tag names to version numbers.
         """
         return self._ds.tags()
@@ -3409,6 +3500,7 @@ def write_dataset(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     enable_v2_manifest_paths: bool = False,
+    enable_move_stable_row_ids: bool = False,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -3462,6 +3554,11 @@ def write_dataset(
         versions on object stores. This parameter has no effect if the dataset
         already exists. To migrate an existing dataset, instead use the
         :meth:`LanceDataset.migrate_manifest_paths_v2` method. Default is False.
+    enable_move_stable_row_ids : bool, optional
+        Experimental parameter: if set to true, the writer will use move-stable row ids.
+        These row ids are stable after compaction operations, but not after updates.
+        This makes compaction more efficient, since with stable row ids no
+        secondary indices need to be updated to point to new row ids.
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -3495,6 +3592,7 @@ def write_dataset(
         "storage_options": storage_options,
         "data_storage_version": data_storage_version,
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
+        "enable_move_stable_row_ids": enable_move_stable_row_ids,
     }
 
     if commit_lock:

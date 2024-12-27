@@ -23,6 +23,7 @@ pub mod norm_l2;
 pub use cosine::*;
 use deepsize::DeepSizeOf;
 pub use dot::*;
+use hamming::hamming_distance_arrow_batch;
 pub use l2::*;
 pub use norm_l2::*;
 
@@ -55,7 +56,7 @@ impl DistanceType {
             Self::L2 => l2_distance_arrow_batch,
             Self::Cosine => cosine_distance_arrow_batch,
             Self::Dot => dot_distance_arrow_batch,
-            Self::Hamming => todo!(),
+            Self::Hamming => hamming_distance_arrow_batch,
         }
     }
 

@@ -30,12 +30,11 @@ use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::MaterializationStyle;
-use lance::dataset::transaction::{
-    RewriteGroup as LanceRewriteGroup, RewrittenIndex as LanceRewrittenIndex, Transaction,
-};
 use lance::dataset::{
-    fragment::FileFragment as LanceFileFragment, progress::WriteFragmentProgress,
-    scanner::Scanner as LanceScanner, transaction::Operation as LanceOperation,
+    fragment::FileFragment as LanceFileFragment,
+    progress::WriteFragmentProgress,
+    scanner::Scanner as LanceScanner,
+    transaction::{Operation, Transaction},
     Dataset as LanceDataset, MergeInsertBuilder as LanceMergeInsertBuilder, ReadParams,
     UpdateBuilder, Version, WhenMatched, WhenNotMatched, WhenNotMatchedBySource, WriteMode,
     WriteParams,
@@ -46,7 +45,6 @@ use lance::dataset::{
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
-use lance_core::datatypes::Schema;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
@@ -60,26 +58,25 @@ use lance_index::{
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
-use lance_table::format::Index;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use pyo3::exceptions::{PyNotImplementedError, PyStopIteration, PyTypeError};
-use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
+use pyo3::exceptions::{PyStopIteration, PyTypeError};
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
     pyclass,
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
-use pyo3::{intern, prelude::*};
 use snafu::{location, Location};
-use uuid::Uuid;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
-use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::fragment::FileFragment;
 use crate::schema::LanceSchema;
 use crate::session::Session;
+use crate::utils::PyLance;
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -94,27 +91,6 @@ pub mod optimize;
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
 const DEFAULT_METADATA_CACHE_SIZE: usize = 256;
-
-#[pyclass(name = "_Operation", module = "_lib")]
-#[derive(Clone)]
-pub struct Operation(LanceOperation);
-
-fn into_fragments(fragments: Vec<FragmentMetadata>) -> Vec<Fragment> {
-    fragments
-        .into_iter()
-        .map(|f| f.inner)
-        .collect::<Vec<Fragment>>()
-}
-
-fn convert_schema(arrow_schema: &ArrowSchema) -> PyResult<Schema> {
-    // Note: the field ids here are wrong.
-    Schema::try_from(arrow_schema).map_err(|e| {
-        PyValueError::new_err(format!(
-            "Failed to convert Arrow schema to Lance schema: {}",
-            e
-        ))
-    })
-}
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send>> {
     let py = reader.py();
@@ -232,166 +208,6 @@ impl MergeInsertBuilder {
         merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
 
         Ok(merge_dict.into())
-    }
-}
-
-#[pyclass(name = "_RewriteGroup", module = "_lib")]
-#[derive(Clone)]
-pub struct RewriteGroup(LanceRewriteGroup);
-
-#[pymethods]
-impl RewriteGroup {
-    #[new]
-    pub fn new(old_fragments: Vec<FragmentMetadata>, new_fragments: Vec<FragmentMetadata>) -> Self {
-        let old_fragments = into_fragments(old_fragments);
-        let new_fragments = into_fragments(new_fragments);
-        Self(LanceRewriteGroup {
-            old_fragments,
-            new_fragments,
-        })
-    }
-}
-
-#[pyclass(name = "_RewrittenIndex", module = "_lib")]
-#[derive(Clone)]
-pub struct RewrittenIndex(LanceRewrittenIndex);
-
-#[pymethods]
-impl RewrittenIndex {
-    #[new]
-    pub fn new(old_index: String, new_index: String) -> PyResult<Self> {
-        let old_id: Uuid = old_index
-            .parse()
-            .map_err(|e: uuid::Error| PyValueError::new_err(e.to_string()))?;
-        let new_id: Uuid = new_index
-            .parse()
-            .map_err(|e: uuid::Error| PyValueError::new_err(e.to_string()))?;
-        Ok(Self(LanceRewrittenIndex { old_id, new_id }))
-    }
-}
-
-#[pymethods]
-impl Operation {
-    fn __repr__(&self) -> String {
-        format!("{:?}", self.0)
-    }
-
-    #[staticmethod]
-    fn overwrite(
-        schema: PyArrowType<ArrowSchema>,
-        fragments: Vec<FragmentMetadata>,
-    ) -> PyResult<Self> {
-        let schema = convert_schema(&schema.0)?;
-        let fragments = into_fragments(fragments);
-        let op = LanceOperation::Overwrite {
-            fragments,
-            schema,
-            config_upsert_values: None,
-        };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn append(fragments: Vec<FragmentMetadata>) -> PyResult<Self> {
-        let fragments = into_fragments(fragments);
-        let op = LanceOperation::Append { fragments };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn delete(
-        updated_fragments: Vec<FragmentMetadata>,
-        deleted_fragment_ids: Vec<u64>,
-        predicate: String,
-    ) -> PyResult<Self> {
-        let updated_fragments = into_fragments(updated_fragments);
-        let op = LanceOperation::Delete {
-            updated_fragments,
-            deleted_fragment_ids,
-            predicate,
-        };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn merge(fragments: Vec<FragmentMetadata>, schema: LanceSchema) -> PyResult<Self> {
-        let schema = schema.0;
-        let fragments = into_fragments(fragments);
-        let op = LanceOperation::Merge { fragments, schema };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn restore(version: u64) -> PyResult<Self> {
-        let op = LanceOperation::Restore { version };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn rewrite(
-        groups: Vec<RewriteGroup>,
-        rewritten_indices: Vec<RewrittenIndex>,
-    ) -> PyResult<Self> {
-        let groups = groups.into_iter().map(|g| g.0).collect();
-        let rewritten_indices = rewritten_indices.into_iter().map(|r| r.0).collect();
-        let op = LanceOperation::Rewrite {
-            groups,
-            rewritten_indices,
-        };
-        Ok(Self(op))
-    }
-
-    #[staticmethod]
-    fn create_index(
-        uuid: String,
-        name: String,
-        fields: Vec<i32>,
-        dataset_version: u64,
-        fragment_ids: &Bound<'_, PySet>,
-    ) -> PyResult<Self> {
-        let fragment_ids: Vec<u32> = fragment_ids
-            .iter()
-            .map(|item| item.extract::<u32>())
-            .collect::<PyResult<Vec<u32>>>()?;
-        let new_indices = vec![Index {
-            uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
-            name,
-            fields,
-            dataset_version,
-            fragment_bitmap: Some(fragment_ids.into_iter().collect()),
-            // TODO: we should use lance::dataset::Dataset::commit_existing_index once
-            // we have a way to determine index details from an existing index.
-            index_details: None,
-        }];
-        let op = LanceOperation::CreateIndex {
-            new_indices,
-            removed_indices: vec![],
-        };
-        Ok(Self(op))
-    }
-
-    /// Convert to a pydict that can be used as kwargs into the Operation dataclasses
-    fn to_dict<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
-        let dict = PyDict::new_bound(py);
-        match &self.0 {
-            LanceOperation::Append { fragments } => {
-                let fragments = fragments
-                    .iter()
-                    .cloned()
-                    .map(FragmentMetadata::new)
-                    .map(|f| f.into_py(py))
-                    .collect::<Vec<_>>();
-                dict.set_item("fragments", fragments).unwrap();
-            }
-            _ => {
-                return Err(PyNotImplementedError::new_err(format!(
-                    "Operation.to_dict is not implemented for this operation: {:?}",
-                    self.0
-                )));
-            }
-        }
-
-        Ok(dict)
     }
 }
 
@@ -516,6 +332,11 @@ impl Dataset {
         self.clone()
     }
 
+    #[getter(max_field_id)]
+    fn max_field_id(self_: PyRef<'_, Self>) -> PyResult<i32> {
+        Ok(self_.ds.manifest().max_field_id())
+    }
+
     #[getter(schema)]
     fn schema(self_: PyRef<'_, Self>) -> PyResult<PyObject> {
         let arrow_schema = ArrowSchema::from(self_.ds.schema());
@@ -525,6 +346,32 @@ impl Dataset {
     #[getter(lance_schema)]
     fn lance_schema(self_: PyRef<'_, Self>) -> LanceSchema {
         LanceSchema(self_.ds.schema().clone())
+    }
+
+    fn replace_schema_metadata(&mut self, metadata: HashMap<String, String>) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.replace_schema_metadata(metadata))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
+    fn replace_field_metadata(
+        &mut self,
+        field_name: &str,
+        metadata: HashMap<String, String>,
+    ) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        let field = new_self
+            .schema()
+            .field(field_name)
+            .ok_or_else(|| PyKeyError::new_err(format!("Field \"{}\" not found", field_name)))?;
+        let new_field_meta: HashMap<u32, HashMap<String, String>> =
+            HashMap::from_iter(vec![(field.id as u32, metadata)]);
+        RT.block_on(None, new_self.replace_field_metadata(new_field_meta))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(())
     }
 
     #[getter(data_storage_version)]
@@ -568,23 +415,15 @@ impl Dataset {
 
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
 
-                let is_vector = idx_schema
-                    .fields
-                    .iter()
-                    .any(|f| matches!(f.data_type(), DataType::FixedSizeList(_, _)));
-
-                let idx_type = if is_vector {
-                    IndexType::Vector
-                } else {
-                    let ds = self_.ds.clone();
-                    RT.block_on(Some(self_.py()), async {
-                        let scalar_idx = ds
-                            .open_scalar_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
+                let ds = self_.ds.clone();
+                let idx_type = RT
+                    .block_on(Some(self_.py()), async {
+                        let idx = ds
+                            .open_generic_index(&idx_schema.fields[0].name, &idx.uuid.to_string())
                             .await?;
-                        Ok::<_, lance::Error>(scalar_idx.index_type())
+                        Ok::<_, lance::Error>(idx.index_type())
                     })?
-                    .map_err(|e| PyIOError::new_err(e.to_string()))?
-                };
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
                 let field_names = idx_schema
                     .fields
@@ -1443,7 +1282,7 @@ impl Dataset {
     #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit(
         dest: &Bound<PyAny>,
-        operation: Operation,
+        operation: PyLance<Operation>,
         read_version: Option<u64>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
@@ -1502,13 +1341,13 @@ impl Dataset {
     #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_batch<'py>(
         dest: &Bound<'py, PyAny>,
-        transactions: Vec<Bound<'py, PyAny>>,
+        transactions: Vec<PyLance<Transaction>>,
         commit_lock: Option<&Bound<'py, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
         max_retries: Option<u32>,
-    ) -> PyResult<Bound<'py, PyTuple>> {
+    ) -> PyResult<(Self, PyLance<Transaction>)> {
         let object_store_params =
             storage_options
                 .as_ref()
@@ -1545,8 +1384,8 @@ impl Dataset {
 
         let transactions = transactions
             .into_iter()
-            .map(|transaction| extract_transaction(&transaction))
-            .collect::<PyResult<Vec<_>>>()?;
+            .map(|transaction| transaction.0)
+            .collect();
 
         let res = RT
             .block_on(Some(py), builder.execute_batch(transactions))?
@@ -1556,9 +1395,8 @@ impl Dataset {
             ds: Arc::new(res.dataset),
             uri,
         };
-        let merged = export_transaction(&res.merged, py)?.to_object(py);
-        let ds = ds.into_py(py);
-        Ok(PyTuple::new_bound(py, [ds, merged]))
+
+        Ok((ds, PyLance(res.merged)))
     }
 
     fn validate(&self) -> PyResult<()> {
@@ -1763,6 +1601,11 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
             });
         }
 
+        if let Some(enable_move_stable_row_ids) =
+            get_dict_opt::<bool>(options, "enable_move_stable_row_ids")?
+        {
+            p.enable_move_stable_row_ids = enable_move_stable_row_ids;
+        }
         if let Some(enable_v2_manifest_paths) =
             get_dict_opt::<bool>(options, "enable_v2_manifest_paths")?
         {
@@ -2085,60 +1928,4 @@ impl UDFCheckpointStore for PyBatchUDFCheckpointWrapper {
             )
         })
     }
-}
-
-/// py_transaction is a dataclass with attributes
-/// read_version: int
-/// uuid: str
-/// operation: LanceOperation.BaseOperation
-/// blobs_op: Optional[LanceOperation.BaseOperation] = None
-fn extract_transaction(py_transaction: &Bound<PyAny>) -> PyResult<Transaction> {
-    let py = py_transaction.py();
-    let read_version = py_transaction.getattr("read_version")?.extract()?;
-    let uuid = py_transaction.getattr("uuid")?.extract()?;
-    let operation: Operation = py_transaction
-        .getattr("operation")?
-        .call_method0(intern!(py, "_to_inner"))?
-        .extract()?;
-    let operation = operation.0;
-    let blobs_op: Option<Operation> = {
-        let blobs_op: Option<Bound<PyAny>> = py_transaction.getattr("blobs_op")?.extract()?;
-        if let Some(blobs_op) = blobs_op {
-            Some(blobs_op.call_method0(intern!(py, "_to_inner"))?.extract()?)
-        } else {
-            None
-        }
-    };
-    let blobs_op = blobs_op.map(|op| op.0);
-    Ok(Transaction {
-        read_version,
-        uuid,
-        operation,
-        blobs_op,
-        tag: None,
-    })
-}
-
-// Exports to a pydict of kwargs to instantiation the python Transaction dataclass.
-fn export_transaction<'a>(
-    transaction: &Transaction,
-    py: Python<'a>,
-) -> PyResult<Bound<'a, PyDict>> {
-    let dict = PyDict::new_bound(py);
-    dict.set_item("read_version", transaction.read_version)?;
-    dict.set_item("uuid", transaction.uuid.clone())?;
-    dict.set_item(
-        "operation",
-        Operation(transaction.operation.clone()).to_dict(py)?,
-    )?;
-    dict.set_item(
-        "blobs_op",
-        transaction
-            .blobs_op
-            .clone()
-            .map(Operation)
-            .map(|op| op.to_dict(py))
-            .transpose()?,
-    )?;
-    Ok(dict)
 }

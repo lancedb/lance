@@ -215,7 +215,7 @@ def from_lance(
                 ):
                     yield LanceFragment(dataset, int(f))
                 elif isinstance(f, FragmentMetadata):
-                    yield LanceFragment(dataset, f.fragment_id)
+                    yield LanceFragment(dataset, f.id)
                 elif isinstance(f, LanceFragment):
                     yield f
                 else:
@@ -315,7 +315,7 @@ def lance_take_batches(
     dataset: Union[str, Path, LanceDataset],
     batch_ranges: Iterable[Tuple[int, int]],
     *,
-    columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    columns: Optional[List[str]] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
     batch_readahead: int = 10,
 ) -> tf.data.Dataset:

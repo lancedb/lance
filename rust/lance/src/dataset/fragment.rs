@@ -12,17 +12,19 @@ use std::sync::Arc;
 
 use arrow::compute::concat_batches;
 use arrow_array::cast::as_primitive_array;
-use arrow_array::{new_null_array, RecordBatch, StructArray, UInt32Array, UInt64Array};
+use arrow_array::{
+    new_null_array, RecordBatch, RecordBatchReader, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
@@ -754,9 +756,11 @@ impl FileFragment {
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
-                let initialized_schema = reader
-                    .schema()
-                    .project_by_schema(schema_per_file.as_ref())?;
+                let initialized_schema = reader.schema().project_by_schema(
+                    schema_per_file.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 let reader = V1Reader::new(reader, Arc::new(initialized_schema));
                 Ok(Some(Box::new(reader)))
             } else {
@@ -1285,11 +1289,14 @@ impl FileFragment {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
+        let mut with_row_id = false;
         if let Some(columns) = columns {
             let mut projection = Vec::new();
             for column in columns {
                 if column.as_ref() == ROW_ADDR {
                     with_row_addr = true;
+                } else if column.as_ref() == ROW_ID {
+                    with_row_id = true;
                 } else {
                     projection.push(column.as_ref());
                 }
@@ -1305,11 +1312,13 @@ impl FileFragment {
         }
 
         // If there is no projection, we at least need to read the row addresses
-        with_row_addr |= schema.fields.is_empty();
+        with_row_addr |= !with_row_id && schema.fields.is_empty();
 
         let reader = self.open(
             &schema,
-            FragReadConfig::default().with_row_address(with_row_addr),
+            FragReadConfig::default()
+                .with_row_address(with_row_addr)
+                .with_row_id(with_row_id),
             None,
         );
         let deletion_vector = read_deletion_file(
@@ -1322,6 +1331,66 @@ impl FileFragment {
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
         Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
+    }
+
+    pub async fn merge_columns(
+        &mut self,
+        stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        max_field_id: i32,
+    ) -> Result<(Fragment, Schema)> {
+        let stream = Box::new(stream);
+        if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the left side fragment",
+                    left_on
+                ),
+                location!(),
+            ));
+        };
+        let right_schema = stream.schema();
+        if right_schema.field_with_name(right_on).is_err() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the right side fragment",
+                    right_on
+                ),
+                location!(),
+            ));
+        };
+
+        for field in right_schema.fields() {
+            if field.name() == right_on {
+                // right_on is allowed to exist in the dataset, since it may be
+                // the same as left_on.
+                continue;
+            }
+            if self.schema().field(field.name()).is_some() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} exists in left side fragment and right side dataset",
+                        field.name()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+        // Hash join
+        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
+        // Final schema is union of current schema, plus the RHS schema without
+        // the right_on key.
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(Some(max_field_id));
+
+        let new_fragment = self
+            .clone()
+            .merge(left_on, &joiner)
+            .await
+            .map(|f| f.metadata)?;
+
+        Ok((new_fragment, new_schema))
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {

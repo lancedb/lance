@@ -165,7 +165,7 @@ impl Wand {
             let score = self.score(doc, &scorer);
             if self.candidates.len() < limit {
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
-            } else if score > self.threshold {
+            } else if score > self.candidates.peek().unwrap().0.score.0 {
                 self.candidates.pop();
                 self.candidates.push(Reverse(OrderedDoc::new(doc, score)));
                 self.threshold = self.candidates.peek().unwrap().0.score.0 * factor;

@@ -22,6 +22,7 @@
 package org.apache.spark.sql.util
 
 import com.lancedb.lance.spark.LanceConstant
+
 import org.apache.arrow.vector.types.pojo.ArrowType
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.types._
@@ -33,7 +34,8 @@ class LanceArrowUtilsSuite extends AnyFunSuite {
   def roundtrip(dt: DataType, fieldName: String = "value"): Unit = {
     dt match {
       case schema: StructType =>
-        assert(LanceArrowUtils.fromArrowSchema(LanceArrowUtils.toArrowSchema(schema, null, true)) === schema)
+        assert(LanceArrowUtils.fromArrowSchema(
+          LanceArrowUtils.toArrowSchema(schema, null, true)) === schema)
       case _ =>
         roundtrip(new StructType().add(fieldName, dt))
     }
@@ -109,11 +111,14 @@ class LanceArrowUtilsSuite extends AnyFunSuite {
 
     roundtrip(new StructType().add("i", IntegerType).add("i", StringType))
 
-    check(new StructType().add("i", IntegerType).add("i", StringType),
+    check(
+      new StructType().add("i", IntegerType).add("i", StringType),
       new StructType().add("i_0", IntegerType).add("i_1", StringType))
-    check(ArrayType(new StructType().add("i", IntegerType).add("i", StringType)),
+    check(
+      ArrayType(new StructType().add("i", IntegerType).add("i", StringType)),
       ArrayType(new StructType().add("i_0", IntegerType).add("i_1", StringType)))
-    check(MapType(StringType, new StructType().add("i", IntegerType).add("i", StringType)),
+    check(
+      MapType(StringType, new StructType().add("i", IntegerType).add("i", StringType)),
       MapType(StringType, new StructType().add("i_0", IntegerType).add("i_1", StringType)))
   }
 

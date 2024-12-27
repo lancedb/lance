@@ -138,7 +138,7 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
         }
 

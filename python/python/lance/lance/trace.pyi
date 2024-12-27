@@ -1,0 +1,3 @@
+from typing import Optional
+
+def trace_to_chrome(file: Optional[str] = None, level: Optional[str] = None): ...

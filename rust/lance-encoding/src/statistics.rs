@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::AsArray;
+use arrow::{array::AsArray, datatypes::UInt64Type};
 use arrow_array::{Array, ArrowPrimitiveType, UInt64Array};
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
@@ -61,7 +61,7 @@ impl ComputeStat for DataBlock {
             Self::FixedSizeList(_) => {}
             Self::VariableWidth(data_block) => data_block.compute_stat(),
             Self::Opaque(data_block) => data_block.compute_stat(),
-            Self::Struct(_) => {}
+            Self::Struct(data_block) => data_block.compute_stat(),
             Self::Dictionary(_) => {}
         }
     }
@@ -371,8 +371,30 @@ impl GetStat for DictionaryDataBlock {
 }
 
 impl GetStat for StructDataBlock {
-    fn get_stat(&self, _stat: Stat) -> Option<Arc<dyn Array>> {
-        None
+    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
+        let block_info = self.block_info.0.read().unwrap();
+        if block_info.is_empty() {
+            panic!("get_stat should be called after statistics are computed.")
+        }
+        block_info.get(&stat).cloned()
+    }
+}
+
+impl ComputeStat for StructDataBlock {
+    fn compute_stat(&mut self) {
+        let data_size = self.data_size();
+        let data_size_array = Arc::new(UInt64Array::from(vec![data_size]));
+
+        let max_len = self
+            .children
+            .iter()
+            .map(|child| child.expect_single_stat::<UInt64Type>(Stat::MaxLength))
+            .sum::<u64>();
+        let max_len_array = Arc::new(UInt64Array::from(vec![max_len]));
+
+        let mut info = self.block_info.0.write().unwrap();
+        info.insert(Stat::DataSize, data_size_array);
+        info.insert(Stat::MaxLength, max_len_array);
     }
 }
 
@@ -394,6 +416,7 @@ mod tests {
     use super::DataBlock;
 
     use arrow::{
+        array::AsArray,
         compute::concat,
         datatypes::{Int32Type, UInt64Type},
     };
@@ -442,18 +465,25 @@ mod tests {
         let fields = vec![
             Arc::new(Field::new("int_field", DataType::Int32, false)),
             Arc::new(Field::new("float_field", DataType::Float32, false)),
-            Arc::new(Field::new(
-                "fsl_field",
-                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 5),
-                false,
-            )),
         ]
         .into();
 
         let mut gen = lance_datagen::array::rand_type(&DataType::Struct(fields));
         let arr = gen.generate(RowCount::from(3), &mut rng).unwrap();
         let block = DataBlock::from_array(arr.clone());
-        assert!(block.get_stat(Stat::DataSize).is_none());
+        let (_, arr_parts, _) = arr.as_struct().clone().into_parts();
+        let total_buffer_size: usize = arr_parts
+            .iter()
+            .map(|arr| {
+                arr.to_data()
+                    .buffers()
+                    .iter()
+                    .map(|buffer| buffer.len())
+                    .sum::<usize>()
+            })
+            .sum();
+        let data_size = block.expect_single_stat::<UInt64Type>(Stat::DataSize);
+        assert!(data_size == total_buffer_size as u64);
 
         // test DataType::Dictionary
         let mut gen = array::rand_type(&DataType::Dictionary(

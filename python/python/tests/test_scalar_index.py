@@ -86,6 +86,25 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         assert actual_price == expected_price
 
 
+def test_indexed_between(tmp_path):
+    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset.create_scalar_index("val", index_type="BTREE")
+
+    scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+    scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+
 def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
@@ -385,6 +404,36 @@ def test_null_handling(tmp_path: Path):
     check(True)
     dataset.create_scalar_index("x", index_type="BTREE")
     check(True)
+
+
+def test_scalar_index_with_nulls(tmp_path):
+    # Create a test dataframe with 50% null values.
+    test_table_size = 10_000
+    test_table = pa.table(
+        {
+            "item_id": list(range(test_table_size)),
+            "inner_id": list(range(test_table_size)),
+            "category": ["a", None] * (test_table_size // 2),
+            "numeric_int": [1, None] * (test_table_size // 2),
+            "numeric_float": [0.1, None] * (test_table_size // 2),
+            "boolean_col": [True, None] * (test_table_size // 2),
+            "timestamp_col": [datetime(2023, 1, 1), None] * (test_table_size // 2),
+        }
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("inner_id", index_type="BTREE")
+    ds.create_scalar_index("category", index_type="BTREE")
+    ds.create_scalar_index("boolean_col", index_type="BTREE")
+    ds.create_scalar_index("timestamp_col", index_type="BTREE")
+    # Test querying with filters on columns with nulls.
+    k = test_table_size // 2
+    result = ds.to_table(filter="category = 'a'", limit=k)
+    assert len(result) == k
+    # Booleans should be stored as strings in the table for backwards compatibility.
+    result = ds.to_table(filter="boolean_col IS TRUE", limit=k)
+    assert len(result) == k
+    result = ds.to_table(filter="timestamp_col IS NOT NULL", limit=k)
+    assert len(result) == k
 
 
 def test_label_list_index(tmp_path: Path):

@@ -57,6 +57,24 @@ pub struct BufferDescriptor {
     pub size: u64,
 }
 
+/// Statistics summarize some of the file metadata for quick summary info
+#[derive(Debug)]
+pub struct FileStatistics {
+    /// Statistics about each of the columns in the file
+    pub columns: Vec<ColumnStatistics>,
+}
+
+/// Summary information describing a column
+#[derive(Debug)]
+pub struct ColumnStatistics {
+    /// The number of pages in the column
+    pub num_pages: usize,
+    /// The total number of data & metadata bytes in the column
+    ///
+    /// This is the compressed on-disk size
+    pub size_bytes: u64,
+}
+
 // TODO: Caching
 #[derive(Debug)]
 pub struct CachedFileMetadata {
@@ -218,23 +236,29 @@ impl ReaderProjection {
     ///
     /// If the schema provided is not the schema of the entire file then
     /// the projection will be invalid and the read will fail.
+    /// If the field is a `struct datatype` with `packed` set to true in the field metadata,
+    /// the whole struct has one column index.
+    /// To support nested `packed-struct encoding`, this method need to be further adjusted.
     pub fn from_whole_schema(schema: &Schema, version: LanceFileVersion) -> Self {
         let schema = Arc::new(schema.clone());
         let is_structural = version >= LanceFileVersion::V2_1;
-        let mut counter = 0;
-        let counter = &mut counter;
-        let column_indices = schema
-            .fields_pre_order()
-            .filter_map(|field| {
-                if field.children.is_empty() || !is_structural {
-                    let col_idx = *counter;
-                    *counter += 1;
-                    Some(col_idx)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut column_indices = vec![];
+        let mut curr_column_idx = 0;
+        let mut packed_struct_fields_num = 0;
+        for field in schema.fields_pre_order() {
+            if packed_struct_fields_num > 0 {
+                packed_struct_fields_num -= 1;
+                continue;
+            }
+            if field.is_packed_struct() {
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+                packed_struct_fields_num = field.children.len();
+            } else if field.children.is_empty() || !is_structural {
+                column_indices.push(curr_column_idx);
+                curr_column_idx += 1;
+            }
+        }
         Self {
             schema,
             column_indices,
@@ -305,6 +329,30 @@ impl FileReader {
 
     pub fn metadata(&self) -> &Arc<CachedFileMetadata> {
         &self.metadata
+    }
+
+    pub fn file_statistics(&self) -> FileStatistics {
+        let column_metadatas = &self.metadata().column_metadatas;
+
+        let column_stats = column_metadatas
+            .iter()
+            .map(|col_metadata| {
+                let num_pages = col_metadata.pages.len();
+                let size_bytes = col_metadata
+                    .pages
+                    .iter()
+                    .map(|page| page.buffer_sizes.iter().sum::<u64>())
+                    .sum::<u64>();
+                ColumnStatistics {
+                    num_pages,
+                    size_bytes,
+                }
+            })
+            .collect();
+
+        FileStatistics {
+            columns: column_stats,
+        }
     }
 
     pub async fn read_global_buffer(&self, index: u32) -> Result<Bytes> {

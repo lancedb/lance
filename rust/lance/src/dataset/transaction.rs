@@ -36,7 +36,8 @@
 //! (1) Delete, update, and rewrite are compatible with each other and themselves only if
 //! they affect distinct fragments. Otherwise, they conflict.
 //! (2) Operations that mutate the config conflict if one of the operations upserts a key
-//! that if referenced by another concurrent operation.
+//! that if referenced by another concurrent operation or if both operations modify the schema
+//! metadata or the same field metadata.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -165,6 +166,8 @@ pub enum Operation {
     UpdateConfig {
         upsert_values: Option<HashMap<String, String>>,
         delete_keys: Option<Vec<String>>,
+        schema_metadata: Option<HashMap<String, String>>,
+        field_metadata: Option<HashMap<u32, HashMap<String, String>>>,
     },
 }
 
@@ -266,6 +269,38 @@ impl Operation {
         let self_ids = self.modified_fragment_ids().collect::<HashSet<_>>();
         let mut other_ids = other.modified_fragment_ids();
         other_ids.any(|id| self_ids.contains(&id))
+    }
+
+    fn modifies_same_metadata(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::UpdateConfig {
+                    schema_metadata,
+                    field_metadata,
+                    ..
+                },
+                Self::UpdateConfig {
+                    schema_metadata: other_schema_metadata,
+                    field_metadata: other_field_metadata,
+                    ..
+                },
+            ) => {
+                if schema_metadata.is_some() && other_schema_metadata.is_some() {
+                    return true;
+                }
+                if let Some(field_metadata) = field_metadata {
+                    if let Some(other_field_metadata) = other_field_metadata {
+                        for field in field_metadata.keys() {
+                            if other_field_metadata.contains_key(field) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     /// Check whether another operation upserts a key that is referenced by another operation
@@ -390,14 +425,33 @@ impl Transaction {
                 Operation::UpdateConfig { .. } => false,
                 _ => true,
             },
-            Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                match &other.operation {
-                    Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+            Operation::Overwrite { .. } => match &other.operation {
+                // Overwrite only conflicts with another operation modifying the same update config
+                Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+                    self.operation.upsert_key_conflict(&other.operation)
+                }
+                _ => false,
+            },
+            Operation::UpdateConfig {
+                schema_metadata,
+                field_metadata,
+                ..
+            } => match &other.operation {
+                Operation::Overwrite { .. } => {
+                    // Updates to schema metadata or field metadata conflict with any kind
+                    // of overwrite.
+                    if schema_metadata.is_some() || field_metadata.is_some() {
+                        true
+                    } else {
                         self.operation.upsert_key_conflict(&other.operation)
                     }
-                    _ => false,
                 }
-            }
+                Operation::UpdateConfig { .. } => {
+                    self.operation.upsert_key_conflict(&other.operation)
+                        | self.operation.modifies_same_metadata(&other.operation)
+                }
+                _ => false,
+            },
             // Merge changes the schema, but preserves row ids, so the only operations
             // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
             Operation::Merge { .. } => !matches!(
@@ -748,6 +802,8 @@ impl Transaction {
             Operation::UpdateConfig {
                 upsert_values,
                 delete_keys,
+                schema_metadata,
+                field_metadata,
             } => {
                 // Delete is handled first. If the same key is referenced by upsert and
                 // delete, then upserted key-value pair will remain.
@@ -762,6 +818,14 @@ impl Transaction {
                 }
                 if let Some(upsert_values) = upsert_values {
                     manifest.update_config(upsert_values.clone());
+                }
+                if let Some(schema_metadata) = schema_metadata {
+                    manifest.update_schema_metadata(schema_metadata.clone());
+                }
+                if let Some(field_metadata) = field_metadata {
+                    for (field_id, metadata) in field_metadata {
+                        manifest.update_field_metadata(*field_id as i32, metadata.clone());
+                    }
                 }
             }
             _ => {}
@@ -1068,6 +1132,8 @@ impl TryFrom<pb::Transaction> for Transaction {
             Some(pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 upsert_values,
                 delete_keys,
+                schema_metadata,
+                field_metadata,
             })) => {
                 let upsert_values = match upsert_values.len() {
                     0 => None,
@@ -1077,9 +1143,26 @@ impl TryFrom<pb::Transaction> for Transaction {
                     0 => None,
                     _ => Some(delete_keys),
                 };
+                let schema_metadata = match schema_metadata.len() {
+                    0 => None,
+                    _ => Some(schema_metadata),
+                };
+                let field_metadata = match field_metadata.len() {
+                    0 => None,
+                    _ => Some(
+                        field_metadata
+                            .into_iter()
+                            .map(|(field_id, field_meta_update)| {
+                                (field_id, field_meta_update.metadata)
+                            })
+                            .collect(),
+                    ),
+                };
                 Operation::UpdateConfig {
                     upsert_values,
                     delete_keys,
+                    schema_metadata,
+                    field_metadata,
                 }
             }
             None => {
@@ -1275,9 +1358,28 @@ impl From<&Transaction> for pb::Transaction {
             Operation::UpdateConfig {
                 upsert_values,
                 delete_keys,
+                schema_metadata,
+                field_metadata,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
                 upsert_values: upsert_values.clone().unwrap_or(Default::default()),
                 delete_keys: delete_keys.clone().unwrap_or(Default::default()),
+                schema_metadata: schema_metadata.clone().unwrap_or(Default::default()),
+                field_metadata: field_metadata
+                    .as_ref()
+                    .map(|field_metadata| {
+                        field_metadata
+                            .iter()
+                            .map(|(field_id, metadata)| {
+                                (
+                                    *field_id,
+                                    pb::transaction::update_config::FieldMetadataUpdate {
+                                        metadata: metadata.clone(),
+                                    },
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or(Default::default()),
             }),
         };
 
@@ -1483,6 +1585,14 @@ mod tests {
                     "value".to_string(),
                 )])),
                 delete_keys: Some(vec!["remove-key".to_string()]),
+                schema_metadata: Some(HashMap::from_iter(vec![(
+                    "schema-key".to_string(),
+                    "schema-value".to_string(),
+                )])),
+                field_metadata: Some(HashMap::from_iter(vec![(
+                    0,
+                    HashMap::from_iter(vec![("field-key".to_string(), "field-value".to_string())]),
+                )])),
             },
         ];
         let other_transactions = other_operations
@@ -1589,6 +1699,8 @@ mod tests {
                         "new-value".to_string(),
                     )])),
                     delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [
                     false, false, false, false, false, false, false, false, false,
@@ -1602,6 +1714,8 @@ mod tests {
                         "new-value".to_string(),
                     )])),
                     delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [false, false, false, false, false, false, false, false, true],
             ),
@@ -1613,6 +1727,8 @@ mod tests {
                         "new-value".to_string(),
                     )])),
                     delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [false, false, false, false, false, false, false, false, true],
             ),
@@ -1621,6 +1737,8 @@ mod tests {
                 Operation::UpdateConfig {
                     upsert_values: None,
                     delete_keys: Some(vec!["remove-key".to_string()]),
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [
                     false, false, false, false, false, false, false, false, false,
@@ -1631,8 +1749,57 @@ mod tests {
                 Operation::UpdateConfig {
                     upsert_values: None,
                     delete_keys: Some(vec!["lance.test".to_string()]),
+                    schema_metadata: None,
+                    field_metadata: None,
                 },
                 [false, false, false, false, false, false, false, false, true],
+            ),
+            (
+                // Changing schema metadata conflicts with another update changing schema
+                // metadata or with an overwrite
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: None,
+                    schema_metadata: Some(HashMap::from_iter(vec![(
+                        "schema-key".to_string(),
+                        "new-value".to_string(),
+                    )])),
+                    field_metadata: None,
+                },
+                [false, false, false, false, true, false, false, false, true],
+            ),
+            (
+                // Changing field metadata conflicts with another update changing same field
+                // metadata or overwrite
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: Some(HashMap::from_iter(vec![(
+                        0,
+                        HashMap::from_iter(vec![(
+                            "field_key".to_string(),
+                            "field_value".to_string(),
+                        )]),
+                    )])),
+                },
+                [false, false, false, false, true, false, false, false, true],
+            ),
+            (
+                // Updates to different field metadata are allowed
+                Operation::UpdateConfig {
+                    upsert_values: None,
+                    delete_keys: None,
+                    schema_metadata: None,
+                    field_metadata: Some(HashMap::from_iter(vec![(
+                        1,
+                        HashMap::from_iter(vec![(
+                            "field_key".to_string(),
+                            "field_value".to_string(),
+                        )]),
+                    )])),
+                },
+                [false, false, false, false, true, false, false, false, false],
             ),
         ];
 

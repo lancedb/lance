@@ -3,7 +3,6 @@
 
 //! IVF - Inverted File index.
 
-use core::fmt;
 use std::marker::PhantomData;
 use std::{
     any::Any,
@@ -55,7 +54,7 @@ use serde_json::json;
 use snafu::{location, Location};
 use tracing::instrument;
 
-use crate::index::vector::builder::index_type_string;
+use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};
 use crate::{
     index::{
         vector::{utils::PartitionLoadLock, VectorIndex},
@@ -67,9 +66,9 @@ use crate::{
 use super::{centroids_to_vectors, IvfIndexPartitionStatistics, IvfIndexStatistics};
 
 #[derive(Debug)]
-struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
-    index: S,
-    storage: Q::Storage,
+pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
+    pub index: S,
+    pub storage: Q::Storage,
 }
 
 /// IVF Index.
@@ -96,7 +95,6 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     /// The session cache, used when fetching pages
     #[allow(dead_code)]
     session: Weak<Session>,
-
     _marker: PhantomData<Q>,
 }
 
@@ -366,9 +364,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 }
 
 #[async_trait]
-impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'static> VectorIndex
-    for IVFIndex<S, Q>
-{
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
         if self.distance_type == DistanceType::Cosine {
@@ -413,19 +409,6 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
 
         self.ivf.find_partitions(&query.key, query.nprobes, dt)
     }
-
-    // async fn append(&self, batches: Vec<RecordBatch>) -> Result<()> {
-    //     IvfIndexBuilder::new(
-    //         dataset,
-    //         column,
-    //         index_dir,
-    //         distance_type,
-    //         shuffler,
-    //         ivf_params,
-    //         sub_index_params,
-    //         quantizer_params,
-    //     )
-    // }
 
     #[instrument(level = "debug", skip(self, pre_filter))]
     async fn search_in_partition(
@@ -477,17 +460,34 @@ impl<S: IvfSubIndex + fmt::Debug + 'static, Q: Quantization + fmt::Debug + 'stat
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        // This will be needed if we want to clean up IVF to allow more than just
-        // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
-        // remap to the lower layers.
-
-        // Currently, remapping for IVF is implemented in remap_index_file which
-        // mirrors some of the other IVF routines like build_ivf_pq_index
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         Err(Error::Index {
             message: "Remapping IVF in this way not supported".to_string(),
             location: location!(),
         })
+    }
+
+    async fn remap_to(
+        self: Arc<Self>,
+        store: ObjectStore,
+        mapping: &HashMap<u64, Option<u64>>,
+        column: String,
+        index_dir: Path,
+    ) -> Result<()> {
+        match self.sub_index_type() {
+            (SubIndexType::Flat, _) => {
+                let mut remapper =
+                    IvfIndexBuilder::<S, Q>::new_remapper(store, column, index_dir, self)?;
+                remapper.remap(mapping).await
+            }
+            _ => Err(Error::Index {
+                message: format!(
+                    "Remapping is not supported for index type {}",
+                    self.index_type(),
+                ),
+                location: location!(),
+            }),
+        }
     }
 
     fn ivf_model(&self) -> IvfModel {
@@ -518,9 +518,12 @@ mod tests {
     use std::collections::HashSet;
     use std::{collections::HashMap, ops::Range, sync::Arc};
 
-    use arrow::datatypes::UInt64Type;
+    use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
-    use arrow_array::{Array, FixedSizeListArray, RecordBatch, RecordBatchIterator};
+    use arrow_array::{
+        Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
 
@@ -531,40 +534,51 @@ mod tests {
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
+    use lance_linalg::distance::hamming::hamming;
     use lance_linalg::distance::DistanceType;
-    use lance_linalg::kernels::normalize_arrow;
     use lance_testing::datagen::generate_random_array_with_range;
+    use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
     use tempfile::tempdir;
 
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
+    use crate::dataset::UpdateBuilder;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
     const DIM: usize = 32;
 
-    async fn generate_test_dataset(
+    async fn generate_test_dataset<T: ArrowPrimitiveType>(
         test_uri: &str,
-        range: Range<f32>,
-    ) -> (Dataset, Arc<FixedSizeListArray>) {
-        let vectors = generate_random_array_with_range::<Float32Type>(1000 * DIM, range);
-        let vectors = normalize_arrow(&vectors).unwrap();
+        range: Range<T::Native>,
+    ) -> (Dataset, Arc<FixedSizeListArray>)
+    where
+        T::Native: SampleUniform,
+    {
+        let ids = Arc::new(UInt64Array::from_iter_values(0..1000));
+        let vectors = generate_random_array_with_range::<T>(1000 * DIM, range);
         let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
             .into_iter()
             .collect();
-
-        let schema: Arc<_> = Schema::new(vec![Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                DIM as i32,
+        let data_type = vectors.data_type().clone();
+        let schema: Arc<_> = Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
             ),
-            true,
-        )])
+        ])
         .with_metadata(metadata)
         .into();
-        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
-        let fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        if data_type != DataType::UInt8 {
+            fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        }
         let array = Arc::new(fsl);
-        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![ids, array.clone()]).unwrap();
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
@@ -574,16 +588,22 @@ mod tests {
     #[allow(dead_code)]
     fn ground_truth(
         vectors: &FixedSizeListArray,
-        query: &[f32],
+        query: &dyn Array,
         k: usize,
         distance_type: DistanceType,
     ) -> Vec<(f32, u64)> {
         let mut dists = vec![];
         for i in 0..vectors.len() {
-            let dist = distance_type.func()(
-                query,
-                vectors.value(i).as_primitive::<Float32Type>().values(),
-            );
+            let dist = match distance_type {
+                DistanceType::Hamming => hamming(
+                    query.as_primitive::<UInt8Type>().values(),
+                    vectors.value(i).as_primitive::<UInt8Type>().values(),
+                ),
+                _ => distance_type.func()(
+                    query.as_primitive::<Float32Type>().values(),
+                    vectors.value(i).as_primitive::<Float32Type>().values(),
+                ),
+            };
             dists.push((dist, i as u64));
         }
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -592,12 +612,31 @@ mod tests {
     }
 
     async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2).await;
+            }
+            _ => {
+                test_index_impl::<Float32Type>(params, nlist, recall_requirement, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_index_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        recall_requirement: f32,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
 
+        let vector_column = "vector";
         dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
             .await
             .unwrap();
 
@@ -605,7 +644,7 @@ mod tests {
         let k = 100;
         let result = dataset
             .scan()
-            .nearest("vector", query.as_primitive::<Float32Type>(), k)
+            .nearest(vector_column, query.as_primitive::<T>(), k)
             .unwrap()
             .nprobs(nlist)
             .with_row_id()
@@ -627,12 +666,7 @@ mod tests {
             .collect::<Vec<_>>();
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
 
-        let gt = ground_truth(
-            &vectors,
-            query.as_primitive::<Float32Type>().values(),
-            k,
-            params.metric_type,
-        );
+        let gt = ground_truth(&vectors, query.as_ref(), k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
@@ -645,10 +679,78 @@ mod tests {
         );
     }
 
+    async fn test_remap(params: VectorIndexParams, nlist: usize) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_remap_impl::<UInt8Type>(params, nlist, 0..2).await;
+            }
+            _ => {
+                test_remap_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_remap_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+
+        let vector_column = "vector";
+        dataset
+            .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        // delete half rows to trigger compact
+        dataset.delete("id < 500").await.unwrap();
+        // update the other half rows
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("id >= 500 and id<600")
+            .unwrap()
+            .set("id", "500+id")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let mut dataset = Dataset::open(update_result.new_dataset.uri())
+            .await
+            .unwrap();
+        let num_rows = dataset.count_rows(None).await.unwrap();
+        assert_eq!(num_rows, 500);
+        compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        // query again, the result should not include the deleted row
+        let result = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), 500)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = result["id"].as_primitive::<UInt64Type>();
+        assert_eq!(row_ids.len(), 500);
+        row_ids.values().iter().for_each(|id| {
+            assert!(*id >= 600);
+        });
+    }
+
     #[rstest]
     #[case(4, DistanceType::L2, 1.0)]
     #[case(4, DistanceType::Cosine, 1.0)]
     #[case(4, DistanceType::Dot, 1.0)]
+    #[case(4, DistanceType::Hamming, 0.9)]
     #[tokio::test]
     async fn test_build_ivf_flat(
         #[case] nlist: usize,
@@ -656,7 +758,8 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -672,7 +775,8 @@ mod tests {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -690,7 +794,8 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -708,7 +813,8 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        test_remap(params, nlist).await;
     }
 
     #[rstest]
@@ -777,24 +883,30 @@ mod tests {
         test_index(params, nlist, recall_requirement).await;
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_index_stats() {
+    async fn test_index_stats(
+        #[values(
+            (VectorIndexParams::ivf_flat(4, DistanceType::Hamming), IndexType::IvfFlat),
+            (VectorIndexParams::ivf_pq(4, 8, 8, DistanceType::L2, 10), IndexType::IvfPq),
+            (VectorIndexParams::with_ivf_hnsw_sq_params(
+                DistanceType::Cosine,
+                IvfBuildParams::new(4),
+                Default::default(),
+                Default::default()
+            ), IndexType::IvfHnswSq),
+        )]
+        index: (VectorIndexParams, IndexType),
+    ) {
+        let (params, index_type) = index;
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 4;
-        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
-
-        let ivf_params = IvfBuildParams::new(nlist);
-        let sq_params = SQBuildParams::default();
-        let hnsw_params = HnswBuildParams::default();
-        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
-            DistanceType::L2,
-            ivf_params,
-            hnsw_params,
-            sq_params,
-        );
-
+        let (mut dataset, _) = match params.metric_type {
+            DistanceType::Hamming => generate_test_dataset::<UInt8Type>(test_uri, 0..2).await,
+            _ => generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await,
+        };
         dataset
             .create_index(
                 &["vector"],
@@ -809,14 +921,29 @@ mod tests {
         let stats = dataset.index_statistics("test_index").await.unwrap();
         let stats: serde_json::Value = serde_json::from_str(stats.as_str()).unwrap();
 
-        assert_eq!(stats["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+        assert_eq!(
+            stats["index_type"].as_str().unwrap(),
+            index_type.to_string()
+        );
         for index in stats["indices"].as_array().unwrap() {
-            assert_eq!(index["index_type"].as_str().unwrap(), "IVF_HNSW_SQ");
+            assert_eq!(
+                index["index_type"].as_str().unwrap(),
+                index_type.to_string()
+            );
             assert_eq!(
                 index["num_partitions"].as_number().unwrap(),
                 &serde_json::Number::from(nlist)
             );
-            assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
+
+            let sub_index = match index_type {
+                IndexType::IvfHnswPq | IndexType::IvfHnswSq => "HNSW",
+                IndexType::IvfPq => "PQ",
+                _ => "FLAT",
+            };
+            assert_eq!(
+                index["sub_index"]["index_type"].as_str().unwrap(),
+                sub_index
+            );
         }
     }
 
@@ -826,7 +953,7 @@ mod tests {
         let test_uri = test_dir.path().to_str().unwrap();
 
         let nlist = 1000;
-        let (mut dataset, _) = generate_test_dataset(test_uri, 0.0..1.0).await;
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
         let sq_params = SQBuildParams::default();

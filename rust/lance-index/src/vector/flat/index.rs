@@ -4,6 +4,7 @@
 //! Flat Vector Index.
 //!
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
@@ -28,7 +29,7 @@ use crate::{
     },
 };
 
-use super::storage::{FlatStorage, FLAT_COLUMN};
+use super::storage::{FlatBinStorage, FlatFloatStorage, FLAT_COLUMN};
 
 /// A Flat index is any index that stores no metadata, and
 /// during query, it simply scans over the storage and returns the top k results
@@ -134,6 +135,10 @@ impl IvfSubIndex for FlatIndex {
         Ok(Self {})
     }
 
+    fn remap(&self, _: &HashMap<u64, Option<u64>>) -> Result<Self> {
+        Ok(self.clone())
+    }
+
     fn to_batch(&self) -> Result<RecordBatch> {
         Ok(RecordBatch::new_empty(Schema::empty().into()))
     }
@@ -166,7 +171,7 @@ impl FlatQuantizer {
 impl Quantization for FlatQuantizer {
     type BuildParams = ();
     type Metadata = FlatMetadata;
-    type Storage = FlatStorage;
+    type Storage = FlatFloatStorage;
 
     fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
         let dim = data.as_fixed_size_list().value_length();
@@ -223,6 +228,84 @@ impl TryFrom<Quantizer> for FlatQuantizer {
             Quantizer::Flat(quantizer) => Ok(quantizer),
             _ => Err(Error::invalid_input(
                 "quantizer is not FlatQuantizer",
+                location!(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, DeepSizeOf)]
+pub struct FlatBinQuantizer {
+    dim: usize,
+    distance_type: DistanceType,
+}
+
+impl FlatBinQuantizer {
+    pub fn new(dim: usize, distance_type: DistanceType) -> Self {
+        Self { dim, distance_type }
+    }
+}
+
+impl Quantization for FlatBinQuantizer {
+    type BuildParams = ();
+    type Metadata = FlatMetadata;
+    type Storage = FlatBinStorage;
+
+    fn build(data: &dyn Array, distance_type: DistanceType, _: &Self::BuildParams) -> Result<Self> {
+        let dim = data.as_fixed_size_list().value_length();
+        Ok(Self::new(dim as usize, distance_type))
+    }
+
+    fn code_dim(&self) -> usize {
+        self.dim
+    }
+
+    fn column(&self) -> &'static str {
+        FLAT_COLUMN
+    }
+
+    fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        Ok(Quantizer::FlatBin(Self {
+            dim: metadata.dim,
+            distance_type,
+        }))
+    }
+
+    fn metadata(
+        &self,
+        _: Option<crate::vector::quantizer::QuantizationMetadata>,
+    ) -> Result<serde_json::Value> {
+        let metadata = FlatMetadata { dim: self.dim };
+        Ok(serde_json::to_value(metadata)?)
+    }
+
+    fn metadata_key() -> &'static str {
+        "flat"
+    }
+
+    fn quantization_type() -> QuantizationType {
+        QuantizationType::Flat
+    }
+
+    fn quantize(&self, vectors: &dyn Array) -> Result<ArrayRef> {
+        Ok(vectors.slice(0, vectors.len()))
+    }
+}
+
+impl From<FlatBinQuantizer> for Quantizer {
+    fn from(value: FlatBinQuantizer) -> Self {
+        Self::FlatBin(value)
+    }
+}
+
+impl TryFrom<Quantizer> for FlatBinQuantizer {
+    type Error = Error;
+
+    fn try_from(value: Quantizer) -> Result<Self> {
+        match value {
+            Quantizer::FlatBin(quantizer) => Ok(quantizer),
+            _ => Err(Error::invalid_input(
+                "quantizer is not FlatBinQuantizer",
                 location!(),
             )),
         }

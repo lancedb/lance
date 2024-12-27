@@ -210,7 +210,8 @@ async fn test_decode(
             assert_eq!(expected.data_type(), actual.data_type());
             if expected.len() != actual.len() {
                 panic!(
-                    "Mismatch in length expected {} but got {}",
+                    "Mismatch in length (at offset={}) expected {} but got {}",
+                    offset,
                     expected.len(),
                     actual.len()
                 );
@@ -223,8 +224,9 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
                             i,
+                            offset,
                             expected,
                             actual,
                             expected.slice(i, 1),
@@ -503,8 +505,15 @@ async fn check_round_trip_encoding_inner(
     for arr in &data {
         let mut external_buffers = writer.new_external_buffers();
         let repdef = RepDefBuilder::default();
+        let num_rows = arr.len() as u64;
         let encode_tasks = encoder
-            .maybe_encode(arr.clone(), &mut external_buffers, repdef, row_number)
+            .maybe_encode(
+                arr.clone(),
+                &mut external_buffers,
+                repdef,
+                row_number,
+                num_rows,
+            )
             .unwrap();
         for buffer in external_buffers.take_buffers() {
             writer.write_lance_buffer(buffer);

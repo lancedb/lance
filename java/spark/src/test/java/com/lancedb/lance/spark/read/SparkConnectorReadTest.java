@@ -162,6 +162,13 @@ public class SparkConnectorReadTest {
             .collect(Collectors.toList()));
   }
 
-  // TODO(lu) support spark.read().format("lance")
-  //    .load(dbPath.resolve(datasetName).toString());
+  @Test
+  public void supportDataSourceLoadPath() {
+    Dataset<Row> df =
+        spark
+            .read()
+            .format("lance")
+            .load(LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName));
+    validateData(df, TestUtils.TestTable1Config.expectedValues);
+  }
 }

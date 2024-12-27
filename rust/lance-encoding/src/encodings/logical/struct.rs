@@ -15,6 +15,7 @@ use futures::{
     FutureExt, StreamExt, TryStreamExt,
 };
 use itertools::Itertools;
+use lance_arrow::FieldExt;
 use log::trace;
 use snafu::{location, Location};
 
@@ -31,7 +32,7 @@ use crate::{
 };
 use lance_core::{Error, Result};
 
-use super::primitive::StructuralPrimitiveFieldDecoder;
+use super::{list::StructuralListDecoder, primitive::StructuralPrimitiveFieldDecoder};
 
 #[derive(Debug)]
 struct SchedulingJobWithStatus<'a> {
@@ -607,8 +608,22 @@ impl StructuralStructDecoder {
         should_validate: bool,
     ) -> Box<dyn StructuralFieldDecoder> {
         match field.data_type() {
-            DataType::Struct(fields) => Box::new(Self::new(fields.clone(), should_validate, false)),
-            DataType::List(_) | DataType::LargeList(_) => todo!(),
+            DataType::Struct(fields) => {
+                if field.is_packed_struct() {
+                    let decoder =
+                        StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
+                    Box::new(decoder)
+                } else {
+                    Box::new(Self::new(fields.clone(), should_validate, false))
+                }
+            }
+            DataType::List(child_field) | DataType::LargeList(child_field) => {
+                let child_decoder = Self::field_to_decoder(child_field, should_validate);
+                Box::new(StructuralListDecoder::new(
+                    child_decoder,
+                    field.data_type().clone(),
+                ))
+            }
             DataType::RunEndEncoded(_, _) => todo!(),
             DataType::ListView(_) | DataType::LargeListView(_) => todo!(),
             DataType::Map(_, _) => todo!(),
@@ -848,6 +863,7 @@ impl FieldEncoder for StructStructuralEncoder {
         external_buffers: &mut OutOfLineBuffers,
         mut repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let struct_array = array.as_struct();
         if let Some(validity) = struct_array.nulls() {
@@ -860,7 +876,13 @@ impl FieldEncoder for StructStructuralEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())
@@ -925,6 +947,7 @@ impl FieldEncoder for StructFieldEncoder {
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         self.num_rows_seen += array.len() as u64;
         let struct_array = array.as_struct();
@@ -933,7 +956,13 @@ impl FieldEncoder for StructFieldEncoder {
             .iter_mut()
             .zip(struct_array.columns().iter())
             .map(|(encoder, arr)| {
-                encoder.maybe_encode(arr.clone(), external_buffers, repdef.clone(), row_number)
+                encoder.maybe_encode(
+                    arr.clone(),
+                    external_buffers,
+                    repdef.clone(),
+                    row_number,
+                    num_rows,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(child_tasks.into_iter().flatten().collect::<Vec<_>>())

@@ -12,9 +12,10 @@ use std::{
 
 use arrow::array::AsArray;
 use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
-use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer};
+use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
+use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_array;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::utils::hash::U8SliceKey;
@@ -26,7 +27,7 @@ use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
-    DefinitionInterpretation,
+    DefinitionInterpretation, RepDefSlicer,
 };
 use crate::statistics::{ComputeStat, GetStat, Stat};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
@@ -281,6 +282,15 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
 struct ChunkMeta {
     num_values: u64,
     chunk_size_bytes: u64,
+    offset_bytes: u64,
+}
+
+/// A mini-block chunk that has been decoded and decompressed
+#[derive(Debug)]
+struct DecodedMiniBlockChunk {
+    rep: Option<ScalarBuffer<u16>>,
+    def: Option<ScalarBuffer<u16>>,
+    values: DataBlock,
 }
 
 /// A task to decode a one or more mini-blocks of data into an output batch
@@ -298,23 +308,15 @@ struct DecodeMiniBlockTask {
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     dictionary_data: Option<Arc<DataBlock>>,
     def_meaning: Arc<[DefinitionInterpretation]>,
-    // The mini-blocks to decode
-    //
-    // For each mini-block we also have the ranges of rows that we want to decode
-    // from that mini-block.  For example, if the user asks for rows 10, 10000, and 20000
-    // then we will have three chunks here and each chunk will have a small range of 1 row.
-    chunks: Vec<ScheduledChunk>,
-    // The offset into the first chunk that we want to start decoding from
-    offset_into_first_chunk: u64,
-    // The total number of rows that we are decoding
-    num_rows: u64,
+    max_visible_level: u16,
+    instructions: Vec<(ChunkDrainInstructions, LoadedChunk)>,
 }
 
 impl DecodeMiniBlockTask {
     fn decode_levels(
         rep_decompressor: &dyn BlockDecompressor,
         levels: LanceBuffer,
-    ) -> Result<Option<impl AsRef<[u16]>>> {
+    ) -> Result<Option<ScalarBuffer<u16>>> {
         let rep = rep_decompressor.decompress(levels)?;
         match rep {
             DataBlock::FixedWidth(mut rep) => Ok(Some(rep.data.borrow_to_typed_slice::<u16>())),
@@ -340,7 +342,6 @@ impl DecodeMiniBlockTask {
     // yet) and the case where `level_buf` is None (the input we are copying from has
     // no nulls)
     fn extend_levels(
-        offset: usize,
         range: Range<u64>,
         levels: &mut Option<LevelBuffer>,
         level_buf: &Option<impl AsRef<[u16]>>,
@@ -351,7 +352,7 @@ impl DecodeMiniBlockTask {
                 // This is the first non-empty def buf we've hit, fill in the past
                 // with 0 (valid)
                 let mut new_levels_vec =
-                    LevelBuffer::with_capacity(offset + (range.end - range.start) as usize);
+                    LevelBuffer::with_capacity(dest_offset + (range.end - range.start) as usize);
                 new_levels_vec.extend(iter::repeat(0).take(dest_offset));
                 *levels = Some(new_levels_vec);
             }
@@ -367,6 +368,262 @@ impl DecodeMiniBlockTask {
             levels.extend(iter::repeat(0).take(num_values));
         }
     }
+
+    /// Maps a range of rows to a range of items and a range of levels
+    ///
+    /// If there is no repetition information this just returns the range as-is.
+    ///
+    /// If there is repetition information then we need to do some work to figure out what
+    /// range of items corresponds to the requested range of rows.
+    ///
+    /// For example, if the data is [[1, 2, 3], [4, 5], [6, 7]] and the range is 1..2 (i.e. just row
+    /// 1) then the user actually wants items 3..5.  In the above case the rep levels would be:
+    ///
+    /// Idx: 0 1 2 3 4 5 6
+    /// Rep: 1 0 0 1 0 1 0
+    ///
+    /// So the start (1) maps to the second 1 (idx=3) and the end (2) maps to the third 1 (idx=5)
+    ///
+    /// If there are invisible items then we don't count them when calcuating the range of items we
+    /// are interested in but we do count them when calculating the range of levels we are interested
+    /// in.  As a result we have to return both the item range (first return value) and the level range
+    /// (second return value).
+    ///
+    /// For example, if the data is [[1, 2, 3], [4, 5], NULL, [6, 7, 8]] and the range is 2..4 then the
+    /// user wants items 5..8 but they want levels 5..9.  In the above case the rep/def levels would be:
+    ///
+    /// Idx: 0 1 2 3 4 5 6 7 8
+    /// Rep: 1 0 0 1 0 1 1 0 0
+    /// Def: 0 0 0 0 0 1 0 0 0
+    /// Itm: 1 2 3 4 5 6 7 8
+    ///
+    /// Finally, we have to contend with the fact that chunks may or may not start with a "preamble" of
+    /// trailing values that finish up a list from the previous chunk.  In this case the first item does
+    /// not start at max_rep because it is a continuation of the previous chunk.  For our purposes we do
+    /// not consider this a "row" and so the range 0..1 will refer to the first row AFTER the preamble.
+    ///
+    /// We have a separate parameter (`preamble_action`) to control whether we want the preamble or not.
+    ///
+    /// Note that the "trailer" is considered a "row" and if we want it we should include it in the range.
+    fn map_range(
+        range: Range<u64>,
+        rep: Option<&impl AsRef<[u16]>>,
+        def: Option<&impl AsRef<[u16]>>,
+        max_rep: u16,
+        max_visible_def: u16,
+        // The total number of items (not rows) in the chunk.  This is not quite the same as
+        // rep.len() / def.len() because it doesn't count invisible items
+        total_items: u64,
+        preamble_action: PreambleAction,
+    ) -> (Range<u64>, Range<u64>) {
+        if let Some(rep) = rep {
+            let mut rep = rep.as_ref();
+            // If there is a preamble and we need to skip it then do that first.  The work is the same
+            // whether there is def information or not
+            let mut items_in_preamble = 0;
+            let first_row_start = match preamble_action {
+                PreambleAction::Skip | PreambleAction::Take => {
+                    let first_row_start = if let Some(def) = def.as_ref() {
+                        let mut first_row_start = None;
+                        for (idx, (rep, def)) in rep.iter().zip(def.as_ref()).enumerate() {
+                            if *rep == max_rep {
+                                first_row_start = Some(idx);
+                                break;
+                            }
+                            if *def <= max_visible_def {
+                                items_in_preamble += 1;
+                            }
+                        }
+                        first_row_start
+                    } else {
+                        let first_row_start = rep.iter().position(|&r| r == max_rep);
+                        items_in_preamble = first_row_start.unwrap_or(rep.len());
+                        first_row_start
+                    };
+                    // It is possible for a chunk to be entirely partial values but if it is then it
+                    // should never show up as a preamble to skip
+                    if first_row_start.is_none() {
+                        assert!(preamble_action == PreambleAction::Take);
+                        return (0..total_items, 0..rep.len() as u64);
+                    }
+                    let first_row_start = first_row_start.unwrap() as u64;
+                    rep = &rep[first_row_start as usize..];
+                    first_row_start
+                }
+                PreambleAction::Absent => {
+                    debug_assert!(rep[0] == max_rep);
+                    0
+                }
+            };
+
+            // We hit this case when all we needed was the preamble
+            if range.start == range.end {
+                debug_assert!(preamble_action == PreambleAction::Take);
+                return (0..items_in_preamble as u64, 0..first_row_start);
+            }
+            assert!(range.start < range.end);
+
+            let mut rows_seen = 0;
+            let mut new_start = 0;
+            let mut new_levels_start = 0;
+
+            if let Some(def) = def {
+                let def = &def.as_ref()[first_row_start as usize..];
+
+                // range.start == 0 always maps to 0 (even with invis items), otherwise we need to walk
+                let mut lead_invis_seen = 0;
+
+                if range.start > 0 {
+                    if def[0] > max_visible_def {
+                        lead_invis_seen += 1;
+                    }
+                    for (idx, (rep, def)) in rep.iter().zip(def).skip(1).enumerate() {
+                        if *rep == max_rep {
+                            rows_seen += 1;
+                            if rows_seen == range.start {
+                                new_start = idx as u64 + 1 - lead_invis_seen;
+                                new_levels_start = idx as u64 + 1;
+                                break;
+                            }
+                            if *def > max_visible_def {
+                                lead_invis_seen += 1;
+                            }
+                        }
+                    }
+                }
+
+                rows_seen += 1;
+
+                let mut new_end = u64::MAX;
+                let mut new_levels_end = rep.len() as u64;
+                let new_start_is_visible = def[new_levels_start as usize] <= max_visible_def;
+                let mut tail_invis_seen = if new_start_is_visible { 0 } else { 1 };
+                for (idx, (rep, def)) in rep[(new_levels_start + 1) as usize..]
+                    .iter()
+                    .zip(&def[(new_levels_start + 1) as usize..])
+                    .enumerate()
+                {
+                    if *rep == max_rep {
+                        rows_seen += 1;
+                        if rows_seen == range.end + 1 {
+                            new_end = idx as u64 + new_start + 1 - tail_invis_seen;
+                            new_levels_end = idx as u64 + new_levels_start + 1;
+                            break;
+                        }
+                        if *def > max_visible_def {
+                            tail_invis_seen += 1;
+                        }
+                    }
+                }
+
+                if new_end == u64::MAX {
+                    new_levels_end = rep.len() as u64;
+                    // This is the total number of visible items (minus any items in the preamble)
+                    let total_invis_seen = lead_invis_seen + tail_invis_seen;
+                    new_end = rep.len() as u64 - total_invis_seen;
+                }
+
+                assert_ne!(new_end, u64::MAX);
+
+                // Adjust for any skipped preamble
+                if preamble_action == PreambleAction::Skip {
+                    // TODO: Should this be items_in_preamble?  If so, add a
+                    // unit test for this case
+                    new_start += first_row_start;
+                    new_end += first_row_start;
+                    new_levels_start += first_row_start;
+                    new_levels_end += first_row_start;
+                } else if preamble_action == PreambleAction::Take {
+                    debug_assert_eq!(new_start, 0);
+                    debug_assert_eq!(new_levels_start, 0);
+                    new_end += first_row_start;
+                    new_levels_end += first_row_start;
+                }
+
+                (new_start..new_end, new_levels_start..new_levels_end)
+            } else {
+                // Easy case, there are no invisible items, so we don't need to check for them
+                // The items range and levels range will be the same.  We do still need to walk
+                // the rep levels to find the row boundaries
+
+                // range.start == 0 always maps to 0, otherwise we need to walk
+                if range.start > 0 {
+                    for (idx, rep) in rep.iter().skip(1).enumerate() {
+                        if *rep == max_rep {
+                            rows_seen += 1;
+                            if rows_seen == range.start {
+                                new_start = idx as u64 + 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let mut new_end = rep.len() as u64;
+                // range.end == max_items always maps to rep.len(), otherwise we need to walk
+                if range.end < total_items {
+                    for (idx, rep) in rep[(new_start + 1) as usize..].iter().enumerate() {
+                        if *rep == max_rep {
+                            rows_seen += 1;
+                            if rows_seen == range.end {
+                                new_end = idx as u64 + new_start + 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Adjust for any skipped preamble
+                if preamble_action == PreambleAction::Skip {
+                    new_start += first_row_start;
+                    new_end += first_row_start;
+                } else if preamble_action == PreambleAction::Take {
+                    debug_assert_eq!(new_start, 0);
+                    new_end += first_row_start;
+                }
+
+                (new_start..new_end, new_start..new_end)
+            }
+        } else {
+            // No repetition info, easy case, just use the range as-is and the item
+            // and level ranges are the same
+            (range.clone(), range)
+        }
+    }
+
+    // Unwraps a miniblock chunk's "envelope" into the rep, def, and data buffers
+    fn decode_miniblock_chunk(
+        &self,
+        buf: &LanceBuffer,
+        items_in_chunk: u64,
+    ) -> Result<DecodedMiniBlockChunk> {
+        // The first 6 bytes describe the size of the remaining buffers
+        let bytes_rep = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let bytes_def = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+        let bytes_val = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+
+        debug_assert!(buf.len() >= bytes_rep + bytes_def + bytes_val + 6);
+        debug_assert!(
+            buf.len()
+                <= bytes_rep
+                                + bytes_def
+                                + bytes_val
+                                + 6
+                                + 1 // P1
+                                + (2 * MINIBLOCK_MAX_PADDING) // P2/P3
+        );
+        let p1 = bytes_rep % 2;
+        let rep = buf.slice_with_length(6, bytes_rep);
+        let def = buf.slice_with_length(6 + bytes_rep + p1, bytes_def);
+        let p2 = pad_bytes::<MINIBLOCK_ALIGNMENT>(6 + bytes_rep + p1 + bytes_def);
+        let values = buf.slice_with_length(6 + bytes_rep + bytes_def + p2, bytes_val);
+
+        let values = self.value_decompressor.decompress(values, items_in_chunk)?;
+
+        let rep = Self::decode_levels(self.rep_decompressor.as_ref(), rep)?;
+        let def = Self::decode_levels(self.def_decompressor.as_ref(), def)?;
+
+        Ok(DecodedMiniBlockChunk { rep, def, values })
+    }
 }
 
 impl DecodePageTask for DecodeMiniBlockTask {
@@ -374,101 +631,51 @@ impl DecodePageTask for DecodeMiniBlockTask {
         // First, we create output buffers for the rep and def and data
         let mut repbuf: Option<LevelBuffer> = None;
         let mut defbuf: Option<LevelBuffer> = None;
-        let rep_decompressor = self.rep_decompressor;
-        let def_decompressor = self.def_decompressor;
 
-        let mut remaining = self.num_rows;
+        let max_rep = self.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
+
+        // This is probably an over-estimate but it's quick and easy to calculate
         let estimated_size_bytes = self
-            .chunks
+            .instructions
             .iter()
-            .map(|chunk| chunk.data.len())
+            .map(|(_, chunk)| chunk.data.len())
             .sum::<usize>()
             * 2;
         let mut data_builder =
             DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
-        let mut to_skip = self.offset_into_first_chunk;
+
         // We need to keep track of the offset into repbuf/defbuf that we are building up
         let mut level_offset = 0;
-        // Now we iterate through each chunk and decode the data into the output buffers
-        for chunk in self.chunks.into_iter() {
-            // We always decode the entire chunk
-            let buf = chunk.data.into_buffer();
-            // The first 6 bytes describe the size of the remaining buffers
-            let bytes_rep = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-            let bytes_def = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-            let bytes_val = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+        // Now we iterate through each instruction and process it
+        for (instructions, chunk) in self.instructions.iter() {
+            // TODO: It's very possible that we have duplicate `buf` in self.instructions and we
+            // don't want to decode the buf again and again on the same thread.
 
-            debug_assert!(buf.len() >= bytes_rep + bytes_def + bytes_val + 6);
-            debug_assert!(
-                buf.len()
-                    <= bytes_rep
-                        + bytes_def
-                        + bytes_val
-                        + 6
-                        + 1 // P1
-                        + (2 * MINIBLOCK_MAX_PADDING) // P2/P3
+            let DecodedMiniBlockChunk { rep, def, values } =
+                self.decode_miniblock_chunk(&chunk.data, chunk.items_in_chunk)?;
+
+            // Our instructions tell us which rows we want to take from this chunk
+            let row_range_start =
+                instructions.rows_to_skip + instructions.chunk_instructions.rows_to_skip;
+            let row_range_end = row_range_start + instructions.rows_to_take;
+
+            // We use the rep info to map the row range to an item range / levels range
+            let (item_range, level_range) = Self::map_range(
+                row_range_start..row_range_end,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                self.max_visible_level,
+                chunk.items_in_chunk,
+                instructions.preamble_action,
             );
-            let p1 = bytes_rep % 2;
-            let rep = buf.slice_with_length(6, bytes_rep);
-            let def = buf.slice_with_length(6 + bytes_rep + p1, bytes_def);
-            let p2 = pad_bytes::<MINIBLOCK_ALIGNMENT>(6 + bytes_rep + p1 + bytes_def);
-            let values = buf.slice_with_length(6 + bytes_rep + bytes_def + p2, bytes_val);
 
-            let values = self
-                .value_decompressor
-                .decompress(LanceBuffer::Borrowed(values), chunk.vals_in_chunk)?;
-
-            let rep = Self::decode_levels(rep_decompressor.as_ref(), LanceBuffer::Borrowed(rep))?;
-            let def = Self::decode_levels(def_decompressor.as_ref(), LanceBuffer::Borrowed(def))?;
-
-            // We've decoded the entire block.  Now we need to factor in:
-            // - The offset into the first chunk
-            // - The ranges the user asked for
-            // - The total # of rows in this task
-            //
-            // From these we can figure out which values to keep.
-            //
-            // For example, maybe we've are asked to decode 100 rows, with an offset of 50, from
-            // a block with 1024 values, and the user asked for the ranges 400..500 and 600..700
-            //
-            // In this case we want to take the values 450..500 and 600..650 from the block.
-            let mut offset = to_skip;
-            for range in chunk.ranges {
-                if to_skip > range.end - range.start {
-                    to_skip -= range.end - range.start;
-                    continue;
-                }
-                // Subtract skip from start of range
-                let range = range.start + to_skip..range.end;
-                to_skip = 0;
-
-                // Truncate range to fit remaining
-                let range_len = range.end - range.start;
-                let to_take = range_len.min(remaining);
-                let range = range.start..range.start + to_take;
-
-                // Grab values and add to what we are building
-                Self::extend_levels(
-                    offset as usize,
-                    range.clone(),
-                    &mut repbuf,
-                    &rep,
-                    level_offset,
-                );
-                Self::extend_levels(
-                    offset as usize,
-                    range.clone(),
-                    &mut defbuf,
-                    &def,
-                    level_offset,
-                );
-                data_builder.append(&values, range);
-                remaining -= to_take;
-                offset += to_take;
-                level_offset += to_take as usize;
-            }
+            // Now we append the data to the output buffers
+            Self::extend_levels(level_range.clone(), &mut repbuf, &rep, level_offset);
+            Self::extend_levels(level_range.clone(), &mut defbuf, &def, level_offset);
+            level_offset += (level_range.end - level_range.start) as usize;
+            data_builder.append(&values, item_range);
         }
-        debug_assert_eq!(remaining, 0);
 
         let data = data_builder.finish();
 
@@ -506,6 +713,28 @@ impl DecodePageTask for DecodeMiniBlockTask {
     }
 }
 
+/// A chunk that has been loaded by the miniblock scheduler (but not
+/// yet decoded)
+#[derive(Debug)]
+struct LoadedChunk {
+    data: LanceBuffer,
+    items_in_chunk: u64,
+    byte_range: Range<u64>,
+    chunk_idx: usize,
+}
+
+impl Clone for LoadedChunk {
+    fn clone(&self) -> Self {
+        Self {
+            // Safe as we always create borrowed buffers here
+            data: self.data.try_clone().unwrap(),
+            items_in_chunk: self.items_in_chunk,
+            byte_range: self.byte_range.clone(),
+            chunk_idx: self.chunk_idx,
+        }
+    }
+}
+
 /// Decodes mini-block formatted data.  See [`PrimitiveStructuralEncoder`] for more
 /// details on the different layouts.
 #[derive(Debug)]
@@ -514,48 +743,250 @@ struct MiniBlockDecoder {
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     def_meaning: Arc<[DefinitionInterpretation]>,
-    data: VecDeque<ScheduledChunk>,
+    loaded_chunks: VecDeque<LoadedChunk>,
+    instructions: VecDeque<ChunkInstructions>,
     offset_in_current_chunk: u64,
     num_rows: u64,
     dictionary: Option<Arc<DataBlock>>,
 }
 
+/// See [`MiniBlockScheduler`] for more details on the scheduling and decoding
+/// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
-        let mut remaining = num_rows;
-        let mut chunks = Vec::new();
-        let offset_into_first_chunk = self.offset_in_current_chunk;
-        while remaining > 0 {
-            if remaining >= self.data.front().unwrap().vals_targeted - self.offset_in_current_chunk
+        let mut rows_desired = num_rows;
+        let mut need_preamble = false;
+        let mut skip_in_chunk = self.offset_in_current_chunk;
+        let mut drain_instructions = Vec::new();
+        while rows_desired > 0 || need_preamble {
+            let (instructions, consumed) = self
+                .instructions
+                .front()
+                .unwrap()
+                .drain_from_instruction(&mut rows_desired, &mut need_preamble, &mut skip_in_chunk);
+
+            while self.loaded_chunks.front().unwrap().chunk_idx
+                != instructions.chunk_instructions.chunk_idx
             {
-                // We are fully consuming the next chunk
-                let chunk = self.data.pop_front().unwrap();
-                remaining -= chunk.vals_targeted - self.offset_in_current_chunk;
-                chunks.push(chunk);
-                self.offset_in_current_chunk = 0;
-            } else {
-                // We are partially consuming the next chunk
-                let chunk = self.data.front().unwrap().clone();
-                self.offset_in_current_chunk += remaining;
-                debug_assert!(self.offset_in_current_chunk > 0);
-                remaining = 0;
-                chunks.push(chunk);
+                self.loaded_chunks.pop_front();
+            }
+            drain_instructions.push((instructions, self.loaded_chunks.front().unwrap().clone()));
+            if consumed {
+                self.instructions.pop_front();
             }
         }
+        // We can throw away need_preamble here because it must be false.  If it were true it would mean
+        // we were still in the middle of loading rows.  We do need to latch skip_in_chunk though.
+        self.offset_in_current_chunk = skip_in_chunk;
+
+        let max_visible_level = self
+            .def_meaning
+            .iter()
+            .take_while(|l| !l.is_list())
+            .map(|l| l.num_def_levels())
+            .sum::<u16>();
+
         Ok(Box::new(DecodeMiniBlockTask {
-            chunks,
-            rep_decompressor: self.rep_decompressor.clone(),
+            instructions: drain_instructions,
             def_decompressor: self.def_decompressor.clone(),
+            rep_decompressor: self.rep_decompressor.clone(),
             value_decompressor: self.value_decompressor.clone(),
             dictionary_data: self.dictionary.clone(),
+            def_meaning: self.def_meaning.clone(),
+            max_visible_level,
+        }))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+}
+
+/// A scheduler for all-null data that has repetition and definition levels
+///
+/// We still need to do some I/O in this case because we need to figure out what kind of null we
+/// are dealing with (null list, null struct, what level null struct, etc.)
+///
+/// TODO: Right now we just load the entire rep/def at initialization time and cache it.  This is a touch
+/// RAM aggressive and maybe we want something more lazy in the future.  On the other hand, it's simple
+/// and fast so...maybe not :)
+#[derive(Debug)]
+pub struct ComplexAllNullScheduler {
+    // Set from protobuf
+    buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+    // Set during initialization
+    rep: Option<ScalarBuffer<u16>>,
+    def: Option<ScalarBuffer<u16>>,
+}
+
+impl ComplexAllNullScheduler {
+    pub fn new(
+        buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
+        def_meaning: Arc<[DefinitionInterpretation]>,
+    ) -> Self {
+        Self {
+            buffer_offsets_and_sizes,
+            def_meaning,
+            rep: None,
+            def: None,
+        }
+    }
+}
+
+impl StructuralPageScheduler for ComplexAllNullScheduler {
+    fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+        // Fully load the rep & def buffers, as needed
+        let (rep_pos, rep_size) = self.buffer_offsets_and_sizes[0];
+        let (def_pos, def_size) = self.buffer_offsets_and_sizes[1];
+        let has_rep = rep_size > 0;
+        let has_def = def_size > 0;
+
+        let mut reads = Vec::with_capacity(2);
+        if has_rep {
+            reads.push(rep_pos..rep_pos + rep_size);
+        }
+        if has_def {
+            reads.push(def_pos..def_pos + def_size);
+        }
+
+        let data = io.submit_request(reads, 0);
+
+        async move {
+            let data = data.await?;
+            let mut data_iter = data.into_iter();
+
+            if has_rep {
+                let rep = data_iter.next().unwrap();
+                let mut rep = LanceBuffer::from_bytes(rep, 2);
+                let rep = rep.borrow_to_typed_slice::<u16>();
+                self.rep = Some(rep);
+            } else {
+                self.rep = None
+            };
+
+            if has_def {
+                let def = data_iter.next().unwrap();
+                let mut def = LanceBuffer::from_bytes(def, 2);
+                let def = def.borrow_to_typed_slice::<u16>();
+                self.def = Some(def);
+            } else {
+                self.def = None;
+            }
+
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn schedule_ranges(
+        &self,
+        ranges: &[Range<u64>],
+        _io: &dyn EncodingsIo,
+    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        let ranges = VecDeque::from_iter(ranges.iter().cloned());
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        Ok(std::future::ready(Ok(Box::new(ComplexAllNullPageDecoder {
+            ranges,
+            rep: self.rep.clone(),
+            def: self.def.clone(),
             num_rows,
-            offset_into_first_chunk,
+            def_meaning: self.def_meaning.clone(),
+        }) as Box<dyn StructuralPageDecoder>))
+        .boxed())
+    }
+}
+
+#[derive(Debug)]
+pub struct ComplexAllNullPageDecoder {
+    ranges: VecDeque<Range<u64>>,
+    rep: Option<ScalarBuffer<u16>>,
+    def: Option<ScalarBuffer<u16>>,
+    num_rows: u64,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+}
+
+impl ComplexAllNullPageDecoder {
+    fn drain_ranges(&mut self, num_rows: u64) -> Vec<Range<u64>> {
+        let mut rows_desired = num_rows;
+        let mut ranges = Vec::with_capacity(self.ranges.len());
+        while rows_desired > 0 {
+            let front = self.ranges.front_mut().unwrap();
+            let avail = front.end - front.start;
+            if avail > rows_desired {
+                ranges.push(front.start..front.start + rows_desired);
+                front.start += rows_desired;
+                rows_desired = 0;
+            } else {
+                ranges.push(self.ranges.pop_front().unwrap());
+                rows_desired -= avail;
+            }
+        }
+        ranges
+    }
+}
+
+impl StructuralPageDecoder for ComplexAllNullPageDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        // TODO: This is going to need to be more complicated to deal with nested lists of nulls
+        // because the row ranges might not map directly to item ranges
+        //
+        // We should add test cases and handle this later
+        let drained_ranges = self.drain_ranges(num_rows);
+        Ok(Box::new(DecodeComplexAllNullTask {
+            ranges: drained_ranges,
+            rep: self.rep.clone(),
+            def: self.def.clone(),
             def_meaning: self.def_meaning.clone(),
         }))
     }
 
     fn num_rows(&self) -> u64 {
         self.num_rows
+    }
+}
+
+/// We use `ranges` to slice into `rep` and `def` and create rep/def buffers
+/// for the null data.
+#[derive(Debug)]
+pub struct DecodeComplexAllNullTask {
+    ranges: Vec<Range<u64>>,
+    rep: Option<ScalarBuffer<u16>>,
+    def: Option<ScalarBuffer<u16>>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+}
+
+impl DecodeComplexAllNullTask {
+    fn decode_level(
+        &self,
+        levels: &Option<ScalarBuffer<u16>>,
+        num_values: u64,
+    ) -> Option<Vec<u16>> {
+        levels.as_ref().map(|levels| {
+            let mut referenced_levels = Vec::with_capacity(num_values as usize);
+            for range in &self.ranges {
+                referenced_levels.extend(
+                    levels[range.start as usize..range.end as usize]
+                        .iter()
+                        .copied(),
+                );
+            }
+            referenced_levels
+        })
+    }
+}
+
+impl DecodePageTask for DecodeComplexAllNullTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let num_values = self.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        let data = DataBlock::AllNull(AllNullDataBlock { num_values });
+        let rep = self.decode_level(&self.rep, num_values);
+        let def = self.decode_level(&self.def, num_values);
+        let unraveler = RepDefUnraveler::new(rep, def, self.def_meaning);
+        Ok(DecodedPage {
+            data,
+            repdef: unraveler,
+        })
     }
 }
 
@@ -635,20 +1066,45 @@ struct MiniBlockSchedulerDictionary {
 }
 
 /// A scheduler for a page that has been encoded with the mini-block layout
+///
+/// Scheduling mini-block encoded data is simple in concept and somewhat complex
+/// in practice.
+///
+/// First, during initialization, we load the chunk metadata, the repetition index,
+/// and the dictionary (these last two may not be present)
+///
+/// Then, during scheduling, we use the user's requested row ranges and the repetition
+/// index to determine which chunks we need and which rows we need from those chunks.
+///
+/// For example, if the repetition index is: [50, 3], [50, 0], [10, 0] and the range
+/// from the user is 40..60 then we need to:
+///
+///  - Read the first chunk and skip the first 40 rows, then read 10 full rows, and
+///    then read 3 items for the 11th row of our range.
+///  - Read the second chunk and read the remaining items in our 11th row and then read
+///    the remaining 9 full rows.
+///
+/// Then, if we are going to decode that in batches of 5, we need to make decode tasks.
+/// The first two decode tasks will just need the first chunk.  The third decode task will
+/// need the first chunk (for the trailer which has the 11th row in our range) and the second
+/// chunk.  The final decode task will just need the second chunk.
+///
+/// The above prose descriptions are what are represented by [`ChunkInstructions`] and
+/// [`ChunkDrainInstructions`].
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
     // These come from the protobuf
-    meta_buf_position: u64,
-    meta_buf_size: u64,
-    data_buf_position: u64,
+    buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
-    rows_in_page: u64,
+    items_in_page: u64,
+    repetition_index_depth: u16,
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     def_meaning: Arc<[DefinitionInterpretation]>,
-    // This is set after initialization
+    // These are set after initialization
     chunk_meta: Vec<ChunkMeta>,
+    rep_index: Vec<Vec<u64>>,
 
     dictionary: Option<MiniBlockSchedulerDictionary>,
 }
@@ -657,13 +1113,10 @@ impl MiniBlockScheduler {
     fn try_new(
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
-        rows_in_page: u64,
+        items_in_page: u64,
         layout: &pb::MiniBlockLayout,
         decompressors: &dyn DecompressorStrategy,
     ) -> Result<Self> {
-        let (meta_buf_position, meta_buf_size) = buffer_offsets_and_sizes[0];
-        // We don't use the data buf size since we can get it from the metadata
-        let (data_buf_position, _) = buffer_offsets_and_sizes[1];
         let rep_decompressor =
             decompressors.create_block_decompressor(layout.rep_compression.as_ref().unwrap())?;
         let def_decompressor =
@@ -704,89 +1157,320 @@ impl MiniBlockScheduler {
         };
 
         Ok(Self {
-            meta_buf_position,
-            meta_buf_size,
-            data_buf_position,
+            buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
             rep_decompressor: rep_decompressor.into(),
             def_decompressor: def_decompressor.into(),
             value_decompressor: value_decompressor.into(),
+            repetition_index_depth: layout.repetition_index_depth as u16,
             priority,
-            rows_in_page,
+            items_in_page,
             chunk_meta: Vec::new(),
+            rep_index: Vec::new(),
             dictionary,
             def_meaning: def_meaning.into(),
         })
     }
 
-    /// Calculates the overlap between a user-supplied range and a chunk of mini-block data
-    fn calc_overlap(
-        range: &mut Range<u64>,
-        chunk: &ChunkMeta,
-        rows_offset: u64,
-        dst: &mut ScheduledChunk,
-    ) -> ChunkOverlap {
-        if range.start > chunk.num_values + rows_offset {
-            ChunkOverlap::RangeAfterChunk
+    fn lookup_chunks(&self, chunk_indices: &[usize]) -> Vec<LoadedChunk> {
+        chunk_indices
+            .iter()
+            .map(|&chunk_idx| {
+                let chunk_meta = &self.chunk_meta[chunk_idx];
+                let bytes_start = chunk_meta.offset_bytes;
+                let bytes_end = bytes_start + chunk_meta.chunk_size_bytes;
+                LoadedChunk {
+                    byte_range: bytes_start..bytes_end,
+                    items_in_chunk: chunk_meta.num_values,
+                    chunk_idx,
+                    data: LanceBuffer::empty(),
+                }
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PreambleAction {
+    Take,
+    Skip,
+    Absent,
+}
+
+// TODO: Add test cases for the all-preamble and all-trailer cases
+
+// When we schedule a chunk we use the repetition index (or, if none exists, just the # of items
+// in each chunk) to map a user requested range into a set of ChunkInstruction objects which tell
+// us how exactly to read from the chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChunkInstructions {
+    // The index of the chunk to read
+    chunk_idx: usize,
+    // A "preamble" is when a chunk begins with a continuation of the previous chunk's list.  If there
+    // is no repetition index there is never a preamble.
+    //
+    // It's possible for a chunk to be entirely premable.  For example, if there is a really large list
+    // that spans several chunks.
+    preamble: PreambleAction,
+    // How many complete rows (not including the preamble or trailer) to skip
+    //
+    // If this is non-zero then premable must not be Take
+    rows_to_skip: u64,
+    // How many complete (non-preamble / non-trailer) rows to take
+    rows_to_take: u64,
+    // A "trailer" is when a chunk ends with a partial list.  If there is no repetition index there is
+    // never a trailer.
+    //
+    // It's possible for a chunk to be entirely trailer.  This would mean the chunk starts with the beginning
+    // of a list and that list is continued in the next chunk.
+    //
+    // If this is true then we want to include the trailer
+    take_trailer: bool,
+}
+
+// First, we schedule a bunch of [`ChunkInstructions`] based on the users ranges.  Then we
+// start decoding them, based on a batch size, which might not align with what we scheduled.
+//
+// This results in `ChunkDrainInstructions` which targets a contiguous slice of a `ChunkInstructions`
+//
+// So if `ChunkInstructions` is "skip preamble, skip 10, take 50, take trailer" and we are decoding in
+// batches of size 10 we might have a `ChunkDrainInstructions` that targets that chunk and has its own
+// skip of 17 and take of 10.  This would mean we decode the chunk, skip the preamble and 27 rows, and
+// then take 10 rows.
+//
+// One very confusing bit is that `rows_to_take` includes the trailer.  So if we have two chunks:
+//  -no preamble, skip 5, take 10, take trailer
+//  -take preamble, skip 0, take 50, no trailer
+//
+// and we are draining 20 rows then the drain instructions for the first batch will be:
+//  - no preamble, skip 0 (from chunk 0), take 11 (from chunk 0)
+//  - take preamble (from chunk 1), skip 0 (from chunk 1), take 9 (from chunk 1)
+#[derive(Debug, PartialEq, Eq)]
+struct ChunkDrainInstructions {
+    chunk_instructions: ChunkInstructions,
+    rows_to_skip: u64,
+    rows_to_take: u64,
+    preamble_action: PreambleAction,
+}
+
+impl ChunkInstructions {
+    // Given a repetition index and a set of user ranges we need to figure out how to read from the chunks
+    //
+    // We assume that `user_ranges` are in sorted order and non-overlapping
+    //
+    // The output will be a set of `ChunkInstructions` which tell us how to read from the chunks
+    fn schedule_instructions(rep_index: &[Vec<u64>], user_ranges: &[Range<u64>]) -> Vec<Self> {
+        let rep_len = rep_index.len();
+        let mut rep_iter = rep_index.iter().enumerate();
+
+        let (mut cur_rep_idx, mut cur_rep) = rep_iter.next().unwrap();
+        let mut offset = 0;
+        let mut chunk_has_preamble = false;
+        let mut chunk_has_trailer = cur_rep[1] > 0;
+
+        let mut chunk_instructions = Vec::with_capacity(rep_len + user_ranges.len());
+
+        for user_range in user_ranges {
+            let mut to_skip = user_range.start - offset;
+            let mut rows_needed = user_range.end - user_range.start;
+            let mut need_preamble = false;
+
+            while rows_needed > 0 || need_preamble {
+                let mut rows_in_chunk_incl_trailer = cur_rep[0];
+                if chunk_has_trailer {
+                    rows_in_chunk_incl_trailer += 1;
+                }
+
+                if chunk_has_preamble {
+                    rows_in_chunk_incl_trailer -= 1;
+                }
+
+                let mut consumed_chunk = false;
+                if rows_in_chunk_incl_trailer <= to_skip {
+                    consumed_chunk = true;
+                    need_preamble = false;
+                } else {
+                    // We have overlap with the current chunk
+                    let rows_available = rows_in_chunk_incl_trailer - to_skip;
+                    let rows_to_take = if rows_available > rows_needed {
+                        rows_needed
+                    } else {
+                        consumed_chunk = true;
+                        rows_available
+                    };
+                    rows_needed -= rows_to_take;
+                    let mut take_trailer = false;
+                    let preamble = if chunk_has_preamble {
+                        if need_preamble {
+                            PreambleAction::Take
+                        } else {
+                            PreambleAction::Skip
+                        }
+                    } else {
+                        PreambleAction::Absent
+                    };
+                    let mut rows_to_take_no_trailer = rows_to_take;
+
+                    // Are we taking the trailer?  If so, make sure we mark that we need the preamble
+                    if rows_to_take == rows_available && chunk_has_trailer {
+                        take_trailer = true;
+                        need_preamble = true;
+                        rows_to_take_no_trailer -= 1;
+                    } else {
+                        need_preamble = false;
+                    };
+
+                    chunk_instructions.push(Self {
+                        preamble,
+                        chunk_idx: cur_rep_idx,
+                        rows_to_skip: to_skip,
+                        rows_to_take: rows_to_take_no_trailer,
+                        take_trailer,
+                    });
+                }
+
+                if consumed_chunk {
+                    to_skip = to_skip.saturating_sub(rows_in_chunk_incl_trailer);
+                    offset += rows_in_chunk_incl_trailer;
+                    // The next chunk has a preamble if the current chunk has a trailer
+                    chunk_has_preamble = chunk_has_trailer;
+                    // This branch could fail on the very last iteration if we are consuming the last row
+                    if let Some((next_rep_idx, next_rep)) = rep_iter.next() {
+                        cur_rep_idx = next_rep_idx;
+                        cur_rep = next_rep;
+                        chunk_has_trailer = cur_rep[1] > 0;
+                    }
+                }
+            }
+        }
+
+        // If there were multiple ranges we may have multiple instructions for a single chunk.  Merge them now if they
+        // are _adjacent_ (i.e. don't merge "take first row of chunk 0" and "take third row of chunk 0" into "take 2
+        // rows of chunk 0 starting at 0")
+        if user_ranges.len() > 1 {
+            // TODO: Could probably optimize this allocation away
+            let mut merged_instructions = Vec::with_capacity(chunk_instructions.len());
+            let mut instructions_iter = chunk_instructions.into_iter();
+            merged_instructions.push(instructions_iter.next().unwrap());
+            for instruction in instructions_iter {
+                let last = merged_instructions.last_mut().unwrap();
+                if last.chunk_idx == instruction.chunk_idx
+                    && last.rows_to_take + last.rows_to_skip == instruction.rows_to_skip
+                {
+                    last.rows_to_take += instruction.rows_to_take;
+                    last.take_trailer |= instruction.take_trailer;
+                } else {
+                    merged_instructions.push(instruction);
+                }
+            }
+            merged_instructions
         } else {
-            let start_in_chunk = range.start - rows_offset;
-            let end_in_chunk = (start_in_chunk + range.end - range.start).min(chunk.num_values);
-            let rows_in_chunk = end_in_chunk - start_in_chunk;
-            range.start += rows_in_chunk;
-            dst.ranges.push(start_in_chunk..end_in_chunk);
-            ChunkOverlap::Overlap
+            chunk_instructions
         }
     }
-}
 
-#[derive(Debug)]
-struct ScheduledChunk {
-    data: LanceBuffer,
-    // The total number of values in the chunk, not all values may be targeted
-    vals_in_chunk: u64,
-    // The number of values that are targeted by the ranges.  This should be the
-    // same as the sum of `Self::ranges`
-    vals_targeted: u64,
-    ranges: Vec<Range<u64>>,
-}
+    fn drain_from_instruction(
+        &self,
+        rows_desired: &mut u64,
+        need_preamble: &mut bool,
+        skip_in_chunk: &mut u64,
+    ) -> (ChunkDrainInstructions, bool) {
+        // If we need the premable then we shouldn't be skipping anything
+        debug_assert!(!*need_preamble || *skip_in_chunk == 0);
+        let mut rows_avail = self.rows_to_take - *skip_in_chunk;
+        let has_preamble = self.preamble != PreambleAction::Absent;
+        let preamble_action = match (*need_preamble, has_preamble) {
+            (true, true) => PreambleAction::Take,
+            (true, false) => panic!("Need preamble but there isn't one"),
+            (false, true) => PreambleAction::Skip,
+            (false, false) => PreambleAction::Absent,
+        };
 
-impl Clone for ScheduledChunk {
-    fn clone(&self) -> Self {
-        Self {
-            data: self.data.try_clone().unwrap(),
-            vals_in_chunk: self.vals_in_chunk,
-            ranges: self.ranges.clone(),
-            vals_targeted: self.vals_targeted,
+        // Did the scheduled chunk have a trailer?  If so, we have one extra row available
+        if self.take_trailer {
+            rows_avail += 1;
         }
-    }
-}
 
-pub enum ChunkOverlap {
-    RangeAfterChunk,
-    Overlap,
+        // How many rows are we actually taking in this take step (including the preamble
+        // and trailer both as individual rows)
+        let rows_taking = if *rows_desired >= rows_avail {
+            // We want all the rows.  If there is a trailer we are grabbing it and will need
+            // the preamble of the next chunk
+            *need_preamble = self.take_trailer;
+            rows_avail
+        } else {
+            // We aren't taking all the rows.  Even if there is a trailer we aren't taking
+            // it so we will not need the preamble
+            *need_preamble = false;
+            *rows_desired
+        };
+        let rows_skipped = *skip_in_chunk;
+
+        // Update the state for the next iteration
+        let consumed_chunk = if *rows_desired >= rows_avail {
+            *rows_desired -= rows_avail;
+            *skip_in_chunk = 0;
+            true
+        } else {
+            *skip_in_chunk += *rows_desired;
+            *rows_desired = 0;
+            false
+        };
+
+        (
+            ChunkDrainInstructions {
+                chunk_instructions: self.clone(),
+                rows_to_skip: rows_skipped,
+                rows_to_take: rows_taking,
+                preamble_action,
+            },
+            consumed_chunk,
+        )
+    }
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
     fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
-        let metadata = io.submit_single(
-            self.meta_buf_position..self.meta_buf_position + self.meta_buf_size,
-            0,
-        );
-        let dictionary_data = self.dictionary.as_ref().map(|dictionary| {
-            io.submit_single(
+        // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
+        // we may also need to fetch the repetition index.  Here, we gather what buffers we
+        // need.
+        let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
+        let value_buf_position = self.buffer_offsets_and_sizes[1].0;
+        let mut bufs_needed = 1;
+        if self.dictionary.is_some() {
+            bufs_needed += 1;
+        }
+        if self.repetition_index_depth > 0 {
+            bufs_needed += 1;
+        }
+        let mut required_ranges = Vec::with_capacity(bufs_needed);
+        required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
+        if let Some(ref dictionary) = self.dictionary {
+            required_ranges.push(
                 dictionary.dictionary_buf_position_and_size.0
                     ..dictionary.dictionary_buf_position_and_size.0
                         + dictionary.dictionary_buf_position_and_size.1,
-                0,
-            )
-        });
+            );
+        }
+        if self.repetition_index_depth > 0 {
+            let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
+            required_ranges.push(*rep_index_pos..*rep_index_pos + *rep_index_size);
+        }
+        let io_req = io.submit_request(required_ranges, 0);
+
         async move {
-            let bytes = metadata.await?;
-            assert!(bytes.len() % 2 == 0);
-            let mut bytes = LanceBuffer::from_bytes(bytes, 2);
+            let mut buffers = io_req.await?.into_iter().fuse();
+            let meta_bytes = buffers.next().unwrap();
+            let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
+            let rep_index_bytes = buffers.next();
+
+            // Parse the metadata and build the chunk meta
+            assert!(meta_bytes.len() % 2 == 0);
+            let mut bytes = LanceBuffer::from_bytes(meta_bytes, 2);
             let words = bytes.borrow_to_typed_slice::<u16>();
             let words = words.as_ref();
             self.chunk_meta.reserve(words.len());
             let mut rows_counter = 0;
+            let mut offset_bytes = value_buf_position;
             for (word_idx, word) in words.iter().enumerate() {
                 let log_num_values = word & 0x0F;
                 let divided_bytes = word >> 4;
@@ -797,18 +1481,44 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                     1 << log_num_values
                 } else {
                     debug_assert_eq!(log_num_values, 0);
-                    self.rows_in_page - rows_counter
+                    self.items_in_page - rows_counter
                 };
                 rows_counter += num_values;
 
                 self.chunk_meta.push(ChunkMeta {
                     num_values,
                     chunk_size_bytes: num_bytes as u64,
+                    offset_bytes,
                 });
+                offset_bytes += num_bytes as u64;
             }
+
+            // Build the repetition index
+            if let Some(rep_index_data) = rep_index_bytes {
+                // If we have a repetition index then we use that
+                // TODO: Compress the repetition index :)
+                assert!(rep_index_data.len() % 8 == 0);
+                let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
+                let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
+                // Unflatten
+                self.rep_index = repetition_index_vals
+                    .as_ref()
+                    .chunks_exact(self.repetition_index_depth as usize + 1)
+                    .map(|c| c.to_vec())
+                    .collect();
+            } else {
+                // Default rep index is just the number of items in each chunk
+                // with 0 partials/leftovers
+                self.rep_index = self
+                    .chunk_meta
+                    .iter()
+                    .map(|c| vec![c.num_values, 0])
+                    .collect();
+            };
+
             // decode dictionary
             if let Some(ref mut dictionary) = self.dictionary {
-                let dictionary_data = dictionary_data.unwrap().await?;
+                let dictionary_data = dictionary_bytes.unwrap();
                 dictionary.dictionary_data =
                     Arc::new(dictionary.dictionary_decompressor.decompress(
                         LanceBuffer::from_bytes(
@@ -827,67 +1537,35 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         ranges: &[Range<u64>],
         io: &dyn EncodingsIo,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
-        let mut chunk_meta_iter = self.chunk_meta.iter();
-        let mut current_chunk = chunk_meta_iter.next().unwrap();
-        let mut row_offset = 0;
-        let mut bytes_offset = 0;
+        let chunk_instructions = ChunkInstructions::schedule_instructions(&self.rep_index, ranges);
 
-        let mut scheduled_chunks = VecDeque::with_capacity(self.chunk_meta.len());
-        let mut ranges_to_req = Vec::with_capacity(self.chunk_meta.len());
-        let mut num_rows = 0;
-
-        let mut current_scheduled_chunk = ScheduledChunk {
-            data: LanceBuffer::empty(),
-            ranges: Vec::new(),
-            vals_in_chunk: current_chunk.num_values,
-            vals_targeted: 0,
-        };
-
-        // There can be both multiple ranges per chunk and multiple chunks per range
-        for range in ranges {
-            num_rows += range.end - range.start;
-            let mut range = range.clone();
-            while !range.is_empty() {
-                Self::calc_overlap(
-                    &mut range,
-                    current_chunk,
-                    row_offset,
-                    &mut current_scheduled_chunk,
-                );
-                // Might be empty if entire chunk is skipped
-                if !range.is_empty() {
-                    if !current_scheduled_chunk.ranges.is_empty() {
-                        scheduled_chunks.push_back(current_scheduled_chunk);
-                        ranges_to_req.push(
-                            (self.data_buf_position + bytes_offset)
-                                ..(self.data_buf_position
-                                    + bytes_offset
-                                    + current_chunk.chunk_size_bytes),
-                        );
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+        debug_assert_eq!(
+            num_rows,
+            chunk_instructions
+                .iter()
+                .map(|ci| {
+                    let taken = ci.rows_to_take;
+                    if ci.take_trailer {
+                        taken + 1
+                    } else {
+                        taken
                     }
-                    row_offset += current_chunk.num_values;
-                    bytes_offset += current_chunk.chunk_size_bytes;
-                    if let Some(next_chunk) = chunk_meta_iter.next() {
-                        current_chunk = next_chunk;
-                    }
-                    current_scheduled_chunk = ScheduledChunk {
-                        data: LanceBuffer::empty(),
-                        ranges: Vec::new(),
-                        vals_in_chunk: current_chunk.num_values,
-                        vals_targeted: 0,
-                    };
-                }
-            }
-        }
-        if !current_scheduled_chunk.ranges.is_empty() {
-            scheduled_chunks.push_back(current_scheduled_chunk);
-            ranges_to_req.push(
-                (self.data_buf_position + bytes_offset)
-                    ..(self.data_buf_position + bytes_offset + current_chunk.chunk_size_bytes),
-            );
-        }
+                })
+                .sum::<u64>()
+        );
 
-        let data = io.submit_request(ranges_to_req, self.priority);
+        let chunks_needed = chunk_instructions
+            .iter()
+            .map(|ci| ci.chunk_idx)
+            .unique()
+            .collect::<Vec<_>>();
+        let mut loaded_chunks = self.lookup_chunks(&chunks_needed);
+        let chunk_ranges = loaded_chunks
+            .iter()
+            .map(|c| c.byte_range.clone())
+            .collect::<Vec<_>>();
+        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
@@ -898,25 +1576,22 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .map(|dictionary| dictionary.dictionary_data.clone());
         let def_meaning = self.def_meaning.clone();
 
-        for scheduled_chunk in scheduled_chunks.iter_mut() {
-            scheduled_chunk.vals_targeted =
-                scheduled_chunk.ranges.iter().map(|r| r.end - r.start).sum();
-        }
-
         Ok(async move {
-            let data = data.await?;
-            for (chunk, data) in scheduled_chunks.iter_mut().zip(data) {
-                chunk.data = LanceBuffer::from_bytes(data, 1);
+            let loaded_chunk_data = loaded_chunk_data.await?;
+            for (loaded_chunk, chunk_data) in loaded_chunks.iter_mut().zip(loaded_chunk_data) {
+                loaded_chunk.data = LanceBuffer::from_bytes(chunk_data, 1);
             }
+
             Ok(Box::new(MiniBlockDecoder {
                 rep_decompressor,
                 def_decompressor,
                 value_decompressor,
                 def_meaning,
-                data: scheduled_chunks,
+                loaded_chunks: VecDeque::from_iter(loaded_chunks),
+                instructions: VecDeque::from(chunk_instructions),
                 offset_in_current_chunk: 0,
-                num_rows,
                 dictionary,
+                num_rows,
             }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed())
@@ -1319,7 +1994,7 @@ impl StructuralPrimitiveFieldScheduler {
                     Box::new(MiniBlockScheduler::try_new(
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
-                        page_info.num_rows,
+                        mini_block.num_items,
                         mini_block,
                         decompressors,
                     )?)
@@ -1333,8 +2008,23 @@ impl StructuralPrimitiveFieldScheduler {
                         decompressors,
                     )?)
                 }
-                Some(pb::page_layout::Layout::AllNullLayout(_)) => {
-                    Box::new(SimpleAllNullScheduler::default()) as Box<dyn StructuralPageScheduler>
+                Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
+                    let def_meaning = all_null
+                        .layers
+                        .iter()
+                        .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
+                        .collect::<Vec<_>>();
+                    if def_meaning.len() == 1
+                        && def_meaning[0] == DefinitionInterpretation::NullableItem
+                    {
+                        Box::new(SimpleAllNullScheduler::default())
+                            as Box<dyn StructuralPageScheduler>
+                    } else {
+                        Box::new(ComplexAllNullScheduler::new(
+                            page_info.buffer_offsets_and_sizes.clone(),
+                            def_meaning.into(),
+                        )) as Box<dyn StructuralPageScheduler>
+                    }
                 }
                 _ => todo!(),
             };
@@ -1647,6 +2337,8 @@ pub struct AccumulationQueue {
     current_bytes: u64,
     // Row number of the first item in buffered_arrays, reset on flush
     row_number: u64,
+    // Number of top level rows represented in buffered_arrays, reset on flush
+    num_rows: u64,
     // This is only for logging / debugging purposes
     column_index: u32,
 }
@@ -1660,15 +2352,22 @@ impl AccumulationQueue {
             column_index,
             keep_original_array,
             row_number: u64::MAX,
+            num_rows: 0,
         }
     }
 
     /// Adds an array to the queue, if there is enough data then the queue is flushed
     /// and returned
-    pub fn insert(&mut self, array: ArrayRef, row_number: u64) -> Option<(Vec<ArrayRef>, u64)> {
+    pub fn insert(
+        &mut self,
+        array: ArrayRef,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.row_number == u64::MAX {
             self.row_number = row_number;
         }
+        self.num_rows += num_rows;
         self.current_bytes += array.get_array_memory_size() as u64;
         if self.current_bytes > self.cache_bytes {
             debug!(
@@ -1680,7 +2379,13 @@ impl AccumulationQueue {
             self.current_bytes = 0;
             let row_number = self.row_number;
             self.row_number = u64::MAX;
-            Some((std::mem::take(&mut self.buffered_arrays), row_number))
+            let num_rows = self.num_rows;
+            self.num_rows = 0;
+            Some((
+                std::mem::take(&mut self.buffered_arrays),
+                row_number,
+                num_rows,
+            ))
         } else {
             trace!(
                 "Accumulating data for column {}.  Now at {} bytes",
@@ -1696,7 +2401,7 @@ impl AccumulationQueue {
         }
     }
 
-    pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64)> {
+    pub fn flush(&mut self) -> Option<(Vec<ArrayRef>, u64, u64)> {
         if self.buffered_arrays.is_empty() {
             trace!(
                 "No final flush since no data at column {}",
@@ -1711,8 +2416,14 @@ impl AccumulationQueue {
             );
             self.current_bytes = 0;
             let row_number = self.row_number;
-            self.row_number = 0;
-            Some((std::mem::take(&mut self.buffered_arrays), row_number))
+            self.row_number = u64::MAX;
+            let num_rows = self.num_rows;
+            self.num_rows = 0;
+            Some((
+                std::mem::take(&mut self.buffered_arrays),
+                row_number,
+                num_rows,
+            ))
         }
     }
 }
@@ -1815,9 +2526,10 @@ impl FieldEncoder for PrimitiveFieldEncoder {
         array: ArrayRef,
         _external_buffers: &mut OutOfLineBuffers,
         _repdef: RepDefBuilder,
-        _row_number: u64,
+        row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        if let Some(arrays) = self.accumulation_queue.insert(array, /*row_number=*/ 0) {
+        if let Some(arrays) = self.accumulation_queue.insert(array, row_number, num_rows) {
             Ok(self.do_flush(arrays.0)?)
         } else {
             Ok(vec![])
@@ -1947,7 +2659,8 @@ impl PrimitiveStructuralEncoder {
 
     // Converts value data, repetition levels, and definition levels into a single
     // buffer of mini-blocks.  In addition, creates a buffer of mini-block metadata
-    // which tells us the size of each block.
+    // which tells us the size of each block.  Finally, if repetition is present then
+    // we also create a buffer for the repetition index.
     //
     // Each chunk is serialized as:
     // | rep_len (2 bytes) | def_len (2 bytes) | values_len (2 bytes) | rep | P1 | def | P2 | values | P3 |
@@ -1975,6 +2688,28 @@ impl PrimitiveStructuralEncoder {
     //
     // All metadata words are serialized (as little endian) into a single buffer
     // of metadata values.
+    //
+    // If there is repetition then we also create a repetition index.  This is a
+    // single buffer of integer vectors (stored in row major order).  There is one
+    // entry for each chunk.  The size of the vector is based on the depth of random
+    // access we want to support.
+    //
+    // A vector of size 2 is the minimum and will support row-based random access (e.g.
+    // "take the 57th row").  A vector of size 3 will support 1 level of nested access
+    // (e.g. "take the 3rd item in the 57th row").  A vector of size 4 will support 2
+    // levels of nested access and so on.
+    //
+    // The first number in the vector is the number of top-level rows that complete in
+    // the chunk.  The second number is the number of second-level rows that complete
+    // after the final top-level row completed (or beginning of the chunk if no top-level
+    // row completes in the chunk).  And so on.  The final number in the vector is always
+    // the number of leftover items not covered by earlier entries in the vector.
+    //
+    // Currently we are limited to 0 levels of nested access but that will change in the
+    // future.
+    //
+    // The repetition index and the chunk metadata are read at initialization time and
+    // cached in memory.
     fn serialize_miniblocks(
         miniblocks: MiniBlockCompressed,
         rep: Vec<LanceBuffer>,
@@ -2054,20 +2789,30 @@ impl PrimitiveStructuralEncoder {
     /// Compresses a buffer of levels into chunks
     ///
     /// TODO: Use bit-packing here
+    ///
+    /// If these are repetition levels then we also calculate the repetition index here (that
+    /// is the third return value)
     fn compress_levels(
-        levels: Option<Arc<[u16]>>,
+        levels: Option<RepDefSlicer<'_>>,
         num_values: u64,
         compression_strategy: &dyn CompressionStrategy,
         chunks: &[MiniBlockChunk],
-    ) -> Result<(Vec<LanceBuffer>, pb::ArrayEncoding)> {
-        if let Some(levels) = levels {
-            debug_assert_eq!(num_values as usize, levels.len());
+        // This will be 0 if we are compressing def levels
+        max_rep: u16,
+    ) -> Result<(Vec<LanceBuffer>, pb::ArrayEncoding, LanceBuffer)> {
+        if let Some(mut levels) = levels {
+            let mut rep_index = if max_rep > 0 {
+                Vec::with_capacity(chunks.len())
+            } else {
+                vec![]
+            };
             // Make the levels into a FixedWidth data block
-            let mut levels_buf = LanceBuffer::reinterpret_slice(levels);
+            let num_levels = levels.num_levels() as u64;
+            let mut levels_buf = levels.all_levels().try_clone().unwrap();
             let levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                 data: levels_buf.borrow_and_clone(),
                 bits_per_value: 16,
-                num_values,
+                num_values: num_levels,
                 block_info: BlockInfo::new(),
             });
             let levels_field = Field::new_arrow("", DataType::UInt16, false)?;
@@ -2076,31 +2821,83 @@ impl PrimitiveStructuralEncoder {
                 compression_strategy.create_block_compressor(&levels_field, &levels_block)?;
             // Compress blocks of levels (sized according to the chunks)
             let mut buffers = Vec::with_capacity(chunks.len());
-            let mut off = 0;
             let mut values_counter = 0;
-            for chunk in chunks {
+            for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let chunk_num_values = chunk.num_values(values_counter, num_values);
                 values_counter += chunk_num_values;
-                let level_bytes = chunk_num_values as usize * 2;
-                let chunk_levels = levels_buf.slice_with_length(off, level_bytes);
+                let mut chunk_levels = if chunk_idx < chunks.len() - 1 {
+                    levels.slice_next(chunk_num_values as usize)
+                } else {
+                    levels.slice_rest()
+                };
+                let num_chunk_levels = (chunk_levels.len() / 2) as u64;
+                if max_rep > 0 {
+                    // If max_rep > 0 then we are working with rep levels and we need
+                    // to calculate the repetition index.  The repetition index for a
+                    // chunk is currently 2 values (in the future it may be more).
+                    //
+                    // The first value is the number of rows that _finish_ in the
+                    // chunk.
+                    //
+                    // The second value is the number of "leftovers" after the last
+                    // finished row in the chunk.
+                    let rep_values = chunk_levels.borrow_to_typed_slice::<u16>();
+                    let rep_values = rep_values.as_ref();
+
+                    // We skip 1 here because a max_rep at spot 0 doesn't count as a finished list (we
+                    // will count it in the previous chunk)
+                    let mut num_rows = rep_values.iter().skip(1).filter(|v| **v == max_rep).count();
+                    let num_leftovers = if chunk_idx < chunks.len() - 1 {
+                        rep_values
+                            .iter()
+                            .rev()
+                            .position(|v| *v == max_rep)
+                            // # of leftovers includes the max_rep spot
+                            .map(|pos| pos + 1)
+                            .unwrap_or(rep_values.len())
+                    } else {
+                        // Last chunk can't have leftovers
+                        0
+                    };
+
+                    if chunk_idx != 0 && rep_values[0] == max_rep {
+                        // This chunk starts with a new row and so, if we thought we had leftovers
+                        // in the previous chunk, we were mistaken
+                        // TODO: Can use unchecked here
+                        let rep_len = rep_index.len();
+                        if rep_index[rep_len - 1] != 0 {
+                            // We thought we had leftovers but that was actually a full row
+                            rep_index[rep_len - 2] += 1;
+                            rep_index[rep_len - 1] = 0;
+                        }
+                    }
+
+                    if chunk_idx == chunks.len() - 1 {
+                        // The final list
+                        num_rows += 1;
+                    }
+                    rep_index.push(num_rows as u64);
+                    rep_index.push(num_leftovers as u64);
+                }
                 let chunk_levels_block = DataBlock::FixedWidth(FixedWidthDataBlock {
                     data: chunk_levels,
                     bits_per_value: 16,
-                    num_values: chunk_num_values,
+                    num_values: num_chunk_levels,
                     block_info: BlockInfo::new(),
                 });
                 let compressed_levels = compressor.compress(chunk_levels_block)?;
-                off += level_bytes;
                 buffers.push(compressed_levels);
             }
-            Ok((buffers, compressor_desc))
+            debug_assert_eq!(levels.num_levels_remaining(), 0);
+            let rep_index = LanceBuffer::reinterpret_vec(rep_index);
+            Ok((buffers, compressor_desc, rep_index))
         } else {
             // Everything is valid or we have no repetition so we encode as a constant
             // array of 0
             let data = chunks.iter().map(|_| LanceBuffer::empty()).collect();
             let scalar = 0_u16.to_le_bytes().to_vec();
             let encoding = ProtobufUtils::constant(scalar, num_values);
-            Ok((data, encoding))
+            Ok((data, encoding, LanceBuffer::empty()))
         }
     }
 
@@ -2119,6 +2916,41 @@ impl PrimitiveStructuralEncoder {
         })
     }
 
+    // Encodes a page where all values are null but we have rep/def
+    // information that we need to store (e.g. to distinguish between
+    // different kinds of null)
+    fn encode_complex_all_null(
+        column_idx: u32,
+        repdefs: Vec<RepDefBuilder>,
+        row_number: u64,
+        num_rows: u64,
+    ) -> Result<EncodedPage> {
+        let repdef = RepDefBuilder::serialize(repdefs);
+
+        // TODO: Actually compress repdef
+        let rep_bytes = if let Some(rep) = repdef.repetition_levels.as_ref() {
+            LanceBuffer::reinterpret_slice(rep.clone())
+        } else {
+            LanceBuffer::empty()
+        };
+
+        let def_bytes = if let Some(def) = repdef.definition_levels.as_ref() {
+            LanceBuffer::reinterpret_slice(def.clone())
+        } else {
+            LanceBuffer::empty()
+        };
+
+        let description = ProtobufUtils::all_null_layout(&repdef.def_meaning);
+        Ok(EncodedPage {
+            column_idx,
+            data: vec![rep_bytes, def_bytes],
+            description: PageEncoding::Structural(description),
+            num_rows,
+            row_number,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn encode_miniblock(
         column_idx: u32,
         field: &Field,
@@ -2127,6 +2959,7 @@ impl PrimitiveStructuralEncoder {
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
         dictionary_data: Option<DataBlock>,
+        num_rows: u64,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
 
@@ -2136,25 +2969,36 @@ impl PrimitiveStructuralEncoder {
             todo!()
         }
 
-        let num_values = data.num_values();
+        let num_items = data.num_values();
         // The validity is encoded in repdef so we can remove it
         let data = data.remove_validity();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
-        let (compressed_rep, rep_encoding) = Self::compress_levels(
-            repdef.repetition_levels,
-            num_values,
+        let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
+
+        let (compressed_rep, rep_encoding, rep_index) = Self::compress_levels(
+            repdef.rep_slicer(),
+            num_items,
             compression_strategy,
             &compressed_data.chunks,
+            max_rep,
         )?;
 
-        let (compressed_def, def_encoding) = Self::compress_levels(
-            repdef.definition_levels,
-            num_values,
+        let (rep_index, rep_index_depth) = if rep_index.is_empty() {
+            (None, 0)
+        } else {
+            // TODO: Support repetition index depth > 1
+            (Some(rep_index), 1)
+        };
+
+        let (compressed_def, def_encoding, _) = Self::compress_levels(
+            repdef.def_slicer(),
+            num_items,
             compression_strategy,
             &compressed_data.chunks,
+            /*max_rep=*/ 0,
         )?;
 
         // TODO: Parquet sparsely encodes values here.  We could do the same but
@@ -2165,6 +3009,11 @@ impl PrimitiveStructuralEncoder {
         let (block_value_buffer, block_meta_buffer) =
             Self::serialize_miniblocks(compressed_data, compressed_rep, compressed_def);
 
+        // Metadata, Data, Dictionary, (maybe) Repetition Index
+        let mut data = Vec::with_capacity(4);
+        data.push(block_meta_buffer);
+        data.push(block_value_buffer);
+
         if let Some(dictionary_data) = dictionary_data {
             // field in `create_block_compressor` is not used currently.
             let dummy_dictionary_field = Field::new_arrow("", DataType::UInt16, false)?;
@@ -2173,17 +3022,24 @@ impl PrimitiveStructuralEncoder {
                 .create_block_compressor(&dummy_dictionary_field, &dictionary_data)?;
             let dictionary_buffer = compressor.compress(dictionary_data)?;
 
+            data.push(dictionary_buffer);
+            if let Some(rep_index) = rep_index {
+                data.push(rep_index);
+            }
+
             let description = ProtobufUtils::miniblock_layout(
                 rep_encoding,
                 def_encoding,
                 value_encoding,
+                rep_index_depth,
                 Some(dictionary_encoding),
                 &repdef.def_meaning,
+                num_items,
             );
             Ok(EncodedPage {
-                num_rows: num_values,
+                num_rows,
                 column_idx,
-                data: vec![block_meta_buffer, block_value_buffer, dictionary_buffer],
+                data,
                 description: PageEncoding::Structural(description),
                 row_number,
             })
@@ -2192,13 +3048,24 @@ impl PrimitiveStructuralEncoder {
                 rep_encoding,
                 def_encoding,
                 value_encoding,
+                rep_index_depth,
                 None,
                 &repdef.def_meaning,
+                num_items,
             );
+
+            if let Some(mut rep_index) = rep_index {
+                let view = rep_index.borrow_to_typed_slice::<u64>();
+                let total = view.chunks_exact(2).map(|c| c[0]).sum::<u64>();
+                debug_assert_eq!(total, num_rows);
+
+                data.push(rep_index);
+            }
+
             Ok(EncodedPage {
-                num_rows: num_values,
+                num_rows,
                 column_idx,
-                data: vec![block_meta_buffer, block_value_buffer],
+                data,
                 description: PageEncoding::Structural(description),
                 row_number,
             })
@@ -2446,12 +3313,19 @@ impl PrimitiveStructuralEncoder {
         arrays: Vec<ArrayRef>,
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         let column_idx = self.column_index;
         let compression_strategy = self.compression_strategy.clone();
         let field = self.field.clone();
         let task = spawn_cpu(move || {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+            if num_values == 0 {
+                // We should not encode empty arrays.  So if we get here that should mean that we
+                // either have all empty lists or all null lists (or a mix).  We still need to encode
+                // the rep/def information but we can skip the data encoding.
+                return Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows);
+            }
             let num_nulls = arrays
                 .iter()
                 .map(|arr| arr.logical_nulls().map(|n| n.null_count()).unwrap_or(0) as u64)
@@ -2459,13 +3333,25 @@ impl PrimitiveStructuralEncoder {
 
             if num_values == num_nulls && repdefs.iter().all(|rd| rd.is_simple_validity()) {
                 log::debug!(
-                    "Encoding column {} with {} rows using simple-null layout",
+                    "Encoding column {} with {} items using simple-null layout",
                     column_idx,
                     num_values
                 );
                 Self::encode_simple_all_null(column_idx, num_values, row_number)
             } else {
                 let data_block = DataBlock::from_arrays(&arrays, num_values);
+
+                // if the `data_block` is a `StructDataBlock`, then this is a struct with packed struct encoding.
+                if let DataBlock::Struct(ref struct_data_block) = data_block {
+                    if struct_data_block
+                        .children
+                        .iter()
+                        .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+                    {
+                        panic!("packed struct encoding currently only supports fixed-width fields.")
+                    }
+                }
+
                 const DICTIONARY_ENCODING_THRESHOLD: u64 = 100;
                 let cardinality =
                     if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
@@ -2488,10 +3374,11 @@ impl PrimitiveStructuralEncoder {
                         repdefs,
                         row_number,
                         Some(dictionary_data_block),
+                        num_rows,
                     )
                 } else if Self::is_narrow(&data_block) {
                     log::debug!(
-                        "Encoding column {} with {} rows using mini-block layout",
+                        "Encoding column {} with {} items using mini-block layout",
                         column_idx,
                         num_values
                     );
@@ -2503,10 +3390,11 @@ impl PrimitiveStructuralEncoder {
                         repdefs,
                         row_number,
                         None,
+                        num_rows,
                     )
                 } else {
                     log::debug!(
-                        "Encoding column {} with {} rows using full-zip layout",
+                        "Encoding column {} with {} items using full-zip layout",
                         column_idx,
                         num_values
                     );
@@ -2554,13 +3442,16 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
         _external_buffers: &mut OutOfLineBuffers,
         mut repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
         Self::extract_validity(array.as_ref(), &mut repdef);
         self.accumulated_repdefs.push(repdef);
 
-        if let Some((arrays, row_number)) = self.accumulation_queue.insert(array, row_number) {
+        if let Some((arrays, row_number, num_rows)) =
+            self.accumulation_queue.insert(array, row_number, num_rows)
+        {
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number)?)
+            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
         } else {
             Ok(vec![])
         }
@@ -2568,9 +3459,9 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 
     // If there is any data left in the buffer then create an encode task from it
     fn flush(&mut self, _external_buffers: &mut OutOfLineBuffers) -> Result<Vec<EncodeTask>> {
-        if let Some((arrays, row_number)) = self.accumulation_queue.flush() {
+        if let Some((arrays, row_number, num_rows)) = self.accumulation_queue.flush() {
             let accumulated_repdefs = std::mem::take(&mut self.accumulated_repdefs);
-            Ok(self.do_flush(arrays, accumulated_repdefs, row_number)?)
+            Ok(self.do_flush(arrays, accumulated_repdefs, row_number, num_rows)?)
         } else {
             Ok(vec![])
         }
@@ -2589,14 +3480,17 @@ impl FieldEncoder for PrimitiveStructuralEncoder {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::VecDeque, sync::Arc};
 
     use arrow_array::{ArrayRef, Int8Array, StringArray};
 
-    use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
+    use crate::encodings::logical::primitive::{
+        ChunkDrainInstructions, PrimitiveStructuralEncoder,
+    };
 
-    use super::DataBlock;
+    use super::{ChunkInstructions, DataBlock, DecodeMiniBlockTask, PreambleAction};
 
     #[test]
     fn test_is_narrow() {
@@ -2616,5 +3510,589 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[test]
+    fn test_map_range() {
+        // Null in the middle
+        // [[A, B, C], [D, E], NULL, [F, G, H]]
+        let rep = Some(vec![1, 0, 0, 1, 0, 1, 1, 0, 0]);
+        let def = Some(vec![0, 0, 0, 0, 0, 1, 0, 0, 0]);
+        let max_visible_def = 0;
+        let total_items = 8;
+        let max_rep = 1;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 0..3, 0..3);
+        check(1..2, 3..5, 3..5);
+        check(2..3, 5..5, 5..6);
+        check(3..4, 5..8, 6..9);
+        check(0..2, 0..5, 0..5);
+        check(1..3, 3..5, 3..6);
+        check(2..4, 5..8, 5..9);
+        check(0..3, 0..5, 0..6);
+        check(1..4, 3..8, 3..9);
+        check(0..4, 0..8, 0..9);
+
+        // Null at start
+        // [NULL, [A, B], [C]]
+        let rep = Some(vec![1, 1, 0, 1]);
+        let def = Some(vec![1, 0, 0, 0]);
+        let max_visible_def = 0;
+        let total_items = 3;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 0..0, 0..1);
+        check(1..2, 0..2, 1..3);
+        check(2..3, 2..3, 3..4);
+        check(0..2, 0..2, 0..3);
+        check(1..3, 0..3, 1..4);
+        check(0..3, 0..3, 0..4);
+
+        // Null at end
+        // [[A], [B, C], NULL]
+        let rep = Some(vec![1, 1, 0, 1]);
+        let def = Some(vec![0, 0, 0, 1]);
+        let max_visible_def = 0;
+        let total_items = 3;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 0..1, 0..1);
+        check(1..2, 1..3, 1..3);
+        check(2..3, 3..3, 3..4);
+        check(0..2, 0..3, 0..3);
+        check(1..3, 1..3, 1..4);
+        check(0..3, 0..3, 0..4);
+
+        // No nulls, with repetition
+        // [[A, B], [C, D], [E, F]]
+        let rep = Some(vec![1, 0, 1, 0, 1, 0]);
+        let def: Option<&[u16]> = None;
+        let max_visible_def = 0;
+        let total_items = 6;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 0..2, 0..2);
+        check(1..2, 2..4, 2..4);
+        check(2..3, 4..6, 4..6);
+        check(0..2, 0..4, 0..4);
+        check(1..3, 2..6, 2..6);
+        check(0..3, 0..6, 0..6);
+
+        // No repetition, with nulls (this case is trivial)
+        // [A, B, NULL, C]
+        let rep: Option<&[u16]> = None;
+        let def = Some(vec![0, 0, 1, 0]);
+        let max_visible_def = 1;
+        let total_items = 4;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Absent,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 0..1, 0..1);
+        check(1..2, 1..2, 1..2);
+        check(2..3, 2..3, 2..3);
+        check(0..2, 0..2, 0..2);
+        check(1..3, 1..3, 1..3);
+        check(0..3, 0..3, 0..3);
+
+        // Tricky case, this chunk is a continuation and starts with a rep-index = 0
+        // [[..., A] [B, C], NULL]
+        //
+        // What we do will depend on the preamble action
+        let rep = Some(vec![0, 1, 0, 1]);
+        let def = Some(vec![0, 0, 0, 1]);
+        let max_visible_def = 0;
+        let total_items = 3;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Take,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        // If we are taking the preamble then the range must start at 0
+        check(0..1, 0..3, 0..3);
+        check(0..2, 0..3, 0..4);
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Skip,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 1..3, 1..3);
+        check(1..2, 3..3, 3..4);
+        check(0..2, 1..3, 1..4);
+
+        // Another preamble case but now it doesn't end with a new list
+        // [[..., A], NULL, [D, E]]
+        //
+        // What we do will depend on the preamble action
+        let rep = Some(vec![0, 1, 1, 0]);
+        let def = Some(vec![0, 1, 0, 0]);
+        let max_visible_def = 0;
+        let total_items = 4;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Take,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        // If we are taking the preamble then the range must start at 0
+        check(0..1, 0..1, 0..2);
+        check(0..2, 0..3, 0..4);
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Skip,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        // If we are taking the preamble then the range must start at 0
+        check(0..1, 1..1, 1..2);
+        check(1..2, 1..3, 2..4);
+        check(0..2, 1..3, 1..4);
+
+        // Now a preamble case without any definition levels
+        // [[..., A] [B, C], [D]]
+        let rep = Some(vec![0, 1, 0, 1]);
+        let def: Option<Vec<u16>> = None;
+        let max_visible_def = 0;
+        let total_items = 4;
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Take,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        // If we are taking the preamble then the range must start at 0
+        check(0..1, 0..3, 0..3);
+        check(0..2, 0..4, 0..4);
+
+        let check = |range, expected_item_range, expected_level_range| {
+            let (item_range, level_range) = DecodeMiniBlockTask::map_range(
+                range,
+                rep.as_ref(),
+                def.as_ref(),
+                max_rep,
+                max_visible_def,
+                total_items,
+                PreambleAction::Skip,
+            );
+            assert_eq!(item_range, expected_item_range);
+            assert_eq!(level_range, expected_level_range);
+        };
+
+        check(0..1, 1..3, 1..3);
+        check(1..2, 3..4, 3..4);
+        check(0..2, 1..4, 1..4);
+    }
+
+    #[test]
+    fn test_schedule_instructions() {
+        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
+
+        let check = |user_ranges, expected_instructions| {
+            let instructions =
+                ChunkInstructions::schedule_instructions(&repetition_index, user_ranges);
+            assert_eq!(instructions, expected_instructions);
+        };
+
+        // The instructions we expect if we're grabbing the whole range
+        let expected_take_all = vec![
+            ChunkInstructions {
+                chunk_idx: 0,
+                preamble: PreambleAction::Absent,
+                rows_to_skip: 0,
+                rows_to_take: 5,
+                take_trailer: true,
+            },
+            ChunkInstructions {
+                chunk_idx: 1,
+                preamble: PreambleAction::Take,
+                rows_to_skip: 0,
+                rows_to_take: 2,
+                take_trailer: false,
+            },
+            ChunkInstructions {
+                chunk_idx: 2,
+                preamble: PreambleAction::Absent,
+                rows_to_skip: 0,
+                rows_to_take: 4,
+                take_trailer: true,
+            },
+            ChunkInstructions {
+                chunk_idx: 3,
+                preamble: PreambleAction::Take,
+                rows_to_skip: 0,
+                rows_to_take: 1,
+                take_trailer: false,
+            },
+        ];
+
+        // Take all as 1 range
+        check(&[0..14], expected_take_all.clone());
+
+        // Take all a individual rows
+        check(
+            &[
+                0..1,
+                1..2,
+                2..3,
+                3..4,
+                4..5,
+                5..6,
+                6..7,
+                7..8,
+                8..9,
+                9..10,
+                10..11,
+                11..12,
+                12..13,
+                13..14,
+            ],
+            expected_take_all,
+        );
+
+        // Test some partial takes
+
+        // 2 rows in the same chunk but not contiguous
+        check(
+            &[0..1, 3..4],
+            vec![
+                ChunkInstructions {
+                    chunk_idx: 0,
+                    preamble: PreambleAction::Absent,
+                    rows_to_skip: 0,
+                    rows_to_take: 1,
+                    take_trailer: false,
+                },
+                ChunkInstructions {
+                    chunk_idx: 0,
+                    preamble: PreambleAction::Absent,
+                    rows_to_skip: 3,
+                    rows_to_take: 1,
+                    take_trailer: false,
+                },
+            ],
+        );
+
+        // Taking just a trailer/preamble
+        check(
+            &[5..6],
+            vec![
+                ChunkInstructions {
+                    chunk_idx: 0,
+                    preamble: PreambleAction::Absent,
+                    rows_to_skip: 5,
+                    rows_to_take: 0,
+                    take_trailer: true,
+                },
+                ChunkInstructions {
+                    chunk_idx: 1,
+                    preamble: PreambleAction::Take,
+                    rows_to_skip: 0,
+                    rows_to_take: 0,
+                    take_trailer: false,
+                },
+            ],
+        );
+
+        // Skipping an entire chunk
+        check(
+            &[7..10],
+            vec![
+                ChunkInstructions {
+                    chunk_idx: 1,
+                    preamble: PreambleAction::Skip,
+                    rows_to_skip: 1,
+                    rows_to_take: 1,
+                    take_trailer: false,
+                },
+                ChunkInstructions {
+                    chunk_idx: 2,
+                    preamble: PreambleAction::Absent,
+                    rows_to_skip: 0,
+                    rows_to_take: 2,
+                    take_trailer: false,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_drain_instructions() {
+        fn drain_from_instructions(
+            instructions: &mut VecDeque<ChunkInstructions>,
+            mut rows_desired: u64,
+            need_preamble: &mut bool,
+            skip_in_chunk: &mut u64,
+        ) -> Vec<ChunkDrainInstructions> {
+            // Note: instructions.len() is an upper bound, we typically take much fewer
+            let mut drain_instructions = Vec::with_capacity(instructions.len());
+            while rows_desired > 0 || *need_preamble {
+                let (next_instructions, consumed_chunk) = instructions
+                    .front()
+                    .unwrap()
+                    .drain_from_instruction(&mut rows_desired, need_preamble, skip_in_chunk);
+                if consumed_chunk {
+                    instructions.pop_front();
+                }
+                drain_instructions.push(next_instructions);
+            }
+            drain_instructions
+        }
+
+        let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
+        let user_ranges = vec![1..7, 10..14];
+
+        // First, schedule the ranges
+        let scheduled = ChunkInstructions::schedule_instructions(&repetition_index, &user_ranges);
+
+        let mut to_drain = VecDeque::from(scheduled.clone());
+
+        // Now we drain in batches of 4
+
+        let mut need_preamble = false;
+        let mut skip_in_chunk = 0;
+
+        let next_batch =
+            drain_from_instructions(&mut to_drain, 4, &mut need_preamble, &mut skip_in_chunk);
+
+        assert!(!need_preamble);
+        assert_eq!(skip_in_chunk, 4);
+        assert_eq!(
+            next_batch,
+            vec![ChunkDrainInstructions {
+                chunk_instructions: scheduled[0].clone(),
+                rows_to_take: 4,
+                rows_to_skip: 0,
+                preamble_action: PreambleAction::Absent,
+            }]
+        );
+
+        let next_batch =
+            drain_from_instructions(&mut to_drain, 4, &mut need_preamble, &mut skip_in_chunk);
+
+        assert!(!need_preamble);
+        assert_eq!(skip_in_chunk, 2);
+
+        assert_eq!(
+            next_batch,
+            vec![
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[0].clone(),
+                    rows_to_take: 1,
+                    rows_to_skip: 4,
+                    preamble_action: PreambleAction::Absent,
+                },
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[1].clone(),
+                    rows_to_take: 1,
+                    rows_to_skip: 0,
+                    preamble_action: PreambleAction::Take,
+                },
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[2].clone(),
+                    rows_to_take: 2,
+                    rows_to_skip: 0,
+                    preamble_action: PreambleAction::Absent,
+                }
+            ]
+        );
+
+        let next_batch =
+            drain_from_instructions(&mut to_drain, 2, &mut need_preamble, &mut skip_in_chunk);
+
+        assert!(!need_preamble);
+        assert_eq!(skip_in_chunk, 0);
+
+        assert_eq!(
+            next_batch,
+            vec![
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[2].clone(),
+                    rows_to_take: 1,
+                    rows_to_skip: 2,
+                    preamble_action: PreambleAction::Absent,
+                },
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[3].clone(),
+                    rows_to_take: 1,
+                    rows_to_skip: 0,
+                    preamble_action: PreambleAction::Take,
+                },
+            ]
+        );
+
+        // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
+        let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
+        let user_ranges = vec![0..28];
+
+        // First, schedule the ranges
+        let scheduled = ChunkInstructions::schedule_instructions(&repetition_index, &user_ranges);
+
+        let mut to_drain = VecDeque::from(scheduled.clone());
+
+        // Drain first chunk and some of second chunk
+
+        let mut need_preamble = false;
+        let mut skip_in_chunk = 0;
+
+        let next_batch =
+            drain_from_instructions(&mut to_drain, 7, &mut need_preamble, &mut skip_in_chunk);
+
+        assert_eq!(
+            next_batch,
+            vec![
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[0].clone(),
+                    rows_to_take: 6,
+                    rows_to_skip: 0,
+                    preamble_action: PreambleAction::Absent,
+                },
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[1].clone(),
+                    rows_to_take: 1,
+                    rows_to_skip: 0,
+                    preamble_action: PreambleAction::Take,
+                },
+            ]
+        );
+
+        assert!(!need_preamble);
+        assert_eq!(skip_in_chunk, 1);
+
+        // Now, the tricky part.  We drain the second chunk, including the trailer, and need to make sure
+        // we get a drain task to take the preamble of the third chunk (and nothing else)
+        let next_batch =
+            drain_from_instructions(&mut to_drain, 2, &mut need_preamble, &mut skip_in_chunk);
+
+        assert_eq!(
+            next_batch,
+            vec![
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[1].clone(),
+                    rows_to_take: 2,
+                    rows_to_skip: 1,
+                    preamble_action: PreambleAction::Skip,
+                },
+                ChunkDrainInstructions {
+                    chunk_instructions: scheduled[2].clone(),
+                    rows_to_take: 0,
+                    rows_to_skip: 0,
+                    preamble_action: PreambleAction::Take,
+                },
+            ]
+        );
+
+        assert!(!need_preamble);
+        assert_eq!(skip_in_chunk, 0);
     }
 }

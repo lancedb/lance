@@ -8,15 +8,18 @@ use std::sync::Arc;
 
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array};
+use arrow_schema::Schema;
 use future::join_all;
 use futures::prelude::*;
-use lance_arrow::RecordBatchExt;
+use itertools::Itertools;
+use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::{
     cache::FileMetadataCache,
     utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
     Error, Result,
 };
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
+use lance_file::v2::reader::ReaderProjection;
 use lance_file::v2::{
     reader::{FileReader, FileReaderOptions},
     writer::FileWriter,
@@ -256,14 +259,35 @@ impl ShuffleReader for IvfShufflerReader {
             FileReaderOptions::default(),
         )
         .await?;
-        let schema = reader.schema().as_ref().into();
-
+        let schema: Schema = reader.schema().as_ref().into();
+        let projection = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, f)| {
+                if f.name() != PART_ID_COLUMN {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let schema = schema.project(&projection)?;
+        let projection = ReaderProjection::from_column_names(
+            reader.schema().as_ref(),
+            &schema
+                .field_names()
+                .into_iter()
+                .map(|s| s.as_ref())
+                .collect_vec(),
+        )?;
         Ok(Some(Box::new(RecordBatchStreamAdapter::new(
             Arc::new(schema),
-            reader.read_stream(
+            reader.read_stream_projected(
                 lance_io::ReadBatchParams::RangeFull,
                 4096,
                 16,
+                projection,
                 FilterExpression::no_filter(),
             )?,
         ))))

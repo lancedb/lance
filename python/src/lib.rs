@@ -38,7 +38,7 @@ use dataset::MergeInsertBuilder;
 use env_logger::Env;
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
-    LanceFileWriter, LancePageMetadata,
+    LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
@@ -65,6 +65,7 @@ pub(crate) mod scanner;
 pub(crate) mod schema;
 pub(crate) mod session;
 pub(crate) mod tracing;
+pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
@@ -73,9 +74,8 @@ pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
 pub use dataset::write_dataset;
-pub use dataset::{Dataset, Operation, RewriteGroup, RewrittenIndex};
-pub use fragment::FragmentMetadata;
-use fragment::{DataFile, FileFragment};
+pub use dataset::Dataset;
+use fragment::{FileFragment, PyDeletionFile, PyRowIdMeta};
 pub use indices::register_indices;
 pub use reader::LanceReader;
 pub use scanner::Scanner;
@@ -111,20 +111,18 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
-    m.add_class::<Operation>()?;
-    m.add_class::<RewriteGroup>()?;
-    m.add_class::<RewrittenIndex>()?;
     m.add_class::<FileFragment>()?;
-    m.add_class::<FragmentMetadata>()?;
+    m.add_class::<PyDeletionFile>()?;
+    m.add_class::<PyRowIdMeta>()?;
     m.add_class::<MergeInsertBuilder>()?;
     m.add_class::<LanceBlobFile>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileMetadata>()?;
+    m.add_class::<LanceFileStatistics>()?;
     m.add_class::<LanceColumnMetadata>()?;
     m.add_class::<LancePageMetadata>()?;
     m.add_class::<LanceBufferDescriptor>()?;
-    m.add_class::<DataFile>()?;
     m.add_class::<BFloat16>()?;
     m.add_class::<CleanupStats>()?;
     m.add_class::<KMeans>()?;

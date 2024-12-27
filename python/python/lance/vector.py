@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import tempfile
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union
 
 import pyarrow as pa
 from tqdm.auto import tqdm
@@ -19,6 +19,7 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .log import LOGGER
+from .util import MetricType, _normalize_metric_type
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -131,8 +132,8 @@ CUDA_REGEX = re.compile(r"^cuda(:\d+)?$")
 
 
 def train_pq_codebook_on_accelerator(
-    dataset: LanceDataset,
-    metric_type: Literal["l2", "cosine", "dot"],
+    dataset: LanceDataset | Path | str,
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
@@ -141,6 +142,8 @@ def train_pq_codebook_on_accelerator(
 
     from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
+
+    metric_type = _normalize_metric_type(metric_type)
 
     centroids_list = []
     kmeans_list = []
@@ -197,7 +200,7 @@ def train_ivf_centroids_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
-    metric_type: Literal["l2", "cosine", "dot"],
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     batch_size: int = 1024 * 10 * 4,
     *,
@@ -209,6 +212,8 @@ def train_ivf_centroids_on_accelerator(
 
     from .torch.data import LanceDataset as TorchDataset
     from .torch.kmeans import KMeans
+
+    metric_type = _normalize_metric_type(metric_type)
 
     if isinstance(accelerator, str) and (
         not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
@@ -274,7 +279,7 @@ def compute_pq_codes(
     batch_size: int = 1024 * 10 * 4,
     dst_dataset_uri: Optional[Union[str, Path]] = None,
     allow_cuda_tf32: bool = True,
-) -> str:
+) -> Tuple[Union[str, Path], List[str]]:
     """Compute pq codes for each row using GPU kmeans and spill to disk.
 
     Parameters
@@ -293,8 +298,8 @@ def compute_pq_codes(
 
     Returns
     -------
-    str
-        The absolute path of the pq codes dataset.
+    Tuple[Union[str, Path], List[str]]
+        The absolute path of the pq codes dataset and shuffle buffers
     """
     from .torch.data import LanceDataset as TorchDataset
 
@@ -382,9 +387,7 @@ def compute_pq_codes(
     LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
 
     shuffle_buffers = [
-        data_file.path()
-        for frag in ds.get_fragments()
-        for data_file in frag.data_files()
+        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
     ]
     return dst_dataset_uri, shuffle_buffers
 
@@ -560,7 +563,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     dataset: LanceDataset,
     column: str,
     k: int,
-    metric_type: Literal["l2", "cosine", "dot"],
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
@@ -569,6 +572,7 @@ def one_pass_train_ivf_pq_on_accelerator(
     max_iters: int = 50,
     filter_nan: bool = True,
 ):
+    metric_type = _normalize_metric_type(metric_type)
     centroids, kmeans = train_ivf_centroids_on_accelerator(
         dataset,
         column,
@@ -599,7 +603,7 @@ def one_pass_train_ivf_pq_on_accelerator(
 def one_pass_assign_ivf_pq_on_accelerator(
     dataset: LanceDataset,
     column: str,
-    metric_type: Literal["l2", "cosine", "dot"],
+    metric_type: MetricType,
     accelerator: Union[str, "torch.Device"],
     ivf_kmeans: Any,  # KMeans
     pq_kmeans_list: List[Any],  # List[KMeans]

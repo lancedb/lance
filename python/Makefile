@@ -31,6 +31,7 @@ lint: lint-python lint-rust
 lint-python:
 	ruff format --check python
 	ruff check python
+	pyright
 .PHONY: lint-python
 
 lint-rust:

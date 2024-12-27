@@ -15,9 +15,10 @@ mod utils;
 #[cfg(test)]
 mod fixture_test;
 
+use arrow_schema::DataType;
 use builder::IvfIndexBuilder;
 use lance_file::reader::FileReader;
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
@@ -40,6 +41,7 @@ use object_store::path::Path;
 use snafu::{location, Location};
 use tempfile::tempdir;
 use tracing::instrument;
+use utils::get_vector_element_type;
 use uuid::Uuid;
 
 use self::{ivf::*, pq::PQIndex};
@@ -252,18 +254,43 @@ pub(crate) async fn build_vector_index(
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = IvfShuffler::new(temp_dir_path, ivf_params.num_partitions);
     if is_ivf_flat(stages) {
-        IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
-            dataset.clone(),
-            column.to_owned(),
-            dataset.indices_dir().child(uuid),
-            params.metric_type,
-            Box::new(shuffler),
-            Some(ivf_params.clone()),
-            Some(()),
-            (),
-        )?
-        .build()
-        .await?;
+        let element_type = get_vector_element_type(dataset, column)?;
+        match element_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new(
+                    dataset.clone(),
+                    column.to_owned(),
+                    dataset.indices_dir().child(uuid),
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params.clone()),
+                    Some(()),
+                    (),
+                )?
+                .build()
+                .await?;
+            }
+            DataType::UInt8 => {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new(
+                    dataset.clone(),
+                    column.to_owned(),
+                    dataset.indices_dir().child(uuid),
+                    params.metric_type,
+                    Box::new(shuffler),
+                    Some(ivf_params.clone()),
+                    Some(()),
+                    (),
+                )?
+                .build()
+                .await?;
+            }
+            _ => {
+                return Err(Error::Index {
+                    message: format!("Build Vector Index: invalid data type: {:?}", element_type),
+                    location: location!(),
+                });
+            }
+        }
     } else if is_ivf_pq(stages) {
         let len = stages.len();
         let StageParams::PQ(pq_params) = &stages[len - 1] else {
@@ -372,30 +399,35 @@ pub(crate) async fn remap_vector_index(
         .open_vector_index(column, &old_uuid.to_string())
         .await?;
     old_index.check_can_remap()?;
-    let ivf_index: &IVFIndex =
-        old_index
-            .as_any()
-            .downcast_ref()
-            .ok_or_else(|| Error::NotSupported {
-                source: "Only IVF indexes can be remapped currently".into(),
-                location: location!(),
-            })?;
 
-    remap_index_file(
-        dataset.as_ref(),
-        &old_uuid.to_string(),
-        &new_uuid.to_string(),
-        old_metadata.dataset_version,
-        ivf_index,
-        mapping,
-        old_metadata.name.clone(),
-        column.to_string(),
-        // We can safely assume there are no transforms today.  We assert above that the
-        // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
-        // will be fixed in the future.
-        vec![],
-    )
-    .await?;
+    if let Some(ivf_index) = old_index.as_any().downcast_ref::<IVFIndex>() {
+        remap_index_file(
+            dataset.as_ref(),
+            &old_uuid.to_string(),
+            &new_uuid.to_string(),
+            old_metadata.dataset_version,
+            ivf_index,
+            mapping,
+            old_metadata.name.clone(),
+            column.to_string(),
+            // We can safely assume there are no transforms today.  We assert above that the
+            // top stage is IVF and IVF does not support transforms between IVF and PQ.  This
+            // will be fixed in the future.
+            vec![],
+        )
+        .await?;
+    } else {
+        // it's v3 index
+        remap_index_file_v3(
+            dataset.as_ref(),
+            &new_uuid.to_string(),
+            old_index,
+            mapping,
+            column.to_string(),
+        )
+        .await?;
+    }
+
     Ok(())
 }
 

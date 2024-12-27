@@ -163,6 +163,12 @@ message Transaction {
   message UpdateConfig {
     map<string, string> upsert_values = 1;
     repeated string delete_keys = 2;
+    map<string, string> schema_metadata = 3;
+    map<uint32, FieldMetadataUpdate> field_metadata = 4;
+
+    message FieldMetadataUpdate {
+      map<string, string> metadata = 5;
+    }
   }
 
   // The operation of this transaction.

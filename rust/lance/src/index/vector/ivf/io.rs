@@ -320,6 +320,7 @@ pub(super) async fn write_hnsw_quantization_index_partitions(
 
         let code_column = match &quantizer {
             Quantizer::Flat(_) => None,
+            Quantizer::FlatBin(_) => None,
             Quantizer::Product(pq) => Some(pq.column()),
             Quantizer::Scalar(_) => None,
         };
