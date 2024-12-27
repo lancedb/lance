@@ -1,25 +1,28 @@
 use std::path::PathBuf;
 
+use super::TokenizerBuilder;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
-use super::TokenizerBuilder;
 
 #[derive(Serialize, Deserialize)]
-pub struct JiebaConfig{
+pub struct JiebaConfig {
     main: Option<String>,
-    users: Option<Vec<String>>
+    users: Option<Vec<String>>,
 }
 
 impl Default for JiebaConfig {
     fn default() -> Self {
-        Self { main: Default::default(), users: Default::default() }
+        Self {
+            main: Default::default(),
+            users: Default::default(),
+        }
     }
 }
 
 pub struct JiebaBuilder {
     root: PathBuf,
-    config: JiebaConfig
+    config: JiebaConfig,
 }
 
 impl JiebaBuilder {
@@ -42,7 +45,10 @@ impl TokenizerBuilder for JiebaBuilder {
     type Config = JiebaConfig;
 
     fn new(config: Self::Config, root: &PathBuf) -> Result<Self> {
-        Ok(JiebaBuilder{config, root: root.clone()})
+        Ok(JiebaBuilder {
+            config,
+            root: root.clone(),
+        })
     }
 
     fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
@@ -51,7 +57,11 @@ impl TokenizerBuilder for JiebaBuilder {
         let mut f = std::io::BufReader::new(file);
         let mut jieba = jieba_rs::Jieba::with_dict(&mut f).map_err(|e| {
             Error::io(
-                format!("load jieba tokenizer dictionary {}, error: {}", main_dict_path.display(), e),
+                format!(
+                    "load jieba tokenizer dictionary {}, error: {}",
+                    main_dict_path.display(),
+                    e
+                ),
                 location!(),
             )
         })?;
@@ -60,19 +70,23 @@ impl TokenizerBuilder for JiebaBuilder {
             let mut f = std::io::BufReader::new(file);
             jieba.load_dict(&mut f).map_err(|e| {
                 Error::io(
-                    format!("load jieba tokenizer user dictionary {},  error: {}", user_dict_path.display(), e),
+                    format!(
+                        "load jieba tokenizer user dictionary {},  error: {}",
+                        user_dict_path.display(),
+                        e
+                    ),
                     location!(),
                 )
             })?
         }
-        let tokenizer = JiebaTokenizer{jieba: jieba};
+        let tokenizer = JiebaTokenizer { jieba: jieba };
         Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
     }
 }
 
 #[derive(Clone)]
-struct JiebaTokenizer{
-    jieba: jieba_rs::Jieba
+struct JiebaTokenizer {
+    jieba: jieba_rs::Jieba,
 }
 
 struct JiebaTokenStream {
@@ -99,7 +113,6 @@ impl tantivy::tokenizer::TokenStream for JiebaTokenStream {
     }
 }
 
-
 #[cfg(feature = "tokenizer-jieba")]
 impl tantivy::tokenizer::Tokenizer for JiebaTokenizer {
     type TokenStream<'a> = JiebaTokenStream;
@@ -107,7 +120,9 @@ impl tantivy::tokenizer::Tokenizer for JiebaTokenizer {
     fn token_stream(&mut self, text: &str) -> JiebaTokenStream {
         let mut indices = text.char_indices().collect::<Vec<_>>();
         indices.push((text.len(), '\0'));
-        let orig_tokens = self.jieba.tokenize(text, jieba_rs::TokenizeMode::Search, true);
+        let orig_tokens = self
+            .jieba
+            .tokenize(text, jieba_rs::TokenizeMode::Search, true);
         let mut tokens = Vec::new();
         for token in orig_tokens {
             tokens.push(tantivy::tokenizer::Token {

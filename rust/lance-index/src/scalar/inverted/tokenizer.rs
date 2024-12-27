@@ -157,7 +157,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
                 return Err(Error::invalid_input(
                     format!("unknown base tokenizer {}", name),
                     location!(),
-                ))
+                ));
             };
             lindera::LinderaBuilder::load(&home.join(s))?.build()
         }
@@ -168,7 +168,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
                 return Err(Error::invalid_input(
                     format!("unknown base tokenizer {}", name),
                     location!(),
-                ))
+                ));
             };
             lindera::LinderaBuilder::load(&home.join(s))?.build()
         }
@@ -198,11 +198,14 @@ trait TokenizerBuilder: Sized {
     type Config: serde::de::DeserializeOwned + Default;
     fn load(p: &PathBuf) -> Result<Self> {
         if !p.is_dir() {
-            return Err(Error::io(format!("{} is not a valid directory", p.display()), location!()))
+            return Err(Error::io(
+                format!("{} is not a valid directory", p.display()),
+                location!(),
+            ));
         }
         use std::{fs::File, io::BufReader};
         let config_path = p.join(LANCE_LANGUAGE_MODEL_CONFIG_FILE);
-        let config= if config_path.exists() {
+        let config = if config_path.exists() {
             let file = File::open(config_path)?;
             let reader = BufReader::new(file);
             serde_json::from_reader::<BufReader<File>, Self::Config>(reader)?

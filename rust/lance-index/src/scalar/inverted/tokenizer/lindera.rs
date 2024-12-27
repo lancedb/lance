@@ -1,10 +1,7 @@
 use std::path::PathBuf;
 
-use lance_core::{Error, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
-use snafu::{location, Location};
 use super::TokenizerBuilder;
+use lance_core::{Error, Result};
 use lindera::{
     dictionary::{
         load_dictionary_from_path, load_user_dictionary_from_config, UserDictionaryConfig,
@@ -13,23 +10,30 @@ use lindera::{
     segmenter::Segmenter,
 };
 use lindera_tantivy::tokenizer::LinderaTokenizer;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use snafu::{location, Location};
 
 #[derive(Serialize, Deserialize)]
-pub struct LinderaConfig{
+pub struct LinderaConfig {
     main: Option<String>,
     user: Option<String>,
-    user_kind: Option<String>
+    user_kind: Option<String>,
 }
 
 impl Default for LinderaConfig {
     fn default() -> Self {
-        Self { main: Default::default(), user: Default::default(), user_kind: Default::default() }
+        Self {
+            main: Default::default(),
+            user: Default::default(),
+            user_kind: Default::default(),
+        }
     }
 }
 
 pub struct LinderaBuilder {
     root: PathBuf,
-    config: LinderaConfig
+    config: LinderaConfig,
 }
 
 impl LinderaBuilder {
@@ -42,15 +46,18 @@ impl LinderaBuilder {
 
     fn user_dict_config(&self) -> Result<Option<UserDictionaryConfig>> {
         let Some(user_dict_path) = &self.config.user else {
-            return Ok(None)
+            return Ok(None);
         };
         let mut conf = Map::<String, Value>::new();
         let user_path = self.root.join(user_dict_path);
         let Some(p) = user_path.to_str() else {
             return Err(Error::io(
-                format!("invalid lindera tokenizer user dictionary path: {}", user_path.display()),
+                format!(
+                    "invalid lindera tokenizer user dictionary path: {}",
+                    user_path.display()
+                ),
                 location!(),
-            ))
+            ));
         };
         conf.insert(String::from("path"), Value::String(String::from(p)));
         if let Some(kind) = &self.config.user_kind {
@@ -64,19 +71,26 @@ impl TokenizerBuilder for LinderaBuilder {
     type Config = LinderaConfig;
 
     fn new(config: Self::Config, root: &PathBuf) -> Result<Self> {
-        Ok(LinderaBuilder{config, root: root.clone()})
+        Ok(LinderaBuilder {
+            config,
+            root: root.clone(),
+        })
     }
 
     fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
         let main_path = self.main_dict_path();
         let dictionary = load_dictionary_from_path(main_path.as_path()).map_err(|e| {
             Error::io(
-                format!("load lindera tokenizer main dictionary from {}, error: {}", main_path.display(), e),
+                format!(
+                    "load lindera tokenizer main dictionary from {}, error: {}",
+                    main_path.display(),
+                    e
+                ),
                 location!(),
             )
         })?;
         let user_dictionary = match self.user_dict_config()? {
-            Some(conf) =>  {
+            Some(conf) => {
                 let user_dictionary = load_user_dictionary_from_config(&conf).map_err(|e| {
                     Error::io(
                         format!("load lindera tokenizer user dictionary err: {e}"),
@@ -84,9 +98,8 @@ impl TokenizerBuilder for LinderaBuilder {
                     )
                 })?;
                 Some(user_dictionary)
-            },
-            None => None
-
+            }
+            None => None,
         };
         let mode = Mode::Normal;
         let segmenter = Segmenter::new(mode, dictionary, user_dictionary);
@@ -94,4 +107,3 @@ impl TokenizerBuilder for LinderaBuilder {
         Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
     }
 }
-

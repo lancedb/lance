@@ -1,0 +1,6 @@
+{
+    "main": "../default/dict.txt",
+    "user": [
+        "user.txt"
+    ]
+}
