@@ -325,7 +325,7 @@ def test_create_from_file(tmp_path):
     frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
     op = LanceOperation.Append([frag])
 
-    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
     frag = dataset.get_fragments()[0]
     assert frag.fragment_id == 0
 
@@ -339,7 +339,7 @@ def test_create_from_file(tmp_path):
     frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
     op = LanceOperation.Append([frag])
 
-    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
     frag = dataset.get_fragments()[1]
     assert frag.fragment_id == 1
 

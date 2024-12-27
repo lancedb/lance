@@ -30,16 +30,13 @@ from .lance import (
 from .lance import (
     RowIdMeta as RowIdMeta,
 )
-from .lance import (
-    _Fragment,
-    _write_fragments,
-)
+from .lance import _Fragment, _write_fragments, _write_fragments_transaction
 from .progress import FragmentWriteProgress, NoopFragmentWriteProgress
 from .types import _coerce_reader
 from .udf import BatchUDF, normalize_transform
 
 if TYPE_CHECKING:
-    from .dataset import LanceDataset, LanceScanner, ReaderLike
+    from .dataset import LanceDataset, LanceScanner, ReaderLike, Transaction
     from .lance import LanceSchema
 
 
@@ -679,6 +676,7 @@ def write_fragments(
     data: ReaderLike,
     dataset_uri: Union[str, Path, LanceDataset],
     schema: Optional[pa.Schema] = None,
+    return_transaction: bool = False,
     *,
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
@@ -688,7 +686,8 @@ def write_fragments(
     data_storage_version: Optional[str] = None,
     use_legacy_format: Optional[bool] = None,
     storage_options: Optional[Dict[str, str]] = None,
-) -> List[FragmentMetadata]:
+    enable_move_stable_row_ids: bool = False,
+) -> List[FragmentMetadata] | Transaction:
     """
     Write data into one or more fragments.
 
@@ -772,7 +771,9 @@ def write_fragments(
         else:
             data_storage_version = "stable"
 
-    return _write_fragments(
+    function = _write_fragments_transaction if return_transaction else _write_fragments
+
+    return function(
         dataset_uri,
         reader,
         mode=mode,
@@ -782,4 +783,5 @@ def write_fragments(
         progress=progress,
         data_storage_version=data_storage_version,
         storage_options=storage_options,
+        enable_move_stable_row_ids=enable_move_stable_row_ids,
     )

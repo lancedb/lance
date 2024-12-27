@@ -21,7 +21,7 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
 use lance::Error;
 use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
@@ -386,6 +386,41 @@ pub fn write_fragments(
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
     Ok(export_vec(reader.py(), &fragments))
+}
+
+#[pyfunction(name = "_write_fragments_transaction")]
+#[pyo3(signature = (dest, reader, **kwargs))]
+pub fn write_fragments_transaction(
+    dest: &Bound<PyAny>,
+    reader: &Bound<PyAny>,
+    kwargs: Option<&PyDict>,
+) -> PyResult<PyObject> {
+    let batches = convert_reader(reader)?;
+
+    let params = kwargs
+        .and_then(|params| get_write_params(params).transpose())
+        .transpose()?
+        .unwrap_or_default();
+
+    let dest = if dest.is_instance_of::<Dataset>() {
+        let dataset: Dataset = dest.extract()?;
+        WriteDestination::Dataset(dataset.ds.clone())
+    } else {
+        WriteDestination::Uri(dest.extract()?)
+    };
+
+    let written: Transaction = RT
+        .block_on(
+            Some(reader.py()),
+            InsertBuilder::new(dest)
+                .with_params(&params)
+                .execute_uncommitted_stream(batches),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+    println!("written: {:?}", written);
+
+    Ok(PyLance(written).to_object(reader.py()))
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
