@@ -7,6 +7,12 @@ use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
+#[cfg(feature = "tokenizer-lindera")]
+mod lindera;
+
+#[cfg(feature = "tokenizer-jieba")]
+mod jieba;
+
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenizerConfig {
@@ -147,11 +153,24 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
         .dynamic()),
         #[cfg(feature = "tokenizer-lindera")]
         s if s.starts_with("lindera/") => {
-            return build_lindera_tokenizer_builder(s);
+            let Some(home) = &*LANCE_LANGUAGE_MODEL_HOME else {
+                return Err(Error::invalid_input(
+                    format!("unknown base tokenizer {}", name),
+                    location!(),
+                ))
+            };
+            lindera::LinderaBuilder::load(&home.join(s))?.build()
         }
         #[cfg(feature = "tokenizer-jieba")]
         s if s.starts_with("jieba/") || s == "jieba" => {
-            return build_jieba_tokenizer_builder(s);
+            let s = if s == "jieba" { "jieba/default" } else { s };
+            let Some(home) = &*LANCE_LANGUAGE_MODEL_HOME else {
+                return Err(Error::invalid_input(
+                    format!("unknown base tokenizer {}", name),
+                    location!(),
+                ))
+            };
+            lindera::LinderaBuilder::load(&home.join(s))?.build()
         }
         _ => Err(Error::invalid_input(
             format!("unknown base tokenizer {}", name),
@@ -164,6 +183,8 @@ pub const LANCE_LANGUAGE_MODEL_HOME_ENV_KEY: &str = "LANCE_LANGUAGE_MODEL_HOME";
 
 pub const LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY: &str = "lance/language_models";
 
+pub const LANCE_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.json";
+
 lazy_static::lazy_static! {
     /// default directory that stores lance tokenizer related files, e.g. tokenizer model.
     pub static ref LANCE_LANGUAGE_MODEL_HOME: Option<PathBuf> = match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
@@ -172,183 +193,26 @@ lazy_static::lazy_static! {
     };
 }
 
-#[cfg(feature = "tokenizer-lindera")]
-#[derive(Serialize, Deserialize)]
-struct LinderaConfig{
-    main: String,
-    user: Option<String>,
-    user_kind: Option<String>
-}
-
-#[cfg(feature = "tokenizer-lindera")]
-fn build_lindera_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
-    use std::{fs::File, io::BufReader};
-
-    use lindera::{
-        dictionary::{
-            load_dictionary_from_path, load_user_dictionary_from_config, UserDictionaryConfig,
-        },
-        mode::Mode,
-        segmenter::Segmenter,
-    };
-    use lindera_tantivy::tokenizer::LinderaTokenizer;
-    use serde_json::Value;
-
-    match LANCE_LANGUAGE_MODEL_HOME.as_ref() {
-        Some(p) => {
-            let dic_dir = p.join(dic);
-            let config_path = dic_dir.join("config.json");
-            let config: LinderaConfig = if config_path.exists() {
-                let file = File::open(config_path)?;
-                let reader = BufReader::new(file);
-                serde_json::from_reader(reader)?
-            } else {
-                let Some(dic_dir) = dic_dir.to_str() else {
-                    return Err(Error::invalid_input("dic dir is invalid",
-                        location!(),
-                    ))
-                };
-                LinderaConfig{main: String::from(dic_dir), user: None, user_kind: None}
-            };
-            let main_path = dic_dir.join(config.main);
-            let dictionary = load_dictionary_from_path(main_path.as_path()).map_err(|e| {
-                Error::io(
-                    format!("load lindera tokenizer main dictionary err: {e}"),
-                    location!(),
-                )
-            })?;
-            let user_dictionary = match config.user {
-                Some(user) =>  {
-                    let mut conf = serde_json::Map::<String, Value>::new();
-                    let user_path = dic_dir.join(user);
-                    match user_path.to_str() {
-                        Some(p) => {
-                            conf.insert(String::from("path"), Value::String(String::from(p)));
-                            Ok(())
-                        },
-                        None => {
-                            let p = user_path.display();
-                            Err(Error::io(
-                                format!("invalid lindera tokenizer user dictionary path: {p}"),
-                                location!(),
-                            ))
-                        }
-                    }?;
-                    if let Some(kind) = config.user_kind {
-                        conf.insert(String::from("kind"), Value::String(kind));
-                    }
-                    let user_dictionary_config: UserDictionaryConfig = Value::Object(conf);
-                    let user_dictionary = load_user_dictionary_from_config(&user_dictionary_config).map_err(|e| {
-                        Error::io(
-                            format!("load lindera tokenizer user dictionary err: {e}"),
-                            location!(),
-                        )
-                    })?;
-                    Some(user_dictionary)
-                },
-                None => None
-
-            };
-            let mode = Mode::Normal;
-            let segmenter = Segmenter::new(mode, dictionary, user_dictionary);
-            let tokenizer = LinderaTokenizer::from_segmenter(segmenter);
-            Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
+#[cfg(feature = "tokenizer-common")]
+trait TokenizerBuilder: Sized {
+    type Config: serde::de::DeserializeOwned + Default;
+    fn load(p: &PathBuf) -> Result<Self> {
+        if !p.is_dir() {
+            return Err(Error::io(format!("{} is not a valid directory", p.display()), location!()))
         }
-        None => Err(Error::invalid_input(
-            format!(
-                "{} is undefined",
-                String::from(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY)
-            ),
-            location!(),
-        )),
-    }
-}
-
-
-
-#[cfg(feature = "tokenizer-jieba")]
-fn build_jieba_tokenizer_builder(dic: &str) -> Result<tantivy::tokenizer::TextAnalyzerBuilder> {
-    match LANCE_LANGUAGE_MODEL_HOME.as_ref() {
-        Some(p) => {
-            let dic = if dic == "jieba" {
-                "jieba/default"
-            } else {
-                dic
-            };
-            let dic_file = p.join(dic).join("dict.txt");
-            let file = std::fs::File::open(dic_file)?;
-            let mut f = std::io::BufReader::new(file);
-            let jieba = jieba_rs::Jieba::with_dict(&mut f).map_err(|e| {
-                Error::io(
-                    format!("load jieba tokenizer dictionary err: {e}"),
-                    location!(),
-                )
-            })?;
-            let tokenizer = JiebaTokenizer{jieba: jieba};
-            Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
-        },
-        None => Err(Error::invalid_input(
-            format!(
-                "{} is undefined",
-                String::from(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY)
-            ),
-            location!(),
-        )),
-    }
-
-}
-
-#[cfg(feature = "tokenizer-jieba")]
-#[derive(Clone)]
-struct JiebaTokenizer{
-    jieba: jieba_rs::Jieba
-}
-
-#[cfg(feature = "tokenizer-jieba")]
-struct JiebaTokenStream {
-    tokens: Vec<tantivy::tokenizer::Token>,
-    index: usize,
-}
-
-#[cfg(feature = "tokenizer-jieba")]
-impl tantivy::tokenizer::TokenStream for JiebaTokenStream {
-    fn advance(&mut self) -> bool {
-        if self.index < self.tokens.len() {
-            self.index += 1;
-            true
+        use std::{fs::File, io::BufReader};
+        let config_path = p.join(LANCE_LANGUAGE_MODEL_CONFIG_FILE);
+        let config= if config_path.exists() {
+            let file = File::open(config_path)?;
+            let reader = BufReader::new(file);
+            serde_json::from_reader::<BufReader<File>, Self::Config>(reader)?
         } else {
-            false
-        }
+            Self::Config::default()
+        };
+        Self::new(config, p)
     }
 
-    fn token(&self) -> &tantivy::tokenizer::Token {
-        &self.tokens[self.index - 1]
-    }
+    fn new(config: Self::Config, root: &PathBuf) -> Result<Self>;
 
-    fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
-        &mut self.tokens[self.index - 1]
-    }
-}
-
-
-#[cfg(feature = "tokenizer-jieba")]
-impl tantivy::tokenizer::Tokenizer for JiebaTokenizer {
-    type TokenStream<'a> = JiebaTokenStream;
-
-    fn token_stream(&mut self, text: &str) -> JiebaTokenStream {
-        let mut indices = text.char_indices().collect::<Vec<_>>();
-        indices.push((text.len(), '\0'));
-        let orig_tokens = self.jieba.tokenize(text, jieba_rs::TokenizeMode::Search, true);
-        let mut tokens = Vec::new();
-        for token in orig_tokens {
-            tokens.push(tantivy::tokenizer::Token {
-                offset_from: indices[token.start].0,
-                offset_to: indices[token.end].0,
-                position: token.start,
-                text: String::from(&text[(indices[token.start].0)..(indices[token.end].0)]),
-                position_length: token.end - token.start,
-            });
-        }
-        JiebaTokenStream { tokens, index: 0 }
-    }
+    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder>;
 }

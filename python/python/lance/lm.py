@@ -28,15 +28,13 @@ def download_jieba():
     try:
         check_requests()
         import requests
-        resp = requests.get("https://api.github.com/repos/messense/jieba-rs/releases/latest")
-        content = requests.get(resp.json()["tarball_url"]).content
-        with tarfile.open(fileobj=BytesIO(content)) as tar:
-            dir = tar.getnames()[0]
-            tar.extract(f'{dir}/src/data', path=dirname)
-        shutil.move(os.path.join(dirname, dir, "src", "data"), dirname)
+        resp = requests.get("https://github.com/messense/jieba-rs/raw/refs/heads/main/src/data/dict.txt")
+        content = resp.content
+        with open(os.path.join(dirname, "dict.txt"), "wb") as fo:
+            fo.write(content)
     except Exception as _:
         traceback.print_exc()
-        print("Download jieba language model failed. Please download this folder "
+        print("Download jieba language model failed. Please download dict.txt from "
               f"https://github.com/messense/jieba-rs/tree/main/src/data and put it in {dirname}")
 
 def download_lindera(lm: str):
@@ -62,8 +60,8 @@ def download_lindera(lm: str):
         with tarfile.open(fileobj=BytesIO(data)) as tar:
             tar.extractall()
             name = tar.getnames()[0]
-        cmd = ["lindera", "build", f"--dictionary-kind={lm}", os.path.join(src_dirname, name), dirname]
-        print(f"compile language model: {' '.join(cmd)}")
+        cmd = ["lindera", "build", f"--dictionary-kind={lm}", os.path.join(src_dirname, name),os.path.join(dirname, "main")]
+        print(f"compiling language model: {' '.join(cmd)}")
         subprocess.run(cmd)
     finally:
         os.chdir(cwd)
