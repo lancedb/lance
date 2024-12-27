@@ -36,15 +36,15 @@ def test_eda_search(benchmark, columns, filt):
     benchmark.pedantic(bench, rounds=1, iterations=1)
 
 
-BTREE_FILTERS = ["image_widths = 3997", "image_widths BETWEEN 100 AND 3997"]
+BTREE_FILTERS = ["image_widths = 3997", "image_widths >= 3990 AND image_widths <= 3997"]
 
 
 @pytest.mark.parametrize("filt", BTREE_FILTERS)
 def test_eda_btree_search(benchmark, filt):
     dataset_uri = get_dataset_uri("image_eda")
+    ds = lance.dataset(dataset_uri)
 
     def bench():
-        ds = lance.dataset(dataset_uri)
         ds.to_table(
             columns=[],
             filter=filt,
