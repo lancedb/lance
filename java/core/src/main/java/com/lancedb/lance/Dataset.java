@@ -386,14 +386,14 @@ public class Dataset implements Closeable {
    *
    * @return num of rows
    */
-  public int countRows() {
+  public long countRows() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       return nativeCountRows();
     }
   }
 
-  private native int nativeCountRows();
+  private native long nativeCountRows();
 
   /**
    * Get all fragments in this dataset.

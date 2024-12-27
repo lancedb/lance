@@ -25,6 +25,8 @@ import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
 import org.apache.spark.sql.connector.read.Scan;
+import org.apache.spark.sql.connector.read.Statistics;
+import org.apache.spark.sql.connector.read.SupportsReportStatistics;
 import org.apache.spark.sql.internal.connector.SupportsMetadata;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
@@ -35,7 +37,8 @@ import java.io.Serializable;
 import java.util.List;
 import java.util.stream.IntStream;
 
-public class LanceScan implements Batch, Scan, SupportsMetadata, Serializable {
+public class LanceScan
+    implements Batch, Scan, SupportsMetadata, SupportsReportStatistics, Serializable {
   private static final long serialVersionUID = 947284762748623947L;
 
   private final StructType schema;
@@ -101,6 +104,11 @@ public class LanceScan implements Batch, Scan, SupportsMetadata, Serializable {
     hashMap.put("offset", offset.toString());
     hashMap.put("topNSortOrders", topNSortOrders.toString());
     return hashMap.toMap(scala.Predef.conforms());
+  }
+
+  @Override
+  public Statistics estimateStatistics() {
+    return new LanceStatistics(config);
   }
 
   private class LanceReaderFactory implements PartitionReaderFactory {

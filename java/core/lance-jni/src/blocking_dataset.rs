@@ -636,8 +636,8 @@ fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> 
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
-) -> jint {
-    ok_or_throw_with_return!(env, inner_count_rows(&mut env, java_dataset), -1) as jint
+) -> jlong {
+    ok_or_throw_with_return!(env, inner_count_rows(&mut env, java_dataset), -1) as jlong
 }
 
 fn inner_count_rows(env: &mut JNIEnv, java_dataset: JObject) -> Result<usize> {

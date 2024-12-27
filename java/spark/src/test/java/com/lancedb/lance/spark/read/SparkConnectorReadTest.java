@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class SparkConnectorReadTest {
   private static SparkSession spark;
@@ -53,6 +54,7 @@ public class SparkConnectorReadTest {
                 LanceConfig.CONFIG_DATASET_URI,
                 LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName))
             .load();
+    data.createOrReplaceTempView("test_dataset1");
   }
 
   @AfterAll
@@ -170,5 +172,18 @@ public class SparkConnectorReadTest {
             .format("lance")
             .load(LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName));
     validateData(df, TestUtils.TestTable1Config.expectedValues);
+  }
+
+  @Test
+  public void supportBroadcastJoin() {
+    Dataset<Row> df =
+        spark
+            .read()
+            .format("lance")
+            .load(LanceConfig.getDatasetUri(dbPath, "test_dataset3"));
+    df.createOrReplaceTempView("test_dataset3");
+    List<Row> desc =  spark.sql("explain select t1.* from test_dataset1 t1 join test_dataset3 t3 on t1.x = t3.x").collectAsList();
+    assertEquals(1, desc.size());
+    assertTrue(desc.get(0).getString(0).contains("BroadcastHashJoin"));
   }
 }
