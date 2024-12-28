@@ -37,8 +37,8 @@ def download_jieba():
             "https://github.com/messense/jieba-rs/raw/refs/heads/main/src/data/dict.txt"
         )
         content = resp.content
-        with open(os.path.join(dirname, "dict.txt"), "wb") as fo:
-            fo.write(content)
+        with open(os.path.join(dirname, "dict.txt"), "wb") as out:
+            out.write(content)
     except Exception as _:
         traceback.print_exc()
         print(
