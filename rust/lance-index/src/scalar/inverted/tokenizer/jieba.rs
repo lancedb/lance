@@ -1,26 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::TokenizerBuilder;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct JiebaConfig {
     main: Option<String>,
     users: Option<Vec<String>>,
-}
-
-impl Default for JiebaConfig {
-    fn default() -> Self {
-        Self {
-            main: Default::default(),
-            users: Default::default(),
-        }
-    }
 }
 
 pub struct JiebaBuilder {
@@ -47,10 +38,10 @@ impl JiebaBuilder {
 impl TokenizerBuilder for JiebaBuilder {
     type Config = JiebaConfig;
 
-    fn new(config: Self::Config, root: &PathBuf) -> Result<Self> {
-        Ok(JiebaBuilder {
+    fn new(config: Self::Config, root: &Path) -> Result<Self> {
+        Ok(Self {
             config,
-            root: root.clone(),
+            root: root.to_path_buf(),
         })
     }
 

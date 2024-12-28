@@ -177,14 +177,14 @@ fn json_to_schema(json: &str) -> PyResult<PyArrowType<ArrowSchema>> {
 #[pyfunction]
 pub fn language_model_home() -> PyResult<String> {
     let Some(p) = lance_index::scalar::inverted::language_model_home() else {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Failed to get language model home"
-        )));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Failed to get language model home",
+        ));
     };
     let Some(pstr) = p.to_str() else {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Failed to convert language model home to str"
-        )));
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Failed to convert language model home to str",
+        ));
     };
     Ok(String::from(pstr))
 }

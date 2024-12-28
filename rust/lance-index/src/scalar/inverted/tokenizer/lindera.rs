@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::TokenizerBuilder;
 use lance_core::{Error, Result};
@@ -17,21 +17,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use snafu::{location, Location};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct LinderaConfig {
     main: Option<String>,
     user: Option<String>,
     user_kind: Option<String>,
-}
-
-impl Default for LinderaConfig {
-    fn default() -> Self {
-        Self {
-            main: Default::default(),
-            user: Default::default(),
-            user_kind: Default::default(),
-        }
-    }
 }
 
 pub struct LinderaBuilder {
@@ -73,10 +63,10 @@ impl LinderaBuilder {
 impl TokenizerBuilder for LinderaBuilder {
     type Config = LinderaConfig;
 
-    fn new(config: Self::Config, root: &PathBuf) -> Result<Self> {
-        Ok(LinderaBuilder {
+    fn new(config: Self::Config, root: &Path) -> Result<Self> {
+        Ok(Self {
             config,
-            root: root.clone(),
+            root: root.to_path_buf(),
         })
     }
 

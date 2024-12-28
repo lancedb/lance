@@ -195,7 +195,7 @@ pub fn language_model_home() -> Option<PathBuf> {
 #[cfg(feature = "tokenizer-common")]
 trait TokenizerBuilder: Sized {
     type Config: serde::de::DeserializeOwned + Default;
-    fn load(p: &PathBuf) -> Result<Self> {
+    fn load(p: &std::path::Path) -> Result<Self> {
         if !p.is_dir() {
             return Err(Error::io(
                 format!("{} is not a valid directory", p.display()),
@@ -214,7 +214,7 @@ trait TokenizerBuilder: Sized {
         Self::new(config, p)
     }
 
-    fn new(config: Self::Config, root: &PathBuf) -> Result<Self>;
+    fn new(config: Self::Config, root: &std::path::Path) -> Result<Self>;
 
     fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder>;
 }
