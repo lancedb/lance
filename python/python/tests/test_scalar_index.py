@@ -5,9 +5,9 @@ import os
 import random
 import shutil
 import string
+import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
-import zipfile
 
 import lance
 import numpy as np
@@ -35,8 +35,11 @@ def create_table(nvec=1000, ndim=128):
     )
     return tbl
 
+
 def set_language_model_path():
-    os.environ["LANCE_LANGUAGE_MODEL_HOME"] = os.path.join(os.path.dirname(__file__), "models")
+    os.environ["LANCE_LANGUAGE_MODEL_HOME"] = os.path.join(
+        os.path.dirname(__file__), "models"
+    )
 
 
 @pytest.fixture()
@@ -46,12 +49,13 @@ def lindera_ipadic():
     cwd = os.getcwd()
     try:
         os.chdir(model_path)
-        with zipfile.ZipFile("main.zip", 'r') as zip_ref:
+        with zipfile.ZipFile("main.zip", "r") as zip_ref:
             zip_ref.extractall()
         os.chdir(cwd)
         yield
     finally:
         shutil.rmtree(os.path.join(model_path, "main"))
+
 
 @pytest.fixture()
 def dataset(tmp_path):
@@ -344,8 +348,13 @@ def test_fts_all_deleted(dataset):
     dataset.delete(f"doc = '{first_row_doc}'")
     dataset.to_table(full_text_query=first_row_doc)
 
-def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(tmp_path, lindera_ipadic):
-    os.environ["LANCE_LANGUAGE_MODEL_HOME"] = os.path.join(os.path.dirname(__file__), "models")
+
+def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(
+    tmp_path, lindera_ipadic
+):
+    os.environ["LANCE_LANGUAGE_MODEL_HOME"] = os.path.join(
+        os.path.dirname(__file__), "models"
+    )
     data = pa.table(
         {
             "text": [
@@ -365,6 +374,7 @@ def test_indexed_filter_with_fts_index_with_lindera_ipadic_jp_tokenizer(tmp_path
     )
     assert results["_rowid"].to_pylist() == [0]
 
+
 def test_lindera_ipadic_jp_tokenizer_invalid_user_dict_path(tmp_path, lindera_ipadic):
     data = pa.table(
         {
@@ -375,9 +385,14 @@ def test_lindera_ipadic_jp_tokenizer_invalid_user_dict_path(tmp_path, lindera_ip
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
     with pytest.raises(OSError):
-        ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/invalid_dict")
+        ds.create_scalar_index(
+            "text", "INVERTED", base_tokenizer="lindera/invalid_dict"
+        )
 
-def test_lindera_ipadic_jp_tokenizer_csv_user_dict_without_type(tmp_path, lindera_ipadic):
+
+def test_lindera_ipadic_jp_tokenizer_csv_user_dict_without_type(
+    tmp_path, lindera_ipadic
+):
     data = pa.table(
         {
             "text": [
@@ -387,7 +402,10 @@ def test_lindera_ipadic_jp_tokenizer_csv_user_dict_without_type(tmp_path, linder
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
     with pytest.raises(OSError):
-        ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/invalid_dict2")
+        ds.create_scalar_index(
+            "text", "INVERTED", base_tokenizer="lindera/invalid_dict2"
+        )
+
 
 def test_lindera_ipadic_jp_tokenizer_csv_user_dict(tmp_path, lindera_ipadic):
     data = pa.table(
@@ -414,6 +432,7 @@ def test_lindera_ipadic_jp_tokenizer_csv_user_dict(tmp_path, lindera_ipadic):
     )
     assert results["_rowid"].to_pylist() == [0]
 
+
 def test_lindera_ipadic_jp_tokenizer_bin_user_dict(tmp_path, lindera_ipadic):
     data = pa.table(
         {
@@ -425,14 +444,12 @@ def test_lindera_ipadic_jp_tokenizer_bin_user_dict(tmp_path, lindera_ipadic):
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
     ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/user_dict2")
 
+
 def test_jieba_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(
         {
-            "text": [
-                "我们都有光明的前途",
-                "光明的前途"
-            ],
+            "text": ["我们都有光明的前途", "光明的前途"],
         }
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
@@ -443,6 +460,7 @@ def test_jieba_tokenizer(tmp_path):
         with_row_id=True,
     )
     assert results["_rowid"].to_pylist() == [0]
+
 
 def test_jieba_invalid_user_dict_tokenizer(tmp_path):
     set_language_model_path()
@@ -471,14 +489,12 @@ def test_jieba_invalid_main_dict_tokenizer(tmp_path):
     with pytest.raises(OSError):
         ds.create_scalar_index("text", "INVERTED", base_tokenizer="jieba/invalid_dict2")
 
+
 def test_jieba_user_dict_tokenizer(tmp_path):
     set_language_model_path()
     data = pa.table(
         {
-            "text": [
-                "我们都有光明的前途",
-                "光明的前途"
-            ],
+            "text": ["我们都有光明的前途", "光明的前途"],
         }
     )
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
