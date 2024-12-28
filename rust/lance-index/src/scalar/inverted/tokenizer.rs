@@ -153,7 +153,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
         .dynamic()),
         #[cfg(feature = "tokenizer-lindera")]
         s if s.starts_with("lindera/") => {
-            let Some(home) = &*LANCE_LANGUAGE_MODEL_HOME else {
+            let Some(home) = language_model_home() else {
                 return Err(Error::invalid_input(
                     format!("unknown base tokenizer {}", name),
                     location!(),
@@ -164,7 +164,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
         #[cfg(feature = "tokenizer-jieba")]
         s if s.starts_with("jieba/") || s == "jieba" => {
             let s = if s == "jieba" { "jieba/default" } else { s };
-            let Some(home) = &*LANCE_LANGUAGE_MODEL_HOME else {
+            let Some(home) = language_model_home() else {
                 return Err(Error::invalid_input(
                     format!("unknown base tokenizer {}", name),
                     location!(),
@@ -185,12 +185,11 @@ pub const LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY: &str = "lance/language_models"
 
 pub const LANCE_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.json";
 
-lazy_static::lazy_static! {
-    /// default directory that stores lance tokenizer related files, e.g. tokenizer model.
-    pub static ref LANCE_LANGUAGE_MODEL_HOME: Option<PathBuf> = match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
+pub fn language_model_home() -> Option<PathBuf> {
+    match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
         Ok(p) => Some(PathBuf::from(p)),
         Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY))
-    };
+    }
 }
 
 #[cfg(feature = "tokenizer-common")]

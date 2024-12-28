@@ -15,6 +15,7 @@
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -433,4 +434,4 @@ class BFloat16:
 def bfloat16_array(values: List[str | None]) -> BFloat16Array: ...
 
 __version__: str
-LANGUAGE_MODEL_HOME: Optional[str]
+language_model_home: Callable[[], str]

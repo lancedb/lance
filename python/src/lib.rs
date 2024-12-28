@@ -144,15 +144,14 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
+    m.add_wrapped(wrap_pyfunction!(language_model_home))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    let none = PyNone::get_bound(py).into_py(py);
-    let lm_home = lance_index::scalar::inverted::LANCE_LANGUAGE_MODEL_HOME.as_ref().and_then(|p| p.to_str()).map(|p| PyString::new_bound(py, p).into_py(py)).unwrap_or(none);
-    m.add("LANGUAGE_MODEL_HOME", lm_home)?;
+
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())
@@ -174,6 +173,21 @@ fn json_to_schema(json: &str) -> PyResult<PyArrowType<ArrowSchema>> {
         ))
     })?;
     Ok(schema.into())
+}
+
+#[pyfunction]
+pub fn language_model_home() -> PyResult<String> {
+    let Some(p) = lance_index::scalar::inverted::language_model_home() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Failed to get language model home"
+        )));
+    };
+    let Some(pstr) = p.to_str() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Failed to convert language model home to str"
+        )));
+    };
+    Ok(String::from(pstr))
 }
 
 /// Infer schema from tfrecord file
