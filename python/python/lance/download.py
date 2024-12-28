@@ -22,7 +22,7 @@ def check_lindera():
 
 def import_requests():
     try:
-        import requests  # type: ignore
+        import requests
     except Exception:
         raise Exception("requests is not installed, Please pip install requests")
     return requests

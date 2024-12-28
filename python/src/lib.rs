@@ -44,7 +44,6 @@ use futures::StreamExt;
 use lance_index::DatasetIndexExt;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyNone, PyString};
 use session::Session;
 
 #[macro_use]
