@@ -188,7 +188,7 @@ pub const LANCE_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.json";
 pub fn language_model_home() -> Option<PathBuf> {
     match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
         Ok(p) => Some(PathBuf::from(p)),
-        Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY))
+        Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY)),
     }
 }
 
