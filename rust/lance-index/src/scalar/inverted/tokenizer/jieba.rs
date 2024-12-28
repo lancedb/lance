@@ -73,7 +73,7 @@ impl TokenizerBuilder for JiebaBuilder {
                 )
             })?
         }
-        let tokenizer = JiebaTokenizer { jieba: jieba };
+        let tokenizer = JiebaTokenizer { jieba };
         Ok(tantivy::tokenizer::TextAnalyzer::builder(tokenizer).dynamic())
     }
 }
