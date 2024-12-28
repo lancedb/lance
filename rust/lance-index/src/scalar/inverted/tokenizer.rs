@@ -20,8 +20,8 @@ pub struct TokenizerConfig {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
-    /// - `lindera-ipadic`: Japanese tokenizer
-    /// - `lindera-ko-dic`: Korea tokenizer
+    /// - `lindera/*`: Lindera tokenizer
+    /// - `jieba/*`: Jieba tokenizer
     ///
     /// `simple` is recommended for most cases and the default value
     base_tokenizer: String,
@@ -170,7 +170,7 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
                     location!(),
                 ));
             };
-            lindera::LinderaBuilder::load(&home.join(s))?.build()
+            jieba::JiebaBuilder::load(&home.join(s))?.build()
         }
         _ => Err(Error::invalid_input(
             format!("unknown base tokenizer {}", name),

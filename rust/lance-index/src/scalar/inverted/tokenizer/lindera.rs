@@ -93,7 +93,7 @@ impl TokenizerBuilder for LinderaBuilder {
             Some(conf) => {
                 let user_dictionary = load_user_dictionary_from_config(&conf).map_err(|e| {
                     Error::io(
-                        format!("load lindera tokenizer user dictionary err: {e}"),
+                        format!("load lindera tokenizer user dictionary, conf:{conf}, err: {e}"),
                         location!(),
                     )
                 })?;

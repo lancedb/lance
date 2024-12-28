@@ -71,12 +71,12 @@ Create a file named config.json in the root directory of the current model.
     {
         "main": "main",
         "users": "path/to/user/dict.bin",
-        "user_type": "ipadic|ko-dic|unidic"
+        "user_kind": "ipadic|ko-dic|unidic"
     }
 
 - The "main" field is optional. If not filled, the default is the "main" directory.
 - "user" is the path of the user dictionary. The user dictionary can be passed as a CSV file or as a binary file compiled by lindera-cli.
-- The "user_type" field can be left blank if the user dictionary is in binary format. If it's in CSV format, you need to specify the type of the language model.
+- The "user_kind" field can be left blank if the user dictionary is in binary format. If it's in CSV format, you need to specify the type of the language model.
 
 
 Create your own language model
