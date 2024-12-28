@@ -418,8 +418,6 @@ pub fn write_fragments_transaction(
         )?
         .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-    println!("written: {:?}", written);
-
     Ok(PyLance(written).to_object(reader.py()))
 }
 
