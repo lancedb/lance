@@ -108,4 +108,8 @@ public class SparkOptions {
   public static boolean enableTopNPushDown(LanceConfig config) {
     return Boolean.parseBoolean(config.getOptions().getOrDefault(topN_push_down, "true"));
   }
+
+  public static boolean overwrite(LanceConfig config) {
+    return config.getOptions().getOrDefault(write_mode, "append").equalsIgnoreCase("overwrite");
+  }
 }

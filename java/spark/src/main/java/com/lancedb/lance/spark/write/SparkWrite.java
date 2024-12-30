@@ -17,6 +17,7 @@ package com.lancedb.lance.spark.write;
 import com.lancedb.lance.spark.LanceConfig;
 
 import org.apache.spark.sql.connector.write.BatchWrite;
+import org.apache.spark.sql.connector.write.SupportsTruncate;
 import org.apache.spark.sql.connector.write.Write;
 import org.apache.spark.sql.connector.write.WriteBuilder;
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite;
@@ -26,15 +27,17 @@ import org.apache.spark.sql.types.StructType;
 public class SparkWrite implements Write {
   private final LanceConfig config;
   private final StructType schema;
+  private final boolean overwrite;
 
-  SparkWrite(StructType schema, LanceConfig config) {
+  SparkWrite(StructType schema, LanceConfig config, boolean overwrite) {
     this.schema = schema;
     this.config = config;
+    this.overwrite = overwrite;
   }
 
   @Override
   public BatchWrite toBatch() {
-    return new BatchAppend(schema, config);
+    return new LanceBatchWrite(schema, config, overwrite);
   }
 
   @Override
@@ -43,9 +46,10 @@ public class SparkWrite implements Write {
   }
 
   /** Task commit. */
-  public static class SparkWriteBuilder implements WriteBuilder {
+  public static class SparkWriteBuilder implements SupportsTruncate, WriteBuilder {
     private final LanceConfig config;
     private final StructType schema;
+    private boolean overwrite = false;
 
     public SparkWriteBuilder(StructType schema, LanceConfig config) {
       this.schema = schema;
@@ -54,7 +58,13 @@ public class SparkWrite implements Write {
 
     @Override
     public Write build() {
-      return new SparkWrite(schema, config);
+      return new SparkWrite(schema, config, overwrite);
+    }
+
+    @Override
+    public WriteBuilder truncate() {
+      this.overwrite = true;
+      return this;
     }
   }
 }

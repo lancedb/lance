@@ -19,6 +19,7 @@ lance-encoding = { workspace = true }
 lance-linalg = { workspace = true }
 lance-index = { workspace = true }
 lance-io.workspace = true
+lance-core.workspace = true
 arrow = { workspace = true, features = ["ffi"] }
 arrow-schema.workspace = true
 datafusion.workspace = true
