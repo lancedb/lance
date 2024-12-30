@@ -15,6 +15,8 @@ import com.lancedb.lance.schema.ColumnAlteration;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
@@ -26,9 +28,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -305,6 +305,33 @@ public class DatasetTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       dataset = testDataset.createEmptyDataset();
       Dataset.drop(datasetPath, new HashMap<>());
+    }
+  }
+
+  @Test
+  void testTake() throws IOException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        List<Integer> indices = Arrays.asList(1, 4);
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.take(indices, columns)) {
+          reader.loadNextBatch();
+          VectorSchemaRoot result = reader.getVectorSchemaRoot();
+          assertNotNull(result);
+          assertEquals(indices.size(), result.getRowCount());
+
+          for (int i = 0; i < indices.size(); i++) {
+            assertEquals(indices.get(i), result.getVector("id").getObject(i));
+            assertNotNull(result.getVector("name").getObject(i));
+          }
+        }
+      }
     }
   }
 }

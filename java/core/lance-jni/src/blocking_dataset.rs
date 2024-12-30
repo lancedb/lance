@@ -22,15 +22,16 @@ use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_schema::DataType;
 use jni::objects::{JMap, JString, JValue};
-use jni::sys::jlong;
 use jni::sys::{jboolean, jint};
+use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{ColumnAlteration, Dataset, ReadParams, WriteParams};
+use lance::dataset::{ColumnAlteration, Dataset, ProjectionRequest, ReadParams, WriteParams};
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
@@ -681,6 +682,59 @@ fn inner_list_indexes<'local>(
     }
 
     Ok(array_list)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTake(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    indices_obj: JObject, // List<Integer>
+    columns_obj: JObject, // List<String>
+) -> jbyteArray {
+    match inner_take(&mut env, java_dataset, indices_obj, columns_obj) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_take(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    indices_obj: JObject, // List<Integer>
+    columns_obj: JObject, // List<String>
+) -> Result<jbyteArray> {
+    let indices: Vec<i32> = env.get_integers(&indices_obj)?;
+    let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
+    let indices_slice: &[u64] = &indices_u64;
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+
+    let result = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset = &dataset_guard.inner;
+
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+
+        match RT.block_on(dataset.take(indices_slice, projection)) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &result.schema())?;
+        writer.write(&result)?;
+        writer.finish()?;
+    }
+
+    let byte_array = env.byte_array_from_slice(&buffer)?;
+    Ok(**byte_array)
 }
 
 //////////////////////////////
