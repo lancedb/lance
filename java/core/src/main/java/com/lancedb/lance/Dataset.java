@@ -332,10 +332,16 @@ public class Dataset implements Closeable {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Scanner is closed");
       byte[] arrowData = nativeTake(indices, columns);
-      try (ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
-          ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream)) {
-        return new ArrowStreamReader(readChannel, allocator);
-      }
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
     }
   }
 

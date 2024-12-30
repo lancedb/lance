@@ -27,6 +27,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URISyntaxException;
+import java.nio.channels.ClosedChannelException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -309,7 +310,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testTake() throws IOException {
+  void testTake() throws IOException, ClosedChannelException {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -321,14 +322,15 @@ public class DatasetTest {
         List<Integer> indices = Arrays.asList(1, 4);
         List<String> columns = Arrays.asList("id", "name");
         try (ArrowReader reader = dataset2.take(indices, columns)) {
-          reader.loadNextBatch();
-          VectorSchemaRoot result = reader.getVectorSchemaRoot();
-          assertNotNull(result);
-          assertEquals(indices.size(), result.getRowCount());
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot result = reader.getVectorSchemaRoot();
+            assertNotNull(result);
+            assertEquals(indices.size(), result.getRowCount());
 
-          for (int i = 0; i < indices.size(); i++) {
-            assertEquals(indices.get(i), result.getVector("id").getObject(i));
-            assertNotNull(result.getVector("name").getObject(i));
+            for (int i = 0; i < indices.size(); i++) {
+              assertEquals(indices.get(i), result.getVector("id").getObject(i));
+              assertNotNull(result.getVector("name").getObject(i));
+            }
           }
         }
       }
