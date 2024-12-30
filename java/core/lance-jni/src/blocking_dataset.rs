@@ -437,8 +437,8 @@ pub fn inner_commit_overwrite<'local>(
     let schema = LanceSchema::try_from(&arrow_schema)?;
 
     let op = Operation::Overwrite {
-        fragments: fragments,
-        schema: schema,
+        fragments,
+        schema,
         config_upsert_values: None,
     };
     let path_str = path.extract(env)?;
