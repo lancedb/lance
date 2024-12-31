@@ -15,6 +15,12 @@ package com.lancedb.lance.schema;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * Represents a list of SQL expressions. Each expression has a name and an expression string. Name:
+ * is used to refer to the new column name. Expression: SQL expression strings. These strings can
+ * reference existing columns in the dataset. The expression would be calculated as the value of new
+ * column.
+ */
 public class SqlExpressions {
 
   private final List<SqlExpression> sqlExpressions;
