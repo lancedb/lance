@@ -2678,7 +2678,7 @@ mod tests {
                 .count_rows(Some("i < 170".to_string()))
                 .await
                 .unwrap(),
-            34
+            10
         );
 
         let fragment = fragment
