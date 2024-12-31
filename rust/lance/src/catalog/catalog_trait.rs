@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::catalog::dataset_identifier::DatasetIdentifier;
 use crate::catalog::database::Database;
+use crate::catalog::dataset_identifier::DatasetIdentifier;
 use crate::dataset::Dataset;
 use std::collections::{HashMap, HashSet};
 
