@@ -2806,3 +2806,10 @@ def test_dataset_drop(tmp_path: Path):
     assert Path(tmp_path).exists()
     lance.LanceDataset.drop(tmp_path)
     assert not Path(tmp_path).exists()
+
+
+def test_dataset_schema(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
+    ds._default_scan_options = {"with_row_id": True}
+    assert ds.schema == ds.to_table().schema

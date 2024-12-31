@@ -82,4 +82,26 @@ public class FilterPushDownTest {
     Optional<String> whereClause = FilterPushDown.compileFiltersToSqlWhereClause(filters);
     assertFalse(whereClause.isPresent());
   }
+
+  @Test
+  public void testIntegerInFilterPushDown() {
+    Object[] values = new Object[2];
+    values[0] = 500;
+    values[1] = 600;
+    Filter[] filters = new Filter[] {new GreaterThan("age", 30), new In("salary", values)};
+    Optional<String> whereClause = FilterPushDown.compileFiltersToSqlWhereClause(filters);
+    assertTrue(whereClause.isPresent());
+    assertEquals("(age > 30) AND (salary IN (500,600))", whereClause.get());
+  }
+
+  @Test
+  public void testStringInFilterPushDown() {
+    Object[] values = new Object[2];
+    values[0] = "500";
+    values[1] = "600";
+    Filter[] filters = new Filter[] {new GreaterThan("age", 30), new In("salary", values)};
+    Optional<String> whereClause = FilterPushDown.compileFiltersToSqlWhereClause(filters);
+    assertTrue(whereClause.isPresent());
+    assertEquals("(age > 30) AND (salary IN ('500','600'))", whereClause.get());
+  }
 }

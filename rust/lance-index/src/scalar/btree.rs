@@ -23,7 +23,7 @@ use datafusion::{
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
 use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
-use deepsize::DeepSizeOf;
+use deepsize::{Context, DeepSizeOf};
 use futures::{
     future::BoxFuture,
     stream::{self},
@@ -37,6 +37,8 @@ use lance_datafusion::{
     chunker::chunk_concat_stream,
     exec::{execute_plan, LanceExecutionOptions, OneShotExec},
 };
+use log::debug;
+use moka::sync::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
 use snafu::{location, Location};
@@ -52,6 +54,13 @@ const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
 pub const DEFAULT_BTREE_BATCH_SIZE: u64 = 4096;
 const BATCH_SIZE_META_KEY: &str = "batch_size";
+
+lazy_static::lazy_static! {
+    static ref CACHE_SIZE: u64 = std::env::var("LANCE_BTREE_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512 * 1024 * 1024);
+}
 
 /// Wraps a ScalarValue and implements Ord (ScalarValue only implements PartialOrd)
 #[derive(Clone, Debug)]
@@ -659,6 +668,42 @@ impl BTreeLookup {
     }
 }
 
+// Caches btree pages in memory
+#[derive(Debug)]
+struct BTreeCache(Cache<u32, Arc<dyn ScalarIndex>>);
+
+impl DeepSizeOf for BTreeCache {
+    fn deep_size_of_children(&self, _: &mut Context) -> usize {
+        self.0.iter().map(|(_, v)| v.deep_size_of()).sum()
+    }
+}
+
+// We only need to open a file reader for pages if we need to load a page.  If all
+// pages are cached we don't open it.  If we do open it we should only open it once.
+#[derive(Clone)]
+struct LazyIndexReader {
+    index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
+    store: Arc<dyn IndexStore>,
+}
+
+impl LazyIndexReader {
+    fn new(store: Arc<dyn IndexStore>) -> Self {
+        Self {
+            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
+            store,
+        }
+    }
+
+    async fn get(&self) -> Result<Arc<dyn IndexReader>> {
+        let mut reader = self.index_reader.lock().await;
+        if reader.is_none() {
+            let index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+            *reader = Some(index_reader);
+        }
+        Ok(reader.as_ref().unwrap().clone())
+    }
+}
+
 /// A btree index satisfies scalar queries using a b tree
 ///
 /// The upper layers of the btree are expected to be cached and, when unloaded,
@@ -677,6 +722,7 @@ impl BTreeLookup {
 #[derive(Clone, Debug, DeepSizeOf)]
 pub struct BTreeIndex {
     page_lookup: Arc<BTreeLookup>,
+    page_cache: Arc<BTreeCache>,
     store: Arc<dyn IndexStore>,
     sub_index: Arc<dyn BTreeSubIndex>,
     batch_size: u64,
@@ -691,24 +737,45 @@ impl BTreeIndex {
         batch_size: u64,
     ) -> Self {
         let page_lookup = Arc::new(BTreeLookup::new(tree, null_pages));
+        let page_cache = Arc::new(BTreeCache(
+            Cache::builder()
+                .max_capacity(*CACHE_SIZE)
+                .weigher(|_, v: &Arc<dyn ScalarIndex>| v.deep_size_of() as u32)
+                .build(),
+        ));
         Self {
             page_lookup,
+            page_cache,
             store,
             sub_index,
             batch_size,
         }
     }
 
-    async fn search_page(
+    async fn lookup_page(
         &self,
-        query: &SargableQuery,
         page_number: u32,
-        index_reader: Arc<dyn IndexReader>,
-    ) -> Result<RowIdTreeMap> {
+        index_reader: LazyIndexReader,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        if let Some(cached) = self.page_cache.0.get(&page_number) {
+            return Ok(cached);
+        }
+        let index_reader = index_reader.get().await?;
         let serialized_page = index_reader
             .read_record_batch(page_number as u64, self.batch_size)
             .await?;
         let subindex = self.sub_index.load_subindex(serialized_page).await?;
+        self.page_cache.0.insert(page_number, subindex.clone());
+        Ok(subindex)
+    }
+
+    async fn search_page(
+        &self,
+        query: &SargableQuery,
+        page_number: u32,
+        index_reader: LazyIndexReader,
+    ) -> Result<RowIdTreeMap> {
+        let subindex = self.lookup_page(page_number, index_reader).await?;
         // TODO: If this is an IN query we can perhaps simplify the subindex query by restricting it to the
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
@@ -894,14 +961,15 @@ impl ScalarIndex for BTreeIndex {
             )),
             SargableQuery::IsNull() => self.page_lookup.pages_null(),
         };
-        let sub_index_reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let lazy_index_reader = LazyIndexReader::new(self.store.clone());
         let page_tasks = pages
             .into_iter()
             .map(|page_index| {
-                self.search_page(query, page_index, sub_index_reader.clone())
+                self.search_page(query, page_index, lazy_index_reader.clone())
                     .boxed()
             })
             .collect::<Vec<_>>();
+        debug!("Searching {} btree pages", page_tasks.len());
         stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
