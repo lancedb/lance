@@ -19,7 +19,10 @@ impl DatasetIdentifier {
         );
         let database = Database::of(&names[..names.len() - 1]);
         let name = names[names.len() - 1].to_string();
-        Self { database: database, name }
+        Self {
+            database: database,
+            name,
+        }
     }
 
     pub fn of_database(database: Database, name: &str) -> Self {
