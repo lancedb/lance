@@ -928,7 +928,7 @@ impl DataBlock {
             Self::Empty() => Self::Empty(),
             Self::Constant(inner) => Self::Constant(inner),
             Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
-            Self::Nullable(inner) => *inner.data,
+            Self::Nullable(inner) => inner.data.remove_validity(),
             Self::FixedWidth(inner) => Self::FixedWidth(inner),
             Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
             Self::VariableWidth(inner) => Self::VariableWidth(inner),
