@@ -366,9 +366,9 @@ class LanceFragment(pa.dataset.Fragment):
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
-        if filter is not None:
-            raise ValueError("Does not support filter at the moment")
-        return self._fragment.count_rows()
+        if isinstance(filter, pa.compute.Expression):
+            raise ValueError("Does not support pyarrow Expression at the moment")
+        return self._fragment.count_rows(filter)
 
     @property
     def num_deletions(self) -> int:
