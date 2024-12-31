@@ -328,9 +328,9 @@ public class Dataset implements Closeable {
    * @param columns the columns to take
    * @return an ArrowReader
    */
-  public ArrowReader take(List<Integer> indices, List<String> columns) throws IOException {
+  public ArrowReader take(List<Long> indices, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
-      Preconditions.checkArgument(nativeDatasetHandle != 0, "Scanner is closed");
       byte[] arrowData = nativeTake(indices, columns);
       ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
       ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
@@ -345,7 +345,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native byte[] nativeTake(List<Integer> indices, List<String> columns);
+  private native byte[] nativeTake(List<Long> indices, List<String> columns);
 
   /**
    * Gets the URI of the dataset.

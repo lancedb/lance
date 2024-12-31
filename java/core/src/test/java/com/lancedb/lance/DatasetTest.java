@@ -319,7 +319,7 @@ public class DatasetTest {
       dataset = testDataset.createEmptyDataset();
 
       try (Dataset dataset2 = testDataset.write(1, 5)) {
-        List<Integer> indices = Arrays.asList(1, 4);
+        List<Long> indices = Arrays.asList(1L, 4L);
         List<String> columns = Arrays.asList("id", "name");
         try (ArrowReader reader = dataset2.take(indices, columns)) {
           while (reader.loadNextBatch()) {
@@ -328,7 +328,7 @@ public class DatasetTest {
             assertEquals(indices.size(), result.getRowCount());
 
             for (int i = 0; i < indices.size(); i++) {
-              assertEquals(indices.get(i), result.getVector("id").getObject(i));
+              assertEquals(indices.get(i).intValue(), result.getVector("id").getObject(i));
               assertNotNull(result.getVector("name").getObject(i));
             }
           }

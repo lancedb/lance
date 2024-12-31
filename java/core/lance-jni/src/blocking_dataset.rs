@@ -688,7 +688,7 @@ fn inner_list_indexes<'local>(
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTake(
     mut env: JNIEnv,
     java_dataset: JObject,
-    indices_obj: JObject, // List<Integer>
+    indices_obj: JObject, // List<Long>
     columns_obj: JObject, // List<String>
 ) -> jbyteArray {
     match inner_take(&mut env, java_dataset, indices_obj, columns_obj) {
@@ -703,10 +703,10 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTake(
 fn inner_take(
     env: &mut JNIEnv,
     java_dataset: JObject,
-    indices_obj: JObject, // List<Integer>
+    indices_obj: JObject, // List<Long>
     columns_obj: JObject, // List<String>
 ) -> Result<jbyteArray> {
-    let indices: Vec<i32> = env.get_integers(&indices_obj)?;
+    let indices: Vec<i64> = env.get_longs(&indices_obj)?;
     let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
     let indices_slice: &[u64] = &indices_u64;
     let columns: Vec<String> = env.get_strings(&columns_obj)?;
