@@ -750,7 +750,7 @@ mod tests {
     #[case(4, DistanceType::L2, 1.0)]
     #[case(4, DistanceType::Cosine, 1.0)]
     #[case(4, DistanceType::Dot, 1.0)]
-    #[case(4, DistanceType::Hamming, 0.7)]
+    #[case(4, DistanceType::Hamming, 0.9)]
     #[tokio::test]
     async fn test_build_ivf_flat(
         #[case] nlist: usize,
@@ -763,9 +763,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.7)]
-    #[case(4, DistanceType::Cosine, 0.7)]
-    #[case(4, DistanceType::Dot, 0.7)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_build_ivf_pq(
         #[case] nlist: usize,
@@ -780,9 +780,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.7)]
-    #[case(4, DistanceType::Cosine, 0.7)]
-    #[case(4, DistanceType::Dot, 0.7)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_build_ivf_pq_v3(
         #[case] nlist: usize,
@@ -799,9 +799,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.7)]
-    #[case(4, DistanceType::Cosine, 0.7)]
-    #[case(4, DistanceType::Dot, 0.7)]
+    #[case(4, DistanceType::L2, 0.85)]
+    #[case(4, DistanceType::Cosine, 0.85)]
+    #[case(4, DistanceType::Dot, 0.75)]
     #[tokio::test]
     async fn test_build_ivf_pq_4bit(
         #[case] nlist: usize,
@@ -818,9 +818,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.7)]
-    #[case(4, DistanceType::Cosine, 0.7)]
-    #[case(4, DistanceType::Dot, 0.7)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq(
         #[case] nlist: usize,
@@ -840,9 +840,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.7)]
-    #[case(4, DistanceType::Cosine, 0.7)]
-    #[case(4, DistanceType::Dot, 0.7)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.9)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
@@ -862,9 +862,9 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.7)]
-    #[case(4, DistanceType::Cosine, 0.7)]
-    #[case(4, DistanceType::Dot, 0.7)]
+    #[case(4, DistanceType::L2, 0.9)]
+    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::Dot, 0.8)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq_4bit(
         #[case] nlist: usize,
