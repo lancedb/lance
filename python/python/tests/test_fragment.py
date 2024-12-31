@@ -422,3 +422,14 @@ def test_fragment_merge(tmp_path):
         tmp_path, merge, read_version=dataset.latest_version
     )
     assert [f.name for f in dataset.schema] == ["a", "b", "c", "d"]
+
+
+def test_fragment_count_rows(tmp_path: Path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    ds = write_dataset(data, tmp_path)
+
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+
+    assert fragments[0].count_rows() == 800
+    assert fragments[0].count_rows("a < 200") == 200
