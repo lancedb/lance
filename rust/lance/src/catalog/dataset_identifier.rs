@@ -20,7 +20,7 @@ impl DatasetIdentifier {
         let database = Database::of(&names[..names.len() - 1]);
         let name = names[names.len() - 1].to_string();
         Self {
-            database: database,
+            database,
             name,
         }
     }
@@ -28,7 +28,7 @@ impl DatasetIdentifier {
     pub fn of_database(database: Database, name: &str) -> Self {
         assert!(!name.is_empty(), "Invalid dataset name: null or empty");
         Self {
-            database: database,
+            database,
             name: name.to_string(),
         }
     }
