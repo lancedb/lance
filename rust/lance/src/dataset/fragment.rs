@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-4.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Wraps a Fragment of the dataset.
@@ -710,7 +710,7 @@ impl FileFragment {
             row_id_sequence,
             opened_files,
             ArrowSchema::from(projection),
-            self.count_rows().await?,
+            self.count_rows(None).await?,
             num_physical_rows,
         )?;
 
@@ -829,7 +829,7 @@ impl FileFragment {
         }
 
         // This should return immediately on modern datasets.
-        let num_rows = self.count_rows().await?;
+        let num_rows = self.count_rows(None).await?;
 
         // Check if there are any fields that are not in any data files
         let field_ids_in_files = opened_files
@@ -849,15 +849,24 @@ impl FileFragment {
     }
 
     /// Count the rows in this fragment.
-    pub async fn count_rows(&self) -> Result<usize> {
-        let total_rows = self.physical_rows();
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        match filter {
+            Some(expr) => self
+                .scan()
+                .filter(&expr)?
+                .count_rows()
+                .await
+                .map(|v| v as usize),
+            None => {
+                let total_rows = self.physical_rows();
+                let deletion_count = self.count_deletions();
 
-        let deletion_count = self.count_deletions();
+                let (total_rows, deletion_count) =
+                    futures::future::try_join(total_rows, deletion_count).await?;
 
-        let (total_rows, deletion_count) =
-            futures::future::try_join(total_rows, deletion_count).await?;
-
-        Ok(total_rows - deletion_count)
+                Ok(total_rows - deletion_count)
+            }
+        }
     }
 
     /// Get the number of rows that have been deleted in this fragment.
@@ -2644,7 +2653,7 @@ mod tests {
         assert_eq!(fragments.len(), 5);
         for f in fragments {
             assert_eq!(f.metadata.num_rows(), Some(40));
-            assert_eq!(f.count_rows().await.unwrap(), 40);
+            assert_eq!(f.count_rows(None).await.unwrap(), 40);
             assert_eq!(f.metadata().deletion_file, None);
         }
     }
@@ -2660,9 +2669,17 @@ mod tests {
         let dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset.get_fragments().pop().unwrap();
 
-        assert_eq!(fragment.count_rows().await.unwrap(), 40);
+        assert_eq!(fragment.count_rows(None).await.unwrap(), 40);
         assert_eq!(fragment.physical_rows().await.unwrap(), 40);
         assert!(fragment.metadata.deletion_file.is_none());
+
+        assert_eq!(
+            fragment
+                .count_rows(Some("i < 170".to_string()))
+                .await
+                .unwrap(),
+            34
+        );
 
         let fragment = fragment
             .delete("i >= 160 and i <= 172")
@@ -2672,7 +2689,7 @@ mod tests {
 
         fragment.validate().await.unwrap();
 
-        assert_eq!(fragment.count_rows().await.unwrap(), 27);
+        assert_eq!(fragment.count_rows(None).await.unwrap(), 27);
         assert_eq!(fragment.physical_rows().await.unwrap(), 40);
         assert!(fragment.metadata.deletion_file.is_some());
         assert_eq!(
