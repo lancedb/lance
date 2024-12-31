@@ -9,6 +9,7 @@ from pathlib import Path
 import lance
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from helper import ProgressForTest
 from lance import (
@@ -433,3 +434,4 @@ def test_fragment_count_rows(tmp_path: Path):
 
     assert fragments[0].count_rows() == 800
     assert fragments[0].count_rows("a < 200") == 200
+    assert fragments[0].count_rows(pc.field("a") < 200) == 200

@@ -217,7 +217,7 @@ class LanceFragment(pa.dataset.Fragment):
             if fragment_id is None:
                 raise ValueError("Either fragment or fragment_id must be specified")
             fragment = dataset.get_fragment(fragment_id)._fragment
-        self._fragment = fragment
+        self._fragment: _Fragment = fragment
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
 
@@ -366,8 +366,8 @@ class LanceFragment(pa.dataset.Fragment):
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
-        if isinstance(filter, pa.compute.Expression):
-            raise ValueError("Does not support pyarrow Expression at the moment")
+        if filter is not None:
+            return self.scanner(filter=filter).count_rows()
         return self._fragment.count_rows(filter)
 
     @property
