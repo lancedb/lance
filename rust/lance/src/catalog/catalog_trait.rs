@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::catalog::dataset_identifier::DatasetIdentifier;
-use crate::catalog::namespace::Namespace;
+use crate::catalog::database::Database;
 use crate::dataset::Dataset;
 use std::collections::{HashMap, HashSet};
 
@@ -10,8 +10,8 @@ pub trait Catalog {
     /// Initialize the catalog.
     fn initialize(&self, name: &str, properties: &HashMap<&str, &str>) -> Result<(), String>;
 
-    /// List all datasets under a specified namespace.
-    fn list_datasets(&self, namespace: &Namespace) -> Vec<DatasetIdentifier>;
+    /// List all datasets under a specified database.
+    fn list_datasets(&self, database: &Database) -> Vec<DatasetIdentifier>;
 
     /// Create a new dataset in the catalog.
     fn create_dataset(
@@ -49,47 +49,47 @@ pub trait Catalog {
     /// Register a dataset in the catalog.
     fn register_dataset(&self, identifier: &DatasetIdentifier) -> Result<Dataset, String>;
 
-    /// Create a namespace in the catalog.
-    fn create_namespace(
+    /// Create a database in the catalog.
+    fn create_database(
         &self,
-        namespace: &Namespace,
+        database: &Database,
         metadata: HashMap<String, String>,
     ) -> Result<(), String>;
 
-    /// List top-level namespaces from the catalog.
-    fn list_namespaces(&self) -> Vec<Namespace> {
-        self.list_child_namespaces(&Namespace::empty())
+    /// List top-level databases from the catalog.
+    fn list_databases(&self) -> Vec<Database> {
+        self.list_child_databases(&Database::empty())
             .unwrap_or_default()
     }
 
-    /// List child namespaces from the namespace.
-    fn list_child_namespaces(&self, namespace: &Namespace) -> Result<Vec<Namespace>, String>;
+    /// List child databases from the database.
+    fn list_child_databases(&self, database: &Database) -> Result<Vec<Database>, String>;
 
-    /// Load metadata properties for a namespace.
-    fn load_namespace_metadata(
+    /// Load metadata properties for a database.
+    fn load_database_metadata(
         &self,
-        namespace: &Namespace,
+        database: &Database,
     ) -> Result<HashMap<String, String>, String>;
 
-    /// Drop a namespace.
-    fn drop_namespace(&self, namespace: &Namespace) -> Result<bool, String>;
+    /// Drop a database.
+    fn drop_database(&self, database: &Database) -> Result<bool, String>;
 
-    /// Set a collection of properties on a namespace in the catalog.
+    /// Set a collection of properties on a database in the catalog.
     fn set_properties(
         &self,
-        namespace: &Namespace,
+        database: &Database,
         properties: HashMap<String, String>,
     ) -> Result<bool, String>;
 
-    /// Remove a set of property keys from a namespace in the catalog.
+    /// Remove a set of property keys from a database in the catalog.
     fn remove_properties(
         &self,
-        namespace: &Namespace,
+        database: &Database,
         properties: HashSet<String>,
     ) -> Result<bool, String>;
 
-    /// Checks whether the Namespace exists.
-    fn namespace_exists(&self, namespace: &Namespace) -> bool {
-        self.load_namespace_metadata(namespace).is_ok()
+    /// Checks whether the database exists.
+    fn database_exists(&self, database: &Database) -> bool {
+        self.load_database_metadata(database).is_ok()
     }
 }

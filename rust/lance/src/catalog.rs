@@ -3,8 +3,8 @@
 
 pub(crate) mod catalog_trait;
 pub(crate) mod dataset_identifier;
-pub(crate) mod namespace;
+pub(crate) mod database;
 
 pub use catalog_trait::Catalog;
 pub use dataset_identifier::DatasetIdentifier;
-pub use namespace::Namespace;
+pub use database::Database;

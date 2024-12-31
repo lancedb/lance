@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::catalog::namespace::Namespace;
+use crate::catalog::database::Database;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Debug)]
 pub struct DatasetIdentifier {
-    namespace: Namespace,
+    database: Database,
     name: String,
 }
 
@@ -17,15 +17,15 @@ impl DatasetIdentifier {
             !names.is_empty(),
             "Cannot create dataset identifier without a dataset name"
         );
-        let namespace = Namespace::of(&names[..names.len() - 1]);
+        let database = Database::of(&names[..names.len() - 1]);
         let name = names[names.len() - 1].to_string();
-        Self { namespace, name }
+        Self { database: database, name }
     }
 
-    pub fn of_namespace(namespace: Namespace, name: &str) -> Self {
+    pub fn of_database(database: Database, name: &str) -> Self {
         assert!(!name.is_empty(), "Invalid dataset name: null or empty");
         Self {
-            namespace,
+            database: database,
             name: name.to_string(),
         }
     }
@@ -35,12 +35,12 @@ impl DatasetIdentifier {
         Self::of(&parts)
     }
 
-    pub fn has_namespace(&self) -> bool {
-        !self.namespace.is_empty()
+    pub fn has_database(&self) -> bool {
+        !self.database.is_empty()
     }
 
-    pub fn namespace(&self) -> &Namespace {
-        &self.namespace
+    pub fn database(&self) -> &Database {
+        &self.database
     }
 
     pub fn name(&self) -> &str {
@@ -49,14 +49,14 @@ impl DatasetIdentifier {
 
     pub fn to_lowercase(&self) -> Self {
         let new_levels: Vec<String> = self
-            .namespace
+            .database
             .levels()
             .iter()
             .map(|s| s.to_lowercase())
             .collect();
         let new_name = self.name.to_lowercase();
-        Self::of_namespace(
-            Namespace::of(&new_levels.iter().map(String::as_str).collect::<Vec<&str>>()),
+        Self::of_database(
+            Database::of(&new_levels.iter().map(String::as_str).collect::<Vec<&str>>()),
             &new_name,
         )
     }
@@ -64,7 +64,7 @@ impl DatasetIdentifier {
 
 impl PartialEq for DatasetIdentifier {
     fn eq(&self, other: &Self) -> bool {
-        self.namespace == other.namespace && self.name == other.name
+        self.database == other.database && self.name == other.name
     }
 }
 
@@ -72,15 +72,15 @@ impl Eq for DatasetIdentifier {}
 
 impl Hash for DatasetIdentifier {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.namespace.hash(state);
+        self.database.hash(state);
         self.name.hash(state);
     }
 }
 
 impl fmt::Display for DatasetIdentifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.has_namespace() {
-            write!(f, "{}.{}", self.namespace, self.name)
+        if self.has_database() {
+            write!(f, "{}.{}", self.database, self.name)
         } else {
             write!(f, "{}", self.name)
         }
@@ -94,65 +94,65 @@ mod tests {
 
     #[test]
     fn test_dataset_identifier_of() {
-        let ds_id = DatasetIdentifier::of(&["namespace1", "namespace2", "dataset"]);
+        let ds_id = DatasetIdentifier::of(&["database1", "database2", "dataset"]);
         assert_eq!(
-            ds_id.namespace().levels(),
-            &vec!["namespace1".to_string(), "namespace2".to_string()]
+            ds_id.database().levels(),
+            &vec!["database1".to_string(), "database2".to_string()]
         );
         assert_eq!(ds_id.name(), "dataset");
     }
 
     #[test]
-    fn test_dataset_identifier_of_namespace() {
-        let namespace = Namespace::of(&["namespace1", "namespace2"]);
-        let ds_id = DatasetIdentifier::of_namespace(namespace.clone(), "dataset");
-        assert_eq!(ds_id.namespace(), &namespace);
+    fn test_dataset_identifier_of_database() {
+        let database = Database::of(&["database1", "database2"]);
+        let ds_id = DatasetIdentifier::of_database(database.clone(), "dataset");
+        assert_eq!(ds_id.database(), &database);
         assert_eq!(ds_id.name(), "dataset");
     }
 
     #[test]
     fn test_dataset_identifier_parse() {
-        let ds_id = DatasetIdentifier::parse("namespace1.namespace2.dataset");
+        let ds_id = DatasetIdentifier::parse("database1.database2.dataset");
         assert_eq!(
-            ds_id.namespace().levels(),
-            &vec!["namespace1".to_string(), "namespace2".to_string()]
+            ds_id.database().levels(),
+            &vec!["database1".to_string(), "database2".to_string()]
         );
         assert_eq!(ds_id.name(), "dataset");
     }
 
     #[test]
-    fn test_dataset_identifier_has_namespace() {
-        let ds_id = DatasetIdentifier::parse("namespace1.namespace2.dataset");
-        assert!(ds_id.has_namespace());
+    fn test_dataset_identifier_has_database() {
+        let ds_id = DatasetIdentifier::parse("database1.database2.dataset");
+        assert!(ds_id.has_database());
 
         let ds_id_no_ns = DatasetIdentifier::of(&["dataset"]);
-        assert!(!ds_id_no_ns.has_namespace());
+        assert!(!ds_id_no_ns.has_database());
     }
 
     #[test]
     fn test_dataset_identifier_to_lowercase() {
-        let ds_id = DatasetIdentifier::parse("Namespace1.Namespace2.Dataset");
+        let ds_id = DatasetIdentifier::parse("Database1.Database2.Dataset");
         let lower_ds_id = ds_id.to_lowercase();
         assert_eq!(
-            lower_ds_id.namespace().levels(),
-            &vec!["namespace1".to_string(), "namespace2".to_string()]
+            lower_ds_id.database().levels(),
+            &vec!["database1".to_string(), "database2".to_string()]
         );
         assert_eq!(lower_ds_id.name(), "dataset");
     }
 
     #[test]
     fn test_dataset_identifier_equality() {
-        let ds_id1 = DatasetIdentifier::parse("namespace1.namespace2.dataset");
-        let ds_id2 = DatasetIdentifier::parse("namespace1.namespace2.dataset");
-        let ds_id3 = DatasetIdentifier::parse("namespace1.namespace2.other_dataset");
+        let ds_id1 = DatasetIdentifier::parse("database1.database2.dataset");
+        let ds_id2 = DatasetIdentifier::parse("database1.database2.dataset");
+        let ds_id3 = DatasetIdentifier::parse("database1.database2.other_dataset");
         assert_eq!(ds_id1, ds_id2);
         assert_ne!(ds_id1, ds_id3);
     }
 
     #[test]
     fn test_dataset_identifier_hash() {
-        let ds_id1 = DatasetIdentifier::parse("namespace1.namespace2.dataset");
-        let ds_id2 = DatasetIdentifier::parse("namespace1.namespace2.dataset");
+        let ds_id1 = DatasetIdentifier::parse("database1.database2.dataset");
+        let ds_id2 = DatasetIdentifier::parse("database1.database2.dataset");
         let mut hasher1 = DefaultHasher::new();
         ds_id1.hash(&mut hasher1);
         let mut hasher2 = DefaultHasher::new();
@@ -162,8 +162,8 @@ mod tests {
 
     #[test]
     fn test_dataset_identifier_display() {
-        let ds_id = DatasetIdentifier::parse("namespace1.namespace2.dataset");
-        assert_eq!(format!("{}", ds_id), "namespace1.namespace2.dataset");
+        let ds_id = DatasetIdentifier::parse("database1.database2.dataset");
+        assert_eq!(format!("{}", ds_id), "database1.database2.dataset");
 
         let ds_id_no_ns = DatasetIdentifier::of(&["dataset"]);
         assert_eq!(format!("{}", ds_id_no_ns), "dataset");
