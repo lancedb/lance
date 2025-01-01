@@ -45,7 +45,7 @@ pub async fn take(
     let mut frag_iter = fragments.iter();
     let mut cur_frag = frag_iter.next();
     let mut cur_frag_rows = if let Some(cur_frag) = cur_frag {
-        cur_frag.count_rows().await? as u64
+        cur_frag.count_rows(None).await? as u64
     } else {
         0
     };
@@ -57,7 +57,7 @@ pub async fn take(
             frag_offset += cur_frag_rows;
             cur_frag = frag_iter.next();
             cur_frag_rows = if let Some(cur_frag) = cur_frag {
-                cur_frag.count_rows().await? as u64
+                cur_frag.count_rows(None).await? as u64
             } else {
                 0
             };

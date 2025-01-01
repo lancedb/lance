@@ -38,6 +38,13 @@ public class JniTestHelper {
   public static native void parseInts(List<Integer> intsList);
 
   /**
+   * JNI parse longs test.
+   *
+   * @param longsList the given list of longs
+   */
+  public static native void parseLongs(List<Long> longsList);
+
+  /**
    * JNI parse ints opts test.
    *
    * @param intsOpt the given optional of list of integers

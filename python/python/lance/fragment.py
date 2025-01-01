@@ -217,7 +217,7 @@ class LanceFragment(pa.dataset.Fragment):
             if fragment_id is None:
                 raise ValueError("Either fragment or fragment_id must be specified")
             fragment = dataset.get_fragment(fragment_id)._fragment
-        self._fragment = fragment
+        self._fragment: _Fragment = fragment
         if self._fragment is None:
             raise ValueError(f"Fragment id does not exist: {fragment_id}")
 
@@ -367,8 +367,8 @@ class LanceFragment(pa.dataset.Fragment):
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
         if filter is not None:
-            raise ValueError("Does not support filter at the moment")
-        return self._fragment.count_rows()
+            return self.scanner(filter=filter).count_rows()
+        return self._fragment.count_rows(filter)
 
     @property
     def num_deletions(self) -> int:

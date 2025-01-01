@@ -38,6 +38,11 @@ public class JNITest {
   }
 
   @Test
+  public void testLongs() {
+    JniTestHelper.parseLongs(Arrays.asList(1L, 2L, 3L, Long.MAX_VALUE));
+  }
+
+  @Test
   public void testIntsOpt() {
     JniTestHelper.parseIntsOpt(Optional.of(Arrays.asList(1, 2, 3)));
   }
