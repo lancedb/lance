@@ -19,8 +19,11 @@ use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_array;
 use lance_core::{
     cache::FileMetadataCache,
-    datatypes::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK},
+    datatypes::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    },
     utils::bit::pad_bytes,
+    Error,
 };
 use lance_core::{
     cache::{Context, DeepSizeOf},
@@ -1599,12 +1602,12 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         ranges: &[Range<u64>],
         io: &dyn EncodingsIo,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
-        let chunk_instructions = ChunkInstructions::schedule_instructions(&self.rep_index, ranges);
-
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
-
         let page_meta = self.page_meta.as_ref().unwrap();
 
+        let chunk_instructions =
+            ChunkInstructions::schedule_instructions(&page_meta.rep_index, ranges);
+
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         debug_assert_eq!(
             num_rows,
             chunk_instructions
@@ -2743,6 +2746,16 @@ impl PrimitiveStructuralEncoder {
         Self::is_narrow(data_block)
     }
 
+    fn prefers_fullzip(field: &Field) -> bool {
+        // Fullzip is the backup option so the only reason we wouldn't use it is if the
+        // user specifically requested not to use it (in which case we're probably going
+        // to emit an error)
+        if let Some(user_requested) = field.metadata.get(STRUCTURAL_ENCODING_META_KEY) {
+            return user_requested.to_lowercase() == STRUCTURAL_ENCODING_FULLZIP;
+        }
+        true
+    }
+
     // Converts value data, repetition levels, and definition levels into a single
     // buffer of mini-blocks.  In addition, creates a buffer of mini-block metadata
     // which tells us the size of each block.  Finally, if repetition is present then
@@ -3478,7 +3491,7 @@ impl PrimitiveStructuralEncoder {
                         None,
                         num_rows,
                     )
-                } else {
+                } else if Self::prefers_fullzip(&field) {
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,
@@ -3492,6 +3505,8 @@ impl PrimitiveStructuralEncoder {
                         repdefs,
                         row_number,
                     )
+                } else {
+                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
                 }
             }
         })
