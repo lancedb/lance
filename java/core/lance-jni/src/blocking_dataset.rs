@@ -35,6 +35,7 @@ use lance::dataset::{ColumnAlteration, Dataset, ProjectionRequest, ReadParams, W
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
@@ -390,6 +391,73 @@ pub fn inner_commit_append<'local>(
         }
         Ok::<_, Error>(map)
     })?;
+    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    dataset.into_java(env)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_commitOverwrite<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    arrow_schema_addr: jlong,
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment
+    storage_options_obj: JObject, // Map<String, String>
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_commit_overwrite(
+            &mut env,
+            path,
+            arrow_schema_addr,
+            read_version_obj,
+            fragments_obj,
+            storage_options_obj
+        )
+    )
+}
+
+pub fn inner_commit_overwrite<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    arrow_schema_addr: jlong,
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment)
+    storage_options_obj: JObject, // Map<String, String>
+) -> Result<JObject<'local>> {
+    let json_fragments = env.get_strings(&fragments_obj)?;
+    let mut fragments: Vec<Fragment> = Vec::new();
+    for json_fragment in json_fragments {
+        let fragment = Fragment::from_json(&json_fragment)?;
+        fragments.push(fragment);
+    }
+    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let arrow_schema = Schema::try_from(&c_schema)?;
+    let schema = LanceSchema::try_from(&arrow_schema)?;
+
+    let op = Operation::Overwrite {
+        fragments,
+        schema,
+        config_upsert_values: None,
+    };
+    let path_str = path.extract(env)?;
+    let read_version = env.get_u64_opt(&read_version_obj)?;
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+        Ok::<_, Error>(map)
+    })?;
+
     let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
     dataset.into_java(env)
 }

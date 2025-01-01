@@ -56,7 +56,7 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
     arrowWriter.setFinished();
     try {
       List<FragmentMetadata> fragmentMetadata = fragmentCreationTask.get();
-      return new BatchAppend.TaskCommit(fragmentMetadata);
+      return new LanceBatchWrite.TaskCommit(fragmentMetadata);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted while waiting for reader thread to finish", e);
