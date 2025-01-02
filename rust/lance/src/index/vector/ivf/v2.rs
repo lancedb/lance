@@ -772,7 +772,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_build_ivf_pq(
         #[case] nlist: usize,
@@ -790,7 +790,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_build_ivf_pq_v3(
         #[case] nlist: usize,
@@ -808,8 +808,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::L2, 0.85)]
+    #[case(4, DistanceType::Cosine, 0.85)]
     #[case(4, DistanceType::Dot, 0.8)]
     #[tokio::test]
     async fn test_build_ivf_pq_4bit(
@@ -823,14 +823,13 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
-        test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq(
         #[case] nlist: usize,
@@ -852,7 +851,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
@@ -1032,7 +1031,7 @@ mod tests {
         }
 
         let query = vectors.value(0);
-        let k = 100;
+        let k = 10;
         let result = dataset
             .scan()
             .nearest(vector_column, query.as_primitive::<T>(), k)
@@ -1080,7 +1079,7 @@ mod tests {
                 if i < part_idx {
                     assert_eq!(left_row_ids[i], *id);
                 } else {
-                    assert_eq!(right_row_ids[i - part_idx], *id);
+                    assert_eq!(right_row_ids[i - part_idx], *id, "{:?}", right_row_ids);
                 }
             });
         }

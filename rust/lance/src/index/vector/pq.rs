@@ -236,7 +236,7 @@ impl VectorIndex for PQIndex {
                     vec![distances, row_ids],
                 )?)
             } else {
-                let indices = sort_to_indices(&distances, None, Some(limit))?;
+                let indices = sort_to_indices(&distances, None, None)?;
                 let mut dists = Vec::with_capacity(limit);
                 let mut ids = Vec::with_capacity(limit);
                 for idx in indices.values().iter() {
