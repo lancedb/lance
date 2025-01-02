@@ -163,7 +163,7 @@ public class Fragment {
   /**
    * Create a fragment from the given arrow array and schema.
    *
-   * @return the json serialized fragment metadata
+   * @return the fragment metadata
    */
   private static native List<FragmentMetadata> createWithFfiArray(
       String datasetUri,
@@ -178,7 +178,7 @@ public class Fragment {
   /**
    * Create a fragment from the given arrow stream.
    *
-   * @return the json serialized fragment metadata
+   * @return the fragment metadata
    */
   private static native List<FragmentMetadata> createWithFfiStream(
       String datasetUri,
