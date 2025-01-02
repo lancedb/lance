@@ -118,6 +118,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             column,
             key,
             k,
+            lower_bound: None,
+            upper_bound: None,
             nprobes,
             ef,
             refine_factor,

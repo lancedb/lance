@@ -44,11 +44,17 @@ lazy_static::lazy_static! {
 }
 
 #[derive(Default)]
-pub struct FlatQueryParams {}
+pub struct FlatQueryParams {
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+}
 
 impl From<&Query> for FlatQueryParams {
-    fn from(_: &Query) -> Self {
-        Self {}
+    fn from(q: &Query) -> Self {
+        Self {
+            lower_bound: q.lower_bound,
+            upper_bound: q.upper_bound,
+        }
     }
 }
 
@@ -72,7 +78,7 @@ impl IvfSubIndex for FlatIndex {
         &self,
         query: ArrayRef,
         k: usize,
-        _params: Self::QueryParams,
+        params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
@@ -88,6 +94,8 @@ impl IvfSubIndex for FlatIndex {
                     dist: OrderedFloat(dist),
                 })
                 .sorted_unstable()
+                .skip_while(|r| params.lower_bound.map_or(false, |lb| r.dist.0 < lb))
+                .take_while(|r| params.upper_bound.map_or(true, |ub| r.dist.0 < ub))
                 .take(k)
                 .map(
                     |OrderedNode {
@@ -105,6 +113,8 @@ impl IvfSubIndex for FlatIndex {
                         dist: OrderedFloat(dist_calc.distance(id as u32)),
                     })
                     .sorted_unstable()
+                    .skip_while(|r| params.lower_bound.map_or(false, |lb| r.dist.0 < lb))
+                    .take_while(|r| params.upper_bound.map_or(true, |ub| r.dist.0 < ub))
                     .take(k)
                     .map(
                         |OrderedNode {
