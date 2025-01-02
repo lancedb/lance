@@ -34,7 +34,8 @@ import java.util.Set;
 /** Lance Spark Dataset. */
 public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetadataColumns {
   private static final Set<TableCapability> CAPABILITIES =
-      ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE);
+      ImmutableSet.of(
+          TableCapability.BATCH_READ, TableCapability.BATCH_WRITE, TableCapability.TRUNCATE);
 
   public static final MetadataColumn[] METADATA_COLUMNS =
       new MetadataColumn[] {

@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
 __all__ = ["LanceDatasink", "LanceFragmentWriter", "LanceCommitter", "write_lance"]
 
+NONE_ARROW_STR = "None"
+
 
 def _pd_to_arrow(
     df: Union[pa.Table, "pd.DataFrame", Dict], schema: Optional[pa.Schema]
@@ -39,10 +41,27 @@ def _pd_to_arrow(
 
     if isinstance(df, dict):
         return pa.Table.from_pydict(df, schema=schema)
-    if _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
+    elif _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
         tbl = pa.Table.from_pandas(df, schema=schema)
-        new_schema = tbl.schema.remove_metadata()
-        new_table = tbl.replace_schema_metadata(new_schema.metadata)
+        tbl.schema = tbl.schema.remove_metadata()
+        return tbl
+    elif isinstance(df, pa.Table):
+        fields = df.schema.names
+        new_columns = []
+        new_fields = []
+        for field in fields:
+            col = df[field]
+            new_field = pa.field(field, col.type)
+            if (
+                pa.types.is_null(col.type)
+                and schema.field_by_name(field).type == pa.string()
+            ):
+                new_field = pa.field(field, pa.string())
+                col = pa.compute.if_else(pa.compute.is_null(col), NONE_ARROW_STR, col)
+            new_columns.append(col)
+            new_fields.append(new_field)
+        new_schema = pa.schema(fields=new_fields)
+        new_table = pa.Table.from_arrays(new_columns, schema=new_schema)
         return new_table
     return df
 

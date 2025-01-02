@@ -43,7 +43,7 @@ import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-public class BatchAppendTest {
+public class LanceBatchWriteTest {
   @TempDir static Path tempDir;
 
   @Test
@@ -59,8 +59,8 @@ public class BatchAppendTest {
       // Append data to lance dataset
       LanceConfig config = LanceConfig.from(datasetUri);
       StructType sparkSchema = LanceArrowUtils.fromArrowSchema(schema);
-      BatchAppend batchAppend = new BatchAppend(sparkSchema, config);
-      DataWriterFactory factor = batchAppend.createBatchWriterFactory(() -> 1);
+      LanceBatchWrite lanceBatchWrite = new LanceBatchWrite(sparkSchema, config, false);
+      DataWriterFactory factor = lanceBatchWrite.createBatchWriterFactory(() -> 1);
 
       int rows = 132;
       WriterCommitMessage message;
@@ -71,7 +71,7 @@ public class BatchAppendTest {
         }
         message = writer.commit();
       }
-      batchAppend.commit(new WriterCommitMessage[] {message});
+      lanceBatchWrite.commit(new WriterCommitMessage[] {message});
 
       // Validate lance dataset data
       try (Dataset dataset = Dataset.open(datasetUri, allocator)) {

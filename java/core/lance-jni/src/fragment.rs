@@ -65,7 +65,7 @@ fn inner_count_rows_native(
             "Fragment not found: {fragment_id}"
         )));
     };
-    let res = RT.block_on(fragment.count_rows())?;
+    let res = RT.block_on(fragment.count_rows(None))?;
     Ok(res)
 }
 

@@ -26,6 +26,7 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.LanceArrowUtils;
 
@@ -74,11 +75,27 @@ public class LanceDatasetAdapter {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset datasetRead = Dataset.open(allocator, uri, options)) {
-
       Dataset.commit(
               allocator,
               config.getDatasetUri(),
               appendOp,
+              java.util.Optional.of(datasetRead.version()),
+              options.getStorageOptions())
+          .close();
+    }
+  }
+
+  public static void overwriteFragments(
+      LanceConfig config, List<FragmentMetadata> fragments, StructType sparkSchema) {
+    Schema schema = LanceArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false);
+    FragmentOperation.Overwrite overwrite = new FragmentOperation.Overwrite(fragments, schema);
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    try (Dataset datasetRead = Dataset.open(allocator, uri, options)) {
+      Dataset.commit(
+              allocator,
+              config.getDatasetUri(),
+              overwrite,
               java.util.Optional.of(datasetRead.version()),
               options.getStorageOptions())
           .close();

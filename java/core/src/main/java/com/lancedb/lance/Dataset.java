@@ -24,9 +24,15 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.ByteArrayInputStream;
 import java.io.Closeable;
+import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -246,6 +252,13 @@ public class Dataset implements Closeable {
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  public static native Dataset commitOverwrite(
+      String path,
+      long arrowSchemaMemoryAddress,
+      Optional<Long> readVersion,
+      List<String> fragmentsMetadata,
+      Map<String, String> storageOptions);
+
   /**
    * Drop a Dataset.
    *
@@ -314,6 +327,32 @@ public class Dataset implements Closeable {
       return LanceScanner.create(this, options, allocator);
     }
   }
+
+  /**
+   * Select rows of data by index.
+   *
+   * @param indices the indices to take
+   * @param columns the columns to take
+   * @return an ArrowReader
+   */
+  public ArrowReader take(List<Long> indices, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      byte[] arrowData = nativeTake(indices, columns);
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
+    }
+  }
+
+  private native byte[] nativeTake(List<Long> indices, List<String> columns);
 
   /**
    * Gets the URI of the dataset.
