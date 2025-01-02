@@ -132,9 +132,11 @@ impl ArrayEncoder for FslEncoder {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use arrow::datatypes::Int32Type;
     use arrow_array::{FixedSizeListArray, Int32Array};
     use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field};
+    use lance_datagen::{array, gen_array, ArrayGeneratorExt, RowCount};
     use rstest::rstest;
 
     use crate::{
@@ -172,6 +174,33 @@ mod tests {
         let list = Arc::new(FixedSizeListArray::new(
             items_field,
             2,
+            items,
+            Some(list_nulls),
+        ));
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 2])
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    #[ignore]
+    async fn test_simple_wide_fsl() {
+        let items = gen_array(array::rand::<Int32Type>().with_random_nulls(0.1))
+            .into_array_rows(RowCount::from(4096))
+            .unwrap();
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false]));
+        let list = Arc::new(FixedSizeListArray::new(
+            items_field,
+            1024,
             items,
             Some(list_nulls),
         ));

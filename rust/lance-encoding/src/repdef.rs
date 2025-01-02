@@ -1613,6 +1613,8 @@ impl CompositeRepDefUnraveler {
 pub struct BinaryControlWordIterator<I: Iterator<Item = (u16, u16)>, W> {
     repdef: I,
     def_width: usize,
+    max_rep: u16,
+    max_visible_def: u16,
     rep_mask: u16,
     def_mask: u16,
     bits_rep: u8,
@@ -1621,28 +1623,40 @@ pub struct BinaryControlWordIterator<I: Iterator<Item = (u16, u16)>, W> {
 }
 
 impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u8> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         let control_word: u8 =
             (((next.0 & self.rep_mask) as u8) << self.def_width) + ((next.1 & self.def_mask) as u8);
         buf.push(control_word);
+        let is_new_row = next.0 == self.max_rep;
+        let is_visible = next.1 <= self.max_visible_def;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible,
+        })
     }
 }
 
 impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u16> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         let control_word: u16 =
             ((next.0 & self.rep_mask) << self.def_width) + (next.1 & self.def_mask);
         let control_word = control_word.to_le_bytes();
         buf.push(control_word[0]);
         buf.push(control_word[1]);
+        let is_new_row = next.0 == self.max_rep;
+        let is_visible = next.1 <= self.max_visible_def;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible,
+        })
     }
 }
 
 impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u32> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         let control_word: u32 = (((next.0 & self.rep_mask) as u32) << self.def_width)
             + ((next.1 & self.def_mask) as u32);
         let control_word = control_word.to_le_bytes();
@@ -1650,6 +1664,12 @@ impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u32> {
         buf.push(control_word[1]);
         buf.push(control_word[2]);
         buf.push(control_word[3]);
+        let is_new_row = next.0 == self.max_rep;
+        let is_visible = next.1 <= self.max_visible_def;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible,
+        })
     }
 }
 
@@ -1660,39 +1680,75 @@ pub struct UnaryControlWordIterator<I: Iterator<Item = u16>, W> {
     level_mask: u16,
     bits_rep: u8,
     bits_def: u8,
+    max_rep: u16,
     phantom: std::marker::PhantomData<W>,
 }
 
 impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u8> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         buf.push((next & self.level_mask) as u8);
+        let is_new_row = self.max_rep == 0 || next == self.max_rep;
+        Some(ControlWordDesc {
+            is_new_row,
+            // Either there is no rep, in which case there are no invisible items
+            // or there is no def, in which case there are no invisible items
+            is_visible: true,
+        })
     }
 }
 
 impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u16> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
         let next = self.repdef.next().unwrap() & self.level_mask;
         let control_word = next.to_le_bytes();
         buf.push(control_word[0]);
         buf.push(control_word[1]);
+        let is_new_row = self.max_rep == 0 || next == self.max_rep;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible: true,
+        })
     }
 }
 
 impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u32> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = (self.repdef.next().unwrap() & self.level_mask) as u32;
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
+        let next = (next & self.level_mask) as u32;
         let control_word = next.to_le_bytes();
         buf.push(control_word[0]);
         buf.push(control_word[1]);
         buf.push(control_word[2]);
         buf.push(control_word[3]);
+        let is_new_row = self.max_rep == 0 || next as u16 == self.max_rep;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible: true,
+        })
     }
 }
 
 /// A [`ControlWordIterator`] when there are no repetition or definition levels
 #[derive(Debug)]
-pub struct NilaryControlWordIterator;
+pub struct NilaryControlWordIterator {
+    len: usize,
+    idx: usize,
+}
+
+impl NilaryControlWordIterator {
+    fn append_next(&mut self) -> Option<ControlWordDesc> {
+        if self.idx == self.len {
+            None
+        } else {
+            self.idx += 1;
+            Some(ControlWordDesc {
+                is_new_row: true,
+                is_visible: true,
+            })
+        }
+    }
+}
 
 /// Helper function to get a bit mask of the given width
 fn get_mask(width: u16) -> u16 {
@@ -1726,9 +1782,26 @@ pub enum ControlWordIterator<'a> {
     Nilary(NilaryControlWordIterator),
 }
 
+/// Describes the properties of a control word
+pub struct ControlWordDesc {
+    pub is_new_row: bool,
+    pub is_visible: bool,
+}
+
+impl ControlWordDesc {
+    fn all_true() -> Self {
+        Self {
+            is_new_row: true,
+            is_visible: true,
+        }
+    }
+}
+
 impl ControlWordIterator<'_> {
     /// Appends the next control word to the buffer
-    pub fn append_next(&mut self, buf: &mut Vec<u8>) {
+    ///
+    /// Returns true if this is the start of a new item (i.e. the repetition level is maxed out)
+    pub fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
         match self {
             Self::Binary8(iter) => iter.append_next(buf),
             Self::Binary16(iter) => iter.append_next(buf),
@@ -1736,7 +1809,18 @@ impl ControlWordIterator<'_> {
             Self::Unary8(iter) => iter.append_next(buf),
             Self::Unary16(iter) => iter.append_next(buf),
             Self::Unary32(iter) => iter.append_next(buf),
-            Self::Nilary(_) => {}
+            Self::Nilary(iter) => iter.append_next(),
+        }
+    }
+
+    /// Return true if the control word iterator has repetition levels
+    pub fn has_repetition(&self) -> bool {
+        match self {
+            Self::Binary8(_) | Self::Binary16(_) | Self::Binary32(_) => true,
+            Self::Unary8(iter) => iter.bits_rep > 0,
+            Self::Unary16(iter) => iter.bits_rep > 0,
+            Self::Unary32(iter) => iter.bits_rep > 0,
+            Self::Nilary(_) => false,
         }
     }
 
@@ -1788,6 +1872,8 @@ pub fn build_control_word_iterator<'a>(
     max_rep: u16,
     def: Option<&'a [u16]>,
     max_def: u16,
+    max_visible_def: u16,
+    len: usize,
 ) -> ControlWordIterator<'a> {
     let rep_width = if max_rep == 0 {
         0
@@ -1812,6 +1898,8 @@ pub fn build_control_word_iterator<'a>(
                     rep_mask,
                     def_mask,
                     def_width,
+                    max_rep,
+                    max_visible_def,
                     bits_rep: rep_width as u8,
                     bits_def: def_width as u8,
                     phantom: std::marker::PhantomData,
@@ -1822,6 +1910,8 @@ pub fn build_control_word_iterator<'a>(
                     rep_mask,
                     def_mask,
                     def_width,
+                    max_rep,
+                    max_visible_def,
                     bits_rep: rep_width as u8,
                     bits_def: def_width as u8,
                     phantom: std::marker::PhantomData,
@@ -1832,6 +1922,8 @@ pub fn build_control_word_iterator<'a>(
                     rep_mask,
                     def_mask,
                     def_width,
+                    max_rep,
+                    max_visible_def,
                     bits_rep: rep_width as u8,
                     bits_def: def_width as u8,
                     phantom: std::marker::PhantomData,
@@ -1846,6 +1938,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: rep_mask,
                     bits_rep: total_width as u8,
                     bits_def: 0,
+                    max_rep,
                     phantom: std::marker::PhantomData,
                 })
             } else if total_width <= 16 {
@@ -1854,6 +1947,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: rep_mask,
                     bits_rep: total_width as u8,
                     bits_def: 0,
+                    max_rep,
                     phantom: std::marker::PhantomData,
                 })
             } else {
@@ -1862,6 +1956,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: rep_mask,
                     bits_rep: total_width as u8,
                     bits_def: 0,
+                    max_rep,
                     phantom: std::marker::PhantomData,
                 })
             }
@@ -1874,6 +1969,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: def_mask,
                     bits_rep: 0,
                     bits_def: total_width as u8,
+                    max_rep: 0,
                     phantom: std::marker::PhantomData,
                 })
             } else if total_width <= 16 {
@@ -1882,6 +1978,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: def_mask,
                     bits_rep: 0,
                     bits_def: total_width as u8,
+                    max_rep: 0,
                     phantom: std::marker::PhantomData,
                 })
             } else {
@@ -1890,11 +1987,12 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: def_mask,
                     bits_rep: 0,
                     bits_def: total_width as u8,
+                    max_rep: 0,
                     phantom: std::marker::PhantomData,
                 })
             }
         }
-        (None, None) => ControlWordIterator::Nilary(NilaryControlWordIterator {}),
+        (None, None) => ControlWordIterator::Nilary(NilaryControlWordIterator { len, idx: 0 }),
     }
 }
 
@@ -1951,6 +2049,51 @@ impl ControlWordParser {
         }
     }
 
+    fn parse_desc_both<const WORD_SIZE: u8>(
+        src: &[u8],
+        bits_to_shift: u8,
+        mask_to_apply: u32,
+        max_rep: u16,
+        max_visible_def: u16,
+    ) -> ControlWordDesc {
+        match WORD_SIZE {
+            1 => {
+                let word = src[0];
+                let rep = word >> bits_to_shift;
+                let def = word & (mask_to_apply as u8);
+                let is_visible = def as u16 <= max_visible_def;
+                let is_new_row = rep as u16 == max_rep;
+                ControlWordDesc {
+                    is_visible,
+                    is_new_row,
+                }
+            }
+            2 => {
+                let word = u16::from_le_bytes([src[0], src[1]]);
+                let rep = word >> bits_to_shift;
+                let def = word & mask_to_apply as u16;
+                let is_visible = def <= max_visible_def;
+                let is_new_row = rep == max_rep;
+                ControlWordDesc {
+                    is_visible,
+                    is_new_row,
+                }
+            }
+            4 => {
+                let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                let rep = word >> bits_to_shift;
+                let def = word & mask_to_apply;
+                let is_visible = def as u16 <= max_visible_def;
+                let is_new_row = rep as u16 == max_rep;
+                ControlWordDesc {
+                    is_visible,
+                    is_new_row,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn parse_one<const WORD_SIZE: u8>(src: &[u8], dst: &mut Vec<u16>) {
         match WORD_SIZE {
             1 => {
@@ -1965,6 +2108,24 @@ impl ControlWordParser {
                 let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
                 dst.push(word as u16);
             }
+            _ => unreachable!(),
+        }
+    }
+
+    fn parse_desc_one<const WORD_SIZE: u8>(src: &[u8], max_rep: u16) -> ControlWordDesc {
+        match WORD_SIZE {
+            1 => ControlWordDesc {
+                is_new_row: src[0] as u16 == max_rep,
+                is_visible: true,
+            },
+            2 => ControlWordDesc {
+                is_new_row: u16::from_le_bytes([src[0], src[1]]) == max_rep,
+                is_visible: true,
+            },
+            4 => ControlWordDesc {
+                is_new_row: u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as u16 == max_rep,
+                is_visible: true,
+            },
             _ => unreachable!(),
         }
     }
@@ -2009,6 +2170,53 @@ impl ControlWordParser {
             Self::DEF16 => Self::parse_one::<2>(src, dst_def),
             Self::DEF32 => Self::parse_one::<4>(src, dst_def),
             Self::NIL => {}
+        }
+    }
+
+    /// Return true if the control words contain repetition information
+    pub fn has_rep(&self) -> bool {
+        match self {
+            Self::BOTH8(..)
+            | Self::BOTH16(..)
+            | Self::BOTH32(..)
+            | Self::REP8
+            | Self::REP16
+            | Self::REP32 => true,
+            Self::DEF8 | Self::DEF16 | Self::DEF32 | Self::NIL => false,
+        }
+    }
+
+    /// Temporarily parses the control word to inspect its properties but does not append to any buffers
+    pub fn parse_desc(&self, src: &[u8], max_rep: u16, max_visible_def: u16) -> ControlWordDesc {
+        match self {
+            Self::BOTH8(bits_to_shift, mask_to_apply) => Self::parse_desc_both::<1>(
+                src,
+                *bits_to_shift,
+                *mask_to_apply,
+                max_rep,
+                max_visible_def,
+            ),
+            Self::BOTH16(bits_to_shift, mask_to_apply) => Self::parse_desc_both::<2>(
+                src,
+                *bits_to_shift,
+                *mask_to_apply,
+                max_rep,
+                max_visible_def,
+            ),
+            Self::BOTH32(bits_to_shift, mask_to_apply) => Self::parse_desc_both::<4>(
+                src,
+                *bits_to_shift,
+                *mask_to_apply,
+                max_rep,
+                max_visible_def,
+            ),
+            Self::REP8 => Self::parse_desc_one::<1>(src, max_rep),
+            Self::REP16 => Self::parse_desc_one::<2>(src, max_rep),
+            Self::REP32 => Self::parse_desc_one::<4>(src, max_rep),
+            Self::DEF8 => ControlWordDesc::all_true(),
+            Self::DEF16 => ControlWordDesc::all_true(),
+            Self::DEF32 => ControlWordDesc::all_true(),
+            Self::NIL => ControlWordDesc::all_true(),
         }
     }
 
@@ -2536,7 +2744,14 @@ mod tests {
             let in_rep = if rep.is_empty() { None } else { Some(rep) };
             let in_def = if def.is_empty() { None } else { Some(def) };
 
-            let mut iter = super::build_control_word_iterator(in_rep, max_rep, in_def, max_def);
+            let mut iter = super::build_control_word_iterator(
+                in_rep,
+                max_rep,
+                in_def,
+                max_def,
+                max_def + 1,
+                expected_values.len(),
+            );
             assert_eq!(iter.bytes_per_word(), expected_bytes_per_word);
             assert_eq!(iter.bits_rep(), expected_bits_rep);
             assert_eq!(iter.bits_def(), expected_bits_def);
@@ -2545,6 +2760,7 @@ mod tests {
             for _ in 0..num_vals {
                 iter.append_next(&mut cw_vec);
             }
+            assert!(iter.append_next(&mut cw_vec).is_none());
 
             assert_eq!(expected_values, cw_vec);
 
@@ -2612,5 +2828,85 @@ mod tests {
 
         // No rep, no def, no bytes
         check(&[], &[], Vec::default(), 0, 0, 0);
+    }
+
+    #[test]
+    fn test_control_words_rep_index() {
+        fn check(
+            rep: &[u16],
+            def: &[u16],
+            expected_new_rows: Vec<bool>,
+            expected_is_visible: Vec<bool>,
+        ) {
+            let num_vals = rep.len().max(def.len());
+            let max_rep = rep.iter().max().copied().unwrap_or(0);
+            let max_def = def.iter().max().copied().unwrap_or(0);
+
+            let in_rep = if rep.is_empty() { None } else { Some(rep) };
+            let in_def = if def.is_empty() { None } else { Some(def) };
+
+            let mut iter = super::build_control_word_iterator(
+                in_rep,
+                max_rep,
+                in_def,
+                max_def,
+                /*max_visible_def=*/ 2,
+                expected_new_rows.len(),
+            );
+
+            let mut cw_vec = Vec::with_capacity(num_vals * iter.bytes_per_word());
+            let mut expected_new_rows = expected_new_rows.iter().copied();
+            let mut expected_is_visible = expected_is_visible.iter().copied();
+            for _ in 0..expected_new_rows.len() {
+                let word_desc = iter.append_next(&mut cw_vec).unwrap();
+                assert_eq!(word_desc.is_new_row, expected_new_rows.next().unwrap());
+                assert_eq!(word_desc.is_visible, expected_is_visible.next().unwrap());
+            }
+            assert!(iter.append_next(&mut cw_vec).is_none());
+        }
+
+        // 2 means new list
+        let rep = &[2_u16, 1, 0, 2, 2, 0, 1, 1, 0, 2, 0];
+        // These values don't matter for this test
+        let def = &[0_u16, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1];
+
+        // Rep & def
+        check(
+            rep,
+            def,
+            vec![
+                true, false, false, true, true, false, false, false, false, true, false,
+            ],
+            vec![
+                true, true, true, false, true, true, true, true, true, true, true,
+            ],
+        );
+        // Rep only
+        check(
+            rep,
+            &[],
+            vec![
+                true, false, false, true, true, false, false, false, false, true, false,
+            ],
+            vec![true; 11],
+        );
+        // No repetition
+        check(
+            &[],
+            def,
+            vec![
+                true, true, true, true, true, true, true, true, true, true, true,
+            ],
+            vec![true; 11],
+        );
+        // No repetition, no definition
+        check(
+            &[],
+            &[],
+            vec![
+                true, true, true, true, true, true, true, true, true, true, true,
+            ],
+            vec![true; 11],
+        );
     }
 }
