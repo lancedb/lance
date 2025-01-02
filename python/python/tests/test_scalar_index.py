@@ -458,3 +458,33 @@ def test_create_index_empty_dataset(tmp_path: Path):
 
     # Finally, make sure we can still search after updating
     test_searches()
+
+
+def test_optimize_no_new_data(tmp_path: Path):
+    tbl = pa.table(
+        {"btree": pa.array([None], pa.int64()), "bitmap": pa.array([None], pa.int64())}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset.create_scalar_index("btree", index_type="BTREE")
+    dataset.create_scalar_index("bitmap", index_type="BITMAP")
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+
+    dataset.insert([], schema=tbl.schema)
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+
+    dataset.insert(pa.table({"btree": [2]}))
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
+
+    dataset.insert(pa.table({"bitmap": [2]}))
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 2
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2

@@ -577,6 +577,7 @@ impl BTreeLookup {
             .iter()
             .flat_map(|(_, pages)| pages)
             .map(|page| page.page_number)
+            .chain(self.null_pages.iter().copied())
             .collect::<Vec<_>>();
         ids.dedup();
         ids

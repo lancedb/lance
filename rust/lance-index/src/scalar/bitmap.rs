@@ -10,7 +10,7 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::{new_empty_array, Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_array::{new_empty_array, new_null_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -271,11 +271,17 @@ impl ScalarIndex for BitmapIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        let state = self
+        let mut state = self
             .index_map
             .iter()
             .map(|(key, bitmap)| (key.0.clone(), bitmap.clone()))
             .collect::<HashMap<_, _>>();
+
+        // Also insert the null map
+        let ex_null = new_null_array(&self.value_type, 1);
+        let ex_null = ScalarValue::try_from_array(ex_null.as_ref(), 0)?;
+        state.insert(ex_null, self.null_map.clone());
+
         do_train_bitmap_index(new_data, state, dest_store).await
     }
 }
