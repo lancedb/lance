@@ -1869,6 +1869,15 @@ class LanceDataset(pa.dataset.Dataset):
                     f" ({num_sub_vectors})"
                 )
 
+        if not (
+            pa.types.is_floating(field.type.value_type)
+            or pa.types.is_uint8(field.type.value_type)
+        ):
+            raise TypeError(
+                f"Vector column {c} must have floating or binary (uint8) value type, "
+                f"got {field.type.value_type}"
+            )
+
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
             "cosine",
