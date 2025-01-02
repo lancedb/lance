@@ -792,10 +792,9 @@ impl BTreeIndex {
         let mut null_pages = Vec::<u32>::new();
 
         if data.num_rows() == 0 {
-            return Err(Error::Internal {
-                message: "attempt to load btree index from empty stats batch".into(),
-                location: location!(),
-            });
+            let data_type = data.column(0).data_type().clone();
+            let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
+            return Ok(Self::new(map, null_pages, store, sub_index, batch_size));
         }
 
         let mins = data.column(0);

@@ -66,10 +66,14 @@ impl BitmapIndex {
     // creates a new BitmapIndex from a serialized RecordBatch
     fn try_from_serialized(data: RecordBatch, store: Arc<dyn IndexStore>) -> Result<Self> {
         if data.num_rows() == 0 {
-            return Err(Error::Internal {
-                message: "attempt to load bitmap index from empty record batch".into(),
-                location: location!(),
-            });
+            let data_type = data.schema().field(0).data_type().clone();
+            return Ok(Self::new(
+                BTreeMap::new(),
+                RowIdTreeMap::default(),
+                data_type,
+                0,
+                store,
+            ));
         }
 
         let dict_keys = data.column(0);

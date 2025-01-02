@@ -424,3 +424,37 @@ def test_create_index_empty_dataset(tmp_path: Path):
 
     for index_type in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
         ds.create_scalar_index(index_type.lower(), index_type=index_type)
+
+    # Make sure the empty index doesn't cause searches to fail
+    ds.insert(
+        pa.table(
+            {
+                "btree": pa.array([1], pa.int32()),
+                "bitmap": pa.array([1], pa.int32()),
+                "label_list": [["foo", "bar"]],
+                "inverted": ["blah"],
+            }
+        )
+    )
+
+    def test_searches():
+        assert ds.to_table(filter="btree = 1").num_rows == 1
+        assert ds.to_table(filter="btree = 0").num_rows == 0
+        assert ds.to_table(filter="bitmap = 1").num_rows == 1
+        assert ds.to_table(filter="bitmap = 0").num_rows == 0
+        assert ds.to_table(filter="array_has_any(label_list, ['foo'])").num_rows == 1
+        assert ds.to_table(filter="array_has_any(label_list, ['oof'])").num_rows == 0
+        assert ds.to_table(filter="inverted = 'blah'").num_rows == 1
+        assert ds.to_table(filter="inverted = 'halb'").num_rows == 0
+
+    test_searches()
+
+    # Make sure fetching index stats on empty index is ok
+    for idx in ds.list_indices():
+        ds.stats.index_stats(idx["name"])
+
+    # Make sure updating empty indices is ok
+    ds.optimize.optimize_indices()
+
+    # Finally, make sure we can still search after updating
+    test_searches()
