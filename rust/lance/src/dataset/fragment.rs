@@ -6,7 +6,7 @@
 pub mod write;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -48,6 +48,7 @@ use self::write::FragmentCreateBuilder;
 use super::hash_joiner::HashJoiner;
 use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
+use super::statistics::FieldStatistics;
 use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
 use crate::arrow::*;
@@ -96,6 +97,9 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Schema of the reader
     fn projection(&self) -> &Arc<Schema>;
+
+    /// Update storage statistics (ignored by v1 reader)
+    fn update_storage_stats(&self, field_stats: &mut HashMap<u32, FieldStatistics>);
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -240,6 +244,10 @@ impl GenericFileReader for V1Reader {
         self.reader.len() as u32
     }
 
+    fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
+        // No-op for v1 files
+    }
+
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
         Box::new(self.clone())
     }
@@ -364,6 +372,29 @@ mod v2_adapter {
                 .boxed())
         }
 
+        fn update_storage_stats(&self, field_stats: &mut HashMap<u32, FieldStatistics>) {
+            let file_statistics = self.reader.file_statistics();
+            let column_idx_to_field_id = self
+                .field_id_to_column_idx
+                .iter()
+                .map(|(field_id, column_idx)| (*column_idx, *field_id))
+                .collect::<HashMap<_, _>>();
+
+            // Some fields span more than one column.  We assume a column that doesn't have an
+            // entry in the field_id_to_column_idx map is a continuation of the previous field.
+            let mut current_field_id = 0;
+            for (column_idx, stats) in file_statistics.columns.iter().enumerate() {
+                if let Some(field_id) = column_idx_to_field_id.get(&(column_idx as u32)) {
+                    current_field_id = *field_id;
+                }
+                // If the field_id is not in the map then the field may no longer be part of the
+                // dataset
+                if let Some(field_stats) = field_stats.get_mut(&current_field_id) {
+                    field_stats.bytes_on_disk += stats.size_bytes;
+                }
+            }
+        }
+
         fn projection(&self) -> &Arc<Schema> {
             &self.projection
         }
@@ -459,6 +490,10 @@ impl GenericFileReader for NullReader {
     ) -> Result<ReadBatchTaskStream> {
         let num_rows = indices.len() as u64;
         self.read_range_tasks(0..num_rows, batch_size, projection)
+    }
+
+    fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
+        // No-op for null reader
     }
 
     fn projection(&self) -> &Arc<Schema> {
@@ -620,6 +655,21 @@ impl FileFragment {
             );
             Ok(frag)
         }
+    }
+
+    pub(crate) async fn update_storage_stats(
+        &self,
+        field_stats: &mut HashMap<u32, FieldStatistics>,
+        dataset_schema: &Schema,
+        scan_scheduler: Arc<ScanScheduler>,
+    ) -> Result<()> {
+        for reader in self
+            .open_readers(dataset_schema, Some((scan_scheduler, 0)))
+            .await?
+        {
+            reader.update_storage_stats(field_stats);
+        }
+        Ok(())
     }
 
     pub fn dataset(&self) -> &Dataset {
