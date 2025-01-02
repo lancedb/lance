@@ -83,11 +83,7 @@ public abstract class FragmentOperation {
       try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
         Data.exportSchema(allocator, schema, null, arrowSchema);
         return Dataset.commitOverwrite(
-            path,
-            arrowSchema.memoryAddress(),
-            readVersion,
-            fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()),
-            storageOptions);
+            path, arrowSchema.memoryAddress(), readVersion, fragments, storageOptions);
       }
     }
   }

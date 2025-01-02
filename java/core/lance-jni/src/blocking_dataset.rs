@@ -389,7 +389,7 @@ pub extern "system" fn Java_com_lancedb_lance_Dataset_commitOverwrite<'local>(
     path: JString,
     arrow_schema_addr: jlong,
     read_version_obj: JObject,    // Optional<Long>
-    fragments_obj: JObject,       // List<String>, String is json serialized Fragment
+    fragments_obj: JObject,       // List<FragmentMetadata>
     storage_options_obj: JObject, // Map<String, String>
 ) -> JObject<'local> {
     ok_or_throw!(
@@ -410,14 +410,13 @@ pub fn inner_commit_overwrite<'local>(
     path: JString,
     arrow_schema_addr: jlong,
     read_version_obj: JObject,    // Optional<Long>
-    fragments_obj: JObject,       // List<String>, String is json serialized Fragment)
+    fragments_obj: JObject,       // List<FragmentMetadata>
     storage_options_obj: JObject, // Map<String, String>
 ) -> Result<JObject<'local>> {
-    let json_fragments = env.get_strings(&fragments_obj)?;
-    let mut fragments: Vec<Fragment> = Vec::new();
-    for json_fragment in json_fragments {
-        let fragment = Fragment::from_json(&json_fragment)?;
-        fragments.push(fragment);
+    let fragment_objs = import_vec(env, &fragments_obj)?;
+    let mut fragments = Vec::with_capacity(fragment_objs.len());
+    for f in fragment_objs {
+        fragments.push(f.extract_object(env)?);
     }
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };

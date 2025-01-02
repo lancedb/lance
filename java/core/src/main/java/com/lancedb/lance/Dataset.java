@@ -256,7 +256,7 @@ public class Dataset implements Closeable {
       String path,
       long arrowSchemaMemoryAddress,
       Optional<Long> readVersion,
-      List<String> fragmentsMetadata,
+      List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
   /**
