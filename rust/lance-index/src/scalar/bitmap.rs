@@ -10,7 +10,7 @@ use std::{
 };
 
 use arrow::array::BinaryBuilder;
-use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array};
+use arrow_array::{new_empty_array, Array, BinaryArray, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -39,6 +39,8 @@ pub struct BitmapIndex {
     index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
     // We put null in its own map to avoid it matching range queries (arrow-rs considers null to come before minval)
     null_map: RowIdTreeMap,
+    // The data type of the values in the index
+    value_type: DataType,
     // Memoized index_map size for DeepSizeOf
     index_map_size_bytes: usize,
     store: Arc<dyn IndexStore>,
@@ -48,12 +50,14 @@ impl BitmapIndex {
     fn new(
         index_map: BTreeMap<OrderableScalarValue, RowIdTreeMap>,
         null_map: RowIdTreeMap,
+        value_type: DataType,
         index_map_size_bytes: usize,
         store: Arc<dyn IndexStore>,
     ) -> Self {
         Self {
             index_map,
             null_map,
+            value_type,
             index_map_size_bytes,
             store,
         }
@@ -69,6 +73,7 @@ impl BitmapIndex {
         }
 
         let dict_keys = data.column(0);
+        let value_type = dict_keys.data_type().clone();
         let binary_bitmaps = data.column(1);
         let bitmap_binary_array = binary_bitmaps
             .as_any()
@@ -94,7 +99,13 @@ impl BitmapIndex {
             }
         }
 
-        Ok(Self::new(index_map, null_map, index_map_size_bytes, store))
+        Ok(Self::new(
+            index_map,
+            null_map,
+            value_type,
+            index_map_size_bytes,
+            store,
+        ))
     }
 }
 
@@ -247,7 +258,7 @@ impl ScalarIndex for BitmapIndex {
                 (key.0.clone(), bitmap)
             })
             .collect::<HashMap<_, _>>();
-        write_bitmap_index(state, dest_store).await
+        write_bitmap_index(state, dest_store, &self.value_type).await
     }
 
     /// Add the new data into the index, creating an updated version of the index in `dest_store`
@@ -299,9 +310,14 @@ where
 async fn write_bitmap_index(
     state: HashMap<ScalarValue, RowIdTreeMap>,
     index_store: &dyn IndexStore,
+    value_type: &DataType,
 ) -> Result<()> {
     let keys_iter = state.keys().cloned();
-    let keys_array = ScalarValue::iter_to_array(keys_iter)?;
+    let keys_array = if state.is_empty() {
+        new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(keys_iter)?
+    };
 
     let values_iter = state.into_values();
     let binary_bitmap_array = get_bitmaps_from_iter(values_iter);
@@ -321,6 +337,7 @@ async fn do_train_bitmap_index(
     mut state: HashMap<ScalarValue, RowIdTreeMap>,
     index_store: &dyn IndexStore,
 ) -> Result<()> {
+    let value_type = data_source.schema().field(0).data_type().clone();
     while let Some(batch) = data_source.try_next().await? {
         debug_assert_eq!(batch.num_columns(), 2);
         debug_assert_eq!(*batch.column(1).data_type(), DataType::UInt64);
@@ -339,7 +356,7 @@ async fn do_train_bitmap_index(
         }
     }
 
-    write_bitmap_index(state, index_store).await
+    write_bitmap_index(state, index_store, &value_type).await
 }
 
 pub async fn train_bitmap_index(

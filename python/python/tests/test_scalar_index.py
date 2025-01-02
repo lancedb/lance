@@ -407,3 +407,20 @@ def test_label_list_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "LabelList"
+
+
+def test_create_index_empty_dataset(tmp_path: Path):
+    # Creating an index on an empty dataset is (currently) not terribly useful but
+    # we shouldn't return strange errors.
+    schema = pa.schema(
+        [
+            pa.field("btree", pa.int32()),
+            pa.field("bitmap", pa.int32()),
+            pa.field("label_list", pa.list_(pa.string())),
+            pa.field("inverted", pa.string()),
+        ]
+    )
+    ds = lance.write_dataset([], tmp_path, schema=schema)
+
+    for index_type in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+        ds.create_scalar_index(index_type.lower(), index_type=index_type)
