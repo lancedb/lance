@@ -91,7 +91,12 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
     match expr {
-        Expr::Between(Between{expr: inner_expr, low, high, negated}) => {
+        Expr::Between(Between {
+            expr: inner_expr,
+            low,
+            high,
+            negated,
+        }) => {
             if let Some(inner_expr_type) = resolve_column_type(inner_expr.as_ref(), schema) {
                 let low = if matches!(low.as_ref(), Expr::Literal(_)) {
                     Box::new(resolve_value(low.as_ref(), &inner_expr_type)?)
@@ -107,12 +112,12 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                     expr: inner_expr.clone(),
                     low,
                     high,
-                    negated: *negated
+                    negated: *negated,
                 }))
             } else {
                 Ok(expr.clone())
             }
-        },
+        }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             if matches!(op, Operator::And | Operator::Or) {
                 Ok(Expr::BinaryExpr(BinaryExpr {
