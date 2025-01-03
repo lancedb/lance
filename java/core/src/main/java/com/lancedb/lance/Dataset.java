@@ -252,6 +252,13 @@ public class Dataset implements Closeable {
       List<String> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  public static native Dataset commitOverwrite(
+      String path,
+      long arrowSchemaMemoryAddress,
+      Optional<Long> readVersion,
+      List<String> fragmentsMetadata,
+      Map<String, String> storageOptions);
+
   /**
    * Drop a Dataset.
    *
