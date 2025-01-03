@@ -29,6 +29,9 @@ pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
 pub const BLOB_META_KEY: &str = "lance-encoding:blob";
 pub const PACKED_STRUCT_LEGACY_META_KEY: &str = "packed";
 pub const PACKED_STRUCT_META_KEY: &str = "lance-encoding:packed";
+pub const STRUCTURAL_ENCODING_META_KEY: &str = "lance-encoding:structural-encoding";
+pub const STRUCTURAL_ENCODING_MINIBLOCK: &str = "miniblock";
+pub const STRUCTURAL_ENCODING_FULLZIP: &str = "fullzip";
 
 lazy_static::lazy_static! {
     pub static ref BLOB_DESC_FIELDS: Fields =
