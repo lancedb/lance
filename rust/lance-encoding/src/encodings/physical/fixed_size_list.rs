@@ -9,10 +9,10 @@ use lance_core::Result;
 use log::trace;
 
 use crate::{
-    data::{BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock},
-    decoder::{PageScheduler, PerValueDecompressor, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray, PerValueCompressor, PerValueDataBlock},
-    format::{pb, ProtobufUtils},
+    data::{DataBlock, FixedSizeListBlock},
+    decoder::{PageScheduler, PrimitivePageDecoder},
+    encoder::{ArrayEncoder, EncodedArray},
+    format::ProtobufUtils,
     EncodingsIo,
 };
 
@@ -128,116 +128,143 @@ impl ArrayEncoder for FslEncoder {
     }
 }
 
-/// A compressor for primitive FSLs that flattens each list into a
-/// single value.  If the inner list has validity then the validity
-/// is zipped in with the values.
-///
-/// In other words, if the list is FSL<u8?, 2> [[0, NULL], [4, 10]] then the
-/// two buffers start as:
-///
-/// values: 0x00 0x?? 0x04 0x0A
-/// validity: 0b1011
-///
-/// The output will be:
-///
-/// zipped: 0x01 0x00 0x00 0x?? 0x01 0x04 0x01 0x0A
-///
-/// Note that we expand validity to be at least a byte per value so this
-/// approach is not ideal for small lists, though we should be using mini-block
-/// for small lists anyways.
-#[derive(Debug)]
-pub struct FslPerValueCompressor {
-    items_compressor: Box<dyn PerValueCompressor>,
-    dimension: u64,
-}
-
-impl FslPerValueCompressor {
-    pub fn new(items_compressor: Box<dyn PerValueCompressor>, dimension: u64) -> Self {
-        Self {
-            items_compressor,
-            dimension,
-        }
-    }
-}
-
-impl PerValueCompressor for FslPerValueCompressor {
-    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
-        let mut data = data.as_fixed_size_list().unwrap();
-        let flattened = match data.child.as_mut() {
-            DataBlock::FixedWidth(fixed_width) => DataBlock::FixedWidth(FixedWidthDataBlock {
-                bits_per_value: fixed_width.bits_per_value * self.dimension,
-                data: fixed_width.data.borrow_and_clone(),
-                block_info: BlockInfo::new(),
-                num_values: fixed_width.num_values / self.dimension,
-            }),
-            DataBlock::VariableWidth(_) => todo!("GH-3111: FSL with variable inner type"),
-            DataBlock::Nullable(_) => todo!("GH-3112: FSL with nullable inner type"),
-            DataBlock::FixedSizeList(_) => todo!("GH-3113: Nested FSLs"),
-            _ => unreachable!(),
-        };
-        let (compressed, encoding) = self.items_compressor.compress(flattened)?;
-        let wrapped_encoding = ProtobufUtils::fixed_size_list(encoding, self.dimension);
-
-        Ok((compressed, wrapped_encoding))
-    }
-}
-
-/// Reversed the process described in [`FslPerValueCompressor`]
-#[derive(Debug)]
-pub struct FslPerValueDecompressor {
-    items_decompressor: Box<dyn PerValueDecompressor>,
-    dimension: u64,
-}
-
-impl FslPerValueDecompressor {
-    pub fn new(items_decompressor: Box<dyn PerValueDecompressor>, dimension: u64) -> Self {
-        Self {
-            items_decompressor,
-            dimension,
-        }
-    }
-}
-
-impl PerValueDecompressor for FslPerValueDecompressor {
-    fn decompress(&self, data: crate::buffer::LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        let decompressed = self.items_decompressor.decompress(data, num_values)?;
-        let unflattened = match decompressed {
-            DataBlock::FixedWidth(fixed_width) => DataBlock::FixedWidth(FixedWidthDataBlock {
-                bits_per_value: fixed_width.bits_per_value / self.dimension,
-                data: fixed_width.data,
-                block_info: BlockInfo::new(),
-                num_values: fixed_width.num_values * self.dimension,
-            }),
-            _ => todo!(),
-        };
-        Ok(DataBlock::FixedSizeList(FixedSizeListBlock {
-            child: Box::new(unflattened),
-            dimension: self.dimension,
-        }))
-    }
-
-    fn bits_per_value(&self) -> u64 {
-        self.items_decompressor.bits_per_value()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
 
+    use arrow::datatypes::Int32Type;
+    use arrow_array::{FixedSizeListArray, Int32Array};
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::{DataType, Field};
+    use lance_datagen::{array, gen_array, ArrayGeneratorExt, RowCount};
+    use rstest::rstest;
 
-    use crate::{testing::check_round_trip_encoding_random, version::LanceFileVersion};
+    use crate::{
+        testing::{check_round_trip_encoding_of_data, check_round_trip_encoding_random, TestCases},
+        version::LanceFileVersion,
+    };
 
     const PRIMITIVE_TYPES: &[DataType] = &[DataType::Int8, DataType::Float32, DataType::Float64];
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_value_fsl_primitive() {
+    async fn test_value_fsl_primitive(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+    ) {
         for data_type in PRIMITIVE_TYPES {
             let inner_field = Field::new("item", data_type.clone(), true);
             let data_type = DataType::FixedSizeList(Arc::new(inner_field), 16);
             let field = Field::new("", data_type, false);
-            check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+            check_round_trip_encoding_random(field, version).await;
         }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_fsl() {
+        let items = Arc::new(Int32Array::from(vec![
+            Some(0),
+            None,
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+        ]));
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false, true]));
+        let list = Arc::new(FixedSizeListArray::new(
+            items_field,
+            2,
+            items,
+            Some(list_nulls),
+        ));
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 2])
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    #[ignore]
+    async fn test_simple_wide_fsl() {
+        let items = gen_array(array::rand::<Int32Type>().with_random_nulls(0.1))
+            .into_array_rows(RowCount::from(4096))
+            .unwrap();
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let list_nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false]));
+        let list = Arc::new(FixedSizeListArray::new(
+            items_field,
+            1024,
+            items,
+            Some(list_nulls),
+        ));
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 2])
+            .with_indices(vec![1])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::default()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_fsl() {
+        // [[0, 1], NULL], NULL, [[8, 9], [NULL, 11]]
+        let items = Arc::new(Int32Array::from(vec![
+            Some(0),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(8),
+            Some(9),
+            None,
+            Some(11),
+        ]));
+        let items_field = Arc::new(Field::new("item", DataType::Int32, true));
+        let inner_list_nulls = NullBuffer::new(BooleanBuffer::from(vec![
+            true, false, false, false, true, true,
+        ]));
+        let inner_list = Arc::new(FixedSizeListArray::new(
+            items_field.clone(),
+            2,
+            items,
+            Some(inner_list_nulls),
+        ));
+        let inner_list_field = Arc::new(Field::new(
+            "item",
+            DataType::FixedSizeList(items_field, 2),
+            true,
+        ));
+        let outer_list_nulls = NullBuffer::new(BooleanBuffer::from(vec![true, false, true]));
+        let outer_list = Arc::new(FixedSizeListArray::new(
+            inner_list_field,
+            2,
+            inner_list,
+            Some(outer_list_nulls),
+        ));
+
+        let test_cases = TestCases::default()
+            .with_range(0..3)
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_indices(vec![0, 1, 2])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+
+        check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::default()).await;
     }
 }

@@ -11,7 +11,9 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use crate::buffer::LanceBuffer;
-use crate::data::{BlockInfo, ConstantDataBlock, DataBlock, FixedWidthDataBlock};
+use crate::data::{
+    BlockInfo, ConstantDataBlock, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+};
 use crate::decoder::PerValueDecompressor;
 use crate::decoder::{BlockDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
@@ -287,6 +289,17 @@ impl ValueEncoder {
             num_values: data.num_values,
         }
     }
+
+    fn make_fsl_encoding(data: &FixedSizeListBlock) -> ArrayEncoding {
+        let inner_encoding = match data.child.as_ref() {
+            DataBlock::FixedWidth(fixed_width) => {
+                ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None)
+            }
+            DataBlock::FixedSizeList(fsl) => Self::make_fsl_encoding(fsl),
+            _ => unreachable!(),
+        };
+        ProtobufUtils::fixed_size_list(inner_encoding, data.dimension)
+    }
 }
 
 impl BlockCompressor for ValueEncoder {
@@ -343,6 +356,11 @@ impl MiniBlockCompressor for ValueEncoder {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((Self::chunk_data(fixed_width), encoding))
+            }
+            DataBlock::FixedSizeList(mut fixed_size_list) => {
+                let flattened = fixed_size_list.flatten_as_fixed();
+                let encoding = Self::make_fsl_encoding(&fixed_size_list);
+                Ok((Self::chunk_data(flattened), encoding))
             }
             _ => Err(Error::InvalidInput {
                 source: format!(
