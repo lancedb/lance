@@ -407,3 +407,84 @@ def test_label_list_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "LabelList"
+
+
+def test_create_index_empty_dataset(tmp_path: Path):
+    # Creating an index on an empty dataset is (currently) not terribly useful but
+    # we shouldn't return strange errors.
+    schema = pa.schema(
+        [
+            pa.field("btree", pa.int32()),
+            pa.field("bitmap", pa.int32()),
+            pa.field("label_list", pa.list_(pa.string())),
+            pa.field("inverted", pa.string()),
+        ]
+    )
+    ds = lance.write_dataset([], tmp_path, schema=schema)
+
+    for index_type in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+        ds.create_scalar_index(index_type.lower(), index_type=index_type)
+
+    # Make sure the empty index doesn't cause searches to fail
+    ds.insert(
+        pa.table(
+            {
+                "btree": pa.array([1], pa.int32()),
+                "bitmap": pa.array([1], pa.int32()),
+                "label_list": [["foo", "bar"]],
+                "inverted": ["blah"],
+            }
+        )
+    )
+
+    def test_searches():
+        assert ds.to_table(filter="btree = 1").num_rows == 1
+        assert ds.to_table(filter="btree = 0").num_rows == 0
+        assert ds.to_table(filter="bitmap = 1").num_rows == 1
+        assert ds.to_table(filter="bitmap = 0").num_rows == 0
+        assert ds.to_table(filter="array_has_any(label_list, ['foo'])").num_rows == 1
+        assert ds.to_table(filter="array_has_any(label_list, ['oof'])").num_rows == 0
+        assert ds.to_table(filter="inverted = 'blah'").num_rows == 1
+        assert ds.to_table(filter="inverted = 'halb'").num_rows == 0
+
+    test_searches()
+
+    # Make sure fetching index stats on empty index is ok
+    for idx in ds.list_indices():
+        ds.stats.index_stats(idx["name"])
+
+    # Make sure updating empty indices is ok
+    ds.optimize.optimize_indices()
+
+    # Finally, make sure we can still search after updating
+    test_searches()
+
+
+def test_optimize_no_new_data(tmp_path: Path):
+    tbl = pa.table(
+        {"btree": pa.array([None], pa.int64()), "bitmap": pa.array([None], pa.int64())}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset.create_scalar_index("btree", index_type="BTREE")
+    dataset.create_scalar_index("bitmap", index_type="BITMAP")
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+
+    dataset.insert([], schema=tbl.schema)
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+
+    dataset.insert(pa.table({"btree": [2]}))
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
+
+    dataset.insert(pa.table({"bitmap": [2]}))
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 2
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
