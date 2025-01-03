@@ -60,6 +60,7 @@ tracing-subscriber = "0.3.17"
 tracing = "0.1.37"
 url = "2.5.0"
 bytes = "1.4"
+reqwest = { version = "0.12.9", features = [] }
 
 [features]
 datagen = ["lance-datagen"]
