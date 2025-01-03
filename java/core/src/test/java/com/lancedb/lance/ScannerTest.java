@@ -180,7 +180,7 @@ public class ScannerTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner = fragment.newScan(batchRows)) {
           testDataset.validateScanResults(dataset, scanner, totalRows, batchRows);
         }
@@ -197,7 +197,7 @@ public class ScannerTest {
       testDataset.createEmptyDataset().close();
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner =
             fragment.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
           testDataset.validateScanResults(dataset, scanner, 20, 20);
@@ -216,7 +216,7 @@ public class ScannerTest {
       int totalRows = 40;
       int batchRows = 20;
       try (Dataset dataset = testDataset.write(1, totalRows)) {
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
         try (Scanner scanner =
             fragment.newScan(
                 new ScanOptions.Builder()
@@ -257,7 +257,7 @@ public class ScannerTest {
       FragmentOperation.Append appendOp =
           new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        List<DatasetFragment> frags = dataset.getFragments();
+        List<Fragment> frags = dataset.getFragments();
         assertEquals(3, frags.size());
         validScanResult(dataset, frags.get(0).getId(), 3);
         validScanResult(dataset, frags.get(1).getId(), 5);
@@ -279,7 +279,7 @@ public class ScannerTest {
       FragmentOperation.Append appendOp =
           new FragmentOperation.Append(Arrays.asList(metadata0, metadata1, metadata2));
       try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
-        List<DatasetFragment> frags = dataset.getFragments();
+        List<Fragment> frags = dataset.getFragments();
         assertEquals(3, frags.size());
         try (Scanner scanner =
             dataset.newScan(

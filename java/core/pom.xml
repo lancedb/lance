@@ -41,10 +41,6 @@
             <artifactId>commons-lang3</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.json</groupId>
-            <artifactId>json</artifactId>
-        </dependency>
-        <dependency>
             <groupId>org.questdb</groupId>
             <artifactId>jar-jni</artifactId>
         </dependency>
