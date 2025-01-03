@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Module for statistics related to the dataset.
+
 use std::{collections::HashMap, future::Future, sync::Arc};
 
 use lance_core::Result;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 
 use super::{fragment::FileFragment, Dataset};
-
-///! Module for statistics related to the dataset.
 
 /// Statistics about a single field in the dataset
 pub struct FieldStatistics {
