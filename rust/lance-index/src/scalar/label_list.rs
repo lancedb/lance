@@ -158,7 +158,9 @@ impl ScalarIndex for LabelListIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        self.values_index.update(new_data, dest_store).await
+        self.values_index
+            .update(unnest_chunks(new_data)?, dest_store)
+            .await
     }
 }
 

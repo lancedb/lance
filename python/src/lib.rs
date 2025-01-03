@@ -144,6 +144,8 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
     m.add_wrapped(wrap_pyfunction!(language_model_home))?;
+    m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
+    m.add_wrapped(wrap_pyfunction!(iops_counter))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
@@ -154,6 +156,16 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())
+}
+
+#[pyfunction(name = "iops_counter")]
+fn iops_counter() -> PyResult<u64> {
+    Ok(::lance::io::iops_counter())
+}
+
+#[pyfunction(name = "bytes_read_counter")]
+fn bytes_read_counter() -> PyResult<u64> {
+    Ok(::lance::io::bytes_read_counter())
 }
 
 #[pyfunction(name = "_schema_to_json")]
