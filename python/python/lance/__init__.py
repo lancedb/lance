@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 from . import log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
+    DataStatistics,
+    FieldStatistics,
     LanceDataset,
     LanceOperation,
     LanceScanner,
@@ -36,6 +38,8 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "DataStatistics",
+    "FieldStatistics",
     "FragmentMetadata",
     "LanceDataset",
     "LanceFragment",

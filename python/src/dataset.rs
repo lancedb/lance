@@ -30,6 +30,7 @@ use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::MaterializationStyle;
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
@@ -87,6 +88,7 @@ pub mod blob;
 pub mod cleanup;
 pub mod commit;
 pub mod optimize;
+pub mod stats;
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
@@ -1230,6 +1232,12 @@ impl Dataset {
     fn num_small_files(&self, max_rows_per_group: usize) -> PyResult<usize> {
         RT.block_on(None, self.ds.num_small_files(max_rows_per_group))
             .map_err(|err| PyIOError::new_err(err.to_string()))
+    }
+
+    fn data_stats(&self) -> PyResult<PyLance<DataStatistics>> {
+        RT.block_on(None, self.ds.calculate_data_stats())?
+            .infer_error()
+            .map(PyLance)
     }
 
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
