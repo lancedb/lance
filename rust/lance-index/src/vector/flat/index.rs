@@ -11,7 +11,6 @@ use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
@@ -84,48 +83,45 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
 
-        let (row_ids, dists): (Vec<u64>, Vec<f32>) = match prefilter.is_empty() {
-            true => dist_calc
-                .distance_all()
-                .into_iter()
-                .zip(0..storage.len() as u32)
-                .map(|(dist, id)| OrderedNode {
-                    id,
-                    dist: OrderedFloat(dist),
-                })
-                .sorted_unstable()
-                .skip_while(|r| params.lower_bound.map_or(false, |lb| r.dist.0 < lb))
-                .take_while(|r| params.upper_bound.map_or(true, |ub| r.dist.0 < ub))
-                .take(k)
-                .map(
-                    |OrderedNode {
-                         id,
-                         dist: OrderedFloat(dist),
-                     }| (storage.row_id(id), dist),
-                )
-                .unzip(),
+        let mut res = match prefilter.is_empty() {
+            true => Vec::from_iter(
+                dist_calc
+                    .distance_all()
+                    .into_iter()
+                    .zip(0..storage.len() as u32)
+                    .map(|(dist, id)| OrderedNode {
+                        id,
+                        dist: OrderedFloat(dist),
+                    }),
+            ),
             false => {
                 let row_id_mask = prefilter.mask();
-                (0..storage.len())
-                    .filter(|&id| row_id_mask.selected(storage.row_id(id as u32)))
-                    .map(|id| OrderedNode {
-                        id: id as u32,
-                        dist: OrderedFloat(dist_calc.distance(id as u32)),
-                    })
-                    .sorted_unstable()
-                    .skip_while(|r| params.lower_bound.map_or(false, |lb| r.dist.0 < lb))
-                    .take_while(|r| params.upper_bound.map_or(true, |ub| r.dist.0 < ub))
-                    .take(k)
-                    .map(
-                        |OrderedNode {
-                             id,
-                             dist: OrderedFloat(dist),
-                         }| (storage.row_id(id), dist),
-                    )
-                    .unzip()
+                Vec::from_iter(
+                    (0..storage.len())
+                        .filter(|&id| row_id_mask.selected(storage.row_id(id as u32)))
+                        .map(|id| OrderedNode {
+                            id: id as u32,
+                            dist: OrderedFloat(dist_calc.distance(id as u32)),
+                        }),
+                )
             }
         };
+        res.sort_unstable();
 
+        let filtered = if params.lower_bound.is_some() || params.upper_bound.is_some() {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
+            let low_idx = res.partition_point(|r| r.dist.0 < lower_bound);
+            let high_idx = res.partition_point(|r| r.dist.0 < upper_bound);
+            res[low_idx..high_idx].iter()
+        } else {
+            res.iter()
+        };
+
+        let (row_ids, dists): (Vec<_>, Vec<_>) = filtered
+            .take(k)
+            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .unzip();
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(
