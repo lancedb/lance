@@ -98,20 +98,10 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
             negated,
         }) => {
             if let Some(inner_expr_type) = resolve_column_type(inner_expr.as_ref(), schema) {
-                let low = if matches!(low.as_ref(), Expr::Literal(_)) {
-                    Box::new(resolve_value(low.as_ref(), &inner_expr_type)?)
-                } else {
-                    low.clone()
-                };
-                let high = if matches!(high.as_ref(), Expr::Literal(_)) {
-                    Box::new(resolve_value(high.as_ref(), &inner_expr_type)?)
-                } else {
-                    high.clone()
-                };
                 Ok(Expr::Between(Between {
                     expr: inner_expr.clone(),
-                    low,
-                    high,
+                    low: Box::new(coerce_expr(low.as_ref(), &inner_expr_type)?),
+                    high: Box::new(coerce_expr(high.as_ref(), &inner_expr_type)?),
                     negated: *negated,
                 }))
             } else {
