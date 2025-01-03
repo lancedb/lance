@@ -432,6 +432,29 @@ def test_create_4bit_ivf_pq_index(dataset, tmp_path):
     assert index["indices"][0]["sub_index"]["nbits"] == 4
 
 
+def test_ivf_flat_over_binary_vector(tmp_path):
+    dim = 128
+    nvec = 1000
+    data = np.random.randint(0, 256, (nvec, dim // 8)).tolist()
+    array = pa.array(data, type=pa.list_(pa.uint8(), dim // 8))
+    tbl = pa.Table.from_pydict({"vector": array})
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_index("vector", index_type="IVF_FLAT", num_partitions=4, metric="hamming")
+    stats = ds.stats.index_stats("vector_idx")
+    assert stats["indices"][0]["metric_type"] == "hamming"
+    assert stats["index_type"] == "IVF_FLAT"
+
+    query = np.random.randint(0, 256, dim // 8).astype(np.uint8)
+    ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": query,
+            "k": 10,
+            "metric": "hamming",
+        }
+    )
+
+
 def test_create_ivf_hnsw_pq_index(dataset, tmp_path):
     assert not dataset.has_index
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
