@@ -398,7 +398,7 @@ impl<'a> SQDistCalculator<'a> {
     }
 }
 
-impl<'a> DistCalculator for SQDistCalculator<'a> {
+impl DistCalculator for SQDistCalculator<'_> {
     fn distance(&self, id: u32) -> f32 {
         let (offset, chunk) = self.storage.chunk(id);
         let sq_code = chunk.sq_code_slice(id - offset);
@@ -407,6 +407,34 @@ impl<'a> DistCalculator for SQDistCalculator<'a> {
                 l2_distance_uint_scalar(sq_code, &self.query_sq_code)
             }
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
+            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
+        }
+    }
+
+    fn distance_all(&self) -> Vec<f32> {
+        match self.storage.distance_type {
+            DistanceType::L2 | DistanceType::Cosine => self
+                .storage
+                .chunks
+                .iter()
+                .flat_map(|c| {
+                    c.sq_codes
+                        .values()
+                        .chunks_exact(c.dim())
+                        .map(|sq_codes| l2_distance_uint_scalar(sq_codes, &self.query_sq_code))
+                })
+                .collect(),
+            DistanceType::Dot => self
+                .storage
+                .chunks
+                .iter()
+                .flat_map(|c| {
+                    c.sq_codes
+                        .values()
+                        .chunks_exact(c.dim())
+                        .map(|sq_codes| dot_distance(sq_codes, &self.query_sq_code))
+                })
+                .collect(),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
         }
     }

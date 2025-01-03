@@ -8,7 +8,6 @@ use arrow_array::{Array, ArrayRef, RecordBatch, UInt8Array};
 use arrow_schema::DataType;
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
-use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{
     Field, Schema, BLOB_DESC_FIELD, BLOB_META_KEY, COMPRESSION_LEVEL_META_KEY,
     COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY, PACKED_STRUCT_META_KEY,
@@ -21,18 +20,21 @@ use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::decoder::PageEncoding;
 use crate::encodings::logical::blob::BlobFieldEncoder;
+use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
-use crate::encodings::physical::binary::BinaryMiniBlockEncoder;
+use crate::encodings::physical::binary::{BinaryBlockEncoder, BinaryMiniBlockEncoder};
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
-use crate::encodings::physical::fsst::FsstArrayEncoder;
+use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
+use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
 use crate::format::ProtobufUtils;
 use crate::repdef::RepDefBuilder;
 use crate::statistics::{GetStat, Stat};
@@ -49,9 +51,13 @@ use crate::{
     },
     format::pb,
 };
+use fsst::fsst::{FSST_LEAST_INPUT_MAX_LENGTH, FSST_LEAST_INPUT_SIZE};
 
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use std::collections::hash_map::RandomState;
+
+/// The minimum alignment for a page buffer.  Writers must respect this.
+pub const MIN_PAGE_BUFFER_ALIGNMENT: u64 = 8;
 
 /// An encoded array
 ///
@@ -206,20 +212,30 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, page: DataBlock) -> Result<(MiniBlockCompressed, pb::ArrayEncoding)>;
 }
 
+/// Per-value compression must either:
+///
+/// A single buffer of fixed-width values
+/// A single buffer of value data and a buffer of offsets
+///
+/// TODO: In the future we may allow metadata buffers
+pub enum PerValueDataBlock {
+    Fixed(FixedWidthDataBlock),
+    Variable(VariableWidthBlock),
+}
+
 /// Trait for compression algorithms that are suitable for use in the zipped structural encoding
 ///
-/// Compared to [`VariablePerValueCompressor`], these compressors are capable of compressing the data
-/// so that every value has the exact same number of bits per value.  For example, this is useful
-/// for encoding vector embeddings where every value has a fixed size but the values themselves are
-/// too large to use mini-block.
+/// This compression must return either a FixedWidthDataBlock or a VariableWidthBlock.  This is because
+/// we need to zip the data and those are the only two blocks we know how to zip today.
 ///
-/// The advantage of a fixed-bytes-per-value is that we can do random access in 1 IOP instead of 2
-/// and do not need a repetition index.
-pub trait FixedPerValueCompressor: std::fmt::Debug + Send + Sync {
-    /// Compress the data into a single buffer where each value is encoded with the same number of bits
+/// In addition, the compressed data must be able to be decompressed in a random-access fashion.
+/// This means that the decompression algorithm must be able to decompress any value without
+/// decompressing all values before it.
+pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
+    /// Compress the data into a single buffer
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
-    fn compress(&self, data: DataBlock) -> Result<(FixedWidthDataBlock, pb::ArrayEncoding)>;
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)>;
 }
 
 /// Trait for compression algorithms that are suitable for use in the zipped structural encoding
@@ -356,12 +372,21 @@ pub trait FieldEncoder: Send {
     /// than a single disk page.
     ///
     /// It could also return an empty Vec if there is not enough data yet to encode any pages.
+    ///
+    /// The `row_number` must be passed which is the top-level row number currently being encoded
+    /// This is stored in any pages produced by this call so that we can know the priority of the
+    /// page.
+    ///
+    /// The `num_rows` is the number of top level rows.  It is initially the same as `array.len()`
+    /// however it is passed seprately because array will become flattened over time (if there is
+    /// repetition) and we need to know the original number of rows for various purposes.
     fn maybe_encode(
         &mut self,
         array: ArrayRef,
         external_buffers: &mut OutOfLineBuffers,
         repdef: RepDefBuilder,
         row_number: u64,
+        num_rows: u64,
     ) -> Result<Vec<EncodeTask>>;
     /// Flush any remaining data from the buffers into encoding tasks
     ///
@@ -404,11 +429,9 @@ pub trait ArrayEncodingStrategy: Send + Sync + std::fmt::Debug {
 /// There are several different kinds of compression.
 ///
 /// - Block compression is the most generic, but most difficult to use efficiently
-/// - Fixed-per-value compression results in a fixed number of bits for each value
-///     It is used for wide fixed-width types like vector embeddings.
-/// - Variable-per-value compression results in two buffers, one buffer of offsets
-///     and one buffer of data bytes.  It is used for wide variable-width types
-///     like strings, variable-length lists, binary, etc.
+/// - Per-value compression results in either a fixed width data block or a variable
+///   width data block.  In other words, there is some number of bits per value.
+///   In addition, each value should be independently decompressible.
 /// - Mini-block compression results in a small block of opaque data for chunks
 ///     of rows.  Each block is somewhere between 0 and 16KiB in size.  This is
 ///     used for narrow data types (both fixed and variable length) where we can
@@ -421,19 +444,12 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, pb::ArrayEncoding)>;
 
-    /// Create a fixed-per-value compressor for the given data
-    fn create_fixed_per_value(
+    /// Create a per-value compressor for the given data
+    fn create_per_value(
         &self,
         field: &Field,
         data: &DataBlock,
-    ) -> Result<Box<dyn FixedPerValueCompressor>>;
-
-    /// Create a variable-per-value compressor for the given data
-    fn create_variable_per_value(
-        &self,
-        field: &Field,
-        data: &DataBlock,
-    ) -> Result<Box<dyn VariablePerValueCompressor>>;
+    ) -> Result<Box<dyn PerValueCompressor>>;
 
     /// Create a mini-block compressor for the given data
     fn create_miniblock_compressor(
@@ -786,9 +802,7 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         if let DataBlock::FixedWidth(ref fixed_width_data) = data {
-            let bit_widths = data
-                .get_stat(Stat::BitWidth)
-                .expect("FixedWidthDataBlock should have valid bit width statistics");
+            let bit_widths = data.expect_stat(Stat::BitWidth);
             // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
             // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
             let has_all_zeros = bit_widths
@@ -807,29 +821,60 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         }
         if let DataBlock::VariableWidth(ref variable_width_data) = data {
             if variable_width_data.bits_per_offset == 32 {
+                let data_size =
+                    variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                let max_len = variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+
+                if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                {
+                    return Ok(Box::new(FsstMiniBlockEncoder::default()));
+                }
                 return Ok(Box::new(BinaryMiniBlockEncoder::default()));
             }
+        }
+        if let DataBlock::Struct(ref struct_data_block) = data {
+            // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
+            // just being cautious here.
+            if struct_data_block
+                .children
+                .iter()
+                .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+            {
+                panic!("packed struct encoding currently only supports fixed-width fields.")
+            }
+            return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
         }
         Ok(Box::new(ValueEncoder::default()))
     }
 
-    fn create_fixed_per_value(
+    fn create_per_value(
         &self,
         field: &Field,
-        _data: &DataBlock,
-    ) -> Result<Box<dyn FixedPerValueCompressor>> {
-        // Right now we only need block compressors for rep/def which is u16.  Will need to expand
-        // this if we need block compression of other types.
-        assert!(field.data_type().byte_width() > 0);
-        Ok(Box::new(ValueEncoder::default()))
-    }
-
-    fn create_variable_per_value(
-        &self,
-        _field: &Field,
-        _data: &DataBlock,
-    ) -> Result<Box<dyn VariablePerValueCompressor>> {
-        todo!()
+        data: &DataBlock,
+    ) -> Result<Box<dyn PerValueCompressor>> {
+        match data {
+            DataBlock::FixedWidth(_) => {
+                let encoder = Box::new(ValueEncoder::default());
+                Ok(encoder)
+            }
+            DataBlock::VariableWidth(_variable_width) => {
+                todo!()
+            }
+            DataBlock::FixedSizeList(fsl) => {
+                let DataType::FixedSizeList(inner_field, field_dim) = field.data_type() else {
+                    panic!("FSL data block without FSL field")
+                };
+                debug_assert_eq!(fsl.dimension, field_dim as u64);
+                let inner_compressor = self.create_per_value(
+                    &inner_field.as_ref().try_into().unwrap(),
+                    fsl.child.as_ref(),
+                )?;
+                let fsl_compressor = FslPerValueCompressor::new(inner_compressor, fsl.dimension);
+                Ok(Box::new(fsl_compressor))
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn create_block_compressor(
@@ -838,10 +883,21 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<(Box<dyn BlockCompressor>, pb::ArrayEncoding)> {
         match data {
+            // Right now we only need block compressors for rep/def which is u16.  Will need to expand
+            // this if we need block compression of other types.
             DataBlock::FixedWidth(fixed_width) => {
                 let encoder = Box::new(ValueEncoder::default());
                 let encoding = ProtobufUtils::flat_encoding(fixed_width.bits_per_value, 0, None);
                 Ok((encoder, encoding))
+            }
+            DataBlock::VariableWidth(variable_width) => {
+                if variable_width.bits_per_offset == 32 {
+                    let encoder = Box::new(BinaryBlockEncoder::default());
+                    let encoding = ProtobufUtils::binary_block();
+                    Ok((encoder, encoding))
+                } else {
+                    todo!("Implement BlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                }
             }
             _ => unreachable!(),
         }
@@ -887,6 +943,17 @@ pub struct EncodingOptions {
     /// The encoder needs to know this so it figures the position of out-of-line
     /// buffers correctly
     pub buffer_alignment: u64,
+}
+
+impl Default for EncodingOptions {
+    fn default() -> Self {
+        Self {
+            cache_bytes_per_column: 8 * 1024 * 1024,
+            max_page_bytes: 32 * 1024 * 1024,
+            keep_original_array: true,
+            buffer_alignment: 64,
+        }
+    }
 }
 
 /// A trait to pick which kind of field encoding to use for a field
@@ -1160,16 +1227,18 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
             )?))
         } else {
             match data_type {
-                DataType::List(_child) | DataType::LargeList(_child) => {
-                    todo!()
+                DataType::List(_) | DataType::LargeList(_) => {
+                    let child = field.children.first().expect("List should have a child");
+                    let child_encoder = self.create_field_encoder(
+                        _encoding_strategy_root,
+                        child,
+                        column_index,
+                        options,
+                    )?;
+                    Ok(Box::new(ListStructuralEncoder::new(child_encoder)))
                 }
                 DataType::Struct(_) => {
-                    let field_metadata = &field.metadata;
-                    if field_metadata
-                        .get("packed")
-                        .map(|v| v == "true")
-                        .unwrap_or(false)
-                    {
+                    if field.is_packed_struct() {
                         Ok(Box::new(PrimitiveStructuralEncoder::try_new(
                             options,
                             self.compression_strategy.clone(),
@@ -1299,9 +1368,14 @@ pub async fn encode_batch(
     encoding_strategy: &dyn FieldEncodingStrategy,
     options: &EncodingOptions,
 ) -> Result<EncodedBatch> {
-    if !is_pwr_two(options.buffer_alignment) || options.buffer_alignment < 8 {
+    if !is_pwr_two(options.buffer_alignment) || options.buffer_alignment < MIN_PAGE_BUFFER_ALIGNMENT
+    {
         return Err(Error::InvalidInput {
-            source: "buffer_alignment must be a power of two and at least 8".into(),
+            source: format!(
+                "buffer_alignment must be a power of two and at least {}",
+                MIN_PAGE_BUFFER_ALIGNMENT
+            )
+            .into(),
             location: location!(),
         });
     }
@@ -1320,7 +1394,9 @@ pub async fn encode_batch(
             OutOfLineBuffers::new(data_buffer.len() as u64, options.buffer_alignment);
         let repdef = RepDefBuilder::default();
         let encoder = encoder.as_mut();
-        let mut tasks = encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0)?;
+        let num_rows = arr.len() as u64;
+        let mut tasks =
+            encoder.maybe_encode(arr.clone(), &mut external_buffers, repdef, 0, num_rows)?;
         tasks.extend(encoder.flush(&mut external_buffers)?);
         for buffer in external_buffers.take_buffers() {
             data_buffer.extend_from_slice(&buffer);

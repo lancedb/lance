@@ -35,7 +35,7 @@ pub mod lance_format;
 
 pub const LANCE_SCALAR_INDEX: &str = "__lance_scalar_index";
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum ScalarIndexType {
     BTree,
     Bitmap,
@@ -165,7 +165,7 @@ pub trait IndexWriter: Send {
 #[async_trait]
 pub trait IndexReader: Send + Sync {
     /// Read the n-th record batch from the file
-    async fn read_record_batch(&self, n: u32) -> Result<RecordBatch>;
+    async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read the range of rows from the file.
     /// If projection is Some, only return the columns in the projection,
     /// nested columns like Some(&["x.y"]) are not supported.

@@ -218,7 +218,7 @@ impl Default for MockClock<'_> {
     }
 }
 
-impl<'a> MockClock<'a> {
+impl MockClock<'_> {
     pub fn new() -> Self {
         Default::default()
     }
@@ -228,7 +228,7 @@ impl<'a> MockClock<'a> {
     }
 }
 
-impl<'a> Drop for MockClock<'a> {
+impl Drop for MockClock<'_> {
     fn drop(&mut self) {
         // Reset the clock to the epoch
         mock_instant::MockClock::set_system_time(TimeDelta::try_days(0).unwrap().to_std().unwrap());

@@ -2,7 +2,11 @@ use arrow::pyarrow::PyArrowType;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use lance_datagen::{BatchCount, ByteCount};
-use pyo3::{pyfunction, types::PyModule, wrap_pyfunction, PyResult, Python};
+use pyo3::{
+    pyfunction,
+    types::{PyModule, PyModuleMethods},
+    wrap_pyfunction, Bound, PyResult, Python,
+};
 
 const DEFAULT_BATCH_SIZE_BYTES: u64 = 32 * 1024;
 const DEFAULT_BATCH_COUNT: u32 = 4;
@@ -13,6 +17,7 @@ pub fn is_datagen_supported() -> bool {
 }
 
 #[pyfunction]
+#[pyo3(signature=(schema, batch_count=None, bytes_in_batch=None))]
 pub fn rand_batches(
     schema: PyArrowType<Schema>,
     batch_count: Option<u32>,
@@ -35,10 +40,10 @@ pub fn rand_batches(
         .collect::<PyResult<Vec<PyArrowType<RecordBatch>>>>()
 }
 
-pub fn register_datagen(py: Python, m: &PyModule) -> PyResult<()> {
-    let datagen = PyModule::new(py, "datagen")?;
+pub fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let datagen = PyModule::new_bound(py, "datagen")?;
     datagen.add_wrapped(wrap_pyfunction!(is_datagen_supported))?;
     datagen.add_wrapped(wrap_pyfunction!(rand_batches))?;
-    m.add_submodule(datagen)?;
+    m.add_submodule(&datagen)?;
     Ok(())
 }

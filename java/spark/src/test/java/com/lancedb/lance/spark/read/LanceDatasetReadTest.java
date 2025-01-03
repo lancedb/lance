@@ -15,9 +15,10 @@
 package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.TestUtils;
-import com.lancedb.lance.spark.internal.LanceFragmentScanner;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
+import com.lancedb.lance.spark.internal.LanceFragmentScanner;
 import com.lancedb.lance.spark.utils.Optional;
+
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.DataTypes;
@@ -37,14 +38,16 @@ public class LanceDatasetReadTest {
   @Test
   public void testSchema() {
     StructType expectedSchema = TestUtils.TestTable1Config.schema;
-    Optional<StructType> schema = LanceDatasetAdapter.getSchema(TestUtils.TestTable1Config.lanceConfig);
+    Optional<StructType> schema =
+        LanceDatasetAdapter.getSchema(TestUtils.TestTable1Config.lanceConfig);
     assertTrue(schema.isPresent());
     assertEquals(expectedSchema, schema.get());
   }
 
   @Test
   public void testFragmentIds() {
-    List<Integer> fragments = LanceDatasetAdapter.getFragmentIds(TestUtils.TestTable1Config.lanceConfig);
+    List<Integer> fragments =
+        LanceDatasetAdapter.getFragmentIds(TestUtils.TestTable1Config.lanceConfig);
     assertEquals(2, fragments.size());
     assertEquals(0, fragments.get(0));
     assertEquals(1, fragments.get(1));
@@ -52,52 +55,60 @@ public class LanceDatasetReadTest {
 
   @Test
   public void getFragmentScanner() throws IOException {
-    List<List<Object>> expectedValues = Arrays.asList(
-        Arrays.asList(0L, 0L, 0L, 0L),
-        Arrays.asList(1L, 2L, 3L, -1L)
-    );
+    List<List<Object>> expectedValues =
+        Arrays.asList(Arrays.asList(0L, 0L, 0L, 0L), Arrays.asList(1L, 2L, 3L, -1L));
     validateFragment(expectedValues, 0, TestUtils.TestTable1Config.schema);
-    List<List<Object>> expectedValues1 = Arrays.asList(
-        Arrays.asList(2L, 4L, 6L, -2L),
-        Arrays.asList(3L, 6L, 9L, -3L)
-    );
+    List<List<Object>> expectedValues1 =
+        Arrays.asList(Arrays.asList(2L, 4L, 6L, -2L), Arrays.asList(3L, 6L, 9L, -3L));
     validateFragment(expectedValues1, 1, TestUtils.TestTable1Config.schema);
-    List<List<Object>> expectedValuesColumnsyb = Arrays.asList(
-        Arrays.asList(4L, 6L),
-        Arrays.asList(6L, 9L)
-    );
-    validateFragment(expectedValuesColumnsyb, 1, new StructType(new StructField[]{
-        DataTypes.createStructField("y", DataTypes.LongType, true),
-        DataTypes.createStructField("b", DataTypes.LongType, true)
-    }));
-    List<List<Object>> expectedValuesColumnsbc = Arrays.asList(
-        Arrays.asList(0L, 0L),
-        Arrays.asList(3L, -1L)
-    );
-    validateFragment(expectedValuesColumnsbc, 0, new StructType(new StructField[]{
-        DataTypes.createStructField("b", DataTypes.LongType, true),
-        DataTypes.createStructField("c", DataTypes.LongType, true)
-    }));
+    List<List<Object>> expectedValuesColumnsyb =
+        Arrays.asList(Arrays.asList(4L, 6L), Arrays.asList(6L, 9L));
+    validateFragment(
+        expectedValuesColumnsyb,
+        1,
+        new StructType(
+            new StructField[] {
+              DataTypes.createStructField("y", DataTypes.LongType, true),
+              DataTypes.createStructField("b", DataTypes.LongType, true)
+            }));
+    List<List<Object>> expectedValuesColumnsbc =
+        Arrays.asList(Arrays.asList(0L, 0L), Arrays.asList(3L, -1L));
+    validateFragment(
+        expectedValuesColumnsbc,
+        0,
+        new StructType(
+            new StructField[] {
+              DataTypes.createStructField("b", DataTypes.LongType, true),
+              DataTypes.createStructField("c", DataTypes.LongType, true)
+            }));
   }
-  
-  public void validateFragment(List<List<Object>> expectedValues, int fragment, StructType schema) throws IOException {
-    try (LanceFragmentScanner scanner = LanceDatasetAdapter.getFragmentScanner(fragment,
-        new LanceInputPartition(schema, 0, new LanceSplit(Arrays.asList(fragment)),
-            TestUtils.TestTable1Config.lanceConfig, Optional.empty()))) {
+
+  public void validateFragment(List<List<Object>> expectedValues, int fragment, StructType schema)
+      throws IOException {
+    try (LanceFragmentScanner scanner =
+        LanceDatasetAdapter.getFragmentScanner(
+            fragment,
+            new LanceInputPartition(
+                schema,
+                0,
+                new LanceSplit(Arrays.asList(fragment)),
+                TestUtils.TestTable1Config.lanceConfig,
+                Optional.empty()))) {
       try (ArrowReader reader = scanner.getArrowReader()) {
         VectorSchemaRoot root = reader.getVectorSchemaRoot();
         assertNotNull(root);
-        
+
         while (reader.loadNextBatch()) {
           for (int i = 0; i < root.getRowCount(); i++) {
             for (int j = 0; j < root.getFieldVectors().size(); j++) {
-              assertEquals(expectedValues.get(i).get(j), root.getFieldVectors().get(j).getObject(i));
+              assertEquals(
+                  expectedValues.get(i).get(j), root.getFieldVectors().get(j).getObject(i));
             }
           }
         }
       }
     }
   }
-  
+
   // TODO test_dataset4 [UNSUPPORTED_ARROWTYPE] Unsupported arrow type FixedSizeList(128).
 }

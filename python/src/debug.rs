@@ -4,29 +4,29 @@
 use std::sync::Arc;
 
 use lance::{datatypes::Schema, Error};
-use lance_table::format::{DeletionFile, Fragment as LanceFragmentMetadata};
+use lance_table::format::{DeletionFile, Fragment};
 use pyo3::{exceptions::PyIOError, prelude::*};
 
-use crate::{Dataset, FragmentMetadata, RT};
+use crate::{utils::PyLance, Dataset, RT};
 
 /// Format the Lance schema of a dataset as a string.
 ///
 /// This can be used to view the field ids and types in the schema.
 #[pyfunction]
-pub fn format_schema(dataset: &PyAny) -> PyResult<String> {
+pub fn format_schema(dataset: &Bound<'_, PyAny>) -> PyResult<String> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let schema = dataset_ref.schema();
     Ok(format!("{:#?}", schema))
 }
 
 /// Print the full Lance manifest of the dataset.
 #[pyfunction]
-pub fn format_manifest(dataset: &PyAny) -> PyResult<String> {
+pub fn format_manifest(dataset: &Bound<'_, PyAny>) -> PyResult<String> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let manifest = dataset_ref.manifest();
     Ok(format!("{:#?}", manifest))
 }
@@ -53,7 +53,7 @@ struct PrettyPrintableDataFile {
 }
 
 impl PrettyPrintableFragment {
-    fn new(fragment: &LanceFragmentMetadata, schema: &Schema) -> Self {
+    fn new(fragment: &Fragment, schema: &Schema) -> Self {
         let files = fragment
             .files
             .iter()
@@ -81,18 +81,18 @@ impl PrettyPrintableFragment {
 
 /// Debug print a LanceFragment.
 #[pyfunction]
-pub fn format_fragment(fragment: &PyAny, dataset: &PyAny) -> PyResult<String> {
-    let py = fragment.py();
-    let fragment = fragment
-        .getattr("_metadata")?
-        .extract::<Py<FragmentMetadata>>()?;
+pub fn format_fragment(
+    fragment: PyLance<Fragment>,
+    dataset: &Bound<'_, PyAny>,
+) -> PyResult<String> {
+    let py = dataset.py();
+    let fragment = fragment.0;
 
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let dataset_ref = &dataset.as_ref(py).borrow().ds;
+    let dataset_ref = &dataset.bind(py).borrow().ds;
     let schema = dataset_ref.schema();
 
-    let meta = fragment.as_ref(py).borrow().inner.clone();
-    let pp_meta = PrettyPrintableFragment::new(&meta, schema);
+    let pp_meta = PrettyPrintableFragment::new(&fragment, schema);
     Ok(format!("{:#?}", pp_meta))
 }
 
@@ -104,12 +104,12 @@ pub fn format_fragment(fragment: &PyAny, dataset: &PyAny) -> PyResult<String> {
 #[pyfunction]
 #[pyo3(signature = (dataset, /, max_transactions = 10))]
 pub fn list_transactions(
-    dataset: &PyAny,
+    dataset: &Bound<'_, PyAny>,
     max_transactions: usize,
 ) -> PyResult<Vec<Option<String>>> {
     let py = dataset.py();
     let dataset = dataset.getattr("_ds")?.extract::<Py<Dataset>>()?;
-    let mut dataset = dataset.as_ref(py).borrow().ds.clone();
+    let mut dataset = dataset.bind(py).borrow().ds.clone();
 
     RT.block_on(Some(py), async move {
         let mut transactions = vec![];

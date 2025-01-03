@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::Schema;
+use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     datasource::empty::EmptyTable, execution::context::SessionContext, logical_expr::Expr,
 };
@@ -20,7 +20,7 @@ use datafusion_substrait::substrait::proto::{
     r#type::{Kind, Struct},
     read_rel::{NamedTable, ReadType},
     rel, Expression, ExtendedExpression, NamedStruct, Plan, PlanRel, ProjectRel, ReadRel, Rel,
-    RelRoot,
+    RelRoot, Type,
 };
 use lance_core::{Error, Result};
 use prost::Message;
@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Convert a DF Expr into a Substrait ExtendedExpressions message
-pub fn encode_substrait(expr: Expr, schema: Arc<Schema>) -> Result<Vec<u8>> {
+pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>> {
     use datafusion::logical_expr::{builder::LogicalTableSource, logical_plan, LogicalPlan};
     use datafusion_substrait::substrait::proto::{plan_rel, ExpressionReference, NamedStruct};
 
@@ -81,10 +81,17 @@ pub fn encode_substrait(expr: Expr, schema: Arc<Schema>) -> Result<Vec<u8>> {
     }
 }
 
+fn count_fields(dtype: &Type) -> usize {
+    match dtype.kind.as_ref().unwrap() {
+        Kind::Struct(struct_type) => struct_type.types.iter().map(count_fields).sum::<usize>() + 1,
+        _ => 1,
+    }
+}
+
 fn remove_extension_types(
     substrait_schema: &NamedStruct,
-    arrow_schema: Arc<Schema>,
-) -> Result<(NamedStruct, Arc<Schema>, HashMap<usize, usize>)> {
+    arrow_schema: Arc<ArrowSchema>,
+) -> Result<(NamedStruct, Arc<ArrowSchema>, HashMap<usize, usize>)> {
     let fields = substrait_schema.r#struct.as_ref().unwrap();
     if fields.types.len() != arrow_schema.fields.len() {
         return Err(Error::InvalidInput {
@@ -96,25 +103,35 @@ fn remove_extension_types(
     let mut kept_arrow_fields = Vec::with_capacity(arrow_schema.fields.len());
     let mut index_mapping = HashMap::with_capacity(arrow_schema.fields.len());
     let mut field_counter = 0;
-    for (field_index, (substrait_field, arrow_field)) in fields
-        .types
-        .iter()
-        .zip(arrow_schema.fields.iter())
-        .enumerate()
-    {
-        if !matches!(
-            substrait_field.kind.as_ref().unwrap(),
-            Kind::UserDefined(_) | Kind::UserDefinedTypeReference(_)
-        ) {
+    let mut field_index = 0;
+    // TODO: this logic doesn't catch user defined fields inside of struct fields
+    for (substrait_field, arrow_field) in fields.types.iter().zip(arrow_schema.fields.iter()) {
+        let num_fields = count_fields(substrait_field);
+
+        if !substrait_schema.names[field_index].starts_with("__unlikely_name_placeholder")
+            && !matches!(
+                substrait_field.kind.as_ref().unwrap(),
+                Kind::UserDefined(_) | Kind::UserDefinedTypeReference(_)
+            )
+        {
             kept_substrait_fields.push(substrait_field.clone());
             kept_arrow_fields.push(arrow_field.clone());
-            index_mapping.insert(field_index, field_counter);
-            field_counter += 1;
+            for i in 0..num_fields {
+                index_mapping.insert(field_index + i, field_counter + i);
+            }
+            field_counter += num_fields;
+        }
+        field_index += num_fields;
+    }
+    let mut names = vec![String::new(); index_mapping.len()];
+    for (old_idx, old_name) in substrait_schema.names.iter().enumerate() {
+        if let Some(new_idx) = index_mapping.get(&old_idx) {
+            names[*new_idx] = old_name.clone();
         }
     }
-    let new_arrow_schema = Arc::new(Schema::new(kept_arrow_fields));
+    let new_arrow_schema = Arc::new(ArrowSchema::new(kept_arrow_fields));
     let new_substrait_schema = NamedStruct {
-        names: vec![],
+        names,
         r#struct: Some(Struct {
             nullability: fields.nullability,
             type_variation_reference: fields.type_variation_reference,
@@ -241,7 +258,7 @@ fn remap_expr_references(expr: &mut Expression, mapping: &HashMap<usize, usize>)
 /// Convert a Substrait ExtendedExpressions message into a DF Expr
 ///
 /// The ExtendedExpressions message must contain a single scalar expression
-pub async fn parse_substrait(expr: &[u8], input_schema: Arc<Schema>) -> Result<Expr> {
+pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Result<Expr> {
     let envelope = ExtendedExpression::decode(expr)?;
     if envelope.referred_expr.is_empty() {
         return Err(Error::InvalidInput {

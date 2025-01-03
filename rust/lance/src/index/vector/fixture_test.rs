@@ -138,7 +138,7 @@ mod test {
             todo!("this method is for only IVF_HNSW_* index");
         }
 
-        fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
         }
 
@@ -233,6 +233,8 @@ mod test {
                 column: "test".to_string(),
                 key: Arc::new(Float32Array::from(query)),
                 k: 1,
+                lower_bound: None,
+                upper_bound: None,
                 nprobes: 1,
                 ef: None,
                 refine_factor: None,

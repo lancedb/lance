@@ -3,7 +3,7 @@
 
 //! Utilities for byte arrays
 
-use std::{ops::Deref, ptr::NonNull, sync::Arc};
+use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use snafu::{location, Location};
@@ -219,10 +219,29 @@ impl LanceBuffer {
         Self::Borrowed(Buffer::from_vec(vec))
     }
 
+    /// Reinterprets Arc<[T]> as a LanceBuffer
+    ///
+    /// This is similar to [`Self::reinterpret_vec`] but for Arc<[T]> instead of Vec<T>
+    ///
+    /// The same alignment constraints apply
+    pub fn reinterpret_slice<T: ArrowNativeType + RefUnwindSafe>(arc: Arc<[T]>) -> Self {
+        let slice = arc.as_ref();
+        let data = NonNull::new(slice.as_ptr() as _).unwrap_or(NonNull::dangling());
+        let len = std::mem::size_of_val(slice);
+        // SAFETY: the ptr will be valid for len items if the Arc<[T]> is valid
+        let buffer = unsafe { Buffer::from_custom_allocation(data, len, Arc::new(arc)) };
+        Self::Borrowed(buffer)
+    }
+
     /// Reinterprets a LanceBuffer into a Vec<T>
     ///
     /// If the underlying buffer is not properly aligned, this will involve a copy of the data
-    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> impl AsRef<[T]> {
+    ///
+    /// Note: doing this sort of re-interpretation generally makes assumptions about the endianness
+    /// of the data.  Lance does not support big-endian machines so this is safe.  However, if we end
+    /// up supporting big-endian machines in the future, then any use of this method will need to be
+    /// carefully reviewed.
+    pub fn borrow_to_typed_slice<T: ArrowNativeType>(&mut self) -> ScalarBuffer<T> {
         let align = std::mem::align_of::<T>();
         let is_aligned = self.as_ptr().align_offset(align) == 0;
         if self.len() % std::mem::size_of::<T>() != 0 {

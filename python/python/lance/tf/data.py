@@ -12,7 +12,6 @@ implementation for Lance.
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -25,6 +24,7 @@ from lance.dependencies import _check_for_numpy
 from lance.dependencies import numpy as np
 from lance.dependencies import tensorflow as tf
 from lance.fragment import FragmentMetadata, LanceFragment
+from lance.log import LOGGER
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -215,7 +215,7 @@ def from_lance(
                 ):
                     yield LanceFragment(dataset, int(f))
                 elif isinstance(f, FragmentMetadata):
-                    yield LanceFragment(dataset, f.fragment_id)
+                    yield LanceFragment(dataset, f.id)
                 elif isinstance(f, LanceFragment):
                     yield f
                 else:
@@ -231,7 +231,7 @@ def from_lance(
     if output_signature is None:
         schema = scanner.projected_schema
         output_signature = schema_to_spec(schema)
-    logging.debug("Output signature: %s", output_signature)
+    LOGGER.debug("Output signature: %s", output_signature)
 
     def generator():
         for batch in scanner.to_batches():
@@ -315,7 +315,7 @@ def lance_take_batches(
     dataset: Union[str, Path, LanceDataset],
     batch_ranges: Iterable[Tuple[int, int]],
     *,
-    columns: Optional[Union[List[str], Dict[str, str]]] = None,
+    columns: Optional[List[str]] = None,
     output_signature: Optional[Dict[str, tf.TypeSpec]] = None,
     batch_readahead: int = 10,
 ) -> tf.data.Dataset:
@@ -356,7 +356,7 @@ def lance_take_batches(
     if output_signature is None:
         schema = dataset.scanner(columns=columns).projected_schema
         output_signature = schema_to_spec(schema)
-    logging.debug("Output signature: %s", output_signature)
+    LOGGER.debug("Output signature: %s", output_signature)
 
     def gen_ranges():
         for start, end in batch_ranges:

@@ -11,22 +11,31 @@
  */
 package com.lancedb.lance;
 
-import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import com.lancedb.lance.schema.ColumnAlteration;
 
-import java.io.IOException;
-import java.net.URISyntaxException;
-import java.nio.file.Path;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.nio.channels.ClosedChannelException;
+import java.nio.file.Path;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static org.junit.jupiter.api.Assertions.*;
+
 public class DatasetTest {
-  @TempDir
-  static Path tempDir; // Temporary directory for the tests
+  @TempDir static Path tempDir; // Temporary directory for the tests
   private static Dataset dataset;
 
   @BeforeAll
@@ -75,9 +84,11 @@ public class DatasetTest {
   @Test
   void testOpenInvalidPath() {
     String validPath = tempDir.resolve("Invalid_dataset").toString();
-    assertThrows(RuntimeException.class, () -> {
-      dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
-    });
+    assertThrows(
+        RuntimeException.class,
+        () -> {
+          dataset = Dataset.open(validPath, new RootAllocator(Long.MAX_VALUE));
+        });
   }
 
   @Test
@@ -132,12 +143,26 @@ public class DatasetTest {
   }
 
   @Test
+  void testDatasetUri() {
+    String datasetPath = tempDir.resolve("dataset_uri").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      try (Dataset dataset = testDataset.createEmptyDataset()) {
+        assertEquals(datasetPath, dataset.uri());
+      }
+    }
+  }
+
+  @Test
   void testOpenNonExist() throws IOException, URISyntaxException {
     String datasetPath = tempDir.resolve("non_exist").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
-      assertThrows(IllegalArgumentException.class, () -> {
-        Dataset.open(datasetPath, allocator);
-      });
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> {
+            Dataset.open(datasetPath, allocator);
+          });
     }
   }
 
@@ -148,9 +173,11 @@ public class DatasetTest {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
-      assertThrows(IllegalArgumentException.class, () -> {
-        testDataset.createEmptyDataset();
-      });
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> {
+            testDataset.createEmptyDataset();
+          });
     }
   }
 
@@ -164,9 +191,11 @@ public class DatasetTest {
       try (Dataset dataset = testDataset.createEmptyDataset()) {
         assertEquals(1, dataset.version());
         assertEquals(1, dataset.latestVersion());
-        assertThrows(IllegalArgumentException.class, () -> {
-          testDataset.write(0, 5);
-        });
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              testDataset.write(0, 5);
+            });
       }
     }
   }
@@ -181,6 +210,150 @@ public class DatasetTest {
       Dataset dataset = testDataset.createEmptyDataset();
       dataset.close();
       assertThrows(RuntimeException.class, dataset::getSchema);
+    }
+  }
+
+  @Test
+  void testDropColumns() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(testDataset.getSchema(), dataset.getSchema());
+      dataset.dropColumns(Collections.singletonList("name"));
+
+      Schema changedSchema =
+          new Schema(
+              Collections.singletonList(Field.nullable("id", new ArrowType.Int(32, true))), null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+    }
+  }
+
+  @Test
+  void testAlterColumns() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      assertEquals(testDataset.getSchema(), dataset.getSchema());
+
+      ColumnAlteration nameColumnAlteration =
+          new ColumnAlteration.Builder("name")
+              .rename("new_name")
+              .nullable(true)
+              .castTo(new ArrowType.Utf8())
+              .build();
+
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
+
+      Schema changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.notNullable("new_name", new ArrowType.Utf8())),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      nameColumnAlteration =
+          new ColumnAlteration.Builder("new_name")
+              .rename("new_name_2")
+              .castTo(new ArrowType.LargeUtf8())
+              .build();
+
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
+      changedSchema =
+          new Schema(
+              Arrays.asList(
+                  Field.nullable("id", new ArrowType.Int(32, true)),
+                  Field.notNullable("new_name_2", new ArrowType.LargeUtf8())),
+              null);
+
+      assertEquals(changedSchema.getFields().size(), dataset.getSchema().getFields().size());
+      assertEquals(
+          changedSchema.getFields().stream().map(Field::getName).collect(Collectors.toList()),
+          dataset.getSchema().getFields().stream()
+              .map(Field::getName)
+              .collect(Collectors.toList()));
+
+      nameColumnAlteration = new ColumnAlteration.Builder("new_name_2").build();
+      dataset.alterColumns(Collections.singletonList(nameColumnAlteration));
+      assertNotNull(dataset.getSchema().findField("new_name_2"));
+    }
+  }
+
+  @Test
+  void testDropPath() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      Dataset.drop(datasetPath, new HashMap<>());
+    }
+  }
+
+  @Test
+  void testTake() throws IOException, ClosedChannelException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        List<Long> indices = Arrays.asList(1L, 4L);
+        List<String> columns = Arrays.asList("id", "name");
+        try (ArrowReader reader = dataset2.take(indices, columns)) {
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot result = reader.getVectorSchemaRoot();
+            assertNotNull(result);
+            assertEquals(indices.size(), result.getRowCount());
+
+            for (int i = 0; i < indices.size(); i++) {
+              assertEquals(indices.get(i).intValue(), result.getVector("id").getObject(i));
+              assertNotNull(result.getVector("name").getObject(i));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testCountRows() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        assertEquals(5, dataset2.countRows());
+        // get id = 3 and 4
+        assertEquals(2, dataset2.countRows("id > 2"));
+
+        assertThrows(IllegalArgumentException.class, () -> dataset2.countRows(null));
+        assertThrows(IllegalArgumentException.class, () -> dataset2.countRows(""));
+      }
     }
   }
 }

@@ -373,7 +373,7 @@ impl UpdateJob {
             None,
         );
 
-        let manifest = commit_transaction(
+        let (manifest, manifest_path) = commit_transaction(
             self.dataset.as_ref(),
             self.dataset.object_store(),
             self.dataset.commit_handler.as_ref(),
@@ -386,6 +386,7 @@ impl UpdateJob {
 
         let mut dataset = self.dataset.as_ref().clone();
         dataset.manifest = Arc::new(manifest);
+        dataset.manifest_file = manifest_path;
 
         Ok(Arc::new(dataset))
     }

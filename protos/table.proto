@@ -5,6 +5,7 @@ syntax = "proto3";
 
 package lance.table;
 
+import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "file.proto";
 
@@ -187,6 +188,12 @@ message IndexMetadata {
   /// 
   /// The bitmap is stored as a 32-bit Roaring bitmap.
   bytes fragment_bitmap = 5;
+
+  /// Details, specific to the index type, which are needed to load / interpret the index
+  ///
+  /// Indices should avoid putting large amounts of information in this field, as it will
+  /// bloat the manifest.
+  google.protobuf.Any index_details = 6;
 }
 
 // Index Section, containing a list of index metadata for one dataset version.
@@ -340,3 +347,18 @@ message ExternalFile {
   // The size of the data in the file.
   uint64 size = 3;
 }
+
+/// The following messages are used for the index_details field in IndexMetadata.
+///
+/// This is not an exhaustive set of index types and just lists the index types supported
+/// by a base distribution of Lance.
+
+// Currently these are all empty messages because all needed details are either hard-coded (e.g.
+// filenames) or stored in the index itself.  However, we may want to add more details in the
+// future, in particular we can add details that may be useful for planning queries (e.g. don't
+// force us to load the index until we know we need it)
+message BTreeIndexDetails {}
+message BitmapIndexDetails {}
+message LabelListIndexDetails {}
+message InvertedIndexDetails {}
+message VectorIndexDetails {}

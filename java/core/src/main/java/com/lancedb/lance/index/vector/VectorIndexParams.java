@@ -15,12 +15,12 @@
 package com.lancedb.lance.index.vector;
 
 import com.lancedb.lance.index.DistanceType;
-import java.util.Optional;
+
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
-/**
- * Parameters for creating a vector index.
- */
+import java.util.Optional;
+
+/** Parameters for creating a vector index. */
 public class VectorIndexParams {
   private final DistanceType distanceType;
   private final IvfBuildParams ivfParams;
@@ -66,27 +66,29 @@ public class VectorIndexParams {
    * Create a new IVF index with PQ quantizer.
    *
    * @param numPartitions the number of partitions of IVF (Inverted File Index)
-   * @param numBits maps the float vectors to integer vectors, each integer is of num_bits.
-   *                Now only 8 bits are supported
+   * @param numBits maps the float vectors to integer vectors, each integer is of num_bits. Now only
+   *     8 bits are supported
    * @param numSubVectors the number of sub-vectors for PQ (Product Quantization)
    * @param distanceType the distance type for calculating the distance between vectors
    * @param maxIterations K-means max iterations. This will run k-means clustering on each subvector
-   *                      to determine the centroids that will be used to quantize the subvectors.
+   *     to determine the centroids that will be used to quantize the subvectors.
    * @return the VectorIndexParams
    */
-  public static VectorIndexParams ivfPq(int numPartitions, int numBits, int numSubVectors,
-      DistanceType distanceType, int maxIterations) {
+  public static VectorIndexParams ivfPq(
+      int numPartitions,
+      int numBits,
+      int numSubVectors,
+      DistanceType distanceType,
+      int maxIterations) {
     IvfBuildParams ivfParams = new IvfBuildParams.Builder().setNumPartitions(numPartitions).build();
-    PQBuildParams pqParams = new PQBuildParams.Builder()
-        .setNumBits(numBits)
-        .setNumSubVectors(numSubVectors)
-        .setMaxIters(maxIterations)
-        .build();
+    PQBuildParams pqParams =
+        new PQBuildParams.Builder()
+            .setNumBits(numBits)
+            .setNumSubVectors(numSubVectors)
+            .setMaxIters(maxIterations)
+            .build();
 
-    return new Builder(ivfParams)
-        .setDistanceType(distanceType)
-        .setPqParams(pqParams)
-        .build();
+    return new Builder(ivfParams).setDistanceType(distanceType).setPqParams(pqParams).build();
   }
 
   /**
@@ -97,18 +99,14 @@ public class VectorIndexParams {
    * @param pq the PQ build parameters
    * @return the VectorIndexParams
    */
-  public static VectorIndexParams withIvfPqParams(DistanceType distanceType,
-      IvfBuildParams ivf,
-      PQBuildParams pq) {
-    return new Builder(ivf)
-        .setDistanceType(distanceType)
-        .setPqParams(pq)
-        .build();
+  public static VectorIndexParams withIvfPqParams(
+      DistanceType distanceType, IvfBuildParams ivf, PQBuildParams pq) {
+    return new Builder(ivf).setDistanceType(distanceType).setPqParams(pq).build();
   }
 
   /**
-   * Create a new IVF HNSW index with PQ quantizer.
-   * The dataset is partitioned into IVF partitions, and each partition builds an HNSW graph.
+   * Create a new IVF HNSW index with PQ quantizer. The dataset is partitioned into IVF partitions,
+   * and each partition builds an HNSW graph.
    *
    * @param distanceType the distance type for calculating the distance between vectors
    * @param ivf the IVF build parameters
@@ -116,10 +114,8 @@ public class VectorIndexParams {
    * @param pq the PQ build parameters
    * @return the VectorIndexParams
    */
-  public static VectorIndexParams withIvfHnswPqParams(DistanceType distanceType,
-      IvfBuildParams ivf,
-      HnswBuildParams hnsw,
-      PQBuildParams pq) {
+  public static VectorIndexParams withIvfHnswPqParams(
+      DistanceType distanceType, IvfBuildParams ivf, HnswBuildParams hnsw, PQBuildParams pq) {
     return new Builder(ivf)
         .setDistanceType(distanceType)
         .setHnswParams(hnsw)
@@ -128,8 +124,8 @@ public class VectorIndexParams {
   }
 
   /**
-   * Create a new IVF HNSW index with SQ quantizer.
-   * The dataset is partitioned into IVF partitions, and each partition builds an HNSW graph.
+   * Create a new IVF HNSW index with SQ quantizer. The dataset is partitioned into IVF partitions,
+   * and each partition builds an HNSW graph.
    *
    * @param distanceType the distance type for calculating the distance between vectors
    * @param ivf the IVF build parameters
@@ -137,10 +133,8 @@ public class VectorIndexParams {
    * @param sq the SQ build parameters
    * @return the VectorIndexParams
    */
-  public static VectorIndexParams withIvfHnswSqParams(DistanceType distanceType,
-      IvfBuildParams ivf,
-      HnswBuildParams hnsw,
-      SQBuildParams sq) {
+  public static VectorIndexParams withIvfHnswSqParams(
+      DistanceType distanceType, IvfBuildParams ivf, HnswBuildParams hnsw, SQBuildParams sq) {
     return new Builder(ivf)
         .setDistanceType(distanceType)
         .setHnswParams(hnsw)
@@ -183,8 +177,8 @@ public class VectorIndexParams {
     }
 
     /**
-     * @param hnswParams the HNSW build parameters for building the HNSW graph
-     *                   for each IVF partition
+     * @param hnswParams the HNSW build parameters for building the HNSW graph for each IVF
+     *     partition
      * @return Builder
      */
     public Builder setHnswParams(HnswBuildParams hnswParams) {
@@ -229,11 +223,11 @@ public class VectorIndexParams {
   @Override
   public String toString() {
     return new ToStringBuilder(this)
-      .append("distanceType", distanceType)
-      .append("ivfParams", ivfParams)
-      .append("pqParams", pqParams.orElse(null))
-      .append("hnswParams", hnswParams.orElse(null))
-      .append("sqParams", sqParams.orElse(null))
-      .toString();
+        .append("distanceType", distanceType)
+        .append("ivfParams", ivfParams)
+        .append("pqParams", pqParams.orElse(null))
+        .append("hnswParams", hnswParams.orElse(null))
+        .append("sqParams", sqParams.orElse(null))
+        .toString();
   }
 }

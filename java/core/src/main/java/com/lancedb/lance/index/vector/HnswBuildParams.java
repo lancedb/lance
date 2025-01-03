@@ -15,11 +15,12 @@
 package com.lancedb.lance.index.vector;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
+
 import java.util.Optional;
 
 /**
- * Parameters for building an HNSW index in each IVF partition.
- * This speeds up the search in a large dataset.
+ * Parameters for building an HNSW index in each IVF partition. This speeds up the search in a large
+ * dataset.
  */
 public class HnswBuildParams {
   private final short maxLevel;
@@ -41,11 +42,10 @@ public class HnswBuildParams {
     private Optional<Integer> prefetchDistance = Optional.of(2);
 
     /**
-     * Create a new builder for HNSW index parameters.
-     * Each IVF partition will be built with an HNSW index.
+     * Create a new builder for HNSW index parameters. Each IVF partition will be built with an HNSW
+     * index.
      */
-    public Builder() {
-    }
+    public Builder() {}
 
     /**
      * @param maxLevel the maximum number of levels in the graph

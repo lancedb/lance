@@ -15,29 +15,33 @@
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::traits::FromJString;
-use crate::utils::{extract_write_params, get_index_params};
+use crate::utils::{extract_storage_options, extract_write_params, get_index_params};
 use crate::{traits::IntoJava, RT};
 use arrow::array::RecordBatchReader;
 use arrow::datatypes::Schema;
 use arrow::ffi::FFI_ArrowSchema;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatchIterator;
+use arrow_schema::DataType;
 use jni::objects::{JMap, JString, JValue};
-use jni::sys::jlong;
 use jni::sys::{jboolean, jint};
+use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::transaction::Operation;
-use lance::dataset::{Dataset, ReadParams, WriteParams};
-use lance::io::ObjectStoreParams;
+use lance::dataset::{ColumnAlteration, Dataset, ProjectionRequest, ReadParams, WriteParams};
+use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
+use lance_core::datatypes::Schema as LanceSchema;
 use lance_index::DatasetIndexExt;
 use lance_index::{IndexParams, IndexType};
 use lance_io::object_store::ObjectStoreRegistry;
 use std::collections::HashMap;
 use std::iter::empty;
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub const NATIVE_DATASET: &str = "nativeDatasetHandle";
@@ -48,6 +52,23 @@ pub struct BlockingDataset {
 }
 
 impl BlockingDataset {
+    pub fn drop(uri: &str, storage_options: HashMap<String, String>) -> Result<()> {
+        RT.block_on(async move {
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let object_store_params = ObjectStoreParams {
+                storage_options: Some(storage_options.clone()),
+                ..Default::default()
+            };
+            let (object_store, path) =
+                ObjectStore::from_uri_and_params(registry, uri, &object_store_params)
+                    .await
+                    .map_err(|e| Error::io_error(e.to_string()))?;
+            object_store
+                .remove_dir_all(path)
+                .await
+                .map_err(|e| Error::io_error(e.to_string()))
+        })
+    }
     pub fn write(
         reader: impl RecordBatchReader + Send + 'static,
         uri: &str,
@@ -197,6 +218,20 @@ fn inner_create_with_ffi_schema<'local>(
         storage_options_obj,
         reader,
     )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_drop<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString<'local>,
+    storage_options_obj: JObject<'local>,
+) -> JObject<'local> {
+    let path_str = ok_or_throw!(env, path.extract(&mut env));
+    let storage_options =
+        ok_or_throw!(env, extract_storage_options(&mut env, &storage_options_obj));
+    ok_or_throw!(env, BlockingDataset::drop(&path_str, storage_options));
+    JObject::null()
 }
 
 #[no_mangle]
@@ -356,6 +391,73 @@ pub fn inner_commit_append<'local>(
         }
         Ok::<_, Error>(map)
     })?;
+    let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
+    dataset.into_java(env)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_commitOverwrite<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    path: JString,
+    arrow_schema_addr: jlong,
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment
+    storage_options_obj: JObject, // Map<String, String>
+) -> JObject<'local> {
+    ok_or_throw!(
+        env,
+        inner_commit_overwrite(
+            &mut env,
+            path,
+            arrow_schema_addr,
+            read_version_obj,
+            fragments_obj,
+            storage_options_obj
+        )
+    )
+}
+
+pub fn inner_commit_overwrite<'local>(
+    env: &mut JNIEnv<'local>,
+    path: JString,
+    arrow_schema_addr: jlong,
+    read_version_obj: JObject,    // Optional<Long>
+    fragments_obj: JObject,       // List<String>, String is json serialized Fragment)
+    storage_options_obj: JObject, // Map<String, String>
+) -> Result<JObject<'local>> {
+    let json_fragments = env.get_strings(&fragments_obj)?;
+    let mut fragments: Vec<Fragment> = Vec::new();
+    for json_fragment in json_fragments {
+        let fragment = Fragment::from_json(&json_fragment)?;
+        fragments.push(fragment);
+    }
+    let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
+    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
+    let arrow_schema = Schema::try_from(&c_schema)?;
+    let schema = LanceSchema::try_from(&arrow_schema)?;
+
+    let op = Operation::Overwrite {
+        fragments,
+        schema,
+        config_upsert_values: None,
+    };
+    let path_str = path.extract(env)?;
+    let read_version = env.get_u64_opt(&read_version_obj)?;
+    let jmap = JMap::from_env(env, &storage_options_obj)?;
+    let storage_options: HashMap<String, String> = env.with_local_frame(16, |env| {
+        let mut map = HashMap::new();
+        let mut iter = jmap.iter(env)?;
+        while let Some((key, value)) = iter.next(env)? {
+            let key_jstring = JString::from(key);
+            let value_jstring = JString::from(value);
+            let key_string: String = env.get_string(&key_jstring)?.into();
+            let value_string: String = env.get_string(&value_jstring)?.into();
+            map.insert(key_string, value_string);
+        }
+        Ok::<_, Error>(map)
+    })?;
+
     let dataset = BlockingDataset::commit(&path_str, op, read_version, storage_options)?;
     dataset.into_java(env)
 }
@@ -549,6 +651,29 @@ fn inner_import_ffi_schema(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeUri<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JString<'local> {
+    ok_or_throw_with_return!(
+        env,
+        inner_uri(&mut env, java_dataset).map_err(|err| Error::input_error(err.to_string())),
+        JString::from(JObject::null())
+    )
+}
+
+fn inner_uri<'local>(env: &mut JNIEnv<'local>, java_dataset: JObject) -> Result<JString<'local>> {
+    let uri = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.inner.uri().to_string()
+    };
+
+    let jstring_uri = env.new_string(uri)?;
+    Ok(jstring_uri)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeVersion(
     mut env: JNIEnv,
     java_dataset: JObject,
@@ -580,14 +705,24 @@ fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> 
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
-) -> jint {
-    ok_or_throw_with_return!(env, inner_count_rows(&mut env, java_dataset), -1) as jint
+    filter_jobj: JObject, // Optional<String>
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        inner_count_rows(&mut env, java_dataset, filter_jobj),
+        -1
+    ) as jlong
 }
 
-fn inner_count_rows(env: &mut JNIEnv, java_dataset: JObject) -> Result<usize> {
+fn inner_count_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    filter_jobj: JObject,
+) -> Result<usize> {
+    let filter = env.get_string_opt(&filter_jobj)?;
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.count_rows(None)
+    dataset_guard.count_rows(filter)
 }
 
 #[no_mangle]
@@ -625,4 +760,187 @@ fn inner_list_indexes<'local>(
     }
 
     Ok(array_list)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeTake(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    indices_obj: JObject, // List<Long>
+    columns_obj: JObject, // List<String>
+) -> jbyteArray {
+    match inner_take(&mut env, java_dataset, indices_obj, columns_obj) {
+        Ok(byte_array) => byte_array,
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{:?}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn inner_take(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    indices_obj: JObject, // List<Long>
+    columns_obj: JObject, // List<String>
+) -> Result<jbyteArray> {
+    let indices: Vec<i64> = env.get_longs(&indices_obj)?;
+    let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
+    let indices_slice: &[u64] = &indices_u64;
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+
+    let result = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset = &dataset_guard.inner;
+
+        let projection = ProjectionRequest::from_columns(columns, dataset.schema());
+
+        match RT.block_on(dataset.take(indices_slice, projection)) {
+            Ok(res) => res,
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    };
+
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, &result.schema())?;
+        writer.write(&result)?;
+        writer.finish()?;
+    }
+
+    let byte_array = env.byte_array_from_slice(&buffer)?;
+    Ok(**byte_array)
+}
+
+//////////////////////////////
+// Schema evolution Methods //
+//////////////////////////////
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDropColumns(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    columns_obj: JObject, // List<String>
+) {
+    ok_or_throw_without_return!(env, inner_drop_columns(&mut env, java_dataset, columns_obj))
+}
+
+fn inner_drop_columns(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    columns_obj: JObject, // List<String>
+) -> Result<()> {
+    let columns: Vec<String> = env.get_strings(&columns_obj)?;
+    let columns_slice: Vec<&str> = columns.iter().map(AsRef::as_ref).collect();
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.drop_columns(&columns_slice))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAlterColumns(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    column_alterations_obj: JObject, // List<ColumnAlteration>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_alter_columns(&mut env, java_dataset, column_alterations_obj)
+    )
+}
+
+fn create_column_alteration(
+    env: &mut JNIEnv,
+    column_alteration_jobj: JObject, // ColumnAlteration
+) -> Result<ColumnAlteration> {
+    let path_obj = env
+        .get_field(&column_alteration_jobj, "path", "Ljava/lang/String;")?
+        .l()?;
+    let path_jstring: JString = path_obj.into();
+    let path: String = env.get_string(&path_jstring)?.into();
+
+    let rename_obj = env
+        .get_field(&column_alteration_jobj, "rename", "Ljava/util/Optional;")?
+        .l()?;
+    let rename = if env.call_method(&rename_obj, "isPresent", "()Z", &[])?.z()? {
+        let jstring: JObject = env
+            .call_method(rename_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let jstring: JString = jstring.into();
+        let rename_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
+        Some(rename_str)
+    } else {
+        None
+    };
+
+    let nullable_obj = env
+        .get_field(&column_alteration_jobj, "nullable", "Ljava/util/Optional;")?
+        .l()?;
+    let nullable = if env
+        .call_method(&nullable_obj, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let nullable_value = env
+            .call_method(nullable_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        Some(
+            env.call_method(nullable_value, "booleanValue", "()Z", &[])?
+                .z()?,
+        )
+    } else {
+        None
+    };
+
+    let data_type_obj = env
+        .get_field(&column_alteration_jobj, "dataType", "Ljava/util/Optional;")?
+        .l()?;
+    let data_type = if env
+        .call_method(&data_type_obj, "isPresent", "()Z", &[])?
+        .z()?
+    {
+        let j_data_type: JObject = env
+            .call_method(data_type_obj, "get", "()Ljava/lang/Object;", &[])?
+            .l()?;
+        let jstring: JString = env
+            .call_method(j_data_type, "toString", "()Ljava/lang/String;", &[])?
+            .l()?
+            .into();
+        let data_type_str: String = env.get_string(&jstring)?.into(); // Intermediate variable
+        DataType::from_str(&data_type_str)
+            .map_err(|e| Error::input_error(e.to_string()))
+            .ok()
+    } else {
+        None
+    };
+
+    Ok(ColumnAlteration {
+        path,
+        rename,
+        nullable,
+        data_type,
+    })
+}
+
+fn inner_alter_columns(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    column_alterations_obj: JObject, // List<ColumnAlteration>
+) -> Result<()> {
+    let list = env.get_list(&column_alterations_obj)?;
+    let mut iter = list.iter(env)?;
+    let mut column_alterations = Vec::new();
+
+    while let Some(elem) = iter.next(env)? {
+        let alteration = create_column_alteration(env, elem)?;
+        column_alterations.push(alteration);
+    }
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
+    Ok(())
 }

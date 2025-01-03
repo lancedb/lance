@@ -16,16 +16,16 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
-import java.util.Arrays;
+
 import org.apache.arrow.util.Preconditions;
 
-/**
- * Dataset format.
- * Matching to Lance Rust FileFragment.
- */
+import java.util.Arrays;
+
+/** Dataset format. Matching to Lance Rust FileFragment. */
 public class DatasetFragment {
   /** Pointer to the {@link Dataset} instance in Java. */
   private final Dataset dataset;
+
   private final FragmentMetadata metadata;
 
   /** Private constructor, calling from JNI. */
@@ -42,8 +42,10 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public LanceScanner newScan() {
-    return LanceScanner.create(dataset, new ScanOptions.Builder()
-        .fragmentIds(Arrays.asList(metadata.getId())).build(), dataset.allocator);
+    return LanceScanner.create(
+        dataset,
+        new ScanOptions.Builder().fragmentIds(Arrays.asList(metadata.getId())).build(),
+        dataset.allocator);
   }
 
   /**
@@ -53,9 +55,12 @@ public class DatasetFragment {
    * @return a dataset scanner
    */
   public LanceScanner newScan(long batchSize) {
-    return LanceScanner.create(dataset,
+    return LanceScanner.create(
+        dataset,
         new ScanOptions.Builder()
-            .fragmentIds(Arrays.asList(metadata.getId())).batchSize(batchSize).build(),
+            .fragmentIds(Arrays.asList(metadata.getId()))
+            .batchSize(batchSize)
+            .build(),
         dataset.allocator);
   }
 
@@ -67,7 +72,8 @@ public class DatasetFragment {
    */
   public LanceScanner newScan(ScanOptions options) {
     Preconditions.checkNotNull(options);
-    return LanceScanner.create(dataset,
+    return LanceScanner.create(
+        dataset,
         new ScanOptions.Builder(options).fragmentIds(Arrays.asList(metadata.getId())).build(),
         dataset.allocator);
   }
@@ -78,9 +84,7 @@ public class DatasetFragment {
     return metadata.getId();
   }
 
-  /**
-   * @return row counts in this Fragment
-   */
+  /** @return row counts in this Fragment */
   public int countRows() {
     return countRowsNative(dataset, metadata.getId());
   }

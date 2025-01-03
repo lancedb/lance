@@ -171,7 +171,7 @@ impl<'a> CleanupTask<'a> {
         // ignore it then we might delete valid data files thinking they are not
         // referenced.
 
-        let manifest = read_manifest(&self.dataset.object_store, &path).await?;
+        let manifest = read_manifest(&self.dataset.object_store, &path, None).await?;
         let dataset_version = self.dataset.version().version;
 
         // Don't delete the latest version, even if it is old. Don't delete tagged versions,
@@ -474,6 +474,7 @@ mod tests {
         ObjectStore, ObjectStoreParams, ObjectStoreRegistry, WrappingObjectStore,
     };
     use lance_linalg::distance::MetricType;
+    use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
     use snafu::{location, Location};
 
@@ -585,6 +586,7 @@ mod tests {
                 &self.dataset_path,
                 Some(WriteParams {
                     store_params: Some(self.os_params()),
+                    commit_handler: Some(Arc::new(RenameCommitHandler)),
                     mode,
                     ..Default::default()
                 }),

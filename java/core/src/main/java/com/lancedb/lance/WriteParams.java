@@ -20,14 +20,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
-/**
- * Write Params for Write Operations of Lance.
- */
+/** Write Params for Write Operations of Lance. */
 public class WriteParams {
 
-  /**
-   * Write Mode.
-   */
+  /** Write Mode. */
   public enum WriteMode {
     CREATE,
     APPEND,
@@ -40,8 +36,11 @@ public class WriteParams {
   private final Optional<WriteMode> mode;
   private Map<String, String> storageOptions = new HashMap<>();
 
-  private WriteParams(Optional<Integer> maxRowsPerFile, Optional<Integer> maxRowsPerGroup,
-      Optional<Long> maxBytesPerFile, Optional<WriteMode> mode,
+  private WriteParams(
+      Optional<Integer> maxRowsPerFile,
+      Optional<Integer> maxRowsPerGroup,
+      Optional<Long> maxBytesPerFile,
+      Optional<WriteMode> mode,
       Map<String, String> storageOptions) {
     this.maxRowsPerFile = maxRowsPerFile;
     this.maxRowsPerGroup = maxRowsPerGroup;
@@ -64,6 +63,7 @@ public class WriteParams {
 
   /**
    * Get Mode with name.
+   *
    * @return mode
    */
   public Optional<String> getMode() {
@@ -84,9 +84,7 @@ public class WriteParams {
         .toString();
   }
 
-  /**
-   * A builder of WriteParams.
-   */
+  /** A builder of WriteParams. */
   public static class Builder {
     private Optional<Integer> maxRowsPerFile = Optional.empty();
     private Optional<Integer> maxRowsPerGroup = Optional.empty();
@@ -120,8 +118,8 @@ public class WriteParams {
     }
 
     public WriteParams build() {
-      return new WriteParams(maxRowsPerFile, maxRowsPerGroup, maxBytesPerFile, mode,
-              storageOptions);
+      return new WriteParams(
+          maxRowsPerFile, maxRowsPerGroup, maxBytesPerFile, mode, storageOptions);
     }
   }
 }

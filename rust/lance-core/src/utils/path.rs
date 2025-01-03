@@ -11,7 +11,7 @@ impl LancePathExt for Path {
     fn child_path(&self, path: &Path) -> Path {
         let mut new_path = self.clone();
         for part in path.parts() {
-            new_path = path.child(part);
+            new_path = new_path.child(part);
         }
         new_path
     }

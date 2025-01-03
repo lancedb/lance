@@ -21,6 +21,12 @@ pub mod statistics;
 pub mod testing;
 pub mod version;
 
+// We can definitely add support for big-endian machines someday.  However, it's not a priority and
+// would involve extensive testing (probably through emulation) to ensure that the encodings are
+// correct.
+#[cfg(not(target_endian = "little"))]
+compile_error!("Lance encodings only support little-endian systems.");
+
 /// A trait for an I/O service
 ///
 /// This represents the I/O API that the encoders and decoders need in order to operate.

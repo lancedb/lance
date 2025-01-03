@@ -26,7 +26,9 @@ use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{parse_url_opts, ClientOptions, DynObjectStore, StaticCredentialProvider};
+use object_store::{
+    parse_url_opts, ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider,
+};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
 use snafu::{location, Location};
@@ -58,20 +60,20 @@ pub trait ObjectStoreExt {
     /// Read all files (start from base directory) recursively
     ///
     /// unmodified_since can be specified to only return files that have not been modified since the given time.
-    async fn read_dir_all(
-        &self,
+    async fn read_dir_all<'a>(
+        &'a self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>>;
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>>;
 }
 
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
-    async fn read_dir_all(
-        &self,
+    async fn read_dir_all<'a>(
+        &'a self,
         dir_path: impl Into<&Path> + Send,
         unmodified_since: Option<DateTime<Utc>>,
-    ) -> Result<BoxStream<Result<ObjectMeta>>> {
+    ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
         let mut output = self.list(Some(dir_path.into()));
         if let Some(unmodified_since_val) = unmodified_since {
             output = output
@@ -400,6 +402,23 @@ impl ObjectStore {
         uri: &str,
         params: &ObjectStoreParams,
     ) -> Result<(Self, Path)> {
+        if let Some((store, path)) = params.object_store.as_ref() {
+            let mut inner = store.clone();
+            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                inner = wrapper.wrap(inner);
+            }
+            let store = Self {
+                inner,
+                scheme: path.scheme().to_string(),
+                block_size: params.block_size.unwrap_or(64 * 1024),
+                use_constant_size_upload_parts: params.use_constant_size_upload_parts,
+                list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
+                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
+            };
+            let path = Path::from(path.path());
+            return Ok((store, path));
+        }
         let (object_store, path) = match Url::parse(uri) {
             Ok(url) if url.scheme().len() == 1 && cfg!(windows) => {
                 // On Windows, the drive is parsed as a scheme
@@ -635,7 +654,7 @@ impl ObjectStore {
     pub fn remove_stream<'a>(
         &'a self,
         locations: BoxStream<'a, Result<Path>>,
-    ) -> BoxStream<Result<Path>> {
+    ) -> BoxStream<'a, Result<Path>> {
         self.inner
             .delete_stream(locations.err_into::<ObjectStoreError>().boxed())
             .err_into::<Error>()
@@ -770,6 +789,24 @@ impl StorageOptions {
             .unwrap_or(3)
     }
 
+    /// Max retry times to set in RetryConfig for s3 client
+    pub fn client_max_retries(&self) -> usize {
+        self.0
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == "client_max_retries")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(10)
+    }
+
+    /// Seconds of timeout to set in RetryConfig for s3 client
+    pub fn client_retry_timeout(&self) -> u64 {
+        self.0
+            .iter()
+            .find(|(key, _)| key.to_ascii_lowercase() == "client_retry_timeout")
+            .and_then(|(_, value)| value.parse::<u64>().ok())
+            .unwrap_or(180)
+    }
+
     /// Subset of options relevant for azure storage
     pub fn as_azure_options(&self) -> HashMap<AzureConfigKey, String> {
         self.0
@@ -833,6 +870,13 @@ async fn configure_store(
             //     });
             // }
 
+            let max_retries = storage_options.client_max_retries();
+            let retry_timeout = storage_options.client_retry_timeout();
+            let retry_config = RetryConfig {
+                backoff: Default::default(),
+                max_retries,
+                retry_timeout: Duration::from_secs(retry_timeout),
+            };
             let storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
@@ -865,11 +909,12 @@ async fn configure_store(
             builder = builder
                 .with_url(url.as_ref())
                 .with_credentials(aws_creds)
+                .with_retry(retry_config)
                 .with_region(region);
             let store = builder.build()?;
 
             Ok(ObjectStore {
-                inner: Arc::new(store),
+                inner: Arc::new(store).traced(),
                 scheme: String::from(url.scheme()),
                 block_size: 64 * 1024,
                 use_constant_size_upload_parts,
@@ -885,7 +930,7 @@ async fn configure_store(
                 builder = builder.with_config(key, value);
             }
             let store = builder.build()?;
-            let store = Arc::new(store);
+            let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
                 inner: store,
@@ -900,7 +945,7 @@ async fn configure_store(
         "az" => {
             storage_options.with_env_azure();
             let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
-            let store = Arc::new(store);
+            let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
                 inner: store,

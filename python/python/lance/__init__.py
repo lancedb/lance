@@ -3,19 +3,25 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, Optional, Union
 
+from . import log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
+    DataStatistics,
+    FieldStatistics,
     LanceDataset,
     LanceOperation,
     LanceScanner,
     MergeInsertBuilder,
+    Transaction,
     __version__,
     batch_udf,
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import bytes_read_counter, iops_counter
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -32,18 +38,24 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "DataStatistics",
+    "FieldStatistics",
     "FragmentMetadata",
     "LanceDataset",
     "LanceFragment",
     "LanceOperation",
     "LanceScanner",
     "MergeInsertBuilder",
+    "Transaction",
     "__version__",
+    "bytes_read_counter",
+    "iops_counter",
     "write_dataset",
     "schema_to_json",
     "json_to_schema",
     "dataset",
     "batch_udf",
+    "set_logger",
 ]
 
 
@@ -63,7 +75,8 @@ def dataset(
     Parameters
     ----------
     uri : str
-        Address to the Lance dataset.
+        Address to the Lance dataset. It can be a local file path `/tmp/data.lance`,
+        or a cloud object store URI, i.e., `s3://bucket/data.lance`.
     version : optional, int | str
         If specified, load a specific version of the Lance dataset. Else, loads the
         latest version. A version number (`int`) or a tag (`str`) can be provided.
@@ -72,10 +85,9 @@ def dataset(
         argument value. If a version is already specified, this arg is ignored.
     block_size : optional, int
         Block size in bytes. Provide a hint for the size of the minimal I/O request.
-    commit_handler : optional, CommitLock
-        If specified, use the provided commit handler to lock the table while
-        committing a new version. Not necessary on object stores other than S3
-        or when there are no concurrent writers.
+    commit_lock : optional, lance.commit.CommitLock
+        A custom commit lock.  Only needed if your object store does not support
+        atomic commits.  See the user guide for more details.
     index_cache_size : optional, int
         Index cache size. Index cache is a LRU cache with TTL. This number specifies the
         number of index pages, for example, IVF partitions, to be cached in
@@ -131,3 +143,13 @@ def dataset(
             )
     else:
         return ds
+
+
+def set_logger(
+    file_path="pylance.log",
+    name="pylance",
+    level=logging.INFO,
+    format_string=None,
+    log_handler=None,
+):
+    log.set_logger(file_path, name, level, format_string, log_handler)

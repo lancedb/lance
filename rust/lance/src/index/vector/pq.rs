@@ -5,30 +5,30 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
-use arrow_array::UInt32Array;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_array::{Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::DataType;
 use arrow_select::take::take;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
-use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::pq::storage::ProductQuantizationStorage;
+use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
-    vector::{pq::ProductQuantizer, Query, DIST_COL},
+    vector::{pq::ProductQuantizer, Query},
     Index, IndexType,
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
 use lance_linalg::distance::{DistanceType, MetricType};
-use log::info;
+use log::{info, warn};
 use roaring::RoaringBitmap;
 use serde_json::json;
 use snafu::{location, Location};
@@ -41,6 +41,7 @@ use lance_linalg::kernels::normalize_fsl;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
+use crate::io::exec::knn::KNN_INDEX_SCHEMA;
 use crate::{arrow::*, Dataset};
 use crate::{Error, Result};
 
@@ -52,6 +53,8 @@ pub struct PQIndex {
     pub pq: ProductQuantizer,
 
     /// PQ code
+    /// the PQ codes are stored in a transposed way,
+    /// call `Self::get_pq_codes` to get the PQ code for a specific vector.
     pub code: Option<Arc<UInt8Array>>,
 
     /// ROW Id used to refer to the actual row in dataset.
@@ -105,21 +108,42 @@ impl PQIndex {
         pre_filter: &dyn PreFilter,
         code: Arc<UInt8Array>,
         row_ids: Arc<UInt64Array>,
-        num_sub_vectors: i32,
+        _num_sub_vectors: i32,
     ) -> Result<(Arc<UInt8Array>, Arc<UInt64Array>)> {
+        let num_vectors = row_ids.len();
+        if num_vectors == 0 {
+            warn!("Filtering on empty PQ code array");
+            return Ok((code, row_ids));
+        }
         let indices_to_keep = pre_filter.filter_row_ids(Box::new(row_ids.values().iter()));
         let indices_to_keep = UInt64Array::from(indices_to_keep);
 
         let row_ids = take(row_ids.as_ref(), &indices_to_keep, None)?;
         let row_ids = Arc::new(as_primitive_array(&row_ids).clone());
 
-        let code = FixedSizeListArray::try_new_from_values(code.as_ref().clone(), num_sub_vectors)
-            .unwrap();
-        let code = take(&code, &indices_to_keep, None)?;
-        let code = as_fixed_size_list_array(&code).values().clone();
-        let code = Arc::new(as_primitive_array(&code).clone());
+        let code = code
+            .values()
+            .chunks_exact(num_vectors)
+            .flat_map(|c| {
+                let mut filtered = Vec::with_capacity(indices_to_keep.len());
+                for idx in indices_to_keep.values() {
+                    filtered.push(c[*idx as usize]);
+                }
+                filtered
+            })
+            .collect();
 
-        Ok((code, row_ids))
+        Ok((Arc::new(code), row_ids))
+    }
+
+    fn get_pq_codes(transposed_codes: &UInt8Array, vec_idx: usize, num_vectors: usize) -> Vec<u8> {
+        transposed_codes
+            .values()
+            .iter()
+            .skip(vec_idx)
+            .step_by(num_vectors)
+            .cloned()
+            .collect()
     }
 }
 
@@ -203,15 +227,42 @@ impl VectorIndex for PQIndex {
             debug_assert_eq!(distances.len(), row_ids.len());
 
             let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-            let indices = sort_to_indices(&distances, None, Some(limit))?;
-            let distances = take(&distances, &indices, None)?;
-            let row_ids = take(row_ids.as_ref(), &indices, None)?;
+            if query.lower_bound.is_none() && query.upper_bound.is_none() {
+                let indices = sort_to_indices(&distances, None, Some(limit))?;
+                let distances = take(&distances, &indices, None)?;
+                let row_ids = take(row_ids.as_ref(), &indices, None)?;
+                Ok(RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![distances, row_ids],
+                )?)
+            } else {
+                let indices = sort_to_indices(&distances, None, None)?;
+                let mut dists = Vec::with_capacity(limit);
+                let mut ids = Vec::with_capacity(limit);
+                for idx in indices.values().iter() {
+                    let dist = distances.value(*idx as usize);
+                    let id = row_ids.value(*idx as usize);
+                    if query.lower_bound.map_or(false, |lb| dist < lb) {
+                        continue;
+                    }
+                    if query.upper_bound.map_or(false, |ub| dist >= ub) {
+                        break;
+                    }
 
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new(DIST_COL, DataType::Float32, true),
-                ROW_ID_FIELD.clone(),
-            ]));
-            Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+                    dists.push(dist);
+                    ids.push(id);
+
+                    if dists.len() >= limit {
+                        break;
+                    }
+                }
+                let dists = Arc::new(Float32Array::from(dists));
+                let ids = Arc::new(UInt64Array::from(ids));
+                Ok(RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![dists, ids],
+                )?)
+            }
         })
         .await
     }
@@ -245,7 +296,7 @@ impl VectorIndex for PQIndex {
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
         let pq_code_length = self.pq.code_dim() * length;
-        let pq_code = read_fixed_stride_array(
+        let pq_codes = read_fixed_stride_array(
             reader.as_ref(),
             &DataType::UInt8,
             offset,
@@ -264,8 +315,14 @@ impl VectorIndex for PQIndex {
         )
         .await?;
 
+        let pq_codes = transpose(
+            pq_codes.as_primitive(),
+            row_ids.len(),
+            self.pq.num_sub_vectors,
+        );
+
         Ok(Box::new(Self {
-            code: Some(Arc::new(pq_code.as_primitive().clone())),
+            code: Some(Arc::new(pq_codes)),
             row_ids: Some(Arc::new(row_ids.as_primitive().clone())),
             pq: self.pq.clone(),
             metric_type: self.metric_type,
@@ -280,30 +337,37 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
-        let code = self
-            .code
-            .as_ref()
-            .unwrap()
-            .values()
-            .chunks_exact(self.pq.code_dim());
+    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+        let num_vectors = self.row_ids.as_ref().unwrap().len();
         let row_ids = self.row_ids.as_ref().unwrap().values().iter();
+        let transposed_codes = self.code.as_ref().unwrap();
         let remapped = row_ids
-            .zip(code)
-            .filter_map(|(old_row_id, code)| {
+            .enumerate()
+            .filter_map(|(vec_idx, old_row_id)| {
                 let new_row_id = mapping.get(old_row_id).cloned();
                 // If the row id is not in the mapping then this row is not remapped and we keep as is
                 let new_row_id = new_row_id.unwrap_or(Some(*old_row_id));
-                new_row_id.map(|new_row_id| (new_row_id, code))
+                new_row_id.map(|new_row_id| {
+                    (
+                        new_row_id,
+                        Self::get_pq_codes(transposed_codes, vec_idx, num_vectors),
+                    )
+                })
             })
             .collect::<Vec<_>>();
 
         self.row_ids = Some(Arc::new(UInt64Array::from_iter_values(
             remapped.iter().map(|(row_id, _)| *row_id),
         )));
-        self.code = Some(Arc::new(UInt8Array::from_iter_values(
-            remapped.into_iter().flat_map(|(_, code)| code).copied(),
-        )));
+
+        let pq_codes =
+            UInt8Array::from_iter_values(remapped.into_iter().flat_map(|(_, code)| code));
+        let transposed_codes = transpose(
+            &pq_codes,
+            self.row_ids.as_ref().unwrap().len(),
+            self.pq.num_sub_vectors,
+        );
+        self.code = Some(Arc::new(transposed_codes));
         Ok(())
     }
 
@@ -448,6 +512,7 @@ pub(crate) fn build_pq_storage(
         pq.code_dim(),
         pq.dimension,
         distance_type,
+        false,
     )?;
 
     Ok(pq_store)
@@ -455,14 +520,18 @@ pub(crate) fn build_pq_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::vector::ivf::build_ivf_model;
+
+    use std::ops::Range;
+
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
     use arrow_schema::{Field, Schema};
+    use tempfile::tempdir;
+
+    use crate::index::vector::ivf::build_ivf_model;
+    use lance_core::utils::mask::RowIdMask;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_testing::datagen::generate_random_array_with_range;
-    use std::ops::Range;
-    use tempfile::tempdir;
 
     const DIM: usize = 128;
     async fn generate_dataset(
@@ -584,5 +653,48 @@ mod tests {
             "distances: {:?}",
             distances
         );
+    }
+
+    struct TestPreFilter {
+        row_ids: Vec<u64>,
+    }
+
+    impl TestPreFilter {
+        fn new(row_ids: Vec<u64>) -> Self {
+            Self { row_ids }
+        }
+    }
+
+    #[async_trait]
+    impl PreFilter for TestPreFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            self.row_ids.is_empty()
+        }
+
+        fn mask(&self) -> Arc<RowIdMask> {
+            RowIdMask::all_rows().into()
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            row_ids
+                .filter(|&row_id| self.row_ids.contains(row_id))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn test_filter_on_empty_pq_code() {
+        let pre_filter = TestPreFilter::new(vec![1, 3, 5, 7, 9]);
+        let code = Arc::new(UInt8Array::from(Vec::<u8>::new()));
+        let row_ids = Arc::new(UInt64Array::from(Vec::<u64>::new()));
+
+        let (code, row_ids) = PQIndex::filter_arrays(&pre_filter, code, row_ids, 16).unwrap();
+        assert!(code.values().is_empty());
+        assert!(row_ids.is_empty());
     }
 }

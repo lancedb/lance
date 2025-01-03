@@ -14,6 +14,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use lance_core::{
     cache::{CapacityMode, FileMetadataCache},
+    utils::bit::pad_bytes,
     Result,
 };
 use lance_datagen::{array, gen, ArrayGenerator, RowCount, Seed};
@@ -26,7 +27,7 @@ use crate::{
     },
     encoder::{
         default_encoding_strategy, ColumnIndexSequence, EncodedColumn, EncodedPage,
-        EncodingOptions, FieldEncoder, OutOfLineBuffers,
+        EncodingOptions, FieldEncoder, OutOfLineBuffers, MIN_PAGE_BUFFER_ALIGNMENT,
     },
     repdef::RepDefBuilder,
     version::LanceFileVersion,
@@ -34,6 +35,7 @@ use crate::{
 };
 
 const MAX_PAGE_BYTES: u64 = 32 * 1024 * 1024;
+const TEST_ALIGNMENT: usize = MIN_PAGE_BUFFER_ALIGNMENT as usize;
 
 #[derive(Debug)]
 pub(crate) struct SimulatedScheduler {
@@ -206,6 +208,14 @@ async fn test_decode(
             let expected_size = (batch_size as usize).min(expected.len() - offset);
             let expected = expected.slice(offset, expected_size);
             assert_eq!(expected.data_type(), actual.data_type());
+            if expected.len() != actual.len() {
+                panic!(
+                    "Mismatch in length (at offset={}) expected {} but got {}",
+                    offset,
+                    expected.len(),
+                    actual.len()
+                );
+            }
             if &expected != actual {
                 if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
                 {
@@ -214,8 +224,9 @@ async fn test_decode(
                     for i in 0..expected.len() {
                         if !matches!(comparator(i, i), Ordering::Equal) {
                             panic!(
-                            "Mismatch at index {} expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
+                            "Mismatch at index {} (offset={}) expected {:?} but got {:?} first mismatch is expected {:?} but got {:?}",
                             i,
+                            offset,
                             expected,
                             actual,
                             expected.slice(i, 1),
@@ -277,7 +288,7 @@ pub async fn check_round_trip_encoding_generated(
                 max_page_bytes: MAX_PAGE_BYTES,
                 cache_bytes_per_column: page_size,
                 keep_original_array: true,
-                buffer_alignment: 64,
+                buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
             };
             encoding_strategy
                 .create_field_encoder(
@@ -410,7 +421,7 @@ pub async fn check_round_trip_encoding_of_data(
             cache_bytes_per_column: *page_size,
             max_page_bytes: test_cases.get_max_page_size(),
             keep_original_array: true,
-            buffer_alignment: 64,
+            buffer_alignment: MIN_PAGE_BUFFER_ALIGNMENT,
         };
         let encoder = encoding_strategy
             .create_field_encoder(
@@ -443,11 +454,17 @@ impl SimulatedWriter {
         let offset = self.encoded_data.len() as u64;
         self.encoded_data.extend_from_slice(&buffer);
         let size = self.encoded_data.len() as u64 - offset;
+        let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
+        self.encoded_data
+            .extend(std::iter::repeat(0).take(pad_bytes));
         (offset, size)
     }
 
     fn write_lance_buffer(&mut self, buffer: LanceBuffer) {
         self.encoded_data.extend_from_slice(&buffer);
+        let pad_bytes = pad_bytes::<TEST_ALIGNMENT>(self.encoded_data.len());
+        self.encoded_data
+            .extend(std::iter::repeat(0).take(pad_bytes));
     }
 
     fn write_page(&mut self, encoded_page: EncodedPage) {
@@ -471,7 +488,7 @@ impl SimulatedWriter {
     }
 
     fn new_external_buffers(&self) -> OutOfLineBuffers {
-        OutOfLineBuffers::new(self.encoded_data.len() as u64, /*buffer_alignment=*/ 1)
+        OutOfLineBuffers::new(self.encoded_data.len() as u64, MIN_PAGE_BUFFER_ALIGNMENT)
     }
 }
 
@@ -488,8 +505,15 @@ async fn check_round_trip_encoding_inner(
     for arr in &data {
         let mut external_buffers = writer.new_external_buffers();
         let repdef = RepDefBuilder::default();
+        let num_rows = arr.len() as u64;
         let encode_tasks = encoder
-            .maybe_encode(arr.clone(), &mut external_buffers, repdef, row_number)
+            .maybe_encode(
+                arr.clone(),
+                &mut external_buffers,
+                repdef,
+                row_number,
+                num_rows,
+            )
             .unwrap();
         for buffer in external_buffers.take_buffers() {
             writer.write_lance_buffer(buffer);

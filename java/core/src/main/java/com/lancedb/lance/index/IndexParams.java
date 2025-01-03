@@ -15,12 +15,12 @@
 package com.lancedb.lance.index;
 
 import com.lancedb.lance.index.vector.VectorIndexParams;
+
 import org.apache.commons.lang3.builder.ToStringBuilder;
+
 import java.util.Optional;
 
-/**
- * Parameters for creating an index.
- */
+/** Parameters for creating an index. */
 public class IndexParams {
   private final DistanceType distanceType;
   private final Optional<VectorIndexParams> vectorIndexParams;
@@ -37,8 +37,7 @@ public class IndexParams {
     public Builder() {}
 
     /**
-     * Set the distance type for calculating the distance between vectors.
-     * Default to L2.
+     * Set the distance type for calculating the distance between vectors. Default to L2.
      *
      * @param distanceType distance type
      * @return this builder
@@ -50,6 +49,7 @@ public class IndexParams {
 
     /**
      * Vector index parameters for creating a vector index.
+     *
      * @param vectorIndexParams vector index parameters
      * @return this builder
      */
@@ -74,8 +74,8 @@ public class IndexParams {
   @Override
   public String toString() {
     return new ToStringBuilder(this)
-      .append("distanceType", distanceType)
-      .append("vectorIndexParams", vectorIndexParams.orElse(null))
-      .toString();
+        .append("distanceType", distanceType)
+        .append("vectorIndexParams", vectorIndexParams.orElse(null))
+        .toString();
   }
 }

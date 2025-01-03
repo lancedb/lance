@@ -14,27 +14,10 @@
 
 package com.lancedb.lance;
 
-import org.apache.arrow.dataset.scanner.Scanner;
-import org.apache.arrow.vector.Float4Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowReader;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import com.lancedb.lance.ipc.Query;
-import com.lancedb.lance.ipc.ScanOptions;
-
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Optional;
-import java.util.Set;
-
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -48,14 +31,14 @@ import static org.junit.jupiter.api.Assertions.*;
 //
 // An IVF-PQ index with 2 partitions is trained on this data
 public class VectorSearchTest {
-  @TempDir
-  Path tempDir;
+  @TempDir Path tempDir;
 
   // TODO: fix in https://github.com/lancedb/lance/issues/2956
 
   // @Test
   // void test_create_index() throws Exception {
-  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_create_index"))) {
+  //   try (TestVectorDataset testVectorDataset = new
+  // TestVectorDataset(tempDir.resolve("test_create_index"))) {
   //     try (Dataset dataset = testVectorDataset.create()) {
   //       testVectorDataset.createIndex(dataset);
   //       List<String> indexes = dataset.listIndexes();
@@ -70,7 +53,8 @@ public class VectorSearchTest {
   // Directly panic instead of throwing an exception
   // @Test
   // void search_invalid_vector() throws Exception {
-  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_create_index"))) {
+  //   try (TestVectorDataset testVectorDataset = new
+  // TestVectorDataset(tempDir.resolve("test_create_index"))) {
   //     try (Dataset dataset = testVectorDataset.create()) {
   //       float[] key = new float[30];
   //       for (int i = 0; i < 30; i++) {
@@ -97,7 +81,8 @@ public class VectorSearchTest {
   // @ParameterizedTest
   // @ValueSource(booleans = { false, true })
   // void test_knn(boolean createVectorIndex) throws Exception {
-  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn"))) {
+  //   try (TestVectorDataset testVectorDataset = new
+  // TestVectorDataset(tempDir.resolve("test_knn"))) {
   //     try (Dataset dataset = testVectorDataset.create()) {
 
   //       if (createVectorIndex) {
@@ -126,7 +111,8 @@ public class VectorSearchTest {
   //           assertEquals(4, root.getSchema().getFields().size(), "Expected 4 columns");
   //           assertEquals("i", root.getSchema().getFields().get(0).getName());
   //           assertEquals("s", root.getSchema().getFields().get(1).getName());
-  //           assertEquals(TestVectorDataset.vectorColumnName, root.getSchema().getFields().get(2).getName());
+  //           assertEquals(TestVectorDataset.vectorColumnName,
+  // root.getSchema().getFields().get(2).getName());
   //           assertEquals("_distance", root.getSchema().getFields().get(3).getName());
 
   //           IntVector iVector = (IntVector) root.getVector("i");
@@ -154,7 +140,8 @@ public class VectorSearchTest {
 
   // @Test
   // void test_knn_with_new_data() throws Exception {
-  //   try (TestVectorDataset testVectorDataset = new TestVectorDataset(tempDir.resolve("test_knn_with_new_data"))) {
+  //   try (TestVectorDataset testVectorDataset = new
+  // TestVectorDataset(tempDir.resolve("test_knn_with_new_data"))) {
   //     try (Dataset dataset = testVectorDataset.create()) {
   //       testVectorDataset.createIndex(dataset);
   //     }
@@ -201,7 +188,8 @@ public class VectorSearchTest {
   //               int resultRows = root.getRowCount();
   //               int expectedRows = testCase.limit.orElse(k);
   //               assertTrue(resultRows <= expectedRows,
-  //                   "Expected less than or equal to " + expectedRows + " rows, got " + resultRows);
+  //                   "Expected less than or equal to " + expectedRows + " rows, got " +
+  // resultRows);
   //             } else {
   //               assertEquals(testCase.limit.orElse(k), root.getRowCount(),
   //                   "Unexpected number of rows");
@@ -209,7 +197,8 @@ public class VectorSearchTest {
 
   //             // Top one should be the first value of new data
   //             IntVector iVector = (IntVector) root.getVector("i");
-  //             assertEquals(400, iVector.get(0), "First result should be the first value of new data");
+  //             assertEquals(400, iVector.get(0), "First result should be the first value of new
+  // data");
 
   //             // Check if distances are in ascending order
   //             Float4Vector distanceVector = (Float4Vector) root.getVector("_distance");

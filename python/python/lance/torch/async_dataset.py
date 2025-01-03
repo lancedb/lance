@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import contextlib
-import logging
 from multiprocessing import Process, Queue, Value
 from typing import Callable, Iterable
 
 from torch.utils.data import IterableDataset
+
+from lance.log import LOGGER
 
 
 def _worker_ep(
@@ -69,7 +70,7 @@ class AsyncDataset(IterableDataset):
             for _ in self:
                 pass
         except Exception as e:
-            logging.exception(e)
+            LOGGER.exception(e)
             pass
         self.queue.close()
         self.worker.join()

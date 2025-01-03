@@ -51,21 +51,20 @@ pub fn num_centroids(num_bits: impl Into<u32>) -> usize {
 }
 
 #[inline]
-pub fn get_sub_vector_centroids<T>(
+pub fn get_sub_vector_centroids<const NUM_BITS: u32, T>(
     codebook: &[T],
     dimension: usize,
-    num_bits: impl Into<u32>,
     num_sub_vectors: usize,
     sub_vector_idx: usize,
 ) -> &[T] {
-    assert!(
+    debug_assert!(
         sub_vector_idx < num_sub_vectors,
         "sub_vector idx: {}, num_sub_vectors: {}",
         sub_vector_idx,
         num_sub_vectors
     );
 
-    let num_centroids = num_centroids(num_bits);
+    let num_centroids: usize = 2_usize.pow(NUM_BITS);
     let sub_vector_width = dimension / num_sub_vectors;
     &codebook[sub_vector_idx * num_centroids * sub_vector_width
         ..(sub_vector_idx + 1) * num_centroids * sub_vector_width]

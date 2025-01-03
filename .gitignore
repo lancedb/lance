@@ -67,11 +67,6 @@ docs/api/python
 **/.ipynb_checkpoints/
 docs/notebooks
 
-
-integration/duckdb/*-build
-integration/duckdb/lance.duckdb_extension.*.zip
-
-notebooks/lance.duckdb_extension
 notebooks/sift
 notebooks/image_data/data
 benchmarks/sift/sift

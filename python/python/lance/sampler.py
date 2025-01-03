@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import gc
-import logging
 import math
 import random
 import warnings
@@ -13,13 +12,23 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from heapq import heappush, heappushpop
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, TypeVar, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Optional,
+    TypeVar,
+    Union,
+)
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
 import lance
 from lance.dependencies import numpy as np
+from lance.log import LOGGER
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -94,7 +103,7 @@ def _efficient_sample(
             ).to_batches()
         )
         if idx % 50 == 0:
-            logging.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
+            LOGGER.info("Sampled at offset=%s, len=%s", offset, chunk_sample_size)
         if sum(len(b) for b in buf) >= batch_size:
             tbl = pa.Table.from_batches(buf)
             buf.clear()
@@ -110,7 +119,7 @@ def _efficient_sample(
 def _filtered_efficient_sample(
     dataset: lance.LanceDataset,
     n: int,
-    columns: Optional[Union[List[str], Dict[str, str]]],
+    columns: List[str],
     batch_size: int,
     target_takes: int,
     filter: str,
@@ -162,7 +171,7 @@ def _filtered_efficient_sample(
 def maybe_sample(
     dataset: Union[str, Path, lance.LanceDataset],
     n: int,
-    columns: Union[list[str], dict[str, str], str],
+    columns: Union[list[str], str],
     batch_size: int = 10240,
     max_takes: int = 2048,
     filt: Optional[str] = None,
@@ -225,7 +234,7 @@ T = TypeVar("T")
 
 
 @dataclass(order=True)
-class PrioritizedItem:
+class PrioritizedItem(Generic[T]):
     priority: int
     item: T = field(compare=False)
 
@@ -241,7 +250,7 @@ def reservoir_sampling(stream: Iterable[T], k: int) -> list[T]:
             vic = heappushpop(heap, entry)
             del vic
         if idx % 10240 == 0:
-            logging.info("Force Python GC")
+            LOGGER.info("Force Python GC")
             gc.collect()
     samples = [i.item for i in heap]
     del heap
@@ -314,7 +323,8 @@ class FullScanSampler(FragmentSampler):
     def iter_fragments(
         self, dataset: lance.LanceDataset, **kwargs
     ) -> Generator[lance.LanceFragment, None, None]:
-        return dataset.get_fragments()
+        for fragment in dataset.get_fragments():
+            yield fragment
 
 
 class ShardedFragmentSampler(FragmentSampler):
@@ -420,7 +430,7 @@ class ShardedBatchSampler(Sampler):
         columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
         filter: str,
-    ) -> Generator[lance.RecordBatch, None, None]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         accumulated_batches = []
         rows_accumulated = 0
         rows_to_skip = self._rank
@@ -471,7 +481,7 @@ class ShardedBatchSampler(Sampler):
         columns: Optional[Union[List[str], Dict[str, str]]],
         batch_readahead: int,
         filter: str,
-    ) -> Generator[lance.RecordBatch, None, None]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         shard_scan = self._shard_scan(
             dataset, batch_size, columns, batch_readahead, filter
         )
@@ -508,9 +518,9 @@ class ShardedBatchSampler(Sampler):
         self,
         dataset: lance.LanceDataset,
         batch_size: int,
-        columns: Optional[Union[List[str], Dict[str, str]]],
+        columns: Optional[List[str]],
         batch_readahead: int,
-    ) -> Generator[lance.RecordBatch, None, None]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         total = dataset.count_rows()
 
         def _gen_ranges():
@@ -537,12 +547,12 @@ class ShardedBatchSampler(Sampler):
         dataset: lance.LanceDataset,
         *args,
         batch_size: int = 128,
-        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        columns: Optional[List[str]] = None,
         filter: Optional[str] = None,
         batch_readahead: int = 16,
         with_row_id: Optional[bool] = None,
         **kwargs,
-    ) -> Generator[lance.RecordBatch, None, None]:
+    ) -> Generator[pa.RecordBatch, None, None]:
         if filter is None:
             if with_row_id is not None:
                 warnings.warn(

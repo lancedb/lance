@@ -6,6 +6,8 @@ use snafu::{Location, Snafu};
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Allocates error on the heap and then places `e` into it.
+#[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
     Box::new(e)
 }
@@ -217,6 +219,16 @@ impl From<prost::DecodeError> for Error {
 impl From<prost::EncodeError> for Error {
     #[track_caller]
     fn from(e: prost::EncodeError) -> Self {
+        Self::IO {
+            source: box_error(e),
+            location: std::panic::Location::caller().to_snafu_location(),
+        }
+    }
+}
+
+impl From<prost::UnknownEnumValue> for Error {
+    #[track_caller]
+    fn from(e: prost::UnknownEnumValue) -> Self {
         Self::IO {
             source: box_error(e),
             location: std::panic::Location::caller().to_snafu_location(),

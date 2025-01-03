@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::delete_item::builders::DeleteItemFluentBuilder;
 use aws_sdk_dynamodb::operation::RequestId;
 use aws_sdk_dynamodb::operation::{
     get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
@@ -235,6 +236,10 @@ impl DynamoDBExternalManifestStore {
             .table_name(&self.table_name)
             .consistent_read(true)
     }
+
+    fn ddb_delete(&self) -> DeleteItemFluentBuilder {
+        self.client.delete_item().table_name(&self.table_name)
+    }
 }
 
 #[async_trait]
@@ -371,6 +376,34 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
             .await
             .wrap_err()?;
 
+        Ok(())
+    }
+
+    /// Delete the manifest information for the given base_uri in dynamodb
+    async fn delete(&self, base_uri: &str) -> Result<()> {
+        let query_result = self
+            .ddb_query()
+            .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
+            .expression_attribute_values(
+                format!(":{}", base_uri!()),
+                AttributeValue::S(base_uri.into()),
+            )
+            .send()
+            .await
+            .wrap_err()?;
+
+        if let Some(items) = query_result.items {
+            for item in items {
+                if let Some(AttributeValue::N(version)) = item.get("version") {
+                    self.ddb_delete()
+                        .key(base_uri!(), AttributeValue::S(base_uri.to_string()))
+                        .key(version!(), AttributeValue::N(version.clone()))
+                        .send()
+                        .await
+                        .wrap_err()?;
+                }
+            }
+        }
         Ok(())
     }
 }

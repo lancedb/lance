@@ -179,6 +179,9 @@ mod test {
         );
         // get should see new data
         assert_eq!(store.get("test", 2).await.unwrap(), "test");
+
+        store.delete("test").await.unwrap();
+        assert_eq!(store.get_latest_version("test").await.unwrap(), None);
     }
 
     #[tokio::test]

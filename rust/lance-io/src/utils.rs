@@ -118,11 +118,7 @@ pub async fn read_struct<
 pub async fn read_last_block(reader: &dyn Reader) -> object_store::Result<Bytes> {
     let file_size = reader.size().await?;
     let block_size = reader.block_size();
-    let begin = if file_size < block_size {
-        0
-    } else {
-        file_size - block_size
-    };
+    let begin = file_size.saturating_sub(block_size);
     reader.get_range(begin..file_size).await
 }
 

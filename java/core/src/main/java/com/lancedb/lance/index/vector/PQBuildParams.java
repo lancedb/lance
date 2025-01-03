@@ -19,12 +19,10 @@ import org.apache.commons.lang3.builder.ToStringBuilder;
 /**
  * Train a PQ model for a given column.
  *
- * This will run k-means clustering on each subvector to determine the centroids
- * that will be used to quantize the subvectors.
- * This step runs against a randomly chosen sample of the data.
- * The sample size is typically quite small
- * and PQ training is relatively fast regardless of dataset scale.
- * As a result, accelerators are not needed here.
+ * <p>This will run k-means clustering on each subvector to determine the centroids that will be
+ * used to quantize the subvectors. This step runs against a randomly chosen sample of the data. The
+ * sample size is typically quite small and PQ training is relatively fast regardless of dataset
+ * scale. As a result, accelerators are not needed here.
  */
 public class PQBuildParams {
   private final int numSubVectors;
@@ -48,15 +46,12 @@ public class PQBuildParams {
     private int kmeansRedos = 1;
     private int sampleRate = 256;
 
-    /**
-     * Create a new builder for training a PQ model.
-     */
-    public Builder() {
-    }
+    /** Create a new builder for training a PQ model. */
+    public Builder() {}
 
     /**
-     * The number of subvectors to divide the source vectors into.
-     * This must be a divisor of the vector dimension.
+     * The number of subvectors to divide the source vectors into. This must be a divisor of the
+     * vector dimension.
      *
      * @param numSubVectors the number of subvectors
      * @return Builder
@@ -130,11 +125,11 @@ public class PQBuildParams {
   @Override
   public String toString() {
     return new ToStringBuilder(this)
-      .append("numSubVectors", numSubVectors)
-      .append("numBits", numBits)
-      .append("maxIters", maxIters)
-      .append("kmeansRedos", kmeansRedos)
-      .append("sampleRate", sampleRate)
-      .toString();
+        .append("numSubVectors", numSubVectors)
+        .append("numBits", numBits)
+        .append("maxIters", maxIters)
+        .append("kmeansRedos", kmeansRedos)
+        .append("sampleRate", sampleRate)
+        .toString();
   }
 }

@@ -20,8 +20,10 @@ import com.lancedb.lance.ReadOptions;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.spark.LanceConfig;
-import com.lancedb.lance.spark.read.LanceInputPartition;
+import com.lancedb.lance.spark.LanceConstant;
 import com.lancedb.lance.spark.SparkOptions;
+import com.lancedb.lance.spark.read.LanceInputPartition;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.spark.sql.types.StructField;
@@ -43,8 +45,8 @@ public class LanceFragmentScanner implements AutoCloseable {
     this.scanner = scanner;
   }
 
-  public static LanceFragmentScanner create(int fragmentId,
-      LanceInputPartition inputPartition, BufferAllocator allocator) {
+  public static LanceFragmentScanner create(
+      int fragmentId, LanceInputPartition inputPartition, BufferAllocator allocator) {
     Dataset dataset = null;
     DatasetFragment fragment = null;
     LanceScanner scanner = null;
@@ -52,11 +54,26 @@ public class LanceFragmentScanner implements AutoCloseable {
       LanceConfig config = inputPartition.getConfig();
       ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
       dataset = Dataset.open(allocator, config.getDatasetUri(), options);
-      fragment = dataset.getFragments().get(fragmentId);
+      fragment =
+          dataset.getFragments().stream()
+              .filter(f -> f.getId() == fragmentId)
+              .findAny()
+              .orElseThrow(() -> new RuntimeException("no fragment found for " + fragmentId));
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));
       if (inputPartition.getWhereCondition().isPresent()) {
         scanOptions.filter(inputPartition.getWhereCondition().get());
+      }
+      scanOptions.batchSize(SparkOptions.getBatchSize(config));
+      scanOptions.withRowId(getWithRowId(inputPartition.getSchema()));
+      if (inputPartition.getLimit().isPresent()) {
+        scanOptions.limit(inputPartition.getLimit().get());
+      }
+      if (inputPartition.getOffset().isPresent()) {
+        scanOptions.offset(inputPartition.getOffset().get());
+      }
+      if (inputPartition.getTopNSortOrders().isPresent()) {
+        scanOptions.setColumnOrderings(inputPartition.getTopNSortOrders().get());
       }
       scanner = fragment.newScan(scanOptions.build());
     } catch (Throwable t) {
@@ -79,9 +96,7 @@ public class LanceFragmentScanner implements AutoCloseable {
     return new LanceFragmentScanner(dataset, fragment, scanner);
   }
 
-  /**
-   * @return the arrow reader. The caller is responsible for closing the reader
-   */
+  /** @return the arrow reader. The caller is responsible for closing the reader */
   public ArrowReader getArrowReader() {
     return scanner.scanBatches();
   }
@@ -103,6 +118,13 @@ public class LanceFragmentScanner implements AutoCloseable {
   private static List<String> getColumnNames(StructType schema) {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
+        .filter(name -> !name.equals(LanceConstant.ROW_ID))
         .collect(Collectors.toList());
+  }
+
+  private static boolean getWithRowId(StructType schema) {
+    return Arrays.stream(schema.fields())
+        .map(StructField::name)
+        .anyMatch(name -> name.equals(LanceConstant.ROW_ID));
   }
 }

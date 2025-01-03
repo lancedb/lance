@@ -14,9 +14,11 @@
 
 package com.lancedb.lance.ipc;
 
+import com.lancedb.lance.index.DistanceType;
+
 import org.apache.arrow.util.Preconditions;
 import org.apache.commons.lang3.builder.ToStringBuilder;
-import com.lancedb.lance.index.DistanceType;
+
 import java.util.Optional;
 
 public class Query {
@@ -145,8 +147,8 @@ public class Query {
     }
 
     /**
-     * Sets the number of candidates to reserve while searching.
-     * This is an optional parameter for HNSW related index types.
+     * Sets the number of candidates to reserve while searching. This is an optional parameter for
+     * HNSW related index types.
      *
      * @param ef The number of candidates to reserve.
      * @return The Builder instance for method chaining.
@@ -193,8 +195,7 @@ public class Query {
      * Builds the Query object.
      *
      * @return A new immutable Query instance.
-     * @throws IllegalStateException if any required fields are not set or have
-     *                               invalid values.
+     * @throws IllegalStateException if any required fields are not set or have invalid values.
      */
     public Query build() {
       return new Query(this);

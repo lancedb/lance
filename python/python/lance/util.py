@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
+from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union, cast
 
 import pyarrow as pa
 
@@ -16,14 +16,16 @@ from .lance import _Hnsw, _KMeans
 if TYPE_CHECKING:
     ts_types = Union[datetime, pd.Timestamp, str]
 
-try:
-    from pyarrow import FixedShapeTensorType
+MetricType = Literal["l2", "euclidean", "dot", "cosine"]
 
-    CENTROIDS_TYPE = FixedShapeTensorType
-    has_fixed_shape_tensor = True
-except ImportError:
-    has_fixed_shape_tensor = False
-    CENTROIDS_TYPE = pa.FixedSizeListType
+
+def _normalize_metric_type(metric_type: str) -> MetricType:
+    normalized = metric_type.lower()
+    if normalized == "euclidean":
+        normalized = "l2"
+    if normalized not in {"l2", "dot", "cosine"}:
+        raise ValueError(f"Invalid metric_type: {metric_type}")
+    return cast(MetricType, normalized)
 
 
 def sanitize_ts(ts: ts_types) -> datetime:
@@ -76,7 +78,7 @@ class KMeans:
     def __init__(
         self,
         k: int,
-        metric_type: Literal["l2", "dot", "cosine"] = "l2",
+        metric_type: MetricType = "l2",
         max_iters: int = 50,
         centroids: Optional[pa.FixedSizeListArray] = None,
     ):
@@ -93,11 +95,7 @@ class KMeans:
             The maximum number of iterations to run the KMeans algorithm. Default: 50.
         centroids (pyarrow.FixedSizeListArray, optional.) – Provide existing centroids.
         """
-        metric_type = metric_type.lower()
-        if metric_type not in ["l2", "dot", "cosine"]:
-            raise ValueError(
-                f"metric_type must be one of 'l2', 'dot', 'cosine', got: {metric_type}"
-            )
+        metric_type = _normalize_metric_type(metric_type)
         self.k = k
         self._metric_type = metric_type
         self._kmeans = _KMeans(
@@ -108,7 +106,7 @@ class KMeans:
         return f"lance.KMeans(k={self.k}, metric_type={self._metric_type})"
 
     @property
-    def centroids(self) -> Optional[CENTROIDS_TYPE]:
+    def centroids(self) -> Optional[pa.FixedShapeTensorArray]:
         """Returns the centroids of the model,
 
         Returns None if the model is not trained.
@@ -116,11 +114,10 @@ class KMeans:
         ret = self._kmeans.centroids()
         if ret is None:
             return None
-        if has_fixed_shape_tensor:
-            # Pyarrow compatibility
-            shape = (ret.type.list_size,)
-            tensor_type = pa.fixed_shape_tensor(ret.type.value_type, shape)
-            ret = pa.FixedShapeTensorArray.from_storage(tensor_type, ret)
+
+        shape = (ret.type.list_size,)
+        tensor_type = pa.fixed_shape_tensor(ret.type.value_type, shape)
+        ret = pa.FixedShapeTensorArray.from_storage(tensor_type, ret)
         return ret
 
     def _to_fixed_size_list(self, data: pa.Array) -> pa.FixedSizeListArray:
@@ -130,7 +127,7 @@ class KMeans:
                     f"Array must be float32 type, got: {data.type.value_type}"
                 )
             return data
-        elif has_fixed_shape_tensor and isinstance(data, pa.FixedShapeTensorArray):
+        elif isinstance(data, pa.FixedShapeTensorArray):
             if len(data.type.shape) != 1:
                 raise ValueError(
                     f"Fixed shape tensor array must be a 1-D array, "
@@ -224,7 +221,7 @@ def validate_vector_index(
 
 
 class HNSW:
-    _hnsw = None
+    _hnsw: _Hnsw
 
     def __init__(self, hnsw) -> None:
         self._hnsw = hnsw

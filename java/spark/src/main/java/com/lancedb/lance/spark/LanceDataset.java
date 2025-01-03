@@ -12,29 +12,47 @@
 
 package com.lancedb.lance.spark;
 
-import com.google.common.collect.ImmutableSet;
-
-import java.util.Set;
-
 import com.lancedb.lance.spark.read.LanceScanBuilder;
 import com.lancedb.lance.spark.write.SparkWrite;
+
+import com.google.common.collect.ImmutableSet;
+import org.apache.spark.sql.connector.catalog.MetadataColumn;
+import org.apache.spark.sql.connector.catalog.SupportsMetadataColumns;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.TableCapability;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.write.LogicalWriteInfo;
 import org.apache.spark.sql.connector.write.WriteBuilder;
+import org.apache.spark.sql.types.DataType;
+import org.apache.spark.sql.types.DataTypes;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
-/**
- * Lance Spark Dataset.
- */
-public class LanceDataset implements SupportsRead, SupportsWrite {
-  private static final Set<TableCapability> CAPABILITIES =
-      ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE);
+import java.util.Set;
 
-  LanceConfig options;
+/** Lance Spark Dataset. */
+public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetadataColumns {
+  private static final Set<TableCapability> CAPABILITIES =
+      ImmutableSet.of(
+          TableCapability.BATCH_READ, TableCapability.BATCH_WRITE, TableCapability.TRUNCATE);
+
+  public static final MetadataColumn[] METADATA_COLUMNS =
+      new MetadataColumn[] {
+        new MetadataColumn() {
+          @Override
+          public String name() {
+            return LanceConstant.ROW_ID;
+          }
+
+          @Override
+          public DataType dataType() {
+            return DataTypes.LongType;
+          }
+        }
+      };
+
+  LanceConfig config;
   private final StructType sparkSchema;
 
   /**
@@ -44,18 +62,18 @@ public class LanceDataset implements SupportsRead, SupportsWrite {
    * @param sparkSchema spark struct type
    */
   public LanceDataset(LanceConfig config, StructType sparkSchema) {
-    this.options = config;
+    this.config = config;
     this.sparkSchema = sparkSchema;
   }
 
   @Override
   public ScanBuilder newScanBuilder(CaseInsensitiveStringMap caseInsensitiveStringMap) {
-    return new LanceScanBuilder(sparkSchema, options);
+    return new LanceScanBuilder(sparkSchema, config);
   }
 
   @Override
   public String name() {
-    return this.options.getDatasetName();
+    return this.config.getDatasetName();
   }
 
   @Override
@@ -70,6 +88,11 @@ public class LanceDataset implements SupportsRead, SupportsWrite {
 
   @Override
   public WriteBuilder newWriteBuilder(LogicalWriteInfo logicalWriteInfo) {
-    return new SparkWrite.SparkWriteBuilder(sparkSchema, options);
+    return new SparkWrite.SparkWriteBuilder(sparkSchema, config);
+  }
+
+  @Override
+  public MetadataColumn[] metadataColumns() {
+    return METADATA_COLUMNS;
   }
 }

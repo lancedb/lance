@@ -739,11 +739,7 @@ impl IvfShuffler {
                             continue;
                         }
 
-                        let local_start = if start < cur_start {
-                            0
-                        } else {
-                            start - cur_start
-                        };
+                        let local_start = start.saturating_sub(cur_start);
                         let local_end = std::cmp::min(end - cur_start, *partition_size);
 
                         input.push(ShuffleInput {

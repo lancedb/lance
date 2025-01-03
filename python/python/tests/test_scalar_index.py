@@ -86,6 +86,25 @@ def test_indexed_scalar_scan(indexed_dataset: lance.LanceDataset, data_table: pa
         assert actual_price == expected_price
 
 
+def test_indexed_between(tmp_path):
+    dataset = lance.write_dataset(pa.table({"val": range(100)}), tmp_path)
+    dataset.create_scalar_index("val", index_type="BTREE")
+
+    scanner = dataset.scanner(filter="val BETWEEN 10 AND 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+    scanner = dataset.scanner(filter="val >= 10 AND val <= 20", prefilter=True)
+
+    assert "MaterializeIndex" in scanner.explain_plan()
+
+    actual_data = scanner.to_table()
+    assert actual_data.num_rows == 11
+
+
 def test_temporal_index(tmp_path):
     # Timestamps
     now = datetime.now()
@@ -300,6 +319,13 @@ def test_fts_with_other_str_scalar_index(dataset):
     assert dataset.to_table(full_text_query=query).num_rows > 0
 
 
+def test_fts_all_deleted(dataset):
+    dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
+    first_row_doc = dataset.take(indices=[0], columns=["doc"]).column(0)[0].as_py()
+    dataset.delete(f"doc = '{first_row_doc}'")
+    dataset.to_table(full_text_query=first_row_doc)
+
+
 def test_bitmap_index(tmp_path: Path):
     """Test create bitmap index"""
     tbl = pa.Table.from_arrays(
@@ -312,6 +338,66 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_null_handling(tmp_path: Path):
+    tbl = pa.table(
+        {
+            "x": [1, 2, None, 3],
+        }
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+
+    def check(has_index: bool):
+        assert dataset.to_table(filter="x IS NULL").num_rows == 1
+        assert dataset.to_table(filter="x IS NOT NULL").num_rows == 3
+        assert dataset.to_table(filter="x > 0").num_rows == 3
+        assert dataset.to_table(filter="x < 5").num_rows == 3
+        assert dataset.to_table(filter="x IN (1, 2)").num_rows == 2
+        # Note: there is a bit of discrepancy here.  Datafusion does not consider
+        # NULL==NULL when doing an IN operation due to classic SQL shenanigans.
+        # We should decide at some point which behavior we want and make this
+        # consistent.
+        if has_index:
+            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 3
+        else:
+            assert dataset.to_table(filter="x IN (1, 2, NULL)").num_rows == 2
+
+    check(False)
+    dataset.create_scalar_index("x", index_type="BITMAP")
+    check(True)
+    dataset.create_scalar_index("x", index_type="BTREE")
+    check(True)
+
+
+def test_scalar_index_with_nulls(tmp_path):
+    # Create a test dataframe with 50% null values.
+    test_table_size = 10_000
+    test_table = pa.table(
+        {
+            "item_id": list(range(test_table_size)),
+            "inner_id": list(range(test_table_size)),
+            "category": ["a", None] * (test_table_size // 2),
+            "numeric_int": [1, None] * (test_table_size // 2),
+            "numeric_float": [0.1, None] * (test_table_size // 2),
+            "boolean_col": [True, None] * (test_table_size // 2),
+            "timestamp_col": [datetime(2023, 1, 1), None] * (test_table_size // 2),
+        }
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("inner_id", index_type="BTREE")
+    ds.create_scalar_index("category", index_type="BTREE")
+    ds.create_scalar_index("boolean_col", index_type="BTREE")
+    ds.create_scalar_index("timestamp_col", index_type="BTREE")
+    # Test querying with filters on columns with nulls.
+    k = test_table_size // 2
+    result = ds.to_table(filter="category = 'a'", limit=k)
+    assert len(result) == k
+    # Booleans should be stored as strings in the table for backwards compatibility.
+    result = ds.to_table(filter="boolean_col IS TRUE", limit=k)
+    assert len(result) == k
+    result = ds.to_table(filter="timestamp_col IS NOT NULL", limit=k)
+    assert len(result) == k
+
+
 def test_label_list_index(tmp_path: Path):
     tags = pa.array(["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7"])
     tag_list = pa.ListArray.from_arrays([0, 2, 4], tags)
@@ -321,3 +407,84 @@ def test_label_list_index(tmp_path: Path):
     indices = dataset.list_indices()
     assert len(indices) == 1
     assert indices[0]["type"] == "LabelList"
+
+
+def test_create_index_empty_dataset(tmp_path: Path):
+    # Creating an index on an empty dataset is (currently) not terribly useful but
+    # we shouldn't return strange errors.
+    schema = pa.schema(
+        [
+            pa.field("btree", pa.int32()),
+            pa.field("bitmap", pa.int32()),
+            pa.field("label_list", pa.list_(pa.string())),
+            pa.field("inverted", pa.string()),
+        ]
+    )
+    ds = lance.write_dataset([], tmp_path, schema=schema)
+
+    for index_type in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+        ds.create_scalar_index(index_type.lower(), index_type=index_type)
+
+    # Make sure the empty index doesn't cause searches to fail
+    ds.insert(
+        pa.table(
+            {
+                "btree": pa.array([1], pa.int32()),
+                "bitmap": pa.array([1], pa.int32()),
+                "label_list": [["foo", "bar"]],
+                "inverted": ["blah"],
+            }
+        )
+    )
+
+    def test_searches():
+        assert ds.to_table(filter="btree = 1").num_rows == 1
+        assert ds.to_table(filter="btree = 0").num_rows == 0
+        assert ds.to_table(filter="bitmap = 1").num_rows == 1
+        assert ds.to_table(filter="bitmap = 0").num_rows == 0
+        assert ds.to_table(filter="array_has_any(label_list, ['foo'])").num_rows == 1
+        assert ds.to_table(filter="array_has_any(label_list, ['oof'])").num_rows == 0
+        assert ds.to_table(filter="inverted = 'blah'").num_rows == 1
+        assert ds.to_table(filter="inverted = 'halb'").num_rows == 0
+
+    test_searches()
+
+    # Make sure fetching index stats on empty index is ok
+    for idx in ds.list_indices():
+        ds.stats.index_stats(idx["name"])
+
+    # Make sure updating empty indices is ok
+    ds.optimize.optimize_indices()
+
+    # Finally, make sure we can still search after updating
+    test_searches()
+
+
+def test_optimize_no_new_data(tmp_path: Path):
+    tbl = pa.table(
+        {"btree": pa.array([None], pa.int64()), "bitmap": pa.array([None], pa.int64())}
+    )
+    dataset = lance.write_dataset(tbl, tmp_path)
+    dataset.create_scalar_index("btree", index_type="BTREE")
+    dataset.create_scalar_index("bitmap", index_type="BITMAP")
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+
+    dataset.insert([], schema=tbl.schema)
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+
+    dataset.insert(pa.table({"btree": [2]}))
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 1
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
+
+    dataset.insert(pa.table({"bitmap": [2]}))
+    dataset.optimize.optimize_indices()
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 2
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2

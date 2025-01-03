@@ -76,8 +76,8 @@ impl LanceSchema {
             states.push(field.encode_to_vec().into_py(py));
         }
 
-        let state = PyTuple::new(py, states).extract()?;
-        let from_protos = PyModule::import(py, "lance.schema")?
+        let state = PyTuple::new_bound(py, states).extract()?;
+        let from_protos = PyModule::import_bound(py, "lance.schema")?
             .getattr("LanceSchema")?
             .getattr("_from_protos")?
             .extract()?;

@@ -14,6 +14,11 @@
 
 package com.lancedb.lance;
 
+import com.lancedb.lance.index.DistanceType;
+import com.lancedb.lance.index.IndexParams;
+import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.index.vector.VectorIndexParams;
+
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.*;
@@ -24,11 +29,6 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.Text;
-
-import com.lancedb.lance.index.DistanceType;
-import com.lancedb.lance.index.IndexParams;
-import com.lancedb.lance.index.IndexType;
-import com.lancedb.lance.index.vector.VectorIndexParams;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -55,21 +55,26 @@ public class TestVectorDataset implements AutoCloseable {
     Map<String, String> metadata = new HashMap<>();
     metadata.put("dataset", "vector");
 
-    List<Field> fields = Arrays.asList(
-        new Field("i", FieldType.nullable(new ArrowType.Int(32, true)), null),
-        new Field("s", FieldType.nullable(new ArrowType.Utf8()), null),
-        new Field(vectorColumnName, FieldType.nullable(new ArrowType.FixedSizeList(32)),
-            Collections.singletonList(new Field("item",
-                FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null))));
+    List<Field> fields =
+        Arrays.asList(
+            new Field("i", FieldType.nullable(new ArrowType.Int(32, true)), null),
+            new Field("s", FieldType.nullable(new ArrowType.Utf8()), null),
+            new Field(
+                vectorColumnName,
+                FieldType.nullable(new ArrowType.FixedSizeList(32)),
+                Collections.singletonList(
+                    new Field(
+                        "item",
+                        FieldType.nullable(
+                            new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)),
+                        null))));
 
     return new Schema(fields, metadata);
   }
 
   private Dataset createDataset() throws IOException {
-    WriteParams writeParams = new WriteParams.Builder()
-        .withMaxRowsPerGroup(10)
-        .withMaxRowsPerFile(200)
-        .build();
+    WriteParams writeParams =
+        new WriteParams.Builder().withMaxRowsPerGroup(10).withMaxRowsPerFile(200).build();
 
     Dataset.create(allocator, datasetPath.toString(), schema, writeParams).close();
 
@@ -102,7 +107,7 @@ public class TestVectorDataset implements AutoCloseable {
       root.setRowCount(80);
 
       WriteParams fragmentWriteParams = new WriteParams.Builder().build();
-      return Fragment.create(datasetPath.toString(), allocator, root, Optional.of(batchIndex), fragmentWriteParams);
+      return Fragment.create(datasetPath.toString(), allocator, root, fragmentWriteParams).get(0);
     }
   }
 
@@ -127,18 +132,21 @@ public class TestVectorDataset implements AutoCloseable {
       root.setRowCount(10);
 
       WriteParams writeParams = new WriteParams.Builder().build();
-      fragmentMetadata = Fragment.create(datasetPath.toString(), allocator, root, Optional.empty(),
-          writeParams);
+      fragmentMetadata =
+          Fragment.create(datasetPath.toString(), allocator, root, writeParams).get(0);
     }
-    FragmentOperation.Append appendOp = new FragmentOperation.Append(Collections.singletonList(fragmentMetadata));
+    FragmentOperation.Append appendOp =
+        new FragmentOperation.Append(Collections.singletonList(fragmentMetadata));
     return Dataset.commit(allocator, datasetPath.toString(), appendOp, Optional.of(2L));
   }
 
   public void createIndex(Dataset dataset) {
-    IndexParams params = new IndexParams.Builder()
-        .setVectorIndexParams(VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2))
-        .build();
-    dataset.createIndex(Arrays.asList(vectorColumnName), IndexType.VECTOR, Optional.of(indexName), params, true);
+    IndexParams params =
+        new IndexParams.Builder()
+            .setVectorIndexParams(VectorIndexParams.ivfPq(2, 8, 2, DistanceType.L2, 2))
+            .build();
+    dataset.createIndex(
+        Arrays.asList(vectorColumnName), IndexType.VECTOR, Optional.of(indexName), params, true);
   }
 
   @Override

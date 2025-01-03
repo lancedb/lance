@@ -27,7 +27,7 @@ pub struct BinarySchedulingJob<'a> {
     inner: Box<dyn SchedulingJob + 'a>,
 }
 
-impl<'a> SchedulingJob for BinarySchedulingJob<'a> {
+impl SchedulingJob for BinarySchedulingJob<'_> {
     fn schedule_next(
         &mut self,
         context: &mut SchedulerContext,

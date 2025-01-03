@@ -24,7 +24,7 @@ use pyo3::{exceptions::PyIOError, prelude::*};
 lazy_static! {
     static ref PY_CONFLICT_ERROR: PyResult<PyObject> = {
         Python::with_gil(|py| {
-            py.import("lance")
+            py.import_bound("lance")
                 .and_then(|lance| lance.getattr("commit"))
                 .and_then(|commit| commit.getattr("CommitConflictError"))
                 .map(|error| error.to_object(py))
@@ -34,7 +34,7 @@ lazy_static! {
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     let conflict_err_type = match &*PY_CONFLICT_ERROR {
-        Ok(err) => err.as_ref(py).get_type(),
+        Ok(err) => err.bind(py).get_type(),
         Err(import_error) => {
             return CommitError::OtherError(Error::Internal {
                 message: format!("Error importing from pylance {}", import_error),
@@ -43,7 +43,7 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
         }
     };
 
-    if py_err.is_instance(py, conflict_err_type) {
+    if py_err.is_instance_bound(py, &conflict_err_type) {
         CommitError::CommitConflict
     } else {
         CommitError::OtherError(Error::Internal {
@@ -113,7 +113,7 @@ impl CommitLease for PyCommitLease {
                 // context manager.
                 PyIOError::new_err("commit failed").restore(py);
                 let args = py
-                    .import("sys")
+                    .import_bound("sys")
                     .unwrap()
                     .getattr("exc_info")
                     .unwrap()

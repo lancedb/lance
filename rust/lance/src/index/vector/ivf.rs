@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use arrow::datatypes::UInt8Type;
 use arrow_arith::numeric::sub;
 use arrow_array::{
     cast::{as_struct_array, AsArray},
@@ -36,6 +37,7 @@ use lance_file::{
 };
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
+use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
 use lance_index::vector::v3::shuffler::IvfShuffler;
 use lance_index::vector::v3::subindex::{IvfSubIndex, SubIndexType};
@@ -637,6 +639,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
     // Write the metadata of quantizer
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
+        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -722,6 +725,12 @@ fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>>
                     DataType::Float32 => Ok(row.as_primitive::<Float32Type>().values().to_vec()),
                     DataType::Float64 => Ok(row
                         .as_primitive::<Float64Type>()
+                        .values()
+                        .iter()
+                        .map(|v| *v as f32)
+                        .collect::<Vec<_>>()),
+                    DataType::UInt8 => Ok(row
+                        .as_primitive::<UInt8Type>()
                         .values()
                         .iter()
                         .map(|v| *v as f32)
@@ -906,7 +915,7 @@ impl VectorIndex for IVFIndex {
         todo!("this method is for only IVF_HNSW_* index");
     }
 
-    fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+    async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
         // This will be needed if we want to clean up IVF to allow more than just
         // one layer (e.g. IVF -> IVF -> PQ).  We need to pass on the call to
         // remap to the lower layers.
@@ -1344,7 +1353,7 @@ impl RemapPageTask {
             .sub_index
             .load(reader, self.offset, self.length as usize)
             .await?;
-        page.remap(mapping)?;
+        page.remap(mapping).await?;
         self.page = Some(page);
         Ok(self)
     }
@@ -1358,7 +1367,12 @@ impl RemapPageTask {
         ivf.offsets.push(writer.tell().await?);
         ivf.lengths
             .push(page.row_ids.as_ref().unwrap().len() as u32);
-        PlainEncoder::write(writer, &[page.code.as_ref().unwrap().as_ref()]).await?;
+        let original_pq = transpose(
+            page.code.as_ref().unwrap(),
+            page.pq.code_dim(),
+            page.row_ids.as_ref().unwrap().len(),
+        );
+        PlainEncoder::write(writer, &[&original_pq]).await?;
         PlainEncoder::write(writer, &[page.row_ids.as_ref().unwrap().as_ref()]).await?;
         Ok(())
     }
@@ -1372,6 +1386,20 @@ fn generate_remap_tasks(offsets: &[usize], lengths: &[u32]) -> Result<Vec<RemapP
     }
 
     Ok(tasks)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn remap_index_file_v3(
+    dataset: &Dataset,
+    new_uuid: &str,
+    index: Arc<dyn VectorIndex>,
+    mapping: &HashMap<u64, Option<u64>>,
+    column: String,
+) -> Result<()> {
+    let index_dir = dataset.indices_dir().child(new_uuid);
+    index
+        .remap_to(dataset.object_store().clone(), mapping, column, index_dir)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1598,6 +1626,7 @@ async fn write_ivf_hnsw_file(
     // For PQ, we need to store the codebook
     let quantization_metadata = match &quantizer {
         Quantizer::Flat(_) => None,
+        Quantizer::FlatBin(_) => None,
         Quantizer::Product(pq) => {
             let codebook_tensor = pb::Tensor::try_from(&pq.codebook)?;
             let codebook_pos = aux_writer.tell().await?;
@@ -1725,6 +1754,15 @@ async fn train_ivf_model(
             )
             .await
         }
+        (DataType::UInt8, DistanceType::Hamming) => {
+            do_train_ivf_model::<UInt8Type>(
+                values.as_primitive::<UInt8Type>().values(),
+                dim,
+                distance_type,
+                params,
+            )
+            .await
+        }
         _ => Err(Error::Index {
             message: "Unsupported data type".to_string(),
             location: location!(),
@@ -1756,6 +1794,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::index::prefilter::DatasetPreFilter;
+    use crate::index::vector_index_details;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
     const DIM: usize = 32;
@@ -1939,6 +1978,8 @@ mod tests {
                     column: Self::COLUMN.to_string(),
                     key: Arc::new(row),
                     k: 5,
+                    lower_bound: None,
+                    upper_bound: None,
                     nprobes: 1,
                     ef: None,
                     refine_factor: None,
@@ -2133,6 +2174,7 @@ mod tests {
             fields: Vec::new(),
             name: INDEX_NAME.to_string(),
             fragment_bitmap: None,
+            index_details: Some(vector_index_details()),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -2742,7 +2784,7 @@ mod tests {
             true,
         )]));
 
-        let arr = generate_random_array_with_range(1000 * DIM, 1000.0..1001.0);
+        let arr = generate_random_array_with_range::<Float32Type>(1000 * DIM, 1000.0..1001.0);
         let fsl = FixedSizeListArray::try_new_from_values(arr.clone(), DIM as i32).unwrap();
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(fsl)]).unwrap();
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());

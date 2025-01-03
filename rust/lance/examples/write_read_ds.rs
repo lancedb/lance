@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+#![allow(clippy::print_stdout)]
 
 use arrow::array::UInt32Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -8,7 +9,6 @@ use futures::StreamExt;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use std::sync::Arc;
-
 // Writes sample dataset to the given path
 async fn write_dataset(data_path: &str) {
     // Define new schema

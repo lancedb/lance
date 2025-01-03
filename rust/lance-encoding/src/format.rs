@@ -19,12 +19,15 @@ use pb::{
     buffer::BufferType,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, BinaryMiniBlock, Bitpack2, Bitpacked, BitpackedForNonNeg,
-    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable,
-    PackedStruct, PageLayout,
+    AllNullLayout, ArrayEncoding, Binary, BinaryBlock, BinaryMiniBlock, Bitpack2, Bitpacked,
+    BitpackedForNonNeg, Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, FsstMiniBlock,
+    MiniBlockLayout, Nullable, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout,
+    RepDefLayer,
 };
 
-use crate::encodings::physical::block_compress::CompressionConfig;
+use crate::{
+    encodings::physical::block_compress::CompressionConfig, repdef::DefinitionInterpretation,
+};
 
 use self::pb::Constant;
 
@@ -139,6 +142,24 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn binary_block() -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::BinaryBlock(BinaryBlock {})),
+        }
+    }
+
+    // Construct a `FsstMiniBlock` ArrayEncoding, the inner `binary_mini_block` encoding is actually
+    // not used and `FsstMiniBlockDecompressor` constructs a `binary_mini_block` in a `hard-coded` fashion.
+    // This can be an optimization later.
+    pub fn fsst_mini_block(data: ArrayEncoding, symbol_table: Vec<u8>) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::FsstMiniBlock(Box::new(FsstMiniBlock {
+                binary_mini_block: Some(Box::new(data)),
+                symbol_table,
+            }))),
+        }
+    }
+
     pub fn packed_struct(
         child_encodings: Vec<ArrayEncoding>,
         packed_buffer_index: u32,
@@ -151,6 +172,20 @@ impl ProtobufUtils {
                     buffer_type: BufferType::Page as i32,
                 }),
             })),
+        }
+    }
+
+    pub fn packed_struct_fixed_width_mini_block(
+        data: ArrayEncoding,
+        bits_per_values: Vec<u32>,
+    ) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::PackedStructFixedWidthMiniBlock(
+                Box::new(PackedStructFixedWidthMiniBlock {
+                    flat: Some(Box::new(data)),
+                    bits_per_values,
+                }),
+            )),
         }
     }
 
@@ -193,10 +228,10 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn fixed_size_list(data: ArrayEncoding, dimension: u32) -> ArrayEncoding {
+    pub fn fixed_size_list(data: ArrayEncoding, dimension: u64) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
-                dimension,
+                dimension: dimension.try_into().unwrap(),
                 items: Some(Box::new(data)),
             }))),
         }
@@ -211,23 +246,91 @@ impl ProtobufUtils {
         }
     }
 
+    fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
+        match def {
+            DefinitionInterpretation::AllValidItem => RepDefLayer::RepdefAllValidItem as i32,
+            DefinitionInterpretation::AllValidList => RepDefLayer::RepdefAllValidList as i32,
+            DefinitionInterpretation::NullableItem => RepDefLayer::RepdefNullableItem as i32,
+            DefinitionInterpretation::NullableList => RepDefLayer::RepdefNullableList as i32,
+            DefinitionInterpretation::EmptyableList => RepDefLayer::RepdefEmptyableList as i32,
+            DefinitionInterpretation::NullableAndEmptyableList => {
+                RepDefLayer::RepdefNullAndEmptyList as i32
+            }
+        }
+    }
+
+    pub fn repdef_layer_to_def_interp(layer: i32) -> DefinitionInterpretation {
+        let layer = RepDefLayer::try_from(layer).unwrap();
+        match layer {
+            RepDefLayer::RepdefAllValidItem => DefinitionInterpretation::AllValidItem,
+            RepDefLayer::RepdefAllValidList => DefinitionInterpretation::AllValidList,
+            RepDefLayer::RepdefNullableItem => DefinitionInterpretation::NullableItem,
+            RepDefLayer::RepdefNullableList => DefinitionInterpretation::NullableList,
+            RepDefLayer::RepdefEmptyableList => DefinitionInterpretation::EmptyableList,
+            RepDefLayer::RepdefNullAndEmptyList => {
+                DefinitionInterpretation::NullableAndEmptyableList
+            }
+            RepDefLayer::RepdefUnspecified => panic!("Unspecified repdef layer"),
+        }
+    }
+
     pub fn miniblock_layout(
         rep_encoding: ArrayEncoding,
         def_encoding: ArrayEncoding,
         value_encoding: ArrayEncoding,
+        repetition_index_depth: u32,
+        dictionary_encoding: Option<ArrayEncoding>,
+        def_meaning: &[DefinitionInterpretation],
+        num_items: u64,
     ) -> PageLayout {
+        assert!(!def_meaning.is_empty());
         PageLayout {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
                 def_compression: Some(def_encoding),
                 rep_compression: Some(rep_encoding),
                 value_compression: Some(value_encoding),
+                repetition_index_depth,
+                dictionary: dictionary_encoding,
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
+                num_items,
+            })),
+        }
+    }
+
+    pub fn full_zip_layout(
+        bits_rep: u8,
+        bits_def: u8,
+        value_encoding: ArrayEncoding,
+        def_meaning: &[DefinitionInterpretation],
+    ) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::FullZipLayout(pb::FullZipLayout {
+                bits_rep: bits_rep as u32,
+                bits_def: bits_def as u32,
+                value_compression: Some(value_encoding),
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
+            })),
+        }
+    }
+
+    pub fn all_null_layout(def_meaning: &[DefinitionInterpretation]) -> PageLayout {
+        PageLayout {
+            layout: Some(Layout::AllNullLayout(AllNullLayout {
+                layers: def_meaning
+                    .iter()
+                    .map(|&def| Self::def_inter_to_repdef_layer(def))
+                    .collect(),
             })),
         }
     }
 
     pub fn simple_all_null_layout() -> PageLayout {
-        PageLayout {
-            layout: Some(Layout::AllNullLayout(AllNullLayout {})),
-        }
+        Self::all_null_layout(&[DefinitionInterpretation::NullableItem])
     }
 }

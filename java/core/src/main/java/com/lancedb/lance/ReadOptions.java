@@ -13,13 +13,12 @@
 package com.lancedb.lance;
 
 import org.apache.commons.lang3.builder.ToStringBuilder;
-import java.util.Optional;
-import java.util.Map;
-import java.util.HashMap;
 
-/**
- * Read options for reading from a dataset.
- */
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+/** Read options for reading from a dataset. */
 public class ReadOptions {
 
   private final Optional<Integer> version;
@@ -58,9 +57,12 @@ public class ReadOptions {
 
   @Override
   public String toString() {
-    return new ToStringBuilder(this).append("version", version.orElse(null))
-        .append("blockSize", blockSize.orElse(null)).append("indexCacheSize", indexCacheSize)
-        .append("metadataCacheSize", metadataCacheSize).append("storageOptions", storageOptions)
+    return new ToStringBuilder(this)
+        .append("version", version.orElse(null))
+        .append("blockSize", blockSize.orElse(null))
+        .append("indexCacheSize", indexCacheSize)
+        .append("metadataCacheSize", metadataCacheSize)
+        .append("storageOptions", storageOptions)
         .toString();
   }
 

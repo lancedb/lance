@@ -16,6 +16,7 @@ package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.spark.LanceConfig;
 import com.lancedb.lance.spark.LanceDataSource;
+
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.RowFactory;
@@ -27,11 +28,11 @@ import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
@@ -43,26 +44,30 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 public class SparkWriteTest {
   private static SparkSession spark;
   private static Dataset<Row> testData;
-  @TempDir
-  static Path dbPath;
+  @TempDir static Path dbPath;
 
   @BeforeAll
   static void setup() {
-    spark = SparkSession.builder()
-        .appName("spark-lance-connector-test")
-        .master("local")
-        .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
-        .getOrCreate();
-    StructType schema = new StructType(new StructField[]{
-        DataTypes.createStructField("id", DataTypes.IntegerType, false),
-        DataTypes.createStructField("name", DataTypes.StringType, false)
-    });
+    spark =
+        SparkSession.builder()
+            .appName("spark-lance-connector-test")
+            .master("local")
+            .config("spark.sql.catalog.lance", "com.lancedb.lance.spark.LanceCatalog")
+            .config("spark.sql.catalog.lance.max_row_per_file", "1")
+            .getOrCreate();
+    StructType schema =
+        new StructType(
+            new StructField[] {
+              DataTypes.createStructField("id", DataTypes.IntegerType, false),
+              DataTypes.createStructField("name", DataTypes.StringType, false)
+            });
 
     Row row1 = RowFactory.create(1, "Alice");
     Row row2 = RowFactory.create(2, "Bob");
     List<Row> data = Arrays.asList(row1, row2);
 
     testData = spark.createDataFrame(data, schema);
+    testData.createOrReplaceTempView("tmp_view");
   }
 
   @AfterAll
@@ -75,8 +80,12 @@ public class SparkWriteTest {
   @Test
   public void defaultWrite(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
-    testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
 
     validateData(datasetName, 1);
@@ -85,25 +94,43 @@ public class SparkWriteTest {
   @Test
   public void errorIfExists(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
-    testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
 
-    assertThrows(TableAlreadyExistsException.class, () -> {
-      testData.write().format(LanceDataSource.name)
-          .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
-          .save();
-    });
+    assertThrows(
+        TableAlreadyExistsException.class,
+        () -> {
+          testData
+              .write()
+              .format(LanceDataSource.name)
+              .option(
+                  LanceConfig.CONFIG_DATASET_URI,
+                  LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+              .save();
+        });
   }
 
   @Test
   public void append(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
-    testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
-    testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .mode("append")
         .save();
     validateData(datasetName, 2);
@@ -112,42 +139,121 @@ public class SparkWriteTest {
   @Test
   public void appendErrorIfNotExist(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
-    assertThrows(NoSuchTableException.class, () -> {
-      testData.write().format(LanceDataSource.name)
-          .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
-          .mode("append")
-          .save();
-    });
+    assertThrows(
+        NoSuchTableException.class,
+        () -> {
+          testData
+              .write()
+              .format(LanceDataSource.name)
+              .option(
+                  LanceConfig.CONFIG_DATASET_URI,
+                  LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+              .mode("append")
+              .save();
+        });
   }
 
   @Test
   public void saveToPath(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
-    testData.write().format(LanceDataSource.name)
+    testData
+        .write()
+        .format(LanceDataSource.name)
         .save(LanceConfig.getDatasetUri(dbPath.toString(), datasetName));
 
     validateData(datasetName, 1);
   }
 
-  @Disabled("Do not support overwrite")
   @Test
   public void overwrite(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
-    testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .save();
-    testData.write().format(LanceDataSource.name)
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
         .mode("overwrite")
         .save();
 
     validateData(datasetName, 1);
   }
 
+  @Test
+  public void appendAfterOverwrite(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+        .save();
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+        .mode("overwrite")
+        .save();
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+        .mode("append")
+        .save();
+    validateData(datasetName, 2);
+  }
+
+  @Test
+  public void writeMultiFiles(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String filePath = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(LanceConfig.CONFIG_DATASET_URI, filePath)
+        .save();
+
+    validateData(datasetName, 1);
+    File directory = new File(filePath + "/data");
+    assertEquals(2, directory.listFiles().length);
+  }
+
+  @Test
+  public void writeEmptyTaskFiles(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String filePath = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    testData
+        .repartition(4)
+        .write()
+        .format(LanceDataSource.name)
+        .option(LanceConfig.CONFIG_DATASET_URI, filePath)
+        .save();
+
+    File directory = new File(filePath + "/data");
+    assertEquals(2, directory.listFiles().length);
+  }
+
   private void validateData(String datasetName, int iteration) {
-    Dataset<Row> data = spark.read().format("lance")
-        .option(LanceConfig.CONFIG_DATASET_URI, LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
-        .load();
+    Dataset<Row> data =
+        spark
+            .read()
+            .format("lance")
+            .option(
+                LanceConfig.CONFIG_DATASET_URI,
+                LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+            .load();
 
     assertEquals(2 * iteration, data.count());
     assertEquals(iteration, data.filter(col("id").equalTo(1)).count());
@@ -163,5 +269,14 @@ public class SparkWriteTest {
     for (Row row : data2.collectAsList()) {
       assertEquals("Bob", row.getString(0));
     }
+  }
+
+  @Test
+  public void dropAndReplaceTable(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String path = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+    spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
+    spark.sql("DROP TABLE lance.`" + path + "`");
   }
 }

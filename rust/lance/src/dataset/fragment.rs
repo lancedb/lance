@@ -6,7 +6,7 @@
 pub mod write;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -20,11 +20,12 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
 use futures::{join, stream, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::datatypes::SchemaCompareOptions;
+use lance_core::datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{datatypes::Schema, Error, Result};
-use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD};
+use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
@@ -47,6 +48,7 @@ use self::write::FragmentCreateBuilder;
 use super::hash_joiner::HashJoiner;
 use super::rowids::load_row_id_sequence;
 use super::scanner::Scanner;
+use super::statistics::FieldStatistics;
 use super::updater::Updater;
 use super::{schema_evolution, NewColumnTransform, WriteParams};
 use crate::arrow::*;
@@ -95,6 +97,9 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
 
     /// Schema of the reader
     fn projection(&self) -> &Arc<Schema>;
+
+    /// Update storage statistics (ignored by v1 reader)
+    fn update_storage_stats(&self, field_stats: &mut HashMap<u32, FieldStatistics>);
 
     // Helper functions to fallback to the legacy implementation while we
     // slowly migrate functionality over to the generic reader
@@ -239,6 +244,10 @@ impl GenericFileReader for V1Reader {
         self.reader.len() as u32
     }
 
+    fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
+        // No-op for v1 files
+    }
+
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
         Box::new(self.clone())
     }
@@ -363,6 +372,29 @@ mod v2_adapter {
                 .boxed())
         }
 
+        fn update_storage_stats(&self, field_stats: &mut HashMap<u32, FieldStatistics>) {
+            let file_statistics = self.reader.file_statistics();
+            let column_idx_to_field_id = self
+                .field_id_to_column_idx
+                .iter()
+                .map(|(field_id, column_idx)| (*column_idx, *field_id))
+                .collect::<HashMap<_, _>>();
+
+            // Some fields span more than one column.  We assume a column that doesn't have an
+            // entry in the field_id_to_column_idx map is a continuation of the previous field.
+            let mut current_field_id = 0;
+            for (column_idx, stats) in file_statistics.columns.iter().enumerate() {
+                if let Some(field_id) = column_idx_to_field_id.get(&(column_idx as u32)) {
+                    current_field_id = *field_id;
+                }
+                // If the field_id is not in the map then the field may no longer be part of the
+                // dataset
+                if let Some(field_stats) = field_stats.get_mut(&current_field_id) {
+                    field_stats.bytes_on_disk += stats.size_bytes;
+                }
+            }
+        }
+
         fn projection(&self) -> &Arc<Schema> {
             &self.projection
         }
@@ -460,6 +492,10 @@ impl GenericFileReader for NullReader {
         self.read_range_tasks(0..num_rows, batch_size, projection)
     }
 
+    fn update_storage_stats(&self, _field_stats: &mut HashMap<u32, FieldStatistics>) {
+        // No-op for null reader
+    }
+
     fn projection(&self) -> &Arc<Schema> {
         &self.schema
     }
@@ -511,7 +547,7 @@ impl FileFragment {
         Self { dataset, metadata }
     }
 
-    /// Create a new [`FileFragment`] from a [`RecordBatchReader`].
+    /// Create a new [`FileFragment`] from a [`StreamingWriteSource`].
     ///
     /// This method can be used before a `Dataset` is created. For example,
     /// Fragments can be created distributed first, before a central machine to
@@ -520,7 +556,7 @@ impl FileFragment {
     pub async fn create(
         dataset_uri: &str,
         id: usize,
-        reader: impl RecordBatchReader + Send + 'static,
+        source: impl StreamingWriteSource,
         params: Option<WriteParams>,
     ) -> Result<Fragment> {
         let mut builder = FragmentCreateBuilder::new(dataset_uri);
@@ -529,7 +565,22 @@ impl FileFragment {
             builder = builder.write_params(params);
         }
 
-        builder.write(reader, Some(id as u64)).await
+        builder.write(source, Some(id as u64)).await
+    }
+
+    /// Create a list of [`FileFragment`] from a [`StreamingWriteSource`].
+    pub async fn create_fragments(
+        dataset_uri: &str,
+        source: impl StreamingWriteSource,
+        params: Option<WriteParams>,
+    ) -> Result<Vec<Fragment>> {
+        let mut builder = FragmentCreateBuilder::new(dataset_uri);
+
+        if let Some(params) = params.as_ref() {
+            builder = builder.write_params(params);
+        }
+
+        builder.write_fragments(source).await
     }
 
     pub async fn create_from_file(
@@ -604,6 +655,21 @@ impl FileFragment {
             );
             Ok(frag)
         }
+    }
+
+    pub(crate) async fn update_storage_stats(
+        &self,
+        field_stats: &mut HashMap<u32, FieldStatistics>,
+        dataset_schema: &Schema,
+        scan_scheduler: Arc<ScanScheduler>,
+    ) -> Result<()> {
+        for reader in self
+            .open_readers(dataset_schema, Some((scan_scheduler, 0)))
+            .await?
+        {
+            reader.update_storage_stats(field_stats);
+        }
+        Ok(())
     }
 
     pub fn dataset(&self) -> &Dataset {
@@ -694,7 +760,7 @@ impl FileFragment {
             row_id_sequence,
             opened_files,
             ArrowSchema::from(projection),
-            self.count_rows().await?,
+            self.count_rows(None).await?,
             num_physical_rows,
         )?;
 
@@ -740,9 +806,11 @@ impl FileFragment {
                     Some(&self.dataset.session.file_metadata_cache),
                 )
                 .await?;
-                let initialized_schema = reader
-                    .schema()
-                    .project_by_schema(schema_per_file.as_ref())?;
+                let initialized_schema = reader.schema().project_by_schema(
+                    schema_per_file.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?;
                 let reader = V1Reader::new(reader, Arc::new(initialized_schema));
                 Ok(Some(Box::new(reader)))
             } else {
@@ -811,7 +879,7 @@ impl FileFragment {
         }
 
         // This should return immediately on modern datasets.
-        let num_rows = self.count_rows().await?;
+        let num_rows = self.count_rows(None).await?;
 
         // Check if there are any fields that are not in any data files
         let field_ids_in_files = opened_files
@@ -831,15 +899,24 @@ impl FileFragment {
     }
 
     /// Count the rows in this fragment.
-    pub async fn count_rows(&self) -> Result<usize> {
-        let total_rows = self.physical_rows();
+    pub async fn count_rows(&self, filter: Option<String>) -> Result<usize> {
+        match filter {
+            Some(expr) => self
+                .scan()
+                .filter(&expr)?
+                .count_rows()
+                .await
+                .map(|v| v as usize),
+            None => {
+                let total_rows = self.physical_rows();
+                let deletion_count = self.count_deletions();
 
-        let deletion_count = self.count_deletions();
+                let (total_rows, deletion_count) =
+                    futures::future::try_join(total_rows, deletion_count).await?;
 
-        let (total_rows, deletion_count) =
-            futures::future::try_join(total_rows, deletion_count).await?;
-
-        Ok(total_rows - deletion_count)
+                Ok(total_rows - deletion_count)
+            }
+        }
     }
 
     /// Get the number of rows that have been deleted in this fragment.
@@ -1271,11 +1348,14 @@ impl FileFragment {
         let mut schema = self.dataset.schema().clone();
 
         let mut with_row_addr = false;
+        let mut with_row_id = false;
         if let Some(columns) = columns {
             let mut projection = Vec::new();
             for column in columns {
                 if column.as_ref() == ROW_ADDR {
                     with_row_addr = true;
+                } else if column.as_ref() == ROW_ID {
+                    with_row_id = true;
                 } else {
                     projection.push(column.as_ref());
                 }
@@ -1291,11 +1371,13 @@ impl FileFragment {
         }
 
         // If there is no projection, we at least need to read the row addresses
-        with_row_addr |= schema.fields.is_empty();
+        with_row_addr |= !with_row_id && schema.fields.is_empty();
 
         let reader = self.open(
             &schema,
-            FragReadConfig::default().with_row_address(with_row_addr),
+            FragReadConfig::default()
+                .with_row_address(with_row_addr)
+                .with_row_id(with_row_id),
             None,
         );
         let deletion_vector = read_deletion_file(
@@ -1308,6 +1390,66 @@ impl FileFragment {
         let deletion_vector = deletion_vector?.unwrap_or_default();
 
         Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size)
+    }
+
+    pub async fn merge_columns(
+        &mut self,
+        stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        max_field_id: i32,
+    ) -> Result<(Fragment, Schema)> {
+        let stream = Box::new(stream);
+        if self.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the left side fragment",
+                    left_on
+                ),
+                location!(),
+            ));
+        };
+        let right_schema = stream.schema();
+        if right_schema.field_with_name(right_on).is_err() {
+            return Err(Error::invalid_input(
+                format!(
+                    "Column {} does not exist in the right side fragment",
+                    right_on
+                ),
+                location!(),
+            ));
+        };
+
+        for field in right_schema.fields() {
+            if field.name() == right_on {
+                // right_on is allowed to exist in the dataset, since it may be
+                // the same as left_on.
+                continue;
+            }
+            if self.schema().field(field.name()).is_some() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "Column {} exists in left side fragment and right side dataset",
+                        field.name()
+                    ),
+                    location!(),
+                ));
+            }
+        }
+        // Hash join
+        let joiner = Arc::new(HashJoiner::try_new(stream, right_on).await?);
+        // Final schema is union of current schema, plus the RHS schema without
+        // the right_on key.
+        let mut new_schema: Schema = self.schema().merge(joiner.out_schema().as_ref())?;
+        new_schema.set_field_id(Some(max_field_id));
+
+        let new_fragment = self
+            .clone()
+            .merge(left_on, &joiner)
+            .await
+            .map(|f| f.metadata)?;
+
+        Ok((new_fragment, new_schema))
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
@@ -2561,7 +2703,7 @@ mod tests {
         assert_eq!(fragments.len(), 5);
         for f in fragments {
             assert_eq!(f.metadata.num_rows(), Some(40));
-            assert_eq!(f.count_rows().await.unwrap(), 40);
+            assert_eq!(f.count_rows(None).await.unwrap(), 40);
             assert_eq!(f.metadata().deletion_file, None);
         }
     }
@@ -2577,9 +2719,17 @@ mod tests {
         let dataset = create_dataset(test_uri, data_storage_version).await;
         let fragment = dataset.get_fragments().pop().unwrap();
 
-        assert_eq!(fragment.count_rows().await.unwrap(), 40);
+        assert_eq!(fragment.count_rows(None).await.unwrap(), 40);
         assert_eq!(fragment.physical_rows().await.unwrap(), 40);
         assert!(fragment.metadata.deletion_file.is_none());
+
+        assert_eq!(
+            fragment
+                .count_rows(Some("i < 170".to_string()))
+                .await
+                .unwrap(),
+            10
+        );
 
         let fragment = fragment
             .delete("i >= 160 and i <= 172")
@@ -2589,7 +2739,7 @@ mod tests {
 
         fragment.validate().await.unwrap();
 
-        assert_eq!(fragment.count_rows().await.unwrap(), 27);
+        assert_eq!(fragment.count_rows(None).await.unwrap(), 27);
         assert_eq!(fragment.physical_rows().await.unwrap(), 40);
         assert!(fragment.metadata.deletion_file.is_some());
         assert_eq!(

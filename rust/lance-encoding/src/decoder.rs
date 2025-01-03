@@ -239,19 +239,25 @@ use crate::data::DataBlock;
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::blob::BlobFieldScheduler;
-use crate::encodings::logical::list::{ListFieldScheduler, OffsetPageInfo};
+use crate::encodings::logical::list::{
+    ListFieldScheduler, OffsetPageInfo, StructuralListScheduler,
+};
 use crate::encodings::logical::primitive::{
     PrimitiveFieldScheduler, StructuralPrimitiveFieldScheduler,
 };
 use crate::encodings::logical::r#struct::{
     SimpleStructDecoder, SimpleStructScheduler, StructuralStructDecoder, StructuralStructScheduler,
 };
-use crate::encodings::physical::binary::BinaryMiniBlockDecompressor;
+use crate::encodings::physical::binary::{BinaryBlockDecompressor, BinaryMiniBlockDecompressor};
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
+use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
+use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
+use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
 use crate::encodings::physical::{ColumnBuffers, FileBuffers};
 use crate::format::pb::{self, column_encoding};
-use crate::repdef::{LevelBuffer, RepDefUnraveler};
+use crate::repdef::{CompositeRepDefUnraveler, RepDefUnraveler};
+use crate::version::LanceFileVersion;
 use crate::{BufferScheduler, EncodingsIo};
 
 // If users are getting batches over 10MiB large then it's time to reduce the batch size
@@ -454,8 +460,14 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
 }
 
-pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
+pub trait PerValueDecompressor: std::fmt::Debug + Send + Sync {
+    /// Decompress one or more values
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+    /// The number of bits in each value
+    ///
+    /// Returns 0 if the data type is variable-width
+    ///
+    /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
 }
 
@@ -469,10 +481,10 @@ pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
         description: &pb::ArrayEncoding,
     ) -> Result<Box<dyn MiniBlockDecompressor>>;
 
-    fn create_fixed_per_value_decompressor(
+    fn create_per_value_decompressor(
         &self,
         description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn FixedPerValueDecompressor>>;
+    ) -> Result<Box<dyn PerValueDecompressor>>;
 
     fn create_block_decompressor(
         &self,
@@ -480,7 +492,7 @@ pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
     ) -> Result<Box<dyn BlockDecompressor>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CoreDecompressorStrategy {}
 
 impl DecompressorStrategy for CoreDecompressorStrategy {
@@ -498,17 +510,33 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => {
                 Ok(Box::new(BinaryMiniBlockDecompressor::default()))
             }
+            pb::array_encoding::ArrayEncoding::FsstMiniBlock(description) => {
+                Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
+            }
+            pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
+                Ok(Box::new(PackedStructFixedWidthMiniBlockDecompressor::new(
+                    description,
+                )))
+            }
             _ => todo!(),
         }
     }
 
-    fn create_fixed_per_value_decompressor(
+    fn create_per_value_decompressor(
         &self,
         description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn FixedPerValueDecompressor>> {
+    ) -> Result<Box<dyn PerValueDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
                 Ok(Box::new(ValueDecompressor::new(flat)))
+            }
+            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
+                let items_decompressor =
+                    self.create_per_value_decompressor(fsl.items.as_ref().unwrap())?;
+                Ok(Box::new(FslPerValueDecompressor::new(
+                    items_decompressor,
+                    fsl.dimension as u64,
+                )))
             }
             _ => todo!(),
         }
@@ -528,6 +556,9 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
                     scalar,
                     constant.num_values,
                 )))
+            }
+            pb::array_encoding::ArrayEncoding::BinaryBlock(_) => {
+                Ok(Box::new(BinaryBlockDecompressor::default()))
             }
             _ => todo!(),
         }
@@ -727,11 +758,26 @@ impl CoreFieldDecoderStrategy {
                 column_info.as_ref(),
                 self.decompressor_strategy.as_ref(),
             )?);
+
+            // advance to the next top level column
             column_infos.next_top_level();
+
             return Ok(scheduler);
         }
         match &data_type {
             DataType::Struct(fields) => {
+                if field.is_packed_struct() {
+                    let column_info = column_infos.expect_next()?;
+                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
+                        column_info.as_ref(),
+                        self.decompressor_strategy.as_ref(),
+                    )?);
+
+                    // advance to the next top level column
+                    column_infos.next_top_level();
+
+                    return Ok(scheduler);
+                }
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
                     let field_scheduler =
@@ -753,6 +799,16 @@ impl CoreFieldDecoderStrategy {
                 )?);
                 column_infos.next_top_level();
                 Ok(scheduler)
+            }
+            DataType::List(_) | DataType::LargeList(_) => {
+                let child = field
+                    .children
+                    .first()
+                    .expect("List field must have a child");
+                let child_scheduler =
+                    self.create_structural_field_scheduler(child, column_infos)?;
+                Ok(Box::new(StructuralListScheduler::new(child_scheduler))
+                    as Box<dyn StructuralFieldScheduler>)
             }
             _ => todo!(),
         }
@@ -1662,7 +1718,11 @@ pub fn create_decode_stream(
 ) -> BoxStream<'static, ReadBatchTask> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
-        let structural_decoder = StructuralStructDecoder::new(arrow_schema.fields, should_validate);
+        let structural_decoder = StructuralStructDecoder::new(
+            arrow_schema.fields,
+            should_validate,
+            /*is_root=*/ true,
+        );
         StructuralBatchDecodeStream::new(rx, batch_size, num_rows, structural_decoder).into_stream()
     } else {
         let arrow_schema = ArrowSchema::from(schema);
@@ -1673,7 +1733,7 @@ pub fn create_decode_stream(
     }
 }
 
-async fn create_scheduler_decoder(
+fn create_scheduler_decoder(
     column_infos: Vec<Arc<ColumnInfo>>,
     requested_rows: RequestedRows,
     filter: FilterExpression,
@@ -1682,19 +1742,6 @@ async fn create_scheduler_decoder(
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     let num_rows = requested_rows.num_rows();
-
-    let mut decode_scheduler = DecodeBatchScheduler::try_new(
-        target_schema.as_ref(),
-        &column_indices,
-        &column_infos,
-        &vec![],
-        num_rows,
-        config.decoder_plugins,
-        config.io.clone(),
-        config.cache,
-        &filter,
-    )
-    .await?;
 
     let is_structural = column_infos[0].is_structural();
 
@@ -1709,14 +1756,33 @@ async fn create_scheduler_decoder(
         rx,
     );
 
-    let io = config.io;
     let scheduler_handle = tokio::task::spawn(async move {
+        let mut decode_scheduler = match DecodeBatchScheduler::try_new(
+            target_schema.as_ref(),
+            &column_indices,
+            &column_infos,
+            &vec![],
+            num_rows,
+            config.decoder_plugins,
+            config.io.clone(),
+            config.cache,
+            &filter,
+        )
+        .await
+        {
+            Ok(scheduler) => scheduler,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+
         match requested_rows {
             RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges(&ranges, &filter, tx, io)
+                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
             }
             RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take(&indices, &filter, tx, io)
+                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
             }
         }
     });
@@ -1743,15 +1809,14 @@ pub fn schedule_and_decode(
     // For convenience we really want this method to be a snchronous method where all
     // errors happen on the stream.  There is some async initialization that must happen
     // when creating a scheduler.  We wrap that all up in the very first task.
-    stream::once(create_scheduler_decoder(
+    match create_scheduler_decoder(
         column_infos,
         requested_rows,
         filter,
         column_indices,
         target_schema,
         config,
-    ))
-    .map(|maybe_stream| match maybe_stream {
+    ) {
         // If the initialization failed make it look like a failed task
         Ok(stream) => stream,
         Err(e) => stream::once(std::future::ready(ReadBatchTask {
@@ -1759,9 +1824,7 @@ pub fn schedule_and_decode(
             task: std::future::ready(Err(e)).boxed(),
         }))
         .boxed(),
-    })
-    .flatten()
-    .boxed()
+    }
 }
 
 /// A decoder for single-column encodings of primitive data (this includes fixed size
@@ -2279,8 +2342,7 @@ pub trait LogicalPageDecoder: std::fmt::Debug + Send {
 
 pub struct DecodedPage {
     pub data: DataBlock,
-    pub repetition: Option<LevelBuffer>,
-    pub definition: Option<LevelBuffer>,
+    pub repdef: RepDefUnraveler,
 }
 
 pub trait DecodePageTask: Send + std::fmt::Debug {
@@ -2321,7 +2383,7 @@ pub struct LoadedPage {
 
 pub struct DecodedArray {
     pub array: ArrayRef,
-    pub repdef: RepDefUnraveler,
+    pub repdef: CompositeRepDefUnraveler,
 }
 
 pub trait StructuralDecodeArrayTask: std::fmt::Debug + Send {
@@ -2349,16 +2411,20 @@ pub async fn decode_batch(
     filter: &FilterExpression,
     decoder_plugins: Arc<DecoderPlugins>,
     should_validate: bool,
+    version: LanceFileVersion,
+    cache: Option<Arc<FileMetadataCache>>,
 ) -> Result<RecordBatch> {
     // The io is synchronous so it shouldn't be possible for any async stuff to still be in progress
     // Still, if we just use now_or_never we hit misfires because some futures (channels) need to be
     // polled twice.
 
     let io_scheduler = Arc::new(BufferScheduler::new(batch.data.clone())) as Arc<dyn EncodingsIo>;
-    let cache = Arc::new(FileMetadataCache::with_capacity(
-        128 * 1024 * 1024,
-        CapacityMode::Bytes,
-    ));
+    let cache = cache.unwrap_or_else(|| {
+        Arc::new(FileMetadataCache::with_capacity(
+            128 * 1024 * 1024,
+            CapacityMode::Bytes,
+        ))
+    });
     let mut decode_scheduler = DecodeBatchScheduler::try_new(
         batch.schema.as_ref(),
         &batch.top_level_columns,
@@ -2373,7 +2439,7 @@ pub async fn decode_batch(
     .await?;
     let (tx, rx) = unbounded_channel();
     decode_scheduler.schedule_range(0..batch.num_rows, filter, tx, io_scheduler);
-    let is_structural = false;
+    let is_structural = version >= LanceFileVersion::V2_1;
     let mut decode_stream = create_decode_stream(
         &batch.schema,
         batch.num_rows,

@@ -36,7 +36,11 @@ public class LanceArrowWriterTest {
   @Test
   public void test() throws Exception {
     try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      Field field = new Field("column1", FieldType.nullable(org.apache.arrow.vector.types.Types.MinorType.INT.getType()), null);
+      Field field =
+          new Field(
+              "column1",
+              FieldType.nullable(org.apache.arrow.vector.types.Types.MinorType.INT.getType()),
+              null);
       Schema schema = new Schema(Collections.singletonList(field));
 
       final int totalRows = 125;
@@ -47,37 +51,42 @@ public class LanceArrowWriterTest {
       AtomicInteger rowsRead = new AtomicInteger(0);
       AtomicLong expectedBytesRead = new AtomicLong(0);
 
-      Thread writerThread = new Thread(() -> {
-        try {
-          for (int i = 0; i < totalRows; i++) {
-            InternalRow row = new GenericInternalRow(new Object[]{rowsWritten.incrementAndGet()});
-            arrowWriter.write(row);
-          }
-          arrowWriter.setFinished();
-        } catch (Exception e) {
-          e.printStackTrace();
-          throw e;
-        }
-      });
+      Thread writerThread =
+          new Thread(
+              () -> {
+                try {
+                  for (int i = 0; i < totalRows; i++) {
+                    InternalRow row =
+                        new GenericInternalRow(new Object[] {rowsWritten.incrementAndGet()});
+                    arrowWriter.write(row);
+                  }
+                  arrowWriter.setFinished();
+                } catch (Exception e) {
+                  e.printStackTrace();
+                  throw e;
+                }
+              });
 
-      Thread readerThread = new Thread(() -> {
-        try {
-          while (arrowWriter.loadNextBatch()) {
-            VectorSchemaRoot root = arrowWriter.getVectorSchemaRoot();
-            int rowCount = root.getRowCount();
-            rowsRead.addAndGet(rowCount);
-            try (ArrowRecordBatch recordBatch = new VectorUnloader(root).getRecordBatch()) {
-              expectedBytesRead.addAndGet(recordBatch.computeBodyLength());
-            }
-            for (int i = 0; i < rowCount; i++) {
-              int value = (int) root.getVector("column1").getObject(i);
-              assertEquals(value, rowsRead.get() - rowCount + i + 1);
-            }
-          }
-        } catch (Exception e) {
-          e.printStackTrace();
-        }
-      });
+      Thread readerThread =
+          new Thread(
+              () -> {
+                try {
+                  while (arrowWriter.loadNextBatch()) {
+                    VectorSchemaRoot root = arrowWriter.getVectorSchemaRoot();
+                    int rowCount = root.getRowCount();
+                    rowsRead.addAndGet(rowCount);
+                    try (ArrowRecordBatch recordBatch = new VectorUnloader(root).getRecordBatch()) {
+                      expectedBytesRead.addAndGet(recordBatch.computeBodyLength());
+                    }
+                    for (int i = 0; i < rowCount; i++) {
+                      int value = (int) root.getVector("column1").getObject(i);
+                      assertEquals(value, rowsRead.get() - rowCount + i + 1);
+                    }
+                  }
+                } catch (Exception e) {
+                  e.printStackTrace();
+                }
+              });
 
       writerThread.start();
       readerThread.start();

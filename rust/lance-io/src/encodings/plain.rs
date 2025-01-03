@@ -7,7 +7,6 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
-use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
 
@@ -204,21 +203,14 @@ pub fn bytes_to_array(
         let min_buffer_size = len_plus_offset.saturating_mul(*byte_width);
 
         // alignment or size isn't right -- just make a copy
-        if (bytes.len() < min_buffer_size) || (bytes.as_ptr().align_offset(*alignment) != 0) {
-            bytes.into()
+        if bytes.len() < min_buffer_size {
+            Buffer::copy_bytes_bytes(bytes, min_buffer_size)
         } else {
-            // SAFETY: the alignment is correct we can make this conversion
-            unsafe {
-                Buffer::from_custom_allocation(
-                    NonNull::new(bytes.as_ptr() as _).expect("should be a valid pointer"),
-                    bytes.len(),
-                    Arc::new(bytes),
-                )
-            }
+            Buffer::from_bytes_bytes(bytes, *alignment as u64)
         }
     } else {
         // cases we don't handle, just copy
-        bytes.into()
+        Buffer::from_slice_ref(bytes)
     };
 
     let array_data = ArrayDataBuilder::new(data_type.clone())
@@ -401,7 +393,7 @@ fn make_chunked_requests(
 }
 
 #[async_trait]
-impl<'a> Decoder for PlainDecoder<'a> {
+impl Decoder for PlainDecoder<'_> {
     async fn decode(&self) -> Result<ArrayRef> {
         self.get(0..self.length).await
     }

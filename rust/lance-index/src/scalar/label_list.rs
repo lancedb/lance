@@ -78,7 +78,7 @@ impl LabelListIndex {
     fn search_values<'a>(
         &'a self,
         values: &'a Vec<ScalarValue>,
-    ) -> BoxStream<Result<RowIdTreeMap>> {
+    ) -> BoxStream<'a, Result<RowIdTreeMap>> {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
@@ -158,7 +158,9 @@ impl ScalarIndex for LabelListIndex {
         new_data: SendableRecordBatchStream,
         dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        self.values_index.update(new_data, dest_store).await
+        self.values_index
+            .update(unnest_chunks(new_data)?, dest_store)
+            .await
     }
 }
 

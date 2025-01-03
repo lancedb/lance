@@ -9,7 +9,7 @@ use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
 use datafusion::logical_expr::{expr::ScalarFunction, BinaryExpr, Operator};
-use datafusion::logical_expr::{ScalarUDF, ScalarUDFImpl};
+use datafusion::logical_expr::{Between, ScalarUDF, ScalarUDFImpl};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::getfield::GetFieldFunc;
@@ -91,6 +91,23 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
     match expr {
+        Expr::Between(Between {
+            expr: inner_expr,
+            low,
+            high,
+            negated,
+        }) => {
+            if let Some(inner_expr_type) = resolve_column_type(inner_expr.as_ref(), schema) {
+                Ok(Expr::Between(Between {
+                    expr: inner_expr.clone(),
+                    low: Box::new(coerce_expr(low.as_ref(), &inner_expr_type)?),
+                    high: Box::new(coerce_expr(high.as_ref(), &inner_expr_type)?),
+                    negated: *negated,
+                }))
+            } else {
+                Ok(expr.clone())
+            }
+        }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             if matches!(op, Operator::And | Operator::Or) {
                 Ok(Expr::BinaryExpr(BinaryExpr {

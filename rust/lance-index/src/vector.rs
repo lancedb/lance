@@ -11,9 +11,11 @@ use arrow_schema::Field;
 use async_trait::async_trait;
 use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
+use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lazy_static::lazy_static;
+use object_store::path::Path;
 use quantizer::{QuantizationType, Quantizer};
 use v3::subindex::SubIndexType;
 
@@ -63,6 +65,12 @@ pub struct Query {
 
     /// Top k results to return.
     pub k: usize,
+
+    /// The lower bound (inclusive) of the distance to be searched.
+    pub lower_bound: Option<f32>,
+
+    /// The upper bound (exclusive) of the distance to be searched.
+    pub upper_bound: Option<f32>,
 
     /// The number of probes to load and search.
     pub nprobes: usize,
@@ -182,7 +190,21 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ///
     /// If an old row id is not in the mapping then it should be
     /// left alone.
-    fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+    async fn remap(&mut self, mapping: &HashMap<u64, Option<u64>>) -> Result<()>;
+
+    /// Remap the index according to mapping
+    ///
+    /// write the remapped index to the index_dir
+    /// this is available for only v3 index
+    async fn remap_to(
+        self: Arc<Self>,
+        _store: ObjectStore,
+        _mapping: &HashMap<u64, Option<u64>>,
+        _column: String,
+        _index_dir: Path,
+    ) -> Result<()> {
+        unimplemented!("only for v3 index")
+    }
 
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;

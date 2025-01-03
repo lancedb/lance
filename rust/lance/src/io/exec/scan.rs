@@ -159,7 +159,7 @@ impl LanceStream {
                 if let Some(next_frag) = frags_iter.next() {
                     let num_rows_in_frag = next_frag
                         .fragment
-                        .count_rows()
+                        .count_rows(None)
                         // count_rows should be a fast operation in v2 files
                         .now_or_never()
                         .ok_or(Error::Internal {

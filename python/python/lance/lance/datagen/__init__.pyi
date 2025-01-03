@@ -12,9 +12,13 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
+from typing import Optional
+
 import pyarrow as pa
 
 def rand_batches(
-    schema: pa.Schema, num_batches: int = None, batch_size_bytes: int = None
+    schema: pa.Schema,
+    num_batches: Optional[int] = None,
+    batch_size_bytes: Optional[int] = None,
 ): ...
 def is_datagen_supported() -> bool: ...

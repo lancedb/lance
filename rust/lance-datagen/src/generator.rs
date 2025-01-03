@@ -1307,6 +1307,38 @@ impl BatchGeneratorBuilder {
     }
 }
 
+/// Factory for creating a single random array
+pub struct ArrayGeneratorBuilder {
+    generator: Box<dyn ArrayGenerator>,
+    seed: Option<Seed>,
+}
+
+impl ArrayGeneratorBuilder {
+    fn new(generator: Box<dyn ArrayGenerator>) -> Self {
+        Self {
+            generator,
+            seed: None,
+        }
+    }
+
+    /// Use the given seed for the generator
+    pub fn with_seed(mut self, seed: Seed) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Generate a single array with the given length
+    pub fn into_array_rows(
+        mut self,
+        length: RowCount,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(
+            self.seed.map(|s| s.0).unwrap_or(DEFAULT_SEED.0),
+        );
+        self.generator.generate(length, &mut rng)
+    }
+}
+
 const MS_PER_DAY: i64 = 86400000;
 
 pub mod array {
@@ -1858,9 +1890,14 @@ pub mod array {
     }
 }
 
-/// Create a BatchGeneratorBuilder to start generating data
+/// Create a BatchGeneratorBuilder to start generating batch data
 pub fn gen() -> BatchGeneratorBuilder {
     BatchGeneratorBuilder::default()
+}
+
+/// Create an ArrayGeneratorBuilder to start generating array data
+pub fn gen_array(gen: Box<dyn ArrayGenerator>) -> ArrayGeneratorBuilder {
+    ArrayGeneratorBuilder::new(gen)
 }
 
 /// Create a BatchGeneratorBuilder with the given schema

@@ -3,6 +3,7 @@
 
 use arrow_array::{RecordBatch, UInt32Array};
 use futures::StreamExt;
+use lance_core::datatypes::{OnMissing, OnTypeMismatch};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_table::format::Fragment;
@@ -182,12 +183,11 @@ impl Updater {
                 final_schema.set_field_id(Some(self.fragment.dataset().manifest.max_field_id()));
                 self.final_schema = Some(final_schema);
                 self.final_schema.as_ref().unwrap().validate()?;
-                self.write_schema = Some(
-                    self.final_schema
-                        .as_ref()
-                        .unwrap()
-                        .project_by_schema(output_schema.as_ref())?,
-                );
+                self.write_schema = Some(self.final_schema.as_ref().unwrap().project_by_schema(
+                    output_schema.as_ref(),
+                    OnMissing::Error,
+                    OnTypeMismatch::Error,
+                )?);
             }
 
             self.writer = Some(
