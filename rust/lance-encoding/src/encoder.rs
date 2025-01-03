@@ -31,7 +31,6 @@ use crate::encodings::physical::bitpack_fastlanes::{
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
-use crate::encodings::physical::fixed_size_list::FslPerValueCompressor;
 use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
@@ -801,56 +800,83 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         _field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        if let DataBlock::FixedWidth(ref fixed_width_data) = data {
-            let bit_widths = data.expect_stat(Stat::BitWidth);
-            // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
-            // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
-            let has_all_zeros = bit_widths
-                .as_primitive::<UInt64Type>()
-                .values()
-                .iter()
-                .any(|v| *v == 0);
-            if !has_all_zeros
-                && (fixed_width_data.bits_per_value == 8
-                    || fixed_width_data.bits_per_value == 16
-                    || fixed_width_data.bits_per_value == 32
-                    || fixed_width_data.bits_per_value == 64)
-            {
-                return Ok(Box::new(BitpackMiniBlockEncoder::default()));
-            }
-        }
-        if let DataBlock::VariableWidth(ref variable_width_data) = data {
-            if variable_width_data.bits_per_offset == 32 {
-                let data_size =
-                    variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
-                let max_len = variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
-
-                if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
-                    && data_size >= FSST_LEAST_INPUT_SIZE as u64
+        match data {
+            DataBlock::FixedWidth(fixed_width_data) => {
+                let bit_widths = data.expect_stat(Stat::BitWidth);
+                // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
+                // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
+                let has_all_zeros = bit_widths
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .any(|v| *v == 0);
+                if !has_all_zeros
+                    && (fixed_width_data.bits_per_value == 8
+                        || fixed_width_data.bits_per_value == 16
+                        || fixed_width_data.bits_per_value == 32
+                        || fixed_width_data.bits_per_value == 64)
                 {
-                    return Ok(Box::new(FsstMiniBlockEncoder::default()));
+                    Ok(Box::new(BitpackMiniBlockEncoder::default()))
+                } else {
+                    Ok(Box::new(ValueEncoder::default()))
                 }
-                return Ok(Box::new(BinaryMiniBlockEncoder::default()));
             }
-        }
-        if let DataBlock::Struct(ref struct_data_block) = data {
-            // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
-            // just being cautious here.
-            if struct_data_block
-                .children
-                .iter()
-                .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
-            {
-                panic!("packed struct encoding currently only supports fixed-width fields.")
+            DataBlock::VariableWidth(variable_width_data) => {
+                if variable_width_data.bits_per_offset == 32 {
+                    let data_size =
+                        variable_width_data.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                    let max_len =
+                        variable_width_data.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+
+                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                    {
+                        Ok(Box::new(FsstMiniBlockEncoder::default()))
+                    } else {
+                        Ok(Box::new(BinaryMiniBlockEncoder::default()))
+                    }
+                } else {
+                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                }
             }
-            return Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()));
+            DataBlock::Struct(struct_data_block) => {
+                // this condition is actually checked at `PrimitiveStructuralEncoder::do_flush`,
+                // just being cautious here.
+                if struct_data_block
+                    .children
+                    .iter()
+                    .any(|child| !matches!(child, DataBlock::FixedWidth(_)))
+                {
+                    panic!("packed struct encoding currently only supports fixed-width fields.")
+                }
+                Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()))
+            }
+            DataBlock::FixedSizeList(_) => {
+                // In theory we could use something like bitpacking here but it's not clear it would
+                // be very effective.  At most we would shave a few bytes off the first item in the
+                // list.  It might be more sophisticated to treat the FSL as a table and bitpack each
+                // column but that would be expensive as well so it's not clear that would be a win.  For
+                // now we just don't compress FSL
+                if data.is_variable() {
+                    todo!("Implement MiniBlockCompression for variable width FSL")
+                } else {
+                    Ok(Box::new(ValueEncoder::default()))
+                }
+            }
+            _ => Err(Error::NotSupported {
+                source: format!(
+                    "Mini-block compression not yet supported for block type {}",
+                    data.name()
+                )
+                .into(),
+                location: location!(),
+            }),
         }
-        Ok(Box::new(ValueEncoder::default()))
     }
 
     fn create_per_value(
         &self,
-        field: &Field,
+        _field: &Field,
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
         match data {
@@ -860,18 +886,6 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
             }
             DataBlock::VariableWidth(_variable_width) => {
                 todo!()
-            }
-            DataBlock::FixedSizeList(fsl) => {
-                let DataType::FixedSizeList(inner_field, field_dim) = field.data_type() else {
-                    panic!("FSL data block without FSL field")
-                };
-                debug_assert_eq!(fsl.dimension, field_dim as u64);
-                let inner_compressor = self.create_per_value(
-                    &inner_field.as_ref().try_into().unwrap(),
-                    fsl.child.as_ref(),
-                )?;
-                let fsl_compressor = FslPerValueCompressor::new(inner_compressor, fsl.dimension);
-                Ok(Box::new(fsl_compressor))
             }
             _ => unreachable!(),
         }

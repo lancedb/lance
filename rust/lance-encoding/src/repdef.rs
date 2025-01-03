@@ -80,18 +80,6 @@
 //! However, in Lance we don't always take advantage of that compression because we want to be able
 //! to zip rep-def levels together with our values.  This gives us fewer IOPS when accessing row values.
 
-// TODO: Right now, if a layer has no nulls, but other layers do, then we still use
-//       up a repetition layer for the no-null spot.  For example, if we have four
-//       levels of rep: [has nulls, has nulls, no nulls, has nulls] then we will say:
-//       0 = valid
-//       1 = layer 4 null
-//       2 = layer 3 null
-//       3 = layer 2 null (useless)
-//       4 = layer 1 null
-//
-// This means we end up with 3 bits per level instead of 2.  We could instead record
-// the layers that are all null somewhere else and not require wider rep levels.
-
 use std::{
     iter::{Copied, Zip},
     sync::Arc,
@@ -129,6 +117,16 @@ struct ValidityDesc {
     num_values: usize,
 }
 
+/// Represents validity information that we extract from FSL arrays.  This is
+/// just validity (no offsets) but we also record the dimension of the FSL array
+/// as that will impact the next layer
+#[derive(Clone, Debug)]
+struct FslDesc {
+    validity: Option<BooleanBuffer>,
+    dimension: usize,
+    num_values: usize,
+}
+
 // As we build up rep/def from arrow arrays we record a
 // series of RawRepDef objects.  Each one corresponds to layer
 // in the array structure
@@ -136,6 +134,7 @@ struct ValidityDesc {
 enum RawRepDef {
     Offsets(OffsetDesc),
     Validity(ValidityDesc),
+    Fsl(FslDesc),
 }
 
 impl RawRepDef {
@@ -144,6 +143,7 @@ impl RawRepDef {
         match self {
             Self::Offsets(OffsetDesc { validity, .. }) => validity.is_some(),
             Self::Validity(ValidityDesc { validity, .. }) => validity.is_some(),
+            Self::Fsl(FslDesc { validity, .. }) => validity.is_some(),
         }
     }
 
@@ -152,6 +152,7 @@ impl RawRepDef {
         match self {
             Self::Offsets(OffsetDesc { num_values, .. }) => *num_values,
             Self::Validity(ValidityDesc { num_values, .. }) => *num_values,
+            Self::Fsl(FslDesc { num_values, .. }) => *num_values,
         }
     }
 }
@@ -504,7 +505,7 @@ impl DefinitionInterpretation {
 /// to build the actual repetition and definition levels by walking through
 /// the arrow constructs in reverse order.
 ///
-/// The algorithm for definition levels is pretty simple
+/// The algorithm for definition levels is as follows:
 ///
 /// Given:
 ///  - a validity buffer of [T, F, F, T, T]
@@ -540,6 +541,8 @@ struct SerializerContext {
     def_levels: LevelBuffer,
     current_rep: u16,
     current_def: u16,
+    // FSL layers multiply the preceding def / rep levels by the dimension
+    current_multiplier: usize,
     has_nulls: bool,
 }
 
@@ -562,6 +565,7 @@ impl SerializerContext {
             def_meaning,
             current_rep: 1,
             current_def: 1,
+            current_multiplier: 1,
             has_nulls: false,
             specials: Vec::default(),
         }
@@ -575,6 +579,12 @@ impl SerializerContext {
     }
 
     fn record_offsets(&mut self, offset_desc: &OffsetDesc) {
+        if self.current_multiplier != 1 {
+            // If we need this it isn't too terrible.  We just need to multiply all of the offsets in offset_desc by
+            // the current multiplier before we do anything with them.  Not adding at the moment simply to avoid the
+            // burden of testing
+            todo!("List<...FSL<...>> not yet supported");
+        }
         let rep_level = self.current_rep;
         let (null_list_level, empty_list_level) =
             match (offset_desc.validity.is_some(), offset_desc.has_empty_lists) {
@@ -687,11 +697,13 @@ impl SerializerContext {
                 .windows(2)
                 .zip(validity.iter())
                 .for_each(|(w, valid)| {
+                    let start = w[0] * self.current_multiplier;
+                    let end = w[1] * self.current_multiplier;
                     if !valid {
-                        self.def_levels[w[0]..w[1]].fill(null_level);
+                        self.def_levels[start..end].fill(null_level);
                     }
                 });
-        } else {
+        } else if self.current_multiplier == 1 {
             self.def_levels
                 .iter_mut()
                 .zip(validity.iter())
@@ -700,16 +712,38 @@ impl SerializerContext {
                         *def = null_level;
                     }
                 });
+        } else {
+            self.def_levels
+                .iter_mut()
+                .zip(
+                    validity
+                        .iter()
+                        .flat_map(|v| std::iter::repeat(v).take(self.current_multiplier)),
+                )
+                .for_each(|(def, valid)| {
+                    if !valid {
+                        *def = null_level;
+                    }
+                });
         }
     }
 
-    fn record_validity(&mut self, validity_desc: &ValidityDesc) {
-        if let Some(validity) = validity_desc.validity.as_ref() {
+    fn record_validity_buf(&mut self, validity: &Option<BooleanBuffer>) {
+        if let Some(validity) = validity {
             let def_level = self.checkout_def(DefinitionInterpretation::NullableItem);
             self.do_record_validity(validity, def_level);
         } else {
             self.checkout_def(DefinitionInterpretation::AllValidItem);
         }
+    }
+
+    fn record_validity(&mut self, validity_desc: &ValidityDesc) {
+        self.record_validity_buf(&validity_desc.validity)
+    }
+
+    fn record_fsl(&mut self, fsl_desc: &FslDesc) {
+        self.current_multiplier *= fsl_desc.dimension;
+        self.record_validity_buf(&fsl_desc.validity);
     }
 
     fn build(self) -> SerializedRepDefs {
@@ -767,11 +801,11 @@ pub struct RepDefBuilder {
 }
 
 impl RepDefBuilder {
-    fn check_validity_len(&mut self, validity: &NullBuffer) {
+    fn check_validity_len(&mut self, incoming_len: usize) {
         if let Some(len) = self.len {
-            assert!(validity.len() == len);
+            assert_eq!(incoming_len, len);
         }
-        self.len = Some(validity.len());
+        self.len = Some(incoming_len);
     }
 
     fn num_layers(&self) -> usize {
@@ -802,6 +836,9 @@ impl RepDefBuilder {
                 RawRepDef::Validity(ValidityDesc {
                     validity: Some(_),
                     ..
+                }) | RawRepDef::Fsl(FslDesc {
+                    validity: Some(_),
+                    ..
                 })
             )
         })
@@ -815,7 +852,7 @@ impl RepDefBuilder {
 
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
-        self.check_validity_len(&validity);
+        self.check_validity_len(validity.len());
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             num_values: validity.len(),
             validity: Some(validity.into_inner()),
@@ -824,10 +861,24 @@ impl RepDefBuilder {
 
     /// Registers an all-valid validity layer
     pub fn add_no_null(&mut self, len: usize) {
+        self.check_validity_len(len);
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             validity: None,
             num_values: len,
         }));
+    }
+
+    pub fn add_fsl(&mut self, validity: Option<NullBuffer>, dimension: usize, num_values: usize) {
+        if let Some(len) = self.len {
+            assert_eq!(num_values, len);
+        }
+        self.len = Some(num_values * dimension);
+        debug_assert!(validity.is_none() || validity.as_ref().unwrap().len() == num_values);
+        self.repdefs.push(RawRepDef::Fsl(FslDesc {
+            num_values,
+            validity: validity.map(|v| v.into_inner()),
+            dimension,
+        }))
     }
 
     fn check_offset_len(&mut self, offsets: &[i64]) {
@@ -961,36 +1012,63 @@ impl RepDefBuilder {
         layers: impl Iterator<Item = &'a RawRepDef>,
         num_layers: usize,
     ) -> RawRepDef {
+        enum LayerKind {
+            Validity,
+            Fsl,
+            Offsets,
+        }
+
         // We make two passes through the layers.  The first determines if we need to pay the cost of allocating
         // buffers.  The second pass actually adds the values.
         let mut collected = Vec::with_capacity(num_layers);
         let mut has_nulls = false;
-        let mut is_offsets = false;
+        let mut layer_kind = LayerKind::Validity;
         let mut num_specials = 0;
+        let mut all_dimension = 0;
         let mut all_has_empty_lists = false;
         let mut all_num_values = 0;
         for layer in layers {
             has_nulls |= layer.has_nulls();
-            if let RawRepDef::Offsets(OffsetDesc {
-                specials,
-                has_empty_lists,
-                ..
-            }) = layer
-            {
-                all_has_empty_lists |= *has_empty_lists;
-                is_offsets = true;
-                num_specials += specials.len();
+            match layer {
+                RawRepDef::Validity(_) => {
+                    layer_kind = LayerKind::Validity;
+                }
+                RawRepDef::Offsets(OffsetDesc {
+                    specials,
+                    has_empty_lists,
+                    ..
+                }) => {
+                    all_has_empty_lists |= *has_empty_lists;
+                    layer_kind = LayerKind::Offsets;
+                    num_specials += specials.len();
+                }
+                RawRepDef::Fsl(FslDesc { dimension, .. }) => {
+                    layer_kind = LayerKind::Fsl;
+                    all_dimension = *dimension;
+                }
             }
             collected.push(layer);
             all_num_values += layer.num_values();
         }
 
         // Shortcut if there are no nulls
-        if !has_nulls && !is_offsets {
-            return RawRepDef::Validity(ValidityDesc {
-                validity: None,
-                num_values: all_num_values,
-            });
+        if !has_nulls {
+            match layer_kind {
+                LayerKind::Validity => {
+                    return RawRepDef::Validity(ValidityDesc {
+                        validity: None,
+                        num_values: all_num_values,
+                    });
+                }
+                LayerKind::Fsl => {
+                    return RawRepDef::Fsl(FslDesc {
+                        validity: None,
+                        num_values: all_num_values,
+                        dimension: all_dimension,
+                    })
+                }
+                LayerKind::Offsets => {}
+            }
         }
 
         // Only allocate if needed
@@ -999,7 +1077,7 @@ impl RepDefBuilder {
         } else {
             BooleanBufferBuilder::new(0)
         };
-        let mut all_offsets = if is_offsets {
+        let mut all_offsets = if matches!(layer_kind, LayerKind::Offsets) {
             let mut all_offsets = Vec::with_capacity(all_num_values);
             all_offsets.push(0);
             all_offsets
@@ -1021,6 +1099,17 @@ impl RepDefBuilder {
                     num_values,
                 }) => {
                     validity_builder.append_n(*num_values, true);
+                }
+                RawRepDef::Fsl(FslDesc {
+                    validity,
+                    num_values,
+                    ..
+                }) => {
+                    if let Some(validity) = validity {
+                        validity_builder.append_buffer(validity);
+                    } else {
+                        validity_builder.append_n(*num_values, true);
+                    }
                 }
                 RawRepDef::Offsets(OffsetDesc {
                     offsets,
@@ -1073,19 +1162,23 @@ impl RepDefBuilder {
         } else {
             None
         };
-        if all_offsets.is_empty() {
-            RawRepDef::Validity(ValidityDesc {
+        match layer_kind {
+            LayerKind::Fsl => RawRepDef::Fsl(FslDesc {
                 validity,
                 num_values: all_num_values,
-            })
-        } else {
-            RawRepDef::Offsets(OffsetDesc {
+                dimension: all_dimension,
+            }),
+            LayerKind::Validity => RawRepDef::Validity(ValidityDesc {
+                validity,
+                num_values: all_num_values,
+            }),
+            LayerKind::Offsets => RawRepDef::Offsets(OffsetDesc {
                 offsets: all_offsets.into(),
                 validity,
                 has_empty_lists: all_has_empty_lists,
                 num_values: all_num_values,
                 specials: all_specials.into(),
-            })
+            }),
         }
     }
 
@@ -1128,6 +1221,9 @@ impl RepDefBuilder {
                 }
                 RawRepDef::Offsets(rep) => {
                     context.record_offsets(&rep);
+                }
+                RawRepDef::Fsl(fsl) => {
+                    context.record_fsl(&fsl);
                 }
             }
         }
@@ -1387,6 +1483,36 @@ impl RepDefUnraveler {
             validity.append(is_valid);
         }
     }
+
+    pub fn decimate(&mut self, dimension: usize) {
+        if self.rep_levels.is_some() {
+            // If we need to support this then I think we need to walk through the rep def levels to find
+            // the spots at which we keep.  E.g. if we have:
+            //  rep: 1 0 0 1 0 1 0 0 0 1 0 0
+            //  def: 1 1 1 0 1 0 1 1 0 1 1 0
+            //  dimension: 2
+            //
+            // The output should be:
+            //  rep: 1 0 0 1 0 0 0
+            //  def: 1 1 1 0 1 1 0
+            //
+            // Maybe there's some special logic for empty/null lists?  I'll save the headache for future me.
+            todo!("Not yet supported FSL<...List<...>>");
+        }
+        let Some(def_levels) = self.def_levels.as_mut() else {
+            return;
+        };
+        let mut read_idx = 0;
+        let mut write_idx = 0;
+        while read_idx < def_levels.len() {
+            unsafe {
+                *def_levels.get_unchecked_mut(write_idx) = *def_levels.get_unchecked(read_idx);
+            }
+            write_idx += 1;
+            read_idx += dimension;
+        }
+        def_levels.truncate(write_idx);
+    }
 }
 
 /// As we decode we may extract rep/def information from multiple pages (or multiple
@@ -1433,6 +1559,17 @@ impl CompositeRepDefUnraveler {
             }
             Some(NullBuffer::new(validity.finish()))
         }
+    }
+
+    pub fn unravel_fsl_validity(
+        &mut self,
+        num_values: usize,
+        dimension: usize,
+    ) -> Option<NullBuffer> {
+        for unraveler in self.unravelers.iter_mut() {
+            unraveler.decimate(dimension);
+        }
+        self.unravel_validity(num_values)
     }
 
     /// Unravels a layer of offsets (and the validity for that layer)
@@ -2049,7 +2186,9 @@ mod tests {
             offsets_32(&[0, 2, 5, 8]),
             Some(validity(&[true, false, true])),
         );
-        builder.add_no_null(8);
+        // Note: we pass 5 here and not 8.  If add_offsets tells us there is garbage nulls they
+        // should be removed before continuing
+        builder.add_no_null(5);
 
         let repdefs = RepDefBuilder::serialize(vec![builder]);
 
@@ -2065,6 +2204,89 @@ mod tests {
                 DefinitionInterpretation::NullableList,
             ],
             repdefs.def_meaning
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, false])), 2, 2);
+        builder.add_fsl(None, 2, 4);
+        builder.add_validity_bitmap(validity(&[
+            true, false, true, false, true, false, true, false,
+        ]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableItem
+            ],
+            repdefs.def_meaning
+        );
+
+        assert!(repdefs.repetition_levels.is_none());
+
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([0, 1, 0, 1, 2, 2, 2, 2], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(8),
+            Some(validity(&[
+                true, false, true, false, false, false, false, false
+            ]))
+        );
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(
+            unraveler.unravel_fsl_validity(2, 2),
+            Some(validity(&[true, false]))
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl_allvalid_item() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, false])), 2, 2);
+        builder.add_fsl(None, 2, 4);
+        builder.add_no_null(8);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableItem
+            ],
+            repdefs.def_meaning
+        );
+
+        assert!(repdefs.repetition_levels.is_none());
+
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([0, 0, 0, 0, 1, 1, 1, 1], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(8), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(
+            unraveler.unravel_fsl_validity(2, 2),
+            Some(validity(&[true, false]))
         );
     }
 
