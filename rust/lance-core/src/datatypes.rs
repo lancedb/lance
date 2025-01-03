@@ -214,19 +214,26 @@ impl TryFrom<&LogicalType> for DataType {
             let splits = lt.0.split(':').collect::<Vec<_>>();
             match splits[0] {
                 "fixed_size_list" => {
-                    if splits.len() != 3 {
+                    if splits.len() < 3 {
                         return Err(Error::Schema {
                             message: format!("Unsupported logical type: {}", lt),
                             location: location!(),
                         });
                     }
 
-                    let size: i32 = splits[2].parse::<i32>().map_err(|e: _| Error::Schema {
-                        message: e.to_string(),
-                        location: location!(),
-                    })?;
+                    let size: i32 =
+                        splits
+                            .last()
+                            .unwrap()
+                            .parse::<i32>()
+                            .map_err(|e: _| Error::Schema {
+                                message: e.to_string(),
+                                location: location!(),
+                            })?;
 
-                    match splits[1] {
+                    let inner_type = splits[1..splits.len() - 1].join(":");
+
+                    match inner_type.as_str() {
                         BFLOAT16_EXT_NAME => {
                             let field = ArrowField::new("item", Self::FixedSizeBinary(2), true)
                                 .with_metadata(
