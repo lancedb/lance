@@ -110,12 +110,14 @@ datafusion-physical-expr = { version = "42.0", features = [
     "regex_expressions",
 ] }
 deepsize = "0.2.0"
+dirs = "5.0.0"
 either = "1.0"
 fsst = { version = "=0.21.1", path = "./rust/lance-encoding/src/compression_algo/fsst" }
 futures = "0.3"
 http = "1.1.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
 itertools = "0.13"
+jieba-rs = { version = "0.7", default-features = false }
 lazy_static = "1"
 log = "0.4"
 mockall = { version = "0.13.1" }
@@ -143,6 +145,8 @@ serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.7.5"
 tantivy = { version = "0.22.0", features = ["stopwords"] }
+lindera = { version = "0.38.1"}
+lindera-tantivy = { version = "0.38.1"}
 tempfile = "3"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [

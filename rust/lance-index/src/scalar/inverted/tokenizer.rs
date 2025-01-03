@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::{env, path::PathBuf};
+
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
+
+#[cfg(feature = "tokenizer-lindera")]
+mod lindera;
+
+#[cfg(feature = "tokenizer-jieba")]
+mod jieba;
 
 /// Tokenizer configs
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +20,8 @@ pub struct TokenizerConfig {
     /// - `simple`: splits tokens on whitespace and punctuation
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
+    /// - `lindera/*`: Lindera tokenizer
+    /// - `jieba/*`: Jieba tokenizer
     ///
     /// `simple` is recommended for most cases and the default value
     base_tokenizer: String,
@@ -141,9 +151,70 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
             tantivy::tokenizer::RawTokenizer::default(),
         )
         .dynamic()),
+        #[cfg(feature = "tokenizer-lindera")]
+        s if s.starts_with("lindera/") => {
+            let Some(home) = language_model_home() else {
+                return Err(Error::invalid_input(
+                    format!("unknown base tokenizer {}", name),
+                    location!(),
+                ));
+            };
+            lindera::LinderaBuilder::load(&home.join(s))?.build()
+        }
+        #[cfg(feature = "tokenizer-jieba")]
+        s if s.starts_with("jieba/") || s == "jieba" => {
+            let s = if s == "jieba" { "jieba/default" } else { s };
+            let Some(home) = language_model_home() else {
+                return Err(Error::invalid_input(
+                    format!("unknown base tokenizer {}", name),
+                    location!(),
+                ));
+            };
+            jieba::JiebaBuilder::load(&home.join(s))?.build()
+        }
         _ => Err(Error::invalid_input(
             format!("unknown base tokenizer {}", name),
             location!(),
         )),
     }
+}
+
+pub const LANCE_LANGUAGE_MODEL_HOME_ENV_KEY: &str = "LANCE_LANGUAGE_MODEL_HOME";
+
+pub const LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY: &str = "lance/language_models";
+
+pub const LANCE_LANGUAGE_MODEL_CONFIG_FILE: &str = "config.json";
+
+pub fn language_model_home() -> Option<PathBuf> {
+    match env::var(LANCE_LANGUAGE_MODEL_HOME_ENV_KEY) {
+        Ok(p) => Some(PathBuf::from(p)),
+        Err(_) => dirs::data_local_dir().map(|p| p.join(LANCE_LANGUAGE_MODEL_DEFAULT_DIRECTORY)),
+    }
+}
+
+#[cfg(feature = "tokenizer-common")]
+trait TokenizerBuilder: Sized {
+    type Config: serde::de::DeserializeOwned + Default;
+    fn load(p: &std::path::Path) -> Result<Self> {
+        if !p.is_dir() {
+            return Err(Error::io(
+                format!("{} is not a valid directory", p.display()),
+                location!(),
+            ));
+        }
+        use std::{fs::File, io::BufReader};
+        let config_path = p.join(LANCE_LANGUAGE_MODEL_CONFIG_FILE);
+        let config = if config_path.exists() {
+            let file = File::open(config_path)?;
+            let reader = BufReader::new(file);
+            serde_json::from_reader::<BufReader<File>, Self::Config>(reader)?
+        } else {
+            Self::Config::default()
+        };
+        Self::new(config, p)
+    }
+
+    fn new(config: Self::Config, root: &std::path::Path) -> Result<Self>;
+
+    fn build(&self) -> Result<tantivy::tokenizer::TextAnalyzerBuilder>;
 }
