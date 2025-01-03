@@ -705,14 +705,24 @@ fn inner_latest_version(env: &mut JNIEnv, java_dataset: JObject) -> Result<u64> 
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeCountRows(
     mut env: JNIEnv,
     java_dataset: JObject,
+    filter_jobj: JObject, // Optional<String>
 ) -> jlong {
-    ok_or_throw_with_return!(env, inner_count_rows(&mut env, java_dataset), -1) as jlong
+    ok_or_throw_with_return!(
+        env,
+        inner_count_rows(&mut env, java_dataset, filter_jobj),
+        -1
+    ) as jlong
 }
 
-fn inner_count_rows(env: &mut JNIEnv, java_dataset: JObject) -> Result<usize> {
+fn inner_count_rows(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    filter_jobj: JObject,
+) -> Result<usize> {
+    let filter = env.get_string_opt(&filter_jobj)?;
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-    dataset_guard.count_rows(None)
+    dataset_guard.count_rows(filter)
 }
 
 #[no_mangle]

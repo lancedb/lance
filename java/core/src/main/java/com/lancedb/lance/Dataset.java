@@ -428,11 +428,26 @@ public class Dataset implements Closeable {
   public long countRows() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCountRows();
+      return nativeCountRows(Optional.empty());
     }
   }
 
-  private native long nativeCountRows();
+  /**
+   * Count the number of rows in the dataset.
+   *
+   * @param filter the filter expr to count row
+   * @return num of rows
+   */
+  public long countRows(String filter) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          null != filter && !filter.isEmpty(), "filter cannot be null or empty");
+      return nativeCountRows(Optional.of(filter));
+    }
+  }
+
+  private native long nativeCountRows(Optional<String> filter);
 
   /**
    * Get all fragments in this dataset.

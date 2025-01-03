@@ -336,4 +336,24 @@ public class DatasetTest {
       }
     }
   }
+
+  @Test
+  void testCountRows() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        assertEquals(5, dataset2.countRows());
+        // get id = 3 and 4
+        assertEquals(2, dataset2.countRows("id > 2"));
+
+        assertThrows(IllegalArgumentException.class, () -> dataset2.countRows(null));
+        assertThrows(IllegalArgumentException.class, () -> dataset2.countRows(""));
+      }
+    }
+  }
 }
