@@ -119,7 +119,7 @@ impl ScalarQuantizer {
             .as_slice();
 
         // TODO: support SQ4
-        let builder: Vec<u8> = scale_to_u8::<T>(data, self.bounds.clone());
+        let builder: Vec<u8> = scale_to_u8::<T>(data, &self.bounds);
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
             UInt8Array::from(builder),
@@ -232,7 +232,7 @@ impl Quantization for ScalarQuantizer {
     }
 }
 
-pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: Range<f64>) -> Vec<u8> {
+pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Range<f64>) -> Vec<u8> {
     let range = bounds.end - bounds.start;
     values
         .iter()
@@ -247,6 +247,16 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: Range
                     .unwrap(),
             }
         })
+        .collect_vec()
+}
+
+pub(crate) fn inverse_scalar_dist(
+    values: impl Iterator<Item = f32>,
+    bounds: &Range<f64>,
+) -> Vec<f32> {
+    let range = (bounds.end - bounds.start) as f32;
+    values
+        .map(|v| v * range.powi(2) / 255.0.powi(2))
         .collect_vec()
 }
 #[cfg(test)]

@@ -88,6 +88,7 @@ impl IvfSubIndex for FlatIndex {
                     dist: OrderedFloat(dist),
                 })
                 .sorted_unstable()
+                .unique_by(|r| r.id)
                 .take(k)
                 .map(
                     |OrderedNode {
@@ -105,6 +106,7 @@ impl IvfSubIndex for FlatIndex {
                         dist: OrderedFloat(dist_calc.distance(id as u32)),
                     })
                     .sorted_unstable()
+                    .unique_by(|r| r.id)
                     .take(k)
                     .map(
                         |OrderedNode {
