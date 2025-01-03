@@ -108,6 +108,13 @@ def test_sql_predicates(dataset):
         assert dataset.to_table(filter=expr).num_rows == expected_num_rows
 
 
+def test_illegal_predicates(dataset):
+    predicates_nrows = ["str BETWEEN 10 AND 20", "str > 10"]
+    for expr in predicates_nrows:
+        with pytest.raises(ValueError, match="Invalid user input: *"):
+            dataset.to_table(filter=expr)
+
+
 def test_compound(dataset):
     predicates = [
         pc.field("int") >= 50,
