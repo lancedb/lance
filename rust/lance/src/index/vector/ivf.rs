@@ -1978,6 +1978,8 @@ mod tests {
                     column: Self::COLUMN.to_string(),
                     key: Arc::new(row),
                     k: 5,
+                    lower_bound: None,
+                    upper_bound: None,
                     nprobes: 1,
                     ef: None,
                     refine_factor: None,

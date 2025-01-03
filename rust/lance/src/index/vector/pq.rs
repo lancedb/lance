@@ -5,25 +5,25 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 use arrow::compute::concat;
-use arrow_array::UInt32Array;
 use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
+use arrow_array::{Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::DataType;
 use arrow_select::take::take;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
-use lance_core::{utils::address::RowAddress, ROW_ID_FIELD};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
-    vector::{pq::ProductQuantizer, Query, DIST_COL},
+    vector::{pq::ProductQuantizer, Query},
     Index, IndexType,
 };
 use lance_io::{traits::Reader, utils::read_fixed_stride_array};
@@ -41,6 +41,7 @@ use lance_linalg::kernels::normalize_fsl;
 use super::VectorIndex;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
+use crate::io::exec::knn::KNN_INDEX_SCHEMA;
 use crate::{arrow::*, Dataset};
 use crate::{Error, Result};
 
@@ -226,15 +227,42 @@ impl VectorIndex for PQIndex {
             debug_assert_eq!(distances.len(), row_ids.len());
 
             let limit = query.k * query.refine_factor.unwrap_or(1) as usize;
-            let indices = sort_to_indices(&distances, None, Some(limit))?;
-            let distances = take(&distances, &indices, None)?;
-            let row_ids = take(row_ids.as_ref(), &indices, None)?;
+            if query.lower_bound.is_none() && query.upper_bound.is_none() {
+                let indices = sort_to_indices(&distances, None, Some(limit))?;
+                let distances = take(&distances, &indices, None)?;
+                let row_ids = take(row_ids.as_ref(), &indices, None)?;
+                Ok(RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![distances, row_ids],
+                )?)
+            } else {
+                let indices = sort_to_indices(&distances, None, None)?;
+                let mut dists = Vec::with_capacity(limit);
+                let mut ids = Vec::with_capacity(limit);
+                for idx in indices.values().iter() {
+                    let dist = distances.value(*idx as usize);
+                    let id = row_ids.value(*idx as usize);
+                    if query.lower_bound.map_or(false, |lb| dist < lb) {
+                        continue;
+                    }
+                    if query.upper_bound.map_or(false, |ub| dist >= ub) {
+                        break;
+                    }
 
-            let schema = Arc::new(ArrowSchema::new(vec![
-                ArrowField::new(DIST_COL, DataType::Float32, true),
-                ROW_ID_FIELD.clone(),
-            ]));
-            Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+                    dists.push(dist);
+                    ids.push(id);
+
+                    if dists.len() >= limit {
+                        break;
+                    }
+                }
+                let dists = Arc::new(Float32Array::from(dists));
+                let ids = Arc::new(UInt64Array::from(ids));
+                Ok(RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![dists, ids],
+                )?)
+            }
         })
         .await
     }
