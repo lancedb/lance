@@ -746,8 +746,7 @@ fn inner_get_data_statistics<'local>(
     let stats = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        let stats = dataset_guard.calculate_data_stats()?;
-        stats
+        dataset_guard.calculate_data_stats()?
     };
     let data_stats = env.new_object("com/lancedb/lance/ipc/DataStatistics", "()V", &[])?;
 
