@@ -18,25 +18,22 @@ import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 import com.lancedb.lance.spark.utils.Optional;
 
 import org.apache.spark.sql.connector.read.Statistics;
-import org.apache.spark.sql.types.StructType;
 
 import java.util.OptionalLong;
 
 public class LanceStatistics implements Statistics {
   private final Optional<Long> rowNumber;
-  private final Optional<StructType> schema;
+  private final Optional<Long> dataBytesSize;
 
   public LanceStatistics(LanceConfig config) {
     this.rowNumber = LanceDatasetAdapter.getDatasetRowCount(config);
-    this.schema = LanceDatasetAdapter.getSchema(config);
+    this.dataBytesSize = LanceDatasetAdapter.getDatasetDataSize(config);
   }
 
   @Override
   public OptionalLong sizeInBytes() {
-    // TODO: Support quickly get the bytes on disk for the lance dataset
-    // Now use schema to infer the byte size for simple
-    if (rowNumber.isPresent()) {
-      return OptionalLong.of(schema.get().defaultSize() * rowNumber.get());
+    if (dataBytesSize.isPresent()) {
+      return OptionalLong.of(dataBytesSize.get());
     } else {
       return OptionalLong.empty();
     }

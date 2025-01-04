@@ -67,6 +67,17 @@ public class LanceDatasetAdapter {
     }
   }
 
+  public static Optional<Long> getDatasetDataSize(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    try (Dataset dataset = Dataset.open(allocator, uri, options)) {
+      return Optional.of(dataset.calculateDataSize());
+    } catch (IllegalArgumentException e) {
+      // dataset not found
+      return Optional.empty();
+    }
+  }
+
   public static List<Integer> getFragmentIds(LanceConfig config) {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
