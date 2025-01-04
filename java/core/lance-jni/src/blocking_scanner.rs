@@ -79,7 +79,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     offset_obj: JObject,           // Optional<Integer>
     query_obj: JObject,            // Optional<Query>
     with_row_id: jboolean,         // boolean
-    with_row_address: jboolean,       // boolean
+    with_row_address: jboolean,    // boolean
     batch_readahead: jint,         // int
     column_orderings: JObject,     // Optional<List<ColumnOrdering>>
 ) -> JObject<'local> {
