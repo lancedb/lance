@@ -2209,6 +2209,7 @@ class LanceDataset(pa.dataset.Dataset):
     def commit(
         base_uri: Union[str, Path, LanceDataset],
         operation: LanceOperation.BaseOperation,
+        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -2320,10 +2321,10 @@ class LanceDataset(pa.dataset.Dataset):
                 "read_version is required for all operations except "
                 "Overwrite and Restore"
             )
-
         new_ds = _Dataset.commit(
             base_uri,
             operation,
+            blobs_op,
             read_version,
             commit_lock,
             storage_options=storage_options,
@@ -2591,10 +2592,8 @@ class LanceOperation:
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
-            if not isinstance(self.new_schema, pa.Schema):
-                raise TypeError(
-                    f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
-                )
+            if isinstance(self.new_schema, pa.Schema):
+                self.new_schema = LanceSchema.from_pyarrow(self.new_schema)
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
