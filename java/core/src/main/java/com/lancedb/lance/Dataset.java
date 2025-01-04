@@ -1,15 +1,16 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed under the License
- * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
- * or implied. See the License for the specific language governing permissions and limitations under
- * the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import com.lancedb.lance.index.IndexParams;
@@ -425,14 +426,29 @@ public class Dataset implements Closeable {
    *
    * @return num of rows
    */
-  public int countRows() {
+  public long countRows() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCountRows();
+      return nativeCountRows(Optional.empty());
     }
   }
 
-  private native int nativeCountRows();
+  /**
+   * Count the number of rows in the dataset.
+   *
+   * @param filter the filter expr to count row
+   * @return num of rows
+   */
+  public long countRows(String filter) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          null != filter && !filter.isEmpty(), "filter cannot be null or empty");
+      return nativeCountRows(Optional.of(filter));
+    }
+  }
+
+  private native long nativeCountRows(Optional<String> filter);
 
   /**
    * Get all fragments in this dataset.

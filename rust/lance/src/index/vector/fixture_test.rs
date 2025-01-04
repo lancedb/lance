@@ -233,6 +233,8 @@ mod test {
                 column: "test".to_string(),
                 key: Arc::new(Float32Array::from(query)),
                 k: 1,
+                lower_bound: None,
+                upper_bound: None,
                 nprobes: 1,
                 ef: None,
                 refine_factor: None,

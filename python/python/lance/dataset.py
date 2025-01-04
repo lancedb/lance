@@ -3449,6 +3449,21 @@ class Tags:
         self._ds.update_tag(tag, version)
 
 
+@dataclass
+class FieldStatistics:
+    """Statistics about a field in the dataset"""
+
+    id: int  #: id of the field
+    bytes_on_disk: int  #: (possibly compressed) bytes on disk used to store the field
+
+
+@dataclass
+class DataStatistics:
+    """Statistics about the data in the dataset"""
+
+    fields: FieldStatistics  #: Statistics about the fields in the dataset
+
+
 class DatasetStats(TypedDict):
     num_deleted_rows: int
     num_fragments: int
@@ -3484,6 +3499,12 @@ class LanceStats:
         """
         index_stats = json.loads(self._ds.index_statistics(index_name))
         return index_stats
+
+    def data_stats(self) -> DataStatistics:
+        """
+        Statistics about the data in the dataset.
+        """
+        return self._ds.data_stats()
 
 
 def write_dataset(

@@ -56,6 +56,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod statistics;
 mod take;
 pub mod transaction;
 pub mod updater;

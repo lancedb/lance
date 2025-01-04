@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.*;
@@ -51,6 +50,17 @@ public class LanceDatasetAdapter {
   public static Optional<StructType> getSchema(String datasetUri) {
     try (Dataset dataset = Dataset.open(datasetUri, allocator)) {
       return Optional.of(LanceArrowUtils.fromArrowSchema(dataset.getSchema()));
+    } catch (IllegalArgumentException e) {
+      // dataset not found
+      return Optional.empty();
+    }
+  }
+
+  public static Optional<Long> getDatasetRowCount(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    try (Dataset dataset = Dataset.open(allocator, uri, options)) {
+      return Optional.of(dataset.countRows());
     } catch (IllegalArgumentException e) {
       // dataset not found
       return Optional.empty();

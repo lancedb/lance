@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use datafusion::{
@@ -577,6 +577,7 @@ impl BTreeLookup {
             .iter()
             .flat_map(|(_, pages)| pages)
             .map(|page| page.page_number)
+            .chain(self.null_pages.iter().copied())
             .collect::<Vec<_>>();
         ids.dedup();
         ids
@@ -792,10 +793,9 @@ impl BTreeIndex {
         let mut null_pages = Vec::<u32>::new();
 
         if data.num_rows() == 0 {
-            return Err(Error::Internal {
-                message: "attempt to load btree index from empty stats batch".into(),
-                location: location!(),
-            });
+            let data_type = data.column(0).data_type().clone();
+            let sub_index = Arc::new(FlatIndexMetadata::new(data_type));
+            return Ok(Self::new(map, null_pages, store, sub_index, batch_size));
         }
 
         let mins = data.column(0);
@@ -1139,9 +1139,17 @@ async fn train_btree_page(
     })
 }
 
-fn btree_stats_as_batch(stats: Vec<EncodedBatch>) -> Result<RecordBatch> {
-    let mins = ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.min.clone()))?;
-    let maxs = ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.max.clone()))?;
+fn btree_stats_as_batch(stats: Vec<EncodedBatch>, value_type: &DataType) -> Result<RecordBatch> {
+    let mins = if stats.is_empty() {
+        new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.min.clone()))?
+    };
+    let maxs = if stats.is_empty() {
+        new_empty_array(value_type)
+    } else {
+        ScalarValue::iter_to_array(stats.iter().map(|stat| stat.stats.max.clone()))?
+    };
     let null_counts = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.stats.null_count));
     let page_numbers = UInt32Array::from_iter_values(stats.iter().map(|stat| stat.page_number));
 
@@ -1207,6 +1215,7 @@ pub async fn train_btree_index(
     let mut encoded_batches = Vec::new();
     let mut batch_idx = 0;
     let mut batches_source = data_source.scan_ordered_chunks(batch_size).await?;
+    let value_type = batches_source.schema().field(0).data_type().clone();
     while let Some(batch) = batches_source.try_next().await? {
         debug_assert_eq!(batch.num_columns(), 2);
         debug_assert_eq!(*batch.column(1).data_type(), DataType::UInt64);
@@ -1216,7 +1225,7 @@ pub async fn train_btree_index(
         batch_idx += 1;
     }
     sub_index_file.finish().await?;
-    let record_batch = btree_stats_as_batch(encoded_batches)?;
+    let record_batch = btree_stats_as_batch(encoded_batches, &value_type)?;
     let mut file_schema = record_batch.schema().as_ref().clone();
     file_schema
         .metadata
