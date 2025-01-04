@@ -225,8 +225,8 @@ fn create_fragment<'a>(
 const DATA_FILE_CLASS: &str = "com/lancedb/lance/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[III)V";
 const DELETE_FILE_CLASS: &str = "com/lancedb/lance/DeletionFile";
-const DELETE_FILE_CONSTRUCTOR_SIG: &str = "(JIILcom/lancedb/lance/DataFile;)V";
-const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFile$FileType";
+const DELETE_FILE_CONSTRUCTOR_SIG: &str = "(JJLjava/lang/Long;Lcom/lancedb/lance/DeletionFileType;)V";
+const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/DeletionFile;Lcom/lancedb/lance/RowIdMeta;)V";
 const ROW_ID_META_CLASS: &str = "com/lancedb/lance/RowIdMeta";
@@ -257,7 +257,7 @@ impl IntoJava for &DeletionFileType {
             lance::table::format::DeletionFileType::Array => "ARRAY",
             lance::table::format::DeletionFileType::Bitmap => "BITMAP",
         };
-        env.get_static_field(DELETE_FILE_TYPE_CLASS, name, DELETE_FILE_TYPE_CLASS)?
+        env.get_static_field(DELETE_FILE_TYPE_CLASS, name, format!("L{};", DELETE_FILE_TYPE_CLASS))?
             .l()
             .map_err(|e| {
                 Error::runtime_error(format!("failed to get {}: {}", DELETE_FILE_TYPE_CLASS, e))

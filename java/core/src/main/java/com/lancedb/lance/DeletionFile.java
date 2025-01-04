@@ -20,17 +20,12 @@ import java.io.Serializable;
 public class DeletionFile implements Serializable {
   private static final long serialVersionUID = 3786348766842875859L;
 
-  public enum FileType {
-    ARRAY,
-    BITMAP,
-  }
-
   private final long id;
   private final long readVersion;
   private final Long numDeletedRows;
-  private final FileType fileType;
+  private final DeletionFileType fileType;
 
-  public DeletionFile(long id, long readVersion, Long numDeletedRows, FileType fileType) {
+  public DeletionFile(long id, long readVersion, Long numDeletedRows, DeletionFileType fileType) {
     this.id = id;
     this.readVersion = readVersion;
     this.numDeletedRows = numDeletedRows;
@@ -49,7 +44,7 @@ public class DeletionFile implements Serializable {
     return numDeletedRows;
   }
 
-  public FileType getFileType() {
+  public DeletionFileType getFileType() {
     return fileType;
   }
 
