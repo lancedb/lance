@@ -357,7 +357,7 @@ def test_create_from_file(tmp_path):
         new_fragments=[frag],
     )
     op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
-    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
 
     assert dataset.count_rows() == 1600
     assert len(dataset.get_fragments()) == 1
