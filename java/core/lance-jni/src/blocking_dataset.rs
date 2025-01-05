@@ -30,6 +30,7 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::Operation;
 use lance::dataset::{ColumnAlteration, Dataset, ProjectionRequest, ReadParams, WriteParams};
 use lance::io::{ObjectStore, ObjectStoreParams};
@@ -152,6 +153,11 @@ impl BlockingDataset {
     pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         let rows = RT.block_on(self.inner.count_rows(filter))?;
         Ok(rows)
+    }
+
+    pub fn calculate_data_stats(&self) -> Result<DataStatistics> {
+        let stats = RT.block_on(Arc::new(self.clone().inner).calculate_data_stats())?;
+        Ok(stats)
     }
 
     pub fn list_indexes(&self) -> Result<Arc<Vec<Index>>> {
@@ -723,6 +729,43 @@ fn inner_count_rows(
     let dataset_guard =
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
     dataset_guard.count_rows(filter)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetDataStatistics<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_data_statistics(&mut env, java_dataset))
+}
+
+fn inner_get_data_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let stats = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.calculate_data_stats()?
+    };
+    let data_stats = env.new_object("com/lancedb/lance/ipc/DataStatistics", "()V", &[])?;
+
+    for field in stats.fields {
+        let id = field.id as jint;
+        let byte_size = field.bytes_on_disk as jlong;
+        let filed_jobj = env.new_object(
+            "com/lancedb/lance/ipc/FieldStatistics",
+            "(IJ)V",
+            &[JValue::Int(id), JValue::Long(byte_size)],
+        )?;
+        env.call_method(
+            &data_stats,
+            "addFiledStatistics",
+            "(Lcom/lancedb/lance/ipc/FieldStatistics;)V",
+            &[JValue::Object(&filed_jobj)],
+        )?;
+    }
+    Ok(data_stats)
 }
 
 #[no_mangle]

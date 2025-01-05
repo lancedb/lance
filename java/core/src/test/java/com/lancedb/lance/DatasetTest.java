@@ -358,4 +358,19 @@ public class DatasetTest {
       }
     }
   }
+
+  @Test
+  void testCalculateDataSize() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        assertEquals(100, dataset2.calculateDataSize());
+      }
+    }
+  }
 }
