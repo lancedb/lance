@@ -33,6 +33,7 @@ public class DataStatistics implements Serializable {
     return fields;
   }
 
+  // get total data size of the whole dataset in bytes
   public long getDataSize() {
     return fields.stream().mapToLong(FieldStatistics::getDataSize).sum();
   }

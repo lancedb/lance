@@ -17,6 +17,7 @@ import java.io.Serializable;
 
 public class FieldStatistics implements Serializable {
   private final int id;
+  // The size of the data in bytes
   private final long dataSize;
 
   public FieldStatistics(int id, long dataSize) {
