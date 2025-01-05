@@ -207,7 +207,7 @@ impl ReadBatchParams {
             Self::Range(r) => Ok(UInt32Array::from(Vec::from_iter(
                 r.start as u32..r.end as u32,
             ))),
-            Self::RangeFull => Ok(UInt32Array::from(Vec::from_iter(0 as u32..total))),
+            Self::RangeFull => Ok(UInt32Array::from(Vec::from_iter(0_u32..total))),
             Self::RangeTo(r) => Ok(UInt32Array::from(Vec::from_iter(0..r.end as u32))),
             Self::RangeFrom(r) => Ok(UInt32Array::from(Vec::from_iter(r.start as u32..total))),
         }
