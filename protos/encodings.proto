@@ -230,15 +230,8 @@ message Binary {
   uint64 null_adjustment = 3;
 }
 
-message BinaryMiniBlock {
-}
-
-message BinaryBlock {
-}
-
-message FsstMiniBlock {
-  ArrayEncoding BinaryMiniBlock = 1;
-  bytes symbol_table = 2;
+message Variable {
+  uint32 bits_per_offset = 1;
 }
 
 message Fsst {
@@ -285,10 +278,8 @@ message ArrayEncoding {
         BitpackedForNonNeg bitpacked_for_non_neg = 12;
         Constant constant = 13;
         Bitpack2 bitpack2 = 14;
-        BinaryMiniBlock binary_mini_block = 15;
-        FsstMiniBlock fsst_mini_block = 16;
-        BinaryBlock binary_block = 17;
-        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 18;
+        Variable variable = 15;
+        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 16;
     }
 }
 
@@ -316,6 +307,34 @@ message ColumnEncoding {
   }
 }
 
+// # Standardized Interpretation of Counting Terms
+//
+// When working with 2.1 encodings we have a number of different "counting terms" and it can be
+// difficult to understand what we mean when we are talking about a "number of values".  Here is
+// a standard interpretation of these terms:
+//
+// TODO: This is a newly added standardization and hasn't yet been applied to all code.
+//
+// To understand these definitions consider a data type FIXED_SIZE_LIST<LIST<INT32>>.
+//
+// A "value" is an abstract term when we aren't being specific.
+//
+// - num_rows: This is the highest level counting term.  A single row includes everything in the
+//             fixed size list.  This is what the user asks for when they asks for a range of rows.
+// - num_elements: The number of elements is the number of rows multiplied by the dimension of any
+//             fixed size list wrappers.  This is what you get when you flatten the FSL layer and
+//             is the starting point for structural encoding.  Note that an element can be a list
+//             value or a single primitive value.
+// - num_items: The number of items is the number of values in the repetition and definition vectors
+//             after everything has been flattened.
+// - num_visible_items: The number of visible items is the number of items after invisible items
+//             have been removed.  Invisible items are rep/def levels that don't correspond to an
+//             actual value.
+//
+// Note that we haven't exactly defined LIST<FIXED_SIZE_LIST<..>> yet.  Both FIXED_SIZE_LIST<LIST<..>>
+// and LIST<FIXED_SIZE_LIST<..>> haven't been fully implemented and tested.
+
+/// Describes the meaning of each repdef layer in a mini-block layout
 enum RepDefLayer {
   // Should never be used, included for debugging purporses and general protobuf best practice
   REPDEF_UNSPECIFIED = 0;
@@ -375,10 +394,25 @@ message FullZipLayout {
   uint32 bits_rep = 1;
   // The number of bits of definition info (0 if there is no definition)
   uint32 bits_def = 2;
+  // The number of bits of value info
+  //
+  // Note: we use bits here (and not bytes) for consistency with other encodings.  However, in practice,
+  // there is never a reason to use a bits per value that is not a multiple of 8.  The complexity is not
+  // worth the small savings in space since this encoding is typically used with large values already.
+  oneof details {
+    // If this is a fixed width block then we need to have a fixed number of bits per value
+    uint32 bits_per_value = 3;
+    // If this is a variable width block then we need to have a fixed number of bits per offset
+    uint32 bits_per_offset = 4;
+  }
+  // The number of items in the page
+  uint32 num_items = 5;
+  // The number of visible items in the page
+  uint32 num_visible_items = 6;
   // Description of the compression of values
-  ArrayEncoding value_compression = 3;
+  ArrayEncoding value_compression = 7;
   // The meaning of each repdef layer, used to interpret repdef buffers correctly
-  repeated RepDefLayer layers = 4;
+  repeated RepDefLayer layers = 8;
 }
 
 /// A layout used for pages where all values are null

@@ -1783,6 +1783,7 @@ pub enum ControlWordIterator<'a> {
 }
 
 /// Describes the properties of a control word
+#[derive(Debug)]
 pub struct ControlWordDesc {
     pub is_new_row: bool,
     pub is_visible: bool,

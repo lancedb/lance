@@ -235,7 +235,7 @@ use lance_core::{Error, Result};
 use tracing::instrument;
 
 use crate::buffer::LanceBuffer;
-use crate::data::DataBlock;
+use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
 use crate::encoder::{values_column_encoding, EncodedBatch};
 use crate::encodings::logical::binary::BinaryFieldScheduler;
 use crate::encodings::logical::blob::BlobFieldScheduler;
@@ -248,7 +248,9 @@ use crate::encodings::logical::primitive::{
 use crate::encodings::logical::r#struct::{
     SimpleStructDecoder, SimpleStructScheduler, StructuralStructDecoder, StructuralStructScheduler,
 };
-use crate::encodings::physical::binary::{BinaryBlockDecompressor, BinaryMiniBlockDecompressor};
+use crate::encodings::physical::binary::{
+    BinaryBlockDecompressor, BinaryMiniBlockDecompressor, VariableDecoder,
+};
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
 use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
@@ -459,15 +461,18 @@ pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
 }
 
-pub trait PerValueDecompressor: std::fmt::Debug + Send + Sync {
+pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+    fn decompress(&self, data: FixedWidthDataBlock) -> Result<DataBlock>;
     /// The number of bits in each value
-    ///
-    /// Returns 0 if the data type is variable-width
     ///
     /// Currently (and probably long term) this must be a multiple of 8
     fn bits_per_value(&self) -> u64;
+}
+
+pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
+    /// Decompress one or more values
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
 }
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
@@ -480,10 +485,15 @@ pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
         description: &pb::ArrayEncoding,
     ) -> Result<Box<dyn MiniBlockDecompressor>>;
 
-    fn create_per_value_decompressor(
+    fn create_fixed_per_value_decompressor(
         &self,
         description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn PerValueDecompressor>>;
+    ) -> Result<Box<dyn FixedPerValueDecompressor>>;
+
+    fn create_variable_per_value_decompressor(
+        &self,
+        description: &pb::ArrayEncoding,
+    ) -> Result<Box<dyn VariablePerValueDecompressor>>;
 
     fn create_block_decompressor(
         &self,
@@ -506,10 +516,10 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::Bitpack2(description) => {
                 Ok(Box::new(BitpackMiniBlockDecompressor::new(description)))
             }
-            pb::array_encoding::ArrayEncoding::BinaryMiniBlock(_) => {
+            pb::array_encoding::ArrayEncoding::Variable(_) => {
                 Ok(Box::new(BinaryMiniBlockDecompressor::default()))
             }
-            pb::array_encoding::ArrayEncoding::FsstMiniBlock(description) => {
+            pb::array_encoding::ArrayEncoding::Fsst(description) => {
                 Ok(Box::new(FsstMiniBlockDecompressor::new(description)))
             }
             pb::array_encoding::ArrayEncoding::PackedStructFixedWidthMiniBlock(description) => {
@@ -521,15 +531,28 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
         }
     }
 
-    fn create_per_value_decompressor(
+    fn create_fixed_per_value_decompressor(
         &self,
         description: &pb::ArrayEncoding,
-    ) -> Result<Box<dyn PerValueDecompressor>> {
+    ) -> Result<Box<dyn FixedPerValueDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
                 Ok(Box::new(ValueDecompressor::new(flat)))
             }
-            _ => todo!(),
+            _ => todo!("fixed-per-value decompressor for {:?}", description),
+        }
+    }
+
+    fn create_variable_per_value_decompressor(
+        &self,
+        description: &pb::ArrayEncoding,
+    ) -> Result<Box<dyn VariablePerValueDecompressor>> {
+        match description.array_encoding.as_ref().unwrap() {
+            &pb::array_encoding::ArrayEncoding::Variable(variable) => {
+                assert!(variable.bits_per_offset < u8::MAX as u32);
+                Ok(Box::new(VariableDecoder::default()))
+            }
+            _ => todo!("variable-per-value decompressor for {:?}", description),
         }
     }
 
@@ -548,7 +571,7 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
                     constant.num_values,
                 )))
             }
-            pb::array_encoding::ArrayEncoding::BinaryBlock(_) => {
+            pb::array_encoding::ArrayEncoding::Variable(_) => {
                 Ok(Box::new(BinaryBlockDecompressor::default()))
             }
             _ => todo!(),
