@@ -66,6 +66,7 @@ pub async fn take(
             addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
         };
+
         let row_addr =
             RowAddress::new_from_parts(cur_frag.id() as u32, (sorted_offset - frag_offset) as u32);
         addrs.push(u64::from(row_addr));
@@ -74,11 +75,12 @@ pub async fn take(
     // Restore the original order
     perm.apply_inv_slice_in_place(&mut addrs);
 
-    let builder = TakeBuilder::try_new_from_addresses(
+    let mut builder = TakeBuilder::try_new_from_addresses(
         Arc::new(dataset.clone()),
         addrs,
         Arc::new(projection),
     )?;
+    builder = builder.skip_deleted_row(true);
 
     take_rows(builder).await
 }
@@ -108,10 +110,16 @@ async fn do_take_rows(
         row_offsets: Vec<u32>,
         projection: Arc<Schema>,
         with_row_addresses: bool,
+        skip_deleted_rows: bool,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
-                .take_rows(&row_offsets, projection.as_ref(), with_row_addresses)
+                .take_rows(
+                    &row_offsets,
+                    projection.as_ref(),
+                    with_row_addresses,
+                    skip_deleted_rows,
+                )
                 .await
         }
     }
@@ -134,7 +142,9 @@ async fn do_take_rows(
         let reader = fragment
             .open(&projection.physical_schema, FragReadConfig::default(), None)
             .await?;
-        reader.legacy_read_range_as_batch(range).await
+        reader
+            .legacy_read_range_as_batch_with_skip_deleted_rows(range, builder.skip_deleted_row)
+            .await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
 
@@ -180,6 +190,7 @@ async fn do_take_rows(
                 row_offsets,
                 projection.physical_schema.clone(),
                 false,
+                builder.skip_deleted_row,
             );
             batches.push(batch_fut);
         }
@@ -224,7 +235,13 @@ async fn do_take_rows(
 
         let mut batches = futures::stream::iter(fragment_and_indices)
             .map(|(fragment, indices)| {
-                do_take(fragment, indices, projection.physical_schema.clone(), true)
+                do_take(
+                    fragment,
+                    indices,
+                    projection.physical_schema.clone(),
+                    true,
+                    builder.skip_deleted_row,
+                )
             })
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
@@ -445,6 +462,7 @@ pub struct TakeBuilder {
     row_addrs: Option<Vec<u64>>,
     projection: Arc<ProjectionPlan>,
     with_row_address: bool,
+    skip_deleted_row: bool,
 }
 
 impl TakeBuilder {
@@ -460,6 +478,7 @@ impl TakeBuilder {
             projection: Arc::new(projection.into_projection_plan(dataset.schema())?),
             dataset,
             with_row_address: false,
+            skip_deleted_row: false,
         })
     }
 
@@ -475,12 +494,18 @@ impl TakeBuilder {
             projection,
             dataset,
             with_row_address: false,
+            skip_deleted_row: false,
         })
     }
 
     /// Adds row addresses to the output
     pub fn with_row_address(mut self, with_row_address: bool) -> Self {
         self.with_row_address = with_row_address;
+        self
+    }
+
+    pub fn skip_deleted_row(mut self, skip_deleted_row: bool) -> Self {
+        self.skip_deleted_row = skip_deleted_row;
         self
     }
 
@@ -669,6 +694,224 @@ mod test {
 
         let values2 = dataset.take_rows(&[10, 50, 100], projection).await.unwrap();
         assert_eq!(values, values2);
+    }
+
+    // #[rstest]
+    #[tokio::test]
+    async fn test_take_when_deleted_rows_in_front_of_fragment(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        // data_storage_version: LanceFileVersion::Stable,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Delete some rows from the beginning of the dataset
+        dataset.delete("i < 20").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 380);
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let indices = &[
+            0, // This row is deleted
+            5, 19, 20, 39,  // This row is deleted
+            40,  // This row is not deleted
+            190, // This row is not deleted
+            191, // This row is not deleted
+        ];
+        let values = dataset.take(indices, projection.clone()).await.unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([
+                        20, 25, 39, 40, 59, 60, 210, 211
+                    ])),
+                    Arc::new(StringArray::from_iter_values(
+                        [20, 25, 39, 40, 59, 60, 210, 211]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // Take an empty selection.
+        let values = dataset.take(&[], projection).await.unwrap();
+        assert_eq!(RecordBatch::new_empty(data.schema()), values);
+    }
+
+    // #[rstest]
+    #[tokio::test]
+    async fn test_take_when_deleted_rows_in_end_of_fragment(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        // data_storage_version: LanceFileVersion::Stable,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Delete some rows from the beginning of the dataset
+        dataset.delete("i >= 30 and i < 40").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 390);
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let indices = &[
+            0, // This row is deleted
+            5, 19, 20, 35, 39,  // This row is deleted
+            40,  // This row is not deleted
+            190, // This row is not deleted
+            191, // This row is not deleted
+        ];
+        let values = dataset.take(indices, projection.clone()).await.unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([
+                        0, 5, 19, 20, 45, 49, 50, 200, 201
+                    ])),
+                    Arc::new(StringArray::from_iter_values(
+                        [0, 5, 19, 20, 45, 49, 50, 200, 201]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // Take an empty selection.
+        let values = dataset.take(&[], projection).await.unwrap();
+        assert_eq!(RecordBatch::new_empty(data.schema()), values);
+    }
+
+    // #[rstest]
+    #[tokio::test]
+    async fn test_take_when_deleted_rows_between_fragments(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        // data_storage_version: LanceFileVersion::Stable,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Delete some rows from the beginning of the dataset
+        dataset.delete("i >= 30 and i < 50").await.unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 380);
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let indices = &[
+            0, // This row is deleted
+            5, 19, 20, 39,  // This row is deleted
+            40,  // This row is not deleted
+            190, // This row is not deleted
+            191, // This row is not deleted
+        ];
+        let values = dataset.take(indices, projection.clone()).await.unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([
+                        0, 5, 19, 20, 59, 60, 210, 211
+                    ])),
+                    Arc::new(StringArray::from_iter_values(
+                        [0, 5, 19, 20, 59, 60, 210, 211]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // Take an empty selection.
+        let values = dataset.take(&[], projection).await.unwrap();
+        assert_eq!(RecordBatch::new_empty(data.schema()), values);
+    }
+
+    #[tokio::test]
+    async fn test_take_when_deleted_discrete_rows(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        // data_storage_version: LanceFileVersion::Stable,
+    ) {
+        let data = test_batch(0..400);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        // Delete some rows from the beginning of the dataset
+        dataset
+            .delete("i in (0, 39, 40, 79, 80, 119)")
+            .await
+            .unwrap();
+        dataset.validate().await.unwrap();
+
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 394);
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let indices = &[
+            0, // This row is deleted
+            5, 19, 20, 39,  // This row is deleted
+            40,  // This row is not deleted
+            190, // This row is not deleted
+            191, // This row is not deleted
+        ];
+        let values = dataset.take(indices, projection.clone()).await.unwrap();
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([
+                        1, 6, 20, 21, 42, 43, 196, 197
+                    ])),
+                    Arc::new(StringArray::from_iter_values(
+                        [1, 6, 20, 21, 42, 43, 196, 197]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+
+        // Take an empty selection.
+        let values = dataset.take(&[], projection).await.unwrap();
+        assert_eq!(RecordBatch::new_empty(data.schema()), values);
     }
 
     #[rstest]

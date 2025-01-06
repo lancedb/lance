@@ -1166,7 +1166,12 @@ impl FileFragment {
     ///
     /// This will always return the same number of rows as the input indices.
     /// If indices are out-of-bounds, this will return an error.
-    pub async fn take(&self, indices: &[u32], projection: &Schema) -> Result<RecordBatch> {
+    pub async fn take(
+        &self,
+        indices: &[u32],
+        projection: &Schema,
+        skip_deleted_rows: bool,
+    ) -> Result<RecordBatch> {
         // Re-map the indices to row ids using the deletion vector
         let deletion_vector = self.get_deletion_vector().await?;
         let row_ids = if let Some(deletion_vector) = deletion_vector {
@@ -1218,7 +1223,8 @@ impl FileFragment {
         };
 
         // Then call take rows
-        self.take_rows(&row_ids, projection, false).await
+        self.take_rows(&row_ids, projection, false, skip_deleted_rows)
+            .await
     }
 
     /// Get the deletion vector for this fragment, using the cache if available.
@@ -1281,6 +1287,7 @@ impl FileFragment {
         row_offsets: &[u32],
         projection: &Schema,
         with_row_address: bool,
+        skip_deleted_rows: bool,
     ) -> Result<RecordBatch> {
         let reader = self
             .open(
@@ -1293,10 +1300,14 @@ impl FileFragment {
         if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
             let range =
                 (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
-            reader.legacy_read_range_as_batch(range).await
+            reader
+                .legacy_read_range_as_batch_with_skip_deleted_rows(range, skip_deleted_rows)
+                .await
         } else {
             // FIXME, change this method to streams
-            reader.take_as_batch(row_offsets).await
+            reader
+                .take_as_batch_with_skip_delete_rows(row_offsets, skip_deleted_rows)
+                .await
         }
     }
 
@@ -2066,6 +2077,18 @@ impl FragmentReader {
         start..end
     }
 
+    fn patch_offset_for_deletions(&self, offset: u32, dv: &DeletionVector) -> u32 {
+        let mut adjusted_offset = offset;
+        for val in dv.to_sorted_iter() {
+            if val <= adjusted_offset {
+                adjusted_offset += 1;
+            } else {
+                break;
+            }
+        }
+        adjusted_offset
+    }
+
     fn do_read_range(
         &self,
         mut range: Range<u32>,
@@ -2106,6 +2129,15 @@ impl FragmentReader {
         self.do_read_range(range, batch_size, false)
     }
 
+    pub fn take_range_with_skip_deleted_rows(
+        &self,
+        range: Range<u32>,
+        batch_size: u32,
+        skip_delete_rows: bool,
+    ) -> Result<ReadBatchFutStream> {
+        self.do_read_range(range, batch_size, skip_delete_rows)
+    }
+
     pub fn read_all(&self, batch_size: u32) -> Result<ReadBatchFutStream> {
         self.new_read_impl(ReadBatchParams::RangeFull, batch_size, move |reader| {
             reader.read_all_tasks(batch_size, reader.projection().clone())
@@ -2128,6 +2160,23 @@ impl FragmentReader {
         concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
     }
 
+    pub async fn legacy_read_range_as_batch_with_skip_deleted_rows(
+        &self,
+        range: Range<usize>,
+        skip_delete_rows: bool,
+    ) -> Result<RecordBatch> {
+        let batches = self
+            .take_range_with_skip_deleted_rows(
+                range.start as u32..range.end as u32,
+                DEFAULT_BATCH_READ_SIZE,
+                skip_delete_rows,
+            )?
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
+        concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
+    }
+
     /// Take rows from this fragment.
     pub async fn take(&self, indices: &[u32], batch_size: u32) -> Result<ReadBatchFutStream> {
         let indices_arr = UInt32Array::from(indices.to_vec());
@@ -2141,6 +2190,34 @@ impl FragmentReader {
     /// Take rows from this fragment, will perform a copy if the underlying reader returns multiple
     /// batches.  May return an error if the taken rows do not fit into a single batch.
     pub async fn take_as_batch(&self, indices: &[u32]) -> Result<RecordBatch> {
+        let batches = self
+            .take(indices, u32::MAX)
+            .await?
+            .buffered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<_>>()
+            .await?;
+        concat_batches(&Arc::new(self.output_schema.clone()), batches.iter()).map_err(Error::from)
+    }
+
+    pub async fn take_as_batch_with_skip_delete_rows(
+        &self,
+        mut indices: &[u32],
+        skip_deleted_rows: bool,
+    ) -> Result<RecordBatch> {
+        let patched_indices: Vec<u32>;
+        if skip_deleted_rows {
+            if let Some(_deletion_vector) = self.deletion_vec.as_ref() {
+                patched_indices = indices
+                    .iter()
+                    .map(|&index| {
+                        self.patch_offset_for_deletions(index, self.deletion_vec.as_ref().unwrap())
+                    })
+                    .collect();
+
+                indices = patched_indices.as_slice();
+            }
+        }
+
         let batches = self
             .take(indices, u32::MAX)
             .await?
@@ -2556,7 +2633,7 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take(&[1, 2, 4, 5, 5, 8], dataset.schema())
+            .take(&[1, 2, 4, 5, 5, 8], dataset.schema(), false)
             .await
             .unwrap();
         assert_eq!(
@@ -2575,7 +2652,7 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take(&[1, 2, 4, 5, 8], dataset.schema())
+            .take(&[1, 2, 4, 5, 8], dataset.schema(), false)
             .await
             .unwrap();
         assert_eq!(
@@ -2584,7 +2661,7 @@ mod tests {
         );
 
         // Empty indices gives empty result
-        let batch = fragment.take(&[], dataset.schema()).await.unwrap();
+        let batch = fragment.take(&[], dataset.schema(), false).await.unwrap();
         assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(Vec::<i32>::new())
@@ -2608,7 +2685,7 @@ mod tests {
 
         // Repeated indices are repeated in result.
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false)
+            .take_rows(&[1, 2, 4, 5, 5, 8], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -2627,7 +2704,7 @@ mod tests {
             .unwrap();
         assert!(fragment.metadata().deletion_file.is_some());
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false)
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -2637,7 +2714,7 @@ mod tests {
 
         // Empty indices gives empty result
         let batch = fragment
-            .take_rows(&[], dataset.schema(), false)
+            .take_rows(&[], dataset.schema(), false, false)
             .await
             .unwrap();
         assert_eq!(
@@ -2647,7 +2724,7 @@ mod tests {
 
         // Can get row ids
         let batch = fragment
-            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), true)
+            .take_rows(&[1, 2, 4, 5, 8], dataset.schema(), true, false)
             .await
             .unwrap();
         assert_eq!(
