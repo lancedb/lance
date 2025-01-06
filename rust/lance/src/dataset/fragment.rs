@@ -1981,7 +1981,7 @@ impl FragmentReader {
         let merged = if self.with_row_addr as usize + self.with_row_id as usize
             == self.output_schema.fields.len()
         {
-            let selected_rows = params.to_offsets_total(total_num_rows).unwrap().len();
+            let selected_rows = params.to_offsets_total(total_num_rows).len();
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
