@@ -23,7 +23,7 @@ use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionState;
-use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
@@ -162,8 +162,7 @@ struct LanceContextProvider {
 impl Default for LanceContextProvider {
     fn default() -> Self {
         let config = SessionConfig::new();
-        let runtime_config = RuntimeConfig::new();
-        let runtime = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+        let runtime = Arc::new(RuntimeEnvBuilder::new().build().unwrap());
         let mut state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
@@ -660,6 +659,7 @@ impl Planner {
                 expr,
                 pattern,
                 escape_char,
+                any: _,
             } => Ok(Expr::Like(Like::new(
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
@@ -672,6 +672,7 @@ impl Planner {
                 expr,
                 pattern,
                 escape_char,
+                any: _,
             } => Ok(Expr::Like(Like::new(
                 *negated,
                 Box::new(self.parse_sql_expr(expr)?),
