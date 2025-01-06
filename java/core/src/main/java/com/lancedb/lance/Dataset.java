@@ -15,6 +15,7 @@ package com.lancedb.lance;
 
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
@@ -449,6 +450,25 @@ public class Dataset implements Closeable {
   }
 
   private native long nativeCountRows(Optional<String> filter);
+
+  /**
+   * Calculate the size of the dataset.
+   *
+   * @return the size of the dataset
+   */
+  public long calculateDataSize() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetDataStatistics().getDataSize();
+    }
+  }
+
+  /**
+   * Calculate the statistics of the dataset.
+   *
+   * @return the statistics of the dataset
+   */
+  private native DataStatistics nativeGetDataStatistics();
 
   /**
    * Get all fragments in this dataset.
