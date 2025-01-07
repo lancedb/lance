@@ -19,6 +19,7 @@ import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -268,6 +269,23 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param sqlExpressions The SQL expressions to add columns
+   * @param batchSize The number of rows to read at a time from the source dataset when applying the
+   *     transform.
+   */
+  public void addColumns(SqlExpressions sqlExpressions, Optional<Long> batchSize) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAddColumnsBySqlExpressions(sqlExpressions, batchSize);
+    }
+  }
+
+  private native void nativeAddColumnsBySqlExpressions(
+      SqlExpressions sqlExpressions, Optional<Long> batchSize);
 
   /**
    * Drop columns from the dataset.
