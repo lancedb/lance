@@ -73,7 +73,7 @@ def test_write_fragments(balanced_dataset, tmp_path):
         transaction.blobs_op.new_schema, transaction.blobs_op.fragments
     )
 
-    ds = lance.LanceDataset.commit(
+    lance.LanceDataset.commit(
         tmp_path / "ds",
         operation,
         blobs_op=blob_operation,
