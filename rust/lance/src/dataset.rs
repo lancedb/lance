@@ -3755,7 +3755,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen().col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)));
+        let data = gen().col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)));
         let reader = data.into_reader_rows(RowCount::from(1000), BatchCount::from(10));
         let mut dataset = Dataset::write(
             reader,
