@@ -369,12 +369,26 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
         } else {
             Some(deletion_file.extract_object(env)?)
         };
+
+        let row_id_meta = env
+            .call_method(
+                self,
+                "getRowIdMeta",
+                format!("()L{};", ROW_ID_META_CLASS),
+                &[],
+            )?
+            .l()?;
+        let row_id_meta = if row_id_meta.is_null() {
+            None
+        } else {
+            Some(row_id_meta.extract_object(env)?)
+        };
         Ok(Fragment {
             id,
             files,
             deletion_file,
             physical_rows: Some(physical_rows),
-            row_id_meta: None,
+            row_id_meta,
         })
     }
 }
