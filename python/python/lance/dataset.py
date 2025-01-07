@@ -3656,7 +3656,9 @@ def write_dataset(
 
 def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
     # if the query is a multivector, convert it to pa.ListArray
-    if isinstance(query[0], (list, tuple, np.ndarray, pa.Array)):
+    if hasattr(query, "__getitem__") and isinstance(
+        query[0], (list, tuple, np.ndarray, pa.Array)
+    ):
         dim = len(query[0])
         multivector_query = []
         for q in query:
