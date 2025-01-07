@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.FragmentMetadata;
@@ -41,7 +40,6 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
       LanceArrowWriter arrowWriter,
       FutureTask<List<FragmentMetadata>> fragmentCreationTask,
       Thread fragmentCreationThread) {
-    // TODO support write to multiple fragments
     this.arrowWriter = arrowWriter;
     this.fragmentCreationThread = fragmentCreationThread;
     this.fragmentCreationTask = fragmentCreationTask;
@@ -57,7 +55,7 @@ public class LanceDataWriter implements DataWriter<InternalRow> {
     arrowWriter.setFinished();
     try {
       List<FragmentMetadata> fragmentMetadata = fragmentCreationTask.get();
-      return new BatchAppend.TaskCommit(fragmentMetadata);
+      return new LanceBatchWrite.TaskCommit(fragmentMetadata);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new IOException("Interrupted while waiting for reader thread to finish", e);

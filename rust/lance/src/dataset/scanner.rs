@@ -33,10 +33,12 @@ use datafusion::physical_plan::{
     ExecutionPlan, SendableRecordBatchStream,
 };
 use datafusion::scalar::ScalarValue;
+use datafusion_expr::Operator;
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
 use datafusion_physical_expr::{Partitioning, PhysicalExpr};
+use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use lance_arrow::floats::{coerce_float_vector, FloatType};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
@@ -742,6 +744,8 @@ impl Scanner {
             column: column.to_string(),
             key,
             k,
+            lower_bound: None,
+            upper_bound: None,
             nprobes: 1,
             ef: None,
             refine_factor: None,
@@ -749,6 +753,19 @@ impl Scanner {
             use_index: true,
         });
         Ok(self)
+    }
+
+    /// Set the distance thresholds for the nearest neighbor search.
+    pub fn distance_range(
+        &mut self,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+    ) -> &mut Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.lower_bound = lower_bound;
+            q.upper_bound = upper_bound;
+        }
+        self
     }
 
     pub fn nprobs(&mut self, n: usize) -> &mut Self {
@@ -982,13 +999,17 @@ impl Scanner {
 
     /// Create a stream from the Scanner.
     #[instrument(skip_all)]
-    pub async fn try_into_stream(&self) -> Result<DatasetRecordBatchStream> {
-        let plan = self.create_plan().await?;
+    pub fn try_into_stream(&self) -> BoxFuture<Result<DatasetRecordBatchStream>> {
+        // Future intentionally boxed here to avoid large futures on the stack
+        async move {
+            let plan = self.create_plan().await?;
 
-        Ok(DatasetRecordBatchStream::new(execute_plan(
-            plan,
-            LanceExecutionOptions::default(),
-        )?))
+            Ok(DatasetRecordBatchStream::new(execute_plan(
+                plan,
+                LanceExecutionOptions::default(),
+            )?))
+        }
+        .boxed()
     }
 
     pub(crate) async fn try_into_dfstream(
@@ -1008,46 +1029,50 @@ impl Scanner {
 
     /// Scan and return the number of matching rows
     #[instrument(skip_all)]
-    pub async fn count_rows(&self) -> Result<u64> {
-        let plan = self.create_plan().await?;
-        // Datafusion interprets COUNT(*) as COUNT(1)
-        let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
+    pub fn count_rows(&self) -> BoxFuture<Result<u64>> {
+        // Future intentionally boxed here to avoid large futures on the stack
+        async move {
+            let plan = self.create_plan().await?;
+            // Datafusion interprets COUNT(*) as COUNT(1)
+            let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
 
-        let input_phy_exprs: &[Arc<dyn PhysicalExpr>] = &[one];
-        let schema = plan.schema();
+            let input_phy_exprs: &[Arc<dyn PhysicalExpr>] = &[one];
+            let schema = plan.schema();
 
-        let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
-        builder = builder.schema(schema);
-        builder = builder.alias("count_rows".to_string());
+            let mut builder = AggregateExprBuilder::new(count_udaf(), input_phy_exprs.to_vec());
+            builder = builder.schema(schema);
+            builder = builder.alias("count_rows".to_string());
 
-        let count_expr = builder.build()?;
+            let count_expr = builder.build()?;
 
-        let plan_schema = plan.schema();
-        let count_plan = Arc::new(AggregateExec::try_new(
-            AggregateMode::Single,
-            PhysicalGroupBy::new_single(Vec::new()),
-            vec![count_expr],
-            vec![None],
-            plan,
-            plan_schema,
-        )?);
-        let mut stream = execute_plan(count_plan, LanceExecutionOptions::default())?;
+            let plan_schema = plan.schema();
+            let count_plan = Arc::new(AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(Vec::new()),
+                vec![count_expr],
+                vec![None],
+                plan,
+                plan_schema,
+            )?);
+            let mut stream = execute_plan(count_plan, LanceExecutionOptions::default())?;
 
-        // A count plan will always return a single batch with a single row.
-        if let Some(first_batch) = stream.next().await {
-            let batch = first_batch?;
-            let array = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or(Error::io(
-                    "Count plan did not return a UInt64Array".to_string(),
-                    location!(),
-                ))?;
-            Ok(array.value(0) as u64)
-        } else {
-            Ok(0)
+            // A count plan will always return a single batch with a single row.
+            if let Some(first_batch) = stream.next().await {
+                let batch = first_batch?;
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or(Error::io(
+                        "Count plan did not return a UInt64Array".to_string(),
+                        location!(),
+                    ))?;
+                Ok(array.value(0) as u64)
+            } else {
+                Ok(0)
+            }
         }
+        .boxed()
     }
 
     /// Given a base schema and a list of desired fields figure out which fields, if any, still need loaded
@@ -2006,16 +2031,59 @@ impl Scanner {
             q.metric_type,
         )?);
 
+        // filter out elements out of distance range
+        let lower_bound_expr = q
+            .lower_bound
+            .map(|v| {
+                let lower_bound = expressions::lit(v);
+                expressions::binary(
+                    expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
+                    Operator::GtEq,
+                    lower_bound,
+                    flat_dist.schema().as_ref(),
+                )
+            })
+            .transpose()?;
+        let upper_bound_expr = q
+            .upper_bound
+            .map(|v| {
+                let upper_bound = expressions::lit(v);
+                expressions::binary(
+                    expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
+                    Operator::Lt,
+                    upper_bound,
+                    flat_dist.schema().as_ref(),
+                )
+            })
+            .transpose()?;
+        let filter_expr = match (lower_bound_expr, upper_bound_expr) {
+            (Some(lower), Some(upper)) => Some(expressions::binary(
+                lower,
+                Operator::And,
+                upper,
+                flat_dist.schema().as_ref(),
+            )?),
+            (Some(lower), None) => Some(lower),
+            (None, Some(upper)) => Some(upper),
+            (None, None) => None,
+        };
+
+        let knn_plan: Arc<dyn ExecutionPlan> = if let Some(filter_expr) = filter_expr {
+            Arc::new(FilterExec::try_new(filter_expr, flat_dist)?)
+        } else {
+            flat_dist
+        };
+
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
             vec![PhysicalSortExpr {
-                expr: expressions::col(DIST_COL, flat_dist.schema().as_ref())?,
+                expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
                 options: SortOptions {
                     descending: false,
                     nulls_first: false,
                 },
             }],
-            flat_dist,
+            knn_plan,
         )
         .with_fetch(Some(q.k));
 

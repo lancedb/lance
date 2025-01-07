@@ -507,13 +507,13 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = True,
+        scan_in_order: Optional[bool] = None,
         *,
-        prefilter: bool = False,
-        with_row_id: bool = False,
-        with_row_address: bool = False,
-        use_stats: bool = True,
-        fast_search: bool = False,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
+        fast_search: Optional[bool] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
@@ -558,11 +558,11 @@ class LanceDataset(pa.dataset.Dataset):
             The number of batches to read ahead.
         fragment_readahead: int, optional
             The number of fragments to read ahead.
-        scan_in_order: bool, default True
+        scan_in_order: bool, optional, default True
             Whether to read the fragments and batches in order. If false,
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
-        prefilter: bool, default False
+        prefilter: bool, optional, default False
             Run filter before the vector search.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
@@ -570,12 +570,13 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
-        with_row_id: bool, default False
+        with_row_id: bool, optional, default False
             Return row ID.
-        with_row_address: bool, default False
+        with_row_address: bool, optional, default False
             Return row address
-        use_stats: bool, default True
+        use_stats: bool, optional, default True
             Use stats pushdown during filters.
+        fast_search: bool, optional, default False
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents contains "hello" or "world".
@@ -687,12 +688,12 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = True,
+        scan_in_order: Optional[bool] = None,
         *,
-        prefilter: bool = False,
-        with_row_id: bool = False,
-        with_row_address: bool = False,
-        use_stats: bool = True,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
@@ -3463,6 +3464,21 @@ class Tags:
         self._ds.update_tag(tag, version)
 
 
+@dataclass
+class FieldStatistics:
+    """Statistics about a field in the dataset"""
+
+    id: int  #: id of the field
+    bytes_on_disk: int  #: (possibly compressed) bytes on disk used to store the field
+
+
+@dataclass
+class DataStatistics:
+    """Statistics about the data in the dataset"""
+
+    fields: FieldStatistics  #: Statistics about the fields in the dataset
+
+
 class DatasetStats(TypedDict):
     num_deleted_rows: int
     num_fragments: int
@@ -3498,6 +3514,12 @@ class LanceStats:
         """
         index_stats = json.loads(self._ds.index_statistics(index_name))
         return index_stats
+
+    def data_stats(self) -> DataStatistics:
+        """
+        Statistics about the data in the dataset.
+        """
+        return self._ds.data_stats()
 
 
 def write_dataset(

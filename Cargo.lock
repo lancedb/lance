@@ -3527,6 +3527,7 @@ dependencies = [
  "datafusion",
  "jni",
  "lance",
+ "lance-core",
  "lance-datafusion",
  "lance-encoding",
  "lance-index",

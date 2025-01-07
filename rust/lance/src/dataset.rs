@@ -56,6 +56,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod statistics;
 mod take;
 pub mod transaction;
 pub mod updater;
@@ -798,7 +799,7 @@ impl Dataset {
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
         let cnts = stream::iter(self.get_fragments())
-            .map(|f| async move { f.count_rows().await })
+            .map(|f| async move { f.count_rows(None).await })
             .buffer_unordered(16)
             .try_collect::<Vec<_>>()
             .await?;
@@ -2037,7 +2038,7 @@ mod tests {
         assert_eq!(fragments.len(), 10);
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
-            assert_eq!(fragment.count_rows().await.unwrap(), 100);
+            assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
             let reader = fragment
                 .open(dataset.schema(), FragReadConfig::default(), None)
                 .await

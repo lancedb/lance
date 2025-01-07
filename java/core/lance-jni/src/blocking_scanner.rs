@@ -79,6 +79,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
     offset_obj: JObject,           // Optional<Integer>
     query_obj: JObject,            // Optional<Query>
     with_row_id: jboolean,         // boolean
+    with_row_address: jboolean,    // boolean
     batch_readahead: jint,         // int
     column_orderings: JObject,     // Optional<List<ColumnOrdering>>
 ) -> JObject<'local> {
@@ -96,6 +97,7 @@ pub extern "system" fn Java_com_lancedb_lance_ipc_LanceScanner_createScanner<'lo
             offset_obj,
             query_obj,
             with_row_id,
+            with_row_address,
             batch_readahead,
             column_orderings
         )
@@ -115,6 +117,7 @@ fn inner_create_scanner<'local>(
     offset_obj: JObject,
     query_obj: JObject,
     with_row_id: jboolean,
+    with_row_address: jboolean,
     batch_readahead: jint,
     column_orderings: JObject,
 ) -> Result<JObject<'local>> {
@@ -167,6 +170,10 @@ fn inner_create_scanner<'local>(
 
     if with_row_id == JNI_TRUE {
         scanner.with_row_id();
+    }
+
+    if with_row_address == JNI_TRUE {
+        scanner.with_row_address();
     }
 
     let query_is_present = env.call_method(&query_obj, "isPresent", "()Z", &[])?.z()?;

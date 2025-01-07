@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import com.lancedb.lance.ipc.LanceScanner;
@@ -24,6 +23,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -116,6 +116,52 @@ public class FragmentTest {
           () -> {
             new FragmentOperation.Append(new ArrayList<>());
           });
+    }
+  }
+
+  @Test
+  void testOverwriteCommit() throws Exception {
+    String datasetPath = tempDir.resolve("testOverwriteCommit").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      // Commit fragment
+      int rowCount = 20;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      FragmentOperation.Overwrite overwrite =
+          new FragmentOperation.Overwrite(
+              Collections.singletonList(fragmentMeta), testDataset.getSchema());
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, overwrite, Optional.of(1L))) {
+        assertEquals(2, dataset.version());
+        assertEquals(2, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        DatasetFragment fragment = dataset.getFragments().get(0);
+
+        try (LanceScanner scanner = fragment.newScan()) {
+          Schema schemaRes = scanner.schema();
+          assertEquals(testDataset.getSchema(), schemaRes);
+        }
+      }
+
+      // Commit fragment again
+      rowCount = 40;
+      fragmentMeta = testDataset.createNewFragment(rowCount);
+      overwrite =
+          new FragmentOperation.Overwrite(
+              Collections.singletonList(fragmentMeta), testDataset.getSchema());
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, overwrite, Optional.of(2L))) {
+        assertEquals(3, dataset.version());
+        assertEquals(3, dataset.latestVersion());
+        assertEquals(rowCount, dataset.countRows());
+        DatasetFragment fragment = dataset.getFragments().get(0);
+
+        try (LanceScanner scanner = fragment.newScan()) {
+          Schema schemaRes = scanner.schema();
+          assertEquals(testDataset.getSchema(), schemaRes);
+        }
+      }
     }
   }
 

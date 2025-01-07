@@ -21,6 +21,8 @@ pub mod testing;
 pub mod traits;
 pub mod utils;
 
+pub use scheduler::{bytes_read_counter, iops_counter};
+
 /// Defines a selection of rows to read from a file/batch
 #[derive(Debug, Clone)]
 pub enum ReadBatchParams {

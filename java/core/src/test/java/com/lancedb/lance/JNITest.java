@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import com.lancedb.lance.index.DistanceType;
@@ -35,6 +34,11 @@ public class JNITest {
   @Test
   public void testInts() {
     JniTestHelper.parseInts(Arrays.asList(1, 2, 3));
+  }
+
+  @Test
+  public void testLongs() {
+    JniTestHelper.parseLongs(Arrays.asList(1L, 2L, 3L, Long.MAX_VALUE));
   }
 
   @Test

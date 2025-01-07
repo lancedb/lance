@@ -239,3 +239,12 @@ def test_roundtrip_schema(tmp_path):
     data = pa.table({"a": [1.0, 2.0]}).to_batches()
     dataset = lance.write_dataset(data, tmp_path, schema=schema)
     assert dataset.schema == schema
+
+
+def test_io_counters(tmp_path):
+    starting_iops = lance.iops_counter()
+    starting_bytes = lance.bytes_read_counter()
+    dataset = lance.write_dataset(pa.table({"a": [1, 2, 3]}), tmp_path)
+    dataset.to_table()
+    assert lance.iops_counter() > starting_iops
+    assert lance.bytes_read_counter() > starting_bytes

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 from . import log
 from .blob import BlobColumn, BlobFile
 from .dataset import (
+    DataStatistics,
+    FieldStatistics,
     LanceDataset,
     LanceOperation,
     LanceScanner,
@@ -19,6 +21,7 @@ from .dataset import (
     write_dataset,
 )
 from .fragment import FragmentMetadata, LanceFragment
+from .lance import bytes_read_counter, iops_counter
 from .schema import json_to_schema, schema_to_json
 from .util import sanitize_ts
 
@@ -35,6 +38,8 @@ if TYPE_CHECKING:
 __all__ = [
     "BlobColumn",
     "BlobFile",
+    "DataStatistics",
+    "FieldStatistics",
     "FragmentMetadata",
     "LanceDataset",
     "LanceFragment",
@@ -43,6 +48,8 @@ __all__ = [
     "MergeInsertBuilder",
     "Transaction",
     "__version__",
+    "bytes_read_counter",
+    "iops_counter",
     "write_dataset",
     "schema_to_json",
     "json_to_schema",

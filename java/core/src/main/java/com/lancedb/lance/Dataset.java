@@ -1,22 +1,25 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed under the License
- * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
- * or implied. See the License for the specific language governing permissions and limitations under
- * the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import com.lancedb.lance.index.IndexParams;
 import com.lancedb.lance.index.IndexType;
+import com.lancedb.lance.ipc.DataStatistics;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
 import com.lancedb.lance.schema.ColumnAlteration;
+import com.lancedb.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.ArrowSchema;
@@ -24,9 +27,15 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
+import java.io.ByteArrayInputStream;
 import java.io.Closeable;
+import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -246,6 +255,13 @@ public class Dataset implements Closeable {
       List<String> fragmentsMetadata,
       Map<String, String> storageOptions);
 
+  public static native Dataset commitOverwrite(
+      String path,
+      long arrowSchemaMemoryAddress,
+      Optional<Long> readVersion,
+      List<String> fragmentsMetadata,
+      Map<String, String> storageOptions);
+
   /**
    * Drop a Dataset.
    *
@@ -253,6 +269,23 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Add columns to the dataset.
+   *
+   * @param sqlExpressions The SQL expressions to add columns
+   * @param batchSize The number of rows to read at a time from the source dataset when applying the
+   *     transform.
+   */
+  public void addColumns(SqlExpressions sqlExpressions, Optional<Long> batchSize) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAddColumnsBySqlExpressions(sqlExpressions, batchSize);
+    }
+  }
+
+  private native void nativeAddColumnsBySqlExpressions(
+      SqlExpressions sqlExpressions, Optional<Long> batchSize);
 
   /**
    * Drop columns from the dataset.
@@ -314,6 +347,32 @@ public class Dataset implements Closeable {
       return LanceScanner.create(this, options, allocator);
     }
   }
+
+  /**
+   * Select rows of data by index.
+   *
+   * @param indices the indices to take
+   * @param columns the columns to take
+   * @return an ArrowReader
+   */
+  public ArrowReader take(List<Long> indices, List<String> columns) throws IOException {
+    Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      byte[] arrowData = nativeTake(indices, columns);
+      ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(arrowData);
+      ReadableByteChannel readChannel = Channels.newChannel(byteArrayInputStream);
+      return new ArrowStreamReader(readChannel, allocator) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          readChannel.close();
+          byteArrayInputStream.close();
+        }
+      };
+    }
+  }
+
+  private native byte[] nativeTake(List<Long> indices, List<String> columns);
 
   /**
    * Gets the URI of the dataset.
@@ -386,14 +445,48 @@ public class Dataset implements Closeable {
    *
    * @return num of rows
    */
-  public int countRows() {
+  public long countRows() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCountRows();
+      return nativeCountRows(Optional.empty());
     }
   }
 
-  private native int nativeCountRows();
+  /**
+   * Count the number of rows in the dataset.
+   *
+   * @param filter the filter expr to count row
+   * @return num of rows
+   */
+  public long countRows(String filter) {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      Preconditions.checkArgument(
+          null != filter && !filter.isEmpty(), "filter cannot be null or empty");
+      return nativeCountRows(Optional.of(filter));
+    }
+  }
+
+  private native long nativeCountRows(Optional<String> filter);
+
+  /**
+   * Calculate the size of the dataset.
+   *
+   * @return the size of the dataset
+   */
+  public long calculateDataSize() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetDataStatistics().getDataSize();
+    }
+  }
+
+  /**
+   * Calculate the statistics of the dataset.
+   *
+   * @return the statistics of the dataset
+   */
+  private native DataStatistics nativeGetDataStatistics();
 
   /**
    * Get all fragments in this dataset.

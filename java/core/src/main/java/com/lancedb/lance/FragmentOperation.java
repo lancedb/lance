@@ -11,11 +11,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
+import org.apache.arrow.c.ArrowSchema;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
+import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Map;
@@ -59,6 +61,38 @@ public abstract class FragmentOperation {
           readVersion,
           fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()),
           storageOptions);
+    }
+  }
+
+  /** Fragment overwrite operation. */
+  public static class Overwrite extends FragmentOperation {
+    private final List<FragmentMetadata> fragments;
+    private final Schema schema;
+
+    public Overwrite(List<FragmentMetadata> fragments, Schema schema) {
+      validateFragments(fragments);
+      this.fragments = fragments;
+      this.schema = schema;
+    }
+
+    @Override
+    public Dataset commit(
+        BufferAllocator allocator,
+        String path,
+        Optional<Long> readVersion,
+        Map<String, String> storageOptions) {
+      Preconditions.checkNotNull(allocator);
+      Preconditions.checkNotNull(path);
+      Preconditions.checkNotNull(readVersion);
+      try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportSchema(allocator, schema, null, arrowSchema);
+        return Dataset.commitOverwrite(
+            path,
+            arrowSchema.memoryAddress(),
+            readVersion,
+            fragments.stream().map(FragmentMetadata::getJsonMetadata).collect(Collectors.toList()),
+            storageOptions);
+      }
     }
   }
 }

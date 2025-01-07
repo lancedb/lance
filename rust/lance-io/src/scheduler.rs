@@ -25,6 +25,19 @@ const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 
+// Global counter of how many IOPS we have issued
+static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Global counter of how many bytes were read by the scheduler
+static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn iops_counter() -> u64 {
+    IOPS_COUNTER.load(Ordering::Acquire)
+}
+
+pub fn bytes_read_counter() -> u64 {
+    BYTES_READ_COUNTER.load(Ordering::Acquire)
+}
+
 // There are two structures that control the I/O scheduler concurrency.  First,
 // we have a hard limit on the number of IOPS that can be issued concurrently.
 // This limit is process-wide.
@@ -456,6 +469,8 @@ impl IoTask {
             let bytes_fut = self
                 .reader
                 .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            IOPS_COUNTER.fetch_add(1, Ordering::Release);
+            BYTES_READ_COUNTER.fetch_add(self.num_bytes(), Ordering::Release);
             bytes_fut.await.map_err(Error::from)
         };
         IOPS_QUOTA.release();

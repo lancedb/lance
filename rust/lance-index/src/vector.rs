@@ -66,6 +66,12 @@ pub struct Query {
     /// Top k results to return.
     pub k: usize,
 
+    /// The lower bound (inclusive) of the distance to be searched.
+    pub lower_bound: Option<f32>,
+
+    /// The upper bound (exclusive) of the distance to be searched.
+    pub upper_bound: Option<f32>,
+
     /// The number of probes to load and search.
     pub nprobes: usize,
 

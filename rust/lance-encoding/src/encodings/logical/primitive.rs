@@ -17,8 +17,18 @@ use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_array;
-use lance_core::utils::bit::pad_bytes;
-use lance_core::utils::hash::U8SliceKey;
+use lance_core::{
+    cache::FileMetadataCache,
+    datatypes::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    },
+    utils::bit::pad_bytes,
+    Error,
+};
+use lance_core::{
+    cache::{Context, DeepSizeOf},
+    utils::hash::U8SliceKey,
+};
 use log::{debug, trace};
 use snafu::{location, Location};
 
@@ -268,7 +278,11 @@ impl FieldScheduler for PrimitiveFieldScheduler {
 /// a single page.
 trait StructuralPageScheduler: std::fmt::Debug + Send {
     /// Fetches any metadata required for the page
-    fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>>;
+    fn initialize<'a>(
+        &'a mut self,
+        io: &Arc<dyn EncodingsIo>,
+        cache: &Arc<FileMetadataCache>,
+    ) -> BoxFuture<'a, Result<()>>;
     /// Schedules the read of the given ranges in the page
     fn schedule_ranges(
         &self,
@@ -835,7 +849,12 @@ impl ComplexAllNullScheduler {
 }
 
 impl StructuralPageScheduler for ComplexAllNullScheduler {
-    fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+    fn initialize<'a>(
+        &'a mut self,
+        io: &Arc<dyn EncodingsIo>,
+        // TODO: Utilize cache here
+        _: &Arc<FileMetadataCache>,
+    ) -> BoxFuture<'a, Result<()>> {
         // Fully load the rep & def buffers, as needed
         let (rep_pos, rep_size) = self.buffer_offsets_and_sizes[0];
         let (def_pos, def_size) = self.buffer_offsets_and_sizes[1];
@@ -998,7 +1017,11 @@ impl DecodePageTask for DecodeComplexAllNullTask {
 pub struct SimpleAllNullScheduler {}
 
 impl StructuralPageScheduler for SimpleAllNullScheduler {
-    fn initialize<'a>(&'a mut self, _io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+    fn initialize<'a>(
+        &'a mut self,
+        _io: &Arc<dyn EncodingsIo>,
+        _cache: &Arc<FileMetadataCache>,
+    ) -> BoxFuture<'a, Result<()>> {
         std::future::ready(Ok(())).boxed()
     }
 
@@ -1060,9 +1083,32 @@ struct MiniBlockSchedulerDictionary {
     dictionary_decompressor: Arc<dyn BlockDecompressor>,
     dictionary_buf_position_and_size: (u64, u64),
     dictionary_data_alignment: u64,
+}
 
-    // This is set after initialization
-    dictionary_data: Arc<DataBlock>,
+/// State that is loaded once and cached for future lookups
+#[derive(Debug)]
+struct MiniBlockCacheableState {
+    /// Metadata that describes each chunk in the page
+    chunk_meta: Vec<ChunkMeta>,
+    /// The repetition index for each chunk
+    ///
+    /// There will be one element per chunk if no repetition (# items)
+    /// Otherwise, there will be one element plus N elements where N
+    ///   is the maximum nested random access supported
+    rep_index: Vec<Vec<u64>>,
+    /// The dictionary for the page, if any
+    dictionary: Option<Arc<DataBlock>>,
+}
+
+impl DeepSizeOf for MiniBlockCacheableState {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.rep_index.deep_size_of_children(context)
+            + self
+                .dictionary
+                .as_ref()
+                .map(|dict| dict.data_size() as usize)
+                .unwrap_or(0)
+    }
 }
 
 /// A scheduler for a page that has been encoded with the mini-block layout
@@ -1098,15 +1144,14 @@ pub struct MiniBlockScheduler {
     priority: u64,
     items_in_page: u64,
     repetition_index_depth: u16,
+    cache_key: String,
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
     def_meaning: Arc<[DefinitionInterpretation]>,
-    // These are set after initialization
-    chunk_meta: Vec<ChunkMeta>,
-    rep_index: Vec<Vec<u64>>,
-
     dictionary: Option<MiniBlockSchedulerDictionary>,
+    // This is set after initialization
+    page_meta: Option<Arc<MiniBlockCacheableState>>,
 }
 
 impl MiniBlockScheduler {
@@ -1114,6 +1159,8 @@ impl MiniBlockScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
+        page_number: usize,
+        column_number: usize,
         layout: &pb::MiniBlockLayout,
         decompressors: &dyn DecompressorStrategy,
     ) -> Result<Self> {
@@ -1137,7 +1184,6 @@ impl MiniBlockScheduler {
                             .into(),
                         dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
                         dictionary_data_alignment: 4,
-                        dictionary_data: Arc::new(DataBlock::Empty()),
                     })
                 }
                 pb::array_encoding::ArrayEncoding::Flat(_) => Some(MiniBlockSchedulerDictionary {
@@ -1146,7 +1192,6 @@ impl MiniBlockScheduler {
                         .into(),
                     dictionary_buf_position_and_size: buffer_offsets_and_sizes[2],
                     dictionary_data_alignment: 16,
-                    dictionary_data: Arc::new(DataBlock::Empty()),
                 }),
                 _ => {
                     unreachable!("Currently only encodings `BinaryBlock` and `Flat` used for encoding MiniBlock dictionary.")
@@ -1156,6 +1201,8 @@ impl MiniBlockScheduler {
             None
         };
 
+        let cache_key = format!("miniblock/{}/{}", page_number, column_number);
+
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
             rep_decompressor: rep_decompressor.into(),
@@ -1163,19 +1210,20 @@ impl MiniBlockScheduler {
             value_decompressor: value_decompressor.into(),
             repetition_index_depth: layout.repetition_index_depth as u16,
             priority,
+            cache_key,
             items_in_page,
-            chunk_meta: Vec::new(),
-            rep_index: Vec::new(),
             dictionary,
             def_meaning: def_meaning.into(),
+            page_meta: None,
         })
     }
 
     fn lookup_chunks(&self, chunk_indices: &[usize]) -> Vec<LoadedChunk> {
+        let page_meta = self.page_meta.as_ref().unwrap();
         chunk_indices
             .iter()
             .map(|&chunk_idx| {
-                let chunk_meta = &self.chunk_meta[chunk_idx];
+                let chunk_meta = &page_meta.chunk_meta[chunk_idx];
                 let bytes_start = chunk_meta.offset_bytes;
                 let bytes_end = bytes_start + chunk_meta.chunk_size_bytes;
                 LoadedChunk {
@@ -1429,7 +1477,16 @@ impl ChunkInstructions {
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
-    fn initialize<'a>(&'a mut self, io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+    fn initialize<'a>(
+        &'a mut self,
+        io: &Arc<dyn EncodingsIo>,
+        cache: &Arc<FileMetadataCache>,
+    ) -> BoxFuture<'a, Result<()>> {
+        if let Some(cached_state) = cache.get_by_str(&self.cache_key) {
+            self.page_meta = Some(cached_state);
+            return Box::pin(std::future::ready(Ok(())));
+        }
+
         // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
         // need.
@@ -1457,6 +1514,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         }
         let io_req = io.submit_request(required_ranges, 0);
 
+        let cache = cache.clone();
         async move {
             let mut buffers = io_req.await?.into_iter().fuse();
             let meta_bytes = buffers.next().unwrap();
@@ -1468,7 +1526,11 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let mut bytes = LanceBuffer::from_bytes(meta_bytes, 2);
             let words = bytes.borrow_to_typed_slice::<u16>();
             let words = words.as_ref();
-            self.chunk_meta.reserve(words.len());
+            let mut page_meta = MiniBlockCacheableState {
+                chunk_meta: Vec::with_capacity(words.len()),
+                rep_index: Vec::with_capacity(words.len()),
+                dictionary: None,
+            };
             let mut rows_counter = 0;
             let mut offset_bytes = value_buf_position;
             for (word_idx, word) in words.iter().enumerate() {
@@ -1485,7 +1547,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 };
                 rows_counter += num_values;
 
-                self.chunk_meta.push(ChunkMeta {
+                page_meta.chunk_meta.push(ChunkMeta {
                     num_values,
                     chunk_size_bytes: num_bytes as u64,
                     offset_bytes,
@@ -1501,7 +1563,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
                 let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
                 // Unflatten
-                self.rep_index = repetition_index_vals
+                page_meta.rep_index = repetition_index_vals
                     .as_ref()
                     .chunks_exact(self.repetition_index_depth as usize + 1)
                     .map(|c| c.to_vec())
@@ -1509,7 +1571,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             } else {
                 // Default rep index is just the number of items in each chunk
                 // with 0 partials/leftovers
-                self.rep_index = self
+                page_meta.rep_index = page_meta
                     .chunk_meta
                     .iter()
                     .map(|c| vec![c.num_values, 0])
@@ -1519,14 +1581,17 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             // decode dictionary
             if let Some(ref mut dictionary) = self.dictionary {
                 let dictionary_data = dictionary_bytes.unwrap();
-                dictionary.dictionary_data =
-                    Arc::new(dictionary.dictionary_decompressor.decompress(
+                page_meta.dictionary =
+                    Some(Arc::new(dictionary.dictionary_decompressor.decompress(
                         LanceBuffer::from_bytes(
                             dictionary_data,
                             dictionary.dictionary_data_alignment,
                         ),
-                    )?)
+                    )?));
             };
+            let page_meta = Arc::new(page_meta);
+            cache.insert_by_str(&self.cache_key, page_meta.clone());
+            self.page_meta = Some(page_meta);
             Ok(())
         }
         .boxed()
@@ -1537,7 +1602,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         ranges: &[Range<u64>],
         io: &dyn EncodingsIo,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
-        let chunk_instructions = ChunkInstructions::schedule_instructions(&self.rep_index, ranges);
+        let page_meta = self.page_meta.as_ref().unwrap();
+
+        let chunk_instructions =
+            ChunkInstructions::schedule_instructions(&page_meta.rep_index, ranges);
 
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         debug_assert_eq!(
@@ -1570,10 +1638,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
         let value_decompressor = self.value_decompressor.clone();
-        let dictionary = self
+        let dictionary = page_meta
             .dictionary
             .as_ref()
-            .map(|dictionary| dictionary.dictionary_data.clone());
+            .map(|dictionary| dictionary.clone());
         let def_meaning = self.def_meaning.clone();
 
         Ok(async move {
@@ -1650,7 +1718,11 @@ impl FullZipScheduler {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
-    fn initialize<'a>(&'a mut self, _io: &Arc<dyn EncodingsIo>) -> BoxFuture<'a, Result<()>> {
+    fn initialize<'a>(
+        &'a mut self,
+        _io: &Arc<dyn EncodingsIo>,
+        _: &Arc<FileMetadataCache>,
+    ) -> BoxFuture<'a, Result<()>> {
         std::future::ready(Ok(())).boxed()
     }
 
@@ -1974,7 +2046,12 @@ impl StructuralPrimitiveFieldScheduler {
             .iter()
             .enumerate()
             .map(|(page_index, page_info)| {
-                Self::page_info_to_scheduler(page_info, page_index, decompressors)
+                Self::page_info_to_scheduler(
+                    page_info,
+                    page_index,
+                    column_info.index as usize,
+                    decompressors,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -1986,6 +2063,7 @@ impl StructuralPrimitiveFieldScheduler {
     fn page_info_to_scheduler(
         page_info: &PageInfo,
         page_index: usize,
+        column_index: usize,
         decompressors: &dyn DecompressorStrategy,
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
@@ -1995,6 +2073,8 @@ impl StructuralPrimitiveFieldScheduler {
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
                         mini_block.num_items,
+                        page_index,
+                        column_index,
                         mini_block,
                         decompressors,
                     )?)
@@ -2045,7 +2125,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
         let page_init = self
             .page_schedulers
             .iter_mut()
-            .map(|s| s.scheduler.initialize(context.io()))
+            .map(|s| s.scheduler.initialize(context.io(), context.cache()))
             .collect::<FuturesUnordered<_>>();
         async move {
             page_init.try_collect::<Vec<_>>().await?;
@@ -2655,6 +2735,25 @@ impl PrimitiveStructuralEncoder {
             }
         }
         false
+    }
+
+    fn prefers_miniblock(data_block: &DataBlock, field: &Field) -> bool {
+        // If the user specifically requested miniblock then use it
+        if let Some(user_requested) = field.metadata.get(STRUCTURAL_ENCODING_META_KEY) {
+            return user_requested.to_lowercase() == STRUCTURAL_ENCODING_MINIBLOCK;
+        }
+        // Otherwise only use miniblock if it is narrow
+        Self::is_narrow(data_block)
+    }
+
+    fn prefers_fullzip(field: &Field) -> bool {
+        // Fullzip is the backup option so the only reason we wouldn't use it is if the
+        // user specifically requested not to use it (in which case we're probably going
+        // to emit an error)
+        if let Some(user_requested) = field.metadata.get(STRUCTURAL_ENCODING_META_KEY) {
+            return user_requested.to_lowercase() == STRUCTURAL_ENCODING_FULLZIP;
+        }
+        true
     }
 
     // Converts value data, repetition levels, and definition levels into a single
@@ -3376,7 +3475,7 @@ impl PrimitiveStructuralEncoder {
                         Some(dictionary_data_block),
                         num_rows,
                     )
-                } else if Self::is_narrow(&data_block) {
+                } else if Self::prefers_miniblock(&data_block, &field) {
                     log::debug!(
                         "Encoding column {} with {} items using mini-block layout",
                         column_idx,
@@ -3392,7 +3491,7 @@ impl PrimitiveStructuralEncoder {
                         None,
                         num_rows,
                     )
-                } else {
+                } else if Self::prefers_fullzip(&field) {
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,
@@ -3406,6 +3505,8 @@ impl PrimitiveStructuralEncoder {
                         repdefs,
                         row_number,
                     )
+                } else {
+                    Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
                 }
             }
         })

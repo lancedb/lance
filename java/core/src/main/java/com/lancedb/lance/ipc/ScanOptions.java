@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.ipc;
 
 import org.apache.arrow.util.Preconditions;
@@ -32,6 +31,7 @@ public class ScanOptions {
   private final Optional<Long> offset;
   private final Optional<Query> nearest;
   private final boolean withRowId;
+  private final boolean withRowAddress;
   private final int batchReadahead;
   private final Optional<List<ColumnOrdering>> columnOrderings;
 
@@ -48,6 +48,7 @@ public class ScanOptions {
    * @param limit (Optional) Maximum number of rows to return.
    * @param offset (Optional) Number of rows to skip before returning results.
    * @param withRowId Whether to include the row ID in the results.
+   * @param withRowAddress Whether to include the row address in the results.
    * @param nearest (Optional) Nearest neighbor query.
    * @param batchReadahead Number of batches to read ahead.
    */
@@ -61,6 +62,7 @@ public class ScanOptions {
       Optional<Long> offset,
       Optional<Query> nearest,
       boolean withRowId,
+      boolean withRowAddress,
       int batchReadahead,
       Optional<List<ColumnOrdering>> columnOrderings) {
     Preconditions.checkArgument(
@@ -75,6 +77,7 @@ public class ScanOptions {
     this.offset = offset;
     this.nearest = nearest;
     this.withRowId = withRowId;
+    this.withRowAddress = withRowAddress;
     this.batchReadahead = batchReadahead;
     this.columnOrderings = columnOrderings;
   }
@@ -161,6 +164,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether to include the row address.
+   *
+   * @return true if row address should be included, false otherwise.
+   */
+  public boolean isWithRowAddress() {
+    return withRowAddress;
+  }
+
+  /**
    * Get the batch readahead.
    *
    * @return the number of batches to read ahead.
@@ -187,6 +199,7 @@ public class ScanOptions {
         .append("offset", offset.orElse(null))
         .append("nearest", nearest.orElse(null))
         .append("withRowId", withRowId)
+        .append("WithRowAddress", withRowAddress)
         .append("batchReadahead", batchReadahead)
         .append("columnOrdering", columnOrderings)
         .toString();
@@ -203,6 +216,7 @@ public class ScanOptions {
     private Optional<Long> offset = Optional.empty();
     private Optional<Query> nearest = Optional.empty();
     private boolean withRowId = false;
+    private boolean withRowAddress = false;
     private int batchReadahead = 16;
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
 
@@ -223,6 +237,7 @@ public class ScanOptions {
       this.offset = options.getOffset();
       this.nearest = options.getNearest();
       this.withRowId = options.isWithRowId();
+      this.withRowAddress = options.isWithRowAddress();
       this.batchReadahead = options.getBatchReadahead();
       this.columnOrderings = options.getColumnOrderings();
     }
@@ -327,6 +342,17 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether to include the row addr.
+     *
+     * @param withRowAddress true to include row ID, false otherwise.
+     * @return Builder instance for method chaining.
+     */
+    public Builder withRowAddress(boolean withRowAddress) {
+      this.withRowAddress = withRowAddress;
+      return this;
+    }
+
+    /**
      * Set the batch readahead.
      *
      * @param batchReadahead Number of batches to read ahead.
@@ -358,6 +384,7 @@ public class ScanOptions {
           offset,
           nearest,
           withRowId,
+          withRowAddress,
           batchReadahead,
           columnOrderings);
     }

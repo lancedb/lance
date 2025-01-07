@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.Dataset;
@@ -54,7 +53,11 @@ public class LanceFragmentScanner implements AutoCloseable {
       LanceConfig config = inputPartition.getConfig();
       ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
       dataset = Dataset.open(allocator, config.getDatasetUri(), options);
-      fragment = dataset.getFragments().get(fragmentId);
+      fragment =
+          dataset.getFragments().stream()
+              .filter(f -> f.getId() == fragmentId)
+              .findAny()
+              .orElseThrow(() -> new RuntimeException("no fragment found for " + fragmentId));
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));
       if (inputPartition.getWhereCondition().isPresent()) {
@@ -62,6 +65,7 @@ public class LanceFragmentScanner implements AutoCloseable {
       }
       scanOptions.batchSize(SparkOptions.getBatchSize(config));
       scanOptions.withRowId(getWithRowId(inputPartition.getSchema()));
+      scanOptions.withRowAddress(getWithRowAddress(inputPartition.getSchema()));
       if (inputPartition.getLimit().isPresent()) {
         scanOptions.limit(inputPartition.getLimit().get());
       }
@@ -114,7 +118,8 @@ public class LanceFragmentScanner implements AutoCloseable {
   private static List<String> getColumnNames(StructType schema) {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
-        .filter(name -> !name.equals(LanceConstant.ROW_ID))
+        .filter(
+            name -> !name.equals(LanceConstant.ROW_ID) && !name.equals(LanceConstant.ROW_ADDRESS))
         .collect(Collectors.toList());
   }
 
@@ -122,5 +127,11 @@ public class LanceFragmentScanner implements AutoCloseable {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
         .anyMatch(name -> name.equals(LanceConstant.ROW_ID));
+  }
+
+  private static boolean getWithRowAddress(StructType schema) {
+    return Arrays.stream(schema.fields())
+        .map(StructField::name)
+        .anyMatch(name -> name.equals(LanceConstant.ROW_ADDRESS));
   }
 }

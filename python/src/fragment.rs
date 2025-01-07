@@ -127,11 +127,11 @@ impl FileFragment {
         PyLance(self.fragment.metadata().clone())
     }
 
-    #[pyo3(signature=(_filter=None))]
-    fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
+    #[pyo3(signature=(filter=None))]
+    fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
         RT.runtime.block_on(async {
             self.fragment
-                .count_rows()
+                .count_rows(filter)
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })

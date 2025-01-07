@@ -11,28 +11,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.lancedb.lance.index;
+package com.lancedb.lance.ipc;
 
-public enum IndexType {
-  SCALAR(0),
-  BTREE(1),
-  BITMAP(2),
-  LABEL_LIST(3),
-  INVERTED(4),
-  VECTOR(100),
-  IVF_FLAT(101),
-  IVF_SQ(102),
-  IVF_PQ(103),
-  IVF_HNSW_SQ(104),
-  IVF_HNSW_PQ(105);
+import java.io.Serializable;
 
-  private final int value;
+public class FieldStatistics implements Serializable {
+  private final int id;
+  // The size of the data in bytes
+  private final long dataSize;
 
-  IndexType(int value) {
-    this.value = value;
+  public FieldStatistics(int id, long dataSize) {
+    this.id = id;
+    this.dataSize = dataSize;
   }
 
-  public int getValue() {
-    return value;
+  public int getId() {
+    return id;
+  }
+
+  public long getDataSize() {
+    return dataSize;
+  }
+
+  @Override
+  public String toString() {
+    return "FieldStatistics{" + "id=" + id + ", dataSize=" + dataSize + '}';
   }
 }

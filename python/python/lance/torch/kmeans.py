@@ -14,6 +14,7 @@ from lance.dependencies import (
 )
 from lance.dependencies import numpy as np
 from lance.log import LOGGER
+from lance.util import MetricType, _normalize_metric_type
 
 from . import preferred_device
 from .data import TensorDataset
@@ -53,7 +54,7 @@ class KMeans:
         self,
         k: int,
         *,
-        metric: Literal["l2", "euclidean", "cosine", "dot"] = "l2",
+        metric: MetricType = "l2",
         init: Literal["random"] = "random",
         max_iters: int = 50,
         tolerance: float = 1e-4,
@@ -64,9 +65,8 @@ class KMeans:
         self.k = k
         self.max_iters = max_iters
 
-        metric = metric.lower()
-        self.metric = metric
-        if metric in ["l2", "euclidean", "cosine"]:
+        self.metric = _normalize_metric_type(metric)
+        if metric in ["l2", "cosine"]:
             # Cosine uses normalized unit vector and calculate l2 distance
             self.dist_func = l2_distance
         elif metric == "dot":
