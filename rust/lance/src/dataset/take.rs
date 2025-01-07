@@ -66,6 +66,7 @@ pub async fn take(
             addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
         };
+        // TODO: Take into account the deletion vector when computing the row offset.
         let row_addr =
             RowAddress::new_from_parts(cur_frag.id() as u32, (sorted_offset - frag_offset) as u32);
         addrs.push(u64::from(row_addr));
@@ -616,6 +617,55 @@ mod test {
                     ])),
                     Arc::new(StringArray::from_iter_values(
                         [200, 199, 39, 40, 199, 40, 125]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_with_deletion() {
+        let data = test_batch(0..120);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.delete("i in (40, 77, 78, 79)").await.unwrap();
+
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let values = dataset
+            .take(
+                &[
+                    0,   // 0
+                    39,  // 39
+                    40,  // 41
+                    75,  // 76
+                    76,  // 80
+                    77,  // 81
+                    115, // 119
+                ],
+                projection,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([0, 39, 41, 76, 80, 81, 119])),
+                    Arc::new(StringArray::from_iter_values(
+                        [0, 39, 41, 76, 80, 81, 119]
                             .iter()
                             .map(|v| format!("str-{v}"))
                     )),
