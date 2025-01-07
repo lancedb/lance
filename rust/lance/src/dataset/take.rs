@@ -16,6 +16,7 @@ use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::deletion;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::{location, Location};
@@ -66,9 +67,14 @@ pub async fn take(
             addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
         };
+
         // TODO: Take into account the deletion vector when computing the row offset.
-        let row_addr =
-            RowAddress::new_from_parts(cur_frag.id() as u32, (sorted_offset - frag_offset) as u32);
+        let deletion_vector = cur_frag.get_deletion_vector().await?;
+        let mut local_offset = (sorted_offset - frag_offset) as u32;
+        if let Some(deletion_vector) = &deletion_vector {
+            local_offset = deletion_vector.map_offset((sorted_offset - frag_offset) as u32);
+        };
+        let row_addr = RowAddress::new_from_parts(cur_frag.id() as u32, local_offset);
         addrs.push(u64::from(row_addr));
     }
 

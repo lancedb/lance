@@ -60,6 +60,14 @@ impl DeletionVector {
         }
     }
 
+    fn range_cardinality(&self, range: Range<u32>) -> u64 {
+        match self {
+            Self::NoDeletions => 0,
+            Self::Set(set) => range.fold(0, |acc, i| acc + set.contains(&i) as u64),
+            Self::Bitmap(bitmap) => bitmap.range_cardinality(range),
+        }
+    }
+
     pub fn iter(&self) -> Box<dyn Iterator<Item = u32> + Send + '_> {
         match self {
             Self::NoDeletions => Box::new(std::iter::empty()),
@@ -112,6 +120,26 @@ impl DeletionVector {
             Self::NoDeletions => None,
         }
         .map(BooleanArray::from)
+    }
+
+    /// Map naive offset into local fragment offset based on deleted values.
+    ///
+    /// This skips over any deleted values that come before the given offset.
+    pub fn map_offset(&self, offset: u32) -> u32 {
+        let max = self.len() as u32 + offset;
+        // We'll do binary search over 0 .. max to find the first value that is not deleted.
+        let mut left = offset;
+        let mut right = max;
+        loop {
+            let mid = left + (dbg!(right) - dbg!(left)) / 2;
+            let deleted_in_range = self.range_cardinality(offset..mid) as u32;
+            let non_deleted = mid - offset - deleted_in_range;
+            match non_deleted.cmp(&offset) {
+                std::cmp::Ordering::Equal => return mid,
+                std::cmp::Ordering::Less => left = mid + 1,
+                std::cmp::Ordering::Greater => right = mid,
+            }
+        }
     }
 }
 
@@ -240,5 +268,17 @@ mod test {
     fn test_threshold() {
         let dv = DeletionVector::from_iter(0..(BITMAP_THRESDHOLD as u32));
         assert!(matches!(dv, DeletionVector::Bitmap(_)));
+    }
+
+    #[test]
+    fn test_map_offset() {
+        let dv = DeletionVector::from_iter(vec![3, 5]);
+
+        assert_eq!(dv.map_offset(0), 0);
+        assert_eq!(dv.map_offset(1), 1);
+        assert_eq!(dv.map_offset(2), 2);
+        assert_eq!(dv.map_offset(3), 4);
+        assert_eq!(dv.map_offset(4), 6);
+        assert_eq!(dv.map_offset(5), 7);
     }
 }
