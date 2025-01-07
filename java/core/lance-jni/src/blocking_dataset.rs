@@ -30,8 +30,11 @@ use jni::sys::{jboolean, jint};
 use jni::sys::{jbyteArray, jlong};
 use jni::{objects::JObject, JNIEnv};
 use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::transaction::Operation;
-use lance::dataset::{ColumnAlteration, Dataset, ProjectionRequest, ReadParams, WriteParams};
+use lance::dataset::{
+    ColumnAlteration, Dataset, NewColumnTransform, ProjectionRequest, ReadParams, WriteParams,
+};
 use lance::io::{ObjectStore, ObjectStoreParams};
 use lance::table::format::Fragment;
 use lance::table::format::Index;
@@ -152,6 +155,11 @@ impl BlockingDataset {
     pub fn count_rows(&self, filter: Option<String>) -> Result<usize> {
         let rows = RT.block_on(self.inner.count_rows(filter))?;
         Ok(rows)
+    }
+
+    pub fn calculate_data_stats(&self) -> Result<DataStatistics> {
+        let stats = RT.block_on(Arc::new(self.clone().inner).calculate_data_stats())?;
+        Ok(stats)
     }
 
     pub fn list_indexes(&self) -> Result<Arc<Vec<Index>>> {
@@ -727,6 +735,43 @@ fn inner_count_rows(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeGetDataStatistics<'local>(
+    mut env: JNIEnv<'local>,
+    java_dataset: JObject,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_get_data_statistics(&mut env, java_dataset))
+}
+
+fn inner_get_data_statistics<'local>(
+    env: &mut JNIEnv<'local>,
+    java_dataset: JObject,
+) -> Result<JObject<'local>> {
+    let stats = {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        dataset_guard.calculate_data_stats()?
+    };
+    let data_stats = env.new_object("com/lancedb/lance/ipc/DataStatistics", "()V", &[])?;
+
+    for field in stats.fields {
+        let id = field.id as jint;
+        let byte_size = field.bytes_on_disk as jlong;
+        let filed_jobj = env.new_object(
+            "com/lancedb/lance/ipc/FieldStatistics",
+            "(IJ)V",
+            &[JValue::Int(id), JValue::Long(byte_size)],
+        )?;
+        env.call_method(
+            &data_stats,
+            "addFiledStatistics",
+            "(Lcom/lancedb/lance/ipc/FieldStatistics;)V",
+            &[JValue::Object(&filed_jobj)],
+        )?;
+    }
+    Ok(data_stats)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeListIndexes<'local>(
     mut env: JNIEnv<'local>,
     java_dataset: JObject,
@@ -943,5 +988,72 @@ fn inner_alter_columns(
         unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
 
     RT.block_on(dataset_guard.inner.alter_columns(&column_alterations))?;
+    Ok(())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsBySqlExpressions(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    sql_expressions: JObject, // SqlExpressions
+    batch_size: JObject,      // Optional<Long>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_add_columns_by_sql_expressions(&mut env, java_dataset, sql_expressions, batch_size)
+    )
+}
+
+fn inner_add_columns_by_sql_expressions(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    sql_expressions: JObject, // SqlExpressions
+    batch_size: JObject,      // Optional<Long>
+) -> Result<()> {
+    let sql_expressions_obj = env
+        .get_field(sql_expressions, "sqlExpressions", "Ljava/util/List;")?
+        .l()?;
+
+    let sql_expressions_obj_list = env.get_list(&sql_expressions_obj)?;
+    let mut expressions: Vec<(String, String)> = Vec::new();
+
+    let mut iterator = sql_expressions_obj_list.iter(env)?;
+
+    while let Some(item) = iterator.next(env)? {
+        let name = env
+            .call_method(&item, "getName", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let value = env
+            .call_method(&item, "getExpression", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let key_str: String = env.get_string(&JString::from(name))?.into();
+        let value_str: String = env.get_string(&JString::from(value))?.into();
+        expressions.push((key_str, value_str));
+    }
+
+    let rust_transform = NewColumnTransform::SqlExpressions(expressions);
+
+    let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
+        let batch_size_value = env.get_long_opt(&batch_size)?;
+        match batch_size_value {
+            Some(value) => Some(
+                value
+                    .try_into()
+                    .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(
+        dataset_guard
+            .inner
+            .add_columns(rust_transform, None, batch_size),
+    )?;
     Ok(())
 }

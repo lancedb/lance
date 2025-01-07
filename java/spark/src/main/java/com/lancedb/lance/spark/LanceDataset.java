@@ -50,7 +50,18 @@ public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetada
           public DataType dataType() {
             return DataTypes.LongType;
           }
-        }
+        },
+        new MetadataColumn() {
+          @Override
+          public String name() {
+            return LanceConstant.ROW_ADDRESS;
+          }
+
+          @Override
+          public DataType dataType() {
+            return DataTypes.LongType;
+          }
+        },
       };
 
   LanceConfig config;

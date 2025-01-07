@@ -93,6 +93,15 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn fsl_encoding(dimension: u64, items: ArrayEncoding) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
+                dimension: dimension.try_into().unwrap(),
+                items: Some(Box::new(items)),
+            }))),
+        }
+    }
+
     pub fn bitpacked_encoding(
         compressed_bits_per_value: u64,
         uncompressed_bits_per_value: u64,

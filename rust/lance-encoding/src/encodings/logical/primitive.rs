@@ -11,35 +11,37 @@ use std::{
 };
 
 use arrow::array::AsArray;
-use arrow_array::{make_array, types::UInt64Type, Array, ArrayRef, PrimitiveArray};
+use arrow_array::{
+    make_array, types::UInt64Type, Array, ArrayRef, FixedSizeListArray, PrimitiveArray,
+};
 use arrow_buffer::{bit_util, BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField};
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_array;
 use lance_core::{
-    cache::FileMetadataCache,
+    cache::{Context, DeepSizeOf, FileMetadataCache},
     datatypes::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     },
+    error::Error,
     utils::bit::pad_bytes,
-    Error,
-};
-use lance_core::{
-    cache::{Context, DeepSizeOf},
     utils::hash::U8SliceKey,
 };
 use log::{debug, trace};
 use snafu::{location, Location};
 
-use crate::data::{AllNullDataBlock, DataBlock, VariableWidthBlock};
-use crate::decoder::PerValueDecompressor;
 use crate::encoder::PerValueDataBlock;
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
     DefinitionInterpretation, RepDefSlicer,
 };
 use crate::statistics::{ComputeStat, GetStat, Stat};
+use crate::{
+    data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
+    utils::bytepack::BytepackedIntegerEncoder,
+};
+use crate::{decoder::PerValueDecompressor, utils::bytepack::ByteUnpacker};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
@@ -287,7 +289,7 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
-        io: &dyn EncodingsIo,
+        io: &Arc<dyn EncodingsIo>,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>>;
 }
 
@@ -761,6 +763,7 @@ struct MiniBlockDecoder {
     instructions: VecDeque<ChunkInstructions>,
     offset_in_current_chunk: u64,
     num_rows: u64,
+    items_per_row: u64,
     dictionary: Option<Arc<DataBlock>>,
 }
 
@@ -768,16 +771,16 @@ struct MiniBlockDecoder {
 /// process for miniblock encoded data.
 impl StructuralPageDecoder for MiniBlockDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
-        let mut rows_desired = num_rows;
+        let mut items_desired = num_rows * self.items_per_row;
         let mut need_preamble = false;
         let mut skip_in_chunk = self.offset_in_current_chunk;
         let mut drain_instructions = Vec::new();
-        while rows_desired > 0 || need_preamble {
+        while items_desired > 0 || need_preamble {
             let (instructions, consumed) = self
                 .instructions
                 .front()
                 .unwrap()
-                .drain_from_instruction(&mut rows_desired, &mut need_preamble, &mut skip_in_chunk);
+                .drain_from_instruction(&mut items_desired, &mut need_preamble, &mut skip_in_chunk);
 
             while self.loaded_chunks.front().unwrap().chunk_idx
                 != instructions.chunk_instructions.chunk_idx
@@ -829,6 +832,7 @@ pub struct ComplexAllNullScheduler {
     // Set from protobuf
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
+    items_per_row: u64,
     // Set during initialization
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
@@ -838,10 +842,12 @@ impl ComplexAllNullScheduler {
     pub fn new(
         buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
         def_meaning: Arc<[DefinitionInterpretation]>,
+        items_per_row: u64,
     ) -> Self {
         Self {
             buffer_offsets_and_sizes,
             def_meaning,
+            items_per_row,
             rep: None,
             def: None,
         }
@@ -901,14 +907,19 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
-        _io: &dyn EncodingsIo,
+        _io: &Arc<dyn EncodingsIo>,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
         let ranges = VecDeque::from_iter(ranges.iter().cloned());
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
+        let item_ranges = ranges
+            .iter()
+            .map(|r| r.start * self.items_per_row..r.end * self.items_per_row)
+            .collect();
         Ok(std::future::ready(Ok(Box::new(ComplexAllNullPageDecoder {
-            ranges,
+            ranges: item_ranges,
             rep: self.rep.clone(),
             def: self.def.clone(),
+            items_per_row: self.items_per_row,
             num_rows,
             def_meaning: self.def_meaning.clone(),
         }) as Box<dyn StructuralPageDecoder>))
@@ -922,6 +933,7 @@ pub struct ComplexAllNullPageDecoder {
     rep: Option<ScalarBuffer<u16>>,
     def: Option<ScalarBuffer<u16>>,
     num_rows: u64,
+    items_per_row: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
 }
 
@@ -951,7 +963,8 @@ impl StructuralPageDecoder for ComplexAllNullPageDecoder {
         // because the row ranges might not map directly to item ranges
         //
         // We should add test cases and handle this later
-        let drained_ranges = self.drain_ranges(num_rows);
+        let num_items = num_rows * self.items_per_row;
+        let drained_ranges = self.drain_ranges(num_items);
         Ok(Box::new(DecodeComplexAllNullTask {
             ranges: drained_ranges,
             rep: self.rep.clone(),
@@ -1028,7 +1041,7 @@ impl StructuralPageScheduler for SimpleAllNullScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
-        _io: &dyn EncodingsIo,
+        _io: &Arc<dyn EncodingsIo>,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         Ok(std::future::ready(Ok(
@@ -1143,6 +1156,7 @@ pub struct MiniBlockScheduler {
     buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
     items_in_page: u64,
+    items_per_row: u64,
     repetition_index_depth: u16,
     cache_key: String,
     rep_decompressor: Arc<dyn BlockDecompressor>,
@@ -1155,10 +1169,12 @@ pub struct MiniBlockScheduler {
 }
 
 impl MiniBlockScheduler {
+    #[allow(clippy::too_many_arguments)]
     fn try_new(
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
+        items_per_row: u64,
         page_number: usize,
         column_number: usize,
         layout: &pb::MiniBlockLayout,
@@ -1201,7 +1217,7 @@ impl MiniBlockScheduler {
             None
         };
 
-        let cache_key = format!("miniblock/{}/{}", page_number, column_number);
+        let cache_key = format!("{}-{}", page_number, column_number);
 
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
@@ -1212,6 +1228,7 @@ impl MiniBlockScheduler {
             priority,
             cache_key,
             items_in_page,
+            items_per_row,
             dictionary,
             def_meaning: def_meaning.into(),
             page_meta: None,
@@ -1600,16 +1617,21 @@ impl StructuralPageScheduler for MiniBlockScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
-        io: &dyn EncodingsIo,
+        io: &Arc<dyn EncodingsIo>,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+        let ranges = ranges
+            .iter()
+            .map(|r| r.start * self.items_per_row..r.end * self.items_per_row)
+            .collect::<Vec<_>>();
+
         let page_meta = self.page_meta.as_ref().unwrap();
 
         let chunk_instructions =
-            ChunkInstructions::schedule_instructions(&page_meta.rep_index, ranges);
+            ChunkInstructions::schedule_instructions(&page_meta.rep_index, &ranges);
 
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         debug_assert_eq!(
-            num_rows,
+            num_rows * self.items_per_row,
             chunk_instructions
                 .iter()
                 .map(|ci| {
@@ -1643,6 +1665,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .as_ref()
             .map(|dictionary| dictionary.clone());
         let def_meaning = self.def_meaning.clone();
+        let items_per_row = self.items_per_row;
 
         Ok(async move {
             let loaded_chunk_data = loaded_chunk_data.await?;
@@ -1660,10 +1683,27 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 offset_in_current_chunk: 0,
                 dictionary,
                 num_rows,
+                items_per_row,
             }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed())
     }
+}
+
+#[derive(Debug)]
+struct FullZipRepIndexDetails {
+    buf_position: u64,
+    bytes_per_value: u64, // Will be 1, 2, 4, or 8
+}
+
+#[derive(Debug)]
+struct FullZipDecodeDetails {
+    value_decompressor: Arc<dyn PerValueDecompressor>,
+    def_meaning: Arc<[DefinitionInterpretation]>,
+    ctrl_word_parser: ControlWordParser,
+    max_rep: u16,
+    max_visible_def: u16,
+    items_per_row: u64,
 }
 
 /// A scheduler for full-zip encoded data
@@ -1676,11 +1716,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
 #[derive(Debug)]
 pub struct FullZipScheduler {
     data_buf_position: u64,
+    rep_index: Option<FullZipRepIndexDetails>,
     priority: u64,
     rows_in_page: u64,
-    value_decompressor: Arc<dyn PerValueDecompressor>,
-    def_meaning: Arc<[DefinitionInterpretation]>,
-    ctrl_word_parser: ControlWordParser,
+    details: Arc<FullZipDecodeDetails>,
 }
 
 impl FullZipScheduler {
@@ -1688,6 +1727,7 @@ impl FullZipScheduler {
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         rows_in_page: u64,
+        items_per_row: u64,
         layout: &pb::FullZipLayout,
         decompressors: &dyn DecompressorStrategy,
     ) -> Result<Self> {
@@ -1695,6 +1735,21 @@ impl FullZipScheduler {
         // fixed-width (and we can tell size from rows_in_page) or it is not
         // and we have a repetition index.
         let (data_buf_position, _) = buffer_offsets_and_sizes[0];
+        let rep_index = buffer_offsets_and_sizes.get(1).map(|(pos, len)| {
+            let num_reps = (items_per_row * rows_in_page) + 1;
+            let bytes_per_value = len / num_reps;
+            debug_assert_eq!(len % num_reps, 0);
+            debug_assert!(
+                bytes_per_value == 1
+                    || bytes_per_value == 2
+                    || bytes_per_value == 4
+                    || bytes_per_value == 8
+            );
+            FullZipRepIndexDetails {
+                buf_position: *pos,
+                bytes_per_value,
+            }
+        });
         let value_decompressor = decompressors
             .create_per_value_decompressor(layout.value_compression.as_ref().unwrap())?;
         let ctrl_word_parser = ControlWordParser::new(
@@ -1706,14 +1761,183 @@ impl FullZipScheduler {
             .iter()
             .map(|l| ProtobufUtils::repdef_layer_to_def_interp(*l))
             .collect::<Vec<_>>();
-        Ok(Self {
-            data_buf_position,
+
+        let max_rep = def_meaning.iter().filter(|d| d.is_list()).count() as u16;
+        let max_visible_def = def_meaning
+            .iter()
+            .filter(|d| !d.is_list())
+            .map(|d| d.num_def_levels())
+            .sum();
+
+        let details = Arc::new(FullZipDecodeDetails {
             value_decompressor: value_decompressor.into(),
             def_meaning: def_meaning.into(),
+            ctrl_word_parser,
+            items_per_row,
+            max_rep,
+            max_visible_def,
+        });
+        Ok(Self {
+            data_buf_position,
+            rep_index,
+            details,
             priority,
             rows_in_page,
-            ctrl_word_parser,
         })
+    }
+
+    /// Schedules indirectly by first fetching the data ranges from the
+    /// repetition index and then fetching the data
+    ///
+    /// This approach is needed whenever we have a repetition index and
+    /// the data has a variable length.
+    async fn indirect_schedule_ranges(
+        data_buffer_pos: u64,
+        item_ranges: Vec<Range<u64>>,
+        rep_index_ranges: Vec<Range<u64>>,
+        bytes_per_rep: u64,
+        io: Arc<dyn EncodingsIo>,
+        priority: u64,
+        details: Arc<FullZipDecodeDetails>,
+    ) -> Result<Box<dyn StructuralPageDecoder>> {
+        let byte_ranges = io
+            .submit_request(rep_index_ranges, priority)
+            .await?
+            .into_iter()
+            .map(|d| LanceBuffer::from_bytes(d, 1))
+            .collect::<Vec<_>>();
+        let byte_ranges = LanceBuffer::concat(&byte_ranges);
+        let byte_ranges = ByteUnpacker::new(byte_ranges, bytes_per_rep as usize)
+            .chunks(2)
+            .into_iter()
+            .map(|mut c| {
+                let start = c.next().unwrap() + data_buffer_pos;
+                let end = c.next().unwrap() + data_buffer_pos;
+                start..end
+            })
+            .collect::<Vec<_>>();
+
+        let data = io.submit_request(byte_ranges, priority);
+
+        let bits_per_value = details.value_decompressor.bits_per_value();
+        if bits_per_value > 0 {
+            if bits_per_value % 8 != 0 {
+                // Unlikely we will ever want this since full-zip values are so large the few bits we shave off don't
+                // make much difference.
+                unimplemented!("Bit-packed full-zip");
+            }
+            let bytes_per_value = bits_per_value / 8;
+            let total_bytes_per_value =
+                bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
+            let data = data.await?;
+            let data = data
+                .into_iter()
+                .map(|d| LanceBuffer::from_bytes(d, 1))
+                .collect();
+            let num_rows = item_ranges.into_iter().map(|r| r.end - r.start).sum();
+            Ok(Box::new(FixedFullZipDecoder {
+                details,
+                data,
+                num_rows,
+                offset_in_current: 0,
+                bytes_per_value: bytes_per_value as usize,
+                total_bytes_per_value,
+            }) as Box<dyn StructuralPageDecoder>)
+        } else {
+            // Variable full-zip
+            todo!()
+        }
+    }
+
+    /// Schedules ranges in the presence of a repetition index
+    fn schedule_ranges_rep(
+        &self,
+        ranges: &[Range<u64>],
+        io: &Arc<dyn EncodingsIo>,
+        rep_index: &FullZipRepIndexDetails,
+    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        // Convert row ranges to item ranges (i.e. multiply by items per row)
+        let item_ranges = ranges
+            .iter()
+            .map(|r| r.start * self.details.items_per_row..r.end * self.details.items_per_row)
+            .collect::<Vec<_>>();
+
+        // For each item range we need to read a portion of the repetition index
+        let rep_index_ranges = item_ranges
+            .iter()
+            .flat_map(|r| {
+                let first_val_start =
+                    rep_index.buf_position + (r.start * rep_index.bytes_per_value);
+                let first_val_end = first_val_start + rep_index.bytes_per_value;
+                let last_val_start = rep_index.buf_position + (r.end * rep_index.bytes_per_value);
+                let last_val_end = last_val_start + rep_index.bytes_per_value;
+                [first_val_start..first_val_end, last_val_start..last_val_end]
+            })
+            .collect::<Vec<_>>();
+
+        // Create the decoder
+
+        Ok(Self::indirect_schedule_ranges(
+            self.data_buf_position,
+            item_ranges,
+            rep_index_ranges,
+            rep_index.bytes_per_value,
+            io.clone(),
+            self.priority,
+            self.details.clone(),
+        )
+        .boxed())
+    }
+
+    // In the simple case there is no repetition and we just have large fixed-width
+    // rows of data.  We can just map row ranges to byte ranges directly using the
+    // fixed-width of the data type.
+    fn schedule_ranges_simple(
+        &self,
+        ranges: &[Range<u64>],
+        io: &dyn EncodingsIo,
+    ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
+        // Convert row ranges to item ranges (i.e. multiply by items per row)
+        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
+        let item_ranges = ranges
+            .iter()
+            .map(|r| r.start * self.details.items_per_row..r.end * self.details.items_per_row)
+            .collect::<Vec<_>>();
+
+        // Convert item ranges to byte ranges (i.e. multiply by bytes per item)
+        let bits_per_value = self.details.value_decompressor.bits_per_value();
+        assert_eq!(bits_per_value % 8, 0);
+        let bytes_per_value = bits_per_value / 8;
+        let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
+        let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
+        let byte_ranges = item_ranges.iter().map(|r| {
+            debug_assert!(r.end <= self.rows_in_page * self.details.items_per_row);
+            let start = self.data_buf_position + r.start * total_bytes_per_value;
+            let end = self.data_buf_position + r.end * total_bytes_per_value;
+            start..end
+        });
+
+        // Request byte ranges
+        let data = io.submit_request(byte_ranges.collect(), self.priority);
+
+        let details = self.details.clone();
+
+        Ok(async move {
+            let data = data.await?;
+            let data = data
+                .into_iter()
+                .map(|d| LanceBuffer::from_bytes(d, 1))
+                .collect();
+            Ok(Box::new(FixedFullZipDecoder {
+                details,
+                data,
+                num_rows,
+                offset_in_current: 0,
+                bytes_per_value: bytes_per_value as usize,
+                total_bytes_per_value: total_bytes_per_value as usize,
+            }) as Box<dyn StructuralPageDecoder>)
+        }
+        .boxed())
     }
 }
 
@@ -1729,43 +1953,13 @@ impl StructuralPageScheduler for FullZipScheduler {
     fn schedule_ranges(
         &self,
         ranges: &[Range<u64>],
-        io: &dyn EncodingsIo,
+        io: &Arc<dyn EncodingsIo>,
     ) -> Result<BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>> {
-        let bits_per_value = self.value_decompressor.bits_per_value();
-        assert_eq!(bits_per_value % 8, 0);
-        let bytes_per_value = bits_per_value / 8;
-        let bytes_per_cw = self.ctrl_word_parser.bytes_per_word();
-        let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
-        // We simply map row ranges into byte ranges
-        let byte_ranges = ranges.iter().map(|r| {
-            debug_assert!(r.end <= self.rows_in_page);
-            let start = self.data_buf_position + r.start * total_bytes_per_value;
-            let end = self.data_buf_position + r.end * total_bytes_per_value;
-            start..end
-        });
-        let data = io.submit_request(byte_ranges.collect(), self.priority);
-        let value_decompressor = self.value_decompressor.clone();
-        let def_meaning = self.def_meaning.clone();
-        let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
-        let ctrl_word_parser = self.ctrl_word_parser;
-        Ok(async move {
-            let data = data.await?;
-            let data = data
-                .into_iter()
-                .map(|d| LanceBuffer::from_bytes(d, 1))
-                .collect();
-            Ok(Box::new(FixedFullZipDecoder {
-                value_decompressor,
-                def_meaning,
-                data,
-                num_rows,
-                ctrl_word_parser,
-                offset_in_current: 0,
-                bytes_per_value: bytes_per_value as usize,
-                total_bytes_per_value: total_bytes_per_value as usize,
-            }) as Box<dyn StructuralPageDecoder>)
+        if let Some(rep_index) = self.rep_index.as_ref() {
+            self.schedule_ranges_rep(ranges, io, rep_index)
+        } else {
+            self.schedule_ranges_simple(ranges, io.as_ref())
         }
-        .boxed())
     }
 }
 
@@ -1778,9 +1972,7 @@ impl StructuralPageScheduler for FullZipScheduler {
 /// requested data.  This decoder / scheduler does not do any read amplification.
 #[derive(Debug)]
 struct FixedFullZipDecoder {
-    value_decompressor: Arc<dyn PerValueDecompressor>,
-    def_meaning: Arc<[DefinitionInterpretation]>,
-    ctrl_word_parser: ControlWordParser,
+    details: Arc<FullZipDecodeDetails>,
     data: VecDeque<LanceBuffer>,
     offset_in_current: usize,
     bytes_per_value: usize,
@@ -1788,38 +1980,93 @@ struct FixedFullZipDecoder {
     num_rows: u64,
 }
 
+impl FixedFullZipDecoder {
+    fn slice_next_task(&mut self, num_rows: u64) -> FullZipDecodeTaskItem {
+        debug_assert!(num_rows > 0);
+        let cur_buf = self.data.front_mut().unwrap();
+        let start = self.offset_in_current;
+        if self.details.ctrl_word_parser.has_rep() {
+            // This is a slightly slower path.  In order to figure out where to split we need to
+            // examine the rep index so we can convert num_lists to num_rows
+            let mut rows_started = 0;
+            // We always need at least one value.  Now loop through until we have passed num_rows
+            // values
+            let mut num_items = 0;
+            while self.offset_in_current < cur_buf.len() {
+                let control = self.details.ctrl_word_parser.parse_desc(
+                    &cur_buf[self.offset_in_current..],
+                    self.details.max_rep,
+                    self.details.max_visible_def,
+                );
+                if control.is_new_row {
+                    if rows_started == num_rows {
+                        break;
+                    }
+                    rows_started += 1;
+                }
+                num_items += 1;
+                if control.is_visible {
+                    self.offset_in_current += self.total_bytes_per_value;
+                } else {
+                    self.offset_in_current += self.details.ctrl_word_parser.bytes_per_word();
+                }
+            }
+
+            let task_slice = cur_buf.slice_with_length(start, self.offset_in_current - start);
+            if self.offset_in_current == cur_buf.len() {
+                self.data.pop_front();
+                self.offset_in_current = 0;
+            }
+
+            FullZipDecodeTaskItem {
+                data: task_slice,
+                rows_in_buf: rows_started,
+                items_in_buf: num_items,
+            }
+        } else {
+            // If there's no repetition we can calculate the slicing point by just multiplying
+            // the number of rows by the total bytes per value
+            let cur_buf = self.data.front_mut().unwrap();
+            let bytes_avail = cur_buf.len() - self.offset_in_current;
+            let offset_in_cur = self.offset_in_current;
+
+            let bytes_needed = num_rows as usize * self.total_bytes_per_value;
+            let mut rows_taken = num_rows;
+            let task_slice = if bytes_needed >= bytes_avail {
+                self.offset_in_current = 0;
+                rows_taken = bytes_avail as u64 / self.total_bytes_per_value as u64;
+                self.data
+                    .pop_front()
+                    .unwrap()
+                    .slice_with_length(offset_in_cur, bytes_avail)
+            } else {
+                self.offset_in_current += bytes_needed;
+                cur_buf.slice_with_length(offset_in_cur, bytes_needed)
+            };
+            FullZipDecodeTaskItem {
+                data: task_slice,
+                rows_in_buf: rows_taken,
+                items_in_buf: rows_taken,
+            }
+        }
+    }
+}
+
 impl StructuralPageDecoder for FixedFullZipDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
         let mut task_data = Vec::with_capacity(self.data.len());
-        let mut remaining = num_rows;
+        let mut remaining = num_rows * self.details.items_per_row;
         while remaining > 0 {
-            let cur_buf = self.data.front_mut().unwrap();
-            let bytes_avail = cur_buf.len() - self.offset_in_current;
-
-            let bytes_needed = remaining as usize * self.total_bytes_per_value;
-            let bytes_to_take = bytes_needed.min(bytes_avail);
-
-            let task_slice = cur_buf.slice_with_length(self.offset_in_current, bytes_to_take);
-            let rows_in_task = (bytes_to_take / self.total_bytes_per_value) as u64;
-
-            task_data.push((task_slice, rows_in_task));
-
-            remaining -= rows_in_task;
-            if bytes_to_take + self.offset_in_current == cur_buf.len() {
-                self.data.pop_front();
-                self.offset_in_current = 0;
-            } else {
-                self.offset_in_current += bytes_to_take;
-            }
+            let task_item = self.slice_next_task(remaining);
+            remaining -= task_item.rows_in_buf;
+            task_data.push(task_item);
         }
-        let num_rows = task_data.iter().map(|td| td.1).sum::<u64>() as usize;
+        let num_items = task_data.iter().map(|td| td.items_in_buf).sum::<u64>() as usize;
         Ok(Box::new(FixedFullZipDecodeTask {
-            value_decompressor: self.value_decompressor.clone(),
-            def_meaning: self.def_meaning.clone(),
-            ctrl_word_parser: self.ctrl_word_parser,
+            details: self.details.clone(),
             data: task_data,
             bytes_per_value: self.bytes_per_value,
-            num_rows,
+            num_items,
         }))
     }
 
@@ -1828,35 +2075,48 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
     }
 }
 
+#[derive(Debug)]
+struct FullZipDecodeTaskItem {
+    data: LanceBuffer,
+    rows_in_buf: u64,
+    items_in_buf: u64,
+}
+
 /// A task to unzip and decompress full-zip encoded data when that data
 /// has a fixed-width.
 #[derive(Debug)]
 struct FixedFullZipDecodeTask {
-    value_decompressor: Arc<dyn PerValueDecompressor>,
-    def_meaning: Arc<[DefinitionInterpretation]>,
-    ctrl_word_parser: ControlWordParser,
-    data: Vec<(LanceBuffer, u64)>,
-    num_rows: usize,
+    details: Arc<FullZipDecodeDetails>,
+    data: Vec<FullZipDecodeTaskItem>,
+    num_items: usize,
     bytes_per_value: usize,
 }
 
 impl DecodePageTask for FixedFullZipDecodeTask {
     fn decode(self: Box<Self>) -> Result<DecodedPage> {
         // Multiply by 2 to make a stab at the size of the output buffer (which will be decompressed and thus bigger)
-        let estimated_size_bytes = self.data.iter().map(|data| data.0.len()).sum::<usize>() * 2;
+        let estimated_size_bytes = self
+            .data
+            .iter()
+            .map(|task_item| task_item.data.len())
+            .sum::<usize>()
+            * 2;
         let mut data_builder =
             DataBlockBuilder::with_capacity_estimate(estimated_size_bytes as u64);
 
-        if self.ctrl_word_parser.bytes_per_word() == 0 {
+        if self.details.ctrl_word_parser.bytes_per_word() == 0 {
             // Fast path, no need to unzip because there is no rep/def
             //
             // We decompress each buffer and add it to our output buffer
-            for (buf, rows_in_buf) in self.data.into_iter() {
-                let decompressed = self.value_decompressor.decompress(buf, rows_in_buf)?;
-                data_builder.append(&decompressed, 0..rows_in_buf);
+            for task_item in self.data.into_iter() {
+                let decompressed = self
+                    .details
+                    .value_decompressor
+                    .decompress(task_item.data, task_item.items_in_buf)?;
+                data_builder.append(&decompressed, 0..task_item.items_in_buf);
             }
 
-            let unraveler = RepDefUnraveler::new(None, None, self.def_meaning);
+            let unraveler = RepDefUnraveler::new(None, None, self.details.def_meaning.clone());
 
             Ok(DecodedPage {
                 data: data_builder.finish(),
@@ -1864,45 +2124,56 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             })
         } else {
             // Slow path, unzipping needed
-            let mut rep = Vec::with_capacity(self.num_rows);
-            let mut def = Vec::with_capacity(self.num_rows);
+            let mut rep = Vec::with_capacity(self.num_items);
+            let mut def = Vec::with_capacity(self.num_items);
 
-            for (buf, rows_in_buf) in self.data.into_iter() {
-                let mut buf_slice = buf.as_ref();
+            for task_item in self.data.into_iter() {
+                let mut buf_slice = task_item.data.as_ref();
                 // We will be unzipping repdef in to `rep` and `def` and the
                 // values into `values` (which contains the compressed values)
                 let mut values = Vec::with_capacity(
-                    buf.len() - (self.ctrl_word_parser.bytes_per_word() * rows_in_buf as usize),
+                    task_item.data.len()
+                        - (self.details.ctrl_word_parser.bytes_per_word()
+                            * task_item.items_in_buf as usize),
                 );
-                for _ in 0..rows_in_buf {
+                let mut visible_items = 0;
+                for _ in 0..task_item.items_in_buf {
                     // Extract rep/def
-                    self.ctrl_word_parser.parse(buf_slice, &mut rep, &mut def);
-                    buf_slice = &buf_slice[self.ctrl_word_parser.bytes_per_word()..];
-                    // Extract value
-                    values.extend_from_slice(buf_slice[..self.bytes_per_value].as_ref());
-                    buf_slice = &buf_slice[self.bytes_per_value..];
+                    self.details
+                        .ctrl_word_parser
+                        .parse(buf_slice, &mut rep, &mut def);
+                    buf_slice = &buf_slice[self.details.ctrl_word_parser.bytes_per_word()..];
+
+                    let is_visible = def
+                        .last()
+                        .map(|d| *d <= self.details.max_visible_def)
+                        .unwrap_or(true);
+                    if is_visible {
+                        // Extract value
+                        values.extend_from_slice(buf_slice[..self.bytes_per_value].as_ref());
+                        buf_slice = &buf_slice[self.bytes_per_value..];
+                        visible_items += 1;
+                    }
                 }
 
                 // Finally, we decompress the values and add them to our output buffer
                 let values_buf = LanceBuffer::Owned(values);
                 let decompressed = self
+                    .details
                     .value_decompressor
-                    .decompress(values_buf, rows_in_buf)?;
-                data_builder.append(&decompressed, 0..rows_in_buf);
+                    .decompress(values_buf, visible_items)?;
+                data_builder.append(&decompressed, 0..visible_items);
             }
 
             let repetition = if rep.is_empty() { None } else { Some(rep) };
             let definition = if def.is_empty() { None } else { Some(def) };
 
-            let unraveler = RepDefUnraveler::new(
-                repetition,
-                definition,
-                // TODO: Fix this
-                self.def_meaning,
-            );
+            let unraveler =
+                RepDefUnraveler::new(repetition, definition, self.details.def_meaning.clone());
+            let data = data_builder.finish();
 
             Ok(DecodedPage {
-                data: data_builder.finish(),
+                data,
                 repdef: unraveler,
             })
         }
@@ -1998,7 +2269,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
 
         let page_decoder = cur_page
             .scheduler
-            .schedule_ranges(&ranges_in_page, context.io().as_ref())?;
+            .schedule_ranges(&ranges_in_page, context.io())?;
 
         let cur_path = context.current_path();
         let page_index = cur_page.page_index;
@@ -2039,6 +2310,7 @@ pub struct StructuralPrimitiveFieldScheduler {
 impl StructuralPrimitiveFieldScheduler {
     pub fn try_new(
         column_info: &ColumnInfo,
+        items_per_row: u64,
         decompressors: &dyn DecompressorStrategy,
     ) -> Result<Self> {
         let page_schedulers = column_info
@@ -2051,6 +2323,7 @@ impl StructuralPrimitiveFieldScheduler {
                     page_index,
                     column_info.index as usize,
                     decompressors,
+                    items_per_row,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2065,6 +2338,7 @@ impl StructuralPrimitiveFieldScheduler {
         page_index: usize,
         column_index: usize,
         decompressors: &dyn DecompressorStrategy,
+        items_per_row: u64,
     ) -> Result<PageInfoAndScheduler> {
         let scheduler: Box<dyn StructuralPageScheduler> =
             match page_info.encoding.as_structural().layout.as_ref() {
@@ -2073,6 +2347,7 @@ impl StructuralPrimitiveFieldScheduler {
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
                         mini_block.num_items,
+                        items_per_row,
                         page_index,
                         column_index,
                         mini_block,
@@ -2084,6 +2359,7 @@ impl StructuralPrimitiveFieldScheduler {
                         &page_info.buffer_offsets_and_sizes,
                         page_info.priority,
                         page_info.num_rows,
+                        items_per_row,
                         full_zip,
                         decompressors,
                     )?)
@@ -2103,6 +2379,7 @@ impl StructuralPrimitiveFieldScheduler {
                         Box::new(ComplexAllNullScheduler::new(
                             page_info.buffer_offsets_and_sizes.clone(),
                             def_meaning.into(),
+                            items_per_row,
                         )) as Box<dyn StructuralPageScheduler>
                     }
                 }
@@ -2305,8 +2582,57 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
 #[derive(Debug)]
 pub struct StructuralCompositeDecodeArrayTask {
     tasks: Vec<Box<dyn DecodePageTask>>,
-    data_type: DataType,
+    items_type: DataType,
+    fsl_fields: Arc<[Arc<ArrowField>]>,
     should_validate: bool,
+}
+
+impl StructuralCompositeDecodeArrayTask {
+    fn restore_validity(
+        array: Arc<dyn Array>,
+        unraveler: &mut CompositeRepDefUnraveler,
+    ) -> Arc<dyn Array> {
+        let validity = unraveler.unravel_validity(array.len());
+        let Some(validity) = validity else {
+            return array;
+        };
+        if array.data_type() == &DataType::Null {
+            // We unravel from a null array but we don't add the null buffer because arrow-rs doesn't like it
+            return array;
+        }
+        assert_eq!(validity.len(), array.len());
+        // SAFETY: We've should have already asserted the buffers are all valid, we are just
+        // adding null buffers to the array here
+        make_array(unsafe {
+            array
+                .to_data()
+                .into_builder()
+                .nulls(Some(validity))
+                .build_unchecked()
+        })
+    }
+
+    fn restore_fsl(
+        array: Arc<dyn Array>,
+        unraveler: &mut CompositeRepDefUnraveler,
+        fsl_fields: Arc<[Arc<ArrowField>]>,
+    ) -> Arc<dyn Array> {
+        let mut array = array;
+        for fsl_field in fsl_fields.iter().rev() {
+            let DataType::FixedSizeList(child_field, dimension) = fsl_field.data_type() else {
+                unreachable!()
+            };
+            let fsl_num_values = array.len() / *dimension as usize;
+            let fsl_validity = unraveler.unravel_fsl_validity(fsl_num_values, *dimension as usize);
+            array = Arc::new(FixedSizeListArray::new(
+                child_field.clone(),
+                *dimension,
+                array,
+                fsl_validity,
+            ));
+        }
+        array
+    }
 }
 
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
@@ -2320,7 +2646,7 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
             let array = make_array(
                 decoded
                     .data
-                    .into_arrow(self.data_type.clone(), self.should_validate)?,
+                    .into_arrow(self.items_type.clone(), self.should_validate)?,
             );
 
             arrays.push(array);
@@ -2329,24 +2655,9 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
         let array = arrow_select::concat::concat(&array_refs)?;
         let mut repdef = CompositeRepDefUnraveler::new(unravelers);
 
-        // The primitive array itself has a validity
-        let mut validity = repdef.unravel_validity(array.len());
-        if matches!(self.data_type, DataType::Null) {
-            // Null arrays don't have a validity but we still pretend they do for consistency's sake
-            // up until this point.  We need to remove it here.
-            validity = None;
-        }
-        if let Some(validity) = validity.as_ref() {
-            assert!(validity.len() == array.len());
-        }
-        // SAFETY: We are just replacing the validity and asserted it is the correct size
-        let array = make_array(unsafe {
-            array
-                .to_data()
-                .into_builder()
-                .nulls(validity)
-                .build_unchecked()
-        });
+        let array = Self::restore_validity(array, &mut repdef);
+        let array = Self::restore_fsl(array, &mut repdef, self.fsl_fields);
+
         Ok(DecodedArray { array, repdef })
     }
 }
@@ -2354,15 +2665,40 @@ impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
 #[derive(Debug)]
 pub struct StructuralPrimitiveFieldDecoder {
     field: Arc<ArrowField>,
+    items_type: DataType,
+    fsl_fields: Arc<[Arc<ArrowField>]>,
     page_decoders: VecDeque<Box<dyn StructuralPageDecoder>>,
     should_validate: bool,
     rows_drained_in_current: u64,
 }
 
 impl StructuralPrimitiveFieldDecoder {
+    fn flatten_field_helper(
+        field: &Arc<ArrowField>,
+        mut fields: Vec<Arc<ArrowField>>,
+    ) -> (Arc<[Arc<ArrowField>]>, &DataType) {
+        match field.data_type() {
+            DataType::FixedSizeList(inner, _) => {
+                fields.push(field.clone());
+                Self::flatten_field_helper(inner, fields)
+            }
+            _ => {
+                let fields = fields.into();
+                (fields, field.data_type())
+            }
+        }
+    }
+
+    fn flatten_field(field: &Arc<ArrowField>) -> (Arc<[Arc<ArrowField>]>, &DataType) {
+        Self::flatten_field_helper(field, Vec::default())
+    }
+
     pub fn new(field: &Arc<ArrowField>, should_validate: bool) -> Self {
+        let (fsl_fields, items_type) = Self::flatten_field(field);
         Self {
             field: field.clone(),
+            items_type: items_type.clone(),
+            fsl_fields,
             page_decoders: VecDeque::new(),
             should_validate,
             rows_drained_in_current: 0,
@@ -2399,8 +2735,9 @@ impl StructuralFieldDecoder for StructuralPrimitiveFieldDecoder {
         }
         Ok(Box::new(StructuralCompositeDecodeArrayTask {
             tasks,
-            data_type: self.field.data_type().clone(),
+            items_type: self.items_type.clone(),
             should_validate: self.should_validate,
+            fsl_fields: self.fsl_fields.clone(),
         }))
     }
 
@@ -2637,6 +2974,14 @@ impl FieldEncoder for PrimitiveFieldEncoder {
     }
 }
 
+/// The serialized representation of full-zip data
+struct SerializedFullZip {
+    /// The zipped values buffer
+    values: LanceBuffer,
+    /// The repetition index (only present if there is repetition)
+    repetition_index: Option<LanceBuffer>,
+}
+
 // We align and pad mini-blocks to 8 byte boundaries for two reasons.  First,
 // to allow us to store a chunk size in 12 bits.
 //
@@ -2693,6 +3038,7 @@ pub struct PrimitiveStructuralEncoder {
     compression_strategy: Arc<dyn CompressionStrategy>,
     column_index: u32,
     field: Field,
+    encoding_metadata: Arc<HashMap<String, String>>,
 }
 
 impl PrimitiveStructuralEncoder {
@@ -2701,6 +3047,7 @@ impl PrimitiveStructuralEncoder {
         compression_strategy: Arc<dyn CompressionStrategy>,
         column_index: u32,
         field: Field,
+        encoding_metadata: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         Ok(Self {
             accumulation_queue: AccumulationQueue::new(
@@ -2712,6 +3059,7 @@ impl PrimitiveStructuralEncoder {
             column_index,
             compression_strategy,
             field,
+            encoding_metadata,
         })
     }
 
@@ -2737,20 +3085,23 @@ impl PrimitiveStructuralEncoder {
         false
     }
 
-    fn prefers_miniblock(data_block: &DataBlock, field: &Field) -> bool {
+    fn prefers_miniblock(
+        data_block: &DataBlock,
+        encoding_metadata: &HashMap<String, String>,
+    ) -> bool {
         // If the user specifically requested miniblock then use it
-        if let Some(user_requested) = field.metadata.get(STRUCTURAL_ENCODING_META_KEY) {
+        if let Some(user_requested) = encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY) {
             return user_requested.to_lowercase() == STRUCTURAL_ENCODING_MINIBLOCK;
         }
         // Otherwise only use miniblock if it is narrow
         Self::is_narrow(data_block)
     }
 
-    fn prefers_fullzip(field: &Field) -> bool {
+    fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
         // Fullzip is the backup option so the only reason we wouldn't use it is if the
         // user specifically requested not to use it (in which case we're probably going
         // to emit an error)
-        if let Some(user_requested) = field.metadata.get(STRUCTURAL_ENCODING_META_KEY) {
+        if let Some(user_requested) = encoding_metadata.get(STRUCTURAL_ENCODING_META_KEY) {
             return user_requested.to_lowercase() == STRUCTURAL_ENCODING_FULLZIP;
         }
         true
@@ -3068,9 +3419,14 @@ impl PrimitiveStructuralEncoder {
             todo!()
         }
 
-        let num_items = data.num_values();
         // The validity is encoded in repdef so we can remove it
         let data = data.remove_validity();
+
+        // We encode FSL by flattening the data and then compressing it.  This means the mini-block will have
+        // more items than rows if any FSL layers are present.
+        let data = data.flatten();
+
+        let num_items = data.num_values();
 
         let compressor = compression_strategy.create_miniblock_compressor(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
@@ -3175,9 +3531,19 @@ impl PrimitiveStructuralEncoder {
     fn serialize_full_zip_fixed(
         fixed: FixedWidthDataBlock,
         mut repdef: ControlWordIterator,
-    ) -> LanceBuffer {
-        let len = fixed.data.len() + repdef.bytes_per_word() * fixed.num_values as usize;
-        let mut buf = Vec::with_capacity(len);
+        num_items: u64,
+    ) -> SerializedFullZip {
+        let len = fixed.data.len() + repdef.bytes_per_word() * num_items as usize;
+        let mut zipped_data = Vec::with_capacity(len);
+
+        let max_rep_index_val = if repdef.has_repetition() {
+            len as u64
+        } else {
+            // Setting this to 0 means we won't write a repetition index
+            0
+        };
+        let mut rep_index_builder =
+            BytepackedIntegerEncoder::with_capacity(num_items as usize + 1, max_rep_index_val);
 
         // I suppose we can just pad to the nearest byte but I'm not sure we need to worry about this anytime soon
         // because it is unlikely compression of large values is going to yield a result that is not byte aligned
@@ -3189,19 +3555,48 @@ impl PrimitiveStructuralEncoder {
 
         let bytes_per_value = fixed.bits_per_value as usize / 8;
 
-        for value in fixed.data.chunks_exact(bytes_per_value) {
-            repdef.append_next(&mut buf);
-            buf.extend_from_slice(value);
+        let mut data_iter = fixed.data.chunks_exact(bytes_per_value);
+        let mut offset = 0;
+        while let Some(control) = repdef.append_next(&mut zipped_data) {
+            if control.is_new_row {
+                // We have finished a row
+                debug_assert!(offset <= len);
+                // SAFETY: We know that `start <= len`
+                unsafe { rep_index_builder.append(offset as u64) };
+            }
+            if control.is_visible {
+                let value = data_iter.next().unwrap();
+                zipped_data.extend_from_slice(value);
+            }
+            offset = zipped_data.len();
         }
 
-        LanceBuffer::Owned(buf)
+        debug_assert_eq!(zipped_data.len(), len);
+        // Put the final value in the rep index
+        // SAFETY: `zipped_data.len() == len`
+        unsafe {
+            rep_index_builder.append(zipped_data.len() as u64);
+        }
+
+        let zipped_data = LanceBuffer::Owned(zipped_data);
+        let rep_index = rep_index_builder.into_data();
+        let rep_index = if rep_index.is_empty() {
+            None
+        } else {
+            Some(LanceBuffer::Owned(rep_index))
+        };
+        SerializedFullZip {
+            values: zipped_data,
+            repetition_index: rep_index,
+        }
     }
 
     // For variable-size data we encode < control word | length | data > for each value
     fn serialize_full_zip_variable(
         mut variable: VariableWidthBlock,
         mut repdef: ControlWordIterator,
-    ) -> LanceBuffer {
+        num_items: u64,
+    ) -> SerializedFullZip {
         let bytes_per_offset = variable.bits_per_offset as usize / 8;
         assert_eq!(
             variable.bits_per_offset % 8,
@@ -3209,34 +3604,77 @@ impl PrimitiveStructuralEncoder {
             "Only byte-aligned offsets supported"
         );
         let len = variable.data.len()
-            + repdef.bytes_per_word() * variable.num_values as usize
-            + bytes_per_offset * variable.num_values as usize;
+            + repdef.bytes_per_word() * num_items as usize
+            + bytes_per_offset * num_items as usize;
         let mut buf = Vec::with_capacity(len);
 
-        // TODO: We may want to bit-pack lengths in the future.  We probably don't need
-        // full bitpacking (which would cause the data to become unaligned) but we could
-        // bitpack to the nearest word size (e.g. u8 / u16 / u32)
+        let max_rep_index_val = if repdef.has_repetition() {
+            len as u64
+        } else {
+            // Setting this to 0 means we won't write a repetition index
+            0
+        };
+        let mut rep_index_builder =
+            BytepackedIntegerEncoder::with_capacity(num_items as usize + 1, max_rep_index_val);
+
+        // TODO: byte pack the item lengths
         match bytes_per_offset {
             4 => {
                 let offs = variable.offsets.borrow_to_typed_slice::<u32>();
-                for offsets in offs.as_ref().windows(2) {
-                    repdef.append_next(&mut buf);
-                    buf.extend_from_slice(&(offsets[1] - offsets[0]).to_le_bytes());
-                    buf.extend_from_slice(&variable.data[offsets[0] as usize..offsets[1] as usize]);
+                let mut rep_offset = 0;
+                let mut windows_iter = offs.as_ref().windows(2);
+                while let Some(control) = repdef.append_next(&mut buf) {
+                    if control.is_new_row {
+                        // We have finished a row
+                        debug_assert!(rep_offset <= len);
+                        // SAFETY: We know that `buf.len() <= len`
+                        unsafe { rep_index_builder.append(rep_offset as u64) };
+                    }
+                    if control.is_visible {
+                        let window = windows_iter.next().unwrap();
+                        buf.extend_from_slice(&(window[1] - window[0]).to_le_bytes());
+                        buf.extend_from_slice(
+                            &variable.data[window[0] as usize..window[1] as usize],
+                        );
+                    }
+                    rep_offset = buf.len();
                 }
             }
             8 => {
                 let offs = variable.offsets.borrow_to_typed_slice::<u64>();
-                for offsets in offs.as_ref().windows(2) {
-                    repdef.append_next(&mut buf);
-                    buf.extend_from_slice(&(offsets[1] - offsets[0]).to_le_bytes());
-                    buf.extend_from_slice(&variable.data[offsets[0] as usize..offsets[1] as usize]);
+                let mut rep_offset = 0;
+                let mut windows_iter = offs.as_ref().windows(2);
+                while let Some(control) = repdef.append_next(&mut buf) {
+                    if control.is_new_row {
+                        // We have finished a row
+                        debug_assert!(rep_offset <= len);
+                        // SAFETY: We know that `buf.len() <= len`
+                        unsafe { rep_index_builder.append(rep_offset as u64) };
+                    }
+                    if control.is_visible {
+                        let window = windows_iter.next().unwrap();
+                        buf.extend_from_slice(&(window[1] - window[0]).to_le_bytes());
+                        buf.extend_from_slice(
+                            &variable.data[window[0] as usize..window[1] as usize],
+                        );
+                    }
+                    rep_offset = buf.len();
                 }
             }
             _ => panic!("Unsupported offset size"),
         }
 
-        LanceBuffer::Owned(buf)
+        let zipped_data = LanceBuffer::Owned(buf);
+        let rep_index = rep_index_builder.into_data();
+        let rep_index = if rep_index.is_empty() {
+            None
+        } else {
+            Some(LanceBuffer::Owned(rep_index))
+        };
+        SerializedFullZip {
+            values: zipped_data,
+            repetition_index: rep_index,
+        }
     }
 
     /// Serializes data into a single buffer according to the full-zip format which zips
@@ -3244,10 +3682,15 @@ impl PrimitiveStructuralEncoder {
     fn serialize_full_zip(
         compressed_data: PerValueDataBlock,
         repdef: ControlWordIterator,
-    ) -> LanceBuffer {
+        num_items: u64,
+    ) -> SerializedFullZip {
         match compressed_data {
-            PerValueDataBlock::Fixed(fixed) => Self::serialize_full_zip_fixed(fixed, repdef),
-            PerValueDataBlock::Variable(var) => Self::serialize_full_zip_variable(var, repdef),
+            PerValueDataBlock::Fixed(fixed) => {
+                Self::serialize_full_zip_fixed(fixed, repdef, num_items)
+            }
+            PerValueDataBlock::Variable(var) => {
+                Self::serialize_full_zip_variable(var, repdef, num_items)
+            }
         }
     }
 
@@ -3258,6 +3701,7 @@ impl PrimitiveStructuralEncoder {
         data: DataBlock,
         repdefs: Vec<RepDefBuilder>,
         row_number: u64,
+        num_lists: u64,
     ) -> Result<EncodedPage> {
         let repdef = RepDefBuilder::serialize(repdefs);
         let max_rep = repdef
@@ -3269,30 +3713,50 @@ impl PrimitiveStructuralEncoder {
             .as_ref()
             .map_or(0, |d| d.iter().max().copied().unwrap_or(0));
 
+        // The validity is encoded in repdef so we can remove it
+        let data = data.remove_validity();
+
+        // To handle FSL we just flatten
+        let data = data.flatten();
+        let num_items = if let Some(rep_levels) = repdef.repetition_levels.as_ref() {
+            // If there are rep levels there may be "invisible" items and we need to encode
+            // rep_levels.len() things which might be larger than data.num_values()
+            rep_levels.len() as u64
+        } else {
+            // If there are no rep levels then we encode data.num_values() things
+            data.num_values()
+        };
+
+        let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
+
         let repdef_iter = build_control_word_iterator(
             repdef.repetition_levels.as_deref(),
             max_rep,
             repdef.definition_levels.as_deref(),
             max_def,
+            max_visible_def,
+            num_items as usize,
         );
         let bits_rep = repdef_iter.bits_rep();
         let bits_def = repdef_iter.bits_def();
 
-        let num_values = data.num_values();
-        // The validity is encoded in repdef so we can remove it
-        let data = data.remove_validity();
-
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
-        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter);
+        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items);
+
+        let data = if let Some(repindex) = zipped.repetition_index {
+            vec![zipped.values, repindex]
+        } else {
+            vec![zipped.values]
+        };
 
         let description =
             ProtobufUtils::full_zip_layout(bits_rep, bits_def, value_encoding, &repdef.def_meaning);
         Ok(EncodedPage {
-            num_rows: num_values,
+            num_rows: num_lists,
             column_idx,
-            data: vec![zipped],
+            data,
             description: PageEncoding::Structural(description),
             row_number,
         })
@@ -3417,6 +3881,7 @@ impl PrimitiveStructuralEncoder {
         let column_idx = self.column_index;
         let compression_strategy = self.compression_strategy.clone();
         let field = self.field.clone();
+        let encoding_metadata = self.encoding_metadata.clone();
         let task = spawn_cpu(move || {
             let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
             if num_values == 0 {
@@ -3430,13 +3895,20 @@ impl PrimitiveStructuralEncoder {
                 .map(|arr| arr.logical_nulls().map(|n| n.null_count()).unwrap_or(0) as u64)
                 .sum::<u64>();
 
-            if num_values == num_nulls && repdefs.iter().all(|rd| rd.is_simple_validity()) {
-                log::debug!(
-                    "Encoding column {} with {} items using simple-null layout",
-                    column_idx,
-                    num_values
-                );
-                Self::encode_simple_all_null(column_idx, num_values, row_number)
+            if num_values == num_nulls {
+                if repdefs.iter().all(|rd| rd.is_simple_validity()) {
+                    log::debug!(
+                        "Encoding column {} with {} items using simple-null layout",
+                        column_idx,
+                        num_values
+                    );
+                    // Simple case, no rep/def and all nulls, we don't need to encode any data
+                    Self::encode_simple_all_null(column_idx, num_values, row_number)
+                } else {
+                    // If we get here then we have definition levels (presumably due to FSL) and
+                    // we need to store those
+                    Self::encode_complex_all_null(column_idx, repdefs, row_number, num_rows)
+                }
             } else {
                 let data_block = DataBlock::from_arrays(&arrays, num_values);
 
@@ -3475,7 +3947,7 @@ impl PrimitiveStructuralEncoder {
                         Some(dictionary_data_block),
                         num_rows,
                     )
-                } else if Self::prefers_miniblock(&data_block, &field) {
+                } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
                     log::debug!(
                         "Encoding column {} with {} items using mini-block layout",
                         column_idx,
@@ -3491,7 +3963,7 @@ impl PrimitiveStructuralEncoder {
                         None,
                         num_rows,
                     )
-                } else if Self::prefers_fullzip(&field) {
+                } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
                     log::debug!(
                         "Encoding column {} with {} items using full-zip layout",
                         column_idx,
@@ -3504,6 +3976,7 @@ impl PrimitiveStructuralEncoder {
                         data_block,
                         repdefs,
                         row_number,
+                        num_rows,
                     )
                 } else {
                     Err(Error::InvalidInput { source: format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into(), location: location!() })
@@ -3529,6 +4002,12 @@ impl PrimitiveStructuralEncoder {
             }
             DataType::Dictionary(_, _) => {
                 unreachable!()
+            }
+            DataType::FixedSizeList(_, dimension) => {
+                // Extract our validity buf and then any child validity bufs
+                repdef.add_fsl(array.nulls().cloned(), *dimension as usize, array.len());
+                let array = array.as_fixed_size_list();
+                Self::extract_validity(array.values(), repdef);
             }
             _ => Self::extract_validity_buf(array, repdef),
         }

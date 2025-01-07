@@ -65,6 +65,7 @@ public class LanceFragmentScanner implements AutoCloseable {
       }
       scanOptions.batchSize(SparkOptions.getBatchSize(config));
       scanOptions.withRowId(getWithRowId(inputPartition.getSchema()));
+      scanOptions.withRowAddress(getWithRowAddress(inputPartition.getSchema()));
       if (inputPartition.getLimit().isPresent()) {
         scanOptions.limit(inputPartition.getLimit().get());
       }
@@ -117,7 +118,8 @@ public class LanceFragmentScanner implements AutoCloseable {
   private static List<String> getColumnNames(StructType schema) {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
-        .filter(name -> !name.equals(LanceConstant.ROW_ID))
+        .filter(
+            name -> !name.equals(LanceConstant.ROW_ID) && !name.equals(LanceConstant.ROW_ADDRESS))
         .collect(Collectors.toList());
   }
 
@@ -125,5 +127,11 @@ public class LanceFragmentScanner implements AutoCloseable {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
         .anyMatch(name -> name.equals(LanceConstant.ROW_ID));
+  }
+
+  private static boolean getWithRowAddress(StructType schema) {
+    return Arrays.stream(schema.fields())
+        .map(StructField::name)
+        .anyMatch(name -> name.equals(LanceConstant.ROW_ADDRESS));
   }
 }

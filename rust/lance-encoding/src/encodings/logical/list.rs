@@ -1465,6 +1465,9 @@ mod tests {
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
+    use lance_core::datatypes::{
+        STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
+    };
     use rstest::rstest;
 
     use crate::{
@@ -1484,8 +1487,16 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_list(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
     ) {
-        let field = Field::new("", make_list_type(DataType::Int32), true);
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+        let field =
+            Field::new("", make_list_type(DataType::Int32), true).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, version).await;
     }
 
@@ -1544,6 +1555,8 @@ mod tests {
     #[test_log::test(tokio::test)]
     async fn test_simple_list(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
     ) {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
@@ -1553,6 +1566,12 @@ mod tests {
         list_builder.append_value([Some(6), Some(7), Some(8)]);
         let list_array = list_builder.finish();
 
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
         let test_cases = TestCases::default()
             .with_range(0..2)
             .with_range(0..3)
@@ -1560,11 +1579,10 @@ mod tests {
             .with_indices(vec![1, 3])
             .with_indices(vec![2])
             .with_file_version(version);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_simple_sliced_list() {
         let items_builder = Int32Builder::new();
@@ -1587,7 +1605,6 @@ mod tests {
             .await;
     }
 
-    #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_list_with_garbage_nulls() {
         // In Arrow, list nulls are allowed to be non-empty, with masked garbage values
@@ -1613,8 +1630,12 @@ mod tests {
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_two_page_list() {
+    async fn test_simple_two_page_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
         // This is a simple pre-defined list that spans two pages.  This test is useful for
         // debugging the repetition index
         let items_builder = Int64Builder::new();
@@ -1632,6 +1653,12 @@ mod tests {
         }
         let list_array_2 = list_builder.finish();
 
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
         let test_cases = TestCases::default()
             .with_file_version(LanceFileVersion::V2_1)
             .with_page_sizes(vec![100])
@@ -1639,7 +1666,7 @@ mod tests {
         check_round_trip_encoding_of_data(
             vec![Arc::new(list_array_1), Arc::new(list_array_2)],
             &test_cases,
-            HashMap::new(),
+            metadata,
         )
         .await;
     }
