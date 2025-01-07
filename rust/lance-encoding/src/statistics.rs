@@ -13,8 +13,8 @@ use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
 use crate::data::{
-    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedWidthDataBlock, NullableDataBlock,
-    OpaqueBlock, StructDataBlock, VariableWidthBlock,
+    AllNullDataBlock, DataBlock, DictionaryDataBlock, FixedSizeListBlock, FixedWidthDataBlock,
+    NullableDataBlock, OpaqueBlock, StructDataBlock, VariableWidthBlock,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -58,7 +58,7 @@ impl ComputeStat for DataBlock {
             Self::AllNull(_) => {}
             Self::Nullable(data_block) => data_block.data.compute_stat(),
             Self::FixedWidth(data_block) => data_block.compute_stat(),
-            Self::FixedSizeList(_) => {}
+            Self::FixedSizeList(data_block) => data_block.compute_stat(),
             Self::VariableWidth(data_block) => data_block.compute_stat(),
             Self::Opaque(data_block) => data_block.compute_stat(),
             Self::Struct(data_block) => data_block.compute_stat(),
@@ -112,8 +112,19 @@ impl ComputeStat for FixedWidthDataBlock {
         if let Some(cardinality_array) = cardidinality_array {
             info.insert(Stat::Cardinality, cardinality_array);
         }
+    }
+}
 
-        // TODO(broccoliSpicy): We also need to consider FixedSizeList here
+impl ComputeStat for FixedSizeListBlock {
+    fn compute_stat(&mut self) {
+        // We leave the child stats unchanged.  This may seem odd (e.g. should bit width be the
+        // bit width of the child * dimension?) but it's because we use these stats to determine
+        // compression and we are currently just compressing the child data.
+        //
+        // There is a potential opportunity here to do better.  For example, if we have a FSL of
+        // 4 32-bit integers then we should probably treat them as a single 128-bit integer or maybe
+        // even 4 columns of 32-bit integers.  This might yield better compression.
+        self.child.compute_stat();
     }
 }
 
@@ -156,7 +167,7 @@ impl GetStat for DataBlock {
             Self::AllNull(data_block) => data_block.get_stat(stat),
             Self::Nullable(data_block) => data_block.get_stat(stat),
             Self::FixedWidth(data_block) => data_block.get_stat(stat),
-            Self::FixedSizeList(_) => None,
+            Self::FixedSizeList(data_block) => data_block.get_stat(stat),
             Self::VariableWidth(data_block) => data_block.get_stat(stat),
             Self::Opaque(data_block) => data_block.get_stat(stat),
             Self::Struct(data_block) => data_block.get_stat(stat),
@@ -182,6 +193,21 @@ impl GetStat for VariableWidthBlock {
             panic!("get_stat should be called after statistics are computed.");
         }
         block_info.get(&stat).cloned()
+    }
+}
+
+impl GetStat for FixedSizeListBlock {
+    fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
+        let child_stat = self.child.get_stat(stat);
+        match stat {
+            Stat::MaxLength => child_stat.map(|max_length| {
+                // this is conservative when working with variable length data as we shouldn't assume
+                // that we have a list of all max-length elements but it's cheap and easy to calculate
+                let max_length = max_length.as_primitive::<UInt64Type>().value(0);
+                Arc::new(UInt64Array::from(vec![max_length * self.dimension])) as Arc<dyn Array>
+            }),
+            _ => child_stat,
+        }
     }
 }
 
