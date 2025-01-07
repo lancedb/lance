@@ -339,13 +339,11 @@ impl From<FileFragment> for LanceFragment {
     }
 }
 
-#[pyfunction(name = "_write_fragments")]
-#[pyo3(signature = (dest, reader, **kwargs))]
-pub fn write_fragments(
+fn do_write_fragments(
     dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
     let params = kwargs
@@ -360,14 +358,23 @@ pub fn write_fragments(
         WriteDestination::Uri(dest.extract()?)
     };
 
-    let written = RT
-        .block_on(
-            Some(reader.py()),
-            InsertBuilder::new(dest)
-                .with_params(&params)
-                .execute_uncommitted_stream(batches),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+    RT.block_on(
+        Some(reader.py()),
+        InsertBuilder::new(dest)
+            .with_params(&params)
+            .execute_uncommitted_stream(batches),
+    )?
+    .map_err(|err| PyIOError::new_err(err.to_string()))
+}
+
+#[pyfunction(name = "_write_fragments")]
+#[pyo3(signature = (dest, reader, **kwargs))]
+pub fn write_fragments(
+    dest: &Bound<PyAny>,
+    reader: &Bound<PyAny>,
+    kwargs: Option<&PyDict>,
+) -> PyResult<Vec<PyObject>> {
+    let written = do_write_fragments(dest, reader, kwargs)?;
 
     assert!(
         written.blobs_op.is_none(),
@@ -395,28 +402,7 @@ pub fn write_fragments_transaction(
     reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
 ) -> PyResult<PyObject> {
-    let batches = convert_reader(reader)?;
-
-    let params = kwargs
-        .and_then(|params| get_write_params(params).transpose())
-        .transpose()?
-        .unwrap_or_default();
-
-    let dest = if dest.is_instance_of::<Dataset>() {
-        let dataset: Dataset = dest.extract()?;
-        WriteDestination::Dataset(dataset.ds.clone())
-    } else {
-        WriteDestination::Uri(dest.extract()?)
-    };
-
-    let written: Transaction = RT
-        .block_on(
-            Some(reader.py()),
-            InsertBuilder::new(dest)
-                .with_params(&params)
-                .execute_uncommitted_stream(batches),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+    let written = do_write_fragments(dest, reader, kwargs)?;
 
     Ok(PyLance(written).to_object(reader.py()))
 }
