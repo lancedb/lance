@@ -1221,15 +1221,14 @@ impl StructuralEncodingStrategy {
                 | DataType::LargeUtf8,
         )
     }
-}
 
-impl FieldEncodingStrategy for StructuralEncodingStrategy {
-    fn create_field_encoder(
+    fn do_create_field_encoder(
         &self,
         _encoding_strategy_root: &dyn FieldEncodingStrategy,
         field: &Field,
         column_index: &mut ColumnIndexSequence,
         options: &EncodingOptions,
+        root_field_metadata: &HashMap<String, String>,
     ) -> Result<Box<dyn FieldEncoder>> {
         let data_type = field.data_type();
         if Self::is_primitive_type(&data_type) {
@@ -1238,16 +1237,18 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
                 self.compression_strategy.clone(),
                 column_index.next_column_index(field.id as u32),
                 field.clone(),
+                Arc::new(root_field_metadata.clone()),
             )?))
         } else {
             match data_type {
                 DataType::List(_) | DataType::LargeList(_) => {
                     let child = field.children.first().expect("List should have a child");
-                    let child_encoder = self.create_field_encoder(
+                    let child_encoder = self.do_create_field_encoder(
                         _encoding_strategy_root,
                         child,
                         column_index,
                         options,
+                        root_field_metadata,
                     )?;
                     Ok(Box::new(ListStructuralEncoder::new(child_encoder)))
                 }
@@ -1258,17 +1259,19 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
                             self.compression_strategy.clone(),
                             column_index.next_column_index(field.id as u32),
                             field.clone(),
+                            Arc::new(root_field_metadata.clone()),
                         )?))
                     } else {
                         let children_encoders = field
                             .children
                             .iter()
                             .map(|field| {
-                                self.create_field_encoder(
+                                self.do_create_field_encoder(
                                     _encoding_strategy_root,
                                     field,
                                     column_index,
                                     options,
+                                    root_field_metadata,
                                 )
                             })
                             .collect::<Result<Vec<_>>>()?;
@@ -1283,6 +1286,7 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
                             self.compression_strategy.clone(),
                             column_index.next_column_index(field.id as u32),
                             field.clone(),
+                            Arc::new(root_field_metadata.clone()),
                         )?))
                     } else {
                         // A dictionary of logical is, itself, logical and we don't support that today
@@ -1296,6 +1300,24 @@ impl FieldEncodingStrategy for StructuralEncodingStrategy {
                 _ => todo!("Implement encoding for field {}", field),
             }
         }
+    }
+}
+
+impl FieldEncodingStrategy for StructuralEncodingStrategy {
+    fn create_field_encoder(
+        &self,
+        encoding_strategy_root: &dyn FieldEncodingStrategy,
+        field: &Field,
+        column_index: &mut ColumnIndexSequence,
+        options: &EncodingOptions,
+    ) -> Result<Box<dyn FieldEncoder>> {
+        self.do_create_field_encoder(
+            encoding_strategy_root,
+            field,
+            column_index,
+            options,
+            &field.metadata,
+        )
     }
 }
 
