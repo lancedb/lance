@@ -222,15 +222,15 @@ fn create_fragment<'a>(
     export_vec(env, &fragments)
 }
 
-const DATA_FILE_CLASS: &str = "com/lancedb/lance/DataFile";
+const DATA_FILE_CLASS: &str = "com/lancedb/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;[I[III)V";
-const DELETE_FILE_CLASS: &str = "com/lancedb/lance/DeletionFile";
+const DELETE_FILE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFile";
 const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lcom/lancedb/lance/DeletionFileType;)V";
-const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/DeletionFileType";
+    "(JJLjava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFileType;)V";
+const DELETE_FILE_TYPE_CLASS: &str = "com/lancedb/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "com/lancedb/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/DeletionFile;Lcom/lancedb/lance/RowIdMeta;)V";
-const ROW_ID_META_CLASS: &str = "com/lancedb/lance/RowIdMeta";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str ="(ILjava/util/List;Ljava/lang/Long;Lcom/lancedb/lance/fragment/DeletionFile;Lcom/lancedb/lance/fragment/RowIdMeta;)V";
+const ROW_ID_META_CLASS: &str = "com/lancedb/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 
 impl IntoJava for &DataFile {

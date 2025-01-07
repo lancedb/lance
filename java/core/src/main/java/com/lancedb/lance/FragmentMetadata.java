@@ -13,6 +13,10 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.fragment.DataFile;
+import com.lancedb.lance.fragment.DeletionFile;
+import com.lancedb.lance.fragment.RowIdMeta;
+
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
