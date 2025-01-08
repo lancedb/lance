@@ -7,9 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::{
-    Array, ArrowPrimitiveType, Float32Array, Int64Array, PrimitiveArray, RecordBatch,
-};
+use arrow::array::AsArray;
+use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
@@ -61,6 +60,7 @@ use tracing::{info_span, instrument, Span};
 use super::Dataset;
 use crate::datatypes::Schema;
 use crate::index::scalar::detect_scalar_index_type;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -636,12 +636,9 @@ impl Scanner {
     }
 
     /// Find k-nearest neighbor within the vector column.
-    pub fn nearest<T: ArrowPrimitiveType>(
-        &mut self,
-        column: &str,
-        q: &PrimitiveArray<T>,
-        k: usize,
-    ) -> Result<&mut Self> {
+    /// the query can be a Float16Array, Float32Array, Float64Array, UInt8Array,
+    /// or a ListArray/FixedSizeListArray of the above types.
+    pub fn nearest(&mut self, column: &str, q: &dyn Array, k: usize) -> Result<&mut Self> {
         if !self.prefilter {
             // We can allow fragment scan if the input to nearest is a prefilter.
             // The fragment scan will be performed by the prefilter.
@@ -661,41 +658,82 @@ impl Scanner {
             ));
         }
         // make sure the field exists
-        let field = self
-            .dataset
-            .schema()
-            .field(column)
-            .ok_or(Error::invalid_input(
-                format!("Column {} not found", column),
-                location!(),
-            ))?;
-        let key = match field.data_type() {
-            DataType::FixedSizeList(dt, _) => {
-                if dt.data_type() == q.data_type() {
-                    Box::new(q.clone())
-                } else if dt.data_type().is_floating() {
-                    coerce_float_vector(
-                        q.as_any().downcast_ref::<Float32Array>().unwrap(),
-                        FloatType::try_from(dt.data_type())?,
-                    )?
-                } else {
+        let (vector_type, element_type) = get_vector_type(self.dataset.schema(), column)?;
+        let dim = get_vector_dim(self.dataset.schema(), column)?;
+
+        let q = match q.data_type() {
+            DataType::List(_) | DataType::FixedSizeList(_, _) => {
+                if !matches!(vector_type, DataType::List(_)) {
                     return Err(Error::invalid_input(
                         format!(
-                            "Column {} has element type {} and the query vector is {}",
-                            column,
-                            dt.data_type(),
-                            q.data_type(),
+                            "Query is multivector but column {}({})is not multivector",
+                            column, vector_type,
                         ),
                         location!(),
                     ));
                 }
+
+                if let Some(list_array) = q.as_list_opt::<i32>() {
+                    for i in 0..list_array.len() {
+                        let vec = list_array.value(i);
+                        if vec.len() != dim {
+                            return Err(Error::invalid_input(
+                                format!(
+                                    "query dim({}) doesn't match the column {} vector dim({})",
+                                    vec.len(),
+                                    column,
+                                    dim,
+                                ),
+                                location!(),
+                            ));
+                        }
+                    }
+                    list_array.values().clone()
+                } else {
+                    let fsl = q.as_fixed_size_list();
+                    if fsl.value_length() as usize != dim {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "query dim({}) doesn't match the column {} vector dim({})",
+                                fsl.value_length(),
+                                column,
+                                dim,
+                            ),
+                            location!(),
+                        ));
+                    }
+                    fsl.values().clone()
+                }
             }
+            _ => {
+                if q.len() != dim {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "query dim({}) doesn't match the column {} vector dim({})",
+                            q.len(),
+                            column,
+                            dim,
+                        ),
+                        location!(),
+                    ));
+                }
+                q.slice(0, q.len())
+            }
+        };
+
+        let key = match element_type {
+            dt if dt == *q.data_type() => q,
+            dt if dt.is_floating() => coerce_float_vector(
+                q.as_any().downcast_ref::<Float32Array>().unwrap(),
+                FloatType::try_from(&dt)?,
+            )?,
             _ => {
                 return Err(Error::invalid_input(
                     format!(
-                        "Column {} is not a vector column (type: {})",
+                        "Column {} has element type {} and the query vector is {}",
                         column,
-                        field.data_type()
+                        element_type,
+                        q.data_type(),
                     ),
                     location!(),
                 ));
@@ -704,7 +742,7 @@ impl Scanner {
 
         self.nearest = Some(Query {
             column: column.to_string(),
-            key: key.into(),
+            key,
             k,
             lower_bound: None,
             upper_bound: None,
@@ -1558,7 +1596,7 @@ impl Scanner {
         let schema = fts_node.schema();
         let group_expr = vec![(expressions::col(ROW_ID, &schema)?, ROW_ID.to_string())];
         let fts_node = Arc::new(AggregateExec::try_new(
-            AggregateMode::Final,
+            AggregateMode::Single,
             PhysicalGroupBy::new_single(group_expr),
             vec![AggregateExprBuilder::new(
                 functions_aggregate::min_max::max_udaf(),
@@ -1594,28 +1632,7 @@ impl Scanner {
         };
 
         // Sanity check
-        let schema = self.dataset.schema();
-        if let Some(field) = schema.field(&q.column) {
-            match field.data_type() {
-                DataType::FixedSizeList(subfield, _)
-                    if subfield.data_type().is_floating()
-                        || *subfield.data_type() == DataType::UInt8 => {}
-                _ => {
-                    return Err(Error::invalid_input(
-                        format!(
-                            "Vector search error: column {} is not a vector type: expected FixedSizeList<Float32>, got {}",
-                            q.column, field.data_type(),
-                        ),
-                        location!(),
-                    ));
-                }
-            }
-        } else {
-            return Err(Error::invalid_input(
-                format!("Vector search error: column {} not found", q.column),
-                location!(),
-            ));
-        }
+        let (vector_type, _) = get_vector_type(self.dataset.schema(), &q.column)?;
 
         let column_id = self.dataset.schema().field_id(q.column.as_str())?;
         let use_index = self.nearest.as_ref().map(|q| q.use_index).unwrap_or(false);
@@ -1636,9 +1653,13 @@ impl Scanner {
 
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let ann_node = self.ann(q, &deltas, filter_plan).await?; // _distance, _rowid
+            let (ann_node, is_multivec) = match vector_type {
+                DataType::FixedSizeList(_, _) => (self.ann(q, &deltas, filter_plan).await?, false),
+                DataType::List(_) => (self.multivec_ann(q, &deltas, filter_plan).await?, true),
+                _ => unreachable!(),
+            };
 
-            let mut knn_node = if q.refine_factor.is_some() {
+            let mut knn_node = if q.refine_factor.is_some() || is_multivec {
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -2078,7 +2099,6 @@ impl Scanner {
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let prefilter_source = self.prefilter_source(filter_plan).await?;
-
         let inner_fanout_search = new_knn_exec(self.dataset.clone(), index, q, prefilter_source)?;
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, inner_fanout_search.schema().as_ref())?,
@@ -2091,6 +2111,85 @@ impl Scanner {
             SortExec::new(vec![sort_expr], inner_fanout_search)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
+    }
+
+    // Create an Execution plan to do ANN over multivectors
+    async fn multivec_ann(
+        &self,
+        q: &Query,
+        index: &[Index],
+        filter_plan: &FilterPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
+        // split the query multivectors
+        let num_queries = q.key.len() / dim;
+        let new_queries = (0..num_queries)
+            .map(|i| q.key.slice(i * dim, dim))
+            .map(|query_vec| {
+                let mut new_query = q.clone();
+                new_query.key = query_vec;
+                new_query
+            });
+        let mut ann_nodes = Vec::with_capacity(new_queries.len());
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
+        for query in new_queries {
+            let ann_node = new_knn_exec(
+                self.dataset.clone(),
+                index,
+                &query,
+                prefilter_source.clone(),
+            )?;
+            ann_nodes.push(ann_node);
+        }
+        let ann_node = Arc::new(UnionExec::new(ann_nodes));
+        let ann_node = Arc::new(RepartitionExec::try_new(
+            ann_node,
+            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
+        )?);
+        let schema = ann_node.schema();
+        // unique by row ids, and get the min distance although it is not used.
+        let group_expr = vec![(
+            expressions::col(ROW_ID, schema.as_ref())?,
+            ROW_ID.to_string(),
+        )];
+        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`,
+        let ann_node: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(group_expr),
+            vec![AggregateExprBuilder::new(
+                functions_aggregate::sum::sum_udaf(),
+                vec![expressions::binary(
+                    expressions::lit(1.0),
+                    datafusion_expr::Operator::Minus,
+                    expressions::cast(
+                        expressions::col(DIST_COL, &schema)?,
+                        &schema,
+                        DataType::Float64,
+                    )?,
+                    &schema,
+                )?],
+            )
+            .schema(schema.clone())
+            .alias(DIST_COL)
+            .build()?],
+            vec![None],
+            ann_node,
+            schema,
+        )?);
+
+        let sort_expr = PhysicalSortExpr {
+            expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        };
+        let ann_node = Arc::new(
+            SortExec::new(vec![sort_expr], ann_node)
+                .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
+        );
+
+        Ok(ann_node)
     }
 
     /// Create prefilter source from filter plan
@@ -3363,7 +3462,7 @@ mod test {
         let query_key = Arc::new(Float32Array::from_iter_values((0..2).map(|x| x as f32)));
         let mut scan = dataset.scan();
         scan.filter("filterable > 5").unwrap();
-        scan.nearest("vector", &query_key, 1).unwrap();
+        scan.nearest("vector", query_key.as_ref(), 1).unwrap();
         scan.with_row_id();
 
         let batches = scan
@@ -4640,8 +4739,9 @@ mod test {
         #[values(false, true)] stable_row_id: bool,
     ) -> Result<()> {
         // Create a vector dataset
+        let dim = 256;
         let mut dataset =
-            TestVectorDataset::new_with_dimension(data_storage_version, stable_row_id, 256).await?;
+            TestVectorDataset::new_with_dimension(data_storage_version, stable_row_id, dim).await?;
         let lance_schema = dataset.dataset.schema();
 
         // Scans
@@ -4738,7 +4838,7 @@ mod test {
 
         // KNN
         // ---------------------------------------------------------------------
-        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+        let q: Float32Array = (32..32 + dim).map(|v| v as f32).collect();
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5),
@@ -4754,7 +4854,7 @@ mod test {
 
         // KNN + Limit (arguably the user, or us, should fold the limit into the KNN but we don't today)
         // ---------------------------------------------------------------------
-        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+        let q: Float32Array = (32..32 + dim).map(|v| v as f32).collect();
         assert_plan_equals(
             &dataset.dataset,
             |scan| scan.nearest("vec", &q, 5)?.limit(Some(1), None),
@@ -5192,7 +5292,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
@@ -5216,7 +5316,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
@@ -5239,7 +5339,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello
@@ -5262,7 +5362,7 @@ mod test {
   Take: columns="_rowid, _score, (s)"
     CoalesceBatchesExec: target_batch_size=8192
       SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
-        AggregateExec: mode=Final, gby=[_rowid@0 as _rowid], aggr=[_score]
+        AggregateExec: mode=Single, gby=[_rowid@0 as _rowid], aggr=[_score]
           RepartitionExec: partitioning=RoundRobinBatch(1), input_partitions=2
             UnionExec
               Fts: query=hello

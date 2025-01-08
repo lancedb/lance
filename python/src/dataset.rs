@@ -20,7 +20,7 @@ use arrow::array::AsArray;
 use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{make_array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
-use lance::index::vector::utils::get_vector_element_type;
+use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::InvertedIndexParams;
@@ -624,7 +624,7 @@ impl Dataset {
                 .get_item("q")?
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
             let data = ArrayData::from_pyarrow_bound(&qval)?;
-            let q = Float32Array::from(data);
+            let q = make_array(data);
 
             let k: usize = if let Some(k) = nearest.get_item("k")? {
                 if k.is_none() {
@@ -690,7 +690,7 @@ impl Dataset {
                 None
             };
 
-            let element_type = get_vector_element_type(&self_.ds, &column)
+            let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
                 DataType::UInt8 => {

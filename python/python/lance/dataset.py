@@ -1851,8 +1851,14 @@ class LanceDataset(pa.dataset.Dataset):
             if c not in self.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.schema.field(c)
+            is_multivec = False
             if pa.types.is_fixed_size_list(field.type):
                 dimension = field.type.list_size
+            elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
+                field.type.value_type
+            ):
+                dimension = field.type.value_type.list_size
+                is_multivec = True
             elif (
                 isinstance(field.type, pa.FixedShapeTensorType)
                 and len(field.type.shape) == 1
@@ -1870,14 +1876,16 @@ class LanceDataset(pa.dataset.Dataset):
                     f" ({num_sub_vectors})"
                 )
 
-        if not (
-            pa.types.is_floating(field.type.value_type)
-            or pa.types.is_uint8(field.type.value_type)
-        ):
-            raise TypeError(
-                f"Vector column {c} must have floating or binary (uint8) value type, "
-                f"got {field.type.value_type}"
-            )
+            element_type = field.type.value_type
+            if is_multivec:
+                element_type = field.type.value_type.value_type
+            if not (
+                pa.types.is_floating(element_type) or pa.types.is_uint8(element_type)
+            ):
+                raise TypeError(
+                    f"Vector column {c} must have floating value type, "
+                    f"got {field.type.value_type}"
+                )
 
         if not isinstance(metric, str) or metric.lower() not in [
             "l2",
@@ -3084,7 +3092,7 @@ class ScannerBuilder:
         use_index: bool = True,
         ef: Optional[int] = None,
     ) -> ScannerBuilder:
-        q = _coerce_query_vector(q)
+        q, q_dim = _coerce_query_vector(q)
 
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} is not in the dataset")
@@ -3093,14 +3101,20 @@ class ScannerBuilder:
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type
-        if not pa.types.is_fixed_size_list(column_type):
+        if pa.types.is_fixed_size_list(column_type):
+            dim = column_type.list_size
+        elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
+            column_type.value_type
+        ):
+            dim = column_type.value_type.list_size
+        else:
             raise TypeError(
                 f"Query column {column} must be a vector. Got {column_field.type}."
             )
-        if len(q) != column_type.list_size:
+
+        if q_dim != dim:
             raise ValueError(
-                f"Query vector size {len(q)} does not match index column size"
-                f" {column_type.list_size}"
+                f"Query vector size {len(q)} does not match index column size" f" {dim}"
             )
 
         if k is not None and int(k) <= 0:
@@ -3643,7 +3657,23 @@ def write_dataset(
     return ds
 
 
-def _coerce_query_vector(query: QueryVectorLike):
+def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
+    # if the query is a multivector, convert it to pa.ListArray
+    if hasattr(query, "__getitem__") and isinstance(
+        query[0], (list, tuple, np.ndarray, pa.Array)
+    ):
+        dim = len(query[0])
+        multivector_query = []
+        for q in query:
+            if len(q) != dim:
+                raise ValueError(
+                    "All query vectors must have the same length, "
+                    f"but got {dim} and {len(q)}"
+                )
+            multivector_query.append(_coerce_query_vector(q)[0])
+        query = pa.array(multivector_query, type=pa.list_(pa.float32()))
+        return (query, dim)
+
     if isinstance(query, pa.Scalar):
         if isinstance(query, pa.ExtensionScalar):
             # If it's an extension scalar then convert to storage
@@ -3676,7 +3706,7 @@ def _coerce_query_vector(query: QueryVectorLike):
                 f"but received {query.type}"
             )
 
-    return query
+    return (query, len(query))
 
 
 def _validate_schema(schema: pa.Schema):

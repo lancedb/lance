@@ -77,6 +77,7 @@ impl Transformer for PartitionTransformer {
                     ),
                     location: location!(),
                 })?;
+
         let fsl = arr
             .as_fixed_size_list_opt()
             .ok_or_else(|| lance_core::Error::Index {

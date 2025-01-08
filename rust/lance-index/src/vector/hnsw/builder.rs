@@ -706,15 +706,16 @@ impl IvfSubIndex for HNSW {
         // if the queue is full, we just don't push it back, so ignore the error here
         let _ = self.inner.visited_generator_queue.push(prefilter_generator);
 
-        let row_ids = UInt64Array::from_iter_values(results.iter().map(|x| storage.row_id(x.id)));
-        let distances = Arc::new(Float32Array::from_iter_values(
-            results.iter().map(|x| x.dist.0),
-        ));
+        // need to unique by row ids in case of searching multivector
+        let (row_ids, dists): (Vec<_>, Vec<_>) = results
+            .into_iter()
+            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .unique_by(|r| r.0)
+            .unzip();
+        let row_ids = Arc::new(UInt64Array::from(row_ids));
+        let distances = Arc::new(Float32Array::from(dists));
 
-        Ok(RecordBatch::try_new(
-            schema,
-            vec![distances, Arc::new(row_ids)],
-        )?)
+        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
     }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
