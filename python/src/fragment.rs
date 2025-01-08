@@ -156,7 +156,7 @@ impl FileFragment {
         let fragment = self_.fragment.clone();
         let batch = RT
             .spawn(Some(self_.py()), async move {
-                fragment.take(&indices, &projection).await
+                fragment.take(&indices, &projection, false).await
             })?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         batch.to_pyarrow(self_.py())
