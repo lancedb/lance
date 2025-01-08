@@ -16,7 +16,7 @@ use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::deletion::{self, OffsetMapper};
+use lance_core::utils::deletion::OffsetMapper;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::{location, Location};
