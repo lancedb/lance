@@ -1876,11 +1876,11 @@ class LanceDataset(pa.dataset.Dataset):
                     f" ({num_sub_vectors})"
                 )
 
-            if (
-                not is_multivec and not pa.types.is_floating(field.type.value_type)
-            ) or (
-                is_multivec
-                and not pa.types.is_floating(field.type.value_type.value_type)
+            element_type = field.type.value_type
+            if is_multivec:
+                element_type = field.type.value_type.value_type
+            if not (
+                pa.types.is_floating(element_type) or pa.types.is_uint8(element_type)
             ):
                 raise TypeError(
                     f"Vector column {c} must have floating value type, "
@@ -1892,13 +1892,14 @@ class LanceDataset(pa.dataset.Dataset):
             "cosine",
             "euclidean",
             "dot",
+            "hamming",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
 
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
         if index_type not in valid_index_types:
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. " f"Got {index_type}"
