@@ -6,6 +6,7 @@
 use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
+use itertools::Either;
 use snafu::{location, Location};
 
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
@@ -102,6 +103,18 @@ impl LanceBuffer {
     /// Converts the buffer into a hex string
     pub fn as_hex(&self) -> String {
         hex::encode_upper(self)
+    }
+
+    /// Combine multiple buffers into a single buffer
+    ///
+    /// This does involve a data copy (and allocation of a new buffer)
+    pub fn concat(buffers: &[Self]) -> Self {
+        let total_len = buffers.iter().map(|b| b.len()).sum();
+        let mut data = Vec::with_capacity(total_len);
+        for buffer in buffers {
+            data.extend_from_slice(buffer.as_ref());
+        }
+        Self::Owned(data)
     }
 
     /// Converts the buffer into a hex string, inserting a space
@@ -387,6 +400,40 @@ impl From<Vec<u8>> for LanceBuffer {
 impl From<Buffer> for LanceBuffer {
     fn from(buffer: Buffer) -> Self {
         Self::Borrowed(buffer)
+    }
+}
+
+// An iterator that keeps a clone of a borrowed LanceBuffer so we
+// can have a 'static lifetime
+pub struct BorrowedBufferIter {
+    buffer: arrow_buffer::Buffer,
+    index: usize,
+}
+
+impl Iterator for BorrowedBufferIter {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.buffer.len() {
+            None
+        } else {
+            // SAFETY: we just checked that index is in bounds
+            let byte = unsafe { self.buffer.get_unchecked(self.index) };
+            self.index += 1;
+            Some(*byte)
+        }
+    }
+}
+
+impl IntoIterator for LanceBuffer {
+    type Item = u8;
+    type IntoIter = Either<std::vec::IntoIter<u8>, BorrowedBufferIter>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Borrowed(buffer) => Either::Right(BorrowedBufferIter { buffer, index: 0 }),
+            Self::Owned(buffer) => Either::Left(buffer.into_iter()),
+        }
     }
 }
 

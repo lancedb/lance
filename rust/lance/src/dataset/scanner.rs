@@ -1383,11 +1383,7 @@ impl Scanner {
 
         // Stage 1.5 load columns needed for stages 2 & 3
         // Calculate the schema needed for the filter and ordering.
-        let mut pre_filter_projection = self
-            .dataset
-            .empty_projection()
-            .union_schema(&self.projection_plan.physical_schema)
-            .subtract_predicate(|field| !self.is_early_field(field));
+        let mut pre_filter_projection = self.dataset.empty_projection();
 
         // We may need to take filter columns if we are going to refine
         // an indexed scan.
@@ -4853,6 +4849,23 @@ mod test {
         SortExec: TopK(fetch=5), expr=...
           KNNVectorDistance: metric=l2
             LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
+        )
+        .await?;
+
+        // KNN + Limit (arguably the user, or us, should fold the limit into the KNN but we don't today)
+        // ---------------------------------------------------------------------
+        let q: Float32Array = (32..64).map(|v| v as f32).collect();
+        assert_plan_equals(
+            &dataset.dataset,
+            |scan| scan.nearest("vec", &q, 5)?.limit(Some(1), None),
+            "ProjectionExec: expr=[i@3 as i, s@4 as s, vec@0 as vec, _distance@2 as _distance]
+  Take: columns=\"vec, _rowid, _distance, (i), (s)\"
+    CoalesceBatchesExec: target_batch_size=8192
+      GlobalLimitExec: skip=0, fetch=1
+        FilterExec: _distance@2 IS NOT NULL
+          SortExec: TopK(fetch=5), expr=...
+            KNNVectorDistance: metric=l2
+              LanceScan: uri=..., projection=[vec], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 

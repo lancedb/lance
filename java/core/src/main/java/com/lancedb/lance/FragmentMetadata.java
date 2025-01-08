@@ -13,10 +13,13 @@
  */
 package com.lancedb.lance;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
+import com.google.gson.annotations.SerializedName;
 import org.apache.arrow.util.Preconditions;
 import org.apache.commons.lang3.builder.ToStringBuilder;
-import org.json.JSONArray;
-import org.json.JSONObject;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -25,8 +28,6 @@ import java.util.List;
 /** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
 public class FragmentMetadata implements Serializable {
   private static final long serialVersionUID = -5886811251944130460L;
-  private static final String ID_KEY = "id";
-  private static final String PHYSICAL_ROWS_KEY = "physical_rows";
   private final String jsonMetadata;
   private final int id;
   private final long physicalRows;
@@ -66,17 +67,13 @@ public class FragmentMetadata implements Serializable {
    */
   public static FragmentMetadata fromJson(String jsonMetadata) {
     Preconditions.checkNotNull(jsonMetadata);
-    JSONObject metadata = new JSONObject(jsonMetadata);
-    if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
-      throw new IllegalArgumentException(
-          String.format(
-              "Fragment metadata must have {} and {} but is {}",
-              ID_KEY,
-              PHYSICAL_ROWS_KEY,
-              jsonMetadata));
+    Gson gson = new Gson();
+    try {
+      Fragment fragment = gson.fromJson(jsonMetadata, Fragment.class);
+      return new FragmentMetadata(jsonMetadata, fragment.getId(), fragment.getPhysicalRows());
+    } catch (Exception e) {
+      throw new IllegalArgumentException(e);
     }
-    return new FragmentMetadata(
-        jsonMetadata, metadata.getInt(ID_KEY), metadata.getLong(PHYSICAL_ROWS_KEY));
   }
 
   /**
@@ -87,22 +84,49 @@ public class FragmentMetadata implements Serializable {
    */
   public static List<FragmentMetadata> fromJsonArray(String jsonMetadata) {
     Preconditions.checkNotNull(jsonMetadata);
-    JSONArray metadatas = new JSONArray(jsonMetadata);
-    List<FragmentMetadata> fragmentMetadataList = new ArrayList<>();
-    for (Object object : metadatas) {
-      JSONObject metadata = (JSONObject) object;
-      if (!metadata.has(ID_KEY) || !metadata.has(PHYSICAL_ROWS_KEY)) {
-        throw new IllegalArgumentException(
-            String.format(
-                "Fragment metadata must have {} and {} but is {}",
-                ID_KEY,
-                PHYSICAL_ROWS_KEY,
-                jsonMetadata));
+    Gson gson = new Gson();
+    JsonParser parser = new JsonParser();
+    try {
+      JsonArray fragments = parser.parse(jsonMetadata).getAsJsonArray();
+      List<FragmentMetadata> fragmentMetadataList = new ArrayList<>();
+      for (JsonElement fragmentE : fragments) {
+        Fragment fragment = gson.fromJson(fragmentE, Fragment.class);
+        fragmentMetadataList.add(
+            new FragmentMetadata(
+                fragmentE.toString(), fragment.getId(), fragment.getPhysicalRows()));
       }
-      fragmentMetadataList.add(
-          new FragmentMetadata(
-              metadata.toString(), metadata.getInt(ID_KEY), metadata.getLong(PHYSICAL_ROWS_KEY)));
+      return fragmentMetadataList;
+    } catch (Exception e) {
+      throw new IllegalArgumentException(e);
     }
-    return fragmentMetadataList;
+  }
+
+  public static class Fragment {
+    @SerializedName("id")
+    private int id;
+
+    @SerializedName("physical_rows")
+    private long physicalRows;
+
+    public Fragment(int id, long physicalRows) {
+      this.id = id;
+      this.physicalRows = physicalRows;
+    }
+
+    public int getId() {
+      return id;
+    }
+
+    public void setId(int id) {
+      this.id = id;
+    }
+
+    public long getPhysicalRows() {
+      return physicalRows;
+    }
+
+    public void setPhysicalRows(long physicalRows) {
+      this.physicalRows = physicalRows;
+    }
   }
 }

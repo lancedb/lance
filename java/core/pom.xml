@@ -41,8 +41,9 @@
             <artifactId>commons-lang3</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.json</groupId>
-            <artifactId>json</artifactId>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <scope>compile</scope>
         </dependency>
         <dependency>
             <groupId>org.questdb</groupId>
