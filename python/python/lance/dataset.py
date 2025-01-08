@@ -1854,7 +1854,9 @@ class LanceDataset(pa.dataset.Dataset):
             is_multivec = False
             if pa.types.is_fixed_size_list(field.type):
                 dimension = field.type.list_size
-            elif pa.types.is_list(field.type):
+            elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
+                field.type.value_type
+            ):
                 dimension = field.type.value_type.list_size
                 is_multivec = True
             elif (
