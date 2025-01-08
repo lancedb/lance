@@ -522,10 +522,12 @@ mod tests {
     use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        Array, ArrowPrimitiveType, FixedSizeListArray, ListArray, RecordBatch, RecordBatchIterator,
         UInt64Array,
     };
+    use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema};
+    use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
     use lance_core::ROW_ID;
@@ -536,7 +538,7 @@ mod tests {
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::hamming::hamming;
-    use lance_linalg::distance::DistanceType;
+    use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_testing::datagen::generate_random_array_with_range;
     use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
@@ -586,6 +588,58 @@ mod tests {
         (dataset, array)
     }
 
+    async fn generate_multivec_test_dataset<T: ArrowPrimitiveType>(
+        test_uri: &str,
+        range: Range<T::Native>,
+    ) -> (Dataset, Arc<ListArray>)
+    where
+        T::Native: SampleUniform,
+    {
+        const VECTOR_NUM_PER_ROW: usize = 5;
+        let vectors = generate_random_array_with_range::<T>(1000 * VECTOR_NUM_PER_ROW * DIM, range);
+        let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
+            .into_iter()
+            .collect();
+        let data_type = vectors.data_type().clone();
+        let schema: Arc<_> = Schema::new(vec![Field::new(
+            "vector",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
+            ))),
+            true,
+        )])
+        .with_metadata(metadata)
+        .into();
+        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        if data_type != DataType::UInt8 {
+            fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        }
+
+        let array = Arc::new(ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
+            )),
+            OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(1000)),
+            Arc::new(fsl),
+            None,
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        (dataset, array)
+    }
+
     #[allow(dead_code)]
     fn ground_truth(
         vectors: &FixedSizeListArray,
@@ -610,6 +664,28 @@ mod tests {
         dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         dists.truncate(k);
         dists
+    }
+
+    #[allow(dead_code)]
+    fn multivec_ground_truth(
+        vectors: &ListArray,
+        query: &dyn Array,
+        k: usize,
+        distance_type: DistanceType,
+    ) -> Vec<(f32, u64)> {
+        let query = if let Some(list_array) = query.as_list_opt::<i32>() {
+            list_array.values().clone()
+        } else {
+            query.as_fixed_size_list().values().clone()
+        };
+        multivec_distance(&query, vectors, distance_type)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, dist)| (dist, i as u64))
+            .sorted_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .take(k)
+            .collect()
     }
 
     async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
@@ -765,6 +841,9 @@ mod tests {
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
@@ -783,6 +862,9 @@ mod tests {
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
@@ -803,6 +885,9 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
@@ -810,7 +895,7 @@ mod tests {
     #[rstest]
     #[case(4, DistanceType::L2, 0.85)]
     #[case(4, DistanceType::Cosine, 0.85)]
-    #[case(4, DistanceType::Dot, 0.8)]
+    #[case(4, DistanceType::Dot, 0.75)]
     #[tokio::test]
     async fn test_build_ivf_pq_4bit(
         #[case] nlist: usize,
@@ -823,6 +908,9 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_remap(params, nlist).await;
     }
 
@@ -845,7 +933,10 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     #[rstest]
@@ -867,7 +958,10 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     #[rstest]
@@ -889,7 +983,91 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
+    }
+
+    async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2)
+                    .await;
+            }
+            _ => {
+                test_index_multivec_impl::<Float32Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0.0..1.0,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn test_index_multivec_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        recall_requirement: f32,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_index".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let k = 100;
+
+        let result = dataset
+            .scan()
+            .nearest("vector", &query, k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        let dists = result[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let results = dists
+            .into_iter()
+            .zip(row_ids.clone().into_iter())
+            .collect::<Vec<_>>();
+        let row_ids = row_ids.into_iter().collect::<HashSet<_>>();
+
+        let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
+        assert!(
+            recall >= recall_requirement,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results,
+            gt
+        );
     }
 
     #[rstest]

@@ -126,6 +126,23 @@ impl ToPyObject for PyLance<&Operation> {
                     .expect("Failed to get Append class");
                 cls.call1((fragments,)).unwrap().to_object(py)
             }
+            Operation::Overwrite {
+                ref fragments,
+                ref schema,
+                ..
+            } => {
+                let fragments_py = export_vec(py, fragments.as_slice());
+
+                let schema_py = LanceSchema(schema.clone());
+
+                let cls = namespace
+                    .getattr("Overwrite")
+                    .expect("Failed to get Overwrite class");
+
+                cls.call1((schema_py, fragments_py))
+                    .expect("Failed to create Overwrite instance")
+                    .to_object(py)
+            }
             _ => todo!(),
         }
     }

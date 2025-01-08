@@ -1672,8 +1672,9 @@ mod tests {
         async fn vector_query(dataset: &Dataset) -> RecordBatch {
             let mut scanner = dataset.scan();
 
+            let query = Float32Array::from(vec![0.0f32; 128]);
             scanner
-                .nearest("vec", &vec![0.0f32; 128].into(), 10)
+                .nearest("vec", &query, 10)
                 .unwrap()
                 .project(&["i"])
                 .unwrap();

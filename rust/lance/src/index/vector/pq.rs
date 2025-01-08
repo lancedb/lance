@@ -450,7 +450,7 @@ pub async fn build_pq_model(
 
     info!(
         "starting to compute partitions for PQ training, sample size: {}",
-        training_data.value_length()
+        training_data.len()
     );
 
     if metric_type == MetricType::Cosine {
