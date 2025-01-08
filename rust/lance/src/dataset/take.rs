@@ -240,7 +240,7 @@ async fn do_take_rows(
                     indices,
                     projection.physical_schema.clone(),
                     true,
-                    builder.skip_deleted_row,
+                    false,
                 )
             })
             .buffered(builder.dataset.object_store.io_parallelism())
@@ -696,16 +696,17 @@ mod test {
         assert_eq!(values, values2);
     }
 
-    // #[rstest]
+    #[rstest]
     #[tokio::test]
-    async fn test_take_when_deleted_rows_in_front_of_fragment(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        // data_storage_version: LanceFileVersion::Stable,
+    async fn test_take_when_deleted_rows_in_front_of_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(LanceFileVersion::Stable),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -720,8 +721,7 @@ mod test {
         assert_eq!(dataset.count_rows(None).await.unwrap(), 380);
         let projection = Schema::try_from(data.schema().as_ref()).unwrap();
         let indices = &[
-            0, // This row is deleted
-            5, 19, 20, 39,  // This row is deleted
+            0, 5, 19, 20, 39,  // This row is deleted
             40,  // This row is not deleted
             190, // This row is not deleted
             191, // This row is not deleted
@@ -750,16 +750,17 @@ mod test {
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
     }
 
-    // #[rstest]
+    #[rstest]
     #[tokio::test]
-    async fn test_take_when_deleted_rows_in_end_of_fragment(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        // data_storage_version: LanceFileVersion::Stable,
+    async fn test_take_when_deleted_rows_in_end_of_fragment(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(LanceFileVersion::Stable),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -804,16 +805,17 @@ mod test {
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
     }
 
-    // #[rstest]
+    #[rstest]
     #[tokio::test]
-    async fn test_take_when_deleted_rows_between_fragments(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        // data_storage_version: LanceFileVersion::Stable,
+    async fn test_take_when_deleted_rows_between_fragments(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(LanceFileVersion::Stable),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
@@ -858,15 +860,17 @@ mod test {
         assert_eq!(RecordBatch::new_empty(data.schema()), values);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_take_when_deleted_discrete_rows(// #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
-        // data_storage_version: LanceFileVersion::Stable,
+    async fn test_take_when_deleted_discrete_rows(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
+        data_storage_version: LanceFileVersion,
     ) {
         let data = test_batch(0..400);
         let write_params = WriteParams {
             max_rows_per_file: 40,
             max_rows_per_group: 10,
-            data_storage_version: Some(LanceFileVersion::Stable),
+            data_storage_version: Some(data_storage_version),
             ..Default::default()
         };
         let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
