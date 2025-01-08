@@ -10,7 +10,7 @@ use std::{any::Any, collections::HashMap};
 pub mod builder;
 pub mod ivf;
 pub mod pq;
-mod utils;
+pub mod utils;
 
 #[cfg(test)]
 mod fixture_test;
