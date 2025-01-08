@@ -690,7 +690,7 @@ impl Dataset {
                 None
             };
 
-            let (_, element_type) = get_vector_type(&self_.ds.schema(), &column)
+            let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
                 DataType::UInt8 => {
