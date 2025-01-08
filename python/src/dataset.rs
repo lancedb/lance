@@ -1319,8 +1319,12 @@ impl Dataset {
             WriteDestination::Uri(dest.extract()?)
         };
 
-        let transaction =
-            Transaction::new(read_version.unwrap_or_default(), operation.0, blobs_op.map(|op| op.0), None);
+        let transaction = Transaction::new(
+            read_version.unwrap_or_default(),
+            operation.0,
+            blobs_op.map(|op| op.0),
+            None,
+        );
 
         let mut builder = CommitBuilder::new(dest)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
