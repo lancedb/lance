@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, ops::Range};
+use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use arrow_array::BooleanArray;
 use deepsize::{Context, DeepSizeOf};
@@ -121,23 +121,61 @@ impl DeletionVector {
         }
         .map(BooleanArray::from)
     }
+}
 
-    /// Map naive offset into local fragment offset based on deleted values.
-    ///
-    /// This skips over any deleted values that come before the given offset.
-    pub fn map_offset(&self, offset: u32) -> u32 {
-        let max = self.len() as u32 + offset;
-        // We'll do binary search over 0 .. max to find the first value that is not deleted.
-        let mut left = offset;
-        let mut right = max;
+/// Maps a naive offset into a fragment to the local row offset that is
+/// not deleted.
+///
+/// For example, if the deletion vector is [0, 1, 2], then the mapping
+/// would be:
+///
+/// - 0 -> 3
+/// - 1 -> 4
+/// - 2 -> 5
+///
+/// and so on.
+///
+/// This expects a monotonically increasing sequence of input offsets. State
+/// is re-used between calls to `map_offset` to make the mapping more efficient.
+pub struct OffsetMapper {
+    dv: Arc<DeletionVector>,
+    left: u32,
+    last_diff: u32,
+}
+
+impl OffsetMapper {
+    pub fn new(dv: Arc<DeletionVector>) -> Self {
+        Self {
+            dv,
+            left: 0,
+            last_diff: 0,
+        }
+    }
+
+    pub fn map_offset(&mut self, offset: u32) -> u32 {
+        // The best initial guess is the offset + last diff. That's the right
+        // answer if there are no deletions in the range between the last
+        // offset and the current one.
+        let mut mid = offset + self.last_diff;
+        let mut right = offset + self.dv.len() as u32;
         loop {
-            let mid = left + (dbg!(right) - dbg!(left)) / 2;
-            let deleted_in_range = self.range_cardinality(offset..mid) as u32;
-            let non_deleted = mid - offset - deleted_in_range;
-            match non_deleted.cmp(&offset) {
-                std::cmp::Ordering::Equal => return mid,
-                std::cmp::Ordering::Less => left = mid + 1,
-                std::cmp::Ordering::Greater => right = mid,
+            let deleted_in_range = self.dv.range_cardinality(0..(mid + 1)) as u32;
+            match mid.cmp(&(offset + deleted_in_range)) {
+                std::cmp::Ordering::Equal if !self.dv.contains(mid) => {
+                    self.last_diff = mid - offset;
+                    return mid;
+                }
+                std::cmp::Ordering::Less => {
+                    assert_ne!(self.left, mid + 1);
+                    self.left = mid + 1;
+                    mid = self.left + (right - self.left) / 2;
+                }
+                // There are cases where the mid is deleted but also equal in
+                // comparison. For those we need to find a lower value.
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
+                    right = mid;
+                    mid = self.left + (right - self.left) / 2;
+                }
             }
         }
     }
@@ -271,14 +309,26 @@ mod test {
     }
 
     #[test]
-    fn test_map_offset() {
+    fn test_map_offsets() {
         let dv = DeletionVector::from_iter(vec![3, 5]);
+        let mut mapper = OffsetMapper::new(Arc::new(dv));
 
-        assert_eq!(dv.map_offset(0), 0);
-        assert_eq!(dv.map_offset(1), 1);
-        assert_eq!(dv.map_offset(2), 2);
-        assert_eq!(dv.map_offset(3), 4);
-        assert_eq!(dv.map_offset(4), 6);
-        assert_eq!(dv.map_offset(5), 7);
+        let offsets = [0, 1, 2, 3, 4, 5, 6];
+        let mut output = Vec::new();
+        for offset in offsets.iter() {
+            output.push(mapper.map_offset(*offset));
+        }
+        assert_eq!(output, vec![0, 1, 2, 4, 6, 7, 8]);
+
+        let dv = DeletionVector::from_iter(vec![0, 1, 2]);
+        let mut mapper = OffsetMapper::new(Arc::new(dv));
+
+        let offsets = [0, 1, 2, 3, 4, 5, 6];
+
+        let mut output = Vec::new();
+        for offset in offsets.iter() {
+            output.push(mapper.map_offset(*offset));
+        }
+        assert_eq!(output, vec![3, 4, 5, 6, 7, 8, 9]);
     }
 }

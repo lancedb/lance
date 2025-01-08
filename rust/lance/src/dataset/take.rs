@@ -16,7 +16,7 @@ use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::deletion;
+use lance_core::utils::deletion::{self, OffsetMapper};
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::{location, Location};
@@ -50,9 +50,15 @@ pub async fn take(
     } else {
         0
     };
+    let mut offset_mapper = if let Some(cur_frag) = cur_frag {
+        let deletion_vector = cur_frag.get_deletion_vector().await?;
+        deletion_vector.map(OffsetMapper::new)
+    } else {
+        None
+    };
     let mut frag_offset = 0;
 
-    let mut addrs = Vec::with_capacity(sorted_offsets.len());
+    let mut addrs: Vec<u64> = Vec::with_capacity(sorted_offsets.len());
     for sorted_offset in sorted_offsets.into_iter() {
         while cur_frag.is_some() && sorted_offset >= frag_offset + cur_frag_rows {
             frag_offset += cur_frag_rows;
@@ -62,17 +68,21 @@ pub async fn take(
             } else {
                 0
             };
+            offset_mapper = if let Some(cur_frag) = cur_frag {
+                let deletion_vector = cur_frag.get_deletion_vector().await?;
+                deletion_vector.map(OffsetMapper::new)
+            } else {
+                None
+            };
         }
         let Some(cur_frag) = cur_frag else {
             addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
         };
 
-        // TODO: Take into account the deletion vector when computing the row offset.
-        let deletion_vector = cur_frag.get_deletion_vector().await?;
         let mut local_offset = (sorted_offset - frag_offset) as u32;
-        if let Some(deletion_vector) = &deletion_vector {
-            local_offset = deletion_vector.map_offset((sorted_offset - frag_offset) as u32);
+        if let Some(offset_mapper) = &mut offset_mapper {
+            local_offset = offset_mapper.map_offset(local_offset);
         };
         let row_addr = RowAddress::new_from_parts(cur_frag.id() as u32, local_offset);
         addrs.push(u64::from(row_addr));
