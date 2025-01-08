@@ -41,10 +41,7 @@ pub fn get_vector_type(
         message: format!("column {} does not exist in schema {}", column, schema),
         location: location!(),
     })?;
-    Ok((
-        field.data_type(),
-        infer_vector_element_type(&field.data_type())?,
-    ))
+    Ok((field.data_type(), infer_vector_element_type(field)?))
 }
 
 fn infer_vector_element_type(
@@ -74,20 +71,21 @@ fn infer_vector_element_type(
     }
 }
 
-pub fn get_vector_element_type(dataset: &Dataset, column: &str) -> Result<arrow_schema::DataType> {
-    let schema = dataset.schema();
-    let field = schema.field(column).ok_or(Error::Index {
-        message: format!("column {} does not exist in schema {}", column, schema),
-        location: location!(),
-    })?;
+fn get_vector_element_type(field: &arrow_schema::Field) -> Result<arrow_schema::DataType> {
     let data_type = field.data_type();
-    if let arrow_schema::DataType::FixedSizeList(element_field, _) = data_type {
-        Ok(element_field.data_type().clone())
-    } else {
-        Err(Error::Index {
-            message: format!("column {} is not a vector type: {:?}", column, data_type),
+    match data_type {
+        arrow_schema::DataType::FixedSizeList(element_field, _) => {
+            Ok(element_field.data_type().clone())
+        }
+        arrow_schema::DataType::List(inner) => get_vector_element_type(&inner),
+        _ => Err(Error::Index {
+            message: format!(
+                "column {} is not a vector type: {:?}",
+                field.name(),
+                data_type
+            ),
             location: location!(),
-        })
+        }),
     }
 }
 
