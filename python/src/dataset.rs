@@ -46,7 +46,7 @@ use lance::dataset::{
     BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
-use lance::index::vector::utils::get_vector_element_type;
+use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::InvertedIndexParams;
@@ -690,7 +690,7 @@ impl Dataset {
                 None
             };
 
-            let element_type = get_vector_element_type(&self_.ds, &column)
+            let (_, element_type) = get_vector_type(&self_.ds.schema(), &column)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             let scanner = match element_type {
                 DataType::UInt8 => {
