@@ -252,14 +252,14 @@ public class Dataset implements Closeable {
   public static native Dataset commitAppend(
       String path,
       Optional<Long> readVersion,
-      List<String> fragmentsMetadata,
+      List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
   public static native Dataset commitOverwrite(
       String path,
       long arrowSchemaMemoryAddress,
       Optional<Long> readVersion,
-      List<String> fragmentsMetadata,
+      List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
   /**
@@ -491,22 +491,22 @@ public class Dataset implements Closeable {
   /**
    * Get all fragments in this dataset.
    *
-   * @return A list of {@link DatasetFragment}.
+   * @return A list of {@link Fragment}.
    */
-  public List<DatasetFragment> getFragments() {
+  public List<Fragment> getFragments() {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       // Set a pointer in Fragment to dataset, to make it is easier to issue IOs
       // later.
       //
       // We do not need to close Fragments.
-      return this.getJsonFragments().stream()
-          .map(jsonFragment -> new DatasetFragment(this, FragmentMetadata.fromJson(jsonFragment)))
+      return this.getFragmentsNative().stream()
+          .map(metadata -> new Fragment(this, metadata))
           .collect(Collectors.toList());
     }
   }
 
-  private native List<String> getJsonFragments();
+  private native List<FragmentMetadata> getFragmentsNative();
 
   /**
    * Gets the schema of the dataset.
@@ -569,4 +569,11 @@ public class Dataset implements Closeable {
       return nativeDatasetHandle == 0;
     }
   }
+
+  public Fragment getFragment(int fragmentId) {
+    FragmentMetadata metadata = getFragmentNative(fragmentId);
+    return new Fragment(this, metadata);
+  }
+
+  private native FragmentMetadata getFragmentNative(int fragmentId);
 }

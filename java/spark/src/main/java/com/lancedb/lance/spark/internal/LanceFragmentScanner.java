@@ -14,7 +14,7 @@
 package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.Dataset;
-import com.lancedb.lance.DatasetFragment;
+import com.lancedb.lance.Fragment;
 import com.lancedb.lance.ReadOptions;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
@@ -35,10 +35,10 @@ import java.util.stream.Collectors;
 
 public class LanceFragmentScanner implements AutoCloseable {
   private Dataset dataset;
-  private DatasetFragment fragment;
+  private Fragment fragment;
   private LanceScanner scanner;
 
-  private LanceFragmentScanner(Dataset dataset, DatasetFragment fragment, LanceScanner scanner) {
+  private LanceFragmentScanner(Dataset dataset, Fragment fragment, LanceScanner scanner) {
     this.dataset = dataset;
     this.fragment = fragment;
     this.scanner = scanner;
@@ -47,7 +47,7 @@ public class LanceFragmentScanner implements AutoCloseable {
   public static LanceFragmentScanner create(
       int fragmentId, LanceInputPartition inputPartition, BufferAllocator allocator) {
     Dataset dataset = null;
-    DatasetFragment fragment = null;
+    Fragment fragment = null;
     LanceScanner scanner = null;
     try {
       LanceConfig config = inputPartition.getConfig();

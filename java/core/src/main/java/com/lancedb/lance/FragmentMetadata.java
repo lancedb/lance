@@ -13,41 +13,70 @@
  */
 package com.lancedb.lance;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParser;
-import com.google.gson.annotations.SerializedName;
-import org.apache.arrow.util.Preconditions;
+import com.lancedb.lance.fragment.DataFile;
+import com.lancedb.lance.fragment.DeletionFile;
+import com.lancedb.lance.fragment.RowIdMeta;
+
 import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.io.Serializable;
-import java.util.ArrayList;
 import java.util.List;
 
 /** Metadata of a Fragment in the dataset. Matching to lance Fragment. */
 public class FragmentMetadata implements Serializable {
   private static final long serialVersionUID = -5886811251944130460L;
-  private final String jsonMetadata;
-  private final int id;
-  private final long physicalRows;
+  private int id;
+  private List<DataFile> files;
+  private long physicalRows;
+  private DeletionFile deletionFile;
+  private RowIdMeta rowIdMeta;
 
-  private FragmentMetadata(String jsonMetadata, int id, long physicalRows) {
-    this.jsonMetadata = jsonMetadata;
+  public FragmentMetadata(
+      int id,
+      List<DataFile> files,
+      Long physicalRows,
+      DeletionFile deletionFile,
+      RowIdMeta rowIdMeta) {
     this.id = id;
+    this.files = files;
     this.physicalRows = physicalRows;
+    this.deletionFile = deletionFile;
+    this.rowIdMeta = rowIdMeta;
   }
 
   public int getId() {
     return id;
   }
 
+  public List<DataFile> getFiles() {
+    return files;
+  }
+
   public long getPhysicalRows() {
     return physicalRows;
   }
 
-  public String getJsonMetadata() {
-    return jsonMetadata;
+  public DeletionFile getDeletionFile() {
+    return deletionFile;
+  }
+
+  public long getNumDeletions() {
+    if (deletionFile == null) {
+      return 0;
+    }
+    Long deleted = deletionFile.getNumDeletedRows();
+    if (deleted == null) {
+      return 0;
+    }
+    return deleted;
+  }
+
+  public long getNumRows() {
+    return getPhysicalRows() - getNumDeletions();
+  }
+
+  public RowIdMeta getRowIdMeta() {
+    return rowIdMeta;
   }
 
   @Override
@@ -55,78 +84,9 @@ public class FragmentMetadata implements Serializable {
     return new ToStringBuilder(this)
         .append("id", id)
         .append("physicalRows", physicalRows)
-        .append("jsonMetadata", jsonMetadata)
+        .append("files", files)
+        .append("deletionFile", deletionFile)
+        .append("rowIdMeta", rowIdMeta)
         .toString();
-  }
-
-  /**
-   * Creates the fragment metadata from json serialized string.
-   *
-   * @param jsonMetadata json metadata
-   * @return created fragment metadata
-   */
-  public static FragmentMetadata fromJson(String jsonMetadata) {
-    Preconditions.checkNotNull(jsonMetadata);
-    Gson gson = new Gson();
-    try {
-      Fragment fragment = gson.fromJson(jsonMetadata, Fragment.class);
-      return new FragmentMetadata(jsonMetadata, fragment.getId(), fragment.getPhysicalRows());
-    } catch (Exception e) {
-      throw new IllegalArgumentException(e);
-    }
-  }
-
-  /**
-   * Converts a JSON array string into a list of FragmentMetadata objects.
-   *
-   * @param jsonMetadata A JSON array string containing fragment metadata.
-   * @return A list of FragmentMetadata objects.
-   */
-  public static List<FragmentMetadata> fromJsonArray(String jsonMetadata) {
-    Preconditions.checkNotNull(jsonMetadata);
-    Gson gson = new Gson();
-    JsonParser parser = new JsonParser();
-    try {
-      JsonArray fragments = parser.parse(jsonMetadata).getAsJsonArray();
-      List<FragmentMetadata> fragmentMetadataList = new ArrayList<>();
-      for (JsonElement fragmentE : fragments) {
-        Fragment fragment = gson.fromJson(fragmentE, Fragment.class);
-        fragmentMetadataList.add(
-            new FragmentMetadata(
-                fragmentE.toString(), fragment.getId(), fragment.getPhysicalRows()));
-      }
-      return fragmentMetadataList;
-    } catch (Exception e) {
-      throw new IllegalArgumentException(e);
-    }
-  }
-
-  public static class Fragment {
-    @SerializedName("id")
-    private int id;
-
-    @SerializedName("physical_rows")
-    private long physicalRows;
-
-    public Fragment(int id, long physicalRows) {
-      this.id = id;
-      this.physicalRows = physicalRows;
-    }
-
-    public int getId() {
-      return id;
-    }
-
-    public void setId(int id) {
-      this.id = id;
-    }
-
-    public long getPhysicalRows() {
-      return physicalRows;
-    }
-
-    public void setPhysicalRows(long physicalRows) {
-      this.physicalRows = physicalRows;
-    }
   }
 }

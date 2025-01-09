@@ -82,9 +82,7 @@ public class LanceDatasetAdapter {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
-      return dataset.getFragments().stream()
-          .map(DatasetFragment::getId)
-          .collect(Collectors.toList());
+      return dataset.getFragments().stream().map(Fragment::getId).collect(Collectors.toList());
     }
   }
 

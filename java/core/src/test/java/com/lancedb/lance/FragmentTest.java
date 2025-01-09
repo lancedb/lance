@@ -60,7 +60,7 @@ public class FragmentTest {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
 
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
@@ -137,7 +137,7 @@ public class FragmentTest {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
 
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
@@ -155,7 +155,7 @@ public class FragmentTest {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
-        DatasetFragment fragment = dataset.getFragments().get(0);
+        Fragment fragment = dataset.getFragments().get(0);
 
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
