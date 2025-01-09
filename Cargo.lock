@@ -1314,6 +1314,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afb84c814227b90d6895e01398aee0d8033c00e7466aca416fb6a8e0eb19d8a7"
 
 [[package]]
+name = "cmake"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c682c223677e0e5b6b7f63a64b9351844c3f1b1678a68b7ee617e30fb082620e"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3462,7 +3471,6 @@ dependencies = [
  "pretty_assertions",
  "prost 0.12.6",
  "prost 0.13.3",
- "prost-build 0.13.3",
  "prost-types 0.13.3",
  "rand",
  "random_word",
@@ -3617,6 +3625,7 @@ dependencies = [
  "prost 0.13.3",
  "prost-build 0.13.3",
  "prost-types 0.13.3",
+ "protobuf-src",
  "rand",
  "rand_xoshiro",
  "rstest",
@@ -3655,6 +3664,7 @@ dependencies = [
  "prost 0.13.3",
  "prost-build 0.13.3",
  "prost-types 0.13.3",
+ "protobuf-src",
  "rand",
  "snafu 0.7.5",
  "test-log",
@@ -3694,6 +3704,7 @@ dependencies = [
  "prost 0.13.3",
  "prost-build 0.13.3",
  "prost-types 0.13.3",
+ "protobuf-src",
  "rand",
  "roaring",
  "snafu 0.7.5",
@@ -3751,6 +3762,7 @@ dependencies = [
  "pprof",
  "prost 0.13.3",
  "prost-build 0.13.3",
+ "protobuf-src",
  "rand",
  "random_word",
  "rayon",
@@ -3800,7 +3812,6 @@ dependencies = [
  "pin-project",
  "pprof",
  "prost 0.13.3",
- "prost-build 0.13.3",
  "rand",
  "shellexpand",
  "snafu 0.7.5",
@@ -3894,6 +3905,7 @@ dependencies = [
  "prost 0.13.3",
  "prost-build 0.13.3",
  "prost-types 0.13.3",
+ "protobuf-src",
  "rand",
  "rangemap",
  "roaring",
@@ -5166,6 +5178,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4759aa0d3a6232fb8dbdb97b61de2c20047c68aca932c7ed76da9d788508d670"
 dependencies = [
  "prost 0.13.3",
+]
+
+[[package]]
+name = "protobuf-src"
+version = "2.1.0+27.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7edafa3bcc668fa93efafcbdf58d7821bbda0f4b458ac7fae3d57ec0fec8167"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

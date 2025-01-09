@@ -82,9 +82,6 @@ pprof.workspace = true
 # Need this so we can prevent dynamic linking in binaries (see cli feature)
 lzma-sys = { version = "0.1" }
 
-[build-dependencies]
-prost-build.workspace = true
-
 [dev-dependencies]
 lance-test-macros = { workspace = true }
 lance-datagen = { workspace = true }
@@ -111,6 +108,12 @@ tensorflow = ["tfrecord", "prost_old"]
 dynamodb = ["lance-table/dynamodb", "aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
+protoc = [
+    "lance-encoding/protoc",
+    "lance-file/protoc",
+    "lance-index/protoc",
+    "lance-table/protoc",
+]
 
 [[bin]]
 name = "lq"
