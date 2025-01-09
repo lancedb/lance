@@ -46,22 +46,8 @@ def _pd_to_arrow(
         tbl.schema = tbl.schema.remove_metadata()
         return tbl
     elif isinstance(df, pa.Table):
-        fields = df.schema.names
-        new_columns = []
-        new_fields = []
-        for field in fields:
-            col = df[field]
-            new_field = pa.field(field, col.type)
-            if (
-                pa.types.is_null(col.type)
-                and schema.field_by_name(field).type == pa.string()
-            ):
-                new_field = pa.field(field, pa.string())
-                col = pa.compute.if_else(pa.compute.is_null(col), NONE_ARROW_STR, col)
-            new_columns.append(col)
-            new_fields.append(new_field)
-        new_schema = pa.schema(fields=new_fields)
-        new_table = pa.Table.from_arrays(new_columns, schema=new_schema)
+        new_table = df.to_pydict()
+        new_table = pa.Table.from_pydict(new_table, schema=schema)
         return new_table
     return df
 
@@ -408,6 +394,7 @@ def write_lance(
     output_uri: str,
     *,
     schema: Optional[pa.Schema] = None,
+    mode: Literal["create", "append", "overwrite"] = "create",
     transform: Optional[
         Callable[[pa.Table], Union[pa.Table, Generator[None, pa.Table, None]]]
     ] = None,
@@ -454,7 +441,7 @@ def write_lance(
         ),
         batch_size=max_rows_per_file,
     ).write_datasink(
-        LanceCommitter(output_uri, schema=schema, storage_options=storage_options)
+        LanceCommitter(output_uri, schema=schema, mode=mode, storage_options=storage_options)
     )
 
 
