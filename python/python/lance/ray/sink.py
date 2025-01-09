@@ -46,8 +46,9 @@ def _pd_to_arrow(
         tbl.schema = tbl.schema.remove_metadata()
         return tbl
     elif isinstance(df, pa.Table):
-        new_table = df.to_pydict()
-        new_table = pa.Table.from_pydict(new_table, schema=schema)
+        if schema is None:
+            return df
+        return df.cast(schema)
         return new_table
     return df
 
