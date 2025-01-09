@@ -46,9 +46,8 @@ def _pd_to_arrow(
         tbl.schema = tbl.schema.remove_metadata()
         return tbl
     elif isinstance(df, pa.Table):
-        if schema is None:
-            return df
-        return df.cast(schema)
+        if schema is not None:
+            return df.cast(schema)
     return df
 
 
