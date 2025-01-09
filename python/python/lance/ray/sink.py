@@ -49,7 +49,6 @@ def _pd_to_arrow(
         if schema is None:
             return df
         return df.cast(schema)
-        return new_table
     return df
 
 
