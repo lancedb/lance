@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to publish (e.g., v1.0.0)'
+        description: "Tag to publish (e.g., v1.0.0)"
         required: true
         type: string
 
@@ -24,7 +24,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
-      CXX: clang-18
+      CXX: clang++-18
     defaults:
       run:
         working-directory: .
@@ -53,5 +53,5 @@ jobs:
       - uses: albertlockett/publish-crates@v2.2
         with:
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          args: '--all-features'
+          args: "--all-features"
           path: .

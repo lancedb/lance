@@ -59,7 +59,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang
-      CXX: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
       # pin the toolchain version to avoid surprises
@@ -126,7 +126,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang
-      CXX: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
       # Remote cargo.lock to force a fresh build
@@ -203,7 +203,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang
-      CXX: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
         with:

@@ -39,7 +39,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
-      CXX: clang-18
+      CXX: clang++-18
     steps:
       - uses: actions/checkout@v4
         with:
