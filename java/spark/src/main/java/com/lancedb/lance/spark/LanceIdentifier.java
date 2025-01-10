@@ -80,7 +80,7 @@ public class LanceIdentifier implements Identifier {
       if (index > 0) {
         // when saving datasource, the IdentifierImpl will contain options in namespaces
         String[] namespace = new String[index];
-        System.arraycopy(namespace, 0, identifier.namespace(), 0, index);
+        System.arraycopy(identifier.namespace(), 0, namespace, 0, index);
         Map<String, String> options = new HashMap<>();
         for (int i = index + 1; i < identifier.namespace().length; i++) {
           String keyValue = identifier.namespace()[i];
