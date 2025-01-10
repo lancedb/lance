@@ -440,7 +440,9 @@ def write_lance(
         ),
         batch_size=max_rows_per_file,
     ).write_datasink(
-        LanceCommitter(output_uri, schema=schema, mode=mode, storage_options=storage_options)
+        LanceCommitter(
+            output_uri, schema=schema, mode=mode, storage_options=storage_options
+        )
     )
 
 

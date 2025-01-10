@@ -140,7 +140,6 @@ def test_ray_write_lance_none_str(tmp_path: Path):
         assert item is None
 
 
-
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_ray_write_lance_none_str_datasink(tmp_path: Path):
     def f(row):
