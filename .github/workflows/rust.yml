@@ -85,6 +85,7 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -sd ","`
           cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Build tests (nightly)
+        if: ${{ matrix.toolchain != 'stable' }}
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -sd ","`
           cargo test --locked --features ${ALL_FEATURES} --workspace --no-run
