@@ -43,7 +43,8 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{
-    BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
+    BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
+    WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
@@ -199,20 +200,46 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let new_self = RT
+        let (new_dataset, stats) = RT
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         let dataset = self.dataset.bind(py);
 
-        dataset.borrow_mut().ds = new_self.0;
-        let merge_stats = new_self.1;
-        let merge_dict = PyDict::new_bound(py);
-        merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
-        merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
-        merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
+        dataset.borrow_mut().ds = new_dataset;
 
-        Ok(merge_dict.into())
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    pub fn execute_uncommitted<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = new_data.py();
+        let new_data = convert_reader(new_data)?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (transaction, stats) = RT
+            .spawn(Some(py), job.execute_uncommitted(new_data))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+
+        Ok((PyLance(transaction), stats))
+    }
+}
+
+impl MergeInsertBuilder {
+    fn build_stats<'a>(stats: &MergeStats, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("num_inserted_rows", stats.num_inserted_rows)?;
+        dict.set_item("num_updated_rows", stats.num_updated_rows)?;
+        dict.set_item("num_deleted_rows", stats.num_deleted_rows)?;
+        Ok(dict)
     }
 }
 
@@ -1313,6 +1340,36 @@ impl Dataset {
         detached: Option<bool>,
         max_retries: Option<u32>,
     ) -> PyResult<Self> {
+        let transaction = Transaction::new(
+            read_version.unwrap_or_default(),
+            operation.0,
+            blobs_op.map(|op| op.0),
+            None,
+        );
+
+        Self::commit_transaction(
+            dest,
+            PyLance(transaction),
+            commit_lock,
+            storage_options,
+            enable_v2_manifest_paths,
+            detached,
+            max_retries,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    fn commit_transaction(
+        dest: &Bound<PyAny>,
+        transaction: PyLance<Transaction>,
+        commit_lock: Option<&Bound<'_, PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
+        max_retries: Option<u32>,
+    ) -> PyResult<Self> {
         let object_store_params =
             storage_options
                 .as_ref()
@@ -1333,13 +1390,6 @@ impl Dataset {
             WriteDestination::Uri(dest.extract()?)
         };
 
-        let transaction = Transaction::new(
-            read_version.unwrap_or_default(),
-            operation.0,
-            blobs_op.map(|op| op.0),
-            None,
-        );
-
         let mut builder = CommitBuilder::new(dest)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
             .with_detached(detached.unwrap_or(false))
@@ -1354,7 +1404,10 @@ impl Dataset {
         }
 
         let ds = RT
-            .block_on(commit_lock.map(|cl| cl.py()), builder.execute(transaction))?
+            .block_on(
+                commit_lock.map(|cl| cl.py()),
+                builder.execute(transaction.0),
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         let uri = ds.uri().to_string();

@@ -1015,6 +1015,31 @@ def test_restore_with_commit(tmp_path: Path):
     assert tbl == table
 
 
+def test_merge_insert_with_commit():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+
+    assert isinstance(stats, dict)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 0
+    assert stats["num_deleted_rows"] == 0
+
+    assert isinstance(transaction, lance.Transaction)
+    assert isinstance(transaction.operation, lance.LanceOperation.Update)
+
+    dataset = lance.LanceDataset.commit(dataset, transaction)
+    assert dataset.to_table().sort_by("id") == pa.table(
+        {"id": range(10), "updated": [False] + [True] + [False] * 8}
+    )
+
+
 def test_merge_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
