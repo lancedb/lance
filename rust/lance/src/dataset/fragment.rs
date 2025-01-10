@@ -1981,12 +1981,7 @@ impl FragmentReader {
         let merged = if self.with_row_addr as usize + self.with_row_id as usize
             == self.output_schema.fields.len()
         {
-            let selected_rows = params
-                .slice(0, total_num_rows as usize)
-                .unwrap()
-                .to_offsets()
-                .unwrap()
-                .len();
+            let selected_rows = params.to_offsets_total(total_num_rows).len();
             let tasks = (0..selected_rows)
                 .step_by(batch_size as usize)
                 .map(move |offset| {
@@ -2370,6 +2365,71 @@ mod tests {
                 .open(
                     fragment.schema(),
                     FragReadConfig::default().with_row_id(with_row_id),
+                    None,
+                )
+                .await
+                .unwrap();
+            for valid_range in [0..20, 0..10, 10..20] {
+                reader
+                    .read_range(valid_range, 100)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
+            for invalid_range in [0..21, 21..22] {
+                assert!(reader.read_range(invalid_range, 100).is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rowid_rowaddr_only() {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        // Creates 400 rows in 10 fragments
+        let mut dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
+        // Delete last 20 rows in first fragment
+        dataset.delete("i >= 20").await.unwrap();
+        // Last fragment has 20 rows but 40 addressable rows
+        let fragment = &dataset.get_fragments()[0];
+        assert_eq!(fragment.metadata.num_rows().unwrap(), 20);
+
+        // Test with take_range (all rows addressable)
+        for (with_row_id, with_row_address) in [(false, true), (true, false), (true, true)] {
+            let reader = fragment
+                .open(
+                    &fragment.schema().project::<&str>(&[]).unwrap(),
+                    FragReadConfig::default()
+                        .with_row_id(with_row_id)
+                        .with_row_address(with_row_address),
+                    None,
+                )
+                .await
+                .unwrap();
+            for valid_range in [0..40, 20..40] {
+                reader
+                    .take_range(valid_range, 100)
+                    .unwrap()
+                    .buffered(1)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
+            for invalid_range in [0..41, 41..42] {
+                assert!(reader.take_range(invalid_range, 100).is_err());
+            }
+        }
+
+        // Test with read_range (only non-deleted rows addressable)
+        for (with_row_id, with_row_address) in [(false, true), (true, false), (true, true)] {
+            let reader = fragment
+                .open(
+                    &fragment.schema().project::<&str>(&[]).unwrap(),
+                    FragReadConfig::default()
+                        .with_row_id(with_row_id)
+                        .with_row_address(with_row_address),
                     None,
                 )
                 .await
