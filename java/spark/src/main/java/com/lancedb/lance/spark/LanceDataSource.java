@@ -48,7 +48,8 @@ public class LanceDataSource implements SupportsCatalogOptions, DataSourceRegist
 
   @Override
   public Identifier extractIdentifier(CaseInsensitiveStringMap options) {
-    return new LanceIdentifier(LanceConfig.from(options).getDatasetUri());
+    LanceConfig config = LanceConfig.from(options);
+    return new LanceIdentifier(config.getDatasetUri(), config.getOptions());
   }
 
   @Override
