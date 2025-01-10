@@ -176,16 +176,13 @@ jobs:
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - name: Build tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --locked --features ${ALL_FEATURES} --no-run
+          cargo test --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
       - name: Run tests
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo test --features ${ALL_FEATURES}
+          cargo test --features fp16kernels,cli,tensorflow,dynamodb,substrait
       - name: Check benchmarks
         run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
-          cargo check --benches --features ${ALL_FEATURES}
+          cargo check --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
   windows-build:
     runs-on: windows-latest
     defaults:
