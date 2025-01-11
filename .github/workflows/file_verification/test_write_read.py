@@ -48,5 +48,5 @@ if __name__ == "__main__":
             assert tab_lance == parquet_table
             print(f"Table read from Lance is the same as table read from Parquet for file: {file_path}")
 
-        except Exception as e:
+        except Exception:
             raise AssertionError(f"Table read from Lance is not the same as table read from Parquet for file: {file_path}")
