@@ -551,7 +551,14 @@ impl MergeInsertJob {
         let columns = schema
             .fields()
             .iter()
-            .map(|f| logical_expr::col(f.name()).alias(format!("{}{}", prefix, f.name())))
+            .map(|f| {
+                // Need to "quote" the column name so it gets interpreted case-sensitively
+                logical_expr::col(format!("\"{}\"", f.name())).alias(format!(
+                    "{}{}",
+                    prefix,
+                    f.name()
+                ))
+            })
             .collect::<Vec<_>>();
         df.select(columns).unwrap()
     }
