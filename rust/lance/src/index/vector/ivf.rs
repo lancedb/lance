@@ -1724,7 +1724,11 @@ async fn train_ivf_model(
             .await
         }
         _ => Err(Error::Index {
-            message: "Unsupported data type".to_string(),
+            message: format!(
+                "Unsupported data type {} with distance type {}",
+                values.data_type(),
+                distance_type
+            ),
             location: location!(),
         }),
     }
