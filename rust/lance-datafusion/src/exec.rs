@@ -210,7 +210,7 @@ pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
                 options.mem_pool_size() as usize
             )));
     }
-    let runtime_env = Arc::new(runtime_env_builder.build().unwrap());
+    let runtime_env = runtime_env_builder.build_arc().unwrap();
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 

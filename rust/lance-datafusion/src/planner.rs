@@ -162,7 +162,7 @@ struct LanceContextProvider {
 impl Default for LanceContextProvider {
     fn default() -> Self {
         let config = SessionConfig::new();
-        let runtime = Arc::new(RuntimeEnvBuilder::new().build().unwrap());
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
         let mut state_builder = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime)
