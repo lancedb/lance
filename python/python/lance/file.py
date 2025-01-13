@@ -134,7 +134,7 @@ class LanceFileReader:
             if indices[i] > indices[i + 1]:
                 raise ValueError(
                     f"Indices must be sorted in ascending order for \
-                                 file API, got {indices[i]} > {indices[i+1]}"
+                                 file API, got {indices[i]} > {indices[i + 1]}"
                 )
 
         return ReaderResults(
