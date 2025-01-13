@@ -57,10 +57,16 @@ pprof = { workspace = true }
 
 [build-dependencies]
 prost-build.workspace = true
+protobuf-src = { version = "2.1", optional = true }
 
 [features]
 dynamodb = ["aws-sdk-dynamodb", "lazy_static"]
 dynamodb_tests = ["dynamodb"]
+protoc = ["dep:protobuf-src"]
+
+[package.metadata.docs.rs]
+# docs.rs uses an older version of Ubuntu that does not have the necessary protoc version
+features = ["protoc"]
 
 [[bench]]
 name = "row_id_index"

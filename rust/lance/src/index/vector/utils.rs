@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{cast::AsArray, FixedSizeListArray};
 use lance_core::datatypes::Schema;
+use log::info;
 use snafu::{location, Location};
 use tokio::sync::Mutex;
 
@@ -86,11 +87,21 @@ pub async fn maybe_sample_training_data(
     let num_rows = dataset.count_rows(None).await?;
     let batch = if num_rows > sample_size_hint {
         let projection = dataset.schema().project(&[column])?;
-        dataset.sample(sample_size_hint, &projection).await?
+        let batch = dataset.sample(sample_size_hint, &projection).await?;
+        info!(
+            "Sample training data: retrieved {} rows by sampling",
+            batch.num_rows()
+        );
+        batch
     } else {
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
-        scanner.try_into_batch().await?
+        let batch = scanner.try_into_batch().await?;
+        info!(
+            "Sample training data: retrieved {} rows scanning full datasets",
+            batch.num_rows()
+        );
+        batch
     };
 
     let array = batch.column_by_name(column).ok_or(Error::Index {

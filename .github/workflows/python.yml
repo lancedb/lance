@@ -39,7 +39,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
-      CXX: clang-18
+      CXX: clang++-18
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,8 +67,9 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Lint Rust
         run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
-          cargo clippy --locked --all-features --tests -- -D warnings
+          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv
