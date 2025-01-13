@@ -49,6 +49,15 @@ jobs:
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo clippy --version
           cargo clippy --locked --features ${ALL_FEATURES} --tests --benches -- -D warnings
+  cargo-deny:
+    name: Check Rust dependencies (cargo-deny)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        log-level: warn
+        command: check
   linux-build:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 45
