@@ -790,7 +790,9 @@ def write_fragments(
             will be assigned when the fragments are committed to a dataset.
 
         If return_transaction is True:
-            the write transaction
+            The write transaction. The type of transaction will correspond to
+            the mode parameter specified. This transaction can be passed to
+            :meth:`LanceDataset.commit`.
 
     """
     from .dataset import LanceDataset
