@@ -783,10 +783,15 @@ def write_fragments(
         secondary indices need to be updated to point to new row ids.
     Returns
     -------
-    List[FragmentMetadata]
-        A list of :class:`FragmentMetadata` for the fragments written. The
-        fragment ids are left as zero meaning they are not yet specified. They
-        will be assigned when the fragments are committed to a dataset.
+    List[FragmentMetadata] | Transaction
+        If return_transaction is False:
+            a list of :class:`FragmentMetadata` for the fragments written. The
+            fragment ids are left as zero meaning they are not yet specified. They
+            will be assigned when the fragments are committed to a dataset.
+
+        If return_transaction is True:
+            the write transaction
+
     """
     from .dataset import LanceDataset
 
