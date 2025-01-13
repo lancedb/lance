@@ -15,9 +15,11 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Literal,
     Optional,
     Tuple,
     Union,
+    overload,
 )
 
 import pyarrow as pa
@@ -672,11 +674,50 @@ class LanceFragment(pa.dataset.Fragment):
         return self._fragment.metadata()
 
 
+if TYPE_CHECKING:
+
+    @overload
+    def write_fragments(
+        data: ReaderLike,
+        dataset_uri: Union[str, Path, LanceDataset],
+        return_transaction: Literal[True],
+        schema: Optional[pa.Schema] = None,
+        *,
+        mode: str = "append",
+        max_rows_per_file: int = 1024 * 1024,
+        max_rows_per_group: int = 1024,
+        max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+        progress: Optional[FragmentWriteProgress] = None,
+        data_storage_version: Optional[str] = None,
+        use_legacy_format: Optional[bool] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        enable_move_stable_row_ids: bool = False,
+    ) -> Transaction: ...
+
+    @overload
+    def write_fragments(
+        data: ReaderLike,
+        dataset_uri: Union[str, Path, LanceDataset],
+        return_transaction: Literal[False] = False,
+        schema: Optional[pa.Schema] = None,
+        *,
+        mode: str = "append",
+        max_rows_per_file: int = 1024 * 1024,
+        max_rows_per_group: int = 1024,
+        max_bytes_per_file: int = DEFAULT_MAX_BYTES_PER_FILE,
+        progress: Optional[FragmentWriteProgress] = None,
+        data_storage_version: Optional[str] = None,
+        use_legacy_format: Optional[bool] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+        enable_move_stable_row_ids: bool = False,
+    ) -> List[FragmentMetadata]: ...
+
+
 def write_fragments(
     data: ReaderLike,
     dataset_uri: Union[str, Path, LanceDataset],
-    schema: Optional[pa.Schema] = None,
     return_transaction: bool = False,
+    schema: Optional[pa.Schema] = None,
     *,
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
@@ -702,6 +743,8 @@ def write_fragments(
         The data to be written to the fragment.
     dataset_uri : str, Path, or LanceDataset
         The URI of the dataset or the dataset object.
+    return_transaction: bool, default False
+        If it's true, the transaction will be returned.
     schema : pa.Schema, optional
         The schema of the data. If not specified, the schema will be inferred
         from the data.
@@ -733,7 +776,11 @@ def write_fragments(
     storage_options : Optional[Dict[str, str]]
         Extra options that make sense for a particular storage connection. This is
         used to store connection parameters like credentials, endpoint, etc.
-
+    enable_move_stable_row_ids: bool
+        Experimental: if set to true, the writer will use move-stable row ids.
+        These row ids are stable after compaction operations, but not after updates.
+        This makes compaction more efficient, since with stable row ids no
+        secondary indices need to be updated to point to new row ids.
     Returns
     -------
     List[FragmentMetadata]
