@@ -680,9 +680,9 @@ if TYPE_CHECKING:
     def write_fragments(
         data: ReaderLike,
         dataset_uri: Union[str, Path, LanceDataset],
-        return_transaction: Literal[True],
         schema: Optional[pa.Schema] = None,
         *,
+        return_transaction: Literal[True],
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
@@ -698,9 +698,9 @@ if TYPE_CHECKING:
     def write_fragments(
         data: ReaderLike,
         dataset_uri: Union[str, Path, LanceDataset],
-        return_transaction: Literal[False] = False,
         schema: Optional[pa.Schema] = None,
         *,
+        return_transaction: Literal[False] = False,
         mode: str = "append",
         max_rows_per_file: int = 1024 * 1024,
         max_rows_per_group: int = 1024,
@@ -716,9 +716,9 @@ if TYPE_CHECKING:
 def write_fragments(
     data: ReaderLike,
     dataset_uri: Union[str, Path, LanceDataset],
-    return_transaction: bool = False,
     schema: Optional[pa.Schema] = None,
     *,
+    return_transaction: bool = False,
     mode: str = "append",
     max_rows_per_file: int = 1024 * 1024,
     max_rows_per_group: int = 1024,
@@ -743,11 +743,11 @@ def write_fragments(
         The data to be written to the fragment.
     dataset_uri : str, Path, or LanceDataset
         The URI of the dataset or the dataset object.
-    return_transaction: bool, default False
-        If it's true, the transaction will be returned.
     schema : pa.Schema, optional
         The schema of the data. If not specified, the schema will be inferred
         from the data.
+    return_transaction: bool, default False
+        If it's true, the transaction will be returned.
     mode : str, default "append"
         The write mode. If "append" is specified, the data will be checked
         against the existing dataset's schema. Otherwise, pass "create" or
