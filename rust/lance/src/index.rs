@@ -570,7 +570,7 @@ impl DatasetIndexExt for Dataset {
             .len();
 
         let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
-        let num_indexed_rows = num_indexed_rows_per_delta.iter().last().unwrap();
+        let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().cloned().sum();
         let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
 
         let stats = json!({

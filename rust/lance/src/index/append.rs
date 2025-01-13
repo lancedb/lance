@@ -71,15 +71,18 @@ pub async fn merge_indices<'a>(
     let unindexed = dataset.unindexed_fragments(&old_indices[0].name).await?;
 
     let mut frag_bitmap = RoaringBitmap::new();
-    old_indices.iter().for_each(|idx| {
-        frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
-    });
     unindexed.iter().for_each(|frag| {
         frag_bitmap.insert(frag.id as u32);
     });
 
     let (new_uuid, indices_merged) = match indices[0].index_type() {
         it if it.is_scalar() => {
+            // There are no delta indices for scalar, so adding all indexed
+            // fragments to the new index.
+            old_indices.iter().for_each(|idx| {
+                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+            });
+
             let index = dataset
                 .open_scalar_index(&column.name, &old_indices[0].uuid.to_string())
                 .await?;
@@ -104,6 +107,14 @@ pub async fn merge_indices<'a>(
             Ok((new_uuid, 1))
         }
         it if it.is_vector() => {
+            let start_pos = old_indices
+                .len()
+                .saturating_sub(options.num_indices_to_merge);
+            let indices_to_merge = &old_indices[start_pos..];
+            indices_to_merge.iter().for_each(|idx| {
+                frag_bitmap.extend(idx.fragment_bitmap.as_ref().unwrap().iter());
+            });
+
             let new_data_stream = if unindexed.is_empty() {
                 None
             } else {
