@@ -2772,6 +2772,7 @@ class LanceOperation:
     class Update(BaseOperation):
         """
         Operation that updates rows in the dataset.
+
         Attributes
         ----------
         removed_fragment_ids: list[int]
