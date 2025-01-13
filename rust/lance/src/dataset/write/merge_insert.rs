@@ -31,14 +31,16 @@ use datafusion::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
     },
-    logical_expr::{Expr, JoinType},
+    logical_expr::{self, Expr, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
+        projection::ProjectionExec,
         repartition::RepartitionExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
+    prelude::DataFrame,
     scalar::ScalarValue,
 };
 
@@ -512,9 +514,16 @@ impl MergeInsertJob {
             )?);
         }
 
+        // We need to prefix the fields in the target with target_ so that we don't have any duplicate
+        // field names (DF doesn't support this as of version 44)
+        target = Self::prefix_columns_phys(target, "target_");
+
         // 6 - Finally, join the input (source table) with the taken data (target table)
         let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key = Column::new_with_schema(&index_column, target.schema().as_ref())?;
+        let target_key = Column::new_with_schema(
+            &format!("target_{}", index_column),
+            target.schema().as_ref(),
+        )?;
         let joined = Arc::new(
             HashJoinExec::try_new(
                 shared_input,
@@ -537,6 +546,38 @@ impl MergeInsertJob {
         )
     }
 
+    fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
+        let schema = df.schema();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                // Need to "quote" the column name so it gets interpreted case-sensitively
+                logical_expr::col(format!("\"{}\"", f.name())).alias(format!(
+                    "{}{}",
+                    prefix,
+                    f.name()
+                ))
+            })
+            .collect::<Vec<_>>();
+        df.select(columns).unwrap()
+    }
+
+    fn prefix_columns_phys(inp: Arc<dyn ExecutionPlan>, prefix: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = inp.schema();
+        let exprs = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| {
+                let col = Arc::new(Column::new(f.name(), idx)) as Arc<dyn PhysicalExpr>;
+                let new_name = format!("{}{}", prefix, f.name());
+                (col, new_name)
+            })
+            .collect::<Vec<_>>();
+        Arc::new(ProjectionExec::try_new(exprs, inp).unwrap())
+    }
+
     // If the join keys are not indexed then we need to do a full scan of the table
     async fn create_full_table_joined_stream(
         &self,
@@ -552,12 +593,21 @@ impl MergeInsertJob {
             .iter()
             .map(|c| c.as_str())
             .collect::<Vec<_>>(); // vector of strings of col names to join
+        let target_cols = self
+            .params
+            .on
+            .iter()
+            .map(|c| format!("target_{}", c))
+            .collect::<Vec<_>>();
+        let target_cols = target_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
 
         match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => {
                 let existing = session_ctx.read_lance(self.dataset.clone(), true, false)?;
+                // We need to rename the columns from the target table so that they don't conflict with the source table
+                let existing = Self::prefix_columns(existing, "target_");
                 let joined =
-                    new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?; // full join
+                    new_data.join(existing, JoinType::Full, &join_cols, &target_cols, None)?; // full join
                 Ok(joined.execute_stream().await?)
             }
             SchemaComparison::Subschema => {
@@ -569,18 +619,27 @@ impl MergeInsertJob {
                     .chain([ROW_ID, ROW_ADDR])
                     .collect::<Vec<_>>();
                 let projected = existing.select_columns(&columns)?;
+                // We need to rename the columns from the target table so that they don't conflict with the source table
+                let projected = Self::prefix_columns(projected, "target_");
                 // We aren't supporting inserts or deletes right now, so we can use inner join
                 let join_type = if self.params.insert_not_matched {
                     JoinType::Left
                 } else {
                     JoinType::Inner
                 };
-                let joined = new_data.join(projected, join_type, &join_cols, &join_cols, None)?;
+                let joined = new_data.join(projected, join_type, &join_cols, &target_cols, None)?;
                 Ok(joined.execute_stream().await?)
             }
         }
     }
 
+    /// Join the source and target data streams
+    ///
+    /// If there is a scalar index on the join key, we can use it to do an indexed join.  Otherwise we need to do
+    /// a full outer join.
+    ///
+    /// Datafusion doesn't allow duplicate column names so during this join we rename the columns from target and
+    /// prefix them with _target.
     async fn create_joined_stream(
         &self,
         source: SendableRecordBatchStream,

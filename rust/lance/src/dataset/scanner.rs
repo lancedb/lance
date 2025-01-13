@@ -35,7 +35,7 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
-use datafusion_physical_expr::{Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
@@ -1049,7 +1049,7 @@ impl Scanner {
             let count_plan = Arc::new(AggregateExec::try_new(
                 AggregateMode::Single,
                 PhysicalGroupBy::new_single(Vec::new()),
-                vec![count_expr],
+                vec![Arc::new(count_expr)],
                 vec![None],
                 plan,
                 plan_schema,
@@ -1437,7 +1437,7 @@ impl Scanner {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            plan = Arc::new(SortExec::new(col_exprs, plan));
+            plan = Arc::new(SortExec::new(LexOrdering::new(col_exprs), plan));
         }
 
         // Stage 4: limit / offset
@@ -1598,13 +1598,15 @@ impl Scanner {
         let fts_node = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(group_expr),
-            vec![AggregateExprBuilder::new(
-                functions_aggregate::min_max::max_udaf(),
-                vec![expressions::col(SCORE_COL, &schema)?],
-            )
-            .schema(schema.clone())
-            .alias(SCORE_COL)
-            .build()?],
+            vec![Arc::new(
+                AggregateExprBuilder::new(
+                    functions_aggregate::min_max::max_udaf(),
+                    vec![expressions::col(SCORE_COL, &schema)?],
+                )
+                .schema(schema.clone())
+                .alias(SCORE_COL)
+                .build()?,
+            )],
             vec![None],
             fts_node,
             schema,
@@ -1618,7 +1620,8 @@ impl Scanner {
         };
 
         Ok(Arc::new(
-            SortExec::new(vec![sort_expr], fts_node).with_fetch(self.limit.map(|l| l as usize)),
+            SortExec::new(LexOrdering::new(vec![sort_expr]), fts_node)
+                .with_fetch(self.limit.map(|l| l as usize)),
         ))
     }
 
@@ -2072,13 +2075,13 @@ impl Scanner {
 
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
-            vec![PhysicalSortExpr {
+            LexOrdering::new(vec![PhysicalSortExpr {
                 expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
                 options: SortOptions {
                     descending: false,
                     nulls_first: false,
                 },
-            }],
+            }]),
             knn_plan,
         )
         .with_fetch(Some(q.k));
@@ -2108,7 +2111,7 @@ impl Scanner {
             },
         };
         Ok(Arc::new(
-            SortExec::new(vec![sort_expr], inner_fanout_search)
+            SortExec::new(LexOrdering::new(vec![sort_expr]), inner_fanout_search)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         ))
     }
@@ -2152,26 +2155,28 @@ impl Scanner {
             expressions::col(ROW_ID, schema.as_ref())?,
             ROW_ID.to_string(),
         )];
-        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`,
+        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
+        // and calculate the sum across all rows with the same row id.
+        let sum_expr = AggregateExprBuilder::new(
+            functions_aggregate::sum::sum_udaf(),
+            vec![expressions::binary(
+                expressions::lit(1.0),
+                datafusion_expr::Operator::Minus,
+                expressions::cast(
+                    expressions::col(DIST_COL, &schema)?,
+                    &schema,
+                    DataType::Float64,
+                )?,
+                &schema,
+            )?],
+        )
+        .schema(schema.clone())
+        .alias(DIST_COL)
+        .build()?;
         let ann_node: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(group_expr),
-            vec![AggregateExprBuilder::new(
-                functions_aggregate::sum::sum_udaf(),
-                vec![expressions::binary(
-                    expressions::lit(1.0),
-                    datafusion_expr::Operator::Minus,
-                    expressions::cast(
-                        expressions::col(DIST_COL, &schema)?,
-                        &schema,
-                        DataType::Float64,
-                    )?,
-                    &schema,
-                )?],
-            )
-            .schema(schema.clone())
-            .alias(DIST_COL)
-            .build()?],
+            vec![Arc::new(sum_expr)],
             vec![None],
             ann_node,
             schema,
@@ -2185,7 +2190,7 @@ impl Scanner {
             },
         };
         let ann_node = Arc::new(
-            SortExec::new(vec![sort_expr], ann_node)
+            SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
                 .with_fetch(Some(q.k * q.refine_factor.unwrap_or(1) as usize)),
         );
 

@@ -50,8 +50,10 @@ pub fn encode_substrait(expr: Expr, schema: Arc<ArrowSchema>) -> Result<Vec<u8>>
 
     let session_context = SessionContext::new();
 
-    let substrait_plan =
-        datafusion_substrait::logical_plan::producer::to_substrait_plan(&plan, &session_context)?;
+    let substrait_plan = datafusion_substrait::logical_plan::producer::to_substrait_plan(
+        &plan,
+        &session_context.state(),
+    )?;
 
     if let Some(plan_rel::RelType::Root(root)) = &substrait_plan.relations[0].rel_type {
         if let Some(rel::RelType::Filter(filt)) = &root.input.as_ref().unwrap().rel_type {
@@ -359,9 +361,11 @@ pub async fn parse_substrait(expr: &[u8], input_schema: Arc<ArrowSchema>) -> Res
         },
         dummy_table,
     )?;
-    let df_plan =
-        datafusion_substrait::logical_plan::consumer::from_substrait_plan(&session_context, &plan)
-            .await?;
+    let df_plan = datafusion_substrait::logical_plan::consumer::from_substrait_plan(
+        &session_context.state(),
+        &plan,
+    )
+    .await?;
 
     let expr = df_plan.expressions().pop().unwrap();
 

@@ -22,7 +22,7 @@ use datafusion::{
 };
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::Accumulator;
-use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
+use datafusion_physical_expr::{expressions::Column, LexOrdering, PhysicalSortExpr};
 use deepsize::{Context, DeepSizeOf};
 use futures::{
     future::BoxFuture,
@@ -1281,7 +1281,10 @@ impl TrainingSource for BTreeUpdater {
         // The UnionExec creates multiple partitions but the SortPreservingMergeExec merges
         // them back into a single partition.
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
-        let ordered = Arc::new(SortPreservingMergeExec::new(vec![sort_expr], all_data));
+        let ordered = Arc::new(SortPreservingMergeExec::new(
+            LexOrdering::new(vec![sort_expr]),
+            all_data,
+        ));
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
