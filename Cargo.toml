@@ -95,20 +95,18 @@ criterion = { version = "0.5", features = [
     "html_reports",
 ] }
 crossbeam-queue = "0.3"
-datafusion = { version = "42.0", default-features = false, features = [
+datafusion = { version = "44.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
 ] }
-datafusion-common = "42.0"
-datafusion-functions = { version = "42.0", features = ["regex_expressions"] }
-datafusion-sql = "42.0"
-datafusion-expr = "42.0"
-datafusion-execution = "42.0"
-datafusion-optimizer = "42.0"
-datafusion-physical-expr = { version = "42.0", features = [
-    "regex_expressions",
-] }
+datafusion-common = "44.0"
+datafusion-functions = { version = "44.0", features = ["regex_expressions"] }
+datafusion-sql = "44.0"
+datafusion-expr = "44.0"
+datafusion-execution = "44.0"
+datafusion-optimizer = "44.0"
+datafusion-physical-expr = { version = "44.0" }
 deepsize = "0.2.0"
 dirs = "5.0.0"
 either = "1.0"

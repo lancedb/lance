@@ -22,6 +22,7 @@ use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
 
 use crate::Dataset;
 
+#[derive(Debug)]
 pub struct LanceTableProvider {
     dataset: Arc<Dataset>,
     full_schema: Arc<Schema>,
@@ -150,6 +151,14 @@ impl OneShotPartitionStream {
             data: Arc::new(Mutex::new(Some(data))),
             schema,
         }
+    }
+}
+
+impl std::fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneShotPartitionStream")
+            .field("schema", &self.schema)
+            .finish()
     }
 }
 

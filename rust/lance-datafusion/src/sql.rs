@@ -129,7 +129,8 @@ mod tests {
                 negated: false,
                 expr: Box::new(Expr::Identifier(Ident::new("a"))),
                 pattern: Box::new(Expr::Value(Value::SingleQuotedString("abc%".to_string()))),
-                escape_char: None
+                escape_char: None,
+                any: false,
             },
             expr
         );

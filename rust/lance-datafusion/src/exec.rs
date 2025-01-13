@@ -14,13 +14,15 @@ use datafusion::{
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
         memory_pool::FairSpillPool,
-        runtime_env::{RuntimeConfig, RuntimeEnv},
+        runtime_env::RuntimeEnvBuilder,
         TaskContext,
     },
     physical_plan::{
-        display::DisplayableExecutionPlan, stream::RecordBatchStreamAdapter,
-        streaming::PartitionStream, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        display::DisplayableExecutionPlan,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream,
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_common::{DataFusionError, Statistics};
@@ -57,7 +59,8 @@ impl OneShotExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(schema),
                 Partitioning::RoundRobinBatch(1),
-                datafusion::physical_plan::ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         }
     }
@@ -199,14 +202,15 @@ impl LanceExecutionOptions {
 
 pub fn new_session_context(options: LanceExecutionOptions) -> SessionContext {
     let session_config = SessionConfig::new();
-    let mut runtime_config = RuntimeConfig::new();
+    let mut runtime_env_builder = RuntimeEnvBuilder::new();
     if options.use_spilling() {
-        runtime_config.disk_manager = DiskManagerConfig::NewOs;
-        runtime_config.memory_pool = Some(Arc::new(FairSpillPool::new(
-            options.mem_pool_size() as usize
-        )));
+        runtime_env_builder = runtime_env_builder
+            .with_disk_manager(DiskManagerConfig::new())
+            .with_memory_pool(Arc::new(FairSpillPool::new(
+                options.mem_pool_size() as usize
+            )));
     }
-    let runtime_env = Arc::new(RuntimeEnv::new(runtime_config).unwrap());
+    let runtime_env = runtime_env_builder.build_arc().unwrap();
     SessionContext::new_with_config_rt(session_config, runtime_env)
 }
 
@@ -268,6 +272,16 @@ pub trait SessionContextExt {
 struct OneShotPartitionStream {
     data: Arc<Mutex<Option<SendableRecordBatchStream>>>,
     schema: Arc<ArrowSchema>,
+}
+
+impl std::fmt::Debug for OneShotPartitionStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let data = self.data.lock().unwrap();
+        f.debug_struct("OneShotPartitionStream")
+            .field("exhausted", &data.is_none())
+            .field("schema", self.schema.as_ref())
+            .finish()
+    }
 }
 
 impl OneShotPartitionStream {
