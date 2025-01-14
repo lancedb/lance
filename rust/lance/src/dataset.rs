@@ -3587,7 +3587,10 @@ mod tests {
 
         let mut new_schema_meta = HashMap::new();
         new_schema_meta.insert("new_key".to_string(), "new_value".to_string());
-        dataset.replace_schema_metadata(new_schema_meta.clone()).await.unwrap();
+        dataset
+            .replace_schema_metadata(new_schema_meta.clone())
+            .await
+            .unwrap();
 
         let manifest_after = dataset.manifest.clone();
 
@@ -3618,13 +3621,15 @@ mod tests {
 
         let mut new_field_meta = HashMap::new();
         new_field_meta.insert("new_key".to_string(), "new_value".to_string());
-        dataset.replace_field_metadata(vec![(0, new_field_meta.clone())]).await.unwrap();
+        dataset
+            .replace_field_metadata(vec![(0, new_field_meta.clone())])
+            .await
+            .unwrap();
 
         let manifest_after = dataset.manifest.clone();
 
         assert_eq!(manifest_before.fragments, manifest_after.fragments);
     }
-
 
     #[rstest]
     #[tokio::test]
