@@ -1,6 +1,7 @@
 name: Run Regression Benchmarks
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -12,7 +13,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
-      CXX: clang-18
+      CXX: clang++-18
     defaults:
       run:
         shell: bash

@@ -15,6 +15,7 @@
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     Iterable,
     Iterator,
@@ -277,6 +278,7 @@ class _Dataset:
     def commit(
         dest: str | _Dataset,
         operation: LanceOperation.BaseOperation,
+        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -376,6 +378,8 @@ class _Fragment:
     @property
     def num_deletions(self) -> int: ...
 
+def iops_counter() -> int: ...
+def bytes_read_counter() -> int: ...
 def _write_dataset(
     reader: pa.RecordBatchReader, uri: str | Path | _Dataset, params: Dict[str, Any]
 ): ...
@@ -387,9 +391,22 @@ def _write_fragments(
     max_rows_per_group: int,
     max_bytes_per_file: int,
     progress: Optional[FragmentWriteProgress],
-    data_storage_version=Optional[str],
-    storage_options=Optional[Dict[str, str]],
+    data_storage_version: Optional[str],
+    storage_options: Optional[Dict[str, str]],
+    enable_move_stable_row_ids: bool,
 ): ...
+def _write_fragments_transaction(
+    dataset_uri: str | Path | _Dataset,
+    reader: ReaderLike,
+    mode: str,
+    max_rows_per_file: int,
+    max_rows_per_group: int,
+    max_bytes_per_file: int,
+    progress: Optional[FragmentWriteProgress],
+    data_storage_version: Optional[str],
+    storage_options: Optional[Dict[str, str]],
+    enable_move_stable_row_ids: bool,
+) -> Transaction: ...
 def _json_to_schema(schema_json: str) -> pa.Schema: ...
 def _schema_to_json(schema: pa.Schema) -> str: ...
 
@@ -433,3 +450,4 @@ class BFloat16:
 def bfloat16_array(values: List[str | None]) -> BFloat16Array: ...
 
 __version__: str
+language_model_home: Callable[[], str]

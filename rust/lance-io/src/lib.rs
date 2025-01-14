@@ -21,6 +21,8 @@ pub mod testing;
 pub mod traits;
 pub mod utils;
 
+pub use scheduler::{bytes_read_counter, iops_counter};
+
 /// Defines a selection of rows to read from a file/batch
 #[derive(Debug, Clone)]
 pub enum ReadBatchParams {
@@ -196,6 +198,16 @@ impl ReadBatchParams {
                 "cannot materialize RangeFrom",
                 location!(),
             )),
+        }
+    }
+
+    pub fn to_offsets_total(&self, total: u32) -> PrimitiveArray<UInt32Type> {
+        match self {
+            Self::Indices(indices) => indices.clone(),
+            Self::Range(r) => UInt32Array::from_iter_values(r.start as u32..r.end as u32),
+            Self::RangeFull => UInt32Array::from_iter_values(0_u32..total),
+            Self::RangeTo(r) => UInt32Array::from_iter_values(0..r.end as u32),
+            Self::RangeFrom(r) => UInt32Array::from_iter_values(r.start as u32..total),
         }
     }
 }

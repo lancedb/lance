@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, ops::Range};
+use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use arrow_array::BooleanArray;
 use deepsize::{Context, DeepSizeOf};
@@ -60,6 +60,14 @@ impl DeletionVector {
         }
     }
 
+    fn range_cardinality(&self, range: Range<u32>) -> u64 {
+        match self {
+            Self::NoDeletions => 0,
+            Self::Set(set) => range.fold(0, |acc, i| acc + set.contains(&i) as u64),
+            Self::Bitmap(bitmap) => bitmap.range_cardinality(range),
+        }
+    }
+
     pub fn iter(&self) -> Box<dyn Iterator<Item = u32> + Send + '_> {
         match self {
             Self::NoDeletions => Box::new(std::iter::empty()),
@@ -112,6 +120,64 @@ impl DeletionVector {
             Self::NoDeletions => None,
         }
         .map(BooleanArray::from)
+    }
+}
+
+/// Maps a naive offset into a fragment to the local row offset that is
+/// not deleted.
+///
+/// For example, if the deletion vector is [0, 1, 2], then the mapping
+/// would be:
+///
+/// - 0 -> 3
+/// - 1 -> 4
+/// - 2 -> 5
+///
+/// and so on.
+///
+/// This expects a monotonically increasing sequence of input offsets. State
+/// is re-used between calls to `map_offset` to make the mapping more efficient.
+pub struct OffsetMapper {
+    dv: Arc<DeletionVector>,
+    left: u32,
+    last_diff: u32,
+}
+
+impl OffsetMapper {
+    pub fn new(dv: Arc<DeletionVector>) -> Self {
+        Self {
+            dv,
+            left: 0,
+            last_diff: 0,
+        }
+    }
+
+    pub fn map_offset(&mut self, offset: u32) -> u32 {
+        // The best initial guess is the offset + last diff. That's the right
+        // answer if there are no deletions in the range between the last
+        // offset and the current one.
+        let mut mid = offset + self.last_diff;
+        let mut right = offset + self.dv.len() as u32;
+        loop {
+            let deleted_in_range = self.dv.range_cardinality(0..(mid + 1)) as u32;
+            match mid.cmp(&(offset + deleted_in_range)) {
+                std::cmp::Ordering::Equal if !self.dv.contains(mid) => {
+                    self.last_diff = mid - offset;
+                    return mid;
+                }
+                std::cmp::Ordering::Less => {
+                    assert_ne!(self.left, mid + 1);
+                    self.left = mid + 1;
+                    mid = self.left + (right - self.left) / 2;
+                }
+                // There are cases where the mid is deleted but also equal in
+                // comparison. For those we need to find a lower value.
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal => {
+                    right = mid;
+                    mid = self.left + (right - self.left) / 2;
+                }
+            }
+        }
     }
 }
 
@@ -240,5 +306,29 @@ mod test {
     fn test_threshold() {
         let dv = DeletionVector::from_iter(0..(BITMAP_THRESDHOLD as u32));
         assert!(matches!(dv, DeletionVector::Bitmap(_)));
+    }
+
+    #[test]
+    fn test_map_offsets() {
+        let dv = DeletionVector::from_iter(vec![3, 5]);
+        let mut mapper = OffsetMapper::new(Arc::new(dv));
+
+        let offsets = [0, 1, 2, 3, 4, 5, 6];
+        let mut output = Vec::new();
+        for offset in offsets.iter() {
+            output.push(mapper.map_offset(*offset));
+        }
+        assert_eq!(output, vec![0, 1, 2, 4, 6, 7, 8]);
+
+        let dv = DeletionVector::from_iter(vec![0, 1, 2]);
+        let mut mapper = OffsetMapper::new(Arc::new(dv));
+
+        let offsets = [0, 1, 2, 3, 4, 5, 6];
+
+        let mut output = Vec::new();
+        for offset in offsets.iter() {
+            output.push(mapper.map_offset(*offset));
+        }
+        assert_eq!(output, vec![3, 4, 5, 6, 7, 8, 9]);
     }
 }

@@ -26,6 +26,9 @@ pub trait JNIEnvExt {
     /// Get integers from Java List<Integer> object.
     fn get_integers(&mut self, obj: &JObject) -> Result<Vec<i32>>;
 
+    /// Get longs from Java List<Long> object.
+    fn get_longs(&mut self, obj: &JObject) -> Result<Vec<i64>>;
+
     /// Get strings from Java List<String> object.
     fn get_strings(&mut self, obj: &JObject) -> Result<Vec<String>>;
 
@@ -123,6 +126,18 @@ impl JNIEnvExt for JNIEnv<'_> {
             let int_obj = self.call_method(elem, "intValue", "()I", &[])?;
             let int_value = int_obj.i()?;
             results.push(int_value);
+        }
+        Ok(results)
+    }
+
+    fn get_longs(&mut self, obj: &JObject) -> Result<Vec<i64>> {
+        let list = self.get_list(obj)?;
+        let mut iter = list.iter(self)?;
+        let mut results = Vec::with_capacity(list.size(self)? as usize);
+        while let Some(elem) = iter.next(self)? {
+            let long_obj = self.call_method(elem, "longValue", "()J", &[])?;
+            let long_value = long_obj.j()?;
+            results.push(long_value);
         }
         Ok(results)
     }
@@ -346,6 +361,15 @@ pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseInts(
     list_obj: JObject, // List<Integer>
 ) {
     ok_or_throw_without_return!(env, env.get_integers(&list_obj));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_test_JniTestHelper_parseLongs(
+    mut env: JNIEnv,
+    _obj: JObject,
+    list_obj: JObject, // List<Long>
+) {
+    ok_or_throw_without_return!(env, env.get_longs(&list_obj));
 }
 
 #[no_mangle]

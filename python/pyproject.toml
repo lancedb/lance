@@ -72,7 +72,12 @@ lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
 [tool.pyright]
 pythonVersion = "3.12"
 # TODO: expand this list as we fix more files.
-include = ["python/lance/util.py"]
+include = [
+    "python/lance/util.py",
+    "python/lance/debug.py",
+    "python/lance/tracing.py",
+    "python/lance/dependencies.py",
+]
 # Dependencies like pyarrow make this difficult to enforce strictly.
 reportMissingTypeStubs = "warning"
 reportImportCycles = "error"

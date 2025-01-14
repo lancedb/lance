@@ -9,6 +9,7 @@ from pathlib import Path
 import lance
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from helper import ProgressForTest
 from lance import (
@@ -324,7 +325,7 @@ def test_create_from_file(tmp_path):
     frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
     op = LanceOperation.Append([frag])
 
-    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
     frag = dataset.get_fragments()[0]
     assert frag.fragment_id == 0
 
@@ -338,7 +339,7 @@ def test_create_from_file(tmp_path):
     frag = LanceFragment.create_from_file(fragment_name, dataset, 0)
     op = LanceOperation.Append([frag])
 
-    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
     frag = dataset.get_fragments()[1]
     assert frag.fragment_id == 1
 
@@ -356,7 +357,7 @@ def test_create_from_file(tmp_path):
         new_fragments=[frag],
     )
     op = LanceOperation.Rewrite(groups=[group], rewritten_indices=[])
-    dataset = lance.LanceDataset.commit(dataset.uri, op, dataset.version)
+    dataset = lance.LanceDataset.commit(dataset.uri, op, read_version=dataset.version)
 
     assert dataset.count_rows() == 1600
     assert len(dataset.get_fragments()) == 1
@@ -422,3 +423,15 @@ def test_fragment_merge(tmp_path):
         tmp_path, merge, read_version=dataset.latest_version
     )
     assert [f.name for f in dataset.schema] == ["a", "b", "c", "d"]
+
+
+def test_fragment_count_rows(tmp_path: Path):
+    data = pa.table({"a": range(800), "b": range(800)})
+    ds = write_dataset(data, tmp_path)
+
+    fragments = ds.get_fragments()
+    assert len(fragments) == 1
+
+    assert fragments[0].count_rows() == 800
+    assert fragments[0].count_rows("a < 200") == 200
+    assert fragments[0].count_rows(pc.field("a") < 200) == 200

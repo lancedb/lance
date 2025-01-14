@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.spark.LanceConfig;
@@ -28,7 +27,6 @@ import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.io.TempDir;
@@ -165,7 +163,6 @@ public class SparkWriteTest {
     validateData(datasetName, 1);
   }
 
-  @Disabled("Do not support overwrite")
   @Test
   public void overwrite(TestInfo testInfo) {
     String datasetName = testInfo.getTestMethod().get().getName();
@@ -186,6 +183,35 @@ public class SparkWriteTest {
         .save();
 
     validateData(datasetName, 1);
+  }
+
+  @Test
+  public void appendAfterOverwrite(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+        .save();
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+        .mode("overwrite")
+        .save();
+    testData
+        .write()
+        .format(LanceDataSource.name)
+        .option(
+            LanceConfig.CONFIG_DATASET_URI,
+            LanceConfig.getDatasetUri(dbPath.toString(), datasetName))
+        .mode("append")
+        .save();
+    validateData(datasetName, 2);
   }
 
   @Test

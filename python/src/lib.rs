@@ -68,7 +68,7 @@ pub(crate) mod transaction;
 pub(crate) mod utils;
 
 pub use crate::arrow::{bfloat16_array, BFloat16};
-use crate::fragment::write_fragments;
+use crate::fragment::{write_fragments, write_fragments_transaction};
 pub use crate::tracing::{trace_to_chrome, TraceGuard};
 use crate::utils::Hnsw;
 use crate::utils::KMeans;
@@ -137,21 +137,36 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(bfloat16_array))?;
     m.add_wrapped(wrap_pyfunction!(write_dataset))?;
     m.add_wrapped(wrap_pyfunction!(write_fragments))?;
+    m.add_wrapped(wrap_pyfunction!(write_fragments_transaction))?;
     m.add_wrapped(wrap_pyfunction!(schema_to_json))?;
     m.add_wrapped(wrap_pyfunction!(json_to_schema))?;
     m.add_wrapped(wrap_pyfunction!(infer_tfrecord_schema))?;
     m.add_wrapped(wrap_pyfunction!(read_tfrecord))?;
     m.add_wrapped(wrap_pyfunction!(trace_to_chrome))?;
     m.add_wrapped(wrap_pyfunction!(manifest_needs_migration))?;
+    m.add_wrapped(wrap_pyfunction!(language_model_home))?;
+    m.add_wrapped(wrap_pyfunction!(bytes_read_counter))?;
+    m.add_wrapped(wrap_pyfunction!(iops_counter))?;
     // Debug functions
     m.add_wrapped(wrap_pyfunction!(debug::format_schema))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_manifest))?;
     m.add_wrapped(wrap_pyfunction!(debug::format_fragment))?;
     m.add_wrapped(wrap_pyfunction!(debug::list_transactions))?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
     register_datagen(py, m)?;
     register_indices(py, m)?;
     Ok(())
+}
+
+#[pyfunction(name = "iops_counter")]
+fn iops_counter() -> PyResult<u64> {
+    Ok(::lance::io::iops_counter())
+}
+
+#[pyfunction(name = "bytes_read_counter")]
+fn bytes_read_counter() -> PyResult<u64> {
+    Ok(::lance::io::bytes_read_counter())
 }
 
 #[pyfunction(name = "_schema_to_json")]
@@ -170,6 +185,21 @@ fn json_to_schema(json: &str) -> PyResult<PyArrowType<ArrowSchema>> {
         ))
     })?;
     Ok(schema.into())
+}
+
+#[pyfunction]
+pub fn language_model_home() -> PyResult<String> {
+    let Some(p) = lance_index::scalar::inverted::language_model_home() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Failed to get language model home",
+        ));
+    };
+    let Some(pstr) = p.to_str() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Failed to convert language model home to str",
+        ));
+    };
+    Ok(String::from(pstr))
 }
 
 /// Infer schema from tfrecord file

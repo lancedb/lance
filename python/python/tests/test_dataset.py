@@ -1015,6 +1015,31 @@ def test_restore_with_commit(tmp_path: Path):
     assert tbl == table
 
 
+def test_merge_insert_with_commit():
+    table = pa.table({"id": range(10), "updated": [False] * 10})
+    dataset = lance.write_dataset(table, "memory://test")
+
+    updates = pa.Table.from_pylist([{"id": 1, "updated": True}])
+    transaction, stats = (
+        dataset.merge_insert(on="id")
+        .when_matched_update_all()
+        .execute_uncommitted(updates)
+    )
+
+    assert isinstance(stats, dict)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 0
+    assert stats["num_deleted_rows"] == 0
+
+    assert isinstance(transaction, lance.Transaction)
+    assert isinstance(transaction.operation, lance.LanceOperation.Update)
+
+    dataset = lance.LanceDataset.commit(dataset, transaction)
+    assert dataset.to_table().sort_by("id") == pa.table(
+        {"id": range(10), "updated": [False] + [True] + [False] * 8}
+    )
+
+
 def test_merge_with_commit(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -2730,6 +2755,36 @@ EXPECTED_MAJOR_VERSION = 2
 EXPECTED_MINOR_VERSION = 0
 
 
+def test_stats(tmp_path: Path):
+    table = pa.table({"x": [1, 2, 3, 4], "y": ["foo", "bar", "baz", "qux"]})
+    dataset = lance.write_dataset(table, tmp_path)
+    stats = dataset.stats.dataset_stats()
+
+    assert stats["num_deleted_rows"] == 0
+    assert stats["num_fragments"] == 1
+    assert stats["num_small_files"] == 1
+
+    data_stats = dataset.stats.data_stats()
+
+    assert data_stats.fields[0].id == 0
+    assert data_stats.fields[0].bytes_on_disk == 32
+    assert data_stats.fields[1].id == 1
+    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+
+    dataset.add_columns({"z": "y"})
+
+    dataset.insert(pa.table({"x": [5], "z": ["quux"]}))
+
+    data_stats = dataset.stats.data_stats()
+
+    assert data_stats.fields[0].id == 0
+    assert data_stats.fields[0].bytes_on_disk == 40
+    assert data_stats.fields[1].id == 1
+    assert data_stats.fields[1].bytes_on_disk == 44  # 12 bytes data + 32 bytes offset
+    assert data_stats.fields[2].id == 2
+    assert data_stats.fields[2].bytes_on_disk == 56  # 16 bytes data + 40 bytes offset
+
+
 def test_default_storage_version(tmp_path: Path):
     table = pa.table({"x": [0]})
     dataset = lance.write_dataset(table, tmp_path)
@@ -2806,3 +2861,10 @@ def test_dataset_drop(tmp_path: Path):
     assert Path(tmp_path).exists()
     lance.LanceDataset.drop(tmp_path)
     assert not Path(tmp_path).exists()
+
+
+def test_dataset_schema(tmp_path: Path):
+    table = pa.table({"x": [0]})
+    ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
+    ds._default_scan_options = {"with_row_id": True}
+    assert ds.schema == ds.to_table().schema

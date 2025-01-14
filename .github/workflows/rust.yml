@@ -46,8 +46,18 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Run clippy
         run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo clippy --version
-          cargo clippy --locked --all-features --tests --benches -- -D warnings
+          cargo clippy --locked --features ${ALL_FEATURES} --tests --benches -- -D warnings
+  cargo-deny:
+    name: Check Rust dependencies (cargo-deny)
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        log-level: warn
+        command: check
   linux-build:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 45
@@ -59,7 +69,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang
-      CXX: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
       # pin the toolchain version to avoid surprises
@@ -81,13 +91,18 @@ jobs:
       - name: Run tests
         if: ${{ matrix.toolchain == 'stable' }}
         run: |
-          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --all-features
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo llvm-cov  --locked --workspace --codecov --output-path coverage.codecov --features ${ALL_FEATURES}
       - name: Build tests (nightly)
-        run: cargo test --locked --all-features --workspace --no-run
+        if: ${{ matrix.toolchain != 'stable' }}
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo test --locked --features ${ALL_FEATURES} --workspace --no-run
       - name: Run tests (nightly)
         if: ${{ matrix.toolchain != 'stable' }}
         run: |
-          cargo test --all-features --workspace
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo test --features ${ALL_FEATURES} --workspace
       - name: Upload coverage to Codecov
         if: ${{ matrix.toolchain == 'stable' }}
         uses: codecov/codecov-action@v4
@@ -113,20 +128,22 @@ jobs:
           sudo apt install -y protobuf-compiler libssl-dev pkg-config
       - name: Build tests
         run: |
-          cargo test --locked --all-features --no-run
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo test --locked --features ${ALL_FEATURES} --no-run
       - name: Start DynamoDB local for tests
         run: |
           docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
       - name: Run tests
         run: |
-          cargo test --locked --all-features
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo test --locked --features ${ALL_FEATURES}
   build-no-lock:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # Need up-to-date compilers for kernels
       CC: clang
-      CXX: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
       # Remote cargo.lock to force a fresh build
@@ -139,7 +156,9 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Build all
-        run: cargo build --benches --all-features --tests
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo build --benches --features ${ALL_FEATURES} --tests
   mac-build:
     runs-on: "macos-14"
     timeout-minutes: 45
@@ -165,11 +184,14 @@ jobs:
         run: |
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
       - name: Build tests
-        run: cargo test --locked --all-features --no-run
+        run: |
+          cargo test --locked --features fp16kernels,cli,tensorflow,dynamodb,substrait --no-run
       - name: Run tests
-        run: cargo test --all-features
+        run: |
+          cargo test --features fp16kernels,cli,tensorflow,dynamodb,substrait
       - name: Check benchmarks
-        run: cargo check --benches --all-features
+        run: |
+          cargo check --benches --features fp16kernels,cli,tensorflow,dynamodb,substrait
   windows-build:
     runs-on: windows-latest
     defaults:
@@ -203,7 +225,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang
-      CXX: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
         with:
@@ -218,4 +240,6 @@ jobs:
         with:
           toolchain: ${{ matrix.msrv }}
       - name: cargo +${{ matrix.msrv }} check
-        run: cargo check --workspace --tests --benches --all-features
+        run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
+          cargo check --workspace --tests --benches --features ${ALL_FEATURES}

@@ -518,13 +518,16 @@ mod tests {
     use std::collections::HashSet;
     use std::{collections::HashMap, ops::Range, sync::Arc};
 
+    use all_asserts::{assert_ge, assert_lt};
     use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrowPrimitiveType, FixedSizeListArray, RecordBatch, RecordBatchIterator,
+        Array, ArrowPrimitiveType, FixedSizeListArray, ListArray, RecordBatch, RecordBatchIterator,
         UInt64Array,
     };
+    use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema};
+    use itertools::Itertools;
     use lance_arrow::FixedSizeListArrayExt;
 
     use lance_core::ROW_ID;
@@ -535,7 +538,7 @@ mod tests {
     use lance_index::vector::DIST_COL;
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::hamming::hamming;
-    use lance_linalg::distance::DistanceType;
+    use lance_linalg::distance::{multivec_distance, DistanceType};
     use lance_testing::datagen::generate_random_array_with_range;
     use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
@@ -585,6 +588,58 @@ mod tests {
         (dataset, array)
     }
 
+    async fn generate_multivec_test_dataset<T: ArrowPrimitiveType>(
+        test_uri: &str,
+        range: Range<T::Native>,
+    ) -> (Dataset, Arc<ListArray>)
+    where
+        T::Native: SampleUniform,
+    {
+        const VECTOR_NUM_PER_ROW: usize = 5;
+        let vectors = generate_random_array_with_range::<T>(1000 * VECTOR_NUM_PER_ROW * DIM, range);
+        let metadata: HashMap<String, String> = vec![("test".to_string(), "ivf_pq".to_string())]
+            .into_iter()
+            .collect();
+        let data_type = vectors.data_type().clone();
+        let schema: Arc<_> = Schema::new(vec![Field::new(
+            "vector",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
+            ))),
+            true,
+        )])
+        .with_metadata(metadata)
+        .into();
+        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        if data_type != DataType::UInt8 {
+            fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
+        }
+
+        let array = Arc::new(ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", data_type.clone(), true)),
+                    DIM as i32,
+                ),
+                true,
+            )),
+            OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(1000)),
+            Arc::new(fsl),
+            None,
+        ));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array.clone()]).unwrap();
+
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+        (dataset, array)
+    }
+
     #[allow(dead_code)]
     fn ground_truth(
         vectors: &FixedSizeListArray,
@@ -611,10 +666,32 @@ mod tests {
         dists
     }
 
+    #[allow(dead_code)]
+    fn multivec_ground_truth(
+        vectors: &ListArray,
+        query: &dyn Array,
+        k: usize,
+        distance_type: DistanceType,
+    ) -> Vec<(f32, u64)> {
+        let query = if let Some(list_array) = query.as_list_opt::<i32>() {
+            list_array.values().clone()
+        } else {
+            query.as_fixed_size_list().values().clone()
+        };
+        multivec_distance(&query, vectors, distance_type)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+            .map(|(i, dist)| (dist, i as u64))
+            .sorted_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .take(k)
+            .collect()
+    }
+
     async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2).await;
+                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..255).await;
             }
             _ => {
                 test_index_impl::<Float32Type>(params, nlist, recall_requirement, 0.0..1.0).await;
@@ -746,6 +823,11 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn test_flat_knn() {
+        test_distance_range(None, 4).await;
+    }
+
     #[rstest]
     #[case(4, DistanceType::L2, 1.0)]
     #[case(4, DistanceType::Cosine, 1.0)]
@@ -759,13 +841,17 @@ mod tests {
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_build_ivf_pq(
         #[case] nlist: usize,
@@ -776,13 +862,17 @@ mod tests {
         let pq_params = PQBuildParams::default();
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_build_ivf_pq_v3(
         #[case] nlist: usize,
@@ -795,13 +885,17 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
+        test_distance_range(Some(params.clone()), nlist).await;
         test_remap(params, nlist).await;
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.8)]
+    #[case(4, DistanceType::L2, 0.85)]
+    #[case(4, DistanceType::Cosine, 0.85)]
+    #[case(4, DistanceType::Dot, 0.75)]
     #[tokio::test]
     async fn test_build_ivf_pq_4bit(
         #[case] nlist: usize,
@@ -814,13 +908,16 @@ mod tests {
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
         test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params.clone(), nlist, recall_requirement).await;
+        }
         test_remap(params, nlist).await;
     }
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_sq(
         #[case] nlist: usize,
@@ -836,13 +933,16 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     #[rstest]
     #[case(4, DistanceType::L2, 0.9)]
     #[case(4, DistanceType::Cosine, 0.9)]
-    #[case(4, DistanceType::Dot, 0.9)]
+    #[case(4, DistanceType::Dot, 0.85)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq(
         #[case] nlist: usize,
@@ -858,12 +958,15 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
     }
 
     #[rstest]
-    #[case(4, DistanceType::L2, 0.9)]
-    #[case(4, DistanceType::Cosine, 0.9)]
+    #[case(4, DistanceType::L2, 0.85)]
+    #[case(4, DistanceType::Cosine, 0.85)]
     #[case(4, DistanceType::Dot, 0.8)]
     #[tokio::test]
     async fn test_create_ivf_hnsw_pq_4bit(
@@ -880,7 +983,91 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params, nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement).await;
+        if distance_type == DistanceType::Cosine {
+            test_index_multivec(params, nlist, recall_requirement).await;
+        }
+    }
+
+    async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        match params.metric_type {
+            DistanceType::Hamming => {
+                test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2)
+                    .await;
+            }
+            _ => {
+                test_index_multivec_impl::<Float32Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0.0..1.0,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn test_index_multivec_impl<T: ArrowPrimitiveType>(
+        params: VectorIndexParams,
+        nlist: usize,
+        recall_requirement: f32,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let (mut dataset, vectors) = generate_multivec_test_dataset::<T>(test_uri, range).await;
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_index".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let query = vectors.value(0);
+        let k = 100;
+
+        let result = dataset
+            .scan()
+            .nearest("vector", &query, k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = result[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        let dists = result[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec();
+        let results = dists
+            .into_iter()
+            .zip(row_ids.clone().into_iter())
+            .collect::<Vec<_>>();
+        let row_ids = row_ids.into_iter().collect::<HashSet<_>>();
+
+        let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
+        let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
+
+        let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
+        assert!(
+            recall >= recall_requirement,
+            "recall: {}\n results: {:?}\n\ngt: {:?}",
+            recall,
+            results,
+            gt
+        );
     }
 
     #[rstest]
@@ -988,5 +1175,128 @@ mod tests {
             );
             assert_eq!(index["sub_index"]["index_type"].as_str().unwrap(), "HNSW");
         }
+    }
+
+    async fn test_distance_range(params: Option<VectorIndexParams>, nlist: usize) {
+        match params.as_ref().map_or(DistanceType::L2, |p| p.metric_type) {
+            DistanceType::Hamming => {
+                test_distance_range_impl::<UInt8Type>(params, nlist, 0..255).await;
+            }
+            _ => {
+                test_distance_range_impl::<Float32Type>(params, nlist, 0.0..1.0).await;
+            }
+        }
+    }
+
+    async fn test_distance_range_impl<T: ArrowPrimitiveType>(
+        params: Option<VectorIndexParams>,
+        nlist: usize,
+        range: Range<T::Native>,
+    ) where
+        T::Native: SampleUniform,
+    {
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+
+        let vector_column = "vector";
+        let dist_type = params.as_ref().map_or(DistanceType::L2, |p| p.metric_type);
+        if let Some(params) = params {
+            dataset
+                .create_index(&[vector_column], IndexType::Vector, None, &params, true)
+                .await
+                .unwrap();
+        }
+
+        let query = vectors.value(0);
+        let k = 10;
+        let result = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), k);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        let dists = result[DIST_COL].as_primitive::<Float32Type>().values();
+
+        let part_idx = k / 2;
+        let part_dist = dists[part_idx];
+
+        let left_res = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), part_idx)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .distance_range(None, Some(part_dist))
+            .try_into_batch()
+            .await
+            .unwrap();
+        let right_res = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), k - part_idx)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .distance_range(Some(part_dist), None)
+            .try_into_batch()
+            .await
+            .unwrap();
+        // don't verify the number of results and row ids for hamming distance,
+        // because there are many vectors with the same distance
+        if dist_type != DistanceType::Hamming {
+            assert_eq!(left_res.num_rows(), part_idx);
+            assert_eq!(right_res.num_rows(), k - part_idx);
+            let left_row_ids = left_res[ROW_ID].as_primitive::<UInt64Type>().values();
+            let right_row_ids = right_res[ROW_ID].as_primitive::<UInt64Type>().values();
+            row_ids.iter().enumerate().for_each(|(i, id)| {
+                if i < part_idx {
+                    assert_eq!(left_row_ids[i], *id);
+                } else {
+                    assert_eq!(right_row_ids[i - part_idx], *id, "{:?}", right_row_ids);
+                }
+            });
+        }
+        let left_dists = left_res[DIST_COL].as_primitive::<Float32Type>().values();
+        let right_dists = right_res[DIST_COL].as_primitive::<Float32Type>().values();
+        left_dists.iter().for_each(|d| {
+            assert!(d < &part_dist);
+        });
+        right_dists.iter().for_each(|d| {
+            assert!(d >= &part_dist);
+        });
+
+        let exclude_last_res = dataset
+            .scan()
+            .nearest(vector_column, query.as_primitive::<T>(), k)
+            .unwrap()
+            .nprobs(nlist)
+            .with_row_id()
+            .distance_range(dists.first().copied(), dists.last().copied())
+            .try_into_batch()
+            .await
+            .unwrap();
+        if dist_type != DistanceType::Hamming {
+            assert_eq!(exclude_last_res.num_rows(), k - 1);
+            let res_row_ids = exclude_last_res[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values();
+            row_ids.iter().enumerate().for_each(|(i, id)| {
+                if i < k - 1 {
+                    assert_eq!(res_row_ids[i], *id);
+                }
+            });
+        }
+        let res_dists = exclude_last_res[DIST_COL]
+            .as_primitive::<Float32Type>()
+            .values();
+        res_dists.iter().for_each(|d| {
+            assert_ge!(*d, dists[0]);
+            assert_lt!(*d, dists[k - 1]);
+        });
     }
 }

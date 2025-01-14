@@ -11,11 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.Dataset;
-import com.lancedb.lance.DatasetFragment;
+import com.lancedb.lance.Fragment;
 import com.lancedb.lance.ReadOptions;
 import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.ipc.ScanOptions;
@@ -36,10 +35,10 @@ import java.util.stream.Collectors;
 
 public class LanceFragmentScanner implements AutoCloseable {
   private Dataset dataset;
-  private DatasetFragment fragment;
+  private Fragment fragment;
   private LanceScanner scanner;
 
-  private LanceFragmentScanner(Dataset dataset, DatasetFragment fragment, LanceScanner scanner) {
+  private LanceFragmentScanner(Dataset dataset, Fragment fragment, LanceScanner scanner) {
     this.dataset = dataset;
     this.fragment = fragment;
     this.scanner = scanner;
@@ -48,13 +47,17 @@ public class LanceFragmentScanner implements AutoCloseable {
   public static LanceFragmentScanner create(
       int fragmentId, LanceInputPartition inputPartition, BufferAllocator allocator) {
     Dataset dataset = null;
-    DatasetFragment fragment = null;
+    Fragment fragment = null;
     LanceScanner scanner = null;
     try {
       LanceConfig config = inputPartition.getConfig();
       ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
       dataset = Dataset.open(allocator, config.getDatasetUri(), options);
-      fragment = dataset.getFragments().get(fragmentId);
+      fragment =
+          dataset.getFragments().stream()
+              .filter(f -> f.getId() == fragmentId)
+              .findAny()
+              .orElseThrow(() -> new RuntimeException("no fragment found for " + fragmentId));
       ScanOptions.Builder scanOptions = new ScanOptions.Builder();
       scanOptions.columns(getColumnNames(inputPartition.getSchema()));
       if (inputPartition.getWhereCondition().isPresent()) {
@@ -62,6 +65,7 @@ public class LanceFragmentScanner implements AutoCloseable {
       }
       scanOptions.batchSize(SparkOptions.getBatchSize(config));
       scanOptions.withRowId(getWithRowId(inputPartition.getSchema()));
+      scanOptions.withRowAddress(getWithRowAddress(inputPartition.getSchema()));
       if (inputPartition.getLimit().isPresent()) {
         scanOptions.limit(inputPartition.getLimit().get());
       }
@@ -114,7 +118,8 @@ public class LanceFragmentScanner implements AutoCloseable {
   private static List<String> getColumnNames(StructType schema) {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
-        .filter(name -> !name.equals(LanceConstant.ROW_ID))
+        .filter(
+            name -> !name.equals(LanceConstant.ROW_ID) && !name.equals(LanceConstant.ROW_ADDRESS))
         .collect(Collectors.toList());
   }
 
@@ -122,5 +127,11 @@ public class LanceFragmentScanner implements AutoCloseable {
     return Arrays.stream(schema.fields())
         .map(StructField::name)
         .anyMatch(name -> name.equals(LanceConstant.ROW_ID));
+  }
+
+  private static boolean getWithRowAddress(StructType schema) {
+    return Arrays.stream(schema.fields())
+        .map(StructField::name)
+        .anyMatch(name -> name.equals(LanceConstant.ROW_ADDRESS));
   }
 }

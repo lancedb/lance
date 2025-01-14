@@ -21,7 +21,7 @@ use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
-use lance::dataset::transaction::Operation;
+use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
 use lance::Error;
 use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
@@ -127,11 +127,11 @@ impl FileFragment {
         PyLance(self.fragment.metadata().clone())
     }
 
-    #[pyo3(signature=(_filter=None))]
-    fn count_rows(&self, _filter: Option<String>) -> PyResult<usize> {
+    #[pyo3(signature=(filter=None))]
+    fn count_rows(&self, filter: Option<String>) -> PyResult<usize> {
         RT.runtime.block_on(async {
             self.fragment
-                .count_rows()
+                .count_rows(filter)
                 .await
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })
@@ -339,13 +339,11 @@ impl From<FileFragment> for LanceFragment {
     }
 }
 
-#[pyfunction(name = "_write_fragments")]
-#[pyo3(signature = (dest, reader, **kwargs))]
-pub fn write_fragments(
+fn do_write_fragments(
     dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
     kwargs: Option<&PyDict>,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
     let params = kwargs
@@ -360,14 +358,23 @@ pub fn write_fragments(
         WriteDestination::Uri(dest.extract()?)
     };
 
-    let written = RT
-        .block_on(
-            Some(reader.py()),
-            InsertBuilder::new(dest)
-                .with_params(&params)
-                .execute_uncommitted_stream(batches),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+    RT.block_on(
+        Some(reader.py()),
+        InsertBuilder::new(dest)
+            .with_params(&params)
+            .execute_uncommitted_stream(batches),
+    )?
+    .map_err(|err| PyIOError::new_err(err.to_string()))
+}
+
+#[pyfunction(name = "_write_fragments")]
+#[pyo3(signature = (dest, reader, **kwargs))]
+pub fn write_fragments(
+    dest: &Bound<PyAny>,
+    reader: &Bound<PyAny>,
+    kwargs: Option<&PyDict>,
+) -> PyResult<Vec<PyObject>> {
+    let written = do_write_fragments(dest, reader, kwargs)?;
 
     assert!(
         written.blobs_op.is_none(),
@@ -386,6 +393,18 @@ pub fn write_fragments(
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
     Ok(export_vec(reader.py(), &fragments))
+}
+
+#[pyfunction(name = "_write_fragments_transaction")]
+#[pyo3(signature = (dest, reader, **kwargs))]
+pub fn write_fragments_transaction(
+    dest: &Bound<PyAny>,
+    reader: &Bound<PyAny>,
+    kwargs: Option<&PyDict>,
+) -> PyResult<PyObject> {
+    let written = do_write_fragments(dest, reader, kwargs)?;
+
+    Ok(PyLance(written).to_object(reader.py()))
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {

@@ -31,14 +31,16 @@ use datafusion::{
         context::{SessionConfig, SessionContext},
         memory_pool::MemoryConsumer,
     },
-    logical_expr::{Expr, JoinType},
+    logical_expr::{self, Expr, JoinType},
     physical_plan::{
         joins::{HashJoinExec, PartitionMode},
+        projection::ProjectionExec,
         repartition::RepartitionExec,
         stream::RecordBatchStreamAdapter,
         union::UnionExec,
         ColumnarValue, ExecutionPlan, PhysicalExpr, SendableRecordBatchStream,
     },
+    prelude::DataFrame,
     scalar::ScalarValue,
 };
 
@@ -82,17 +84,13 @@ use crate::{
         write::open_writer,
     },
     index::DatasetIndexInternalExt,
-    io::{
-        commit::commit_transaction,
-        exec::{
-            project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner,
-            TakeExec,
-        },
+    io::exec::{
+        project, scalar_index::MapIndexExec, utils::ReplayExec, AddRowAddrExec, Planner, TakeExec,
     },
     Dataset,
 };
 
-use super::{write_fragments_internal, WriteParams};
+use super::{write_fragments_internal, CommitBuilder, WriteParams};
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
@@ -512,9 +510,16 @@ impl MergeInsertJob {
             )?);
         }
 
+        // We need to prefix the fields in the target with target_ so that we don't have any duplicate
+        // field names (DF doesn't support this as of version 44)
+        target = Self::prefix_columns_phys(target, "target_");
+
         // 6 - Finally, join the input (source table) with the taken data (target table)
         let source_key = Column::new_with_schema(&index_column, shared_input.schema().as_ref())?;
-        let target_key = Column::new_with_schema(&index_column, target.schema().as_ref())?;
+        let target_key = Column::new_with_schema(
+            &format!("target_{}", index_column),
+            target.schema().as_ref(),
+        )?;
         let joined = Arc::new(
             HashJoinExec::try_new(
                 shared_input,
@@ -537,6 +542,38 @@ impl MergeInsertJob {
         )
     }
 
+    fn prefix_columns(df: DataFrame, prefix: &str) -> DataFrame {
+        let schema = df.schema();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                // Need to "quote" the column name so it gets interpreted case-sensitively
+                logical_expr::col(format!("\"{}\"", f.name())).alias(format!(
+                    "{}{}",
+                    prefix,
+                    f.name()
+                ))
+            })
+            .collect::<Vec<_>>();
+        df.select(columns).unwrap()
+    }
+
+    fn prefix_columns_phys(inp: Arc<dyn ExecutionPlan>, prefix: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = inp.schema();
+        let exprs = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, f)| {
+                let col = Arc::new(Column::new(f.name(), idx)) as Arc<dyn PhysicalExpr>;
+                let new_name = format!("{}{}", prefix, f.name());
+                (col, new_name)
+            })
+            .collect::<Vec<_>>();
+        Arc::new(ProjectionExec::try_new(exprs, inp).unwrap())
+    }
+
     // If the join keys are not indexed then we need to do a full scan of the table
     async fn create_full_table_joined_stream(
         &self,
@@ -552,12 +589,21 @@ impl MergeInsertJob {
             .iter()
             .map(|c| c.as_str())
             .collect::<Vec<_>>(); // vector of strings of col names to join
+        let target_cols = self
+            .params
+            .on
+            .iter()
+            .map(|c| format!("target_{}", c))
+            .collect::<Vec<_>>();
+        let target_cols = target_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
 
         match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => {
                 let existing = session_ctx.read_lance(self.dataset.clone(), true, false)?;
+                // We need to rename the columns from the target table so that they don't conflict with the source table
+                let existing = Self::prefix_columns(existing, "target_");
                 let joined =
-                    new_data.join(existing, JoinType::Full, &join_cols, &join_cols, None)?; // full join
+                    new_data.join(existing, JoinType::Full, &join_cols, &target_cols, None)?; // full join
                 Ok(joined.execute_stream().await?)
             }
             SchemaComparison::Subschema => {
@@ -569,18 +615,27 @@ impl MergeInsertJob {
                     .chain([ROW_ID, ROW_ADDR])
                     .collect::<Vec<_>>();
                 let projected = existing.select_columns(&columns)?;
+                // We need to rename the columns from the target table so that they don't conflict with the source table
+                let projected = Self::prefix_columns(projected, "target_");
                 // We aren't supporting inserts or deletes right now, so we can use inner join
                 let join_type = if self.params.insert_not_matched {
                     JoinType::Left
                 } else {
                     JoinType::Inner
                 };
-                let joined = new_data.join(projected, join_type, &join_cols, &join_cols, None)?;
+                let joined = new_data.join(projected, join_type, &join_cols, &target_cols, None)?;
                 Ok(joined.execute_stream().await?)
             }
         }
     }
 
+    /// Join the source and target data streams
+    ///
+    /// If there is a scalar index on the join key, we can use it to do an indexed join.  Otherwise we need to do
+    /// a full outer join.
+    ///
+    /// Datafusion doesn't allow duplicate column names so during this join we rename the columns from target and
+    /// prefix them with _target.
     async fn create_joined_stream(
         &self,
         source: SendableRecordBatchStream,
@@ -942,6 +997,27 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
+        let ds = self.dataset.clone();
+        let (transaction, stats) = self.execute_uncommitted_impl(source).await?;
+        let dataset = CommitBuilder::new(ds).execute(transaction).await?;
+        Ok((Arc::new(dataset), stats))
+    }
+
+    /// Execute the merge insert job without committing the changes.
+    ///
+    /// Use [`CommitBuilder`] to commit the returned transaction.
+    pub async fn execute_uncommitted(
+        self,
+        source: impl StreamingWriteSource,
+    ) -> Result<(Transaction, MergeStats)> {
+        let stream = source.into_stream();
+        self.execute_uncommitted_impl(stream).await
+    }
+
+    async fn execute_uncommitted_impl(
+        self,
+        source: SendableRecordBatchStream,
+    ) -> Result<(Transaction, MergeStats)> {
         let schema = source.schema();
 
         let full_schema = Schema::from(self.dataset.local_schema());
@@ -957,7 +1033,7 @@ impl MergeInsertJob {
             .try_flatten();
         let stream = RecordBatchStreamAdapter::new(merger_schema, stream);
 
-        let committed_ds = if !is_full_schema {
+        let operation = if !is_full_schema {
             if !matches!(
                 self.params.delete_not_matched_by_source,
                 WhenNotMatchedBySource::Keep
@@ -971,7 +1047,11 @@ impl MergeInsertJob {
             let (updated_fragments, new_fragments) =
                 Self::update_fragments(self.dataset.clone(), Box::pin(stream)).await?;
 
-            Self::commit(self.dataset, Vec::new(), updated_fragments, new_fragments).await?
+            Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments,
+                new_fragments,
+            }
         } else {
             let written = write_fragments_internal(
                 Some(&self.dataset),
@@ -993,13 +1073,11 @@ impl MergeInsertJob {
                 Self::apply_deletions(&self.dataset, &removed_row_ids).await?;
 
             // Commit updated and new fragments
-            Self::commit(
-                self.dataset,
+            Operation::Update {
                 removed_fragment_ids,
-                old_fragments,
+                updated_fragments: old_fragments,
                 new_fragments,
-            )
-            .await?
+            }
         };
 
         let stats = Arc::into_inner(merge_statistics)
@@ -1007,7 +1085,14 @@ impl MergeInsertJob {
             .into_inner()
             .unwrap();
 
-        Ok((committed_ds, stats))
+        let transaction = Transaction::new(
+            self.dataset.manifest.version,
+            operation,
+            /*blobs_op=*/ None,
+            None,
+        );
+
+        Ok((transaction, stats))
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
@@ -1055,43 +1140,6 @@ impl MergeInsertJob {
         }
 
         Ok((updated_fragments, removed_fragments))
-    }
-
-    // Commit the operation
-    async fn commit(
-        dataset: Arc<Dataset>,
-        removed_fragment_ids: Vec<u64>,
-        updated_fragments: Vec<Fragment>,
-        new_fragments: Vec<Fragment>,
-    ) -> Result<Arc<Dataset>> {
-        let operation = Operation::Update {
-            removed_fragment_ids,
-            updated_fragments,
-            new_fragments,
-        };
-        let transaction = Transaction::new(
-            dataset.manifest.version,
-            operation,
-            /*blobs_op=*/ None,
-            None,
-        );
-
-        let (manifest, manifest_path) = commit_transaction(
-            dataset.as_ref(),
-            dataset.object_store(),
-            dataset.commit_handler.as_ref(),
-            &transaction,
-            &Default::default(),
-            &Default::default(),
-            dataset.manifest_naming_scheme,
-        )
-        .await?;
-
-        let mut dataset = dataset.as_ref().clone();
-        dataset.manifest = Arc::new(manifest);
-        dataset.manifest_file = manifest_path;
-
-        Ok(Arc::new(dataset))
     }
 }
 

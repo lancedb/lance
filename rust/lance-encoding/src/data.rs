@@ -450,6 +450,14 @@ impl FixedSizeListBlock {
         }
     }
 
+    pub fn flatten_as_fixed(&mut self) -> FixedWidthDataBlock {
+        match self.child.as_mut() {
+            DataBlock::FixedSizeList(fsl) => fsl.flatten_as_fixed(),
+            DataBlock::FixedWidth(fw) => fw.borrow_and_clone(),
+            _ => panic!("Expected FixedSizeList or FixedWidth data block"),
+        }
+    }
+
     /// Convert a flattened values block into a FixedSizeListBlock
     pub fn from_flat(data: FixedWidthDataBlock, data_type: &DataType) -> DataBlock {
         match data_type {
@@ -884,6 +892,27 @@ impl DataBlock {
         }
     }
 
+    pub fn is_variable(&self) -> bool {
+        match self {
+            Self::Constant(_) => false,
+            Self::Empty() => false,
+            Self::AllNull(_) => false,
+            Self::Nullable(nullable) => nullable.data.is_variable(),
+            Self::FixedWidth(_) => false,
+            Self::FixedSizeList(fsl) => fsl.child.is_variable(),
+            Self::VariableWidth(_) => true,
+            Self::Struct(strct) => strct.children.iter().any(|c| c.is_variable()),
+            Self::Dictionary(_) => {
+                todo!("is_variable for DictionaryDataBlock is not implemented yet")
+            }
+            Self::Opaque(_) => panic!("Does not make sense to ask if an Opaque block is variable"),
+        }
+    }
+
+    /// The number of values in the block
+    ///
+    /// This function does not recurse into child blocks.  If this is a FSL then it will
+    /// be the number of lists and not the number of items.
     pub fn num_values(&self) -> u64 {
         match self {
             Self::Empty() => 0,
@@ -899,6 +928,25 @@ impl DataBlock {
         }
     }
 
+    /// The number of items in a single row
+    ///
+    /// This is always 1 unless there are layers of FSL
+    pub fn items_per_row(&self) -> u64 {
+        match self {
+            Self::Empty() => todo!(),     // Leave undefined until needed
+            Self::Constant(_) => todo!(), // Leave undefined until needed
+            Self::AllNull(_) => todo!(),  // Leave undefined until needed
+            Self::Nullable(nullable) => nullable.data.items_per_row(),
+            Self::FixedWidth(_) => 1,
+            Self::FixedSizeList(fsl) => fsl.dimension * fsl.child.items_per_row(),
+            Self::VariableWidth(_) => 1,
+            Self::Struct(_) => todo!(), // Leave undefined until needed
+            Self::Dictionary(_) => 1,
+            Self::Opaque(_) => 1,
+        }
+    }
+
+    /// The number of bytes in the data block (including any child blocks)
     pub fn data_size(&self) -> u64 {
         match self {
             Self::Empty() => 0,
@@ -928,13 +976,21 @@ impl DataBlock {
             Self::Empty() => Self::Empty(),
             Self::Constant(inner) => Self::Constant(inner),
             Self::AllNull(_) => panic!("Cannot remove validity on all-null data"),
-            Self::Nullable(inner) => *inner.data,
+            Self::Nullable(inner) => inner.data.remove_validity(),
             Self::FixedWidth(inner) => Self::FixedWidth(inner),
             Self::FixedSizeList(inner) => Self::FixedSizeList(inner.remove_validity()),
             Self::VariableWidth(inner) => Self::VariableWidth(inner),
             Self::Struct(inner) => Self::Struct(inner.remove_validity()),
             Self::Dictionary(inner) => Self::FixedWidth(inner.indices),
             Self::Opaque(inner) => Self::Opaque(inner),
+        }
+    }
+
+    pub fn flatten(self) -> Self {
+        if let Self::FixedSizeList(fsl) = self {
+            fsl.child.flatten()
+        } else {
+            self
         }
     }
 

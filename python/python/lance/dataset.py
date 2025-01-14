@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Sequence,
     Set,
+    Tuple,
     TypedDict,
     Union,
 )
@@ -101,6 +102,30 @@ class MergeInsertBuilder(_MergeInsertBuilder):
         reader = _coerce_reader(data_obj, schema)
 
         return super(MergeInsertBuilder, self).execute(reader)
+
+    def execute_uncommitted(
+        self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None
+    ) -> Tuple[Transaction, Dict[str, Any]]:
+        """Executes the merge insert operation without committing
+
+        This function updates the original dataset and returns a dictionary with
+        information about merge statistics - i.e. the number of inserted, updated,
+        and deleted rows.
+
+        Parameters
+        ----------
+
+        data_obj: ReaderLike
+            The new data to use as the source table for the operation.  This parameter
+            can be any source of data (e.g. table / dataset) that
+            :func:`~lance.write_dataset` accepts.
+        schema: Optional[pa.Schema]
+            The schema of the data.  This only needs to be supplied whenever the data
+            source is some kind of generator.
+        """
+        reader = _coerce_reader(data_obj, schema)
+
+        return super(MergeInsertBuilder, self).execute_uncommitted(reader)
 
     # These next three overrides exist only to document the methods
 
@@ -507,13 +532,13 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = True,
+        scan_in_order: Optional[bool] = None,
         *,
-        prefilter: bool = False,
-        with_row_id: bool = False,
-        with_row_address: bool = False,
-        use_stats: bool = True,
-        fast_search: bool = False,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
+        fast_search: Optional[bool] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
@@ -558,11 +583,11 @@ class LanceDataset(pa.dataset.Dataset):
             The number of batches to read ahead.
         fragment_readahead: int, optional
             The number of fragments to read ahead.
-        scan_in_order: bool, default True
+        scan_in_order: bool, optional, default True
             Whether to read the fragments and batches in order. If false,
             throughput may be higher, but batches will be returned out of order
             and memory use might increase.
-        prefilter: bool, default False
+        prefilter: bool, optional, default False
             Run filter before the vector search.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  See
@@ -570,12 +595,13 @@ class LanceDataset(pa.dataset.Dataset):
         use_scalar_index: bool, default True
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
-        with_row_id: bool, default False
+        with_row_id: bool, optional, default False
             Return row ID.
-        with_row_address: bool, default False
+        with_row_address: bool, optional, default False
             Return row address
-        use_stats: bool, default True
+        use_stats: bool, optional, default True
             Use stats pushdown during filters.
+        fast_search: bool, optional, default False
         full_text_query: str or dict, optional
             query string to search for, the results will be ranked by BM25.
             e.g. "hello world", would match documents contains "hello" or "world".
@@ -687,12 +713,12 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: Optional[int] = None,
         batch_readahead: Optional[int] = None,
         fragment_readahead: Optional[int] = None,
-        scan_in_order: bool = True,
+        scan_in_order: Optional[bool] = None,
         *,
-        prefilter: bool = False,
-        with_row_id: bool = False,
-        with_row_address: bool = False,
-        use_stats: bool = True,
+        prefilter: Optional[bool] = None,
+        with_row_id: Optional[bool] = None,
+        with_row_address: Optional[bool] = None,
+        use_stats: Optional[bool] = None,
         full_text_query: Optional[Union[str, dict]] = None,
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
@@ -1850,8 +1876,14 @@ class LanceDataset(pa.dataset.Dataset):
             if c not in self.schema.names:
                 raise KeyError(f"{c} not found in schema")
             field = self.schema.field(c)
+            is_multivec = False
             if pa.types.is_fixed_size_list(field.type):
                 dimension = field.type.list_size
+            elif pa.types.is_list(field.type) and pa.types.is_fixed_size_list(
+                field.type.value_type
+            ):
+                dimension = field.type.value_type.list_size
+                is_multivec = True
             elif (
                 isinstance(field.type, pa.FixedShapeTensorType)
                 and len(field.type.shape) == 1
@@ -1869,7 +1901,12 @@ class LanceDataset(pa.dataset.Dataset):
                     f" ({num_sub_vectors})"
                 )
 
-            if not pa.types.is_floating(field.type.value_type):
+            element_type = field.type.value_type
+            if is_multivec:
+                element_type = field.type.value_type.value_type
+            if not (
+                pa.types.is_floating(element_type) or pa.types.is_uint8(element_type)
+            ):
                 raise TypeError(
                     f"Vector column {c} must have floating value type, "
                     f"got {field.type.value_type}"
@@ -1880,13 +1917,14 @@ class LanceDataset(pa.dataset.Dataset):
             "cosine",
             "euclidean",
             "dot",
+            "hamming",
         ]:
             raise ValueError(f"Metric {metric} not supported.")
 
         kwargs["metric_type"] = metric
 
         index_type = index_type.upper()
-        valid_index_types = ["IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
+        valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
         if index_type not in valid_index_types:
             raise NotImplementedError(
                 f"Only {valid_index_types} index types supported. " f"Got {index_type}"
@@ -2207,7 +2245,8 @@ class LanceDataset(pa.dataset.Dataset):
     @staticmethod
     def commit(
         base_uri: Union[str, Path, LanceDataset],
-        operation: LanceOperation.BaseOperation,
+        operation: Union[LanceOperation.BaseOperation, Transaction],
+        blobs_op: Optional[LanceOperation.BaseOperation] = None,
         read_version: Optional[int] = None,
         commit_lock: Optional[CommitLock] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -2312,24 +2351,45 @@ class LanceDataset(pa.dataset.Dataset):
                     f"commit_lock must be a function, got {type(commit_lock)}"
                 )
 
-        if read_version is None and not isinstance(
-            operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+        if (
+            isinstance(operation, LanceOperation.BaseOperation)
+            and read_version is None
+            and not isinstance(
+                operation, (LanceOperation.Overwrite, LanceOperation.Restore)
+            )
         ):
             raise ValueError(
                 "read_version is required for all operations except "
                 "Overwrite and Restore"
             )
+        if isinstance(operation, Transaction):
+            new_ds = _Dataset.commit_transaction(
+                base_uri,
+                operation,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        elif isinstance(operation, LanceOperation.BaseOperation):
+            new_ds = _Dataset.commit(
+                base_uri,
+                operation,
+                blobs_op,
+                read_version,
+                commit_lock,
+                storage_options=storage_options,
+                enable_v2_manifest_paths=enable_v2_manifest_paths,
+                detached=detached,
+                max_retries=max_retries,
+            )
+        else:
+            raise TypeError(
+                "operation must be a LanceOperation.BaseOperation or Transaction, "
+                f"got {type(operation)}"
+            )
 
-        new_ds = _Dataset.commit(
-            base_uri,
-            operation,
-            read_version,
-            commit_lock,
-            storage_options=storage_options,
-            enable_v2_manifest_paths=enable_v2_manifest_paths,
-            detached=detached,
-            max_retries=max_retries,
-        )
         ds = LanceDataset.__new__(LanceDataset)
         ds._storage_options = storage_options
         ds._ds = new_ds
@@ -2590,10 +2650,8 @@ class LanceOperation:
         fragments: Iterable[FragmentMetadata]
 
         def __post_init__(self):
-            if not isinstance(self.new_schema, pa.Schema):
-                raise TypeError(
-                    f"schema must be pyarrow.Schema, got {type(self.new_schema)}"
-                )
+            if isinstance(self.new_schema, pa.Schema):
+                self.new_schema = LanceSchema.from_pyarrow(self.new_schema)
             LanceOperation._validate_fragments(self.fragments)
 
     @dataclass
@@ -2709,6 +2767,29 @@ class LanceOperation:
 
         def __post_init__(self):
             LanceOperation._validate_fragments(self.updated_fragments)
+
+    @dataclass
+    class Update(BaseOperation):
+        """
+        Operation that updates rows in the dataset.
+
+        Attributes
+        ----------
+        removed_fragment_ids: list[int]
+            The ids of the fragments that have been removed entirely.
+        updated_fragments: list[FragmentMetadata]
+            The fragments that have been updated with new deletion vectors.
+        new_fragments: list[FragmentMetadata]
+            The fragments that contain the new rows.
+        """
+
+        removed_fragment_ids: List[int]
+        updated_fragments: List[FragmentMetadata]
+        new_fragments: List[FragmentMetadata]
+
+        def __post_init__(self):
+            LanceOperation._validate_fragments(self.updated_fragments)
+            LanceOperation._validate_fragments(self.new_fragments)
 
     @dataclass
     class Merge(BaseOperation):
@@ -3079,7 +3160,7 @@ class ScannerBuilder:
         use_index: bool = True,
         ef: Optional[int] = None,
     ) -> ScannerBuilder:
-        q = _coerce_query_vector(q)
+        q, q_dim = _coerce_query_vector(q)
 
         if self.ds.schema.get_field_index(column) < 0:
             raise ValueError(f"Embedding column {column} is not in the dataset")
@@ -3088,14 +3169,20 @@ class ScannerBuilder:
         column_type = column_field.type
         if hasattr(column_type, "storage_type"):
             column_type = column_type.storage_type
-        if not pa.types.is_fixed_size_list(column_type):
+        if pa.types.is_fixed_size_list(column_type):
+            dim = column_type.list_size
+        elif pa.types.is_list(column_type) and pa.types.is_fixed_size_list(
+            column_type.value_type
+        ):
+            dim = column_type.value_type.list_size
+        else:
             raise TypeError(
                 f"Query column {column} must be a vector. Got {column_field.type}."
             )
-        if len(q) != column_type.list_size:
+
+        if q_dim != dim:
             raise ValueError(
-                f"Query vector size {len(q)} does not match index column size"
-                f" {column_type.list_size}"
+                f"Query vector size {len(q)} does not match index column size" f" {dim}"
             )
 
         if k is not None and int(k) <= 0:
@@ -3448,6 +3535,21 @@ class Tags:
         self._ds.update_tag(tag, version)
 
 
+@dataclass
+class FieldStatistics:
+    """Statistics about a field in the dataset"""
+
+    id: int  #: id of the field
+    bytes_on_disk: int  #: (possibly compressed) bytes on disk used to store the field
+
+
+@dataclass
+class DataStatistics:
+    """Statistics about the data in the dataset"""
+
+    fields: FieldStatistics  #: Statistics about the fields in the dataset
+
+
 class DatasetStats(TypedDict):
     num_deleted_rows: int
     num_fragments: int
@@ -3483,6 +3585,12 @@ class LanceStats:
         """
         index_stats = json.loads(self._ds.index_statistics(index_name))
         return index_stats
+
+    def data_stats(self) -> DataStatistics:
+        """
+        Statistics about the data in the dataset.
+        """
+        return self._ds.data_stats()
 
 
 def write_dataset(
@@ -3617,7 +3725,23 @@ def write_dataset(
     return ds
 
 
-def _coerce_query_vector(query: QueryVectorLike):
+def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
+    # if the query is a multivector, convert it to pa.ListArray
+    if hasattr(query, "__getitem__") and isinstance(
+        query[0], (list, tuple, np.ndarray, pa.Array)
+    ):
+        dim = len(query[0])
+        multivector_query = []
+        for q in query:
+            if len(q) != dim:
+                raise ValueError(
+                    "All query vectors must have the same length, "
+                    f"but got {dim} and {len(q)}"
+                )
+            multivector_query.append(_coerce_query_vector(q)[0])
+        query = pa.array(multivector_query, type=pa.list_(pa.float32()))
+        return (query, dim)
+
     if isinstance(query, pa.Scalar):
         if isinstance(query, pa.ExtensionScalar):
             # If it's an extension scalar then convert to storage
@@ -3650,7 +3774,7 @@ def _coerce_query_vector(query: QueryVectorLike):
                 f"but received {query.type}"
             )
 
-    return query
+    return (query, len(query))
 
 
 def _validate_schema(schema: pa.Schema):

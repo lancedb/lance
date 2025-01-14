@@ -56,6 +56,7 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod statistics;
 mod take;
 pub mod transaction;
 pub mod updater;
@@ -84,7 +85,8 @@ pub use schema_evolution::{
 };
 pub use take::TakeBuilder;
 pub use write::merge_insert::{
-    MergeInsertBuilder, MergeInsertJob, WhenMatched, WhenNotMatched, WhenNotMatchedBySource,
+    MergeInsertBuilder, MergeInsertJob, MergeStats, WhenMatched, WhenNotMatched,
+    WhenNotMatchedBySource,
 };
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
@@ -798,7 +800,7 @@ impl Dataset {
 
     pub(crate) async fn count_all_rows(&self) -> Result<usize> {
         let cnts = stream::iter(self.get_fragments())
-            .map(|f| async move { f.count_rows().await })
+            .map(|f| async move { f.count_rows(None).await })
             .buffer_unordered(16)
             .try_collect::<Vec<_>>()
             .await?;
@@ -2037,7 +2039,7 @@ mod tests {
         assert_eq!(fragments.len(), 10);
         assert_eq!(dataset.count_fragments(), 10);
         for fragment in &fragments {
-            assert_eq!(fragment.count_rows().await.unwrap(), 100);
+            assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
             let reader = fragment
                 .open(dataset.schema(), FragReadConfig::default(), None)
                 .await
@@ -3754,7 +3756,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let data = gen().col("vec", array::rand_vec::<Float32Type>(Dimension::from(32)));
+        let data = gen().col("vec", array::rand_vec::<Float32Type>(Dimension::from(128)));
         let reader = data.into_reader_rows(RowCount::from(1000), BatchCount::from(10));
         let mut dataset = Dataset::write(
             reader,

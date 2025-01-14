@@ -19,6 +19,7 @@ use datafusion::{
 use datafusion_physical_expr::{expressions::Column, PhysicalExpr};
 
 /// Rule that eliminates [TakeExec] nodes that are immediately followed by another [TakeExec].
+#[derive(Debug)]
 pub struct CoalesceTake;
 
 impl CoalesceTake {
@@ -115,6 +116,7 @@ impl PhysicalOptimizerRule for CoalesceTake {
 
 /// Rule that eliminates [ProjectionExec] nodes that projects all columns
 /// from its input with no additional expressions.
+#[derive(Debug)]
 pub struct SimplifyProjection;
 
 impl PhysicalOptimizerRule for SimplifyProjection {

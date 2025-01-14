@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use datafusion::{
     common::{stats::Precision, Statistics},
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
     scalar::ScalarValue,
 };
@@ -89,7 +90,8 @@ impl ScalarIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(SCALAR_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,
@@ -190,7 +192,8 @@ impl MapIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(INDEX_LOOKUP_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,
@@ -394,7 +397,8 @@ impl MaterializeIndexExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(MATERIALIZE_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,

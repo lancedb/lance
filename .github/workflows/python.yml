@@ -39,7 +39,7 @@ jobs:
     env:
       # Need up-to-date compilers for kernels
       CC: clang-18
-      CXX: clang-18
+      CXX: clang++-18
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,20 +54,22 @@ jobs:
           workspaces: python
       - name: Install linting tools
         run: |
-          pip install ruff==0.4.1 maturin tensorflow tqdm ray[data]
+          pip install ruff==0.4.1 maturin tensorflow tqdm ray[data] pyright datasets polars[pyarrow,pandas]
           pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Lint Python
         run: |
           ruff format --check python
           ruff check python
+          pyright
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
       - name: Lint Rust
         run: |
+          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo fmt --all -- --check
-          cargo clippy --locked --all-features --tests -- -D warnings
+          cargo clippy --locked --features ${ALL_FEATURES} --tests -- -D warnings
       - name: Build
         run: |
           python -m venv venv

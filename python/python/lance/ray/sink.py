@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
 __all__ = ["LanceDatasink", "LanceFragmentWriter", "LanceCommitter", "write_lance"]
 
+NONE_ARROW_STR = "None"
+
 
 def _pd_to_arrow(
     df: Union[pa.Table, "pd.DataFrame", Dict], schema: Optional[pa.Schema]
@@ -39,11 +41,13 @@ def _pd_to_arrow(
 
     if isinstance(df, dict):
         return pa.Table.from_pydict(df, schema=schema)
-    if _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
+    elif _PANDAS_AVAILABLE and isinstance(df, pd.DataFrame):
         tbl = pa.Table.from_pandas(df, schema=schema)
-        new_schema = tbl.schema.remove_metadata()
-        new_table = tbl.replace_schema_metadata(new_schema.metadata)
-        return new_table
+        tbl.schema = tbl.schema.remove_metadata()
+        return tbl
+    elif isinstance(df, pa.Table):
+        if schema is not None:
+            return df.cast(schema)
     return df
 
 
@@ -131,6 +135,37 @@ class _BaseLanceDatasink(ray.data.Datasink):
         self,
         write_results: List[List[Tuple[str, str]]],
     ):
+        import warnings
+
+        if not write_results:
+            warnings.warn(
+                "write_results is empty.",
+                DeprecationWarning,
+            )
+            return
+        if (
+            not isinstance(write_results, list)
+            or not isinstance(write_results[0], list)
+        ) and not hasattr(write_results, "write_returns"):
+            warnings.warn(
+                "write_results type is wrong. please check version, "
+                "upgrade or downgrade your ray version. ray versions >= 2.38 "
+                "and < 2.41 are unable to write Lance datasets, check ray PR "
+                "https://github.com/ray-project/ray/pull/49251 in your "
+                "ray version. ",
+                DeprecationWarning,
+            )
+            return
+        if hasattr(write_results, "write_returns"):
+            write_results = write_results.write_returns
+
+        if len(write_results) == 0:
+            warnings.warn(
+                "write results is empty. please check ray version " "or internal error",
+                DeprecationWarning,
+            )
+            return
+
         fragments = []
         schema = None
         for batch in write_results:
@@ -389,6 +424,7 @@ def write_lance(
     output_uri: str,
     *,
     schema: Optional[pa.Schema] = None,
+    mode: Literal["create", "append", "overwrite"] = "create",
     transform: Optional[
         Callable[[pa.Table], Union[pa.Table, Generator[None, pa.Table, None]]]
     ] = None,
@@ -435,7 +471,9 @@ def write_lance(
         ),
         batch_size=max_rows_per_file,
     ).write_datasink(
-        LanceCommitter(output_uri, schema=schema, storage_options=storage_options)
+        LanceCommitter(
+            output_uri, schema=schema, mode=mode, storage_options=storage_options
+        )
     )
 
 

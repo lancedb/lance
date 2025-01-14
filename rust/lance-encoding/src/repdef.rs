@@ -80,18 +80,6 @@
 //! However, in Lance we don't always take advantage of that compression because we want to be able
 //! to zip rep-def levels together with our values.  This gives us fewer IOPS when accessing row values.
 
-// TODO: Right now, if a layer has no nulls, but other layers do, then we still use
-//       up a repetition layer for the no-null spot.  For example, if we have four
-//       levels of rep: [has nulls, has nulls, no nulls, has nulls] then we will say:
-//       0 = valid
-//       1 = layer 4 null
-//       2 = layer 3 null
-//       3 = layer 2 null (useless)
-//       4 = layer 1 null
-//
-// This means we end up with 3 bits per level instead of 2.  We could instead record
-// the layers that are all null somewhere else and not require wider rep levels.
-
 use std::{
     iter::{Copied, Zip},
     sync::Arc,
@@ -129,6 +117,16 @@ struct ValidityDesc {
     num_values: usize,
 }
 
+/// Represents validity information that we extract from FSL arrays.  This is
+/// just validity (no offsets) but we also record the dimension of the FSL array
+/// as that will impact the next layer
+#[derive(Clone, Debug)]
+struct FslDesc {
+    validity: Option<BooleanBuffer>,
+    dimension: usize,
+    num_values: usize,
+}
+
 // As we build up rep/def from arrow arrays we record a
 // series of RawRepDef objects.  Each one corresponds to layer
 // in the array structure
@@ -136,6 +134,7 @@ struct ValidityDesc {
 enum RawRepDef {
     Offsets(OffsetDesc),
     Validity(ValidityDesc),
+    Fsl(FslDesc),
 }
 
 impl RawRepDef {
@@ -144,6 +143,7 @@ impl RawRepDef {
         match self {
             Self::Offsets(OffsetDesc { validity, .. }) => validity.is_some(),
             Self::Validity(ValidityDesc { validity, .. }) => validity.is_some(),
+            Self::Fsl(FslDesc { validity, .. }) => validity.is_some(),
         }
     }
 
@@ -152,6 +152,7 @@ impl RawRepDef {
         match self {
             Self::Offsets(OffsetDesc { num_values, .. }) => *num_values,
             Self::Validity(ValidityDesc { num_values, .. }) => *num_values,
+            Self::Fsl(FslDesc { num_values, .. }) => *num_values,
         }
     }
 }
@@ -504,7 +505,7 @@ impl DefinitionInterpretation {
 /// to build the actual repetition and definition levels by walking through
 /// the arrow constructs in reverse order.
 ///
-/// The algorithm for definition levels is pretty simple
+/// The algorithm for definition levels is as follows:
 ///
 /// Given:
 ///  - a validity buffer of [T, F, F, T, T]
@@ -540,6 +541,8 @@ struct SerializerContext {
     def_levels: LevelBuffer,
     current_rep: u16,
     current_def: u16,
+    // FSL layers multiply the preceding def / rep levels by the dimension
+    current_multiplier: usize,
     has_nulls: bool,
 }
 
@@ -562,6 +565,7 @@ impl SerializerContext {
             def_meaning,
             current_rep: 1,
             current_def: 1,
+            current_multiplier: 1,
             has_nulls: false,
             specials: Vec::default(),
         }
@@ -575,6 +579,12 @@ impl SerializerContext {
     }
 
     fn record_offsets(&mut self, offset_desc: &OffsetDesc) {
+        if self.current_multiplier != 1 {
+            // If we need this it isn't too terrible.  We just need to multiply all of the offsets in offset_desc by
+            // the current multiplier before we do anything with them.  Not adding at the moment simply to avoid the
+            // burden of testing
+            todo!("List<...FSL<...>> not yet supported");
+        }
         let rep_level = self.current_rep;
         let (null_list_level, empty_list_level) =
             match (offset_desc.validity.is_some(), offset_desc.has_empty_lists) {
@@ -687,11 +697,13 @@ impl SerializerContext {
                 .windows(2)
                 .zip(validity.iter())
                 .for_each(|(w, valid)| {
+                    let start = w[0] * self.current_multiplier;
+                    let end = w[1] * self.current_multiplier;
                     if !valid {
-                        self.def_levels[w[0]..w[1]].fill(null_level);
+                        self.def_levels[start..end].fill(null_level);
                     }
                 });
-        } else {
+        } else if self.current_multiplier == 1 {
             self.def_levels
                 .iter_mut()
                 .zip(validity.iter())
@@ -700,16 +712,38 @@ impl SerializerContext {
                         *def = null_level;
                     }
                 });
+        } else {
+            self.def_levels
+                .iter_mut()
+                .zip(
+                    validity
+                        .iter()
+                        .flat_map(|v| std::iter::repeat(v).take(self.current_multiplier)),
+                )
+                .for_each(|(def, valid)| {
+                    if !valid {
+                        *def = null_level;
+                    }
+                });
         }
     }
 
-    fn record_validity(&mut self, validity_desc: &ValidityDesc) {
-        if let Some(validity) = validity_desc.validity.as_ref() {
+    fn record_validity_buf(&mut self, validity: &Option<BooleanBuffer>) {
+        if let Some(validity) = validity {
             let def_level = self.checkout_def(DefinitionInterpretation::NullableItem);
             self.do_record_validity(validity, def_level);
         } else {
             self.checkout_def(DefinitionInterpretation::AllValidItem);
         }
+    }
+
+    fn record_validity(&mut self, validity_desc: &ValidityDesc) {
+        self.record_validity_buf(&validity_desc.validity)
+    }
+
+    fn record_fsl(&mut self, fsl_desc: &FslDesc) {
+        self.current_multiplier *= fsl_desc.dimension;
+        self.record_validity_buf(&fsl_desc.validity);
     }
 
     fn build(self) -> SerializedRepDefs {
@@ -767,11 +801,11 @@ pub struct RepDefBuilder {
 }
 
 impl RepDefBuilder {
-    fn check_validity_len(&mut self, validity: &NullBuffer) {
+    fn check_validity_len(&mut self, incoming_len: usize) {
         if let Some(len) = self.len {
-            assert!(validity.len() == len);
+            assert_eq!(incoming_len, len);
         }
-        self.len = Some(validity.len());
+        self.len = Some(incoming_len);
     }
 
     fn num_layers(&self) -> usize {
@@ -802,6 +836,9 @@ impl RepDefBuilder {
                 RawRepDef::Validity(ValidityDesc {
                     validity: Some(_),
                     ..
+                }) | RawRepDef::Fsl(FslDesc {
+                    validity: Some(_),
+                    ..
                 })
             )
         })
@@ -815,7 +852,7 @@ impl RepDefBuilder {
 
     /// Registers a nullable validity bitmap
     pub fn add_validity_bitmap(&mut self, validity: NullBuffer) {
-        self.check_validity_len(&validity);
+        self.check_validity_len(validity.len());
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             num_values: validity.len(),
             validity: Some(validity.into_inner()),
@@ -824,10 +861,24 @@ impl RepDefBuilder {
 
     /// Registers an all-valid validity layer
     pub fn add_no_null(&mut self, len: usize) {
+        self.check_validity_len(len);
         self.repdefs.push(RawRepDef::Validity(ValidityDesc {
             validity: None,
             num_values: len,
         }));
+    }
+
+    pub fn add_fsl(&mut self, validity: Option<NullBuffer>, dimension: usize, num_values: usize) {
+        if let Some(len) = self.len {
+            assert_eq!(num_values, len);
+        }
+        self.len = Some(num_values * dimension);
+        debug_assert!(validity.is_none() || validity.as_ref().unwrap().len() == num_values);
+        self.repdefs.push(RawRepDef::Fsl(FslDesc {
+            num_values,
+            validity: validity.map(|v| v.into_inner()),
+            dimension,
+        }))
     }
 
     fn check_offset_len(&mut self, offsets: &[i64]) {
@@ -961,36 +1012,63 @@ impl RepDefBuilder {
         layers: impl Iterator<Item = &'a RawRepDef>,
         num_layers: usize,
     ) -> RawRepDef {
+        enum LayerKind {
+            Validity,
+            Fsl,
+            Offsets,
+        }
+
         // We make two passes through the layers.  The first determines if we need to pay the cost of allocating
         // buffers.  The second pass actually adds the values.
         let mut collected = Vec::with_capacity(num_layers);
         let mut has_nulls = false;
-        let mut is_offsets = false;
+        let mut layer_kind = LayerKind::Validity;
         let mut num_specials = 0;
+        let mut all_dimension = 0;
         let mut all_has_empty_lists = false;
         let mut all_num_values = 0;
         for layer in layers {
             has_nulls |= layer.has_nulls();
-            if let RawRepDef::Offsets(OffsetDesc {
-                specials,
-                has_empty_lists,
-                ..
-            }) = layer
-            {
-                all_has_empty_lists |= *has_empty_lists;
-                is_offsets = true;
-                num_specials += specials.len();
+            match layer {
+                RawRepDef::Validity(_) => {
+                    layer_kind = LayerKind::Validity;
+                }
+                RawRepDef::Offsets(OffsetDesc {
+                    specials,
+                    has_empty_lists,
+                    ..
+                }) => {
+                    all_has_empty_lists |= *has_empty_lists;
+                    layer_kind = LayerKind::Offsets;
+                    num_specials += specials.len();
+                }
+                RawRepDef::Fsl(FslDesc { dimension, .. }) => {
+                    layer_kind = LayerKind::Fsl;
+                    all_dimension = *dimension;
+                }
             }
             collected.push(layer);
             all_num_values += layer.num_values();
         }
 
         // Shortcut if there are no nulls
-        if !has_nulls && !is_offsets {
-            return RawRepDef::Validity(ValidityDesc {
-                validity: None,
-                num_values: all_num_values,
-            });
+        if !has_nulls {
+            match layer_kind {
+                LayerKind::Validity => {
+                    return RawRepDef::Validity(ValidityDesc {
+                        validity: None,
+                        num_values: all_num_values,
+                    });
+                }
+                LayerKind::Fsl => {
+                    return RawRepDef::Fsl(FslDesc {
+                        validity: None,
+                        num_values: all_num_values,
+                        dimension: all_dimension,
+                    })
+                }
+                LayerKind::Offsets => {}
+            }
         }
 
         // Only allocate if needed
@@ -999,7 +1077,7 @@ impl RepDefBuilder {
         } else {
             BooleanBufferBuilder::new(0)
         };
-        let mut all_offsets = if is_offsets {
+        let mut all_offsets = if matches!(layer_kind, LayerKind::Offsets) {
             let mut all_offsets = Vec::with_capacity(all_num_values);
             all_offsets.push(0);
             all_offsets
@@ -1021,6 +1099,17 @@ impl RepDefBuilder {
                     num_values,
                 }) => {
                     validity_builder.append_n(*num_values, true);
+                }
+                RawRepDef::Fsl(FslDesc {
+                    validity,
+                    num_values,
+                    ..
+                }) => {
+                    if let Some(validity) = validity {
+                        validity_builder.append_buffer(validity);
+                    } else {
+                        validity_builder.append_n(*num_values, true);
+                    }
                 }
                 RawRepDef::Offsets(OffsetDesc {
                     offsets,
@@ -1073,19 +1162,23 @@ impl RepDefBuilder {
         } else {
             None
         };
-        if all_offsets.is_empty() {
-            RawRepDef::Validity(ValidityDesc {
+        match layer_kind {
+            LayerKind::Fsl => RawRepDef::Fsl(FslDesc {
                 validity,
                 num_values: all_num_values,
-            })
-        } else {
-            RawRepDef::Offsets(OffsetDesc {
+                dimension: all_dimension,
+            }),
+            LayerKind::Validity => RawRepDef::Validity(ValidityDesc {
+                validity,
+                num_values: all_num_values,
+            }),
+            LayerKind::Offsets => RawRepDef::Offsets(OffsetDesc {
                 offsets: all_offsets.into(),
                 validity,
                 has_empty_lists: all_has_empty_lists,
                 num_values: all_num_values,
                 specials: all_specials.into(),
-            })
+            }),
         }
     }
 
@@ -1128,6 +1221,9 @@ impl RepDefBuilder {
                 }
                 RawRepDef::Offsets(rep) => {
                     context.record_offsets(&rep);
+                }
+                RawRepDef::Fsl(fsl) => {
+                    context.record_fsl(&fsl);
                 }
             }
         }
@@ -1387,6 +1483,36 @@ impl RepDefUnraveler {
             validity.append(is_valid);
         }
     }
+
+    pub fn decimate(&mut self, dimension: usize) {
+        if self.rep_levels.is_some() {
+            // If we need to support this then I think we need to walk through the rep def levels to find
+            // the spots at which we keep.  E.g. if we have:
+            //  rep: 1 0 0 1 0 1 0 0 0 1 0 0
+            //  def: 1 1 1 0 1 0 1 1 0 1 1 0
+            //  dimension: 2
+            //
+            // The output should be:
+            //  rep: 1 0 0 1 0 0 0
+            //  def: 1 1 1 0 1 1 0
+            //
+            // Maybe there's some special logic for empty/null lists?  I'll save the headache for future me.
+            todo!("Not yet supported FSL<...List<...>>");
+        }
+        let Some(def_levels) = self.def_levels.as_mut() else {
+            return;
+        };
+        let mut read_idx = 0;
+        let mut write_idx = 0;
+        while read_idx < def_levels.len() {
+            unsafe {
+                *def_levels.get_unchecked_mut(write_idx) = *def_levels.get_unchecked(read_idx);
+            }
+            write_idx += 1;
+            read_idx += dimension;
+        }
+        def_levels.truncate(write_idx);
+    }
 }
 
 /// As we decode we may extract rep/def information from multiple pages (or multiple
@@ -1435,6 +1561,17 @@ impl CompositeRepDefUnraveler {
         }
     }
 
+    pub fn unravel_fsl_validity(
+        &mut self,
+        num_values: usize,
+        dimension: usize,
+    ) -> Option<NullBuffer> {
+        for unraveler in self.unravelers.iter_mut() {
+            unraveler.decimate(dimension);
+        }
+        self.unravel_validity(num_values)
+    }
+
     /// Unravels a layer of offsets (and the validity for that layer)
     pub fn unravel_offsets<T: ArrowNativeType>(
         &mut self,
@@ -1476,6 +1613,8 @@ impl CompositeRepDefUnraveler {
 pub struct BinaryControlWordIterator<I: Iterator<Item = (u16, u16)>, W> {
     repdef: I,
     def_width: usize,
+    max_rep: u16,
+    max_visible_def: u16,
     rep_mask: u16,
     def_mask: u16,
     bits_rep: u8,
@@ -1484,28 +1623,40 @@ pub struct BinaryControlWordIterator<I: Iterator<Item = (u16, u16)>, W> {
 }
 
 impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u8> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         let control_word: u8 =
             (((next.0 & self.rep_mask) as u8) << self.def_width) + ((next.1 & self.def_mask) as u8);
         buf.push(control_word);
+        let is_new_row = next.0 == self.max_rep;
+        let is_visible = next.1 <= self.max_visible_def;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible,
+        })
     }
 }
 
 impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u16> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         let control_word: u16 =
             ((next.0 & self.rep_mask) << self.def_width) + (next.1 & self.def_mask);
         let control_word = control_word.to_le_bytes();
         buf.push(control_word[0]);
         buf.push(control_word[1]);
+        let is_new_row = next.0 == self.max_rep;
+        let is_visible = next.1 <= self.max_visible_def;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible,
+        })
     }
 }
 
 impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u32> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         let control_word: u32 = (((next.0 & self.rep_mask) as u32) << self.def_width)
             + ((next.1 & self.def_mask) as u32);
         let control_word = control_word.to_le_bytes();
@@ -1513,6 +1664,12 @@ impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u32> {
         buf.push(control_word[1]);
         buf.push(control_word[2]);
         buf.push(control_word[3]);
+        let is_new_row = next.0 == self.max_rep;
+        let is_visible = next.1 <= self.max_visible_def;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible,
+        })
     }
 }
 
@@ -1523,39 +1680,75 @@ pub struct UnaryControlWordIterator<I: Iterator<Item = u16>, W> {
     level_mask: u16,
     bits_rep: u8,
     bits_def: u8,
+    max_rep: u16,
     phantom: std::marker::PhantomData<W>,
 }
 
 impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u8> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = self.repdef.next().unwrap();
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
         buf.push((next & self.level_mask) as u8);
+        let is_new_row = self.max_rep == 0 || next == self.max_rep;
+        Some(ControlWordDesc {
+            is_new_row,
+            // Either there is no rep, in which case there are no invisible items
+            // or there is no def, in which case there are no invisible items
+            is_visible: true,
+        })
     }
 }
 
 impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u16> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
         let next = self.repdef.next().unwrap() & self.level_mask;
         let control_word = next.to_le_bytes();
         buf.push(control_word[0]);
         buf.push(control_word[1]);
+        let is_new_row = self.max_rep == 0 || next == self.max_rep;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible: true,
+        })
     }
 }
 
 impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u32> {
-    fn append_next(&mut self, buf: &mut Vec<u8>) {
-        let next = (self.repdef.next().unwrap() & self.level_mask) as u32;
+    fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
+        let next = self.repdef.next()?;
+        let next = (next & self.level_mask) as u32;
         let control_word = next.to_le_bytes();
         buf.push(control_word[0]);
         buf.push(control_word[1]);
         buf.push(control_word[2]);
         buf.push(control_word[3]);
+        let is_new_row = self.max_rep == 0 || next as u16 == self.max_rep;
+        Some(ControlWordDesc {
+            is_new_row,
+            is_visible: true,
+        })
     }
 }
 
 /// A [`ControlWordIterator`] when there are no repetition or definition levels
 #[derive(Debug)]
-pub struct NilaryControlWordIterator;
+pub struct NilaryControlWordIterator {
+    len: usize,
+    idx: usize,
+}
+
+impl NilaryControlWordIterator {
+    fn append_next(&mut self) -> Option<ControlWordDesc> {
+        if self.idx == self.len {
+            None
+        } else {
+            self.idx += 1;
+            Some(ControlWordDesc {
+                is_new_row: true,
+                is_visible: true,
+            })
+        }
+    }
+}
 
 /// Helper function to get a bit mask of the given width
 fn get_mask(width: u16) -> u16 {
@@ -1589,9 +1782,26 @@ pub enum ControlWordIterator<'a> {
     Nilary(NilaryControlWordIterator),
 }
 
+/// Describes the properties of a control word
+pub struct ControlWordDesc {
+    pub is_new_row: bool,
+    pub is_visible: bool,
+}
+
+impl ControlWordDesc {
+    fn all_true() -> Self {
+        Self {
+            is_new_row: true,
+            is_visible: true,
+        }
+    }
+}
+
 impl ControlWordIterator<'_> {
     /// Appends the next control word to the buffer
-    pub fn append_next(&mut self, buf: &mut Vec<u8>) {
+    ///
+    /// Returns true if this is the start of a new item (i.e. the repetition level is maxed out)
+    pub fn append_next(&mut self, buf: &mut Vec<u8>) -> Option<ControlWordDesc> {
         match self {
             Self::Binary8(iter) => iter.append_next(buf),
             Self::Binary16(iter) => iter.append_next(buf),
@@ -1599,7 +1809,18 @@ impl ControlWordIterator<'_> {
             Self::Unary8(iter) => iter.append_next(buf),
             Self::Unary16(iter) => iter.append_next(buf),
             Self::Unary32(iter) => iter.append_next(buf),
-            Self::Nilary(_) => {}
+            Self::Nilary(iter) => iter.append_next(),
+        }
+    }
+
+    /// Return true if the control word iterator has repetition levels
+    pub fn has_repetition(&self) -> bool {
+        match self {
+            Self::Binary8(_) | Self::Binary16(_) | Self::Binary32(_) => true,
+            Self::Unary8(iter) => iter.bits_rep > 0,
+            Self::Unary16(iter) => iter.bits_rep > 0,
+            Self::Unary32(iter) => iter.bits_rep > 0,
+            Self::Nilary(_) => false,
         }
     }
 
@@ -1651,6 +1872,8 @@ pub fn build_control_word_iterator<'a>(
     max_rep: u16,
     def: Option<&'a [u16]>,
     max_def: u16,
+    max_visible_def: u16,
+    len: usize,
 ) -> ControlWordIterator<'a> {
     let rep_width = if max_rep == 0 {
         0
@@ -1675,6 +1898,8 @@ pub fn build_control_word_iterator<'a>(
                     rep_mask,
                     def_mask,
                     def_width,
+                    max_rep,
+                    max_visible_def,
                     bits_rep: rep_width as u8,
                     bits_def: def_width as u8,
                     phantom: std::marker::PhantomData,
@@ -1685,6 +1910,8 @@ pub fn build_control_word_iterator<'a>(
                     rep_mask,
                     def_mask,
                     def_width,
+                    max_rep,
+                    max_visible_def,
                     bits_rep: rep_width as u8,
                     bits_def: def_width as u8,
                     phantom: std::marker::PhantomData,
@@ -1695,6 +1922,8 @@ pub fn build_control_word_iterator<'a>(
                     rep_mask,
                     def_mask,
                     def_width,
+                    max_rep,
+                    max_visible_def,
                     bits_rep: rep_width as u8,
                     bits_def: def_width as u8,
                     phantom: std::marker::PhantomData,
@@ -1709,6 +1938,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: rep_mask,
                     bits_rep: total_width as u8,
                     bits_def: 0,
+                    max_rep,
                     phantom: std::marker::PhantomData,
                 })
             } else if total_width <= 16 {
@@ -1717,6 +1947,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: rep_mask,
                     bits_rep: total_width as u8,
                     bits_def: 0,
+                    max_rep,
                     phantom: std::marker::PhantomData,
                 })
             } else {
@@ -1725,6 +1956,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: rep_mask,
                     bits_rep: total_width as u8,
                     bits_def: 0,
+                    max_rep,
                     phantom: std::marker::PhantomData,
                 })
             }
@@ -1737,6 +1969,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: def_mask,
                     bits_rep: 0,
                     bits_def: total_width as u8,
+                    max_rep: 0,
                     phantom: std::marker::PhantomData,
                 })
             } else if total_width <= 16 {
@@ -1745,6 +1978,7 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: def_mask,
                     bits_rep: 0,
                     bits_def: total_width as u8,
+                    max_rep: 0,
                     phantom: std::marker::PhantomData,
                 })
             } else {
@@ -1753,11 +1987,12 @@ pub fn build_control_word_iterator<'a>(
                     level_mask: def_mask,
                     bits_rep: 0,
                     bits_def: total_width as u8,
+                    max_rep: 0,
                     phantom: std::marker::PhantomData,
                 })
             }
         }
-        (None, None) => ControlWordIterator::Nilary(NilaryControlWordIterator {}),
+        (None, None) => ControlWordIterator::Nilary(NilaryControlWordIterator { len, idx: 0 }),
     }
 }
 
@@ -1814,6 +2049,51 @@ impl ControlWordParser {
         }
     }
 
+    fn parse_desc_both<const WORD_SIZE: u8>(
+        src: &[u8],
+        bits_to_shift: u8,
+        mask_to_apply: u32,
+        max_rep: u16,
+        max_visible_def: u16,
+    ) -> ControlWordDesc {
+        match WORD_SIZE {
+            1 => {
+                let word = src[0];
+                let rep = word >> bits_to_shift;
+                let def = word & (mask_to_apply as u8);
+                let is_visible = def as u16 <= max_visible_def;
+                let is_new_row = rep as u16 == max_rep;
+                ControlWordDesc {
+                    is_visible,
+                    is_new_row,
+                }
+            }
+            2 => {
+                let word = u16::from_le_bytes([src[0], src[1]]);
+                let rep = word >> bits_to_shift;
+                let def = word & mask_to_apply as u16;
+                let is_visible = def <= max_visible_def;
+                let is_new_row = rep == max_rep;
+                ControlWordDesc {
+                    is_visible,
+                    is_new_row,
+                }
+            }
+            4 => {
+                let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+                let rep = word >> bits_to_shift;
+                let def = word & mask_to_apply;
+                let is_visible = def as u16 <= max_visible_def;
+                let is_new_row = rep as u16 == max_rep;
+                ControlWordDesc {
+                    is_visible,
+                    is_new_row,
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     fn parse_one<const WORD_SIZE: u8>(src: &[u8], dst: &mut Vec<u16>) {
         match WORD_SIZE {
             1 => {
@@ -1828,6 +2108,24 @@ impl ControlWordParser {
                 let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
                 dst.push(word as u16);
             }
+            _ => unreachable!(),
+        }
+    }
+
+    fn parse_desc_one<const WORD_SIZE: u8>(src: &[u8], max_rep: u16) -> ControlWordDesc {
+        match WORD_SIZE {
+            1 => ControlWordDesc {
+                is_new_row: src[0] as u16 == max_rep,
+                is_visible: true,
+            },
+            2 => ControlWordDesc {
+                is_new_row: u16::from_le_bytes([src[0], src[1]]) == max_rep,
+                is_visible: true,
+            },
+            4 => ControlWordDesc {
+                is_new_row: u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as u16 == max_rep,
+                is_visible: true,
+            },
             _ => unreachable!(),
         }
     }
@@ -1872,6 +2170,53 @@ impl ControlWordParser {
             Self::DEF16 => Self::parse_one::<2>(src, dst_def),
             Self::DEF32 => Self::parse_one::<4>(src, dst_def),
             Self::NIL => {}
+        }
+    }
+
+    /// Return true if the control words contain repetition information
+    pub fn has_rep(&self) -> bool {
+        match self {
+            Self::BOTH8(..)
+            | Self::BOTH16(..)
+            | Self::BOTH32(..)
+            | Self::REP8
+            | Self::REP16
+            | Self::REP32 => true,
+            Self::DEF8 | Self::DEF16 | Self::DEF32 | Self::NIL => false,
+        }
+    }
+
+    /// Temporarily parses the control word to inspect its properties but does not append to any buffers
+    pub fn parse_desc(&self, src: &[u8], max_rep: u16, max_visible_def: u16) -> ControlWordDesc {
+        match self {
+            Self::BOTH8(bits_to_shift, mask_to_apply) => Self::parse_desc_both::<1>(
+                src,
+                *bits_to_shift,
+                *mask_to_apply,
+                max_rep,
+                max_visible_def,
+            ),
+            Self::BOTH16(bits_to_shift, mask_to_apply) => Self::parse_desc_both::<2>(
+                src,
+                *bits_to_shift,
+                *mask_to_apply,
+                max_rep,
+                max_visible_def,
+            ),
+            Self::BOTH32(bits_to_shift, mask_to_apply) => Self::parse_desc_both::<4>(
+                src,
+                *bits_to_shift,
+                *mask_to_apply,
+                max_rep,
+                max_visible_def,
+            ),
+            Self::REP8 => Self::parse_desc_one::<1>(src, max_rep),
+            Self::REP16 => Self::parse_desc_one::<2>(src, max_rep),
+            Self::REP32 => Self::parse_desc_one::<4>(src, max_rep),
+            Self::DEF8 => ControlWordDesc::all_true(),
+            Self::DEF16 => ControlWordDesc::all_true(),
+            Self::DEF32 => ControlWordDesc::all_true(),
+            Self::NIL => ControlWordDesc::all_true(),
         }
     }
 
@@ -2049,7 +2394,9 @@ mod tests {
             offsets_32(&[0, 2, 5, 8]),
             Some(validity(&[true, false, true])),
         );
-        builder.add_no_null(8);
+        // Note: we pass 5 here and not 8.  If add_offsets tells us there is garbage nulls they
+        // should be removed before continuing
+        builder.add_no_null(5);
 
         let repdefs = RepDefBuilder::serialize(vec![builder]);
 
@@ -2065,6 +2412,89 @@ mod tests {
                 DefinitionInterpretation::NullableList,
             ],
             repdefs.def_meaning
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, false])), 2, 2);
+        builder.add_fsl(None, 2, 4);
+        builder.add_validity_bitmap(validity(&[
+            true, false, true, false, true, false, true, false,
+        ]));
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::NullableItem,
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableItem
+            ],
+            repdefs.def_meaning
+        );
+
+        assert!(repdefs.repetition_levels.is_none());
+
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([0, 1, 0, 1, 2, 2, 2, 2], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(
+            unraveler.unravel_validity(8),
+            Some(validity(&[
+                true, false, true, false, false, false, false, false
+            ]))
+        );
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(
+            unraveler.unravel_fsl_validity(2, 2),
+            Some(validity(&[true, false]))
+        );
+    }
+
+    #[test]
+    fn test_repdef_fsl_allvalid_item() {
+        let mut builder = RepDefBuilder::default();
+        builder.add_fsl(Some(validity(&[true, false])), 2, 2);
+        builder.add_fsl(None, 2, 4);
+        builder.add_no_null(8);
+
+        let repdefs = RepDefBuilder::serialize(vec![builder]);
+
+        assert_eq!(
+            vec![
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::NullableItem
+            ],
+            repdefs.def_meaning
+        );
+
+        assert!(repdefs.repetition_levels.is_none());
+
+        let def = repdefs.definition_levels.unwrap();
+
+        assert_eq!([0, 0, 0, 0, 1, 1, 1, 1], *def);
+
+        let mut unraveler = CompositeRepDefUnraveler::new(vec![RepDefUnraveler::new(
+            None,
+            Some(def.as_ref().to_vec()),
+            repdefs.def_meaning.into(),
+        )]);
+
+        assert_eq!(unraveler.unravel_validity(8), None);
+        assert_eq!(unraveler.unravel_fsl_validity(4, 2), None);
+        assert_eq!(
+            unraveler.unravel_fsl_validity(2, 2),
+            Some(validity(&[true, false]))
         );
     }
 
@@ -2314,7 +2744,14 @@ mod tests {
             let in_rep = if rep.is_empty() { None } else { Some(rep) };
             let in_def = if def.is_empty() { None } else { Some(def) };
 
-            let mut iter = super::build_control_word_iterator(in_rep, max_rep, in_def, max_def);
+            let mut iter = super::build_control_word_iterator(
+                in_rep,
+                max_rep,
+                in_def,
+                max_def,
+                max_def + 1,
+                expected_values.len(),
+            );
             assert_eq!(iter.bytes_per_word(), expected_bytes_per_word);
             assert_eq!(iter.bits_rep(), expected_bits_rep);
             assert_eq!(iter.bits_def(), expected_bits_def);
@@ -2323,6 +2760,7 @@ mod tests {
             for _ in 0..num_vals {
                 iter.append_next(&mut cw_vec);
             }
+            assert!(iter.append_next(&mut cw_vec).is_none());
 
             assert_eq!(expected_values, cw_vec);
 
@@ -2390,5 +2828,85 @@ mod tests {
 
         // No rep, no def, no bytes
         check(&[], &[], Vec::default(), 0, 0, 0);
+    }
+
+    #[test]
+    fn test_control_words_rep_index() {
+        fn check(
+            rep: &[u16],
+            def: &[u16],
+            expected_new_rows: Vec<bool>,
+            expected_is_visible: Vec<bool>,
+        ) {
+            let num_vals = rep.len().max(def.len());
+            let max_rep = rep.iter().max().copied().unwrap_or(0);
+            let max_def = def.iter().max().copied().unwrap_or(0);
+
+            let in_rep = if rep.is_empty() { None } else { Some(rep) };
+            let in_def = if def.is_empty() { None } else { Some(def) };
+
+            let mut iter = super::build_control_word_iterator(
+                in_rep,
+                max_rep,
+                in_def,
+                max_def,
+                /*max_visible_def=*/ 2,
+                expected_new_rows.len(),
+            );
+
+            let mut cw_vec = Vec::with_capacity(num_vals * iter.bytes_per_word());
+            let mut expected_new_rows = expected_new_rows.iter().copied();
+            let mut expected_is_visible = expected_is_visible.iter().copied();
+            for _ in 0..expected_new_rows.len() {
+                let word_desc = iter.append_next(&mut cw_vec).unwrap();
+                assert_eq!(word_desc.is_new_row, expected_new_rows.next().unwrap());
+                assert_eq!(word_desc.is_visible, expected_is_visible.next().unwrap());
+            }
+            assert!(iter.append_next(&mut cw_vec).is_none());
+        }
+
+        // 2 means new list
+        let rep = &[2_u16, 1, 0, 2, 2, 0, 1, 1, 0, 2, 0];
+        // These values don't matter for this test
+        let def = &[0_u16, 0, 0, 3, 1, 1, 2, 1, 0, 0, 1];
+
+        // Rep & def
+        check(
+            rep,
+            def,
+            vec![
+                true, false, false, true, true, false, false, false, false, true, false,
+            ],
+            vec![
+                true, true, true, false, true, true, true, true, true, true, true,
+            ],
+        );
+        // Rep only
+        check(
+            rep,
+            &[],
+            vec![
+                true, false, false, true, true, false, false, false, false, true, false,
+            ],
+            vec![true; 11],
+        );
+        // No repetition
+        check(
+            &[],
+            def,
+            vec![
+                true, true, true, true, true, true, true, true, true, true, true,
+            ],
+            vec![true; 11],
+        );
+        // No repetition, no definition
+        check(
+            &[],
+            &[],
+            vec![
+                true, true, true, true, true, true, true, true, true, true, true,
+            ],
+            vec![true; 11],
+        );
     }
 }

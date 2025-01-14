@@ -11,7 +11,6 @@ use arrow::array::AsArray;
 use arrow_array::{Array, ArrayRef, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use deepsize::DeepSizeOf;
-use itertools::Itertools;
 use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
@@ -44,11 +43,17 @@ lazy_static::lazy_static! {
 }
 
 #[derive(Default)]
-pub struct FlatQueryParams {}
+pub struct FlatQueryParams {
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+}
 
 impl From<&Query> for FlatQueryParams {
-    fn from(_: &Query) -> Self {
-        Self {}
+    fn from(q: &Query) -> Self {
+        Self {
+            lower_bound: q.lower_bound,
+            upper_bound: q.upper_bound,
+        }
     }
 }
 
@@ -72,50 +77,57 @@ impl IvfSubIndex for FlatIndex {
         &self,
         query: ArrayRef,
         k: usize,
-        _params: Self::QueryParams,
+        params: Self::QueryParams,
         storage: &impl VectorStore,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let dist_calc = storage.dist_calculator(query);
 
-        let (row_ids, dists): (Vec<u64>, Vec<f32>) = match prefilter.is_empty() {
-            true => dist_calc
-                .distance_all()
-                .into_iter()
-                .zip(0..storage.len() as u32)
-                .map(|(dist, id)| OrderedNode {
-                    id,
-                    dist: OrderedFloat(dist),
-                })
-                .sorted_unstable()
-                .take(k)
-                .map(
-                    |OrderedNode {
-                         id,
-                         dist: OrderedFloat(dist),
-                     }| (storage.row_id(id), dist),
-                )
-                .unzip(),
+        let mut res: Vec<_> = match prefilter.is_empty() {
+            true => {
+                let iter = dist_calc
+                    .distance_all()
+                    .into_iter()
+                    .zip(0..storage.len() as u32)
+                    .map(|(dist, id)| OrderedNode {
+                        id,
+                        dist: OrderedFloat(dist),
+                    });
+
+                if params.lower_bound.is_some() || params.upper_bound.is_some() {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
+                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
+                        .collect()
+                } else {
+                    iter.collect()
+                }
+            }
             false => {
                 let row_id_mask = prefilter.mask();
-                (0..storage.len())
+                let iter = (0..storage.len())
                     .filter(|&id| row_id_mask.selected(storage.row_id(id as u32)))
                     .map(|id| OrderedNode {
                         id: id as u32,
                         dist: OrderedFloat(dist_calc.distance(id as u32)),
-                    })
-                    .sorted_unstable()
-                    .take(k)
-                    .map(
-                        |OrderedNode {
-                             id,
-                             dist: OrderedFloat(dist),
-                         }| (storage.row_id(id), dist),
-                    )
-                    .unzip()
+                    });
+                if params.lower_bound.is_some() || params.upper_bound.is_some() {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
+                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
+                        .collect()
+                } else {
+                    iter.collect()
+                }
             }
         };
+        res.sort_unstable();
 
+        let (row_ids, dists): (Vec<_>, Vec<_>) = res
+            .into_iter()
+            .take(k)
+            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .unzip();
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(

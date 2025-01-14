@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.read.LanceInputPartition;
@@ -38,6 +37,12 @@ public class TestUtils {
             Arrays.asList(2L, 4L, 6L, -2L),
             Arrays.asList(3L, 6L, 9L, -3L));
     public static final List<List<Long>> expectedValuesWithRowId =
+        Arrays.asList(
+            Arrays.asList(0L, 0L, 0L, 0L, 0L),
+            Arrays.asList(1L, 2L, 3L, -1L, 1L),
+            Arrays.asList(2L, 4L, 6L, -2L, (1L << 32) + 0L),
+            Arrays.asList(3L, 6L, 9L, -3L, (1L << 32) + 1L));
+    public static final List<List<Long>> expectedValuesWithRowAddress =
         Arrays.asList(
             Arrays.asList(0L, 0L, 0L, 0L, 0L),
             Arrays.asList(1L, 2L, 3L, -1L, 1L),

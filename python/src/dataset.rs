@@ -16,9 +16,11 @@ use std::collections::HashMap;
 use std::str;
 use std::sync::Arc;
 
+use arrow::array::AsArray;
+use arrow::datatypes::UInt8Type;
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::*;
-use arrow_array::{Float32Array, RecordBatch, RecordBatchReader};
+use arrow_array::{make_array, RecordBatch, RecordBatchReader};
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
@@ -30,6 +32,7 @@ use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
 use lance::dataset::scanner::MaterializationStyle;
+use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
     progress::WriteFragmentProgress,
@@ -40,9 +43,11 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::dataset::{
-    BatchInfo, BatchUDF, CommitBuilder, NewColumnTransform, UDFCheckpointStore, WriteDestination,
+    BatchInfo, BatchUDF, CommitBuilder, MergeStats, NewColumnTransform, UDFCheckpointStore,
+    WriteDestination,
 };
 use lance::dataset::{ColumnAlteration, ProjectionRequest};
+use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
 use lance_index::scalar::InvertedIndexParams;
@@ -87,6 +92,7 @@ pub mod blob;
 pub mod cleanup;
 pub mod commit;
 pub mod optimize;
+pub mod stats;
 
 const DEFAULT_NPROBS: usize = 1;
 const DEFAULT_INDEX_CACHE_SIZE: usize = 256;
@@ -194,20 +200,46 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let new_self = RT
+        let (new_dataset, stats) = RT
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         let dataset = self.dataset.bind(py);
 
-        dataset.borrow_mut().ds = new_self.0;
-        let merge_stats = new_self.1;
-        let merge_dict = PyDict::new_bound(py);
-        merge_dict.set_item("num_inserted_rows", merge_stats.num_inserted_rows)?;
-        merge_dict.set_item("num_updated_rows", merge_stats.num_updated_rows)?;
-        merge_dict.set_item("num_deleted_rows", merge_stats.num_deleted_rows)?;
+        dataset.borrow_mut().ds = new_dataset;
 
-        Ok(merge_dict.into())
+        Ok(Self::build_stats(&stats, py)?.into())
+    }
+
+    pub fn execute_uncommitted<'a>(
+        &mut self,
+        new_data: &Bound<'a, PyAny>,
+    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+        let py = new_data.py();
+        let new_data = convert_reader(new_data)?;
+
+        let job = self
+            .builder
+            .try_build()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let (transaction, stats) = RT
+            .spawn(Some(py), job.execute_uncommitted(new_data))?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+
+        let stats = Self::build_stats(&stats, py)?;
+
+        Ok((PyLance(transaction), stats))
+    }
+}
+
+impl MergeInsertBuilder {
+    fn build_stats<'a>(stats: &MergeStats, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        dict.set_item("num_inserted_rows", stats.num_inserted_rows)?;
+        dict.set_item("num_updated_rows", stats.num_updated_rows)?;
+        dict.set_item("num_deleted_rows", stats.num_deleted_rows)?;
+        Ok(dict)
     }
 }
 
@@ -619,7 +651,7 @@ impl Dataset {
                 .get_item("q")?
                 .ok_or_else(|| PyKeyError::new_err("Need q for nearest"))?;
             let data = ArrayData::from_pyarrow_bound(&qval)?;
-            let q = Float32Array::from(data);
+            let q = make_array(data);
 
             let k: usize = if let Some(k) = nearest.get_item("k")? {
                 if k.is_none() {
@@ -685,8 +717,19 @@ impl Dataset {
                 None
             };
 
+            let (_, element_type) = get_vector_type(self_.ds.schema(), &column)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let scanner = match element_type {
+                DataType::UInt8 => {
+                    let q = arrow::compute::cast(&q, &DataType::UInt8).map_err(|e| {
+                        PyValueError::new_err(format!("Failed to cast q to binary vector: {}", e))
+                    })?;
+                    let q = q.as_primitive::<UInt8Type>();
+                    scanner.nearest(&column, q, k)
+                }
+                _ => scanner.nearest(&column, &q, k),
+            };
             scanner
-                .nearest(column.as_str(), &q, k)
                 .map(|s| {
                     let mut s = s.nprobs(nprobes);
                     if let Some(factor) = refine_factor {
@@ -1135,7 +1178,7 @@ impl Dataset {
             "BITMAP" => IndexType::Bitmap,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
+            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
             _ => {
                 return Err(PyValueError::new_err(format!(
                     "Index type '{index_type}' is not supported."
@@ -1232,6 +1275,12 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
+    fn data_stats(&self) -> PyResult<PyLance<DataStatistics>> {
+        RT.block_on(None, self.ds.calculate_data_stats())?
+            .infer_error()
+            .map(PyLance)
+    }
+
     fn get_fragments(self_: PyRef<'_, Self>) -> PyResult<Vec<FileFragment>> {
         let core_fragments = self_.ds.get_fragments();
 
@@ -1279,11 +1328,42 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
-    #[pyo3(signature = (dest, operation, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    #[pyo3(signature = (dest, operation, blobs_op=None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit(
         dest: &Bound<PyAny>,
         operation: PyLance<Operation>,
+        blobs_op: Option<PyLance<Operation>>,
         read_version: Option<u64>,
+        commit_lock: Option<&Bound<'_, PyAny>>,
+        storage_options: Option<HashMap<String, String>>,
+        enable_v2_manifest_paths: Option<bool>,
+        detached: Option<bool>,
+        max_retries: Option<u32>,
+    ) -> PyResult<Self> {
+        let transaction = Transaction::new(
+            read_version.unwrap_or_default(),
+            operation.0,
+            blobs_op.map(|op| op.0),
+            None,
+        );
+
+        Self::commit_transaction(
+            dest,
+            PyLance(transaction),
+            commit_lock,
+            storage_options,
+            enable_v2_manifest_paths,
+            detached,
+            max_retries,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
+    fn commit_transaction(
+        dest: &Bound<PyAny>,
+        transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
@@ -1310,9 +1390,6 @@ impl Dataset {
             WriteDestination::Uri(dest.extract()?)
         };
 
-        let transaction =
-            Transaction::new(read_version.unwrap_or_default(), operation.0, None, None);
-
         let mut builder = CommitBuilder::new(dest)
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
             .with_detached(detached.unwrap_or(false))
@@ -1327,7 +1404,10 @@ impl Dataset {
         }
 
         let ds = RT
-            .block_on(commit_lock.map(|cl| cl.py()), builder.execute(transaction))?
+            .block_on(
+                commit_lock.map(|cl| cl.py()),
+                builder.execute(transaction.0),
+            )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         let uri = ds.uri().to_string();
@@ -1749,6 +1829,11 @@ fn prepare_vector_index_params(
     }
 
     match index_type {
+        "IVF_FLAT" => Ok(Box::new(VectorIndexParams::ivf_flat(
+            ivf_params.num_partitions,
+            m_type,
+        ))),
+
         "IVF_PQ" => Ok(Box::new(VectorIndexParams::with_ivf_pq_params(
             m_type, ivf_params, pq_params,
         ))),

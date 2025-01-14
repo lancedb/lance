@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.internal;
 
 import com.lancedb.lance.*;
@@ -26,6 +25,7 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.LanceArrowUtils;
 
@@ -56,13 +56,33 @@ public class LanceDatasetAdapter {
     }
   }
 
+  public static Optional<Long> getDatasetRowCount(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    try (Dataset dataset = Dataset.open(allocator, uri, options)) {
+      return Optional.of(dataset.countRows());
+    } catch (IllegalArgumentException e) {
+      // dataset not found
+      return Optional.empty();
+    }
+  }
+
+  public static Optional<Long> getDatasetDataSize(LanceConfig config) {
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    try (Dataset dataset = Dataset.open(allocator, uri, options)) {
+      return Optional.of(dataset.calculateDataSize());
+    } catch (IllegalArgumentException e) {
+      // dataset not found
+      return Optional.empty();
+    }
+  }
+
   public static List<Integer> getFragmentIds(LanceConfig config) {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset dataset = Dataset.open(allocator, uri, options)) {
-      return dataset.getFragments().stream()
-          .map(DatasetFragment::getId)
-          .collect(Collectors.toList());
+      return dataset.getFragments().stream().map(Fragment::getId).collect(Collectors.toList());
     }
   }
 
@@ -76,11 +96,27 @@ public class LanceDatasetAdapter {
     String uri = config.getDatasetUri();
     ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
     try (Dataset datasetRead = Dataset.open(allocator, uri, options)) {
-
       Dataset.commit(
               allocator,
               config.getDatasetUri(),
               appendOp,
+              java.util.Optional.of(datasetRead.version()),
+              options.getStorageOptions())
+          .close();
+    }
+  }
+
+  public static void overwriteFragments(
+      LanceConfig config, List<FragmentMetadata> fragments, StructType sparkSchema) {
+    Schema schema = LanceArrowUtils.toArrowSchema(sparkSchema, "UTC", false, false);
+    FragmentOperation.Overwrite overwrite = new FragmentOperation.Overwrite(fragments, schema);
+    String uri = config.getDatasetUri();
+    ReadOptions options = SparkOptions.genReadOptionFromConfig(config);
+    try (Dataset datasetRead = Dataset.open(allocator, uri, options)) {
+      Dataset.commit(
+              allocator,
+              config.getDatasetUri(),
+              overwrite,
               java.util.Optional.of(datasetRead.version()),
               options.getStorageOptions())
           .close();

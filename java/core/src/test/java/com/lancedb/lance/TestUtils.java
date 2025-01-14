@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
 
 import org.apache.arrow.c.ArrowArrayStream;
@@ -71,7 +70,7 @@ public class TestUtils {
           Dataset.create(allocator, datasetPath, schema, new WriteParams.Builder().build());
       assertEquals(0, dataset.countRows());
       assertEquals(schema, dataset.getSchema());
-      List<DatasetFragment> fragments = dataset.getFragments();
+      List<Fragment> fragments = dataset.getFragments();
       assertEquals(0, fragments.size());
       assertEquals(1, dataset.version());
       assertEquals(1, dataset.latestVersion());
@@ -269,7 +268,7 @@ public class TestUtils {
     private void validateFragments(Dataset dataset) {
       assertNotNull(schema);
       assertNotNull(dataset);
-      List<DatasetFragment> fragments = dataset.getFragments();
+      List<Fragment> fragments = dataset.getFragments();
       assertEquals(1, fragments.size());
       assertEquals(0, fragments.get(0).getId());
       assertEquals(9, fragments.get(0).countRows());

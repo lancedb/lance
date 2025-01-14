@@ -28,8 +28,8 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    datatypes::Field, traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error,
-    Result, ROW_ID_FIELD,
+    traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error, Result,
+    ROW_ID_FIELD,
 };
 use lance_file::{
     format::MAGIC,
@@ -85,6 +85,7 @@ use super::{
     utils::maybe_sample_training_data,
 };
 use crate::dataset::builder::DatasetBuilder;
+use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::{
     dataset::Dataset,
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
@@ -1049,38 +1050,6 @@ impl TryFrom<&IvfPQIndexMetadata> for pb::Index {
     }
 }
 
-fn sanity_check<'a>(dataset: &'a Dataset, column: &str) -> Result<&'a Field> {
-    let Some(field) = dataset.schema().field(column) else {
-        return Err(Error::io(
-            format!(
-                "Building index: column {} does not exist in dataset: {:?}",
-                column, dataset
-            ),
-            location!(),
-        ));
-    };
-    if let DataType::FixedSizeList(elem_type, _) = field.data_type() {
-        if !elem_type.data_type().is_floating() {
-            return Err(Error::Index{
-                message:format!(
-                    "VectorIndex requires the column data type to be fixed size list of f16/f32/f64, got {}",
-                    elem_type.data_type()
-                ),
-                location: location!()
-            });
-        }
-    } else {
-        return Err(Error::Index {
-            message: format!(
-            "VectorIndex requires the column data type to be fixed size list of float32s, got {}",
-            field.data_type()
-        ),
-            location: location!(),
-        });
-    }
-    Ok(field)
-}
-
 fn sanity_check_ivf_params(ivf: &IvfBuildParams) -> Result<()> {
     if ivf.precomputed_partitions_file.is_some() && ivf.centroids.is_none() {
         return Err(Error::Index {
@@ -1203,18 +1172,9 @@ async fn build_ivf_model_and_pq(
         ivf_params.num_partitions, pq_params.num_sub_vectors, metric_type,
     );
 
-    let field = sanity_check(dataset, column)?;
-    let dim = if let DataType::FixedSizeList(_, d) = field.data_type() {
-        d as usize
-    } else {
-        return Err(Error::Index {
-            message: format!(
-                "VectorIndex requires the column data type to be fixed size list of floats, got {}",
-                field.data_type()
-            ),
-            location: location!(),
-        });
-    };
+    // sanity check
+    get_vector_type(dataset.schema(), column)?;
+    let dim = get_vector_dim(dataset.schema(), column)?;
 
     let ivf_model = build_ivf_model(dataset, column, dim, metric_type, ivf_params).await?;
 
@@ -1764,7 +1724,11 @@ async fn train_ivf_model(
             .await
         }
         _ => Err(Error::Index {
-            message: "Unsupported data type".to_string(),
+            message: format!(
+                "Unsupported data type {} with distance type {}",
+                values.data_type(),
+                distance_type
+            ),
             location: location!(),
         }),
     }
@@ -1978,6 +1942,8 @@ mod tests {
                     column: Self::COLUMN.to_string(),
                     key: Arc::new(row),
                     k: 5,
+                    lower_bound: None,
+                    upper_bound: None,
                     nprobes: 1,
                     ef: None,
                     refine_factor: None,

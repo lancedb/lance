@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.FragmentMetadata;
@@ -60,7 +59,7 @@ public class LanceDataWriterTest {
         dataWriter.write(row);
       }
 
-      BatchAppend.TaskCommit commitMessage = (BatchAppend.TaskCommit) dataWriter.commit();
+      LanceBatchWrite.TaskCommit commitMessage = (LanceBatchWrite.TaskCommit) dataWriter.commit();
       dataWriter.close();
       List<FragmentMetadata> fragments = commitMessage.getFragments();
       assertEquals(1, fragments.size());

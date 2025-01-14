@@ -16,6 +16,7 @@ use futures::{Future, Stream, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::deletion::OffsetMapper;
 use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::{location, Location};
@@ -45,29 +46,45 @@ pub async fn take(
     let mut frag_iter = fragments.iter();
     let mut cur_frag = frag_iter.next();
     let mut cur_frag_rows = if let Some(cur_frag) = cur_frag {
-        cur_frag.count_rows().await? as u64
+        cur_frag.count_rows(None).await? as u64
     } else {
         0
     };
+    let mut offset_mapper = if let Some(cur_frag) = cur_frag {
+        let deletion_vector = cur_frag.get_deletion_vector().await?;
+        deletion_vector.map(OffsetMapper::new)
+    } else {
+        None
+    };
     let mut frag_offset = 0;
 
-    let mut addrs = Vec::with_capacity(sorted_offsets.len());
+    let mut addrs: Vec<u64> = Vec::with_capacity(sorted_offsets.len());
     for sorted_offset in sorted_offsets.into_iter() {
         while cur_frag.is_some() && sorted_offset >= frag_offset + cur_frag_rows {
             frag_offset += cur_frag_rows;
             cur_frag = frag_iter.next();
             cur_frag_rows = if let Some(cur_frag) = cur_frag {
-                cur_frag.count_rows().await? as u64
+                cur_frag.count_rows(None).await? as u64
             } else {
                 0
+            };
+            offset_mapper = if let Some(cur_frag) = cur_frag {
+                let deletion_vector = cur_frag.get_deletion_vector().await?;
+                deletion_vector.map(OffsetMapper::new)
+            } else {
+                None
             };
         }
         let Some(cur_frag) = cur_frag else {
             addrs.push(RowAddress::TOMBSTONE_ROW);
             continue;
         };
-        let row_addr =
-            RowAddress::new_from_parts(cur_frag.id() as u32, (sorted_offset - frag_offset) as u32);
+
+        let mut local_offset = (sorted_offset - frag_offset) as u32;
+        if let Some(offset_mapper) = &mut offset_mapper {
+            local_offset = offset_mapper.map_offset(local_offset);
+        };
+        let row_addr = RowAddress::new_from_parts(cur_frag.id() as u32, local_offset);
         addrs.push(u64::from(row_addr));
     }
 
@@ -616,6 +633,55 @@ mod test {
                     ])),
                     Arc::new(StringArray::from_iter_values(
                         [200, 199, 39, 40, 199, 40, 125]
+                            .iter()
+                            .map(|v| format!("str-{v}"))
+                    )),
+                ],
+            )
+            .unwrap(),
+            values
+        );
+    }
+
+    #[tokio::test]
+    async fn test_take_with_deletion() {
+        let data = test_batch(0..120);
+        let write_params = WriteParams {
+            max_rows_per_file: 40,
+            max_rows_per_group: 10,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new([Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(batches, "memory://", Some(write_params))
+            .await
+            .unwrap();
+
+        dataset.delete("i in (40, 77, 78, 79)").await.unwrap();
+
+        let projection = Schema::try_from(data.schema().as_ref()).unwrap();
+        let values = dataset
+            .take(
+                &[
+                    0,   // 0
+                    39,  // 39
+                    40,  // 41
+                    75,  // 76
+                    76,  // 80
+                    77,  // 81
+                    115, // 119
+                ],
+                projection,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            RecordBatch::try_new(
+                data.schema(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values([0, 39, 41, 76, 80, 81, 119])),
+                    Arc::new(StringArray::from_iter_values(
+                        [0, 39, 41, 76, 80, 81, 119]
                             .iter()
                             .map(|v| format!("str-{v}"))
                     )),

@@ -11,8 +11,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance;
+
+import com.lancedb.lance.ipc.LanceScanner;
+import com.lancedb.lance.ipc.ScanOptions;
 
 import org.apache.arrow.c.ArrowArray;
 import org.apache.arrow.c.ArrowArrayStream;
@@ -22,6 +24,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -30,6 +33,77 @@ import java.util.Optional;
 public class Fragment {
   static {
     JniLoader.ensureLoaded();
+  }
+
+  /** Pointer to the {@link Dataset} instance in Java. */
+  private final Dataset dataset;
+
+  private final FragmentMetadata fragment;
+
+  public Fragment(Dataset dataset, int fragmentId) {
+    Preconditions.checkNotNull(dataset);
+    this.dataset = dataset;
+    this.fragment = dataset.getFragment(fragmentId).fragment;
+  }
+
+  public Fragment(Dataset dataset, FragmentMetadata fragment) {
+    Preconditions.checkNotNull(dataset);
+    Preconditions.checkNotNull(fragment);
+    this.dataset = dataset;
+    this.fragment = fragment;
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @return a dataset scanner
+   */
+  public LanceScanner newScan() {
+    return LanceScanner.create(
+        dataset,
+        new ScanOptions.Builder().fragmentIds(Arrays.asList(fragment.getId())).build(),
+        dataset.allocator);
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param batchSize scan batch size
+   * @return a dataset scanner
+   */
+  public LanceScanner newScan(long batchSize) {
+    return LanceScanner.create(
+        dataset,
+        new ScanOptions.Builder()
+            .fragmentIds(Arrays.asList(fragment.getId()))
+            .batchSize(batchSize)
+            .build(),
+        dataset.allocator);
+  }
+
+  /**
+   * Create a new Dataset Scanner.
+   *
+   * @param options the scan options
+   * @return a dataset scanner
+   */
+  public LanceScanner newScan(ScanOptions options) {
+    Preconditions.checkNotNull(options);
+    return LanceScanner.create(
+        dataset,
+        new ScanOptions.Builder(options).fragmentIds(Arrays.asList(fragment.getId())).build(),
+        dataset.allocator);
+  }
+
+  private native int countRowsNative(Dataset dataset, long fragmentId);
+
+  public int getId() {
+    return fragment.getId();
+  }
+
+  /** @return row counts in this Fragment */
+  public int countRows() {
+    return countRowsNative(dataset, fragment.getId());
   }
 
   /**
@@ -50,16 +124,15 @@ public class Fragment {
     try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator);
         ArrowArray arrowArray = ArrowArray.allocateNew(allocator)) {
       Data.exportVectorSchemaRoot(allocator, root, null, arrowArray, arrowSchema);
-      return FragmentMetadata.fromJsonArray(
-          createWithFfiArray(
-              datasetUri,
-              arrowArray.memoryAddress(),
-              arrowSchema.memoryAddress(),
-              params.getMaxRowsPerFile(),
-              params.getMaxRowsPerGroup(),
-              params.getMaxBytesPerFile(),
-              params.getMode(),
-              params.getStorageOptions()));
+      return createWithFfiArray(
+          datasetUri,
+          arrowArray.memoryAddress(),
+          arrowSchema.memoryAddress(),
+          params.getMaxRowsPerFile(),
+          params.getMaxRowsPerGroup(),
+          params.getMaxBytesPerFile(),
+          params.getMode(),
+          params.getStorageOptions());
     }
   }
 
@@ -76,23 +149,22 @@ public class Fragment {
     Preconditions.checkNotNull(datasetUri);
     Preconditions.checkNotNull(stream);
     Preconditions.checkNotNull(params);
-    return FragmentMetadata.fromJsonArray(
-        createWithFfiStream(
-            datasetUri,
-            stream.memoryAddress(),
-            params.getMaxRowsPerFile(),
-            params.getMaxRowsPerGroup(),
-            params.getMaxBytesPerFile(),
-            params.getMode(),
-            params.getStorageOptions()));
+    return createWithFfiStream(
+        datasetUri,
+        stream.memoryAddress(),
+        params.getMaxRowsPerFile(),
+        params.getMaxRowsPerGroup(),
+        params.getMaxBytesPerFile(),
+        params.getMode(),
+        params.getStorageOptions());
   }
 
   /**
    * Create a fragment from the given arrow array and schema.
    *
-   * @return the json serialized fragment metadata
+   * @return the fragment metadata
    */
-  private static native String createWithFfiArray(
+  private static native List<FragmentMetadata> createWithFfiArray(
       String datasetUri,
       long arrowArrayMemoryAddress,
       long arrowSchemaMemoryAddress,
@@ -105,9 +177,9 @@ public class Fragment {
   /**
    * Create a fragment from the given arrow stream.
    *
-   * @return the json serialized fragment metadata
+   * @return the fragment metadata
    */
-  private static native String createWithFfiStream(
+  private static native List<FragmentMetadata> createWithFfiStream(
       String datasetUri,
       long arrowStreamMemoryAddress,
       Optional<Integer> maxRowsPerFile,

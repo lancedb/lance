@@ -1,15 +1,16 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
- * in compliance with the License. You may obtain a copy of the License at
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software distributed under the License
- * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
- * or implied. See the License for the specific language governing permissions and limitations under
- * the License.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-
 package com.lancedb.lance.spark;
 
 import com.lancedb.lance.spark.read.LanceScanBuilder;
@@ -34,7 +35,8 @@ import java.util.Set;
 /** Lance Spark Dataset. */
 public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetadataColumns {
   private static final Set<TableCapability> CAPABILITIES =
-      ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE);
+      ImmutableSet.of(
+          TableCapability.BATCH_READ, TableCapability.BATCH_WRITE, TableCapability.TRUNCATE);
 
   public static final MetadataColumn[] METADATA_COLUMNS =
       new MetadataColumn[] {
@@ -48,7 +50,18 @@ public class LanceDataset implements SupportsRead, SupportsWrite, SupportsMetada
           public DataType dataType() {
             return DataTypes.LongType;
           }
-        }
+        },
+        new MetadataColumn() {
+          @Override
+          public String name() {
+            return LanceConstant.ROW_ADDRESS;
+          }
+
+          @Override
+          public DataType dataType() {
+            return DataTypes.LongType;
+          }
+        },
       };
 
   LanceConfig config;

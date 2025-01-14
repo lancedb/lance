@@ -12,8 +12,8 @@ use datafusion::{
     common::Statistics,
     execution::context::TaskContext,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
-        SendableRecordBatchStream,
+        execution_plan::{Boundedness, EmissionType},
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     },
 };
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
@@ -29,7 +29,8 @@ impl TestingExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(batches[0].schema()),
             Partitioning::RoundRobinBatch(1),
-            ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             batches,

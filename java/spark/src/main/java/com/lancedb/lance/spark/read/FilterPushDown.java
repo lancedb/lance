@@ -11,7 +11,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.read;
 
 import com.lancedb.lance.spark.utils.Optional;
@@ -36,6 +35,7 @@ import org.apache.spark.sql.sources.StringStartsWith;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -89,7 +89,7 @@ public class FilterPushDown {
     } else if (filter instanceof EqualNullSafe) {
       return false;
     } else if (filter instanceof In) {
-      return false;
+      return true;
     } else if (filter instanceof LessThan) {
       return true;
     } else if (filter instanceof LessThanOrEqual) {
@@ -163,6 +163,13 @@ public class FilterPushDown {
       Optional<String> child = compileFilter(f.child());
       if (child.isEmpty()) return child;
       return Optional.of(String.format("NOT (%s)", child.get()));
+    } else if (filter instanceof In) {
+      In in = (In) filter;
+      String values =
+          Arrays.stream(in.values())
+              .map(FilterPushDown::compileValue)
+              .collect(Collectors.joining(","));
+      return Optional.of(String.format("%s IN (%s)", in.attribute(), values));
     }
 
     return Optional.empty();

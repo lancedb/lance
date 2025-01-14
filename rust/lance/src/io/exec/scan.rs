@@ -11,6 +11,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -159,7 +160,7 @@ impl LanceStream {
                 if let Some(next_frag) = frags_iter.next() {
                     let num_rows_in_frag = next_frag
                         .fragment
-                        .count_rows()
+                        .count_rows(None)
                         // count_rows should be a fast operation in v2 files
                         .now_or_never()
                         .ok_or(Error::Internal {
@@ -476,7 +477,8 @@ impl LanceScanExec {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             Partitioning::RoundRobinBatch(1),
-            datafusion::physical_plan::ExecutionMode::Bounded,
+            EmissionType::Incremental,
+            Boundedness::Bounded,
         );
         Self {
             dataset,

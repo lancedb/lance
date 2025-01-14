@@ -11,11 +11,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.lancedb.lance.spark.write;
 
 import com.lancedb.lance.FragmentMetadata;
 import com.lancedb.lance.spark.LanceConfig;
+import com.lancedb.lance.spark.SparkOptions;
 import com.lancedb.lance.spark.internal.LanceDatasetAdapter;
 
 import org.apache.spark.sql.connector.write.BatchWrite;
@@ -28,13 +28,15 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.stream.Collectors;
 
-public class BatchAppend implements BatchWrite {
+public class LanceBatchWrite implements BatchWrite {
   private final StructType schema;
   private final LanceConfig config;
+  private final boolean overwrite;
 
-  public BatchAppend(StructType schema, LanceConfig config) {
+  public LanceBatchWrite(StructType schema, LanceConfig config, boolean overwrite) {
     this.schema = schema;
     this.config = config;
+    this.overwrite = overwrite;
   }
 
   @Override
@@ -55,7 +57,11 @@ public class BatchAppend implements BatchWrite {
             .map(TaskCommit::getFragments)
             .flatMap(List::stream)
             .collect(Collectors.toList());
-    LanceDatasetAdapter.appendFragments(config, fragments);
+    if (overwrite || SparkOptions.overwrite(this.config)) {
+      LanceDatasetAdapter.overwriteFragments(config, fragments, schema);
+    } else {
+      LanceDatasetAdapter.appendFragments(config, fragments);
+    }
   }
 
   @Override

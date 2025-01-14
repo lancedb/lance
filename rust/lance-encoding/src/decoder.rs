@@ -250,7 +250,6 @@ use crate::encodings::logical::r#struct::{
 };
 use crate::encodings::physical::binary::{BinaryBlockDecompressor, BinaryMiniBlockDecompressor};
 use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
-use crate::encodings::physical::fixed_size_list::FslPerValueDecompressor;
 use crate::encodings::physical::fsst::FsstMiniBlockDecompressor;
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
@@ -530,14 +529,6 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
                 Ok(Box::new(ValueDecompressor::new(flat)))
             }
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
-                let items_decompressor =
-                    self.create_per_value_decompressor(fsl.items.as_ref().unwrap())?;
-                Ok(Box::new(FslPerValueDecompressor::new(
-                    items_decompressor,
-                    fsl.dimension as u64,
-                )))
-            }
             _ => todo!(),
         }
     }
@@ -746,6 +737,15 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
+    fn items_per_row(data_type: &DataType) -> u64 {
+        match data_type {
+            DataType::FixedSizeList(inner, dimension) => {
+                Self::items_per_row(inner.data_type()) * *dimension as u64
+            }
+            _ => 1,
+        }
+    }
+
     fn create_structural_field_scheduler(
         &self,
         field: &Field,
@@ -754,8 +754,10 @@ impl CoreFieldDecoderStrategy {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
+            let items_per_row = Self::items_per_row(&data_type);
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
+                items_per_row,
                 self.decompressor_strategy.as_ref(),
             )?);
 
@@ -770,6 +772,7 @@ impl CoreFieldDecoderStrategy {
                     let column_info = column_infos.expect_next()?;
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
+                        1, // items_per_row is always 1, any FSL will get transposed into 1 row
                         self.decompressor_strategy.as_ref(),
                     )?);
 
@@ -795,6 +798,7 @@ impl CoreFieldDecoderStrategy {
                 let column_info = column_infos.expect_next()?;
                 let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
+                    /*items_per_row=*/ 1,
                     self.decompressor_strategy.as_ref(),
                 )?);
                 column_infos.next_top_level();

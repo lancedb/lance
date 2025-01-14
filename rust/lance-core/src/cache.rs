@@ -6,13 +6,14 @@
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 
-use deepsize::{Context, DeepSizeOf};
 use futures::Future;
 use moka::sync::Cache;
 use object_store::path::Path;
 
 use crate::utils::path::LancePathExt;
 use crate::Result;
+
+pub use deepsize::{Context, DeepSizeOf};
 
 type ArcAny = Arc<dyn Any + Send + Sync>;
 
@@ -121,6 +122,12 @@ impl FileMetadataCache {
         }
     }
 
+    /// Fetch an item from the cache, using a str as the key
+    pub fn get_by_str<T: Send + Sync + 'static>(&self, path: &str) -> Option<Arc<T>> {
+        self.get(&Path::parse(path).unwrap())
+    }
+
+    /// Fetch an item from the cache
     pub fn get<T: Send + Sync + 'static>(&self, path: &Path) -> Option<Arc<T>> {
         let cache = self.cache.as_ref()?;
         let temp: Path;
@@ -135,6 +142,7 @@ impl FileMetadataCache {
             .map(|metadata| metadata.record.clone().downcast::<T>().unwrap())
     }
 
+    /// Insert an item into the cache
     pub fn insert<T: DeepSizeOf + Send + Sync + 'static>(&self, path: Path, metadata: Arc<T>) {
         let Some(cache) = self.cache.as_ref() else {
             return;
@@ -145,6 +153,15 @@ impl FileMetadataCache {
             path
         };
         cache.insert((path, TypeId::of::<T>()), SizedRecord::new(metadata));
+    }
+
+    /// Insert an item into the cache, using a str as the key
+    pub fn insert_by_str<T: DeepSizeOf + Send + Sync + 'static>(
+        &self,
+        key: &str,
+        metadata: Arc<T>,
+    ) {
+        self.insert(Path::parse(key).unwrap(), metadata);
     }
 
     /// Get an item
