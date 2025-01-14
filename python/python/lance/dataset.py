@@ -2222,6 +2222,16 @@ class LanceDataset(pa.dataset.Dataset):
             )
         return self
 
+    def drop_index(self, column: str, name: str):
+        """
+        Drops an index from the dataset
+
+        Note: A name is required, even if one was not provided when the index was
+        created.  You can use the `list_indices` method to get the names of the
+        indices.
+        """
+        return self._ds.drop_index(column, name)
+
     def session(self) -> Session:
         """
         Return the dataset session, which holds the dataset's state.

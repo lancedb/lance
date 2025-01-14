@@ -34,6 +34,16 @@ pub trait DatasetIndexExt {
         replace: bool,
     ) -> Result<()>;
 
+    /// Drop indices by name.
+    ///
+    /// Upon finish, a new dataset version is generated.
+    ///
+    /// Parameters:
+    ///
+    /// - `column`: the column to drop the index on.
+    /// - `name`: the name of the index to drop.
+    async fn drop_index(&mut self, column: &str, name: &str) -> Result<()>;
+
     /// Read all indices of this Dataset version.
     ///
     /// The indices are lazy loaded and cached in memory within the [`Dataset`] instance.

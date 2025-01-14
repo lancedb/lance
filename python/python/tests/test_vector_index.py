@@ -1105,3 +1105,27 @@ def test_optimize_indices(indexed_dataset):
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     indices = indexed_dataset.list_indices()
     assert len(indices) == 2
+
+
+def test_drop_indices(indexed_dataset):
+    idx_name = indexed_dataset.list_indices()[0]["name"]
+
+    indexed_dataset.drop_index("vector", idx_name)
+    indices = indexed_dataset.list_indices()
+    assert len(indices) == 0
+
+    test_vec = (
+        indexed_dataset.take([0], columns=["vector"]).column("vector").to_pylist()[0]
+    )
+
+    # make sure we can still search the column (will do flat search)
+    results = indexed_dataset.to_table(
+        nearest={
+            "column": "vector",
+            "q": test_vec,
+            "k": 15,
+            "nprobes": 1,
+        },
+    )
+
+    assert len(results) == 15
