@@ -99,6 +99,10 @@ datafusion = { version = "44.0", default-features = false, features = [
     "nested_expressions",
     "regex_expressions",
     "unicode_expressions",
+    "crypto_expressions",
+    "encoding_expressions",
+    "datetime_expressions",
+    "string_expressions",
 ] }
 datafusion-common = "44.0"
 datafusion-functions = { version = "44.0", features = ["regex_expressions"] }
@@ -143,8 +147,8 @@ serde_json = { version = "1" }
 shellexpand = "3.0"
 snafu = "0.7.5"
 tantivy = { version = "0.22.0", features = ["stopwords"] }
-lindera = { version = "0.38.1"}
-lindera-tantivy = { version = "0.38.1"}
+lindera = { version = "0.38.1" }
+lindera-tantivy = { version = "0.38.1" }
 tempfile = "3"
 test-log = { version = "0.2.15" }
 tokio = { version = "1.23", features = [
