@@ -12,7 +12,7 @@ jobs:
   macos-arm64:
     name: Build on MacOS Arm64
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ./java
@@ -66,7 +66,7 @@ jobs:
           if-no-files-found: error
   linux-x86:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     needs: [macos-arm64, linux-arm64]
     defaults:
       run:
