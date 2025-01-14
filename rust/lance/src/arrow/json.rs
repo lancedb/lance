@@ -204,8 +204,8 @@ impl TryFrom<&JsonField> for Field {
     fn try_from(value: &JsonField) -> Result<Self> {
         let data_type = DataType::try_from(&value.type_)?;
         let mut field = Self::new(&value.name, data_type, value.nullable);
-        if value.metadata.is_some() {
-            field.set_metadata(value.metadata.clone().unwrap());
+        if let Some(metadata) = value.metadata.cloned() {
+            field.set_metadata(metadata);
         }
         Ok(field)
     }
