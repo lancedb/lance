@@ -744,7 +744,9 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
-            Operation::UpdateConfig { .. } => {}
+            Operation::UpdateConfig { .. } => {
+                final_fragments.extend(maybe_existing_fragments?.clone());
+            }
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.
