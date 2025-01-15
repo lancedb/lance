@@ -554,20 +554,36 @@ impl DatasetIndexExt for Dataset {
         let index_type = indices[0].index_type().to_string();
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
-        let num_indexed_rows_per_delta = self.indexed_fragments(index_name).await?
-        .iter()
-        .map(|frags| {
-            frags.iter().map(|f| f.num_rows().expect("Fragment should have row counts, please upgrade lance and trigger a single right to fix this")).sum::<usize>()
-        })
-        .collect::<Vec<_>>();
+        let num_indexed_rows_per_delta = indexed_fragments_per_delta
+            .iter()
+            .map(|frags| {
+                let mut sum = 0;
+                for frag in frags.iter() {
+                    sum += frag.num_rows().ok_or_else(|| Error::Internal {
+                        message: "Fragment should have row counts, please upgrade lance and \
+                                      trigger a single write to fix this"
+                            .to_string(),
+                        location: location!(),
+                    })?;
+                }
+                Ok(sum)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let num_indexed_fragments = indexed_fragments_per_delta
-            .clone()
-            .into_iter()
-            .flatten()
-            .map(|f| f.id)
-            .collect::<HashSet<_>>()
-            .len();
+        let mut fragment_ids = HashSet::new();
+        for frags in indexed_fragments_per_delta.iter() {
+            for frag in frags.iter() {
+                if !fragment_ids.insert(frag.id) {
+                    return Err(Error::Internal {
+                        message: "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                                  and trigger a single write to fix this"
+                            .to_string(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+        let num_indexed_fragments = fragment_ids.len();
 
         let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
         let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().cloned().sum();
