@@ -631,6 +631,16 @@ impl VariableWidthBlock {
         })
     }
 
+    pub fn offsets_as_block(&mut self) -> DataBlock {
+        let offsets = self.offsets.borrow_and_clone();
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            data: offsets,
+            bits_per_value: self.bits_per_offset as u64,
+            num_values: self.num_values + 1,
+            block_info: BlockInfo::new(),
+        })
+    }
+
     pub fn data_size(&self) -> u64 {
         (self.data.len() + self.offsets.len()) as u64
     }

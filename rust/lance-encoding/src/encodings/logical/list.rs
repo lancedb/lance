@@ -1583,8 +1583,43 @@ mod tests {
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_sliced_list() {
+    async fn test_simple_string_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
+        let items_builder = StringBuilder::new();
+        let mut list_builder = ListBuilder::new(items_builder);
+        list_builder.append_value([Some("a"), Some("bc"), Some("def")]);
+        list_builder.append_value([Some("gh"), None]);
+        list_builder.append_null();
+        list_builder.append_value([Some("ijk"), Some("lmnop"), Some("qrs")]);
+        let list_array = list_builder.finish();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(0..3)
+            .with_range(1..3)
+            .with_indices(vec![1, 3])
+            .with_indices(vec![2])
+            .with_file_version(LanceFileVersion::V2_1);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
+            .await;
+    }
+
+    #[rstest]
+    #[test_log::test(tokio::test)]
+    async fn test_simple_sliced_list(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
         let items_builder = Int32Builder::new();
         let mut list_builder = ListBuilder::new(items_builder);
         list_builder.append_value([Some(1), Some(2), Some(3)]);
@@ -1595,18 +1630,28 @@ mod tests {
 
         let list_array = list_array.slice(1, 2);
 
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
         let test_cases = TestCases::default()
             .with_range(0..2)
             .with_range(1..2)
             .with_indices(vec![0])
             .with_indices(vec![1])
             .with_file_version(LanceFileVersion::V2_1);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
 
+    #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_list_with_garbage_nulls() {
+    async fn test_list_with_garbage_nulls(
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+    ) {
         // In Arrow, list nulls are allowed to be non-empty, with masked garbage values
         // Here we make a list with a null row in the middle with 3 garbage values
         let items = UInt64Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
@@ -1620,13 +1665,19 @@ mod tests {
             Some(list_validity),
         );
 
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
         let test_cases = TestCases::default()
             .with_range(0..3)
             .with_range(1..2)
             .with_indices(vec![1])
             .with_indices(vec![2])
             .with_file_version(LanceFileVersion::V2_1);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, HashMap::new())
+        check_round_trip_encoding_of_data(vec![Arc::new(list_arr)], &test_cases, field_metadata)
             .await;
     }
 
