@@ -40,9 +40,8 @@ pub trait DatasetIndexExt {
     ///
     /// Parameters:
     ///
-    /// - `column`: the column to drop the index on.
     /// - `name`: the name of the index to drop.
-    async fn drop_index(&mut self, column: &str, name: &str) -> Result<()>;
+    async fn drop_index(&mut self, name: &str) -> Result<()>;
 
     /// Read all indices of this Dataset version.
     ///

@@ -347,32 +347,11 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
-    async fn drop_index(&mut self, column: &str, name: &str) -> Result<()> {
+    async fn drop_index(&mut self, name: &str) -> Result<()> {
         let indices = self.load_indices_by_name(name).await?;
         if indices.is_empty() {
             return Err(Error::IndexNotFound {
                 identity: format!("name={}", name),
-                location: location!(),
-            });
-        }
-
-        let field = self.schema().field(column).ok_or_else(|| Error::Index {
-            message: format!("Column {} does not exist in the schema", column),
-            location: location!(),
-        })?;
-
-        let indices = indices
-            .iter()
-            .filter(|idx| idx.fields.len() == 1 && idx.fields[0] == field.id)
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if indices.is_empty() {
-            return Err(Error::IndexNotFound {
-                identity: format!(
-                    "An index with the name {} was found but it was not on the column {}",
-                    name, column
-                ),
                 location: location!(),
             });
         }
@@ -1095,18 +1074,18 @@ mod tests {
 
         assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
 
-        dataset.drop_index("vec", &idx_name).await.unwrap();
+        dataset.drop_index(&idx_name).await.unwrap();
 
         assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
 
         // Even though we didn't give the scalar index a name it still has an auto-generated one we can use
-        let scalar_idx_name = dataset.load_indices().await.unwrap()[0].name.clone();
-        dataset.drop_index("ints", &scalar_idx_name).await.unwrap();
+        let scalar_idx_name = &dataset.load_indices().await.unwrap()[0].name;
+        dataset.drop_index(scalar_idx_name).await.unwrap();
 
         assert_eq!(dataset.load_indices().await.unwrap().len(), 0);
 
         // Make sure it returns an error if the index doesn't exist
-        assert!(dataset.drop_index("ints", &scalar_idx_name).await.is_err());
+        assert!(dataset.drop_index(scalar_idx_name).await.is_err());
     }
 
     #[tokio::test]

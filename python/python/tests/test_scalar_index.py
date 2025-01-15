@@ -693,20 +693,13 @@ def test_drop_index(tmp_path):
 
     assert len(ds.list_indices()) == 3
 
-    test_idx = ds.list_indices()[0]
-    test_col = test_idx["fields"][0]
-    test_name = test_idx["name"]
-    # Attempt to drop index (col does not exist)
-    with pytest.raises(RuntimeError, match="nonexistent_col does not exist"):
-        ds.drop_index("nonexistent_col", test_name)
     # Attempt to drop index (name does not exist)
     with pytest.raises(RuntimeError, match="index not found"):
-        ds.drop_index(test_col, "nonexistent_name")
+        ds.drop_index("nonexistent_name")
 
     for idx in ds.list_indices():
         idx_name = idx["name"]
-        col_name = idx["fields"][0]
-        ds.drop_index(col_name, idx_name)
+        ds.drop_index(idx_name)
 
     assert len(ds.list_indices()) == 0
 

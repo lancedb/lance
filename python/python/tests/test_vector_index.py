@@ -1110,7 +1110,7 @@ def test_optimize_indices(indexed_dataset):
 def test_drop_indices(indexed_dataset):
     idx_name = indexed_dataset.list_indices()[0]["name"]
 
-    indexed_dataset.drop_index("vector", idx_name)
+    indexed_dataset.drop_index(idx_name)
     indices = indexed_dataset.list_indices()
     assert len(indices) == 0
 
