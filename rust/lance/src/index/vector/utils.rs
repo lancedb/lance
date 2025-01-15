@@ -20,12 +20,12 @@ pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
     infer_vector_dim(&field.data_type())
 }
 
-fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
+pub fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
     match data_type {
         arrow::datatypes::DataType::FixedSizeList(_, dim) => Ok(*dim as usize),
         arrow::datatypes::DataType::List(inner) => infer_vector_dim(inner.data_type()),
         _ => Err(Error::Index {
-            message: format!("Data type is not a FixedSizeListArray, but {:?}", data_type),
+            message: format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type),
             location: location!(),
         }),
     }
@@ -48,7 +48,7 @@ pub fn get_vector_type(
     ))
 }
 
-fn infer_vector_element_type(
+pub fn infer_vector_element_type(
     data_type: &arrow::datatypes::DataType,
 ) -> Result<arrow_schema::DataType> {
     match data_type {
