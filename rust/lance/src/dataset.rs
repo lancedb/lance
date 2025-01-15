@@ -4332,6 +4332,14 @@ mod tests {
         // Force a migration
         dataset.delete("false").await.unwrap();
         dataset.validate().await.unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 2);
+        fn get_bitmap(meta: &Index) -> Vec<u32> {
+            meta.fragment_bitmap.as_ref().unwrap().iter().collect()
+        }
+        assert_eq!(get_bitmap(&indices[0]), vec![0]);
+        assert_eq!(get_bitmap(&indices[1]), vec![1]);
     }
 
     #[rstest]
