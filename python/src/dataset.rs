@@ -1266,6 +1266,15 @@ impl Dataset {
         Ok(())
     }
 
+    fn drop_index(&mut self, name: &str) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        RT.block_on(None, new_self.drop_index(name))?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+
+        Ok(())
+    }
+
     fn count_fragments(&self) -> usize {
         self.ds.count_fragments()
     }

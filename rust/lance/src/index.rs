@@ -347,6 +347,42 @@ impl DatasetIndexExt for Dataset {
         Ok(())
     }
 
+    async fn drop_index(&mut self, name: &str) -> Result<()> {
+        let indices = self.load_indices_by_name(name).await?;
+        if indices.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", name),
+                location: location!(),
+            });
+        }
+
+        let transaction = Transaction::new(
+            self.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: indices.clone(),
+            },
+            /*blobs_op= */ None,
+            None,
+        );
+
+        let (new_manifest, manifest_path) = commit_transaction(
+            self,
+            self.object_store(),
+            self.commit_handler.as_ref(),
+            &transaction,
+            &Default::default(),
+            &Default::default(),
+            self.manifest_naming_scheme,
+        )
+        .await?;
+
+        self.manifest = Arc::new(new_manifest);
+        self.manifest_file = manifest_path;
+
+        Ok(())
+    }
+
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>> {
         let dataset_dir = self.base.to_string();
         if let Some(indices) = self
@@ -909,6 +945,7 @@ impl DatasetIndexInternalExt for Dataset {
 #[cfg(test)]
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
 
@@ -984,19 +1021,79 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
-    async fn test_count_index_rows() {
-        let test_dir = tempdir().unwrap();
+    fn sample_vector_field() -> Field {
         let dimensions = 16;
         let column_name = "vec";
-        let field = Field::new(
+        Field::new(
             column_name,
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
                 dimensions,
             ),
             false,
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn test_drop_index() {
+        let test_dir = tempdir().unwrap();
+        let schema = Schema::new(vec![
+            sample_vector_field(),
+            Field::new("ints", DataType::Int32, false),
+        ]);
+        let mut dataset = lance_datagen::rand(&schema)
+            .into_dataset(
+                test_dir.path().to_str().unwrap(),
+                FragmentCount::from(1),
+                FragmentRowCount::from(256),
+            )
+            .await
+            .unwrap();
+
+        let idx_name = "name".to_string();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some(idx_name.clone()),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 10),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ints"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 2);
+
+        dataset.drop_index(&idx_name).await.unwrap();
+
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 1);
+
+        // Even though we didn't give the scalar index a name it still has an auto-generated one we can use
+        let scalar_idx_name = &dataset.load_indices().await.unwrap()[0].name;
+        dataset.drop_index(scalar_idx_name).await.unwrap();
+
+        assert_eq!(dataset.load_indices().await.unwrap().len(), 0);
+
+        // Make sure it returns an error if the index doesn't exist
+        assert!(dataset.drop_index(scalar_idx_name).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_count_index_rows() {
+        let test_dir = tempdir().unwrap();
+        let dimensions = 16;
+        let column_name = "vec";
+        let field = sample_vector_field();
         let schema = Arc::new(Schema::new(vec![field]));
 
         let float_arr = generate_random_array(512 * dimensions as usize);
