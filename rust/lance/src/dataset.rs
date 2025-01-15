@@ -20,6 +20,7 @@ use lance_core::ROW_ADDR;
 use lance_datafusion::projection::ProjectionPlan;
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::version::LanceFileVersion;
+use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::WriteExt;
@@ -38,7 +39,7 @@ use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
 use snafu::{location, Location};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -72,7 +73,10 @@ use self::transaction::{Operation, Transaction};
 use self::write::write_fragments_internal;
 use crate::datatypes::Schema;
 use crate::error::box_error;
-use crate::io::commit::{commit_detached_transaction, commit_new_dataset, commit_transaction};
+use crate::io::commit::{
+    commit_detached_transaction, commit_new_dataset, commit_transaction,
+    detect_overlapping_fragments,
+};
 use crate::session::Session;
 use crate::utils::temporal::{timestamp_to_nanos, utc_now, SystemTime};
 use crate::{Error, Result};
@@ -1300,6 +1304,41 @@ impl Dataset {
             .buffer_unordered(self.object_store.io_parallelism())
             .try_collect::<Vec<()>>()
             .await?;
+
+        // Validate indices
+        let indices = self.load_indices().await?;
+        // Make sure there are no duplicate ids
+        let mut index_ids = HashSet::new();
+        for index in indices.iter() {
+            if !index_ids.insert(&index.uuid) {
+                return Err(Error::corrupt_file(
+                    self.manifest_file.clone(),
+                    format!(
+                        "Duplicate index id {} found in dataset {:?}",
+                        &index.uuid, self.base
+                    ),
+                    location!(),
+                ));
+            }
+        }
+
+        // For each index name, make sure there is no overlap in fragment bitmaps
+        if let Err(err) = detect_overlapping_fragments(indices.as_slice()) {
+            let mut message = "Overlapping fragments detected in dataset.".to_string();
+            for (index_name, overlapping_frags) in
+                err.index_names.iter().zip(err.overlapping_fragments.iter())
+            {
+                message.push_str(&format!(
+                    "\nIndex {:?} has overlapping fragments: {:?}",
+                    index_name, overlapping_frags
+                ));
+            }
+            return Err(Error::corrupt_file(
+                self.manifest_file.clone(),
+                message,
+                location!(),
+            ));
+        };
 
         Ok(())
     }
@@ -4274,6 +4313,25 @@ mod tests {
                 .values(),
             &[0, 5, 10, 15]
         );
+    }
+
+    #[tokio::test]
+    async fn test_fix_v0_21_0_corrupt_fragment_bitmap() {
+        // In v0.21.0 and earlier, delta indices had a bug where the fragment bitmap
+        // could contain fragments that are part of other index deltas.
+
+        // Copy over table
+        let test_dir = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+
+        let mut dataset = Dataset::open(test_uri).await.unwrap();
+
+        let validate_res = dataset.validate().await;
+        assert!(validate_res.is_err());
+
+        // Force a migration
+        dataset.delete("false").await.unwrap();
+        dataset.validate().await.unwrap();
     }
 
     #[rstest]
