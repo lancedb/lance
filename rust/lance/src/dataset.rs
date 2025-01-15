@@ -3609,7 +3609,7 @@ mod tests {
         );
 
         let reader = RecordBatchIterator::new(vec![data.unwrap()].into_iter().map(Ok), schema);
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
 
         let manifest_before = dataset.manifest.clone();
 
