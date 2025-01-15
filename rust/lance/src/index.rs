@@ -1319,7 +1319,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tokenizer_config = TokenizerConfig::default();
+        let tokenizer_config = TokenizerConfig::default().lower_case(false);
         let params = InvertedIndexParams {
             with_position: true,
             tokenizer_config,
@@ -1367,6 +1367,98 @@ mod tests {
 
             assert_eq!(texts.len(), 1);
             assert_eq!(texts[0], word);
+        }
+
+        let uppercase_words = ["Apple", "Banana", "Cherry", "Date"];
+        for &word in uppercase_words.iter() {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
+
+            assert_eq!(texts.len(), 0);
+        }
+        let new_data = StringArray::from_iter_values(uppercase_words.iter().map(|s| s.to_string()));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
+        let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        dataset.append(batch_iter, None).await.unwrap();
+
+        // we should be able to query the new words
+        for &word in uppercase_words.iter() {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
+
+            assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
+            assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions {
+                num_indices_to_merge: 0,
+                index_names: None,
+            })
+            .await
+            .unwrap();
+
+        // we should be able to query the new words after optimization
+        for &word in uppercase_words.iter() {
+            let query_result = dataset
+                .scan()
+                .project(&["text"])
+                .unwrap()
+                .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+
+            let texts = query_result["text"]
+                .as_string::<i32>()
+                .iter()
+                .map(|v| match v {
+                    None => "".to_string(),
+                    Some(v) => v.to_string(),
+                })
+                .collect::<Vec<String>>();
+
+            assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
+            assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
         }
     }
 

@@ -11,8 +11,8 @@ use arrow::array::{
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{self, Float32Type, Int32Type, UInt64Type};
 use arrow_array::{
-    Array, ArrayRef, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float32Array, ListArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -1090,7 +1090,7 @@ pub fn flat_bm25_search_stream(
 
     let stream = input.map(move |batch| {
         let batch = batch?;
-        flat_bm25_search(
+        let scored_batch = flat_bm25_search(
             batch,
             &doc_col,
             inverted_list.as_ref(),
@@ -1099,7 +1099,17 @@ pub fn flat_bm25_search_stream(
             &mut tokenizer,
             avgdl,
             num_docs,
-        )
+        )?;
+
+        // filter out rows with score 0
+        let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();
+        let mask = score_col
+            .iter()
+            .map(|score| score.map_or(false, |score| score > 0.0))
+            .collect::<Vec<_>>();
+        let mask = BooleanArray::from(mask);
+        let batch = arrow::compute::filter_record_batch(&scored_batch, &mask)?;
+        Ok(batch)
     });
 
     Box::pin(RecordBatchStreamAdapter::new(FTS_SCHEMA.clone(), stream)) as SendableRecordBatchStream
