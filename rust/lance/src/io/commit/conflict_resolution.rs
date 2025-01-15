@@ -12,6 +12,14 @@ async fn resolve_conflicts(
     transaction: Transaction,
     dataset: &Dataset,
 ) -> Result<(Transaction, Option<BoxFuture<Result<()>>>)> {
+    // Assume dataset is already in latest version.
+    let start = transaction.read_version + 1;
+    let end = dataset.manifest().version;
+
+    let original_dataset = dataset.checkout_version(transaction.read_version).await?;
+    let old_fragments = original_dataset.fragments().as_slice();
+    for version in start..=end {}
+
     // Maybe I should grab them in here?
     // TODO: return cleanup task too?
     // TODO: nice errors differentiate retry-able and non-retry-able conflicts
