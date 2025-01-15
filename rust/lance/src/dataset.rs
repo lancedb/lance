@@ -3603,9 +3603,6 @@ mod tests {
             false,
         )]));
 
-        let test_dir = tempdir().unwrap();
-        let test_uri = test_dir.path().to_str().unwrap();
-
         let data = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(UInt32Array::from_iter_values(0..100))],
