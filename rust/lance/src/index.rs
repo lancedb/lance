@@ -945,6 +945,7 @@ impl DatasetIndexInternalExt for Dataset {
 #[cfg(test)]
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
