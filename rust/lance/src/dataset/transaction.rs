@@ -353,123 +353,6 @@ impl Transaction {
         }
     }
 
-    /// Returns true if the transaction cannot be committed if the other
-    /// transaction is committed first.
-    pub fn conflicts_with(&self, other: &Self) -> bool {
-        // This assumes IsolationLevel is Snapshot Isolation, which is more
-        // permissive than Serializable. In particular, it allows a Delete
-        // transaction to succeed after a concurrent Append, even if the Append
-        // added rows that would be deleted.
-        match &self.operation {
-            Operation::Append { .. } => match &other.operation {
-                // Append is compatible with anything that doesn't change the schema
-                Operation::Append { .. } => false,
-                Operation::Rewrite { .. } => false,
-                Operation::CreateIndex { .. } => false,
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Rewrite { .. } => match &other.operation {
-                // Rewrite is only compatible with operations that don't touch
-                // existing fragments.
-                // TODO: it could also be compatible with operations that update
-                // fragments we don't touch.
-                Operation::Append { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // As long as they rewrite disjoint fragments they shouldn't conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Project { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            // Restore always succeeds
-            Operation::Restore { .. } => false,
-            // ReserveFragments is compatible with anything that doesn't reset the
-            // max fragment id.
-            Operation::ReserveFragments { .. } => matches!(
-                &other.operation,
-                Operation::Overwrite { .. } | Operation::Restore { .. }
-            ),
-            Operation::CreateIndex { .. } => match &other.operation {
-                Operation::Append { .. } => false,
-                // Indices are identified by UUIDs, so they shouldn't conflict.
-                Operation::CreateIndex { .. } => false,
-                // Although some of the rows we indexed may have been deleted / moved,
-                // row ids are still valid, so we allow this optimistically.
-                Operation::Delete { .. } | Operation::Update { .. } => false,
-                // Merge & reserve don't change row ids, so this should be fine.
-                Operation::Merge { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                // Rewrite likely changed many of the row ids, so our index is
-                // likely useless. It should be rebuilt.
-                // TODO: we could be smarter here and only invalidate the index
-                // if the rewrite changed more than X% of row ids.
-                Operation::Rewrite { .. } => true,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
-                Operation::CreateIndex { .. } => false,
-                Operation::ReserveFragments { .. } => false,
-                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
-                    // If we update the same fragments, we conflict.
-                    self.operation.modifies_same_ids(&other.operation)
-                }
-                Operation::Project { .. } => false,
-                Operation::Append { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-            Operation::Overwrite { .. } => match &other.operation {
-                // Overwrite only conflicts with another operation modifying the same update config
-                Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
-                    self.operation.upsert_key_conflict(&other.operation)
-                }
-                _ => false,
-            },
-            Operation::UpdateConfig {
-                schema_metadata,
-                field_metadata,
-                ..
-            } => match &other.operation {
-                Operation::Overwrite { .. } => {
-                    // Updates to schema metadata or field metadata conflict with any kind
-                    // of overwrite.
-                    if schema_metadata.is_some() || field_metadata.is_some() {
-                        true
-                    } else {
-                        self.operation.upsert_key_conflict(&other.operation)
-                    }
-                }
-                Operation::UpdateConfig { .. } => {
-                    self.operation.upsert_key_conflict(&other.operation)
-                        | self.operation.modifies_same_metadata(&other.operation)
-                }
-                _ => false,
-            },
-            // Merge changes the schema, but preserves row ids, so the only operations
-            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
-            Operation::Merge { .. } => !matches!(
-                &other.operation,
-                Operation::CreateIndex { .. }
-                    | Operation::ReserveFragments { .. }
-                    | Operation::UpdateConfig { .. }
-            ),
-            Operation::Project { .. } => match &other.operation {
-                // Project is compatible with anything that doesn't change the schema
-                Operation::CreateIndex { .. } => false,
-                Operation::Overwrite { .. } => false,
-                Operation::UpdateConfig { .. } => false,
-                _ => true,
-            },
-        }
-    }
-
     fn fragments_with_ids<'a, T>(
         new_fragments: T,
         fragment_id: &'a mut u64,
@@ -996,6 +879,241 @@ impl Transaction {
             *next_row_id += physical_rows;
         }
         Ok(())
+    }
+}
+
+struct TransactionError {
+    candidate: Transaction,
+    other: Transaction,
+}
+
+enum ConflictError {
+    /// Another transaction was committed concurrently that makes this operation invalid.
+    ///
+    /// For example, if when attempting to update a table, another transaction has
+    /// committed an overwrite, then the update is invalid.
+    Irreconcilable(TransactionError),
+    /// Another transaction was committed concurrently that makes this transaction
+    /// invalid, but the operation is still valid. Retry the operation.
+    ///
+    /// For example, if when attempting to update a table, another transaction has
+    /// compacted the same fragments the update was modifying, this error will
+    /// occur. The rows being update likely existing, they just need to be
+    /// re-processed.
+    Retryable(TransactionError),
+    /// Another transaction was commmitted concurrently that *may* make this
+    /// transaction invalid. Additional checks need to be performed to determine
+    /// if the operation is valid. Call `resolve_conflicts`.
+    Potential(TransactionError),
+}
+
+impl Transaction {
+    /// Returns true if the transaction cannot be committed if the other
+    /// transaction is committed first.
+    pub fn conflicts_with(&self, other: &Self) -> std::result::Result<(), ConflictError> {
+        // This assumes IsolationLevel is Snapshot Isolation, which is more
+        // permissive than Serializable. In particular, it allows a Delete
+        // transaction to succeed after a concurrent Append, even if the Append
+        // added rows that would be deleted.
+        match &self.operation {
+            Operation::Append { .. } => match &other.operation {
+                // Append is compatible with anything that doesn't change the schema
+                Operation::Append { .. }
+                | Operation::Rewrite { .. }
+                | Operation::CreateIndex { .. }
+                | Operation::Delete { .. }
+                | Operation::Update { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::UpdateConfig { .. } => Ok(()),
+                // Otherwise, if the schema is changed, it is irreconcilable.
+                // TODO: since we support inserting subschemas, we could make
+                // merge compatible.
+                _ => Err(ConflictError::Irreconcilable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+            },
+            Operation::Rewrite { .. } => match &other.operation {
+                // Rewrite is only compatible with operations that don't touch
+                // existing fragments.
+                // TODO: it could also be compatible with operations that update
+                // fragments we don't touch.
+                Operation::Append { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::UpdateConfig { .. } => Ok(()),
+                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
+                    // As long as they rewrite disjoint fragments they shouldn't conflict.
+                    if self.operation.modifies_same_ids(&other.operation) {
+                        Err(ConflictError::Retryable(TransactionError {
+                            candidate: self.clone(),
+                            other: other.clone(),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Err(ConflictError::Retryable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+            },
+            // Restore always succeeds
+            Operation::Restore { .. } => Ok(()),
+            // ReserveFragments is compatible with anything that doesn't reset the
+            // max fragment id.
+            Operation::ReserveFragments { .. } => match &other.operation {
+                Operation::Overwrite { .. } => {
+                    Err(ConflictError::Irreconcilable(TransactionError {
+                        candidate: self.clone(),
+                        other: other.clone(),
+                    }))
+                }
+                Operation::Restore { .. } => Err(ConflictError::Retryable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+                _ => Ok(()),
+            },
+            Operation::CreateIndex { new_indices, .. } => match &other.operation {
+                Operation::Append { .. } => Ok(()),
+                // Indices are identified by UUIDs, so they shouldn't conflict.
+                Operation::CreateIndex {
+                    new_indices: other_new_indices,
+                    ..
+                } => {
+                    // If fragment bitmaps overlap for same index name, we conflict.
+                    todo!()
+                }
+                // Although some of the rows we indexed may have been deleted / moved,
+                // row ids are still valid, so we allow this optimistically.
+                Operation::Delete { .. } | Operation::Update { .. } => Ok(()),
+                // Merge & reserve don't change row ids, so this should be fine.
+                Operation::Merge { .. } => Ok(()),
+                Operation::ReserveFragments { .. } => Ok(()),
+                // Rewrite likely changed many of the row ids, so our index is
+                // likely useless. It should be rebuilt.
+                // TODO: we could be smarter here and only invalidate the index
+                // if the rewrite changed more than X% of row ids.
+                Operation::Rewrite { .. } => Err(ConflictError::Retryable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+                Operation::UpdateConfig { .. } => Ok(()),
+                _ => Err(ConflictError::Irreconcilable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+            },
+            Operation::Delete { .. } | Operation::Update { .. } => match &other.operation {
+                Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::Project { .. }
+                | Operation::Append { .. }
+                | Operation::UpdateConfig { .. } => Ok(()),
+                Operation::Delete { .. } | Operation::Rewrite { .. } | Operation::Update { .. } => {
+                    // If we update the same fragments, we conflict.
+                    if self.operation.modifies_same_ids(&other.operation) {
+                        todo!("we need to differentiate potential and definite conflict here");
+                        Err(ConflictError::Potential(TransactionError {
+                            candidate: self.clone(),
+                            other: other.clone(),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Err(ConflictError::Irreconcilable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+            },
+            Operation::Overwrite { .. } => match &other.operation {
+                // Overwrite only conflicts with another operation modifying the same update config
+                Operation::Overwrite { .. } | Operation::UpdateConfig { .. } => {
+                    if self.operation.upsert_key_conflict(&other.operation) {
+                        Err(ConflictError::Irreconcilable(TransactionError {
+                            candidate: self.clone(),
+                            other: other.clone(),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            },
+            Operation::UpdateConfig {
+                schema_metadata,
+                field_metadata,
+                ..
+            } => match &other.operation {
+                Operation::Overwrite { .. } => {
+                    // Updates to schema metadata or field metadata conflict with any kind
+                    // of overwrite.
+                    if schema_metadata.is_some()
+                        || field_metadata.is_some()
+                        || self.operation.upsert_key_conflict(&other.operation)
+                    {
+                        Err(ConflictError::Irreconcilable(TransactionError {
+                            candidate: self.clone(),
+                            other: other.clone(),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Operation::UpdateConfig { .. } => {
+                    if self.operation.upsert_key_conflict(&other.operation)
+                        || self.operation.modifies_same_metadata(&other.operation)
+                    {
+                        Err(ConflictError::Irreconcilable(TransactionError {
+                            candidate: self.clone(),
+                            other: other.clone(),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Ok(()),
+            },
+            // Merge changes the schema, but preserves row ids, so the only operations
+            // it's compatible with is CreateIndex, ReserveFragments, SetMetadata and DeleteMetadata.
+            Operation::Merge { .. } => match &other.operation {
+                Operation::CreateIndex { .. }
+                | Operation::ReserveFragments { .. }
+                | Operation::UpdateConfig { .. } => Ok(()),
+                _ => Err(ConflictError::Irreconcilable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+            },
+            Operation::Project { .. } => match &other.operation {
+                // Project is compatible with anything that doesn't change the schema
+                Operation::CreateIndex { .. }
+                | Operation::Append { .. }
+                | Operation::Delete { .. }
+                | Operation::Update { .. } => Ok(()),
+                Operation::UpdateConfig {
+                    schema_metadata,
+                    field_metadata,
+                    ..
+                } => {
+                    if schema_metadata.is_some() || field_metadata.is_some() {
+                        Err(ConflictError::Retryable(TransactionError {
+                            candidate: self.clone(),
+                            other: other.clone(),
+                        }))
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Err(ConflictError::Irreconcilable(TransactionError {
+                    candidate: self.clone(),
+                    other: other.clone(),
+                })),
+            },
+        }
     }
 }
 

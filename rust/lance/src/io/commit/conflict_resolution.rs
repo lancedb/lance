@@ -18,7 +18,24 @@ async fn resolve_conflicts(
 
     let original_dataset = dataset.checkout_version(transaction.read_version).await?;
     let old_fragments = original_dataset.fragments().as_slice();
-    for version in start..=end {}
+    let mut possible_conflicts: Vec<(u64, Transaction)> = Vec::new();
+    for version in start..=end {
+        // Load each transaction
+
+        // For each transaction, there are four possible outcomes:
+        // 1. Irreconcilable conflict. Example: overwrite happened.
+        // 2. No conflict. Example: append happened. (can ignore)
+        // 3. Retry-able conflict. Example: upsert deleted relevant fragment
+        // 4. Possible conflict. Example: upsert modified relevant fragment
+
+        // TODO: modify .conflicts_with() to differentiate these four outcomes.
+    }
+
+    // If there are no conflicts, we can just return the transaction as-is.
+
+    // Possible conflict:
+    // * Either needs a rewrite
+    // * Or becomes retry-able conflict
 
     // Maybe I should grab them in here?
     // TODO: return cleanup task too?
