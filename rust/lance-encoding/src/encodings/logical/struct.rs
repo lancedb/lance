@@ -733,7 +733,6 @@ impl SimpleStructDecoder {
     }
 
     async fn do_wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
-        println!("Wait for loaded_need: {}", loaded_need);
         let mut wait_orders = self
             .children
             .iter_mut()
