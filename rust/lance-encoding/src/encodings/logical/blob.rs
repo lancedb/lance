@@ -231,7 +231,6 @@ impl LogicalPageDecoder for BlobFieldDecoder {
         let validity = self.drain_validity(num_rows as usize)?;
         self.rows_drained += num_rows;
         Ok(NextDecodeTask {
-            has_more: self.rows_drained < self.num_rows,
             num_rows,
             task: Box::new(BlobArrayDecodeTask::new(bytes, validity)),
         })

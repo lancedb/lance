@@ -1670,7 +1670,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let def_meaning = self.def_meaning.clone();
         let items_per_row = self.items_per_row;
 
-        Ok(async move {
+        let res = async move {
             let loaded_chunk_data = loaded_chunk_data.await?;
             for (loaded_chunk, chunk_data) in loaded_chunks.iter_mut().zip(loaded_chunk_data) {
                 loaded_chunk.data = LanceBuffer::from_bytes(chunk_data, 1);
@@ -1689,7 +1689,8 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 items_per_row,
             }) as Box<dyn StructuralPageDecoder>)
         }
-        .boxed())
+        .boxed();
+        Ok(res)
     }
 }
 
@@ -2909,7 +2910,6 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         Ok(NextDecodeTask {
             task,
             num_rows: rows_to_take,
-            has_more: self.rows_drained != self.num_rows,
         })
     }
 
@@ -4253,7 +4253,7 @@ impl PrimitiveStructuralEncoder {
                 }
             }
             _ => {
-                unreachable!()
+                unreachable!("dictionary encode called with data block {:?}", data_block)
             }
         }
     }
