@@ -945,6 +945,7 @@ impl DatasetIndexInternalExt for Dataset {
 #[cfg(test)]
 mod tests {
     use crate::dataset::builder::DatasetBuilder;
+    use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use super::*;
@@ -1556,6 +1557,32 @@ mod tests {
 
             assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
             assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
+
+            // we should be able to query the new words after compaction
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+            for &word in uppercase_words.iter() {
+                let query_result = dataset
+                    .scan()
+                    .project(&["text"])
+                    .unwrap()
+                    .full_text_search(FullTextSearchQuery::new(word.to_string()))
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                let texts = query_result["text"]
+                    .as_string::<i32>()
+                    .iter()
+                    .map(|v| match v {
+                        None => "".to_string(),
+                        Some(v) => v.to_string(),
+                    })
+                    .collect::<Vec<String>>();
+                assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
+                assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
+            }
         }
     }
 
