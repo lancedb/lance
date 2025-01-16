@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::RecordBatchReader;
 use arrow_schema::Schema as ArrowSchema;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
@@ -16,14 +17,16 @@ use deepsize::{Context, DeepSizeOf};
 use futures::{stream::BoxStream, Stream, StreamExt};
 use lance_encoding::{
     decoder::{
-        schedule_and_decode, ColumnInfo, DecoderPlugins, FilterExpression, PageEncoding, PageInfo,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig,
+        schedule_and_decode, schedule_and_decode_blocking, ColumnInfo, DecoderPlugins,
+        FilterExpression, PageEncoding, PageInfo, ReadBatchTask, RequestedRows,
+        SchedulerDecoderConfig,
     },
     encoder::EncodedBatch,
     version::LanceFileVersion,
     EncodingsIo,
 };
 use log::debug;
+use object_store::path::Path;
 use prost::{Message, Name};
 use snafu::{location, Location};
 
@@ -296,7 +299,7 @@ pub struct FileReaderOptions {
 
 #[derive(Debug)]
 pub struct FileReader {
-    scheduler: Arc<LanceEncodingsIo>,
+    scheduler: Arc<dyn EncodingsIo>,
     // The default projection to be applied to all reads
     base_projection: ReaderProjection,
     num_rows: u64,
@@ -718,15 +721,17 @@ impl FileReader {
     pub async fn try_open(
         scheduler: FileScheduler,
         base_projection: Option<ReaderProjection>,
-        decoder_strategy: Arc<DecoderPlugins>,
+        decoder_plugins: Arc<DecoderPlugins>,
         cache: &FileMetadataCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
         let file_metadata = Arc::new(Self::read_all_metadata(&scheduler).await?);
+        let path = scheduler.reader().path().clone();
         Self::try_open_with_file_metadata(
-            scheduler,
+            Arc::new(LanceEncodingsIo(scheduler)),
+            path,
             base_projection,
-            decoder_strategy,
+            decoder_plugins,
             file_metadata,
             cache,
             options,
@@ -735,22 +740,27 @@ impl FileReader {
     }
 
     /// Same as `try_open` but with the file metadata already loaded.
+    ///
+    /// This method also can accept any kind of `EncodingsIo` implementation allowing
+    /// for custom strategies to be used for I/O scheduling (e.g. for takes on fast
+    /// disks it may be better to avoid asynchronous overhead).
     pub async fn try_open_with_file_metadata(
-        scheduler: FileScheduler,
+        scheduler: Arc<dyn EncodingsIo>,
+        path: Path,
         base_projection: Option<ReaderProjection>,
         decoder_plugins: Arc<DecoderPlugins>,
         file_metadata: Arc<CachedFileMetadata>,
         cache: &FileMetadataCache,
         options: FileReaderOptions,
     ) -> Result<Self> {
-        let cache = Arc::new(cache.with_base_path(scheduler.reader().path().clone()));
+        let cache = Arc::new(cache.with_base_path(path));
 
         if let Some(base_projection) = base_projection.as_ref() {
             Self::validate_projection(base_projection, &file_metadata)?;
         }
         let num_rows = file_metadata.num_rows;
         Ok(Self {
-            scheduler: Arc::new(LanceEncodingsIo(scheduler)),
+            scheduler,
             base_projection: base_projection.unwrap_or(ReaderProjection::from_whole_schema(
                 file_metadata.file_schema.as_ref(),
                 file_metadata.version(),
@@ -1025,6 +1035,95 @@ impl FileReader {
             arrow_schema,
             batch_stream,
         )))
+    }
+
+    fn take_rows_blocking(
+        &self,
+        indices: Vec<u64>,
+        batch_size: u32,
+        projection: ReaderProjection,
+        filter: FilterExpression,
+    ) -> Result<Box<dyn RecordBatchReader>> {
+        let column_infos = self.collect_columns_from_projection(&projection)?;
+        debug!(
+            "Taking {} rows spread across range {}..{} with batch_size {} from columns {:?}",
+            indices.len(),
+            indices[0],
+            indices[indices.len() - 1],
+            batch_size,
+            column_infos.iter().map(|ci| ci.index).collect::<Vec<_>>()
+        );
+
+        let config = SchedulerDecoderConfig {
+            batch_size,
+            cache: self.cache.clone(),
+            decoder_plugins: self.decoder_plugins.clone(),
+            io: self.scheduler.clone(),
+            should_validate: self.options.validate_on_decode,
+        };
+
+        let requested_rows = RequestedRows::Indices(indices);
+
+        schedule_and_decode_blocking(
+            column_infos,
+            requested_rows,
+            filter,
+            projection.column_indices,
+            projection.schema,
+            config,
+        )
+    }
+
+    /// Read data from the file as an iterator of record batches
+    ///
+    /// This is a blocking variant of [`Self::read_stream_projected`] that runs entirely in the
+    /// calling thread.  It will block on I/O if the decode is faster than the I/O.  It is useful
+    /// for benchmarking and potentially from "take"ing small batches from fast disks.
+    ///
+    /// Large scans of in-memory data will still benefit from threading (and should therefore not
+    /// use this method) because we can parallelize the decode.
+    pub fn read_stream_projected_blocking(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+        projection: Option<ReaderProjection>,
+        filter: FilterExpression,
+    ) -> Result<Box<dyn RecordBatchReader>> {
+        let projection = projection.unwrap_or_else(|| self.base_projection.clone());
+        Self::validate_projection(&projection, &self.metadata)?;
+        let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
+            if bound > self.num_rows || bound == self.num_rows && inclusive {
+                Err(Error::invalid_input(
+                    format!(
+                        "cannot read {:?} from file with {} rows",
+                        params, self.num_rows
+                    ),
+                    location!(),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        match &params {
+            ReadBatchParams::Indices(indices) => {
+                for idx in indices {
+                    match idx {
+                        None => {
+                            return Err(Error::invalid_input(
+                                "Null value in indices array",
+                                location!(),
+                            ));
+                        }
+                        Some(idx) => {
+                            verify_bound(&params, idx as u64, true)?;
+                        }
+                    }
+                }
+                let indices = indices.iter().map(|idx| idx.unwrap() as u64).collect();
+                self.take_rows_blocking(indices, batch_size, projection, filter)
+            }
+            _ => todo!(),
+        }
     }
 
     /// Reads data from the file as a stream of record batches
