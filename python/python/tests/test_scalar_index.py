@@ -675,3 +675,35 @@ def test_optimize_no_new_data(tmp_path: Path):
 
     assert dataset.to_table(filter="btree IS NULL").num_rows == 2
     assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
+
+
+def test_drop_index(tmp_path):
+    test_table_size = 100
+    test_table = pa.table(
+        {
+            "btree": list(range(test_table_size)),
+            "bitmap": list(range(test_table_size)),
+            "fts": ["a" for _ in range(test_table_size)],
+        }
+    )
+    ds = lance.write_dataset(test_table, tmp_path)
+    ds.create_scalar_index("btree", index_type="BTREE")
+    ds.create_scalar_index("bitmap", index_type="BITMAP")
+    ds.create_scalar_index("fts", index_type="INVERTED")
+
+    assert len(ds.list_indices()) == 3
+
+    # Attempt to drop index (name does not exist)
+    with pytest.raises(RuntimeError, match="index not found"):
+        ds.drop_index("nonexistent_name")
+
+    for idx in ds.list_indices():
+        idx_name = idx["name"]
+        ds.drop_index(idx_name)
+
+    assert len(ds.list_indices()) == 0
+
+    # Ensure we can still search columns
+    assert ds.to_table(filter="btree = 1").num_rows == 1
+    assert ds.to_table(filter="bitmap = 1").num_rows == 1
+    assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size

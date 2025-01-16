@@ -710,7 +710,7 @@ impl Transaction {
                 });
                 final_indices.extend(new_indices.clone());
             }
-            Operation::ReserveFragments { .. } => {
+            Operation::ReserveFragments { .. } | Operation::UpdateConfig { .. } => {
                 final_fragments.extend(maybe_existing_fragments?.clone());
             }
             Operation::Merge { ref fragments, .. } => {
@@ -744,7 +744,6 @@ impl Transaction {
             Operation::Restore { .. } => {
                 unreachable!()
             }
-            Operation::UpdateConfig { .. } => {}
         };
 
         // If a fragment was reserved then it may not belong at the end of the fragments list.

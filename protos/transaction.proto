@@ -67,7 +67,9 @@ message Transaction {
 
   // Add or replace a new secondary index.
   //
-  // - new_indices: the modified indices
+  // This is also used to remove an index (we are replacing it with nothing)
+  //
+  // - new_indices: the modified indices, empty if dropping indices only
   // - removed_indices: the indices that are being replaced
   message CreateIndex {
     repeated IndexMetadata new_indices = 1;
