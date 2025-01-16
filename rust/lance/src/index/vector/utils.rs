@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use crate::dataset::Dataset;
 use crate::{Error, Result};
 
+/// Get the vector dimension of the given column in the schema.
 pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
     let field = schema.field(column).ok_or(Error::Index {
         message: format!("Column {} does not exist in schema {}", column, schema),
@@ -20,10 +21,15 @@ pub fn get_vector_dim(schema: &Schema, column: &str) -> Result<usize> {
     infer_vector_dim(&field.data_type())
 }
 
+/// Infer the vector dimension from the given data type.
 pub fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize> {
-    match data_type {
-        arrow::datatypes::DataType::FixedSizeList(_, dim) => Ok(*dim as usize),
-        arrow::datatypes::DataType::List(inner) => infer_vector_dim(inner.data_type()),
+    infer_vector_dim_impl(data_type, false)
+}
+
+fn infer_vector_dim_impl(data_type: &arrow::datatypes::DataType, in_list: bool) -> Result<usize> {
+    match (data_type,in_list) {
+        (arrow::datatypes::DataType::FixedSizeList(_, dim),_) => Ok(*dim as usize),
+        (arrow::datatypes::DataType::List(inner), false) => infer_vector_dim_impl(inner.data_type(),true),
         _ => Err(Error::Index {
             message: format!("Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}", data_type),
             location: location!(),
@@ -31,9 +37,9 @@ pub fn infer_vector_dim(data_type: &arrow::datatypes::DataType) -> Result<usize>
     }
 }
 
-// this checks whether the given column is with a valid vector type
-// returns the vector type (FixedSizeList for vectors, or List for multivectors),
-// and element type (Float16/Float32/Float64 or UInt8 for binary vectors).
+/// Checks whether the given column is with a valid vector type
+/// returns the vector type (FixedSizeList for vectors, or List for multivectors),
+/// and element type (Float16/Float32/Float64 or UInt8 for binary vectors).
 pub fn get_vector_type(
     schema: &Schema,
     column: &str,
@@ -48,11 +54,22 @@ pub fn get_vector_type(
     ))
 }
 
+/// If the data type is a fixed size list or list of fixed size list return the inner element type
+/// and verify it is a type we can create a vector index on.
+///
+/// Return an error if the data type is any other type
 pub fn infer_vector_element_type(
     data_type: &arrow::datatypes::DataType,
 ) -> Result<arrow_schema::DataType> {
-    match data_type {
-        arrow::datatypes::DataType::FixedSizeList(element_field, _) => {
+    infer_vector_element_type_impl(data_type, false)
+}
+
+fn infer_vector_element_type_impl(
+    data_type: &arrow::datatypes::DataType,
+    in_list: bool,
+) -> Result<arrow_schema::DataType> {
+    match (data_type, in_list) {
+        (arrow::datatypes::DataType::FixedSizeList(element_field, _), _) => {
             match element_field.data_type() {
                 arrow::datatypes::DataType::Float16
                 | arrow::datatypes::DataType::Float32
@@ -60,16 +77,21 @@ pub fn infer_vector_element_type(
                 | arrow::datatypes::DataType::UInt8 => Ok(element_field.data_type().clone()),
                 _ => Err(Error::Index {
                     message: format!(
-                        "vector element is not expected type (Float16/Float32/Float64 or UInt8) {:?}",
+                        "vector element is not expected type (Float16/Float32/Float64 or UInt8): {:?}",
                         element_field.data_type()
                     ),
                     location: location!(),
                 }),
             }
         }
-        arrow::datatypes::DataType::List(inner) => infer_vector_element_type(inner.data_type()),
+        (arrow::datatypes::DataType::List(inner), false) => {
+            infer_vector_element_type_impl(inner.data_type(), true)
+        }
         _ => Err(Error::Index {
-            message: format!("vector is not with valid data type: {:?}", data_type),
+            message: format!(
+                "Data type is not a vector (FixedSizeListArray or List<FixedSizeListArray>), but {:?}",
+                data_type
+            ),
             location: location!(),
         }),
     }
