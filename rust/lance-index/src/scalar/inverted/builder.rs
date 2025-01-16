@@ -285,8 +285,7 @@ impl InvertedIndexBuilder {
                     Result::Ok((batch, max_score))
                 }
             });
-            let mut stream =
-                stream::iter(batches).buffer_unordered(get_num_compute_intensive_cpus());
+            let mut stream = stream::iter(batches).buffered(get_num_compute_intensive_cpus());
             let mut offsets = Vec::new();
             let mut max_scores = Vec::new();
             let mut num_rows = 0;
