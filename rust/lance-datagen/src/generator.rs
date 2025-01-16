@@ -11,8 +11,9 @@ use arrow::{
 use arrow_array::{
     make_array,
     types::{ArrowDictionaryKeyType, BinaryType, ByteArrayType, Utf8Type},
-    Array, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray, ListArray, NullArray,
-    PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray, StructArray,
+    Array, BinaryArray, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray, ListArray,
+    NullArray, PrimitiveArray, RecordBatch, RecordBatchOptions, RecordBatchReader, StringArray,
+    StructArray,
 };
 use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema, SchemaRef};
 use futures::{stream::BoxStream, StreamExt};
@@ -775,6 +776,51 @@ impl ArrayGenerator for RandomBinaryGenerator {
     }
 }
 
+pub struct VariableRandomBinaryGenerator {
+    lengths_gen: Box<dyn ArrayGenerator>,
+    data_type: DataType,
+}
+
+impl VariableRandomBinaryGenerator {
+    pub fn new(min_bytes_per_element: ByteCount, max_bytes_per_element: ByteCount) -> Self {
+        let lengths_dist = Uniform::new_inclusive(
+            min_bytes_per_element.0 as i32,
+            max_bytes_per_element.0 as i32,
+        );
+        let lengths_gen = rand_with_distribution::<Int32Type, Uniform<i32>>(lengths_dist);
+
+        Self {
+            lengths_gen,
+            data_type: DataType::Binary,
+        }
+    }
+}
+
+impl ArrayGenerator for VariableRandomBinaryGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let lengths = self.lengths_gen.generate(length, rng)?;
+        let lengths = lengths.as_primitive::<Int32Type>();
+        let total_length = lengths.values().iter().map(|i| *i as usize).sum::<usize>();
+        let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+        let mut bytes = vec![0; total_length];
+        rng.fill_bytes(&mut bytes);
+        let bytes = Buffer::from(bytes);
+        Ok(Arc::new(BinaryArray::try_new(offsets, bytes, None)?))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        None
+    }
+}
+
 pub struct CycleBinaryGenerator<T: ByteArrayType> {
     values: Vec<u8>,
     lengths: Vec<usize>,
@@ -1427,7 +1473,7 @@ pub mod array {
     pub fn blob() -> Box<dyn ArrayGenerator> {
         let mut blob_meta = HashMap::new();
         blob_meta.insert("lance-encoding:blob".to_string(), "true".to_string());
-        rand_varbin(ByteCount::from(4 * 1024 * 1024), true).with_metadata(blob_meta)
+        rand_fixedbin(ByteCount::from(4 * 1024 * 1024), true).with_metadata(blob_meta)
     }
 
     /// Create a generator that starts at a given value and increments by a given step for each element
@@ -1769,12 +1815,25 @@ pub mod array {
         ))
     }
 
-    /// Create a generator of random binary values
-    pub fn rand_varbin(bytes_per_element: ByteCount, is_large: bool) -> Box<dyn ArrayGenerator> {
+    /// Create a generator of random binary values where each value has a fixed number of bytes
+    pub fn rand_fixedbin(bytes_per_element: ByteCount, is_large: bool) -> Box<dyn ArrayGenerator> {
         Box::new(RandomBinaryGenerator::new(
             bytes_per_element,
             false,
             is_large,
+        ))
+    }
+
+    /// Create a generator of random binary values where each value has a variable number of bytes
+    ///
+    /// The number of bytes per element will be randomly sampled from the given (inclusive) range
+    pub fn rand_varbin(
+        min_bytes_per_element: ByteCount,
+        max_bytes_per_element: ByteCount,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(VariableRandomBinaryGenerator::new(
+            min_bytes_per_element,
+            max_bytes_per_element,
         ))
     }
 
@@ -1830,8 +1889,8 @@ pub mod array {
             DataType::Decimal256(_, _) => rand_primitive::<Decimal256Type>(data_type.clone()),
             DataType::Utf8 => rand_utf8(ByteCount::from(12), false),
             DataType::LargeUtf8 => rand_utf8(ByteCount::from(12), true),
-            DataType::Binary => rand_varbin(ByteCount::from(12), false),
-            DataType::LargeBinary => rand_varbin(ByteCount::from(12), true),
+            DataType::Binary => rand_fixedbin(ByteCount::from(12), false),
+            DataType::LargeBinary => rand_fixedbin(ByteCount::from(12), true),
             DataType::Dictionary(key_type, value_type) => {
                 dict_type(rand_type(value_type), key_type)
             }
@@ -2015,7 +2074,7 @@ mod tests {
             Int32Array::from_iter([-797553329, 1369325940, -69174021])
         );
 
-        let mut gen = array::rand_varbin(ByteCount::from(3), false);
+        let mut gen = array::rand_fixedbin(ByteCount::from(3), false);
         assert_eq!(
             *gen.generate(RowCount::from(3), &mut rng).unwrap(),
             arrow_array::BinaryArray::from_iter_values([
@@ -2046,6 +2105,16 @@ mod tests {
         // Sanity check to ensure we're getting at least some rng
         assert!(bools.false_count() > 100);
         assert!(bools.true_count() > 100);
+
+        let mut gen = array::rand_varbin(ByteCount::from(2), ByteCount::from(4));
+        assert_eq!(
+            *gen.generate(RowCount::from(3), &mut rng).unwrap(),
+            arrow_array::BinaryArray::from_iter_values([
+                vec![56, 122, 157, 34],
+                vec![58, 51],
+                vec![41, 184, 125]
+            ])
+        );
     }
 
     #[test]
