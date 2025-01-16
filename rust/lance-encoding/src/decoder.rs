@@ -1495,10 +1495,51 @@ impl BatchDecodeStream {
     }
 }
 
+// Utility types to smooth out the differences between the 2.0 and 2.1 decoders so that
+// we can have a single implementation of the batch decode iterator
+enum RootDecoderMessage {
+    LoadedPage(LoadedPage),
+    LegacyPage(DecoderReady),
+}
+trait RootDecoderType {
+    fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()>;
+    fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask>;
+    fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()>;
+}
+impl RootDecoderType for StructuralStructDecoder {
+    fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
+        let RootDecoderMessage::LoadedPage(loaded_page) = message else {
+            unreachable!()
+        };
+        self.accept_page(loaded_page)
+    }
+    fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        self.drain_batch_task(num_rows)
+    }
+    fn wait(&mut self, _: u64, _: &tokio::runtime::Runtime) -> Result<()> {
+        // Waiting happens elsewhere (not as part of the decoder)
+        Ok(())
+    }
+}
+impl RootDecoderType for SimpleStructDecoder {
+    fn accept_message(&mut self, message: RootDecoderMessage) -> Result<()> {
+        let RootDecoderMessage::LegacyPage(legacy_page) = message else {
+            unreachable!()
+        };
+        self.accept_child(legacy_page)
+    }
+    fn drain_batch(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        self.drain(num_rows)
+    }
+    fn wait(&mut self, loaded_need: u64, runtime: &tokio::runtime::Runtime) -> Result<()> {
+        runtime.block_on(self.wait_for_loaded(loaded_need))
+    }
+}
+
 /// A blocking back decoder that performs synchronous decoding
-pub struct BatchDecodeIterator {
+struct BatchDecodeIterator<T: RootDecoderType> {
     messages: VecDeque<Result<DecoderMessage>>,
-    root_decoder: StructuralStructDecoder,
+    root_decoder: T,
     rows_remaining: u64,
     rows_per_batch: u32,
     rows_scheduled: u64,
@@ -1511,13 +1552,13 @@ pub struct BatchDecodeIterator {
     schema: Arc<ArrowSchema>,
 }
 
-impl BatchDecodeIterator {
+impl<T: RootDecoderType> BatchDecodeIterator<T> {
     /// Create a new instance of a batch decode iterator
     pub fn new(
         messages: VecDeque<Result<DecoderMessage>>,
         rows_per_batch: u32,
         num_rows: u64,
-        root_decoder: StructuralStructDecoder,
+        root_decoder: T,
         schema: Arc<ArrowSchema>,
     ) -> Self {
         Self {
@@ -1559,11 +1600,24 @@ impl BatchDecodeIterator {
             let message = self.messages.pop_front().unwrap()?;
             self.rows_scheduled = message.scheduled_so_far;
             for decoder_message in message.decoders {
-                let unloaded_page = decoder_message.into_structural();
-                let loaded_page = self.wait_for_page(unloaded_page)?;
-                self.root_decoder.accept_page(loaded_page)?;
+                match decoder_message {
+                    MessageType::UnloadedPage(unloaded_page) => {
+                        let loaded_page = self.wait_for_page(unloaded_page)?;
+                        self.root_decoder
+                            .accept_message(RootDecoderMessage::LoadedPage(loaded_page))?;
+                    }
+                    MessageType::DecoderReady(decoder_ready) => {
+                        // The root decoder we can ignore
+                        if !decoder_ready.path.is_empty() {
+                            self.root_decoder
+                                .accept_message(RootDecoderMessage::LegacyPage(decoder_ready))?;
+                        }
+                    }
+                }
             }
         }
+        self.root_decoder
+            .wait(self.rows_scheduled, &self.wait_for_io_runtime)?;
         Ok(self.rows_scheduled)
     }
 
@@ -1601,12 +1655,8 @@ impl BatchDecodeIterator {
             return Ok(None);
         }
 
-        let next_task = self.root_decoder.drain(to_take)?;
-        let next_task = NextDecodeTask {
-            has_more: self.rows_remaining > 0,
-            num_rows: to_take,
-            task: Box::new(next_task),
-        };
+        let next_task = self.root_decoder.drain_batch(to_take)?;
+
         self.rows_drained += to_take;
 
         let batch = next_task.into_batch(self.emitted_batch_size_warning.clone())?;
@@ -1615,7 +1665,7 @@ impl BatchDecodeIterator {
     }
 }
 
-impl Iterator for BatchDecodeIterator {
+impl<T: RootDecoderType> Iterator for BatchDecodeIterator<T> {
     type Item = ArrowResult<RecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1625,7 +1675,7 @@ impl Iterator for BatchDecodeIterator {
     }
 }
 
-impl RecordBatchReader for BatchDecodeIterator {
+impl<T: RootDecoderType> RecordBatchReader for BatchDecodeIterator<T> {
     fn schema(&self) -> Arc<ArrowSchema> {
         self.schema.clone()
     }
@@ -1734,12 +1784,7 @@ impl StructuralBatchDecodeStream {
             return Ok(None);
         }
 
-        let next_task = self.root_decoder.drain(to_take)?;
-        let next_task = NextDecodeTask {
-            has_more: self.rows_remaining > 0,
-            num_rows: to_take,
-            task: Box::new(next_task),
-        };
+        let next_task = self.root_decoder.drain_batch_task(to_take)?;
         self.rows_drained += to_take;
         Ok(Some(next_task))
     }
@@ -1848,19 +1893,32 @@ pub fn create_decode_iterator(
     num_rows: u64,
     batch_size: u32,
     should_validate: bool,
+    is_structural: bool,
     messages: VecDeque<Result<DecoderMessage>>,
 ) -> Box<dyn RecordBatchReader> {
     let arrow_schema = Arc::new(ArrowSchema::from(schema));
     let root_fields = arrow_schema.fields.clone();
-    let simple_struct_decoder =
-        StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true);
-    Box::new(BatchDecodeIterator::new(
-        messages,
-        batch_size,
-        num_rows,
-        simple_struct_decoder,
-        arrow_schema,
-    ))
+    if is_structural {
+        let simple_struct_decoder =
+            StructuralStructDecoder::new(root_fields, should_validate, /*is_root=*/ true);
+        Box::new(BatchDecodeIterator::new(
+            messages,
+            batch_size,
+            num_rows,
+            simple_struct_decoder,
+            arrow_schema,
+        ))
+    } else {
+        let root_decoder = SimpleStructDecoder::new(root_fields, num_rows);
+        let _legacy_iterator = Box::new(BatchDecodeIterator::new(
+            messages,
+            batch_size,
+            num_rows,
+            root_decoder,
+            arrow_schema,
+        ));
+        todo!("The synchronous path for 2.0 is not quite working yet")
+    }
 }
 
 fn create_scheduler_decoder(
@@ -1991,6 +2049,7 @@ pub fn schedule_and_decode_blocking(
     }
 
     let num_rows = requested_rows.num_rows();
+    let is_structural = column_infos[0].is_structural();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -2033,6 +2092,7 @@ pub fn schedule_and_decode_blocking(
         num_rows,
         config.batch_size,
         config.should_validate,
+        is_structural,
         messages.into(),
     );
 
@@ -2431,8 +2491,6 @@ pub struct NextDecodeTask {
     pub task: Box<dyn DecodeArrayTask>,
     /// The number of rows that will be created
     pub num_rows: u64,
-    /// Whether or not the decoder that created this still has more rows to decode
-    pub has_more: bool,
 }
 
 impl NextDecodeTask {

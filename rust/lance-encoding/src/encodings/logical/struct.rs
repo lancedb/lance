@@ -631,6 +631,14 @@ impl StructuralStructDecoder {
             _ => Box::new(StructuralPrimitiveFieldDecoder::new(field, should_validate)),
         }
     }
+
+    pub fn drain_batch_task(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        let array_drain = self.drain(num_rows)?;
+        Ok(NextDecodeTask {
+            num_rows,
+            task: Box::new(array_drain),
+        })
+    }
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
@@ -725,6 +733,7 @@ impl SimpleStructDecoder {
     }
 
     async fn do_wait_for_loaded(&mut self, loaded_need: u64) -> Result<()> {
+        println!("Wait for loaded_need: {}", loaded_need);
         let mut wait_orders = self
             .children
             .iter_mut()
@@ -787,16 +796,13 @@ impl LogicalPageDecoder for SimpleStructDecoder {
             .map(|child| child.drain(num_rows))
             .collect::<Result<Vec<_>>>()?;
         let num_rows = child_tasks[0].num_rows;
-        let has_more = child_tasks[0].has_more;
         debug_assert!(child_tasks.iter().all(|task| task.num_rows == num_rows));
-        debug_assert!(child_tasks.iter().all(|task| task.has_more == has_more));
         Ok(NextDecodeTask {
             task: Box::new(SimpleStructDecodeTask {
                 children: child_tasks,
                 child_fields: self.child_fields.clone(),
             }),
             num_rows,
-            has_more,
         })
     }
 

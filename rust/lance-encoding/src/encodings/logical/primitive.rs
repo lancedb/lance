@@ -2909,7 +2909,6 @@ impl LogicalPageDecoder for PrimitiveFieldDecoder {
         Ok(NextDecodeTask {
             task,
             num_rows: rows_to_take,
-            has_more: self.rows_drained != self.num_rows,
         })
     }
 

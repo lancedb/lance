@@ -1082,6 +1082,9 @@ impl FileReader {
     ///
     /// Large scans of in-memory data will still benefit from threading (and should therefore not
     /// use this method) because we can parallelize the decode.
+    ///
+    /// Note: calling this from within a tokio runtime will panic.  It is acceptable to call this
+    /// from a spawn_blocking context.
     pub fn read_stream_projected_blocking(
         &self,
         params: ReadBatchParams,
@@ -1310,13 +1313,13 @@ pub mod tests {
 
     use arrow_array::{
         types::{Float64Type, Int32Type},
-        RecordBatch,
+        RecordBatch, UInt32Array,
     };
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
     use bytes::Bytes;
     use futures::{prelude::stream::TryStreamExt, StreamExt};
     use lance_arrow::RecordBatchExt;
-    use lance_core::datatypes::Schema;
+    use lance_core::{datatypes::Schema, ArrowResult};
     use lance_datagen::{array, gen, BatchCount, ByteCount, RowCount};
     use lance_encoding::{
         decoder::{decode_batch, DecodeBatchScheduler, DecoderPlugins, FilterExpression},
@@ -1333,22 +1336,32 @@ pub mod tests {
         writer::{EncodedBatchWriteExt, FileWriter, FileWriterOptions},
     };
 
-    async fn create_some_file(fs: &FsFixture) -> WrittenFile {
+    async fn create_some_file(fs: &FsFixture, version: LanceFileVersion) -> WrittenFile {
         let location_type = DataType::Struct(Fields::from(vec![
             Field::new("x", DataType::Float64, true),
             Field::new("y", DataType::Float64, true),
         ]));
         let categories_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
 
-        let reader = gen()
+        let mut reader = gen()
             .col("score", array::rand::<Float64Type>())
             .col("location", array::rand_type(&location_type))
             .col("categories", array::rand_type(&categories_type))
-            .col("binary", array::rand_type(&DataType::Binary))
-            .col("large_bin", array::rand_type(&DataType::LargeBinary))
-            .into_reader_rows(RowCount::from(1000), BatchCount::from(100));
+            .col("binary", array::rand_type(&DataType::Binary));
+        if version <= LanceFileVersion::V2_0 {
+            reader = reader.col("large_bin", array::rand_type(&DataType::LargeBinary));
+        }
+        let reader = reader.into_reader_rows(RowCount::from(1000), BatchCount::from(100));
 
-        write_lance_file(reader, fs, FileWriterOptions::default()).await
+        write_lance_file(
+            reader,
+            fs,
+            FileWriterOptions {
+                format_version: Some(version),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     type Transformer = Box<dyn Fn(&RecordBatch) -> RecordBatch>;
@@ -1407,7 +1420,7 @@ pub mod tests {
     async fn test_round_trip() {
         let fs = FsFixture::default();
 
-        let WrittenFile { data, .. } = create_some_file(&fs).await;
+        let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
 
         for read_size in [32, 1024, 1024 * 1024] {
             let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
@@ -1503,7 +1516,7 @@ pub mod tests {
     async fn test_projection() {
         let fs = FsFixture::default();
 
-        let written_file = create_some_file(&fs).await;
+        let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
 
         let field_id_mapping = written_file
@@ -1636,7 +1649,7 @@ pub mod tests {
     async fn test_compressing_buffer() {
         let fs = FsFixture::default();
 
-        let written_file = create_some_file(&fs).await;
+        let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
 
         // We can specify the projection as part of the read operation via read_stream_projected
@@ -1686,7 +1699,7 @@ pub mod tests {
     #[tokio::test]
     async fn test_read_all() {
         let fs = FsFixture::default();
-        let WrittenFile { data, .. } = create_some_file(&fs).await;
+        let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
@@ -1715,10 +1728,47 @@ pub mod tests {
         assert_eq!(batches[0].num_rows(), total_rows);
     }
 
+    #[tokio::test]
+    async fn test_blocking_take() {
+        let fs = FsFixture::default();
+        let WrittenFile { data, schema, .. } = create_some_file(&fs, LanceFileVersion::V2_1).await;
+        let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
+
+        let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler.clone(),
+            Some(ReaderProjection::from_column_names(&schema, &["score"]).unwrap()),
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let batches = tokio::task::spawn_blocking(move || {
+            file_reader
+                .read_stream_projected_blocking(
+                    lance_io::ReadBatchParams::Indices(UInt32Array::from(vec![0, 1, 2, 3, 4])),
+                    total_rows as u32,
+                    None,
+                    FilterExpression::no_filter(),
+                )
+                .unwrap()
+                .collect::<ArrowResult<Vec<_>>>()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 5);
+        assert_eq!(batches[0].num_columns(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_drop_in_progress() {
         let fs = FsFixture::default();
-        let WrittenFile { data, .. } = create_some_file(&fs).await;
+        let WrittenFile { data, .. } = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = data.iter().map(|batch| batch.num_rows()).sum::<usize>();
 
         let file_scheduler = fs.scheduler.open_file(&fs.tmp_path).await.unwrap();
@@ -1762,7 +1812,7 @@ pub mod tests {
         // if the stream was dropped before it finished.
 
         let fs = FsFixture::default();
-        let written_file = create_some_file(&fs).await;
+        let written_file = create_some_file(&fs, LanceFileVersion::V2_0).await;
         let total_rows = written_file
             .data
             .iter()
