@@ -13,6 +13,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
+use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
 use snafu::{location, Location};
 
@@ -60,6 +61,8 @@ pub enum NewColumnTransform {
     Stream(SendableRecordBatchStream),
     /// An iterator of RecordBatches that define new columns.
     Reader(Box<dyn RecordBatchReader + Send>),
+    /// Add new columns that are initially all null
+    AllNulls(Arc<ArrowSchema>),
 }
 
 /// Definition of a change to a column in a dataset
@@ -236,6 +239,46 @@ pub(super) async fn add_columns_to_fragments(
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            Ok((output_schema, fragments))
+        }
+        NewColumnTransform::AllNulls(output_schema) => {
+            check_names(output_schema.as_ref())?;
+
+            // Check that the schema is compatible considering all the new columns must be nullable
+            let schema = Schema::try_from(output_schema.as_ref())?;
+            if !schema.all_fields_nullable() {
+                return Err(Error::InvalidInput {
+                    source: "All-null columns must be nullable.".into(),
+                    location: location!(),
+                });
+            }
+
+            let fragments = fragments
+                .iter()
+                .map(|f| f.metadata.clone())
+                .collect::<Vec<_>>();
+
+            // Check if any of the fragment's files are using the legacy dataset version if so, we
+            // can't add all-null columns as a metadata-only operation. The reason is because we
+            // use the NullReader for fragments that have missing columns and we can't mix legacy
+            // and non-legacy readers when reading the fragment.
+            if fragments.iter().any(|fragment| {
+                fragment.files.iter().any(|file| {
+                    matches!(
+                        LanceFileVersion::try_from_major_minor(
+                            file.file_major_version,
+                            file.file_minor_version
+                        ),
+                        Ok(LanceFileVersion::Legacy)
+                    )
+                })
+            }) {
+                return Err(Error::NotSupported {
+                    source: "Cannot add all-null columns to legacy dataset version.".into(),
+                    location: location!(),
+                });
+            }
+
             Ok((output_schema, fragments))
         }
     }?;
@@ -1042,6 +1085,131 @@ mod test {
                 batch_index: 1,
             },]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_column_all_nulls() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempfile::tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.validate().await?;
+
+        dataset
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                    "nulls",
+                    DataType::Int32,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nulls", DataType::Int32, true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows as usize);
+
+        // check that can't add non-nullable columns
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("non_nulls", DataType::Int32, false),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("All-null columns must be nullable."));
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nulls", DataType::Int32, true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows as usize);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_column_all_nulls_legacy() -> Result<()> {
+        let num_rows = 100;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..num_rows))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = tempfile::tempdir()?;
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        dataset.validate().await?;
+
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("nulls", DataType::Int32, true),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Cannot add all-null columns to legacy dataset version"));
 
         Ok(())
     }
