@@ -590,23 +590,39 @@ impl DatasetIndexExt for Dataset {
         let index_type = indices[0].index_type().to_string();
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
-        let num_indexed_rows_per_delta = self.indexed_fragments(index_name).await?
-        .iter()
-        .map(|frags| {
-            frags.iter().map(|f| f.num_rows().expect("Fragment should have row counts, please upgrade lance and trigger a single right to fix this")).sum::<usize>()
-        })
-        .collect::<Vec<_>>();
+        let num_indexed_rows_per_delta = indexed_fragments_per_delta
+            .iter()
+            .map(|frags| {
+                let mut sum = 0;
+                for frag in frags.iter() {
+                    sum += frag.num_rows().ok_or_else(|| Error::Internal {
+                        message: "Fragment should have row counts, please upgrade lance and \
+                                      trigger a single write to fix this"
+                            .to_string(),
+                        location: location!(),
+                    })?;
+                }
+                Ok(sum)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let num_indexed_fragments = indexed_fragments_per_delta
-            .clone()
-            .into_iter()
-            .flatten()
-            .map(|f| f.id)
-            .collect::<HashSet<_>>()
-            .len();
+        let mut fragment_ids = HashSet::new();
+        for frags in indexed_fragments_per_delta.iter() {
+            for frag in frags.iter() {
+                if !fragment_ids.insert(frag.id) {
+                    return Err(Error::Internal {
+                        message: "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                                  and trigger a single write to fix this"
+                            .to_string(),
+                        location: location!(),
+                    });
+                }
+            }
+        }
+        let num_indexed_fragments = fragment_ids.len();
 
         let num_unindexed_fragments = self.fragments().len() - num_indexed_fragments;
-        let num_indexed_rows = num_indexed_rows_per_delta.iter().last().unwrap();
+        let num_indexed_rows: usize = num_indexed_rows_per_delta.iter().cloned().sum();
         let num_unindexed_rows = self.count_rows(None).await? - num_indexed_rows;
 
         let stats = json!({
@@ -1150,7 +1166,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_optimize_delta_indices() {
-        let test_dir = tempdir().unwrap();
         let dimensions = 16;
         let column_name = "vec";
         let vec_field = Field::new(
@@ -1186,8 +1201,7 @@ mod tests {
             schema.clone(),
         );
 
-        let test_uri = test_dir.path().to_str().unwrap();
-        let mut dataset = Dataset::write(reader, test_uri, None).await.unwrap();
+        let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
         let params = VectorIndexParams::ivf_pq(10, 8, 2, MetricType::L2, 10);
         dataset
             .create_index(
@@ -1210,24 +1224,44 @@ mod tests {
             .await
             .unwrap();
 
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        async fn get_stats(dataset: &Dataset, name: &str) -> serde_json::Value {
+            serde_json::from_str(&dataset.index_statistics(name).await.unwrap()).unwrap()
+        }
+        async fn get_meta(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
+            dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.name == name)
+                .cloned()
+                .collect()
+        }
+        fn get_bitmap(meta: &IndexMetadata) -> Vec<u32> {
+            meta.fragment_bitmap.as_ref().unwrap().iter().collect()
+        }
+
+        let stats = get_stats(&dataset, "vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_indices"], 1);
+        let meta = get_meta(&dataset, "vec_idx").await;
+        assert_eq!(meta.len(), 1);
+        assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         let reader =
             RecordBatchIterator::new(vec![record_batch].into_iter().map(Ok), schema.clone());
         dataset.append(reader, None).await.unwrap();
-        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        let stats = get_stats(&dataset, "vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 1);
         assert_eq!(stats["num_indices"], 1);
+        let meta = get_meta(&dataset, "vec_idx").await;
+        assert_eq!(meta.len(), 1);
+        assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         dataset
             .optimize_indices(&OptimizeOptions {
@@ -1236,13 +1270,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        let stats = get_stats(&dataset, "vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 1);
         assert_eq!(stats["num_indices"], 1);
+        let meta = get_meta(&dataset, "vec_idx").await;
+        assert_eq!(meta.len(), 1);
+        assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         // optimize the other index
         dataset
@@ -1252,22 +1288,26 @@ mod tests {
             })
             .await
             .unwrap();
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        let stats = get_stats(&dataset, "vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 512);
         assert_eq!(stats["num_indexed_rows"], 512);
         assert_eq!(stats["num_indexed_fragments"], 1);
         assert_eq!(stats["num_unindexed_fragments"], 1);
         assert_eq!(stats["num_indices"], 1);
+        let meta = get_meta(&dataset, "vec_idx").await;
+        assert_eq!(meta.len(), 1);
+        assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("other_vec_idx").await.unwrap())
-                .unwrap();
+        let stats = get_stats(&dataset, "other_vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 2);
+        let meta = get_meta(&dataset, "other_vec_idx").await;
+        assert_eq!(meta.len(), 2);
+        assert_eq!(get_bitmap(&meta[0]), vec![0]);
+        assert_eq!(get_bitmap(&meta[1]), vec![1]);
 
         dataset
             .optimize_indices(&OptimizeOptions {
@@ -1276,15 +1316,17 @@ mod tests {
             })
             .await
             .unwrap();
-        let mut dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
 
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        let stats = get_stats(&dataset, "vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 2);
+        let meta = get_meta(&dataset, "vec_idx").await;
+        assert_eq!(meta.len(), 2);
+        assert_eq!(get_bitmap(&meta[0]), vec![0]);
+        assert_eq!(get_bitmap(&meta[1]), vec![1]);
 
         dataset
             .optimize_indices(&OptimizeOptions {
@@ -1293,13 +1335,15 @@ mod tests {
             })
             .await
             .unwrap();
-        let stats: serde_json::Value =
-            serde_json::from_str(&dataset.index_statistics("vec_idx").await.unwrap()).unwrap();
+        let stats = get_stats(&dataset, "vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
+        let meta = get_meta(&dataset, "vec_idx").await;
+        assert_eq!(meta.len(), 1);
+        assert_eq!(get_bitmap(&meta[0]), vec![0, 1]);
     }
 
     #[tokio::test]
