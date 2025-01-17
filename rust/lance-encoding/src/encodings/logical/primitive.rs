@@ -31,17 +31,20 @@ use lance_core::{
 use log::{debug, trace};
 use snafu::{location, Location};
 
-use crate::encoder::PerValueDataBlock;
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,
     DefinitionInterpretation, RepDefSlicer,
 };
 use crate::statistics::{ComputeStat, GetStat, Stat};
+use crate::utils::bytepack::ByteUnpacker;
 use crate::{
     data::{AllNullDataBlock, DataBlock, VariableWidthBlock},
     utils::bytepack::BytepackedIntegerEncoder,
 };
-use crate::{decoder::PerValueDecompressor, utils::bytepack::ByteUnpacker};
+use crate::{
+    decoder::{FixedPerValueDecompressor, VariablePerValueDecompressor},
+    encoder::PerValueDataBlock,
+};
 use lance_core::{datatypes::Field, utils::tokio::spawn_cpu, Result};
 
 use crate::{
@@ -1193,7 +1196,7 @@ impl MiniBlockScheduler {
             .create_miniblock_decompressor(layout.value_compression.as_ref().unwrap())?;
         let dictionary = if let Some(dictionary_encoding) = layout.dictionary.as_ref() {
             match dictionary_encoding.array_encoding.as_ref().unwrap() {
-                pb::array_encoding::ArrayEncoding::BinaryBlock(_) => {
+                pb::array_encoding::ArrayEncoding::Variable(_) => {
                     Some(MiniBlockSchedulerDictionary {
                         dictionary_decompressor: decompressors
                             .create_block_decompressor(dictionary_encoding)?
@@ -1697,8 +1700,14 @@ struct FullZipRepIndexDetails {
 }
 
 #[derive(Debug)]
+enum PerValueDecompressor {
+    Fixed(Arc<dyn FixedPerValueDecompressor>),
+    Variable(Arc<dyn VariablePerValueDecompressor>),
+}
+
+#[derive(Debug)]
 struct FullZipDecodeDetails {
-    value_decompressor: Arc<dyn PerValueDecompressor>,
+    value_decompressor: PerValueDecompressor,
     def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
     max_rep: u16,
@@ -1719,6 +1728,7 @@ pub struct FullZipScheduler {
     rep_index: Option<FullZipRepIndexDetails>,
     priority: u64,
     rows_in_page: u64,
+    bits_per_offset: u8,
     details: Arc<FullZipDecodeDetails>,
 }
 
@@ -1730,28 +1740,45 @@ impl FullZipScheduler {
         items_per_row: u64,
         layout: &pb::FullZipLayout,
         decompressors: &dyn DecompressorStrategy,
+        bits_per_offset: u8,
     ) -> Result<Self> {
-        // We don't need the data_buf_size because we either the data type is
+        // We don't need the data_buf_size because either the data type is
         // fixed-width (and we can tell size from rows_in_page) or it is not
         // and we have a repetition index.
         let (data_buf_position, _) = buffer_offsets_and_sizes[0];
         let rep_index = buffer_offsets_and_sizes.get(1).map(|(pos, len)| {
             let num_reps = (items_per_row * rows_in_page) + 1;
-            let bytes_per_value = len / num_reps;
+            let bytes_per_rep = len / num_reps;
             debug_assert_eq!(len % num_reps, 0);
             debug_assert!(
-                bytes_per_value == 1
-                    || bytes_per_value == 2
-                    || bytes_per_value == 4
-                    || bytes_per_value == 8
+                bytes_per_rep == 1
+                    || bytes_per_rep == 2
+                    || bytes_per_rep == 4
+                    || bytes_per_rep == 8
             );
             FullZipRepIndexDetails {
                 buf_position: *pos,
-                bytes_per_value,
+                bytes_per_value: bytes_per_rep,
             }
         });
-        let value_decompressor = decompressors
-            .create_per_value_decompressor(layout.value_compression.as_ref().unwrap())?;
+
+        let value_decompressor = match layout.details {
+            Some(pb::full_zip_layout::Details::BitsPerValue(_)) => {
+                let decompressor = decompressors.create_fixed_per_value_decompressor(
+                    layout.value_compression.as_ref().unwrap(),
+                )?;
+                PerValueDecompressor::Fixed(decompressor.into())
+            }
+            Some(pb::full_zip_layout::Details::BitsPerOffset(_)) => {
+                let decompressor = decompressors.create_variable_per_value_decompressor(
+                    layout.value_compression.as_ref().unwrap(),
+                )?;
+                PerValueDecompressor::Variable(decompressor.into())
+            }
+            None => {
+                panic!("Full-zip layout must have a `details` field");
+            }
+        };
         let ctrl_word_parser = ControlWordParser::new(
             layout.bits_rep.try_into().unwrap(),
             layout.bits_def.try_into().unwrap(),
@@ -1770,7 +1797,7 @@ impl FullZipScheduler {
             .sum();
 
         let details = Arc::new(FullZipDecodeDetails {
-            value_decompressor: value_decompressor.into(),
+            value_decompressor,
             def_meaning: def_meaning.into(),
             ctrl_word_parser,
             items_per_row,
@@ -1783,6 +1810,7 @@ impl FullZipScheduler {
             details,
             priority,
             rows_in_page,
+            bits_per_offset,
         })
     }
 
@@ -1791,6 +1819,7 @@ impl FullZipScheduler {
     ///
     /// This approach is needed whenever we have a repetition index and
     /// the data has a variable length.
+    #[allow(clippy::too_many_arguments)]
     async fn indirect_schedule_ranges(
         data_buffer_pos: u64,
         item_ranges: Vec<Range<u64>>,
@@ -1798,6 +1827,7 @@ impl FullZipScheduler {
         bytes_per_rep: u64,
         io: Arc<dyn EncodingsIo>,
         priority: u64,
+        bits_per_offset: u8,
         details: Arc<FullZipDecodeDetails>,
     ) -> Result<Box<dyn StructuralPageDecoder>> {
         let byte_ranges = io
@@ -1819,33 +1849,45 @@ impl FullZipScheduler {
 
         let data = io.submit_request(byte_ranges, priority);
 
-        let bits_per_value = details.value_decompressor.bits_per_value();
-        if bits_per_value > 0 {
-            if bits_per_value % 8 != 0 {
-                // Unlikely we will ever want this since full-zip values are so large the few bits we shave off don't
-                // make much difference.
-                unimplemented!("Bit-packed full-zip");
+        let data = data.await?;
+        let data = data
+            .into_iter()
+            .map(|d| LanceBuffer::from_bytes(d, 1))
+            .collect();
+        let num_rows = item_ranges.into_iter().map(|r| r.end - r.start).sum();
+
+        match &details.value_decompressor {
+            PerValueDecompressor::Fixed(decompressor) => {
+                let bits_per_value = decompressor.bits_per_value();
+                assert!(bits_per_value > 0);
+                if bits_per_value % 8 != 0 {
+                    // Unlikely we will ever want this since full-zip values are so large the few bits we shave off don't
+                    // make much difference.
+                    unimplemented!("Bit-packed full-zip");
+                }
+                let bytes_per_value = bits_per_value / 8;
+                let total_bytes_per_value =
+                    bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
+                Ok(Box::new(FixedFullZipDecoder {
+                    details,
+                    data,
+                    num_rows,
+                    offset_in_current: 0,
+                    bytes_per_value: bytes_per_value as usize,
+                    total_bytes_per_value,
+                }) as Box<dyn StructuralPageDecoder>)
             }
-            let bytes_per_value = bits_per_value / 8;
-            let total_bytes_per_value =
-                bytes_per_value as usize + details.ctrl_word_parser.bytes_per_word();
-            let data = data.await?;
-            let data = data
-                .into_iter()
-                .map(|d| LanceBuffer::from_bytes(d, 1))
-                .collect();
-            let num_rows = item_ranges.into_iter().map(|r| r.end - r.start).sum();
-            Ok(Box::new(FixedFullZipDecoder {
-                details,
-                data,
-                num_rows,
-                offset_in_current: 0,
-                bytes_per_value: bytes_per_value as usize,
-                total_bytes_per_value,
-            }) as Box<dyn StructuralPageDecoder>)
-        } else {
-            // Variable full-zip
-            todo!()
+            PerValueDecompressor::Variable(_decompressor) => {
+                // Variable full-zip
+
+                Ok(Box::new(VariableFullZipDecoder::new(
+                    details,
+                    data,
+                    num_rows,
+                    bits_per_offset,
+                    bits_per_offset,
+                )))
+            }
         }
     }
 
@@ -1862,7 +1904,6 @@ impl FullZipScheduler {
             .map(|r| r.start * self.details.items_per_row..r.end * self.details.items_per_row)
             .collect::<Vec<_>>();
 
-        // For each item range we need to read a portion of the repetition index
         let rep_index_ranges = item_ranges
             .iter()
             .flat_map(|r| {
@@ -1884,6 +1925,7 @@ impl FullZipScheduler {
             rep_index.bytes_per_value,
             io.clone(),
             self.priority,
+            self.bits_per_offset,
             self.details.clone(),
         )
         .boxed())
@@ -1904,8 +1946,12 @@ impl FullZipScheduler {
             .map(|r| r.start * self.details.items_per_row..r.end * self.details.items_per_row)
             .collect::<Vec<_>>();
 
+        let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor else {
+            unreachable!()
+        };
+
         // Convert item ranges to byte ranges (i.e. multiply by bytes per item)
-        let bits_per_value = self.details.value_decompressor.bits_per_value();
+        let bits_per_value = decompressor.bits_per_value();
         assert_eq!(bits_per_value % 8, 0);
         let bytes_per_value = bits_per_value / 8;
         let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
@@ -2019,7 +2065,12 @@ impl FixedFullZipDecoder {
             }
 
             FullZipDecodeTaskItem {
-                data: task_slice,
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data: task_slice,
+                    bits_per_value: self.bytes_per_value as u64 * 8,
+                    num_values: num_items,
+                    block_info: BlockInfo::new(),
+                }),
                 rows_in_buf: rows_started,
                 items_in_buf: num_items,
             }
@@ -2044,7 +2095,12 @@ impl FixedFullZipDecoder {
                 cur_buf.slice_with_length(offset_in_cur, bytes_needed)
             };
             FullZipDecodeTaskItem {
-                data: task_slice,
+                data: PerValueDataBlock::Fixed(FixedWidthDataBlock {
+                    data: task_slice,
+                    bits_per_value: self.bytes_per_value as u64 * 8,
+                    num_values: rows_taken,
+                    block_info: BlockInfo::new(),
+                }),
                 rows_in_buf: rows_taken,
                 items_in_buf: rows_taken,
             }
@@ -2075,9 +2131,275 @@ impl StructuralPageDecoder for FixedFullZipDecoder {
     }
 }
 
+/// A decoder for full-zip encoded data when the data has a variable-width
+///
+/// Here we need to unzip the control words AND lengths from the values and
+/// then decompress the requested values.
+#[derive(Debug)]
+struct VariableFullZipDecoder {
+    details: Arc<FullZipDecodeDetails>,
+    decompressor: Arc<dyn VariablePerValueDecompressor>,
+    data: LanceBuffer,
+    offsets: LanceBuffer,
+    rep: ScalarBuffer<u16>,
+    def: ScalarBuffer<u16>,
+    repdef_starts: Vec<usize>,
+    data_starts: Vec<usize>,
+    offset_starts: Vec<usize>,
+    visible_item_counts: Vec<u64>,
+    bits_per_offset: u8,
+    current_idx: usize,
+    num_rows: u64,
+}
+
+impl VariableFullZipDecoder {
+    fn new(
+        details: Arc<FullZipDecodeDetails>,
+        data: VecDeque<LanceBuffer>,
+        num_rows: u64,
+        in_bits_per_length: u8,
+        out_bits_per_offset: u8,
+    ) -> Self {
+        let decompressor = match details.value_decompressor {
+            PerValueDecompressor::Variable(ref d) => d.clone(),
+            _ => unreachable!(),
+        };
+
+        assert_eq!(in_bits_per_length % 8, 0);
+        assert!(out_bits_per_offset == 32 || out_bits_per_offset == 64);
+
+        let mut decoder = Self {
+            details,
+            decompressor,
+            data: LanceBuffer::empty(),
+            offsets: LanceBuffer::empty(),
+            rep: LanceBuffer::empty().borrow_to_typed_slice(),
+            def: LanceBuffer::empty().borrow_to_typed_slice(),
+            bits_per_offset: out_bits_per_offset,
+            repdef_starts: Vec::with_capacity(num_rows as usize + 1),
+            data_starts: Vec::with_capacity(num_rows as usize + 1),
+            offset_starts: Vec::with_capacity(num_rows as usize + 1),
+            visible_item_counts: Vec::with_capacity(num_rows as usize + 1),
+            current_idx: 0,
+            num_rows,
+        };
+
+        // There's no great time to do this and this is the least worst time.  If we don't unzip then
+        // we can't slice the data during the decode phase.  This is because we need the offsets to be
+        // unpacked to know where the values start and end.
+        //
+        // We don't want to unzip on the decode thread because that is a single-threaded path
+        // We don't want to unzip on the scheduling thread because that is a single-threaded path
+        //
+        // Fortunately, we know variable length data will always be read indirectly and so we can do it
+        // here, which should be on the indirect thread.  The primary disadvantage to doing it here is that
+        // we load all the data into memory and then throw it away only to load it all into memory again during
+        // the decode.
+        //
+        // There are some alternatives to investigate:
+        //   - Instead of just reading the beginning and end of the rep index we could read the entire
+        //     range in between.  This will give us the break points that we need for slicing and won't increase
+        //     the number of IOPs but it will mean we are doing more total I/O and we need to load the rep index
+        //     even when doing a full scan.
+        //   - We could force each decode task to do a full unzip of all the data.  Each decode task now
+        //     has to do more work but the work is all fused.
+        //   - We could just try doing this work on the decode thread and see if it is a problem.
+        decoder.unzip(data, in_bits_per_length, out_bits_per_offset, num_rows);
+
+        decoder
+    }
+
+    unsafe fn parse_length(data: &[u8], bits_per_offset: u8) -> u64 {
+        match bits_per_offset {
+            8 => *data.get_unchecked(0) as u64,
+            16 => u16::from_le_bytes([*data.get_unchecked(0), *data.get_unchecked(1)]) as u64,
+            32 => u32::from_le_bytes([
+                *data.get_unchecked(0),
+                *data.get_unchecked(1),
+                *data.get_unchecked(2),
+                *data.get_unchecked(3),
+            ]) as u64,
+            64 => u64::from_le_bytes([
+                *data.get_unchecked(0),
+                *data.get_unchecked(1),
+                *data.get_unchecked(2),
+                *data.get_unchecked(3),
+                *data.get_unchecked(4),
+                *data.get_unchecked(5),
+                *data.get_unchecked(6),
+                *data.get_unchecked(7),
+            ]),
+            _ => unreachable!(),
+        }
+    }
+
+    fn unzip(
+        &mut self,
+        data: VecDeque<LanceBuffer>,
+        in_bits_per_length: u8,
+        out_bits_per_offset: u8,
+        num_rows: u64,
+    ) {
+        // This undercounts if there are lists but, at this point, we don't really know how many items we have
+        let mut rep = Vec::with_capacity(num_rows as usize);
+        let mut def = Vec::with_capacity(num_rows as usize);
+        let bytes_cw = self.details.ctrl_word_parser.bytes_per_word() * num_rows as usize;
+
+        // This undercounts if there are lists
+        // It can also overcount if there are invisible items
+        let bytes_per_offset = out_bits_per_offset as usize / 8;
+        let bytes_offsets = bytes_per_offset * (num_rows as usize + 1);
+        let mut offsets_data = Vec::with_capacity(bytes_offsets);
+
+        let bytes_per_length = in_bits_per_length as usize / 8;
+        let bytes_lengths = bytes_per_length * num_rows as usize;
+
+        let bytes_data = data.iter().map(|d| d.len()).sum::<usize>();
+        // This overcounts since bytes_lengths and bytes_cw are undercounts
+        // It can also undercount if there are invisible items (hence the saturating_sub)
+        let mut unzipped_data =
+            Vec::with_capacity((bytes_data - bytes_cw).saturating_sub(bytes_lengths));
+
+        let mut current_offset = 0_u64;
+        let mut visible_item_count = 0_u64;
+        for databuf in data.into_iter() {
+            let mut databuf = databuf.as_ref();
+            while !databuf.is_empty() {
+                let data_start = unzipped_data.len();
+                let offset_start = offsets_data.len();
+                // TODO: Kind of inefficient we parse the control word twice here
+                let ctrl_desc = self.details.ctrl_word_parser.parse_desc(
+                    databuf,
+                    self.details.max_rep,
+                    self.details.max_visible_def,
+                );
+                self.details
+                    .ctrl_word_parser
+                    .parse(databuf, &mut rep, &mut def);
+                databuf = &databuf[self.details.ctrl_word_parser.bytes_per_word()..];
+
+                if ctrl_desc.is_new_row {
+                    self.repdef_starts.push(rep.len() - 1);
+                    self.data_starts.push(data_start);
+                    self.offset_starts.push(offset_start);
+                    self.visible_item_counts.push(visible_item_count);
+                }
+                if ctrl_desc.is_visible {
+                    visible_item_count += 1;
+                    // Safety: Data should have at least bytes_per_length bytes remaining
+                    debug_assert!(databuf.len() >= bytes_per_length);
+                    let length = unsafe { Self::parse_length(databuf, in_bits_per_length) };
+                    match out_bits_per_offset {
+                        32 => {
+                            offsets_data.extend_from_slice(&(current_offset as u32).to_le_bytes())
+                        }
+                        64 => offsets_data.extend_from_slice(&current_offset.to_le_bytes()),
+                        _ => unreachable!(),
+                    };
+                    databuf = &databuf[bytes_per_offset..];
+                    unzipped_data.extend_from_slice(&databuf[..length as usize]);
+                    databuf = &databuf[length as usize..];
+                    current_offset += length;
+                }
+            }
+        }
+        self.repdef_starts.push(rep.len());
+        self.data_starts.push(unzipped_data.len());
+        self.offset_starts.push(offsets_data.len());
+        self.visible_item_counts.push(visible_item_count);
+        match out_bits_per_offset {
+            32 => offsets_data.extend_from_slice(&(current_offset as u32).to_le_bytes()),
+            64 => offsets_data.extend_from_slice(&current_offset.to_le_bytes()),
+            _ => unreachable!(),
+        };
+        self.rep = ScalarBuffer::from(rep);
+        self.def = ScalarBuffer::from(def);
+        self.data = LanceBuffer::Owned(unzipped_data);
+        self.offsets = LanceBuffer::Owned(offsets_data);
+    }
+}
+
+impl StructuralPageDecoder for VariableFullZipDecoder {
+    fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+        let start = self.current_idx;
+        let end = start + num_rows as usize;
+
+        let data_start = self.data_starts[start];
+        let data_end = self.data_starts[end];
+        let data = self
+            .data
+            .slice_with_length(data_start, data_end - data_start);
+
+        let offset_start = self.offset_starts[start];
+        let offset_end = self.offset_starts[end] + (self.bits_per_offset as usize / 8);
+        let offsets = self
+            .offsets
+            .slice_with_length(offset_start, offset_end - offset_start);
+
+        let repdef_start = self.repdef_starts[start];
+        let repdef_end = self.repdef_starts[end];
+        let rep = self.rep.slice(repdef_start, repdef_end - repdef_start);
+        let def = self.def.slice(repdef_start, repdef_end - repdef_start);
+
+        let visible_item_counts_start = self.visible_item_counts[start];
+        let visible_item_counts_end = self.visible_item_counts[end];
+        let num_visible_items = visible_item_counts_end - visible_item_counts_start;
+
+        self.current_idx += num_rows as usize;
+
+        Ok(Box::new(VariableFullZipDecodeTask {
+            details: self.details.clone(),
+            decompressor: self.decompressor.clone(),
+            data,
+            offsets,
+            bits_per_offset: self.bits_per_offset,
+            num_visible_items,
+            rep,
+            def,
+        }))
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+}
+
+#[derive(Debug)]
+struct VariableFullZipDecodeTask {
+    details: Arc<FullZipDecodeDetails>,
+    decompressor: Arc<dyn VariablePerValueDecompressor>,
+    data: LanceBuffer,
+    offsets: LanceBuffer,
+    bits_per_offset: u8,
+    num_visible_items: u64,
+    rep: ScalarBuffer<u16>,
+    def: ScalarBuffer<u16>,
+}
+
+impl DecodePageTask for VariableFullZipDecodeTask {
+    fn decode(self: Box<Self>) -> Result<DecodedPage> {
+        let block = VariableWidthBlock {
+            data: self.data,
+            offsets: self.offsets,
+            bits_per_offset: self.bits_per_offset,
+            num_values: self.num_visible_items,
+            block_info: BlockInfo::new(),
+        };
+        let decomopressed = self.decompressor.decompress(block)?;
+        let rep = self.rep.to_vec();
+        let def = self.def.to_vec();
+        let unraveler =
+            RepDefUnraveler::new(Some(rep), Some(def), self.details.def_meaning.clone());
+        Ok(DecodedPage {
+            data: decomopressed,
+            repdef: unraveler,
+        })
+    }
+}
+
 #[derive(Debug)]
 struct FullZipDecodeTaskItem {
-    data: LanceBuffer,
+    data: PerValueDataBlock,
     rows_in_buf: u64,
     items_in_buf: u64,
 }
@@ -2098,7 +2420,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
         let estimated_size_bytes = self
             .data
             .iter()
-            .map(|task_item| task_item.data.len())
+            .map(|task_item| task_item.data.data_size() as usize)
             .sum::<usize>()
             * 2;
         let mut data_builder =
@@ -2109,10 +2431,15 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             //
             // We decompress each buffer and add it to our output buffer
             for task_item in self.data.into_iter() {
-                let decompressed = self
-                    .details
-                    .value_decompressor
-                    .decompress(task_item.data, task_item.items_in_buf)?;
+                let PerValueDataBlock::Fixed(fixed_data) = task_item.data else {
+                    unreachable!()
+                };
+                let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor
+                else {
+                    unreachable!()
+                };
+                debug_assert_eq!(fixed_data.num_values, task_item.items_in_buf);
+                let decompressed = decompressor.decompress(fixed_data)?;
                 data_builder.append(&decompressed, 0..task_item.items_in_buf);
             }
 
@@ -2128,11 +2455,14 @@ impl DecodePageTask for FixedFullZipDecodeTask {
             let mut def = Vec::with_capacity(self.num_items);
 
             for task_item in self.data.into_iter() {
-                let mut buf_slice = task_item.data.as_ref();
+                let PerValueDataBlock::Fixed(fixed_data) = task_item.data else {
+                    unreachable!()
+                };
+                let mut buf_slice = fixed_data.data.as_ref();
                 // We will be unzipping repdef in to `rep` and `def` and the
                 // values into `values` (which contains the compressed values)
                 let mut values = Vec::with_capacity(
-                    task_item.data.len()
+                    fixed_data.data.len()
                         - (self.details.ctrl_word_parser.bytes_per_word()
                             * task_item.items_in_buf as usize),
                 );
@@ -2158,10 +2488,17 @@ impl DecodePageTask for FixedFullZipDecodeTask {
 
                 // Finally, we decompress the values and add them to our output buffer
                 let values_buf = LanceBuffer::Owned(values);
-                let decompressed = self
-                    .details
-                    .value_decompressor
-                    .decompress(values_buf, visible_items)?;
+                let fixed_data = FixedWidthDataBlock {
+                    bits_per_value: self.bytes_per_value as u64 * 8,
+                    block_info: BlockInfo::new(),
+                    data: values_buf,
+                    num_values: visible_items,
+                };
+                let PerValueDecompressor::Fixed(decompressor) = &self.details.value_decompressor
+                else {
+                    unreachable!()
+                };
+                let decompressed = decompressor.decompress(fixed_data)?;
                 data_builder.append(&decompressed, 0..visible_items);
             }
 
@@ -2362,6 +2699,7 @@ impl StructuralPrimitiveFieldScheduler {
                         items_per_row,
                         full_zip,
                         decompressors,
+                        /*bits_per_offset=*/ 32,
                     )?)
                 }
                 Some(pb::page_layout::Layout::AllNullLayout(all_null)) => {
@@ -3605,7 +3943,7 @@ impl PrimitiveStructuralEncoder {
         );
         let len = variable.data.len()
             + repdef.bytes_per_word() * num_items as usize
-            + bytes_per_offset * num_items as usize;
+            + bytes_per_offset * variable.num_values as usize;
         let mut buf = Vec::with_capacity(len);
 
         let max_rep_index_val = if repdef.has_repetition() {
@@ -3664,6 +4002,13 @@ impl PrimitiveStructuralEncoder {
             _ => panic!("Unsupported offset size"),
         }
 
+        debug_assert_eq!(buf.len(), len);
+        // Put the final value in the rep index
+        // SAFETY: `zipped_data.len() == len`
+        unsafe {
+            rep_index_builder.append(buf.len() as u64);
+        }
+
         let zipped_data = LanceBuffer::Owned(buf);
         let rep_index = rep_index_builder.into_data();
         let rep_index = if rep_index.is_empty() {
@@ -3718,14 +4063,15 @@ impl PrimitiveStructuralEncoder {
 
         // To handle FSL we just flatten
         let data = data.flatten();
-        let num_items = if let Some(rep_levels) = repdef.repetition_levels.as_ref() {
-            // If there are rep levels there may be "invisible" items and we need to encode
-            // rep_levels.len() things which might be larger than data.num_values()
-            rep_levels.len() as u64
-        } else {
-            // If there are no rep levels then we encode data.num_values() things
-            data.num_values()
-        };
+        let (num_items, num_visible_items) =
+            if let Some(rep_levels) = repdef.repetition_levels.as_ref() {
+                // If there are rep levels there may be "invisible" items and we need to encode
+                // rep_levels.len() things which might be larger than data.num_values()
+                (rep_levels.len() as u64, data.num_values())
+            } else {
+                // If there are no rep levels then we encode data.num_values() things
+                (data.num_values(), data.num_values())
+            };
 
         let max_visible_def = repdef.max_visible_level.unwrap_or(u16::MAX);
 
@@ -3743,6 +4089,27 @@ impl PrimitiveStructuralEncoder {
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
 
+        let description = match &compressed_data {
+            PerValueDataBlock::Fixed(fixed) => ProtobufUtils::fixed_full_zip_layout(
+                bits_rep,
+                bits_def,
+                fixed.bits_per_value as u32,
+                value_encoding,
+                &repdef.def_meaning,
+                num_items as u32,
+                num_visible_items as u32,
+            ),
+            PerValueDataBlock::Variable(variable) => ProtobufUtils::variable_full_zip_layout(
+                bits_rep,
+                bits_def,
+                variable.bits_per_offset as u32,
+                value_encoding,
+                &repdef.def_meaning,
+                num_items as u32,
+                num_visible_items as u32,
+            ),
+        };
+
         let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items);
 
         let data = if let Some(repindex) = zipped.repetition_index {
@@ -3751,8 +4118,6 @@ impl PrimitiveStructuralEncoder {
             vec![zipped.values]
         };
 
-        let description =
-            ProtobufUtils::full_zip_layout(bits_rep, bits_def, value_encoding, &repdef.def_meaning);
         Ok(EncodedPage {
             num_rows: num_lists,
             column_idx,

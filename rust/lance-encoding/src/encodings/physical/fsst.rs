@@ -14,10 +14,14 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock},
     decoder::{MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder},
-    encoder::{ArrayEncoder, EncodedArray},
-    encoder::{MiniBlockCompressed, MiniBlockCompressor},
-    format::pb::{self},
-    format::ProtobufUtils,
+    encoder::{
+        ArrayEncoder, EncodedArray, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
+        PerValueDataBlock,
+    },
+    format::{
+        pb::{self},
+        ProtobufUtils,
+    },
     EncodingsIo,
 };
 
@@ -202,14 +206,13 @@ impl ArrayEncoder for FsstArrayEncoder {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct FsstMiniBlockEncoder {}
+struct FsstCompressed {
+    data: VariableWidthBlock,
+    symbol_table: Vec<u8>,
+}
 
-impl MiniBlockCompressor for FsstMiniBlockEncoder {
-    fn compress(
-        &self,
-        data: DataBlock,
-    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+impl FsstCompressed {
+    fn fsst_compress(data: DataBlock) -> Result<Self> {
         match data {
             DataBlock::VariableWidth(mut variable_width) => {
                 let offsets = variable_width.offsets.borrow_to_typed_slice::<i32>();
@@ -231,29 +234,22 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
                 )?;
 
                 // construct `DataBlock` for BinaryMiniBlockEncoder, we may want some `DataBlock` construct methods later
-                let data_block = DataBlock::VariableWidth(VariableWidthBlock {
+                let compressed = VariableWidthBlock {
                     data: LanceBuffer::reinterpret_vec(dest_values),
                     bits_per_offset: 32,
                     offsets: LanceBuffer::reinterpret_vec(dest_offsets),
                     num_values: variable_width.num_values,
                     block_info: BlockInfo::new(),
-                });
+                };
 
-                // compress the fsst compressed data using `BinaryMiniBlockEncoder`
-                let binary_compressor =
-                    Box::new(BinaryMiniBlockEncoder::default()) as Box<dyn MiniBlockCompressor>;
-
-                let (binary_miniblock_compressed, binary_array_encoding) =
-                    binary_compressor.compress(data_block)?;
-
-                Ok((
-                    binary_miniblock_compressed,
-                    ProtobufUtils::fsst_mini_block(binary_array_encoding, symbol_table),
-                ))
+                Ok(Self {
+                    data: compressed,
+                    symbol_table,
+                })
             }
             _ => Err(Error::InvalidInput {
                 source: format!(
-                    "Cannot compress a data block of type {} with BinaryMiniBlockEncoder",
+                    "Cannot compress a data block of type {} with FsstEncoder",
                     data.name()
                 )
                 .into(),
@@ -263,13 +259,65 @@ impl MiniBlockCompressor for FsstMiniBlockEncoder {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct FsstMiniBlockEncoder {}
+
+impl MiniBlockCompressor for FsstMiniBlockEncoder {
+    fn compress(
+        &self,
+        data: DataBlock,
+    ) -> Result<(MiniBlockCompressed, crate::format::pb::ArrayEncoding)> {
+        let compressed = FsstCompressed::fsst_compress(data)?;
+
+        let data_block = DataBlock::VariableWidth(compressed.data);
+
+        // compress the fsst compressed data using `BinaryMiniBlockEncoder`
+        let binary_compressor =
+            Box::new(BinaryMiniBlockEncoder::default()) as Box<dyn MiniBlockCompressor>;
+
+        let (binary_miniblock_compressed, binary_array_encoding) =
+            binary_compressor.compress(data_block)?;
+
+        Ok((
+            binary_miniblock_compressed,
+            ProtobufUtils::fsst(binary_array_encoding, compressed.symbol_table),
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct FsstPerValueEncoder {
+    inner: Box<dyn PerValueCompressor>,
+}
+
+impl FsstPerValueEncoder {
+    pub fn new(inner: Box<dyn PerValueCompressor>) -> Self {
+        Self { inner }
+    }
+}
+
+impl PerValueCompressor for FsstPerValueEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+        let compressed = FsstCompressed::fsst_compress(data)?;
+
+        let data_block = DataBlock::VariableWidth(compressed.data);
+
+        let (binary_compressed, binary_array_encoding) = self.inner.compress(data_block)?;
+
+        Ok((
+            binary_compressed,
+            ProtobufUtils::fsst(binary_array_encoding, compressed.symbol_table),
+        ))
+    }
+}
+
 #[derive(Debug)]
 pub struct FsstMiniBlockDecompressor {
     symbol_table: Vec<u8>,
 }
 
 impl FsstMiniBlockDecompressor {
-    pub fn new(description: &pb::FsstMiniBlock) -> Self {
+    pub fn new(description: &pb::Fsst) -> Self {
         Self {
             symbol_table: description.symbol_table.clone(),
         }
