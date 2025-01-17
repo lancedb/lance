@@ -243,6 +243,16 @@ pub(super) async fn add_columns_to_fragments(
         }
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
+
+            // Check that the schema is compatible considering all the new columns must be nullable
+            let schema = Schema::try_from(output_schema.as_ref())?;
+            if !schema.all_fields_nullable() {
+                return Err(Error::InvalidInput {
+                    source: "All-null columns must be nullable.".into(),
+                    location: location!(),
+                });
+            }
+
             let fragments = fragments
                 .iter()
                 .map(|f| f.metadata.clone())
@@ -1102,7 +1112,7 @@ mod test {
             Some(WriteParams {
                 max_rows_per_file: 50,
                 max_rows_per_group: 25,
-                data_storage_version: Some(LanceFileVersion::Legacy),
+                data_storage_version: Some(LanceFileVersion::Stable),
                 ..Default::default()
             }),
         )
@@ -1120,6 +1130,30 @@ mod test {
                 None,
             )
             .await?;
+
+        let data = dataset.scan().try_into_batch().await?;
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("nulls", DataType::Int32, true),
+        ]);
+        assert_eq!(data.schema().as_ref(), &expected_schema);
+        assert_eq!(data.num_rows(), num_rows as usize);
+
+        // check that can't add non-nullable columns
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("non_nulls", DataType::Int32, false),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("All-null columns must be nullable."));
 
         let data = dataset.scan().try_into_batch().await?;
         let expected_schema = ArrowSchema::new(vec![
@@ -1162,19 +1196,20 @@ mod test {
         .await?;
         dataset.validate().await?;
 
-        let err = dataset
-            .add_columns(
-                NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![ArrowField::new(
-                    "nulls",
-                    DataType::Int32,
-                    true,
-                )]))),
-                None,
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Cannot add all-null columns to legacy dataset version"));
+        let err =
+            dataset
+                .add_columns(
+                    NewColumnTransform::AllNulls(Arc::new(ArrowSchema::new(vec![
+                        ArrowField::new("nulls", DataType::Int32, true),
+                    ]))),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Cannot add all-null columns to legacy dataset version"));
 
         Ok(())
     }
