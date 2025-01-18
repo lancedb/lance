@@ -211,6 +211,22 @@ def test_filtered_sampling_odd_batch_size(tmp_path: Path):
     assert x.shape[1] == 3
 
 
+def test_len(tmp_path: Path):
+    tbl = pa.Table.from_pydict({"ints": pa.array(range(1000))})
+
+    lance.write_dataset(tbl, tmp_path, max_rows_per_file=200)
+
+    ds = LanceDataset(
+        tmp_path,
+        batch_size=38,
+        columns=["ints"],
+        samples=38 * 256,
+        filter="ints is not null",
+    )
+
+    assert len(ds) == 1000
+
+
 def test_sample_batches_with_filter(tmp_path: Path):
     NUM_ROWS = 10000
     tbl = pa.Table.from_pydict(

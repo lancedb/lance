@@ -278,6 +278,9 @@ class LanceDataset(torch.utils.data.IterableDataset):
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
 
+    def __len__(self) -> int:
+        return len(self.dataset)
+
     @property
     def schema(self) -> pa.Schema:
         if not self.columns:
