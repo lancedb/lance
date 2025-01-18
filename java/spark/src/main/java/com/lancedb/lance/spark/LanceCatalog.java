@@ -41,7 +41,8 @@ public class LanceCatalog implements TableCatalog {
 
   @Override
   public Table loadTable(Identifier ident) throws NoSuchTableException {
-    LanceConfig config = LanceConfig.from(options, ident.name());
+    LanceIdentifier lanceIdentifier = LanceIdentifier.of(ident);
+    LanceConfig config = lanceIdentifier.genLanceConfig(options);
     Optional<StructType> schema = LanceDatasetAdapter.getSchema(config);
     if (schema.isEmpty()) {
       throw new NoSuchTableException(config.getDbPath(), config.getDatasetName());
@@ -54,7 +55,8 @@ public class LanceCatalog implements TableCatalog {
       Identifier ident, StructType schema, Transform[] partitions, Map<String, String> properties)
       throws TableAlreadyExistsException, NoSuchNamespaceException {
     try {
-      LanceConfig config = LanceConfig.from(options, ident.name());
+      LanceIdentifier lanceIdentifier = LanceIdentifier.of(ident);
+      LanceConfig config = lanceIdentifier.genLanceConfig(options);
       WriteParams params = SparkOptions.genWriteParamsFromConfig(config);
       LanceDatasetAdapter.createDataset(ident.name(), schema, params);
     } catch (IllegalArgumentException e) {
@@ -70,7 +72,8 @@ public class LanceCatalog implements TableCatalog {
 
   @Override
   public boolean dropTable(Identifier ident) {
-    LanceConfig config = LanceConfig.from(options, ident.name());
+    LanceIdentifier lanceIdentifier = LanceIdentifier.of(ident);
+    LanceConfig config = lanceIdentifier.genLanceConfig(options);
     LanceDatasetAdapter.dropDataset(config);
     return true;
   }
