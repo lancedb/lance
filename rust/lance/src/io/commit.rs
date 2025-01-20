@@ -499,7 +499,9 @@ fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersio
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
     let needs_recalculating = match detect_overlapping_fragments(indices) {
         Ok(()) => vec![],
-        Err(BadFragmentBitmapError { index_names, .. }) => index_names,
+        Err(BadFragmentBitmapError { bad_indices }) => {
+            bad_indices.into_iter().map(|(name, _)| name).collect()
+        }
     };
     for index in indices {
         if needs_recalculating.contains(&index.name)
@@ -524,8 +526,7 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
 }
 
 pub(crate) struct BadFragmentBitmapError {
-    pub index_names: Vec<String>,
-    pub overlapping_fragments: Vec<Vec<u32>>,
+    pub bad_indices: Vec<(String, Vec<u32>)>,
 }
 
 /// Detect whether a given index has overlapping fragment bitmaps in it's index
@@ -534,8 +535,7 @@ pub(crate) fn detect_overlapping_fragments(
     indices: &[Index],
 ) -> std::result::Result<(), BadFragmentBitmapError> {
     let index_names: HashSet<&str> = indices.iter().map(|i| i.name.as_str()).collect();
-    let mut bad_indices = Vec::new();
-    let mut overlapping_frags = Vec::new();
+    let mut bad_indices = Vec::new(); // (index_name, overlapping_fragments)
     for name in index_names {
         let mut seen_fragment_ids = HashSet::new();
         let mut overlap = Vec::new();
@@ -549,17 +549,13 @@ pub(crate) fn detect_overlapping_fragments(
             }
         }
         if !overlap.is_empty() {
-            bad_indices.push(name.to_string());
-            overlapping_frags.push(overlap);
+            bad_indices.push((name.to_string(), overlap));
         }
     }
     if bad_indices.is_empty() {
         Ok(())
     } else {
-        Err(BadFragmentBitmapError {
-            index_names: bad_indices,
-            overlapping_fragments: overlapping_frags,
-        })
+        Err(BadFragmentBitmapError { bad_indices })
     }
 }
 

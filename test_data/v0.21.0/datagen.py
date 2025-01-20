@@ -19,7 +19,6 @@ data = pa.table(
 )
 ds = lance.write_dataset(data, "bad_index_fragment_bitmap")
 ds.create_index("vector", index_type="IVF_PQ", num_partitions=1, num_sub_vectors=1)
-ds.list_indices()
 
 data2 = pa.table(
     {

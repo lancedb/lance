@@ -1307,6 +1307,12 @@ impl Dataset {
 
         // Validate indices
         let indices = self.load_indices().await?;
+        self.validate_indices(&indices)?;
+
+        Ok(())
+    }
+
+    fn validate_indices(&self, indices: &[Index]) -> Result<()> {
         // Make sure there are no duplicate ids
         let mut index_ids = HashSet::new();
         for index in indices.iter() {
@@ -1323,11 +1329,9 @@ impl Dataset {
         }
 
         // For each index name, make sure there is no overlap in fragment bitmaps
-        if let Err(err) = detect_overlapping_fragments(indices.as_slice()) {
+        if let Err(err) = detect_overlapping_fragments(indices) {
             let mut message = "Overlapping fragments detected in dataset.".to_string();
-            for (index_name, overlapping_frags) in
-                err.index_names.iter().zip(err.overlapping_fragments.iter())
-            {
+            for (index_name, overlapping_frags) in err.bad_indices {
                 message.push_str(&format!(
                     "\nIndex {:?} has overlapping fragments: {:?}",
                     index_name, overlapping_frags
