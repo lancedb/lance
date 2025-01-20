@@ -79,7 +79,7 @@ use snafu::{location, Location};
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
-use crate::fragment::{FileFragment, FragmentMetadata};
+use crate::fragment::FileFragment;
 use crate::scanner::LanceScanStats;
 use crate::schema::LanceSchema;
 use crate::session::Session;
@@ -487,7 +487,7 @@ impl Dataset {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None))]
+    #[pyo3(signature=(columns=None, columns_with_transform=None, filter=None, prefilter=None, limit=None, offset=None, nearest=None, batch_size=None, io_buffer_size=None, batch_readahead=None, fragment_readahead=None, scan_in_order=None, fragments=None, with_row_id=None, with_row_address=None, use_stats=None, substrait_filter=None, fast_search=None, full_text_query=None, late_materialization=None, use_scalar_index=None, stats_handler=None))]
     fn scanner(
         self_: PyRef<'_, Self>,
         columns: Option<Vec<String>>,
@@ -606,7 +606,7 @@ impl Dataset {
                     let wrapped_stats = LanceScanStats::new(stats);
                     let stats_handler = stats_handler.clone();
                     Python::with_gil(move |py| {
-                        let args = PyTuple::new(py, vec![wrapped_stats.into_py(py)]);
+                        let args = PyTuple::new_bound(py, vec![wrapped_stats.into_py(py)]);
                         stats_handler.call1(py, args)
                     })
                     .map_err(|err| lance_core::Error::Wrapped {
