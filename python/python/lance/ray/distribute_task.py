@@ -1,118 +1,128 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
-from typing import Any, Callable, Dict, List
-
-from ray.data._internal.datasource.lance_datasource import LanceDatasource
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 import lance
 
+# ==============================================================================
+# Message Structure Constants
+# ==============================================================================
+TASK_ID_KEY = "task_id"
+PARTITION_KEY = "partition"
 
-class TaskCommitMessage:
-    def __init__(self, task_id: str, partition: Dict[Any, Any]):
-        self.task_id = task_id
-        self.partition = partition
+# ==============================================================================
+# Data Component Keys
+# ==============================================================================
+FRAGMENT_KEY = "fragment"
+SCHEMA_KEY = "schema"
 
-    def __getitem__(self, key):
-        if key == "task_id":
-            return self.task_id
-        elif key == "partition":
-            return self.partition
-        else:
-            raise KeyError(f"Key {key} not found")
+# ==============================================================================
+# Operation Parameters
+# ==============================================================================
+PARAMS_KEY = "params"
+ACTION_KEY = "action"
+READ_COLUMNS_KEY = "read_columns"
+
+# ==============================================================================
+# Execution Metadata
+# ==============================================================================
+OPERATION_TYPE_KEY = "operation_type"
+VERSION_KEY = "version"
 
 
+@dataclass
 class TaskInput:
-    def __init__(self, task_id: str, fn: Callable, partition: Dict[Any, Any]):
-        self.task_id = task_id
-        self.fn = fn
-        self.partition = partition
+    """Container for task execution parameters and metadata."""
+
+    task_id: str
+    fn: Callable
+    fragment: Any
+    params: Dict[str, Any] = field(default_factory=dict)
 
 
-class CustomTask:
-    def __init__(self, task_input: "TaskInput"):
-        self._fn = task_input.fn
-        self._task_id = task_input.task_id
+class FragmentTask:
+    """Base class for distributed data processing tasks."""
+
+    def __init__(self, task_input: TaskInput):
+        self.task_input = task_input
 
     def __call__(self) -> Dict[str, Any]:
         output = self._fn()
-        return {"commit_messages": TaskCommitMessage(self._task_id, {"output", output})}
-
-
-class DistributeCustomTasks:
-    def __init__(self, ray_lance_ds: LanceDatasource):
-        self.ray_lance_ds = ray_lance_ds
-        self.lance_ds = ray_lance_ds.lance_ds
-
-    def get_custom_tasks(
-        self,
-        fn: Callable,
-        params: Dict[str, Any] = None,
-    ) -> List[CustomTask]:
-        custom_tasks = []
-        for fragment in self.lance_ds.get_fragments():
-            task_input = TaskInput(
-                fragment.fragment_id,
-                fn=fn,
-                partition={"fragment": fragment, "params": params},
-            )
-            if params["action"] == "add_column":
-                custom_task = AddColumnTask(task_input)
-            elif params["action"] == "delete_records":
-                custom_task = DeleteRecordTask(task_input)
-            else:
-                custom_task = CustomTask(task_input)
-            custom_tasks.append(custom_task)
-
-        return custom_tasks
-
-    def commit_tasks(self, commit_messages: List[TaskCommitMessage]) -> bool:
-        merged_fragments = [item["partition"]["fragment"] for item in commit_messages]
-        schema = commit_messages[0]["partition"]["schema"]
-        operation = lance.LanceOperation.Merge(merged_fragments, schema)
-        lance.LanceDataset.commit(
-            self.ray_lance_ds.uri,
-            operation,
-            read_version=self.lance_ds.version,
-            storage_options=self.ray_lance_ds.storage_options,
-        )
-        return True
-
-
-class AddColumnTask(CustomTask):
-    def __init__(self, task_input: TaskInput):
-        self.fragment_id = task_input.task_id
-        self.fn = task_input.fn
-        assert task_input.partition["fragment"] is not None
-        self.fragment = task_input.partition["fragment"]
-        params = task_input.partition["params"]
-        assert (
-            params is not None
-            and params["action"] == "add_column"
-            and params["read_columns"] is not None
-        )
-        self.read_columns = params["read_columns"]
-
-    def __call__(self) -> Dict[str, Any]:
-        new_fragment, new_schema = self.fragment.merge_columns(
-            self.fn, self.read_columns
-        )
         return {
-            "commit_messages": TaskCommitMessage(
-                task_id=self.fragment_id,
-                partition={"fragment": new_fragment, "schema": new_schema},
-            )
+            TASK_ID_KEY: self.task_input._task_id,
+            PARTITION_KEY: {FRAGMENT_KEY: self.task_input._fragment, "output": output},
         }
 
 
-class DeleteRecordTask(CustomTask):
-    def __init__(self, task_input: TaskInput):
-        self.fragment_id = task_input.task_id
-        assert (
-            task_input.partition["fragment"] is not None
-            and task_input.partition["delete_rows_predicate"] is not None
-        )
-        self.delete_rows_predicate = task_input.partition["delete_rows_predicate"]
-        self.fragment = task_input.partition["fragment"]
+class AddColumnTask(FragmentTask):
+    """Task for adding new columns to dataset fragments."""
 
-    def __call__(self, *args, **kwargs) -> TaskCommitMessage:
-        return self.fragment.delete_rows(*args, **kwargs)
+    def __init__(self, task_input: TaskInput, read_columns):
+        super().__init__(task_input)
+        self._read_columns = read_columns
+        self._validate_input_params()
+
+    def _validate_input_params(self) -> None:
+        """Ensure required parameters are present and valid."""
+        if self.task_input.fragment is None:
+            raise ValueError("Fragment must be provided for column addition")
+
+    def __call__(self) -> Dict[str, Any]:
+        """Execute column addition and return updated fragment metadata."""
+        new_fragment, new_schema = self._fragment.merge_columns(
+            value_func=self._fn, columns=self._read_columns
+        )
+        return {
+            TASK_ID_KEY: self._task_id,
+            PARTITION_KEY: {FRAGMENT_KEY: new_fragment, SCHEMA_KEY: new_schema},
+        }
+
+
+class DispatchFragmentTasks:
+    """Orchestrates distributed execution of fragment operations."""
+
+    def __init__(self, dataset: lance.LanceDataset):
+        self.dataset = dataset
+
+    def get_tasks(
+        self, transform_fn: Callable, operation_params: Optional[Dict[str, Any]] = None
+    ) -> List[FragmentTask]:
+        """Generate tasks for processing all dataset fragments."""
+        operation_params = operation_params or {}
+        return [
+            self._create_task(fragment, transform_fn, operation_params)
+            for fragment in self.dataset.get_fragments()
+        ]
+
+    def _create_task(
+        self, fragment: Any, transform_fn: Callable, params: Dict[str, Any]
+    ) -> FragmentTask:
+        """Factory method for creating appropriate task type."""
+        task_input = TaskInput(
+            task_id=fragment.fragment_id,
+            fn=transform_fn,
+            fragment=fragment,
+            params=params,
+        )
+
+        if params[ACTION_KEY] == "add_column":
+            return AddColumnTask(task_input, params[READ_COLUMNS_KEY])
+
+        raise ValueError(f"Unsupported operation: {params[ACTION_KEY]}")
+
+    def commit_results(self, partitions: List[Dict[str, Any]]) -> bool:
+        """Commit processed results to the dataset."""
+        if not partitions:
+            return False
+
+        fragments = [part[FRAGMENT_KEY] for part in partitions]
+        unified_schema = partitions[0][SCHEMA_KEY]
+
+        operation = lance.LanceOperation.Merge(fragments, unified_schema)
+        self.dataset.commit(
+            base_uri=self.dataset.uri,
+            operation=operation,
+            read_version=self.dataset.version,
+        )
+        return True
