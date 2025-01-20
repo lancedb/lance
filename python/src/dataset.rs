@@ -604,8 +604,7 @@ impl Dataset {
                 let stats_handler = stats_handler.unbind();
                 let stats_handler = ScanStatisticsHandler::Custom(Arc::new(move |stats| {
                     let wrapped_stats = LanceScanStats::new(stats);
-                    let stats_handler = stats_handler.clone();
-                    Python::with_gil(move |py| {
+                    Python::with_gil(|py| {
                         let args = PyTuple::new_bound(py, vec![wrapped_stats.into_py(py)]);
                         stats_handler.call1(py, args)
                     })
