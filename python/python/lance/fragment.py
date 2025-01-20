@@ -692,8 +692,7 @@ if TYPE_CHECKING:
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_move_stable_row_ids: bool = False,
-    ) -> Transaction:
-        ...
+    ) -> Transaction: ...
 
     @overload
     def write_fragments(
@@ -711,8 +710,7 @@ if TYPE_CHECKING:
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_move_stable_row_ids: bool = False,
-    ) -> List[FragmentMetadata]:
-        ...
+    ) -> List[FragmentMetadata]: ...
 
 
 def write_fragments(
