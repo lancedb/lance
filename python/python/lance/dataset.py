@@ -3082,9 +3082,19 @@ class ScannerBuilder:
                 # Serialize the pyarrow compute expression toSubstrait and use
                 # that as a filter.
                 scalar_schema = pa.schema(fields_without_lists)
-                self._substrait_filter = serialize_expressions(
+                substrait_filter = serialize_expressions(
                     [filter], ["my_filter"], scalar_schema
                 )
+                if isinstance(substrait_filter, memoryview):
+                    self._substrait_filter = substrait_filter.tobytes()
+                else:
+                    try:
+                        self._substrait_filter = substrait_filter.to_pybytes()
+                    except AttributeError:
+                        raise TypeError(
+                            "serialize_expressions returned unexpected"
+                            f"type {type(substrait_filter)}"
+                        )
             except ImportError:
                 # serialize_expressions was introduced in pyarrow 14.  Fallback to
                 # stringifying the expression if pyarrow is too old
