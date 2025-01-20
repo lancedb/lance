@@ -497,8 +497,16 @@ fn must_recalculate_fragment_bitmap(index: &Index, version: Option<&WriterVersio
 ///
 /// Indices might be missing `fragment_bitmap`, so this function will add it.
 async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()> {
+    let needs_recalculating = match detect_overlapping_fragments(indices) {
+        Ok(()) => vec![],
+        Err(BadFragmentBitmapError { bad_indices }) => {
+            bad_indices.into_iter().map(|(name, _)| name).collect()
+        }
+    };
     for index in indices {
-        if must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref()) {
+        if needs_recalculating.contains(&index.name)
+            || must_recalculate_fragment_bitmap(index, dataset.manifest.writer_version.as_ref())
+        {
             debug_assert_eq!(index.fields.len(), 1);
             let idx_field = dataset.schema().field_by_id(index.fields[0]).ok_or_else(|| Error::Internal { message: format!("Index with uuid {} referred to field with id {} which did not exist in dataset", index.uuid, index.fields[0]), location: location!() })?;
             // We need to calculate the fragments covered by the index
@@ -515,6 +523,40 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [Index]) -> Result<()>
     }
 
     Ok(())
+}
+
+pub(crate) struct BadFragmentBitmapError {
+    pub bad_indices: Vec<(String, Vec<u32>)>,
+}
+
+/// Detect whether a given index has overlapping fragment bitmaps in it's index
+/// segments.
+pub(crate) fn detect_overlapping_fragments(
+    indices: &[Index],
+) -> std::result::Result<(), BadFragmentBitmapError> {
+    let index_names: HashSet<&str> = indices.iter().map(|i| i.name.as_str()).collect();
+    let mut bad_indices = Vec::new(); // (index_name, overlapping_fragments)
+    for name in index_names {
+        let mut seen_fragment_ids = HashSet::new();
+        let mut overlap = Vec::new();
+        for index in indices.iter().filter(|i| i.name == name) {
+            if let Some(fragment_bitmap) = index.fragment_bitmap.as_ref() {
+                for fragment in fragment_bitmap {
+                    if !seen_fragment_ids.insert(fragment) {
+                        overlap.push(fragment);
+                    }
+                }
+            }
+        }
+        if !overlap.is_empty() {
+            bad_indices.push((name.to_string(), overlap));
+        }
+    }
+    if bad_indices.is_empty() {
+        Ok(())
+    } else {
+        Err(BadFragmentBitmapError { bad_indices })
+    }
 }
 
 pub(crate) async fn do_commit_detached_transaction(

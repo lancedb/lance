@@ -504,11 +504,9 @@ async fn optimize_ivf_pq_indices(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());
 
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
-        0
-    } else {
-        existing_indices.len() - options.num_indices_to_merge
-    };
+    let start_pos = existing_indices
+        .len()
+        .saturating_sub(options.num_indices_to_merge);
 
     let indices_to_merge = existing_indices[start_pos..]
         .iter()
