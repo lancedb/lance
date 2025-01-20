@@ -1858,6 +1858,13 @@ pub mod array {
         Box::new(RandomListGenerator::new(child_gen, is_large))
     }
 
+    pub fn rand_list_any(
+        item_gen: Box<dyn ArrayGenerator>,
+        is_large: bool,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(RandomListGenerator::new(item_gen, is_large))
+    }
+
     pub fn rand_struct(fields: Fields) -> Box<dyn ArrayGenerator> {
         let child_gens = fields
             .iter()
