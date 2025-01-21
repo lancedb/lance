@@ -858,6 +858,8 @@ async fn configure_store(
     // Block size: On local file systems, we use 4KB block size. On cloud
     // object stores, we use 64KB block size. This is generally the largest
     // block size where we don't see a latency penalty.
+    let file_block_size = options.block_size.unwrap_or(4 * 1024);
+    let cloud_block_size = options.block_size.unwrap_or(64 * 1024);
     match url.scheme() {
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
@@ -916,7 +918,7 @@ async fn configure_store(
             Ok(ObjectStore {
                 inner: Arc::new(store).traced(),
                 scheme: String::from(url.scheme()),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
                 use_constant_size_upload_parts,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -935,7 +937,7 @@ async fn configure_store(
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("gs"),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -950,7 +952,7 @@ async fn configure_store(
             Ok(ObjectStore {
                 inner: store,
                 scheme: String::from("az"),
-                block_size: 64 * 1024,
+                block_size: cloud_block_size,
                 use_constant_size_upload_parts: false,
                 list_is_lexically_ordered: true,
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
@@ -961,14 +963,20 @@ async fn configure_store(
         // however this makes testing harder as we can't use the same code path
         // "file-object-store" forces local file system dataset to use the same
         // code path as cloud object stores
-        "file" => Ok(ObjectStore::from_path(url.path())?.0),
+        "file" => {
+            let mut object_store = ObjectStore::from_path(url.path())?.0;
+            object_store.set_block_size(file_block_size);
+            Ok(object_store)
+        }
         "file-object-store" => {
-            Ok(ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0)
+            let mut object_store = ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0;
+            object_store.set_block_size(file_block_size);
+            Ok(object_store)
         }
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: cloud_block_size,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
@@ -1175,6 +1183,54 @@ mod tests {
             .unwrap();
         assert_eq!(store.scheme, "gs");
         assert_eq!(path.to_string(), "foo.lance");
+    }
+
+    macro_rules! test_block_size_used_test {
+        ($uri:expr, $storage_options:expr, $default_size:expr) => {
+            let uri = $uri;
+
+            // Test the default
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let params = ObjectStoreParams {
+                storage_options: $storage_options,
+                ..ObjectStoreParams::default()
+            };
+            let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+                .await
+                .unwrap();
+            assert_eq!(store.block_size, $default_size);
+
+            // Ensure param is used
+            let registry = Arc::new(ObjectStoreRegistry::default());
+            let params = ObjectStoreParams {
+                block_size: Some(1024),
+                storage_options: $storage_options,
+                ..ObjectStoreParams::default()
+            };
+            let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+                .await
+                .unwrap();
+            assert_eq!(store.block_size, 1024);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_block_size_used() {
+        test_block_size_used_test!("s3://bucket/foo.lance", None, 64 * 1024);
+        test_block_size_used_test!("gs://bucket/foo.lance", None, 64 * 1024);
+        test_block_size_used_test!("memory:///foo.lance", None, 64 * 1024);
+
+        test_block_size_used_test!("az://account/bucket/foo.lance",
+                                   Some(HashMap::from([(String::from("account_name"), String::from("account")),
+                                                       (String::from("container_name"), String::from("container"))])),
+                                   64 * 1024);
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
+        let file_path = format!("{tmp_path}/bar/foo.lance/test_file");
+        write_to_file(&file_path, "URL").unwrap();
+        test_block_size_used_test!(&format!("file:///{file_path}"), None, 4 * 1024);
+        test_block_size_used_test!(&format!("file-object-store:///{file_path}"), None, 4 * 1024);
     }
 
     #[tokio::test]
