@@ -10,6 +10,7 @@ use arrow_array::{
     cast::AsArray, types::UInt32Type, Array, FixedSizeListArray, RecordBatch, UInt32Array,
 };
 use arrow_schema::Field;
+use lance_table::utils::LanceIteratorExtension;
 use snafu::{location, Location};
 use tracing::instrument;
 
@@ -122,6 +123,8 @@ impl PartitionFilter {
                     None
                 }
             })
+            // in most cases, no partition will be filtered out.
+            .exact_size(partition_ids.len())
             .collect()
     }
 }

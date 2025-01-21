@@ -16,6 +16,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::compute_partition;
+use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
 use snafu::{location, Location};
@@ -143,6 +144,7 @@ impl ProductQuantizer {
 
         let flatten_data = fsl.values().as_primitive::<T>();
         let sub_dim = dim / num_sub_vectors;
+        let total_code_length = fsl.len() * num_sub_vectors / (8 / NUM_BITS as usize);
         let values = flatten_data
             .values()
             .chunks_exact(dim)
@@ -169,6 +171,7 @@ impl ProductQuantizer {
                     sub_vec_code
                 }
             })
+            .exact_size(total_code_length)
             .collect::<Vec<_>>();
 
         let num_sub_vectors_in_byte = if NUM_BITS == 4 {
