@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::iter;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
+use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
 use snafu::{location, Location};
 use tracing::instrument;
@@ -77,6 +79,7 @@ where
         )
         .into()
     });
+    let part_ids = part_ids.values();
 
     let vectors_slice = vectors.values();
     let centroids_slice = centroids.values();
@@ -84,10 +87,11 @@ where
         .chunks_exact(dimension)
         .enumerate()
         .flat_map(|(idx, vector)| {
-            let part_id = part_ids.value(idx) as usize;
+            let part_id = part_ids[idx] as usize;
             let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
-            vector.iter().zip(c.iter()).map(|(v, cent)| *v - *cent)
+            iter::zip(vector, c).map(|(v, cent)| *v - *cent)
         })
+        .exact_size(vectors.len() * dimension)
         .collect::<Vec<_>>();
     let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
     Ok(FixedSizeListArray::try_new_from_values(
