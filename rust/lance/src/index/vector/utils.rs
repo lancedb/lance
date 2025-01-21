@@ -9,7 +9,7 @@ use log::info;
 use snafu::{location, Location};
 use tokio::sync::Mutex;
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, ProjectionRequest, TakeBuilder};
 use crate::{Error, Result};
 
 /// Get the vector dimension of the given column in the schema.
@@ -107,7 +107,20 @@ pub async fn maybe_sample_training_data(
     sample_size_hint: usize,
 ) -> Result<FixedSizeListArray> {
     let num_rows = dataset.count_rows(None).await?;
-    let batch = if num_rows > sample_size_hint {
+
+    let is_nullable = dataset
+        .schema()
+        .field(column)
+        .ok_or(Error::Index {
+            message: format!(
+                "Sample training data: column {} does not exist in schema",
+                column
+            ),
+            location: location!(),
+        })?
+        .nullable;
+
+    let batch = if num_rows > sample_size_hint && !is_nullable {
         let projection = dataset.schema().project(&[column])?;
         let batch = dataset.sample(sample_size_hint, &projection).await?;
         info!(
@@ -115,9 +128,51 @@ pub async fn maybe_sample_training_data(
             batch.num_rows()
         );
         batch
+    } else if num_rows > sample_size_hint && is_nullable {
+        // Need to filter out null values
+        // Use a scan to collect row ids. Then sample from the row ids. Then do take.
+        let row_addrs = dataset
+            .scan()
+            .filter_expr(datafusion_expr::col(column).is_not_null())
+            .with_row_address()
+            .project(&["_rowaddr"])?
+            .try_into_batch()
+            .await?;
+        debug_assert_eq!(row_addrs.num_columns(), 1);
+        debug_assert_eq!(row_addrs["_rowaddr"].logical_null_count(), 0);
+        let row_addrs = row_addrs
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .ok_or(Error::Index {
+                message: format!(
+                    "Sample training data: column {} is not a UInt64Array",
+                    column
+                ),
+                location: location!(),
+            })?;
+
+        let batch = TakeBuilder::try_new_from_addresses(
+            Arc::new(dataset.clone()),
+            row_addrs.values().to_vec(),
+            Arc::new(
+                ProjectionRequest::from_columns([column], dataset.schema())
+                    .into_projection_plan(dataset.schema())?,
+            ),
+        )?
+        .execute()
+        .await?;
+        info!(
+            "Sample training data: retrieved {} rows by sampling after filtering out nulls",
+            batch.num_rows()
+        );
+        batch
     } else {
         let mut scanner = dataset.scan();
         scanner.project(&[column])?;
+        if is_nullable {
+            scanner.filter_expr(datafusion_expr::col(column).is_not_null());
+        }
         let batch = scanner.try_into_batch().await?;
         info!(
             "Sample training data: retrieved {} rows scanning full datasets",

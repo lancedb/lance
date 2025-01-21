@@ -1741,11 +1741,15 @@ mod tests {
     use std::ops::Range;
 
     use arrow_array::types::UInt64Type;
-    use arrow_array::{Float32Array, RecordBatchIterator, RecordBatchReader, UInt64Array};
+    use arrow_array::{
+        make_array, Float32Array, RecordBatchIterator, RecordBatchReader, UInt64Array,
+    };
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
     use arrow_schema::Field;
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
+    use lance_datagen::{array, gen, Dimension, RowCount};
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -1753,9 +1757,12 @@ mod tests {
         generate_scaled_random_array, sample_without_replacement,
     };
     use rand::{seq::SliceRandom, thread_rng};
+    use rstest::rstest;
     use tempfile::tempdir;
 
+    use crate::dataset::InsertBuilder;
     use crate::index::prefilter::DatasetPreFilter;
+    use crate::index::vector::IndexFileVersion;
     use crate::index::vector_index_details;
     use crate::index::{vector::VectorIndexParams, DatasetIndexExt, DatasetIndexInternalExt};
 
@@ -2213,6 +2220,77 @@ mod tests {
                 is_not_remapped,
             )
             .await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_create_index_nulls(
+        // We test L2 and Dot, because L2 PQ uses residuals while Dot doesn't,
+        // so they have slightly different code paths.
+        #[values(
+            VectorIndexParams::with_ivf_pq_params(
+                MetricType::L2,
+                IvfBuildParams::new(2),
+                PQBuildParams::new(2, 4),
+            ),
+            VectorIndexParams::with_ivf_pq_params(
+                MetricType::Dot,
+                IvfBuildParams::new(2),
+                PQBuildParams::new(2, 4),
+            ),
+            VectorIndexParams::with_ivf_pq_params(
+                MetricType::Dot,
+                IvfBuildParams::new(2),
+                PQBuildParams::new(2, 4),
+            ),
+            VectorIndexParams::ivf_flat(1, MetricType::Dot),
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                MetricType::Dot,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                PQBuildParams::new(2, 4)
+            ),
+            VectorIndexParams::with_ivf_hnsw_sq_params(
+                MetricType::Dot,
+                IvfBuildParams::new(2),
+                HnswBuildParams::default(),
+                SQBuildParams::default()
+            )
+        )]
+        mut index_params: VectorIndexParams,
+        #[values(IndexFileVersion::Legacy, IndexFileVersion::V3)] index_version: IndexFileVersion,
+    ) {
+        index_params.version(index_version);
+
+        let nrows = 2_000;
+        let data = gen()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(16)))
+            .into_batch_rows(RowCount::from(nrows))
+            .unwrap();
+
+        // Make every other row null
+        let null_buffer = (0..nrows).map(|i| i % 2 == 0).collect::<BooleanBuffer>();
+        let null_buffer = NullBuffer::new(null_buffer);
+        let vectors = data["vec"]
+            .clone()
+            .to_data()
+            .into_builder()
+            .nulls(Some(null_buffer))
+            .build()
+            .unwrap();
+        let vectors = make_array(vectors);
+        let data = RecordBatch::try_new(data.schema(), vec![vectors]).unwrap();
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        // Create index
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, false)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
