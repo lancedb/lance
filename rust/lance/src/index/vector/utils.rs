@@ -135,7 +135,7 @@ pub async fn maybe_sample_training_data(
             .scan()
             .filter_expr(datafusion_expr::col(column).is_not_null())
             .with_row_address()
-            .project(&["_rowaddr"])?
+            .project::<&str>(&[])?
             .try_into_batch()
             .await?;
         debug_assert_eq!(row_addrs.num_columns(), 1);
