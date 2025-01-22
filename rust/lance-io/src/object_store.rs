@@ -969,7 +969,8 @@ async fn configure_store(
             Ok(object_store)
         }
         "file-object-store" => {
-            let mut object_store = ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0;
+            let mut object_store =
+                ObjectStore::from_path_with_scheme(url.path(), "file-object-store")?.0;
             object_store.set_block_size(file_block_size);
             Ok(object_store)
         }
@@ -1120,6 +1121,7 @@ lazy_static::lazy_static! {
 mod tests {
     use super::*;
     use parquet::data_type::AsBytes;
+    use rstest::rstest;
     use std::env::set_current_dir;
     use std::fs::{create_dir_all, write};
     use std::path::Path as StdPath;
@@ -1185,52 +1187,63 @@ mod tests {
         assert_eq!(path.to_string(), "foo.lance");
     }
 
-    macro_rules! test_block_size_used_test {
-        ($uri:expr, $storage_options:expr, $default_size:expr) => {
-            let uri = $uri;
+    async fn test_block_size_used_test_helper(
+        uri: &str,
+        storage_options: Option<HashMap<String, String>>,
+        default_expected_block_size: usize,
+    ) {
+        // Test the default
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            storage_options: storage_options.clone(),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, default_expected_block_size);
 
-            // Test the default
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            let params = ObjectStoreParams {
-                storage_options: $storage_options,
-                ..ObjectStoreParams::default()
-            };
-            let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
-                .await
-                .unwrap();
-            assert_eq!(store.block_size, $default_size);
-
-            // Ensure param is used
-            let registry = Arc::new(ObjectStoreRegistry::default());
-            let params = ObjectStoreParams {
-                block_size: Some(1024),
-                storage_options: $storage_options,
-                ..ObjectStoreParams::default()
-            };
-            let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
-                .await
-                .unwrap();
-            assert_eq!(store.block_size, 1024);
-        }
+        // Ensure param is used
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            block_size: Some(1024),
+            storage_options: storage_options.clone(),
+            ..ObjectStoreParams::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(registry, uri, &params)
+            .await
+            .unwrap();
+        assert_eq!(store.block_size, 1024);
     }
 
+    #[rstest]
+    #[case("s3://bucket/foo.lance", None)]
+    #[case("gs://bucket/foo.lance", None)]
+    #[case("memory:///bucket/foo.lance", None)]
+    #[case("az://account/bucket/foo.lance",
+      Some(HashMap::from([
+            (String::from("account_name"), String::from("account")),
+            (String::from("container_name"), String::from("container"))
+           ])))]
     #[tokio::test]
-    async fn test_block_size_used() {
-        test_block_size_used_test!("s3://bucket/foo.lance", None, 64 * 1024);
-        test_block_size_used_test!("gs://bucket/foo.lance", None, 64 * 1024);
-        test_block_size_used_test!("memory:///foo.lance", None, 64 * 1024);
+    async fn test_block_size_used_cloud(
+        #[case] uri: &str,
+        #[case] storage_options: Option<HashMap<String, String>>,
+    ) {
+        test_block_size_used_test_helper(&uri, storage_options, 64 * 1024).await;
+    }
 
-        test_block_size_used_test!("az://account/bucket/foo.lance",
-                                   Some(HashMap::from([(String::from("account_name"), String::from("account")),
-                                                       (String::from("container_name"), String::from("container"))])),
-                                   64 * 1024);
-
+    #[rstest]
+    #[case("file")]
+    #[case("file-object-store")]
+    #[tokio::test]
+    async fn test_block_size_used_file(#[case] prefix: &str) {
         let tmp_dir = tempfile::tempdir().unwrap();
         let tmp_path = tmp_dir.path().to_str().unwrap().to_owned();
-        let file_path = format!("{tmp_path}/bar/foo.lance/test_file");
-        write_to_file(&file_path, "URL").unwrap();
-        test_block_size_used_test!(&format!("file:///{file_path}"), None, 4 * 1024);
-        test_block_size_used_test!(&format!("file-object-store:///{file_path}"), None, 4 * 1024);
+        let path = format!("{tmp_path}/bar/foo.lance/test_file");
+        write_to_file(&path, "URL").unwrap();
+        let uri = format!("{prefix}:///{path}");
+        test_block_size_used_test_helper(&uri, None, 4 * 1024).await;
     }
 
     #[tokio::test]

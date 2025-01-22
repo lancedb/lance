@@ -52,6 +52,7 @@ parquet.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
 mockall.workspace = true
+rstest = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 pprof.workspace = true
