@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arrow::{array::AsArray, compute::sort_to_indices};
 use arrow_array::{RecordBatch, UInt32Array};
 use arrow_schema::Schema;
-use future::join_all;
+use future::try_join_all;
 use futures::prelude::*;
 use itertools::Itertools;
 use lance_arrow::{RecordBatchExt, SchemaExt};
@@ -30,6 +30,7 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
 };
 use object_store::path::Path;
+use tokio::sync;
 
 use crate::vector::PART_ID_COLUMN;
 
@@ -91,6 +92,10 @@ impl Shuffler for IvfShuffler {
         &self,
         data: Box<dyn RecordBatchStream + Unpin + 'static>,
     ) -> Result<Box<dyn ShuffleReader>> {
+        if self.num_partitions == 1 {
+            return Ok(Box::new(SinglePartitionReader::new(data)));
+        }
+
         let mut writers: Vec<FileWriter> = vec![];
         let mut partition_sizes = vec![0; self.num_partitions];
         let mut first_pass = true;
@@ -190,10 +195,7 @@ impl Shuffler for IvfShuffler {
                     partition_sizes[part_id] += batches.iter().map(|b| b.num_rows()).sum::<usize>();
                     futs.push(writer.write_batches(batches.iter()));
                 }
-                join_all(futs)
-                    .await
-                    .into_iter()
-                    .collect::<Result<Vec<_>>>()?;
+                try_join_all(futs).await?;
 
                 partition_buffers.iter_mut().for_each(|b| b.clear());
             }
@@ -295,5 +297,35 @@ impl ShuffleReader for IvfShufflerReader {
 
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self.partition_sizes[partition_id])
+    }
+}
+
+pub struct SinglePartitionReader {
+    data: sync::Mutex<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>,
+}
+
+impl SinglePartitionReader {
+    pub fn new(data: Box<dyn RecordBatchStream + Unpin + 'static>) -> Self {
+        Self {
+            data: sync::Mutex::new(Some(data)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShuffleReader for SinglePartitionReader {
+    async fn read_partition(
+        &self,
+        _partition_id: usize,
+    ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
+        let mut data = self.data.lock().await;
+        Ok(data.take())
+    }
+
+    fn partition_size(&self, _partition_id: usize) -> Result<usize> {
+        // we don't really care about the partition size
+        // it's used for determining the order of building the index and skipping empty partitions
+        // so we just return 1 here
+        Ok(1)
     }
 }

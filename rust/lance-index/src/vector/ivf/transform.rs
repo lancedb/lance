@@ -23,9 +23,10 @@ use crate::vector::transform::Transformer;
 
 use super::PART_ID_COLUMN;
 
-/// Ivf Transformer
+/// PartitionTransformer
 ///
-/// It transforms a Vector column, specified by the input data, into a column of partition IDs.
+/// It computes the partition ID for each row from the input batch,
+/// and adds the partition ID as a new column to the batch.
 ///
 /// If the partition ID ("__ivf_part_id") column is already present in the Batch,
 /// this transform is a Noop.
