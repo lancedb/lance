@@ -173,6 +173,12 @@ message Transaction {
     }
   }
 
+  // An operation that replaces the data in a region of the table with new data.
+  message DataReplacement {
+    repeated DataFragment old_fragments = 1;
+    repeated DataFile new_datafiles = 2;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -186,6 +192,7 @@ message Transaction {
     Update update = 108;
     Project project = 109;
     UpdateConfig update_config = 110;
+    DataReplacement data_replacement = 111;
   }
 
   // An operation to apply to the blob dataset
