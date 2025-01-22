@@ -2238,11 +2238,6 @@ mod tests {
                 IvfBuildParams::new(2),
                 PQBuildParams::new(2, 4),
             ),
-            VectorIndexParams::with_ivf_pq_params(
-                MetricType::Dot,
-                IvfBuildParams::new(2),
-                PQBuildParams::new(2, 4),
-            ),
             VectorIndexParams::ivf_flat(1, MetricType::Dot),
             VectorIndexParams::with_ivf_hnsw_pq_params(
                 MetricType::Dot,
@@ -2279,6 +2274,7 @@ mod tests {
             .build()
             .unwrap();
         let vectors = make_array(vectors);
+        let num_non_null = vectors.len() - vectors.logical_null_count();
         let data = RecordBatch::try_new(data.schema(), vec![vectors]).unwrap();
 
         let mut dataset = InsertBuilder::new("memory://")
@@ -2291,6 +2287,18 @@ mod tests {
             .create_index(&["vec"], IndexType::Vector, None, &index_params, false)
             .await
             .unwrap();
+
+        let query = vec![0.0; 16].into_iter().collect::<Float32Array>();
+        let results = dataset
+            .scan()
+            .nearest("vec", &query, 2_000)
+            .unwrap()
+            .nprobs(2)
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), num_non_null);
+        assert_eq!(results["vec"].logical_null_count(), 0);
     }
 
     #[tokio::test]
