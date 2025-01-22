@@ -45,7 +45,7 @@ from .dependencies import (
 )
 from .dependencies import numpy as np
 from .dependencies import pandas as pd
-from .fragment import FragmentMetadata, LanceFragment
+from .fragment import DataFile, FragmentMetadata, LanceFragment
 from .lance import (
     CleanupStats,
     Compaction,
@@ -1927,7 +1927,7 @@ class LanceDataset(pa.dataset.Dataset):
         valid_index_types = ["IVF_FLAT", "IVF_PQ", "IVF_HNSW_PQ", "IVF_HNSW_SQ"]
         if index_type not in valid_index_types:
             raise NotImplementedError(
-                f"Only {valid_index_types} index types supported. " f"Got {index_type}"
+                f"Only {valid_index_types} index types supported. Got {index_type}"
             )
         if index_type != "IVF_PQ" and one_pass_ivfpq:
             raise ValueError(
@@ -2247,8 +2247,7 @@ class LanceDataset(pa.dataset.Dataset):
         commit_lock: Optional[CommitLock] = None,
     ) -> LanceDataset:
         warnings.warn(
-            "LanceDataset._commit() is deprecated, use LanceDataset.commit()"
-            " instead",
+            "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
             DeprecationWarning,
         )
         return LanceDataset.commit(base_uri, operation, read_version, commit_lock)
@@ -2935,6 +2934,23 @@ class LanceOperation:
         dataset_version: int
         fragment_ids: Set[int]
 
+    @dataclass
+    class DataReplacementGroup:
+        """
+        Group of data replacements
+        """
+
+        fragment_id: int
+        new_file: DataFile
+
+    @dataclass
+    class DataReplacement(BaseOperation):
+        """
+        Operation that replaces existing datafiles in the dataset.
+        """
+
+        replacements: List[LanceOperation.DataReplacementGroup]
+
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
@@ -3203,7 +3219,7 @@ class ScannerBuilder:
 
         if q_dim != dim:
             raise ValueError(
-                f"Query vector size {len(q)} does not match index column size" f" {dim}"
+                f"Query vector size {len(q)} does not match index column size {dim}"
             )
 
         if k is not None and int(k) <= 0:
