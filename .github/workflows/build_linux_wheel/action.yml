@@ -69,7 +69,7 @@ runs:
         args: ${{ inputs.args }}
         before-script-linux: |
           set -e
-          apt install -y unzip
+          sudo apt install -y unzip
           if [ $(uname -m) = "x86_64" ]; then
             PROTOC_ARCH="x86_64"
           else
