@@ -742,6 +742,7 @@ mod tests {
             .zip(row_ids.into_iter())
             .collect::<Vec<_>>();
         let row_ids = results.iter().map(|(_, id)| *id).collect::<HashSet<_>>();
+        assert!(row_ids.len() == k);
 
         let gt = ground_truth(&vectors, query.as_ref(), k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();

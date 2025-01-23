@@ -104,7 +104,6 @@ pub async fn read_message<M: Message + Default>(reader: &dyn Reader, pos: usize)
 /// Read a Protobuf-backed struct at file position: `pos`.
 // TODO: pub(crate)
 pub async fn read_struct<
-    'm,
     M: Message + Default + 'static,
     T: ProtoStruct<Proto = M> + TryFrom<M, Error = Error>,
 >(
