@@ -665,16 +665,20 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     )?
                     .try_collect::<Vec<_>>()
                     .await?;
-                let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+                let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
                 if storage_writer.is_none() {
                     storage_writer = Some(FileWriter::try_new(
                         self.store.create(&storage_path).await?,
-                        batch.schema_ref().as_ref().try_into()?,
+                        batches[0].schema_ref().as_ref().try_into()?,
                         Default::default(),
                     )?);
                 }
-                storage_writer.as_mut().unwrap().write_batch(&batch).await?;
-                storage_ivf.add_partition(batch.num_rows() as u32);
+                storage_writer
+                    .as_mut()
+                    .unwrap()
+                    .write_batches(batches.iter())
+                    .await?;
+                storage_ivf.add_partition(num_rows as u32);
             }
 
             if index_size == 0 {
@@ -699,9 +703,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     )?
                     .try_collect::<Vec<_>>()
                     .await?;
-                let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
-                index_writer.write_batch(&batch).await?;
-                index_ivf.add_partition(batch.num_rows() as u32);
+                let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
+                index_writer.write_batches(batches.iter()).await?;
+                index_ivf.add_partition(num_rows as u32);
                 partition_index_metadata.push(
                     reader
                         .schema()
