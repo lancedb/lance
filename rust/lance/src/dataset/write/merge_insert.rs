@@ -1018,13 +1018,20 @@ impl MergeInsertJob {
         self,
         source: SendableRecordBatchStream,
     ) -> Result<(Transaction, MergeStats)> {
-        let schema = source.schema();
+        // Erase metadata on source / dataset schemas to avoid comparing metadata
+        let schema = lance_core::datatypes::Schema::try_from(source.schema().as_ref())?;
+        let full_schema = self.dataset.local_schema();
+        let is_full_schema = full_schema.compare_with_options(
+            &schema,
+            &SchemaCompareOptions {
+                compare_metadata: false,
+                ..Default::default()
+            },
+        );
 
-        let full_schema = Schema::from(self.dataset.local_schema());
-        let is_full_schema = &full_schema == schema.as_ref();
-
+        let source_schema = source.schema();
         let joined = self.create_joined_stream(source).await?;
-        let merger = Merger::try_new(self.params.clone(), schema.clone(), !is_full_schema)?;
+        let merger = Merger::try_new(self.params.clone(), source_schema, !is_full_schema)?;
         let merge_statistics = merger.merge_stats.clone();
         let deleted_rows = merger.deleted_rows.clone();
         let merger_schema = merger.output_schema().clone();

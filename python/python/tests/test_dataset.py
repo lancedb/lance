@@ -1306,12 +1306,23 @@ def check_merge_stats(merge_dict, expected):
 
 def test_merge_insert(tmp_path: Path):
     nrows = 1000
+    # Create a schema with some metadata to regress an issue where the metadata
+    # caused schema comparison problems in merge_insert.
+    schema = pa.schema(
+        [
+            pa.field("a", pa.int64()),
+            pa.field("b", pa.int64()),
+            pa.field("c", pa.int64()),
+        ],
+        metadata={"foo": "bar"},
+    )
     table = pa.Table.from_pydict(
         {
             "a": range(nrows),
             "b": [1 for _ in range(nrows)],
             "c": [x % 2 for x in range(nrows)],
-        }
+        },
+        schema=schema,
     )
     dataset = lance.write_dataset(
         table, tmp_path / "dataset", mode="create", max_rows_per_file=100
@@ -1323,7 +1334,8 @@ def test_merge_insert(tmp_path: Path):
             "a": range(300, 300 + nrows),
             "b": [2 for _ in range(nrows)],
             "c": [0 for _ in range(nrows)],
-        }
+        },
+        schema=schema,
     )
 
     is_new = pc.field("b") == 2
