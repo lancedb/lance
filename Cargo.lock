@@ -3813,6 +3813,7 @@ dependencies = [
  "pprof",
  "prost 0.13.4",
  "rand",
+ "rstest",
  "shellexpand",
  "snafu 0.7.5",
  "tempfile",
