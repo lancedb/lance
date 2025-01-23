@@ -323,7 +323,7 @@ impl ShuffleReader for SinglePartitionReader {
         match data.as_mut() {
             Some(_) => Ok(data.take()),
             None => Err(Error::Internal {
-                message: format!("the partition has been read and consumed"),
+                message: "the partition has been read and consumed".to_string(),
                 location: location!(),
             }),
         }
