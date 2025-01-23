@@ -146,7 +146,6 @@ jobs:
         with:
           arm-build: "true"
           manylinux: "2_28"
-          extra_args: "--features fp16kernels"
       - name: Install dependencies
         run: |
           sudo apt update -y -qq
