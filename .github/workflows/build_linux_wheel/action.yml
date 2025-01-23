@@ -67,9 +67,11 @@ runs:
         target: aarch64-unknown-linux-gnu
         manylinux: ${{ inputs.manylinux }}
         args: ${{ inputs.args }}
+        # This uses an image based on Ubuntu 22.04 that does cross compilation
+        # https://github.com/rust-cross/manylinux-cross?tab=readme-ov-file#manylinux_2_28
         before-script-linux: |
           set -e
-          yum install -y openssl-devel clang \
+          apt-get install -y pkg-config libssl-dev unzip \
             && curl -L https://github.com/protocolbuffers/protobuf/releases/download/v24.4/protoc-24.4-linux-aarch_64.zip > /tmp/protoc.zip \
             && unzip /tmp/protoc.zip -d /usr/local \
             && rm /tmp/protoc.zip
