@@ -1105,7 +1105,7 @@ pub fn flat_bm25_search_stream(
         let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();
         let mask = score_col
             .iter()
-            .map(|score| score.map_or(false, |score| score > 0.0))
+            .map(|score| score.is_some_and(|score| score > 0.0))
             .collect::<Vec<_>>();
         let mask = BooleanArray::from(mask);
         let batch = arrow::compute::filter_record_batch(&scored_batch, &mask)?;

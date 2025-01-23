@@ -930,10 +930,7 @@ mod tests {
                 DataType::Struct(fields.clone()),
                 false,
             )]);
-            let children = types
-                .iter()
-                .map(|ty| new_empty_array(ty))
-                .collect::<Vec<_>>();
+            let children = types.iter().map(new_empty_array).collect::<Vec<_>>();
             let batch = RecordBatch::try_new(
                 Arc::new(schema.clone()),
                 vec![Arc::new(StructArray::new(fields, children, None)) as ArrayRef],

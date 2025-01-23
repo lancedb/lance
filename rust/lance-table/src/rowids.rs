@@ -204,10 +204,7 @@ impl RowIdSequence {
             // If we've cycled through all segments, we know the row id is not in the sequence.
             while i < self.0.len() {
                 let (segment_idx, segment) = segment_iter.next().unwrap();
-                if segment
-                    .range()
-                    .map_or(false, |range| range.contains(&row_id))
-                {
+                if segment.range().is_some_and(|range| range.contains(&row_id)) {
                     if let Some(offset) = segment.position(row_id) {
                         segment_matches.get_mut(segment_idx).unwrap().push(offset);
                     }

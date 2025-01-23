@@ -242,10 +242,10 @@ impl VectorIndex for PQIndex {
                 for idx in indices.values().iter() {
                     let dist = distances.value(*idx as usize);
                     let id = row_ids.value(*idx as usize);
-                    if query.lower_bound.map_or(false, |lb| dist < lb) {
+                    if query.lower_bound.is_some_and(|lb| dist < lb) {
                         continue;
                     }
-                    if query.upper_bound.map_or(false, |ub| dist >= ub) {
+                    if query.upper_bound.is_some_and(|ub| dist >= ub) {
                         break;
                     }
 
