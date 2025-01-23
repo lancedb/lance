@@ -30,7 +30,8 @@ use lance_io::{
     stream::{RecordBatchStream, RecordBatchStreamAdapter},
 };
 use object_store::path::Path;
-use tokio::sync;
+use snafu::{location, Location};
+use tokio::sync::Mutex;
 
 use crate::vector::PART_ID_COLUMN;
 
@@ -301,13 +302,13 @@ impl ShuffleReader for IvfShufflerReader {
 }
 
 pub struct SinglePartitionReader {
-    data: sync::Mutex<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>,
+    data: Mutex<Option<Box<dyn RecordBatchStream + Unpin + 'static>>>,
 }
 
 impl SinglePartitionReader {
     pub fn new(data: Box<dyn RecordBatchStream + Unpin + 'static>) -> Self {
         Self {
-            data: sync::Mutex::new(Some(data)),
+            data: Mutex::new(Some(data)),
         }
     }
 }
@@ -319,7 +320,13 @@ impl ShuffleReader for SinglePartitionReader {
         _partition_id: usize,
     ) -> Result<Option<Box<dyn RecordBatchStream + Unpin + 'static>>> {
         let mut data = self.data.lock().await;
-        Ok(data.take())
+        match data.as_mut() {
+            Some(_) => Ok(data.take()),
+            None => Err(Error::Internal {
+                message: format!("the partition has been read and consumed"),
+                location: location!(),
+            }),
+        }
     }
 
     fn partition_size(&self, _partition_id: usize) -> Result<usize> {
