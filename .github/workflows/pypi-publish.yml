@@ -1,11 +1,8 @@
 name: Build and upload python wheels
 
 on:
-  # release:
-  #   types: [published]
-  pull_request:
-    paths:
-      - .github/workflows/pypi-publish.yml
+  release:
+    types: [published]
 
 jobs:
   linux:
@@ -23,9 +20,6 @@ jobs:
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
             runner: ubuntu-22.04
-          # TODO: maybe this is irrelevant?
-          # ring doesn't compile on aarch64 under manylinux2.17
-          # https://github.com/briansmith/ring/issues/1789
           - platform: aarch64
             manylinux: "2_17"
             extra_args: ""
@@ -63,11 +57,11 @@ jobs:
         args: "--release --strip ${{ matrix.config.extra_args }}"
         arm-build: ${{ matrix.config.platform == 'aarch64' }}
         manylinux: ${{ matrix.config.manylinux }}
-    # - uses: ./.github/workflows/upload_wheel
-    #   with:
-    #     pypi_token: ${{ secrets.PYPI_TOKEN }}
-    #     fury_token: ${{ secrets.FURY_TOKEN }}
-    #     repo: ${{ steps.handle_tag.outputs.repo }}
+    - uses: ./.github/workflows/upload_wheel
+      with:
+        pypi_token: ${{ secrets.PYPI_TOKEN }}
+        fury_token: ${{ secrets.FURY_TOKEN }}
+        repo: ${{ steps.handle_tag.outputs.repo }}
   mac:
     timeout-minutes: 60
     runs-on: ${{ matrix.config.runner }}
@@ -108,11 +102,11 @@ jobs:
       with:
         python-minor-version: ${{ matrix.python-minor-version }}
         args: "--release --strip --target ${{ matrix.config.target }} --features fp16kernels"
-    # - uses: ./.github/workflows/upload_wheel
-    #   with:
-    #     pypi_token: ${{ secrets.PYPI_TOKEN }}
-    #     fury_token: ${{ secrets.FURY_TOKEN }}
-    #     repo: ${{ steps.handle_tag.outputs.repo }}
+    - uses: ./.github/workflows/upload_wheel
+      with:
+        pypi_token: ${{ secrets.PYPI_TOKEN }}
+        fury_token: ${{ secrets.FURY_TOKEN }}
+        repo: ${{ steps.handle_tag.outputs.repo }}
   windows:
     timeout-minutes: 60
     runs-on: windows-latest
@@ -148,8 +142,8 @@ jobs:
           python-minor-version: ${{ matrix.python-minor-version }}
           args: "--release --strip"
           vcpkg_token: ${{ secrets.VCPKG_GITHUB_PACKAGES }}
-      # - uses: ./.github/workflows/upload_wheel
-      #   with:
-      #     pypi_token: ${{ secrets.PYPI_TOKEN }}
-      #     fury_token: ${{ secrets.FURY_TOKEN }}
-      #     repo: ${{ steps.handle_tag.outputs.repo }}
+      - uses: ./.github/workflows/upload_wheel
+        with:
+          pypi_token: ${{ secrets.PYPI_TOKEN }}
+          fury_token: ${{ secrets.FURY_TOKEN }}
+          repo: ${{ steps.handle_tag.outputs.repo }}
