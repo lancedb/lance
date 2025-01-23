@@ -784,7 +784,7 @@ impl StorageOptions {
     pub fn download_retry_count(&self) -> usize {
         self.0
             .iter()
-            .find(|(key, _)| key.to_ascii_lowercase() == "download_retry_count")
+            .find(|(key, _)| key.eq_ignore_ascii_case("download_retry_count"))
             .map(|(_, value)| value.parse::<usize>().unwrap_or(3))
             .unwrap_or(3)
     }
@@ -793,7 +793,7 @@ impl StorageOptions {
     pub fn client_max_retries(&self) -> usize {
         self.0
             .iter()
-            .find(|(key, _)| key.to_ascii_lowercase() == "client_max_retries")
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_max_retries"))
             .and_then(|(_, value)| value.parse::<usize>().ok())
             .unwrap_or(10)
     }
@@ -802,7 +802,7 @@ impl StorageOptions {
     pub fn client_retry_timeout(&self) -> u64 {
         self.0
             .iter()
-            .find(|(key, _)| key.to_ascii_lowercase() == "client_retry_timeout")
+            .find(|(key, _)| key.eq_ignore_ascii_case("client_retry_timeout"))
             .and_then(|(_, value)| value.parse::<u64>().ok())
             .unwrap_or(180)
     }
