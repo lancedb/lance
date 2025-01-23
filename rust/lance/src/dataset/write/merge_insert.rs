@@ -670,8 +670,8 @@ impl MergeInsertJob {
         });
         let mut group_stream = session_ctx
             .read_one_shot(source)?
-            .sort(vec![col(ROW_ADDR).sort(true, true)])?
             .with_column("_fragment_id", col(ROW_ADDR) >> lit(32))?
+            .sort(vec![col(ROW_ADDR).sort(true, true)])?
             .group_by_stream(&["_fragment_id"])
             .await?;
 

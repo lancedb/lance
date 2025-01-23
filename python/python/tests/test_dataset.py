@@ -1670,6 +1670,39 @@ def test_merge_insert_vector_column(tmp_path: Path):
     check_merge_stats(merge_dict, (1, 1, 0))
 
 
+def test_merge_insert_large():
+    # Doing subcolumns update with merge insert triggers this error.
+    # Data needs to be large enough to make DataFusion create multiple batches
+    # when outputting join results.
+    # https://github.com/lancedb/lance/issues/3406
+    # This test is in Python because for whatever reason, the error doesn't
+    # reproduce in the equivalent Rust test.
+    dims = 32
+    nrows = 20_000
+    data = pa.table({"id": range(nrows), "num": [str(i) for i in range(nrows)]})
+
+    ds = lance.write_dataset(data, "memory://")
+
+    ds.add_columns({"vector": f"arrow_cast(NULL, 'FixedSizeList({dims}, Float32)')"})
+
+    batch_size = 10_000
+    other_columns = pa.table(
+        {
+            "id": range(batch_size),
+            "vector": pa.FixedSizeListArray.from_arrays(
+                pc.random(batch_size * dims).cast(pa.float32()), dims
+            ),
+        }
+    )
+
+    (
+        ds.merge_insert(on="id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(other_columns)
+    )
+
+
 def check_update_stats(update_dict, expected):
     assert (update_dict["num_rows_updated"],) == expected
 
