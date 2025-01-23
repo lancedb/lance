@@ -415,8 +415,6 @@ impl MergeInsertJob {
             SchemaComparison::Subschema => true,
         };
 
-        dbg!(add_row_addr);
-
         // 1 - Input from user
         let input = Arc::new(OneShotExec::new(source));
 
@@ -1303,8 +1301,6 @@ impl Merger {
         batch: RecordBatch,
     ) -> datafusion::common::Result<impl Stream<Item = datafusion::common::Result<RecordBatch>>>
     {
-        dbg!(batch.schema_ref());
-
         let mut merge_statistics = self.merge_stats.lock().unwrap();
         let num_fields = batch.schema().fields.len();
         // The schema of the combined batches will be:
