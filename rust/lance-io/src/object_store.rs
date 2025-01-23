@@ -1230,7 +1230,7 @@ mod tests {
         #[case] uri: &str,
         #[case] storage_options: Option<HashMap<String, String>>,
     ) {
-        test_block_size_used_test_helper(&uri, storage_options, 64 * 1024).await;
+        test_block_size_used_test_helper(uri, storage_options, 64 * 1024).await;
     }
 
     #[rstest]
