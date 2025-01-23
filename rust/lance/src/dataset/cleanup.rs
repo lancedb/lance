@@ -556,7 +556,7 @@ mod tests {
         pub clock: MockClock<'a>,
     }
 
-    impl<'a> MockDatasetFixture<'a> {
+    impl MockDatasetFixture<'_> {
         fn try_new() -> Result<Self> {
             let tmpdir = tempdir()?;
             // let tmpdir_uri = to_obj_store_uri(tmpdir.path())?;

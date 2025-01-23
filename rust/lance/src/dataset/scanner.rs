@@ -1119,9 +1119,9 @@ impl Scanner {
                 let byte_width = field.data_type().byte_width_opt();
                 let is_cloud = self.dataset.object_store().is_cloud();
                 if is_cloud {
-                    byte_width.map_or(false, |bw| bw < 1000)
+                    byte_width.is_some_and(|bw| bw < 1000)
                 } else {
-                    byte_width.map_or(false, |bw| bw < 10)
+                    byte_width.is_some_and(|bw| bw < 10)
                 }
             }
         }

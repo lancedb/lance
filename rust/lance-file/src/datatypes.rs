@@ -250,10 +250,7 @@ async fn load_field_dictionary<'a>(field: &mut Field, reader: &dyn Reader) -> Re
 
 /// Load dictionary value array from manifest files.
 // TODO: pub(crate)
-pub async fn populate_schema_dictionary<'a>(
-    schema: &mut Schema,
-    reader: &dyn Reader,
-) -> Result<()> {
+pub async fn populate_schema_dictionary(schema: &mut Schema, reader: &dyn Reader) -> Result<()> {
     for field in schema.fields.as_mut_slice() {
         load_field_dictionary(field, reader).await?;
     }
