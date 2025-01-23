@@ -18,15 +18,23 @@ jobs:
           - platform: x86_64
             manylinux: "2_17"
             extra_args: ""
+            runner: ubuntu-22.04
           - platform: x86_64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
+            runner: ubuntu-22.04
+          # TODO: maybe this is irrelevant?
           # ring doesn't compile on aarch64 under manylinux2.17
           # https://github.com/briansmith/ring/issues/1789
           - platform: aarch64
+            manylinux: "2_17"
+            extra_args: ""
+            runner: ubuntu-2404-4x-arm64
+          - platform: aarch64
             manylinux: "2_28"
             extra_args: "--features fp16kernels"
-    runs-on: "ubuntu-22.04"
+            runner: ubuntu-2404-4x-arm64
+    runs-on: ${{ matrix.config.runner }}
     steps:
     - uses: actions/checkout@v4
       with:
