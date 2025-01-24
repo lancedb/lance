@@ -21,13 +21,17 @@ import java.util.Map;
 
 /**
  * LanceIdentifier is a custom implementation of {@link Identifier} for Lance. It contains the
- * dataset URI and the namespace. The namespace is an array of strings, which contains the namespace
- * of the dataset and the options. The options are key-value pairs, which are separated by "#####".
+ * dataset URI and the namespace. The key difference with IdentifierImpl is that the LanceIdentifier
+ * will have the read or write options for lance. If there are some options, the `name` field will
+ * change into this format "name#key1=value1&amp;key2=value2".
  */
 public class LanceIdentifier implements Identifier {
-  public static final String SEPARATOR = "#####";
+  public static final String SEPARATOR = "#";
+  public static final String AMPERSAND = "&";
+  public static final String EQUAL = "=";
   private final String[] namespace;
   private final String datasetUri;
+  private final String datasetUriWithOptions;
   private final Map<String, String> options;
 
   public LanceIdentifier(String datasetUri) {
@@ -43,19 +47,21 @@ public class LanceIdentifier implements Identifier {
   }
 
   public LanceIdentifier(String datasetUri, String[] namespace, Map<String, String> options) {
+    this.namespace = namespace;
     this.datasetUri = datasetUri;
     if (null != options && !options.isEmpty()) {
-      this.namespace = new String[namespace.length + 1 + options.size()];
-      System.arraycopy(namespace, 0, this.namespace, 0, namespace.length);
-      this.namespace[namespace.length] = SEPARATOR;
-      int i = namespace.length + 1;
+      StringBuilder sb = new StringBuilder();
+      sb.append(datasetUri);
+      sb.append(SEPARATOR);
       for (Map.Entry<String, String> entry : options.entrySet()) {
-        this.namespace[i] = entry.getKey() + "=" + entry.getValue();
-        i++;
+        sb.append(entry.getKey()).append(EQUAL).append(entry.getValue());
+        sb.append(AMPERSAND);
       }
+      sb.deleteCharAt(sb.length() - 1);
+      this.datasetUriWithOptions = sb.toString();
       this.options = options;
     } else {
-      this.namespace = namespace;
+      this.datasetUriWithOptions = datasetUri;
       this.options = new HashMap<>();
     }
   }
@@ -70,29 +76,27 @@ public class LanceIdentifier implements Identifier {
     if (identifier instanceof LanceIdentifier) {
       return (LanceIdentifier) identifier;
     } else {
-      int index = -1;
-      for (int i = 0; i < identifier.namespace().length; i++) {
-        if (identifier.namespace()[i].contains(SEPARATOR)) {
-          index = i;
-          break;
-        }
-      }
-      if (index > 0) {
-        // when saving datasource, the IdentifierImpl will contain options in namespaces
-        String[] namespace = new String[index];
-        System.arraycopy(identifier.namespace(), 0, namespace, 0, index);
-        Map<String, String> options = new HashMap<>();
-        for (int i = index + 1; i < identifier.namespace().length; i++) {
-          String keyValue = identifier.namespace()[i];
-          String[] kv = keyValue.split("=");
-          options.put(kv[0], kv[1]);
-        }
-        return new LanceIdentifier(identifier.name(), namespace, options);
+      if (identifier.name().contains(SEPARATOR)) {
+        String nameWithOptions = identifier.name();
+        String name = nameWithOptions.substring(0, nameWithOptions.indexOf(SEPARATOR));
+        return new LanceIdentifier(name, identifier.namespace(), extraOptions(nameWithOptions));
       } else {
-        // catalog identifier only have namespaces
         return new LanceIdentifier(identifier.name(), identifier.namespace());
       }
     }
+  }
+
+  public static Map<String, String> extraOptions(String urlWithOptions) {
+    if (urlWithOptions.contains(SEPARATOR)) {
+      String optionsStr = urlWithOptions.substring(urlWithOptions.indexOf(SEPARATOR) + 1);
+      Map<String, String> options = new HashMap<>();
+      for (String kv : optionsStr.split(AMPERSAND)) {
+        String[] keyValue = kv.split(EQUAL);
+        options.put(keyValue[0], keyValue[1]);
+      }
+      return options;
+    }
+    return new HashMap<>();
   }
 
   @Override
@@ -102,6 +106,10 @@ public class LanceIdentifier implements Identifier {
 
   @Override
   public String name() {
+    return datasetUriWithOptions;
+  }
+
+  public String shortName() {
     return datasetUri;
   }
 

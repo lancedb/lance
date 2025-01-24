@@ -40,21 +40,18 @@ public class LanceIdentifierTest {
     options.put("key1", "value1");
     options.put("key2", "value2");
     identifier = new LanceIdentifier(url, options);
-    assertEquals(4, identifier.namespace().length);
+    assertEquals(1, identifier.namespace().length);
     assertEquals("default", identifier.namespace()[0]);
-    assertEquals(LanceIdentifier.SEPARATOR, identifier.namespace()[1]);
-    assertEquals("key1=value1", identifier.namespace()[2]);
-    assertEquals("key2=value2", identifier.namespace()[3]);
+    assertEquals("/tmp/data.lance#key1=value1&key2=value2", identifier.name());
+    assertEquals("/tmp/data.lance", identifier.shortName());
 
     String[] namespace = new String[] {"spark_catalog", "default"};
     identifier = new LanceIdentifier(url, namespace, options);
-    assertEquals(url, identifier.name());
-    assertEquals(5, identifier.namespace().length);
+    assertEquals("/tmp/data.lance#key1=value1&key2=value2", identifier.name());
+    assertEquals("/tmp/data.lance", identifier.shortName());
+    assertEquals(2, identifier.namespace().length);
     assertEquals("spark_catalog", identifier.namespace()[0]);
     assertEquals("default", identifier.namespace()[1]);
-    assertEquals(LanceIdentifier.SEPARATOR, identifier.namespace()[2]);
-    assertEquals("key1=value1", identifier.namespace()[3]);
-    assertEquals("key2=value2", identifier.namespace()[4]);
   }
 
   @Test
@@ -98,7 +95,7 @@ public class LanceIdentifierTest {
 
     identifierImpl = Identifier.of(namespace, identifier.name());
     lanceIdentifier = LanceIdentifier.of(identifierImpl);
-    assertEquals(0, lanceIdentifier.genLanceConfig(emptyOptions).getOptions().size());
+    assertEquals(2, lanceIdentifier.genLanceConfig(emptyOptions).getOptions().size());
     assertEquals(namespace, lanceIdentifier.namespace());
   }
 }

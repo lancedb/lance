@@ -16,6 +16,7 @@ package com.lancedb.lance.spark;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
 import java.io.Serializable;
+import java.util.HashMap;
 import java.util.Map;
 
 /** Lance Configuration. */
@@ -38,12 +39,12 @@ public class LanceConfig implements Serializable {
       String datasetName,
       String datasetUri,
       boolean pushDownFilters,
-      CaseInsensitiveStringMap options) {
+      Map<String, String> options) {
     this.dbPath = dbPath;
     this.datasetName = datasetName;
     this.datasetUri = datasetUri;
     this.pushDownFilters = pushDownFilters;
-    this.options = options.asCaseSensitiveMap();
+    this.options = options;
   }
 
   public static LanceConfig from(Map<String, String> properties) {
@@ -68,8 +69,13 @@ public class LanceConfig implements Serializable {
   public static LanceConfig from(CaseInsensitiveStringMap options, String datasetUri) {
     boolean pushDownFilters =
         options.getBoolean(CONFIG_PUSH_DOWN_FILTERS, DEFAULT_PUSH_DOWN_FILTERS);
+    Map<String, String> optionWithUri = new HashMap<>(options);
+    optionWithUri.putAll(LanceIdentifier.extraOptions(datasetUri));
+    if (datasetUri.contains("#")) {
+      datasetUri = datasetUri.substring(0, datasetUri.indexOf("#"));
+    }
     String[] paths = extractDbPathAndDatasetName(datasetUri);
-    return new LanceConfig(paths[0], paths[1], datasetUri, pushDownFilters, options);
+    return new LanceConfig(paths[0], paths[1], datasetUri, pushDownFilters, optionWithUri);
   }
 
   public static String getDatasetUri(String dbPath, String datasetUri) {
@@ -82,7 +88,7 @@ public class LanceConfig implements Serializable {
 
   private static String[] extractDbPathAndDatasetName(String datasetUri) {
     if (datasetUri == null || !datasetUri.endsWith(LANCE_FILE_SUFFIX)) {
-      throw new IllegalArgumentException("Invalid dataset uri: " + datasetUri);
+      throw new IllegalArgumentException("Invalid dataset uri(ended with .lance): " + datasetUri);
     }
 
     int lastSlashIndex = datasetUri.lastIndexOf('/');

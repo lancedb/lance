@@ -58,7 +58,7 @@ public class LanceCatalog implements TableCatalog {
       LanceIdentifier lanceIdentifier = LanceIdentifier.of(ident);
       LanceConfig config = lanceIdentifier.genLanceConfig(options);
       WriteParams params = SparkOptions.genWriteParamsFromConfig(config);
-      LanceDatasetAdapter.createDataset(ident.name(), schema, params);
+      LanceDatasetAdapter.createDataset(lanceIdentifier.shortName(), schema, params);
     } catch (IllegalArgumentException e) {
       throw new TableAlreadyExistsException(ident.name(), new Some<>(e));
     }
