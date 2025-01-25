@@ -1078,6 +1078,16 @@ pub fn describe_encoding(page: &pbfile::column_metadata::Page) -> String {
                                 format!("Unsupported(decode_err={})", err)
                             }
                         }
+                    } else if encoding_any.type_url == "/lance.encodings.PageLayout" {
+                        let encoding = encoding_any.to_msg::<pbenc::PageLayout>();
+                        match encoding {
+                            Ok(encoding) => {
+                                format!("{:#?}", encoding)
+                            }
+                            Err(err) => {
+                                format!("Unsupported(decode_err={})", err)
+                            }
+                        }
                     } else {
                         format!("Unrecognized(type_url={})", encoding_any.type_url)
                     }

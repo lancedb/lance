@@ -14,8 +14,7 @@ use crate::buffer::LanceBuffer;
 use crate::data::{
     BlockInfo, ConstantDataBlock, DataBlock, FixedSizeListBlock, FixedWidthDataBlock,
 };
-use crate::decoder::PerValueDecompressor;
-use crate::decoder::{BlockDecompressor, MiniBlockDecompressor};
+use crate::decoder::{BlockDecompressor, FixedPerValueDecompressor, MiniBlockDecompressor};
 use crate::encoder::{
     BlockCompressor, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
     PerValueDataBlock, MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES,
@@ -413,37 +412,33 @@ impl ValueDecompressor {
             bytes_per_value: description.bits_per_value / 8,
         }
     }
+
+    fn buffer_to_block(&self, data: LanceBuffer) -> DataBlock {
+        DataBlock::FixedWidth(FixedWidthDataBlock {
+            bits_per_value: self.bytes_per_value * 8,
+            num_values: data.len() as u64 / self.bytes_per_value,
+            data,
+            block_info: BlockInfo::new(),
+        })
+    }
 }
 
 impl BlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
-        let num_values = data.len() as u64 / self.bytes_per_value;
-        assert_eq!(data.len() as u64 % self.bytes_per_value, 0);
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            bits_per_value: self.bytes_per_value * 8,
-            data,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+        Ok(self.buffer_to_block(data))
     }
 }
 
 impl MiniBlockDecompressor for ValueDecompressor {
     fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        debug_assert!(data.len() as u64 >= num_values * self.bytes_per_value);
-
-        Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data,
-            bits_per_value: self.bytes_per_value * 8,
-            num_values,
-            block_info: BlockInfo::new(),
-        }))
+        assert_eq!(data.len() as u64, num_values * self.bytes_per_value);
+        Ok(self.buffer_to_block(data))
     }
 }
 
-impl PerValueDecompressor for ValueDecompressor {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
-        MiniBlockDecompressor::decompress(self, data, num_values)
+impl FixedPerValueDecompressor for ValueDecompressor {
+    fn decompress(&self, data: FixedWidthDataBlock) -> Result<DataBlock> {
+        Ok(DataBlock::FixedWidth(data))
     }
 
     fn bits_per_value(&self) -> u64 {

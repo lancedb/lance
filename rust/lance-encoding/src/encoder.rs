@@ -24,14 +24,16 @@ use crate::encodings::logical::list::ListStructuralEncoder;
 use crate::encodings::logical::primitive::PrimitiveStructuralEncoder;
 use crate::encodings::logical::r#struct::StructFieldEncoder;
 use crate::encodings::logical::r#struct::StructStructuralEncoder;
-use crate::encodings::physical::binary::{BinaryBlockEncoder, BinaryMiniBlockEncoder};
+use crate::encodings::physical::binary::{BinaryMiniBlockEncoder, VariableEncoder};
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
-use crate::encodings::physical::fsst::{FsstArrayEncoder, FsstMiniBlockEncoder};
+use crate::encodings::physical::fsst::{
+    FsstArrayEncoder, FsstMiniBlockEncoder, FsstPerValueEncoder,
+};
 use crate::encodings::physical::packed_struct::PackedStructEncoder;
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockEncoder;
 use crate::format::ProtobufUtils;
@@ -217,9 +219,19 @@ pub trait MiniBlockCompressor: std::fmt::Debug + Send + Sync {
 /// A single buffer of value data and a buffer of offsets
 ///
 /// TODO: In the future we may allow metadata buffers
+#[derive(Debug)]
 pub enum PerValueDataBlock {
     Fixed(FixedWidthDataBlock),
     Variable(VariableWidthBlock),
+}
+
+impl PerValueDataBlock {
+    pub fn data_size(&self) -> u64 {
+        match self {
+            Self::Fixed(fixed) => fixed.data_size(),
+            Self::Variable(variable) => variable.data_size(),
+        }
+    }
 }
 
 /// Trait for compression algorithms that are suitable for use in the zipped structural encoding
@@ -884,8 +896,23 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 let encoder = Box::new(ValueEncoder::default());
                 Ok(encoder)
             }
-            DataBlock::VariableWidth(_variable_width) => {
-                todo!()
+            DataBlock::VariableWidth(variable_width) => {
+                if variable_width.bits_per_offset == 32 {
+                    let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
+                    let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+
+                    let variable_compression = Box::new(VariableEncoder::default());
+
+                    if max_len >= FSST_LEAST_INPUT_MAX_LENGTH
+                        && data_size >= FSST_LEAST_INPUT_SIZE as u64
+                    {
+                        Ok(Box::new(FsstPerValueEncoder::new(variable_compression)))
+                    } else {
+                        Ok(variable_compression)
+                    }
+                } else {
+                    todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
+                }
             }
             _ => unreachable!(),
         }
@@ -905,13 +932,9 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 Ok((encoder, encoding))
             }
             DataBlock::VariableWidth(variable_width) => {
-                if variable_width.bits_per_offset == 32 {
-                    let encoder = Box::new(BinaryBlockEncoder::default());
-                    let encoding = ProtobufUtils::binary_block();
-                    Ok((encoder, encoding))
-                } else {
-                    todo!("Implement BlockCompression for VariableWidth DataBlock with 64 bits offsets.")
-                }
+                let encoder = Box::new(VariableEncoder::default());
+                let encoding = ProtobufUtils::variable(variable_width.bits_per_offset);
+                Ok((encoder, encoding))
             }
             _ => unreachable!(),
         }
