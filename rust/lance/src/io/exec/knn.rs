@@ -496,6 +496,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let plan = if children.len() == 1 || children.len() == 2 {
+            if children.len() == 2 {
+                let _prefilter = children.pop().expect("length checked");
+            }
             // NOTE!!!! Prefilter transformation is ignored.
             Self {
                 input: children.pop().expect("length checked"),
