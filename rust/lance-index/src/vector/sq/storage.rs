@@ -3,13 +3,13 @@
 
 use std::ops::Range;
 
-use arrow::compute::concat_batches;
+use arrow::{compute::concat_batches, datatypes::Float16Type};
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, UInt64Type, UInt8Type},
     ArrayRef, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
@@ -391,8 +391,21 @@ pub struct SQDistCalculator<'a> {
 
 impl<'a> SQDistCalculator<'a> {
     fn new(query: ArrayRef, storage: &'a ScalarQuantizationStorage, bounds: Range<f64>) -> Self {
-        let query_sq_code =
-            scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds);
+        // This is okay-ish to use hand-rolled dynamic dispatch here
+        // since we search 10s-100s of partitions, we can afford the overhead
+        // this could be annoying at indexing time for HNSW, which requires constructing the
+        // dist calculator frequently. However, HNSW isn't first-class citizen in Lance yet. so be it.
+        let query_sq_code = match query.data_type() {
+            DataType::Float16 => {
+                scale_to_u8::<Float16Type>(query.as_primitive::<Float16Type>().values(), &bounds)
+            }
+            DataType::Float32 => {
+                scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds)
+            }
+            _ => {
+                panic!("Unsupported data type for ScalarQuantizationStorage");
+            }
+        };
         Self {
             query_sq_code,
             bounds,
