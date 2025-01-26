@@ -495,22 +495,22 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
+        let plan = if children.len() == 1 || children.len() == 2 {
+            // NOTE!!!! Prefilter transformation is ignored.
+            Self {
+                input: children.pop().expect("length checked"),
+                dataset: self.dataset.clone(),
+                indices: self.indices.clone(),
+                query: self.query.clone(),
+                prefilter_source: self.prefilter_source.clone(),
+                properties: self.properties.clone(),
+            }
+        } else {
             return Err(DataFusionError::Internal(
-                "ANNSubIndexExec node must have exactly one child".to_string(),
+                "ANNSubIndexExec node must have exactly one or two (prefilter) child".to_string(),
             ));
-        }
-
-        let new_plan = Self {
-            input: children.pop().expect("length checked"),
-            dataset: self.dataset.clone(),
-            indices: self.indices.clone(),
-            query: self.query.clone(),
-            prefilter_source: self.prefilter_source.clone(),
-            properties: self.properties.clone(),
         };
-
-        Ok(Arc::new(new_plan))
+        Ok(Arc::new(plan))
     }
 
     fn execute(
