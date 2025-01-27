@@ -37,6 +37,7 @@ lazy_static::lazy_static! {
         .thread_name("lance-cpu")
         .max_blocking_threads(get_num_compute_intensive_cpus())
         .worker_threads(1)
+        .enable_time()
         // keep the thread alive "forever"
         .thread_keep_alive(Duration::from_secs(u64::MAX))
         .build()

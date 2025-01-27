@@ -254,6 +254,20 @@ impl PartitionLoadLock {
     }
 }
 
+/// Generate random ranges to sample from a dataset.
+///
+/// This will return an iterator of ranges that cover the whole dataset. It
+/// provides an unbound iterator so that the caller can decide when to stop.
+/// This is useful when the caller wants to sample a fixed number of rows, but
+/// has an additional filter that must be applied.
+///
+/// Parameters:
+/// * `num_rows`: number of rows in the dataset
+/// * `sample_size_hint`: the target number of rows to be sampled in the end.
+///   This is a hint for the minimum number of rows that will be consumed, but
+///   the caller may consume more than this.
+/// * `block_size`: the byte size of ranges that should be used.
+/// * `byte_width`: the byte width of the vectors that will be sampled.
 fn random_ranges(
     num_rows: usize,
     sample_size_hint: usize,
@@ -270,7 +284,10 @@ fn random_ranges(
         indices.shuffle(&mut rng);
         Box::new(indices.into_iter())
     } else {
-        // Create slices of size `sample_granularity` to sample from
+        // If the sample is a small proportion, then we can instead use a set
+        // to track which bins we have seen. We start by using the sample_size_hint
+        // to provide an efficient start, and from there we randomly choose bins
+        // one by one.
         let num_bins = num_rows.div_ceil(rows_per_batch);
         // Start with the minimum number we will need.
         let min_sample_size = sample_size_hint / rows_per_batch;
