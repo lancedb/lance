@@ -83,7 +83,7 @@ pub struct ListingCatalog {
 
 const LANCE_EXTENSION: &str = "lance";
 
-fn format_table_path(is_url: bool, scheme: &str, base_path: &str, name: &str) -> String {
+fn format_table_url_or_path(is_url: bool, scheme: &str, base_path: &str, name: &str) -> String {
     if is_url {
         format!("{}:///{}/{}.{}", scheme, base_path, name, LANCE_EXTENSION)
     } else {
@@ -106,7 +106,7 @@ impl ListingCatalog {
 #[async_trait::async_trait]
 impl Catalog for ListingCatalog {
     async fn create_table(&self, name: &str, schema: Arc<Schema>) -> Result<TableReference> {
-        let table_path = format_table_path(
+        let table_url = format_table_url_or_path(
             true,
             &*self.object_store.scheme,
             self.base_path.as_ref(),
@@ -115,13 +115,13 @@ impl Catalog for ListingCatalog {
 
         let mut ds = Dataset::write(
             RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
-            &table_path,
+            &table_url,
             Some(WriteParams {
                 commit_handler: Option::from(self.commit_handler.clone()),
                 store_params: Some(ObjectStoreParams {
                     object_store: Some((
                         self.object_store.clone().inner,
-                        Url::parse(&*table_path).unwrap(),
+                        Url::parse(&*table_url).unwrap(),
                     )),
                     ..Default::default()
                 }),
@@ -137,7 +137,7 @@ impl Catalog for ListingCatalog {
             store_params: Some(ObjectStoreParams {
                 object_store: Some((
                     self.object_store.clone().inner,
-                    Url::parse(&*table_path).unwrap(),
+                    Url::parse(&*table_url).unwrap(),
                 )),
                 ..Default::default()
             }),
@@ -145,7 +145,7 @@ impl Catalog for ListingCatalog {
     }
 
     async fn drop_table(&self, name: &str) -> Result<()> {
-        let table_path = format_table_path(
+        let table_path = format_table_url_or_path(
             false,
             &*self.object_store.scheme,
             self.base_path.as_ref(),
@@ -158,18 +158,18 @@ impl Catalog for ListingCatalog {
     }
 
     async fn get_table(&self, name: &str) -> Result<TableReference> {
-        let table_path = format_table_path(
+        let table_url = format_table_url_or_path(
             true,
             &*self.object_store.scheme,
             self.base_path.as_ref(),
             name,
         );
 
-        let ds = DatasetBuilder::from_uri(&table_path)
+        let ds = DatasetBuilder::from_uri(&table_url)
             .with_commit_handler(self.commit_handler.clone())
             .with_object_store(
                 self.object_store.clone().inner,
-                Url::parse(&*table_path).unwrap(),
+                Url::parse(&*table_url).unwrap(),
                 self.commit_handler.clone(),
             )
             .load()
@@ -182,7 +182,7 @@ impl Catalog for ListingCatalog {
             store_params: Some(ObjectStoreParams {
                 object_store: Some((
                     self.object_store.clone().inner,
-                    Url::parse(&*table_path).unwrap(),
+                    Url::parse(&*table_url).unwrap(),
                 )),
                 ..Default::default()
             }),
