@@ -4,12 +4,10 @@
 use arrow_array::RecordBatchIterator;
 use arrow_schema::Schema;
 use async_trait::async_trait;
-use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::path::LancePathExt;
-use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams, WrappingObjectStore};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::{Index, Manifest};
 use lance_table::io::commit::{CommitError, CommitHandler, ManifestNamingScheme, ManifestWriter};
-use object_store::{path::Path, ObjectStore as OSObjectStore};
+use object_store::path::Path;
 use std::fmt::Debug;
 use std::sync::Arc;
 use url::Url;
@@ -85,9 +83,7 @@ impl ListingCatalog {
         Self {
             base_path,
             object_store: object_store.clone(),
-            commit_handler: Arc::new(ListingCommitHandler {
-                object_store: object_store.into(),
-            }),
+            commit_handler: Arc::new(ListingCommitHandler { object_store }),
         }
     }
 }
@@ -97,12 +93,12 @@ impl Catalog for ListingCatalog {
     async fn create_table(&self, name: &str, schema: Arc<Schema>) -> Result<TableReference> {
         let table_url = format_table_url_or_path(
             true,
-            &*self.object_store.scheme,
+            &self.object_store.scheme,
             self.base_path.as_ref(),
             name,
         );
 
-        let mut ds = Dataset::write(
+        let ds = Dataset::write(
             RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
             &table_url,
             Some(WriteParams {
@@ -110,7 +106,7 @@ impl Catalog for ListingCatalog {
                 store_params: Some(ObjectStoreParams {
                     object_store: Some((
                         self.object_store.clone().inner,
-                        Url::parse(&*table_url).unwrap(),
+                        Url::parse(&table_url).unwrap(),
                     )),
                     ..Default::default()
                 }),
@@ -126,7 +122,7 @@ impl Catalog for ListingCatalog {
             store_params: Some(ObjectStoreParams {
                 object_store: Some((
                     self.object_store.clone().inner,
-                    Url::parse(&*table_url).unwrap(),
+                    Url::parse(&table_url).unwrap(),
                 )),
                 ..Default::default()
             }),
@@ -136,7 +132,7 @@ impl Catalog for ListingCatalog {
     async fn drop_table(&self, name: &str) -> Result<()> {
         let table_path = format_table_url_or_path(
             false,
-            &*self.object_store.scheme,
+            &self.object_store.scheme,
             self.base_path.as_ref(),
             name,
         );
@@ -149,7 +145,7 @@ impl Catalog for ListingCatalog {
     async fn get_table(&self, name: &str) -> Result<TableReference> {
         let table_url = format_table_url_or_path(
             true,
-            &*self.object_store.scheme,
+            &self.object_store.scheme,
             self.base_path.as_ref(),
             name,
         );
@@ -158,7 +154,7 @@ impl Catalog for ListingCatalog {
             .with_commit_handler(self.commit_handler.clone())
             .with_object_store(
                 self.object_store.clone().inner,
-                Url::parse(&*table_url).unwrap(),
+                Url::parse(&table_url).unwrap(),
                 self.commit_handler.clone(),
             )
             .load()
@@ -171,7 +167,7 @@ impl Catalog for ListingCatalog {
             store_params: Some(ObjectStoreParams {
                 object_store: Some((
                     self.object_store.clone().inner,
-                    Url::parse(&*table_url).unwrap(),
+                    Url::parse(&table_url).unwrap(),
                 )),
                 ..Default::default()
             }),
