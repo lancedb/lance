@@ -58,10 +58,7 @@ use futures::{
 use lance_core::{
     datatypes::{OnMissing, OnTypeMismatch, SchemaCompareOptions},
     error::{box_error, InvalidInputSnafu},
-    utils::{
-        futures::Capacity,
-        tokio::{get_num_compute_intensive_cpus, CPU_RUNTIME},
-    },
+    utils::{futures::Capacity, tokio::get_num_compute_intensive_cpus},
     Error, Result, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD,
 };
 use lance_datafusion::{
@@ -679,10 +676,10 @@ impl MergeInsertJob {
         let updated_fragments = Arc::new(Mutex::new(Vec::new()));
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
-        let task_limit = get_num_compute_intensive_cpus();
+        let task_limit = dataset.object_store().io_parallelism();
         let mut reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
-        let handle = CPU_RUNTIME.handle();
+
         while let Some((frag_id, batches)) = group_stream.next().await.transpose()? {
             async fn handle_fragment(
                 dataset: Arc<Dataset>,
@@ -938,7 +935,7 @@ impl MergeInsertJob {
                         updated_fragments.clone(),
                         memory_size,
                     );
-                    tasks.spawn_on(fut, handle);
+                    tasks.spawn(fut);
                 }
                 Some(ScalarValue::Null | ScalarValue::UInt64(None)) => {
                     let fut = handle_new_fragments(
@@ -947,7 +944,7 @@ impl MergeInsertJob {
                         new_fragments.clone(),
                         memory_size,
                     );
-                    tasks.spawn_on(fut, handle);
+                    tasks.spawn(fut);
                 }
                 _ => {
                     return Err(Error::Internal {
