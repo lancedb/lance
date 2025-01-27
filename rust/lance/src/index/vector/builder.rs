@@ -351,13 +351,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "dataset not set before shuffling",
             location!(),
         ))?;
-        let stream = dataset
-            .scan()
+        let is_nullable = dataset
+            .schema()
+            .field(&self.column)
+            .ok_or(Error::invalid_input(
+                format!("column {} not found in dataset", self.column).as_str(),
+                location!(),
+            ))?
+            .nullable;
+        let mut builder = dataset.scan();
+        builder
             .batch_readahead(get_num_compute_intensive_cpus())
             .project(&[self.column.as_str()])?
-            .with_row_id()
-            .try_into_stream()
-            .await?;
+            .with_row_id();
+        if is_nullable {
+            builder.filter_expr(datafusion_expr::col(&self.column).is_not_null());
+        }
+        let stream = builder.try_into_stream().await?;
         self.shuffle_data(Some(stream)).await?;
         Ok(())
     }

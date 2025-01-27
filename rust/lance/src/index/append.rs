@@ -123,6 +123,9 @@ pub async fn merge_indices<'a>(
                     .with_fragments(unindexed)
                     .with_row_id()
                     .project(&[&column.name])?;
+                if column.nullable {
+                    scanner.filter_expr(datafusion_expr::col(&column.name).is_not_null());
+                }
                 Some(scanner.try_into_stream().await?)
             };
 

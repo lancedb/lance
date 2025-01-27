@@ -2222,37 +2222,35 @@ mod tests {
             .await;
     }
 
-    #[rstest]
+    // We test L2 and Dot, because L2 PQ uses residuals while Dot doesn't,
+    // so they have slightly different code paths.
     #[tokio::test]
+    #[rstest]
+    #[case::ivf_pq_l2(VectorIndexParams::with_ivf_pq_params(
+        MetricType::L2,
+        IvfBuildParams::new(2),
+        PQBuildParams::new(2, 8),
+    ))]
+    #[case::ivf_pq_dot(VectorIndexParams::with_ivf_pq_params(
+        MetricType::Dot,
+        IvfBuildParams::new(2),
+        PQBuildParams::new(2, 8),
+    ))]
+    #[case::ivf_flat(VectorIndexParams::ivf_flat(1, MetricType::Dot))]
+    #[case::ivf_hnsw_pq(VectorIndexParams::with_ivf_hnsw_pq_params(
+        MetricType::Dot,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default().num_edges(100),
+        PQBuildParams::new(2, 8)
+    ))]
+    #[case::ivf_hnsw_sq(VectorIndexParams::with_ivf_hnsw_sq_params(
+        MetricType::Dot,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default().num_edges(100),
+        SQBuildParams::default()
+    ))]
     async fn test_create_index_nulls(
-        // We test L2 and Dot, because L2 PQ uses residuals while Dot doesn't,
-        // so they have slightly different code paths.
-        #[values(
-            VectorIndexParams::with_ivf_pq_params(
-                MetricType::L2,
-                IvfBuildParams::new(2),
-                PQBuildParams::new(2, 4),
-            ),
-            VectorIndexParams::with_ivf_pq_params(
-                MetricType::Dot,
-                IvfBuildParams::new(2),
-                PQBuildParams::new(2, 4),
-            ),
-            VectorIndexParams::ivf_flat(1, MetricType::Dot),
-            VectorIndexParams::with_ivf_hnsw_pq_params(
-                MetricType::Dot,
-                IvfBuildParams::new(2),
-                HnswBuildParams::default(),
-                PQBuildParams::new(2, 4)
-            ),
-            VectorIndexParams::with_ivf_hnsw_sq_params(
-                MetricType::Dot,
-                IvfBuildParams::new(2),
-                HnswBuildParams::default(),
-                SQBuildParams::default()
-            )
-        )]
-        mut index_params: VectorIndexParams,
+        #[case] mut index_params: VectorIndexParams,
         #[values(IndexFileVersion::Legacy, IndexFileVersion::V3)] index_version: IndexFileVersion,
     ) {
         index_params.version(index_version);
@@ -2293,6 +2291,7 @@ mod tests {
             .scan()
             .nearest("vec", &query, 2_000)
             .unwrap()
+            .ef(100_000)
             .nprobs(2)
             .try_into_batch()
             .await
