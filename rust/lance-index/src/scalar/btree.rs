@@ -970,12 +970,14 @@ impl ScalarIndex for BTreeIndex {
             })
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
-        stream::iter(page_tasks)
+        let selections = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<RowIdTreeMap>()
-            .await
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        Ok(RowIdTreeMap::union_all(&selections.iter().collect::<Vec<_>>()))
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
