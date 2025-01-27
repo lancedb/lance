@@ -12,26 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use arrow_array::RecordBatchIterator;
+use arrow_schema::Schema;
+use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
+use lance_core::utils::path::LancePathExt;
+use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams, WrappingObjectStore};
+use lance_table::format::{Index, Manifest};
+use lance_table::io::commit::{CommitError, CommitHandler, ManifestNamingScheme, ManifestWriter};
+use object_store::{path::Path, ObjectStore as OSObjectStore};
 use std::fmt::Debug;
 use std::sync::Arc;
-use futures::stream::BoxStream;
-use object_store::path::Path;
 use url::Url;
-use lance_core::Error;
-use lance_io::object_store::{ObjectStore, ObjectStoreExt, ObjectStoreParams, WrappingObjectStore};
-use object_store::{ObjectStore as OSObjectStore};
-use lance_table::format::{Index, Manifest};
-use lance_table::io::commit::{CommitError, CommitHandler, ManifestLocation, ManifestNamingScheme, ManifestWriter};
 
-use crate::{Dataset, Result};
 use crate::dataset::builder::DatasetBuilder;
+use crate::dataset::WriteParams;
+use crate::{Dataset, Result};
 
 /// Contains all the information that Lance needs to access a table
 pub struct TableReference {
     /// Base URI of the table
     pub uri: String,
     /// Object store wrapper used to access the table
-    pub store_wrapper: Option<Arc<dyn WrappingObjectStore>>,
+    pub object_store: ObjectStore,
     /// Commit handler used to handle new commits to the table
     pub commit_handler: Arc<dyn CommitHandler>,
     /// Parameters used to read / write to the object store
@@ -44,7 +47,7 @@ pub trait Catalog: std::fmt::Debug + Send + Sync {
     /// Create a new table in the catalog
     ///
     /// Returns a table reference that can be used to read/write to the table
-    async fn create_table(&self, name: &str) -> Result<TableReference>;
+    async fn create_table(&self, name: &str, schema: Arc<Schema>) -> Result<TableReference>;
     /// Drop a table from the catalog
     async fn drop_table(&self, name: &str) -> Result<()>;
     /// Get a reference to a table in the catalog
@@ -80,56 +83,110 @@ pub struct ListingCatalog {
 
 const LANCE_EXTENSION: &str = "lance";
 
-impl ListingCatalog {
+fn format_table_path(is_url: bool, scheme: &str, base_path: &str, name: &str) -> String {
+    if is_url {
+        format!("{}:///{}/{}.{}", scheme, base_path, name, LANCE_EXTENSION)
+    } else {
+        format!("{}/{}.{}", base_path, name, LANCE_EXTENSION)
+    }
+}
 
+impl ListingCatalog {
     pub fn new(base_path: Path, object_store: ObjectStore) -> Self {
         Self {
             base_path,
             object_store: object_store.clone(),
-            commit_handler: Arc::new(
-                ListingCommitHandler { object_store: object_store.into() }
-            ),
+            commit_handler: Arc::new(ListingCommitHandler {
+                object_store: object_store.into(),
+            }),
         }
     }
-
 }
 
 #[async_trait::async_trait]
 impl Catalog for ListingCatalog {
-    async fn create_table(&self, name: &str) -> Result<TableReference> {
-        let table_path = self.base_path.child(name);
-        DatasetBuilder::from_uri(table_path)
-            .with_commit_handler(self.commit_handler.clone())
-            .with_object_store(self.object_store.clone().inner, Url::parse(table_path.clone().as_ref()).unwrap(), self.commit_handler.clone())
-            .load()
-            .await?;
-        let ds = Dataset::open(table_path.as_ref()).await?;
+    async fn create_table(&self, name: &str, schema: Arc<Schema>) -> Result<TableReference> {
+        let table_path = format_table_path(
+            true,
+            &*self.object_store.scheme,
+            self.base_path.as_ref(),
+            name,
+        );
 
-        Ok(
-            TableReference {
-                uri: ds.uri().to_string(),
-                store_wrapper: Some(self.object_store.into()),
-                commit_handler: self.commit_handler.clone(),
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
+            &table_path,
+            Some(WriteParams {
+                commit_handler: Option::from(self.commit_handler.clone()),
                 store_params: Some(ObjectStoreParams {
-                    block_size: None,
-                    object_store: None,
-                    s3_credentials_refresh_offset: Default::default(),
-                    aws_credentials: None,
-                    object_store_wrapper: None,
-                    storage_options: None,
-                    use_constant_size_upload_parts: false,
-                    list_is_lexically_ordered: None,
+                    object_store: Some((
+                        self.object_store.clone().inner,
+                        Url::parse(&*table_path).unwrap(),
+                    )),
+                    ..Default::default()
                 }),
-            }
+                ..Default::default()
+            }),
         )
+        .await?;
+
+        Ok(TableReference {
+            uri: ds.uri().to_string(),
+            object_store: self.object_store.clone(),
+            commit_handler: self.commit_handler.clone(),
+            store_params: Some(ObjectStoreParams {
+                object_store: Some((
+                    self.object_store.clone().inner,
+                    Url::parse(&*table_path).unwrap(),
+                )),
+                ..Default::default()
+            }),
+        })
     }
 
     async fn drop_table(&self, name: &str) -> Result<()> {
-        todo!()
+        let table_path = format_table_path(
+            false,
+            &*self.object_store.scheme,
+            self.base_path.as_ref(),
+            name,
+        );
+
+        self.object_store.remove_dir_all(table_path).await?;
+
+        Ok(())
     }
 
     async fn get_table(&self, name: &str) -> Result<TableReference> {
-        todo!()
+        let table_path = format_table_path(
+            true,
+            &*self.object_store.scheme,
+            self.base_path.as_ref(),
+            name,
+        );
+
+        let ds = DatasetBuilder::from_uri(&table_path)
+            .with_commit_handler(self.commit_handler.clone())
+            .with_object_store(
+                self.object_store.clone().inner,
+                Url::parse(&*table_path).unwrap(),
+                self.commit_handler.clone(),
+            )
+            .load()
+            .await?;
+
+        Ok(TableReference {
+            uri: ds.uri().to_string(),
+            object_store: self.object_store.clone(),
+            commit_handler: self.commit_handler.clone(),
+            store_params: Some(ObjectStoreParams {
+                object_store: Some((
+                    self.object_store.clone().inner,
+                    Url::parse(&*table_path).unwrap(),
+                )),
+                ..Default::default()
+            }),
+        })
     }
 
     async fn list_tables(
@@ -177,145 +234,8 @@ impl Debug for ListingCommitHandler {
     }
 }
 
+#[async_trait]
 impl CommitHandler for ListingCommitHandler {
-    async fn resolve_latest_location(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> Result<ManifestLocation> {
-        let manifests = object_store
-            .read_dir(base_path.clone())
-            .await?
-            .iter()
-            .filter(|path| Path::from(path).extension().and_then(|e| e.to_str()) == Some("manifest"))
-            .collect::<Vec<_>>();
-
-        if manifests.is_empty() {
-            return Err(lance_core::Error::InvalidTableLocation {
-                message: "No manifests found".to_string(),
-            });
-
-        }
-
-        let latest_manifest = manifests
-            .iter()
-            .max_by_key(|path| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .ok_or_else(|| lance_core::Error::InvalidTableLocation {
-                message: "Failed to find latest manifest"
-            }.to_string())?;
-
-        Ok(ManifestLocation {
-            version: 0,
-            path: Path::from(latest_manifest.clone()),
-            size: None,
-            naming_scheme: ManifestNamingScheme::V1,
-        })
-    }
-
-
-    async fn resolve_latest_version(&self, base_path: &Path, object_store: &ObjectStore) -> std::result::Result<Path, Error> {
-        let manifests = object_store
-            .read_dir(base_path.clone())
-            .await?
-            .iter()
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("manifest"))
-            .collect::<Vec<_>>();
-
-        if manifests.is_empty() {
-            return Err("No manifests found".to_string());
-        }
-
-        let latest_manifest = manifests
-            .iter()
-            .max_by_key(|path| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .ok_or_else(|| Err("Failed to find latest manifest".to_string()))?;
-
-        Ok(latest_manifest.clone())
-    }
-
-    async fn resolve_latest_version_id(&self, base_path: &Path, object_store: &ObjectStore) -> Result<u64> {
-        let manifests = object_store
-            .read_dir(base_path.clone())
-            .await?
-            .iter()
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("manifest"))
-            .collect::<Vec<_>>();
-
-        if manifests.is_empty() {
-            return Err("No manifests found".to_string());
-        }
-
-        let latest_version = manifests
-            .iter()
-            .filter_map(|path| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .max()
-            .ok_or_else(|| Err("Failed to find latest version".to_string()))?;
-
-        Ok(latest_version)
-    }
-
-    async fn resolve_version(
-        &self,
-        base_path: &Path,
-        version: u64,
-        object_store: &dyn OSObjectStore,
-    ) -> std::result::Result<Path, Error> {
-        let version_path = base_path.child(format!("{:020}.manifest", version));
-        if object_store.exists(&version_path).await? {
-            Ok(version_path)
-        } else {
-            Err(Error::Execution {
-                message: format!(
-                    "Manifest for version {} not found",
-                    version
-                ),
-                location: Default::default(),
-            })
-        }
-    }
-
-
-    async fn resolve_version_location(
-        &self,
-        base_path: &Path,
-        version: u64,
-        object_store: &dyn OSObjectStore,
-    ) -> Result<ManifestLocation> {
-        let version_path = self.resolve_version(base_path, version, object_store).await?;
-        Ok(ManifestLocation { version, path: version_path, size: None, naming_scheme: ManifestNamingScheme::V1 })
-    }
-
-
-    async fn list_manifests<'a>(
-        &self,
-        base_path: &Path,
-        object_store: &'a dyn OSObjectStore,
-    ) -> Result<BoxStream<'a, Result<Path>>> {
-        let manifests = object_store
-            .read_dir_all(base_path.clone(), None)
-            .await?
-            .iter()
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("manifest"))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let stream = futures::stream::iter(manifests.into_iter().map(Ok));
-        Ok(Box::pin(stream))
-    }
-
-
     async fn commit(
         &self,
         manifest: &mut Manifest,
@@ -325,35 +245,47 @@ impl CommitHandler for ListingCommitHandler {
         manifest_writer: ManifestWriter,
         naming_scheme: ManifestNamingScheme,
     ) -> std::result::Result<Path, CommitError> {
-        // Generate the next version number
-        let latest_version = self
-            .resolve_latest_version_id(base_path, object_store)
+        let version_path = naming_scheme.manifest_path(base_path, manifest.version);
+        manifest_writer(object_store, manifest, indices, &version_path).await?;
+
+        Ok(version_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+
+    #[tokio::test]
+    async fn test_listing_catalog() {
+        let object_store = ObjectStore::memory();
+        let base_path = Path::parse("/catalog").unwrap();
+
+        // Init a listing catalog
+        let catalog = ListingCatalog::new(base_path.clone(), object_store.clone());
+
+        // Create a table
+        let field_a = ArrowField::new("a", DataType::Int32, true);
+        let schema = Arc::new(ArrowSchema::new(vec![field_a.clone()]));
+        let table_ref = catalog
+            .create_table("test_table", schema.clone())
             .await
-            .unwrap_or(0);
-        let next_version = latest_version + 1;
+            .unwrap();
 
-        // Write the manifest to the object store
-        let manifest_path = base_path.child(format!("{:020}.manifest", next_version));
-        manifest_writer(object_store, manifest, indices, &manifest_path).await?;
+        // Verify the table was created
+        let table_ref_fetched = catalog.get_table("test_table").await.unwrap();
+        assert_eq!(table_ref.uri, table_ref_fetched.uri);
 
-        Ok(manifest_path)
+        // List tables
+        let tables = catalog.list_tables(None, None).await.unwrap();
+        assert_eq!(tables, vec!["test_table"]);
+
+        // Drop the table
+        catalog.drop_table("test_table").await.unwrap();
+
+        // Verify the table was dropped
+        let tables = catalog.list_tables(None, None).await.unwrap();
+        assert!(tables.is_empty());
     }
-
-
-    async fn delete(&self, base_path: &Path) -> Result<()> {
-        let manifests = self
-            .list_manifests(base_path, &self.object_store.inner)
-            .await?
-            .collect::<Vec<_>>()
-            .await;
-
-        for manifest in manifests {
-            if let Ok(path) = manifest {
-                self.object_store.delete(&path).await?;
-            }
-        }
-
-        Ok(())
-    }
-
 }

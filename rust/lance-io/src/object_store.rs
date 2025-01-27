@@ -97,7 +97,7 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
-    scheme: String,
+    pub scheme: String,
     block_size: usize,
     /// Whether to use constant size upload parts for multipart uploads. This
     /// is only necessary for Cloudflare R2.
