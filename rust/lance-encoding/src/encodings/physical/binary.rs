@@ -847,6 +847,7 @@ pub mod tests {
     };
     use arrow_schema::{DataType, Field};
 
+    use lance_core::datatypes::{STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_MINIBLOCK};
     use rstest::rstest;
     use std::{collections::HashMap, sync::Arc, vec};
 
@@ -902,8 +903,19 @@ pub mod tests {
     #[test_log::test(tokio::test)]
     async fn test_binary(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+        #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
-        let field = Field::new("", DataType::Binary, false);
+        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
+
+        let field = Field::new("", data_type, false).with_metadata(field_metadata);
         check_round_trip_encoding_random(field, version).await;
     }
 
@@ -921,10 +933,22 @@ pub mod tests {
 
     #[rstest]
     #[test_log::test(tokio::test)]
-    async fn test_simple_utf8_binary(
+    async fn test_simple_binary(
         #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)]
+        structural_encoding: &str,
+        #[values(DataType::Utf8, DataType::Binary)] data_type: DataType,
     ) {
+        use lance_core::datatypes::STRUCTURAL_ENCODING_META_KEY;
+
         let string_array = StringArray::from(vec![Some("abc"), None, Some("pqr"), None, Some("m")]);
+        let string_array = arrow_cast::cast(&string_array, &data_type).unwrap();
+
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            structural_encoding.into(),
+        );
 
         let test_cases = TestCases::default()
             .with_range(0..2)
@@ -935,7 +959,7 @@ pub mod tests {
         check_round_trip_encoding_of_data(
             vec![Arc::new(string_array)],
             &test_cases,
-            HashMap::new(),
+            field_metadata,
         )
         .await;
     }
@@ -1060,15 +1084,6 @@ pub mod tests {
         // // We can't validate because our validation relies on concatenating all input arrays
         let test_cases = TestCases::default().without_validation();
         check_round_trip_encoding_of_data(arrs, &test_cases, HashMap::new()).await;
-    }
-
-    #[rstest]
-    #[test_log::test(tokio::test)]
-    async fn test_binary_miniblock(
-        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1)] version: LanceFileVersion,
-    ) {
-        let field = Field::new("", DataType::Utf8, false);
-        check_round_trip_encoding_random(field, version).await;
     }
 
     #[test_log::test(tokio::test)]
