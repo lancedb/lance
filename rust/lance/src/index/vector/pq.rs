@@ -447,6 +447,7 @@ pub async fn build_pq_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
+    assert_eq!(training_data.logical_null_count(), 0);
 
     info!(
         "starting to compute partitions for PQ training, sample size: {}",
