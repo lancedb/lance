@@ -1742,14 +1742,15 @@ mod tests {
 
     use arrow_array::types::UInt64Type;
     use arrow_array::{
-        make_array, Float32Array, RecordBatchIterator, RecordBatchReader, UInt64Array,
+        make_array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
+        RecordBatchReader, UInt64Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer};
-    use arrow_schema::Field;
+    use arrow_schema::{DataType, Field, Schema};
     use itertools::Itertools;
     use lance_core::utils::address::RowAddress;
     use lance_core::ROW_ID;
-    use lance_datagen::{array, gen, Dimension, RowCount};
+    use lance_datagen::{array, gen, ArrayGeneratorExt, Dimension, RowCount};
     use lance_index::vector::sq::builder::SQBuildParams;
     use lance_linalg::distance::l2_distance_batch;
     use lance_testing::datagen::{
@@ -1760,7 +1761,7 @@ mod tests {
     use rstest::rstest;
     use tempfile::tempdir;
 
-    use crate::dataset::InsertBuilder;
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
     use crate::index::prefilter::DatasetPreFilter;
     use crate::index::vector::IndexFileVersion;
     use crate::index::vector_index_details;
@@ -2298,6 +2299,75 @@ mod tests {
             .unwrap();
         assert_eq!(results.num_rows(), num_non_null);
         assert_eq!(results["vec"].logical_null_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_index_lifecycle_nulls() {
+        // Generate random data with nulls
+        let nrows = 2_000;
+        let dims = 32;
+        let data = gen()
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),
+            )
+            .into_batch_rows(RowCount::from(nrows))
+            .unwrap();
+        let num_non_null = data["vec"].len() - data["vec"].logical_null_count();
+
+        let mut dataset = InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        // Create index
+        let index_params = VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            IvfBuildParams::new(2),
+            PQBuildParams::new(2, 8),
+        );
+        dataset
+            .create_index(&["vec"], IndexType::Vector, None, &index_params, false)
+            .await
+            .unwrap();
+
+        // Check that the index is working
+        async fn check_index(dataset: &Dataset, num_non_null: usize, dims: usize) {
+            let query = vec![0.0; dims].into_iter().collect::<Float32Array>();
+            let results = dataset
+                .scan()
+                .nearest("vec", &query, 2_000)
+                .unwrap()
+                .nprobs(2)
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(results.num_rows(), num_non_null);
+        }
+        check_index(&dataset, num_non_null, dims).await;
+
+        // Append more data
+        let data = gen()
+            .col(
+                "vec",
+                array::rand_vec::<Float32Type>(Dimension::from(dims as u32)).with_random_nulls(0.5),
+            )
+            .into_batch_rows(RowCount::from(500))
+            .unwrap();
+        let num_non_null = data["vec"].len() - data["vec"].logical_null_count() + num_non_null;
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        check_index(&dataset, num_non_null, dims).await;
+
+        // Optimize the index
+        dataset.optimize_indices(&Default::default()).await.unwrap();
+        check_index(&dataset, num_non_null, dims).await;
     }
 
     #[tokio::test]

@@ -105,6 +105,9 @@ pub(super) fn compute_pq_distance(
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
+    if code.is_empty() {
+        return Vec::new();
+    }
     if num_bits == 4 {
         return compute_pq_distance_4bit(distance_table, num_sub_vectors, code);
     }
