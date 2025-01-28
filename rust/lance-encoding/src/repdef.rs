@@ -1630,9 +1630,11 @@ impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u8> {
         buf.push(control_word);
         let is_new_row = next.0 == self.max_rep;
         let is_visible = next.1 <= self.max_visible_def;
+        let is_valid_item = next.1 == 0;
         Some(ControlWordDesc {
             is_new_row,
             is_visible,
+            is_valid_item,
         })
     }
 }
@@ -1647,9 +1649,11 @@ impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u16> {
         buf.push(control_word[1]);
         let is_new_row = next.0 == self.max_rep;
         let is_visible = next.1 <= self.max_visible_def;
+        let is_valid_item = next.1 == 0;
         Some(ControlWordDesc {
             is_new_row,
             is_visible,
+            is_valid_item,
         })
     }
 }
@@ -1666,9 +1670,11 @@ impl<I: Iterator<Item = (u16, u16)>> BinaryControlWordIterator<I, u32> {
         buf.push(control_word[3]);
         let is_new_row = next.0 == self.max_rep;
         let is_visible = next.1 <= self.max_visible_def;
+        let is_valid_item = next.1 == 0;
         Some(ControlWordDesc {
             is_new_row,
             is_visible,
+            is_valid_item,
         })
     }
 }
@@ -1689,11 +1695,13 @@ impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u8> {
         let next = self.repdef.next()?;
         buf.push((next & self.level_mask) as u8);
         let is_new_row = self.max_rep == 0 || next == self.max_rep;
+        let is_valid_item = next == 0 || self.bits_def == 0;
         Some(ControlWordDesc {
             is_new_row,
             // Either there is no rep, in which case there are no invisible items
             // or there is no def, in which case there are no invisible items
             is_visible: true,
+            is_valid_item,
         })
     }
 }
@@ -1705,9 +1713,11 @@ impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u16> {
         buf.push(control_word[0]);
         buf.push(control_word[1]);
         let is_new_row = self.max_rep == 0 || next == self.max_rep;
+        let is_valid_item = next == 0 || self.bits_def == 0;
         Some(ControlWordDesc {
             is_new_row,
             is_visible: true,
+            is_valid_item,
         })
     }
 }
@@ -1722,9 +1732,11 @@ impl<I: Iterator<Item = u16>> UnaryControlWordIterator<I, u32> {
         buf.push(control_word[2]);
         buf.push(control_word[3]);
         let is_new_row = self.max_rep == 0 || next as u16 == self.max_rep;
+        let is_valid_item = next == 0 || self.bits_def == 0;
         Some(ControlWordDesc {
             is_new_row,
             is_visible: true,
+            is_valid_item,
         })
     }
 }
@@ -1745,6 +1757,7 @@ impl NilaryControlWordIterator {
             Some(ControlWordDesc {
                 is_new_row: true,
                 is_visible: true,
+                is_valid_item: true,
             })
         }
     }
@@ -1787,15 +1800,7 @@ pub enum ControlWordIterator<'a> {
 pub struct ControlWordDesc {
     pub is_new_row: bool,
     pub is_visible: bool,
-}
-
-impl ControlWordDesc {
-    fn all_true() -> Self {
-        Self {
-            is_new_row: true,
-            is_visible: true,
-        }
-    }
+    pub is_valid_item: bool,
 }
 
 impl ControlWordIterator<'_> {
@@ -2064,9 +2069,11 @@ impl ControlWordParser {
                 let def = word & (mask_to_apply as u8);
                 let is_visible = def as u16 <= max_visible_def;
                 let is_new_row = rep as u16 == max_rep;
+                let is_valid_item = def == 0;
                 ControlWordDesc {
                     is_visible,
                     is_new_row,
+                    is_valid_item,
                 }
             }
             2 => {
@@ -2075,9 +2082,11 @@ impl ControlWordParser {
                 let def = word & mask_to_apply as u16;
                 let is_visible = def <= max_visible_def;
                 let is_new_row = rep == max_rep;
+                let is_valid_item = def == 0;
                 ControlWordDesc {
                     is_visible,
                     is_new_row,
+                    is_valid_item,
                 }
             }
             4 => {
@@ -2086,9 +2095,11 @@ impl ControlWordParser {
                 let def = word & mask_to_apply;
                 let is_visible = def as u16 <= max_visible_def;
                 let is_new_row = rep as u16 == max_rep;
+                let is_valid_item = def == 0;
                 ControlWordDesc {
                     is_visible,
                     is_new_row,
+                    is_valid_item,
                 }
             }
             _ => unreachable!(),
@@ -2113,19 +2124,43 @@ impl ControlWordParser {
         }
     }
 
-    fn parse_desc_one<const WORD_SIZE: u8>(src: &[u8], max_rep: u16) -> ControlWordDesc {
+    fn parse_rep_desc_one<const WORD_SIZE: u8>(src: &[u8], max_rep: u16) -> ControlWordDesc {
         match WORD_SIZE {
             1 => ControlWordDesc {
                 is_new_row: src[0] as u16 == max_rep,
                 is_visible: true,
+                is_valid_item: true,
             },
             2 => ControlWordDesc {
                 is_new_row: u16::from_le_bytes([src[0], src[1]]) == max_rep,
                 is_visible: true,
+                is_valid_item: true,
             },
             4 => ControlWordDesc {
                 is_new_row: u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as u16 == max_rep,
                 is_visible: true,
+                is_valid_item: true,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn parse_def_desc_one<const WORD_SIZE: u8>(src: &[u8]) -> ControlWordDesc {
+        match WORD_SIZE {
+            1 => ControlWordDesc {
+                is_new_row: true,
+                is_visible: true,
+                is_valid_item: src[0] == 0,
+            },
+            2 => ControlWordDesc {
+                is_new_row: true,
+                is_visible: true,
+                is_valid_item: u16::from_le_bytes([src[0], src[1]]) == 0,
+            },
+            4 => ControlWordDesc {
+                is_new_row: true,
+                is_visible: true,
+                is_valid_item: u32::from_le_bytes([src[0], src[1], src[2], src[3]]) as u16 == 0,
             },
             _ => unreachable!(),
         }
@@ -2211,13 +2246,17 @@ impl ControlWordParser {
                 max_rep,
                 max_visible_def,
             ),
-            Self::REP8 => Self::parse_desc_one::<1>(src, max_rep),
-            Self::REP16 => Self::parse_desc_one::<2>(src, max_rep),
-            Self::REP32 => Self::parse_desc_one::<4>(src, max_rep),
-            Self::DEF8 => ControlWordDesc::all_true(),
-            Self::DEF16 => ControlWordDesc::all_true(),
-            Self::DEF32 => ControlWordDesc::all_true(),
-            Self::NIL => ControlWordDesc::all_true(),
+            Self::REP8 => Self::parse_rep_desc_one::<1>(src, max_rep),
+            Self::REP16 => Self::parse_rep_desc_one::<2>(src, max_rep),
+            Self::REP32 => Self::parse_rep_desc_one::<4>(src, max_rep),
+            Self::DEF8 => Self::parse_def_desc_one::<1>(src),
+            Self::DEF16 => Self::parse_def_desc_one::<2>(src),
+            Self::DEF32 => Self::parse_def_desc_one::<4>(src),
+            Self::NIL => ControlWordDesc {
+                is_new_row: true,
+                is_valid_item: true,
+                is_visible: true,
+            },
         }
     }
 

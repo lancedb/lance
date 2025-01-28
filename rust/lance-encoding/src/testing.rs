@@ -473,7 +473,11 @@ impl SimulatedWriter {
         let page_encoding = encoded_page.description;
         let buffer_offsets_and_sizes = page_buffers
             .into_iter()
-            .map(|b| self.write_buffer(b))
+            .map(|b| {
+                let (offset, size) = self.write_buffer(b);
+                trace!("Encoded buffer offset={} size={}", offset, size);
+                (offset, size)
+            })
             .collect::<Vec<_>>();
 
         let page_info = PageInfo {
