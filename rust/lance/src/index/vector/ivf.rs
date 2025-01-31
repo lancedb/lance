@@ -2237,6 +2237,9 @@ mod tests {
         }
     }
 
+    // Clippy doesn't like that all start with Ivf but we might have some in the future
+    // that _don't_ start with Ivf so I feel it is meaningful to keep the prefix
+    #[allow(clippy::enum_variant_names)]
     enum TestIndexType {
         IvfPq { pq: TestPqParams },
         IvfHnswPq { pq: TestPqParams, num_edges: usize },
@@ -2344,7 +2347,7 @@ mod tests {
             .await
             .unwrap();
 
-        let query = vec![0.0; test_case.dimension as usize]
+        let query = vec![0.0; test_case.dimension]
             .into_iter()
             .collect::<Float32Array>();
         let results = dataset
