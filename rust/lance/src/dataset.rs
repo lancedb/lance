@@ -4395,10 +4395,13 @@ mod tests {
         let validate_res = dataset.validate().await;
         assert!(validate_res.is_err());
         assert_eq!(dataset.load_indices().await.unwrap()[0].name, "vector_idx");
-        assert!(dataset.index_statistics("vector_idx").await.is_err());
 
-        // Force a migration
-        dataset.delete("false").await.unwrap();
+        // Calling index statistics will force a migration
+        let stats = dataset.index_statistics("vector_idx").await.unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["num_indexed_fragments"], 2);
+
+        dataset.checkout_latest().await.unwrap();
         dataset.validate().await.unwrap();
 
         let indices = dataset.load_indices().await.unwrap();
@@ -4408,10 +4411,6 @@ mod tests {
         }
         assert_eq!(get_bitmap(&indices[0]), vec![0]);
         assert_eq!(get_bitmap(&indices[1]), vec![1]);
-
-        let stats = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
-        assert_eq!(stats["num_indexed_fragments"], 2);
     }
 
     #[rstest]
