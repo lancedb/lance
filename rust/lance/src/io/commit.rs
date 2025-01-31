@@ -50,6 +50,7 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;
 
+mod conflict_resolution;
 #[cfg(all(feature = "dynamodb", test))]
 mod dynamodb;
 #[cfg(test)]
