@@ -1219,7 +1219,6 @@ mod tests {
     #[rstest]
     #[case("s3://bucket/foo.lance", None)]
     #[case("gs://bucket/foo.lance", None)]
-    #[case("memory:///bucket/foo.lance", None)]
     #[case("az://account/bucket/foo.lance",
       Some(HashMap::from([
             (String::from("account_name"), String::from("account")),
@@ -1236,6 +1235,7 @@ mod tests {
     #[rstest]
     #[case("file")]
     #[case("file-object-store")]
+    #[case("memory:///bucket/foo.lance")]
     #[tokio::test]
     async fn test_block_size_used_file(#[case] prefix: &str) {
         let tmp_dir = tempfile::tempdir().unwrap();
