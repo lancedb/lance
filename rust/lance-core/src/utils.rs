@@ -8,6 +8,7 @@ pub mod deletion;
 pub mod futures;
 pub mod hash;
 pub mod mask;
+pub mod parse;
 pub mod path;
 pub mod testing;
 pub mod tokio;

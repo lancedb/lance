@@ -11,6 +11,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::parse::str_is_truthy;
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -70,15 +71,8 @@ use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
 
 // Whether to auto-migrate a dataset when we encounter corruption.
 fn auto_migrate_corruption() -> bool {
-    static MAX_CONN_RESET_RETRIES: OnceLock<bool> = OnceLock::new();
-    fn str_is_truthy(val: &str) -> bool {
-        val.eq_ignore_ascii_case("1")
-            | val.eq_ignore_ascii_case("true")
-            | val.eq_ignore_ascii_case("on")
-            | val.eq_ignore_ascii_case("yes")
-            | val.eq_ignore_ascii_case("y")
-    }
-    *MAX_CONN_RESET_RETRIES.get_or_init(|| {
+    static LANCE_AUTO_MIGRATION: OnceLock<bool> = OnceLock::new();
+    *LANCE_AUTO_MIGRATION.get_or_init(|| {
         std::env::var("LANCE_AUTO_MIGRATION")
             .ok()
             .map(|s| str_is_truthy(&s))
