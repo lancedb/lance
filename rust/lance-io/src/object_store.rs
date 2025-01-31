@@ -501,7 +501,7 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: 4 * 1024,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
@@ -977,7 +977,7 @@ async fn configure_store(
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: cloud_block_size,
+            block_size: file_block_size,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
@@ -1219,7 +1219,6 @@ mod tests {
     #[rstest]
     #[case("s3://bucket/foo.lance", None)]
     #[case("gs://bucket/foo.lance", None)]
-    #[case("memory:///bucket/foo.lance", None)]
     #[case("az://account/bucket/foo.lance",
       Some(HashMap::from([
             (String::from("account_name"), String::from("account")),
@@ -1236,6 +1235,7 @@ mod tests {
     #[rstest]
     #[case("file")]
     #[case("file-object-store")]
+    #[case("memory:///bucket/foo.lance")]
     #[tokio::test]
     async fn test_block_size_used_file(#[case] prefix: &str) {
         let tmp_dir = tempfile::tempdir().unwrap();
