@@ -501,7 +501,7 @@ impl ObjectStore {
         Self {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: 64 * 1024,
+            block_size: 4 * 1024,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
@@ -977,7 +977,7 @@ async fn configure_store(
         "memory" => Ok(ObjectStore {
             inner: Arc::new(InMemory::new()).traced(),
             scheme: String::from("memory"),
-            block_size: cloud_block_size,
+            block_size: file_block_size,
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: get_num_compute_intensive_cpus(),
