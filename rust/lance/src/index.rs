@@ -44,7 +44,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;

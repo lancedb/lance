@@ -10,7 +10,7 @@ use lance_arrow::DataTypeExt;
 use lance_file::{version::LanceFileVersion, writer::ManifestProvider};
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use lance_core::{datatypes::Schema, Error, Result};

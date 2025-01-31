@@ -18,7 +18,7 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::prefilter::PreFilter;

@@ -14,7 +14,7 @@ use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
-use snafu::{location, Location};
+use snafu::location;
 use std::borrow::Cow;
 use std::sync::Arc;
 use uuid::Uuid;

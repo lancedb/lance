@@ -34,7 +34,7 @@ use lance_index::{
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::{debug_span, instrument};
 
 use crate::{

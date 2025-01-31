@@ -6,7 +6,7 @@ use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 

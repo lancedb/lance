@@ -5,7 +5,7 @@ use arrow_array::{types::ArrowPrimitiveType, ArrayRef, FixedSizeListArray, Primi
 use lance_arrow::FixedSizeListArrayExt;
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result};
 use lance_linalg::{

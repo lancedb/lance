@@ -15,7 +15,7 @@ use lance_arrow::*;
 use lance_core::{Error, Result};
 use lance_linalg::distance::DistanceType;
 use num_traits::*;
-use snafu::{location, Location};
+use snafu::location;
 use storage::{ScalarQuantizationMetadata, ScalarQuantizationStorage, SQ_METADATA_KEY};
 
 use super::quantizer::{Quantization, QuantizationMetadata, QuantizationType, Quantizer};

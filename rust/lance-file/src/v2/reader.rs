@@ -25,7 +25,7 @@ use lance_encoding::{
 };
 use log::debug;
 use prost::{Message, Name};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{
     cache::FileMetadataCache,

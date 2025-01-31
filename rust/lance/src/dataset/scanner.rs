@@ -70,7 +70,7 @@ use crate::io::exec::{
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;

@@ -13,7 +13,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
 use crate::{Error, Result, ROW_ADDR, ROW_ID};

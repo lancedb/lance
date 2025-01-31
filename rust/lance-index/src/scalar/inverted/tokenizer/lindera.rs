@@ -15,7 +15,7 @@ use lindera::{
 use lindera_tantivy::tokenizer::LinderaTokenizer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use snafu::{location, Location};
+use snafu::location;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct LinderaConfig {

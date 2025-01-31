@@ -21,7 +21,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
-use snafu::{location, Location};
+use snafu::location;
 
 use super::{
     schema::{compare_fields, explain_fields_difference},

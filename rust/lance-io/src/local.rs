@@ -19,7 +19,7 @@ use bytes::{Bytes, BytesMut};
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncSeekExt;
 use tokio::sync::OnceCell;
 use tracing::instrument;

@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::{FutureExt, TryFutureExt};
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
