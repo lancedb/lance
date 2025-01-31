@@ -33,7 +33,7 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use log::warn;
-use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
+use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode};
 use snafu::{location, Location};
 use url::Url;
 
@@ -605,7 +605,7 @@ pub async fn commit_handler_from_url(
     match url.scheme() {
         // TODO: for Cloudflare R2 and Minio, we can provide a PutIfNotExist commit handler
         // See: https://docs.rs/object_store/latest/object_store/aws/enum.S3ConditionalPut.html#variant.ETagMatch
-        "s3" => Ok(Arc::new(UnsafeCommitHandler)),
+        "s3" => Ok(Arc::new(ConcurrentCommitHandler)),
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -669,7 +669,7 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(RenameCommitHandler)),
+        "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(ConcurrentCommitHandler)),
         _ => Ok(Arc::new(UnsafeCommitHandler)),
     }
 }
@@ -749,6 +749,28 @@ impl CommitHandler for UnsafeCommitHandler {
 impl Debug for UnsafeCommitHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnsafeCommitHandler").finish()
+    }
+}
+
+#[derive(Debug)]
+pub struct ConcurrentCommitHandler;
+
+#[async_trait::async_trait]
+impl CommitHandler for ConcurrentCommitHandler {
+    async fn commit(
+        &self,
+        object_store: &ObjectStore,
+        path: &Path,
+        content: Vec<u8>,
+    ) -> Result<(), CommitError> {
+        // Use the new put_opts method with atomic PutMode::Create
+        match object_store.put_opts(path, &content, PutMode::Create).await {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::Precondition { .. }) => {
+                Err(CommitError::CommitConflict)
+            }
+            Err(err) => Err(CommitError::OtherError(err.into())),
+        }
     }
 }
 
@@ -897,6 +919,9 @@ impl Debug for RenameCommitHandler {
     }
 }
 
+
+ 
+ 
 #[derive(Debug, Clone)]
 pub struct CommitConfig {
     pub num_retries: u32,

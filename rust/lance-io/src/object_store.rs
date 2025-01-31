@@ -30,6 +30,7 @@ use object_store::{
     parse_url_opts, ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider,
 };
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+use object_store::{PutOptions, PutMode};
 use shellexpand::tilde;
 use snafu::{location, Location};
 use tokio::io::AsyncWriteExt;
@@ -596,6 +597,28 @@ impl ObjectStore {
         writer.write_all(content).await?;
         writer.shutdown().await
     }
+
+    /// A helper funtion to create a file with a put option (Overwrite, Create, Update)
+    pub async fn put_opts(&self, path: &Path, content: &[u8], mode: PutMode) -> Result<()> {
+        let options = PutOptions {
+            mode,
+            content_length: Some(content.len()),
+            ..Default::default() /// What attributes do we want to write to the metdata?
+        };
+
+        // Use 'put_opts' for conditional writes
+        self.inner.put(path, content.into(), options).await
+    }
+
+    /// impl Default for PutOptions {
+    ///     fn default() -> Self {
+    ///         PutOptions {
+    ///             mode: PutMode::Create,  // Default to overwrite behavior.
+    ///             content_length: None,
+    ///             metadata: None,
+    ///         }
+    ///     }
+    /// }
 
     pub async fn delete(&self, path: &Path) -> Result<()> {
         self.inner.delete(path).await?;

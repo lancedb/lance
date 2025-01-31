@@ -107,15 +107,19 @@ async fn read_dataset_transaction_file(
 /// Write a transaction to a file and return the relative path.
 async fn write_transaction_file(
     object_store: &ObjectStore,
+    commit_handler: &dyn CommitHandler,
     base_path: &Path,
     transaction: &Transaction,
 ) -> Result<String> {
     let file_name = format!("{}-{}.txn", transaction.read_version, transaction.uuid);
     let path = base_path.child("_transactions").child(file_name.as_str());
 
+    // Serialize the transaction to bytes
     let message = pb::Transaction::from(transaction);
     let buf = message.encode_to_vec();
-    object_store.inner.put(&path, buf.into()).await?;
+
+    // Use the commit handler to safely write the transaction file
+    commit_handler.commit(object_store, &path, buf).await?;
 
     Ok(file_name)
 }
@@ -164,7 +168,7 @@ async fn do_commit_new_dataset(
     blob_version: Option<u64>,
     session: &Session,
 ) -> Result<(Manifest, Path)> {
-    let transaction_file = write_transaction_file(object_store, base_path, transaction).await?;
+    let transaction_file = write_transaction_file(object_store, commit_handler, base_path, transaction).await?;
 
     let (mut manifest, indices) =
         transaction.build_manifest(None, vec![], &transaction_file, write_config, blob_version)?;
@@ -570,7 +574,7 @@ pub(crate) async fn do_commit_detached_transaction(
 ) -> Result<(Manifest, Path)> {
     // We don't strictly need a transaction file but we go ahead and create one for
     // record-keeping if nothing else.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+    let transaction_file = write_transaction_file(object_store, commit_handler, &dataset.base, transaction).await?;
 
     // We still do a loop since we may have conflicts in the random version we pick
     for attempt_i in 0..commit_config.num_retries {
@@ -725,7 +729,7 @@ pub(crate) async fn commit_transaction(
 
     // Note: object_store has been configured with WriteParams, but dataset.object_store()
     // has not necessarily. So for anything involving writing, use `object_store`.
-    let transaction_file = write_transaction_file(object_store, &dataset.base, transaction).await?;
+    let transaction_file = write_transaction_file(object_store, commit_handler, &dataset.base, transaction).await?;
 
     // First, get all transactions since read_version
     let read_version = transaction.read_version;
@@ -902,7 +906,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::format::{DataFile, DataStorageFormat};
     use lance_table::io::commit::{
-        CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler,
+        CommitLease, CommitLock, RenameCommitHandler, UnsafeCommitHandler, ConcurrentCommitHandler,
     };
     use lance_testing::datagen::generate_random_array;
 
@@ -1049,7 +1053,7 @@ mod tests {
             Some("hello world".to_string()),
         );
 
-        let file_name = write_transaction_file(&object_store, &base_path, &transaction)
+        let file_name = write_transaction_file(&object_store, commit_handler, &base_path, &transaction)
             .await
             .unwrap();
         let read_transaction = read_transaction_file(&object_store, &base_path, &file_name)
