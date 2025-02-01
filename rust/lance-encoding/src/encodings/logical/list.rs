@@ -786,9 +786,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         };
 
         self.rows_drained += num_rows;
-        let has_more = self.rows_left() > 0;
         Ok(NextDecodeTask {
-            has_more,
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,

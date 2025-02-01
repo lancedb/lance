@@ -5,3 +5,5 @@ pub(crate) mod io;
 pub mod reader;
 pub mod testing;
 pub mod writer;
+
+pub use io::LanceEncodingsIo;
