@@ -39,7 +39,7 @@ bytes.workspace = true
 chrono.workspace = true
 clap = { version = "4.1.1", features = ["derive"], optional = true }
 # This is already used by datafusion
-dashmap = "5"
+dashmap = "6"
 deepsize.workspace = true
 # matches arrow-rs use
 half.workspace = true

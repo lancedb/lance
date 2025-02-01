@@ -19,7 +19,7 @@ use lance_linalg::kmeans::compute_partition;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::Float;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use storage::{ProductQuantizationMetadata, ProductQuantizationStorage, PQ_METADATA_KEY};
 use tracing::instrument;
 

@@ -3,7 +3,7 @@
 
 use async_cell::sync::AsyncCell;
 use futures::Future;
-use snafu::{location, Location};
+use snafu::location;
 use std::sync::Arc;
 
 /// An async background task whose output can be shared across threads (via cloning)

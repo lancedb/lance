@@ -12,7 +12,7 @@ use lance_core::{Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreExt};
 use log::warn;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use snafu::{location, Location};
+use snafu::location;
 
 use super::{
     current_manifest_path, default_resolve_version, make_staging_manifest_path, ManifestLocation,

@@ -11,7 +11,7 @@ use datafusion::sql::sqlparser::{
 };
 
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 #[derive(Debug, Default)]
 struct LanceDialect(GenericDialect);
 

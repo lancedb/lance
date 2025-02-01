@@ -14,7 +14,7 @@ use itertools::Itertools;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_linalg::distance::DistanceType;
 use rayon::prelude::*;
-use snafu::{location, Location};
+use snafu::location;
 use std::cmp::min;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Debug;

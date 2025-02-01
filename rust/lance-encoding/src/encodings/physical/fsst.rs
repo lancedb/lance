@@ -8,7 +8,7 @@ use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,

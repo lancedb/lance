@@ -8,7 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use rangemap::RangeInclusiveMap;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::{RowIdSequence, U64Segment};
 

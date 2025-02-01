@@ -16,7 +16,7 @@ use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
-use snafu::{location, Location, ResultExt};
+use snafu::{location, ResultExt};
 use tracing::instrument;
 
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
@@ -136,7 +136,10 @@ pub async fn read_deletion_file(
             let mut batches: Vec<RecordBatch> = ArrowFileReader::try_new(data, None)?
                 .collect::<std::result::Result<_, ArrowError>>()
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path: path.clone() })?;
+                .context(CorruptFileSnafu {
+                    path: path.clone(),
+                    location: location!(),
+                })?;
 
             if batches.len() != 1 {
                 return Err(Error::corrupt_file(
@@ -189,7 +192,10 @@ pub async fn read_deletion_file(
             let reader = data.reader();
             let bitmap = RoaringBitmap::deserialize_from(reader)
                 .map_err(box_error)
-                .context(CorruptFileSnafu { path })?;
+                .context(CorruptFileSnafu {
+                    path,
+                    location: location!(),
+                })?;
 
             Ok(Some(DeletionVector::Bitmap(bitmap)))
         }

@@ -4,7 +4,7 @@
 use super::Dataset;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use snafu::{location, Location};
+use snafu::location;
 use std::sync::Arc;
 
 use lance_table::{

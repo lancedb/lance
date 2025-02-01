@@ -4,7 +4,7 @@
 use arrow::datatypes::UInt64Type;
 
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     buffer::LanceBuffer,

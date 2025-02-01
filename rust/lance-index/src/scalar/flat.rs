@@ -17,7 +17,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{Index, IndexType};
 

@@ -9,7 +9,7 @@ use lance_table::{
     format::{is_detached_version, DataStorageFormat},
     io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     dataset::{

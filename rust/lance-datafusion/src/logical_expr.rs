@@ -17,7 +17,7 @@ use lance_arrow::DataTypeExt;
 
 use lance_core::datatypes::Schema;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {

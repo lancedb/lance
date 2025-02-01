@@ -21,7 +21,7 @@ use deepsize::DeepSizeOf;
 use inverted::TokenizerConfig;
 use lance_core::utils::mask::RowIdTreeMap;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{Index, IndexParams, IndexType};
 

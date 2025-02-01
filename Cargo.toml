@@ -127,7 +127,7 @@ mock_instant = { version = "0.3.1", features = ["sync"] }
 moka = { version = "0.12", features = ["future", "sync"] }
 num-traits = "0.2"
 # Set min to prevent use of versions with CVE-2024-41178
-object_store = { version = "0.10.2" }
+object_store = { version = "0.11.0" }
 parquet = "53.0"
 pin-project = "1.0"
 path_abs = "0.5"
@@ -145,7 +145,7 @@ rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 shellexpand = "3.0"
-snafu = "0.7.5"
+snafu = "0.8"
 tantivy = { version = "0.22.0", features = ["stopwords"] }
 lindera = { version = "0.38.1" }
 lindera-tantivy = { version = "0.38.1" }

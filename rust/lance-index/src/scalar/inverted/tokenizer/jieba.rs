@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use super::TokenizerBuilder;
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct JiebaConfig {

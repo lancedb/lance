@@ -19,7 +19,7 @@ use lance_core::{
 };
 use lance_io::traits::Reader;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::sync::Mutex;
 
 use crate::io::exec::{ShareableRecordBatchStream, ShareableRecordBatchStreamAdapter};

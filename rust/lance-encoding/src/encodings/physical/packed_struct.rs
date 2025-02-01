@@ -9,7 +9,7 @@ use bytes::BytesMut;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::data::BlockInfo;
 use crate::data::FixedSizeListBlock;

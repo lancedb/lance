@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
-use snafu::{location, Location};
+use snafu::location;
 use std::{
     io::{Cursor, Write},
     str::FromStr,

@@ -8,7 +8,7 @@ use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::stream::StreamExt;
 use futures::TryStreamExt;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance::dataset::Dataset;
 use lance::index::vector::VectorIndexParams;

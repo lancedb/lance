@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_buffer::ToByteSlice;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 mod fragment;
