@@ -17,6 +17,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
+use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
@@ -1037,14 +1038,6 @@ fn infer_block_size(scheme: &str) -> usize {
         "file" => 4 * 1024,
         _ => 64 * 1024,
     }
-}
-
-fn str_is_truthy(val: &str) -> bool {
-    val.eq_ignore_ascii_case("1")
-        | val.eq_ignore_ascii_case("true")
-        | val.eq_ignore_ascii_case("on")
-        | val.eq_ignore_ascii_case("yes")
-        | val.eq_ignore_ascii_case("y")
 }
 
 /// Attempt to create a Url from given table location.

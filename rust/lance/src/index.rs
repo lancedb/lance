@@ -5,12 +5,13 @@
 //!
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::parse::str_is_truthy;
 use lance_file::reader::FileReader;
 use lance_file::v2;
 use lance_file::v2::reader::FileReaderOptions;
@@ -67,6 +68,17 @@ use crate::{dataset::Dataset, Error, Result};
 use self::append::merge_indices;
 use self::scalar::build_scalar_index;
 use self::vector::{build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX};
+
+// Whether to auto-migrate a dataset when we encounter corruption.
+fn auto_migrate_corruption() -> bool {
+    static LANCE_AUTO_MIGRATION: OnceLock<bool> = OnceLock::new();
+    *LANCE_AUTO_MIGRATION.get_or_init(|| {
+        std::env::var("LANCE_AUTO_MIGRATION")
+            .ok()
+            .map(|s| str_is_truthy(&s))
+            .unwrap_or(true)
+    })
+}
 
 /// Builds index.
 #[async_trait]
@@ -590,7 +602,8 @@ impl DatasetIndexExt for Dataset {
         let index_type = indices[0].index_type().to_string();
 
         let indexed_fragments_per_delta = self.indexed_fragments(index_name).await?;
-        let num_indexed_rows_per_delta = indexed_fragments_per_delta
+
+        let res = indexed_fragments_per_delta
             .iter()
             .map(|frags| {
                 let mut sum = 0;
@@ -604,18 +617,49 @@ impl DatasetIndexExt for Dataset {
                 }
                 Ok(sum)
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>();
+
+        async fn migrate_and_recompute(ds: &Dataset, index_name: &str) -> Result<String> {
+            let mut ds = ds.clone();
+            log::warn!(
+                "Detecting out-dated fragment metadata, migrating dataset. \
+                        To disable migration, set LANCE_AUTO_MIGRATION=false"
+            );
+            ds.delete("false").await.map_err(|err| {
+                Error::Execution {
+                    message: format!("Failed to migrate dataset while calculating index statistics. \
+                            To disable migration, set LANCE_AUTO_MIGRATION=false. Original error: {}", err),
+                    location: location!(),
+                }
+            })?;
+            ds.index_statistics(index_name).await
+        }
+
+        let num_indexed_rows_per_delta = match res {
+            Ok(rows) => rows,
+            Err(Error::Internal { message, .. })
+                if auto_migrate_corruption() && message.contains("trigger a single write") =>
+            {
+                return migrate_and_recompute(self, index_name).await;
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut fragment_ids = HashSet::new();
         for frags in indexed_fragments_per_delta.iter() {
             for frag in frags.iter() {
                 if !fragment_ids.insert(frag.id) {
-                    return Err(Error::Internal {
-                        message: "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
+                    if auto_migrate_corruption() {
+                        return migrate_and_recompute(self, index_name).await;
+                    } else {
+                        return Err(Error::Internal {
+                            message:
+                                "Overlap in indexed fragments. Please upgrade to lance >= 0.23.0 \
                                   and trigger a single write to fix this"
-                            .to_string(),
-                        location: location!(),
-                    });
+                                    .to_string(),
+                            location: location!(),
+                        });
+                    }
                 }
             }
         }
