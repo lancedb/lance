@@ -2913,3 +2913,28 @@ def test_dataset_schema(tmp_path: Path):
     ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
     ds._default_scan_options = {"with_row_id": True}
     assert ds.schema == ds.to_table().schema
+
+
+def test_data_replacement(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    data_file = fragment.files[0]
+    data_replacement = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    dataset = lance.LanceDataset.commit(dataset, data_replacement, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100, 200)),
+            "b": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected
