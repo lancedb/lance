@@ -822,7 +822,7 @@ impl BufferExt for arrow_buffer::Buffer {
         let mut buf = MutableBuffer::with_capacity(size_bytes);
         let to_fill = size_bytes - bytes.len();
         buf.extend(bytes);
-        buf.extend(std::iter::repeat(0).take(to_fill));
+        buf.extend(std::iter::repeat(0_u8).take(to_fill));
         Self::from(buf)
     }
 }

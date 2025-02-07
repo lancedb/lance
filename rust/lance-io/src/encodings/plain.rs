@@ -199,7 +199,7 @@ pub fn bytes_to_array(
     {
         // this code is taken from
         // https://github.com/apache/arrow-rs/blob/master/arrow-data/src/data.rs#L748-L768
-        let len_plus_offset = bytes.len() + offset;
+        let len_plus_offset = len + offset;
         let min_buffer_size = len_plus_offset.saturating_mul(*byte_width);
 
         // alignment or size isn't right -- just make a copy
@@ -632,6 +632,25 @@ mod tests {
             arrs.push(Arc::new(arr) as ArrayRef);
         }
         test_round_trip(arrs.as_slice(), t).await;
+    }
+
+    #[tokio::test]
+    async fn test_bytes_to_array_padding() {
+        let bytes = Bytes::from_static(&[0x01, 0x00, 0x02, 0x00, 0x03]);
+        let arr = bytes_to_array(&DataType::UInt16, bytes, 3, 0).unwrap();
+
+        let expected = UInt16Array::from(vec![1, 2, 3]);
+        assert_eq!(arr.as_ref(), &expected);
+
+        // Underlying data is padded to the nearest multiple of two bytes (for u16).
+        let data = arr.to_data();
+        let buf = &data.buffers()[0];
+        let repr = format!("{:?}", buf);
+        assert!(
+            repr.contains("[1, 0, 2, 0, 3, 0]"),
+            "Underlying buffer contains unexpected data: {}",
+            repr
+        );
     }
 
     #[tokio::test]
