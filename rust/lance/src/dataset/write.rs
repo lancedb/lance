@@ -244,7 +244,7 @@ pub async fn do_write_fragments(
     } else {
         // In v2 we don't care about group size but we do want to break
         // the stream on file boundaries
-        break_stream(data, params.max_rows_per_file)
+        break_stream(data, params.max_rows_per_file, params.max_bytes_per_file)
             .map_ok(|batch| vec![batch])
             .boxed()
     };

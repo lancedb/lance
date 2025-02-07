@@ -108,12 +108,15 @@ struct BreakStreamState {
     max_rows: usize,
     rows_seen: usize,
     rows_remaining: usize,
+    max_bytes: usize,
+    bytes_seen: usize,
+    bytes_remaining: usize,
     batch: Option<RecordBatch>,
 }
 
 impl BreakStreamState {
     fn next(mut self) -> Option<(Result<RecordBatch>, Self)> {
-        if self.rows_remaining == 0 {
+        if self.rows_remaining == 0 || self.bytes_remaining <= 0 {
             return None;
         }
         if self.rows_remaining + self.rows_seen <= self.max_rows {
@@ -121,10 +124,22 @@ impl BreakStreamState {
             self.rows_remaining = 0;
             let next = self.batch.take().unwrap();
             Some((Ok(next), self))
+        } else if self.bytes_remaining + self.bytes_seen <= self.max_bytes{
+            self.bytes_seen = (self.bytes_seen + self.bytes_remaining) % self.max_bytes;
+            self.bytes_remaining = 0;
+            let next = self.batch.take().unwrap();
+            Some((Ok(next), self))
         } else {
-            let rows_to_emit = self.max_rows - self.rows_seen;
+            let avg_bytes_row = self.bytes_remaining as f64 / self.rows_remaining as f64;
+            let rows_to_emit = if self.rows_remaining + self.rows_seen > self.max_rows {
+                self.max_rows - self.rows_seen
+            } else {
+                ((self.max_bytes - self.bytes_seen) as f64 / avg_bytes_row) as usize
+            };
             self.rows_seen = 0;
             self.rows_remaining -= rows_to_emit;
+            self.bytes_seen = 0;
+            self.bytes_remaining -= (rows_to_emit as f64 * avg_bytes_row) as usize;
             let batch = self.batch.as_mut().unwrap();
             let next = batch.slice(0, rows_to_emit);
             *batch = batch.slice(rows_to_emit, batch.num_rows() - rows_to_emit);
@@ -142,18 +157,24 @@ impl BreakStreamState {
 // output batches will be [3, 5, 2 (break inserted) 6, 3, 1 (break inserted) 4]
 pub fn break_stream(
     stream: SendableRecordBatchStream,
+    max_chunk_rows: usize,
     max_chunk_size: usize,
 ) -> Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>> {
     let mut rows_already_seen = 0;
+    let mut bytes_already_seen = 0;
     stream
         .map_ok(move |batch| {
             let state = BreakStreamState {
                 rows_remaining: batch.num_rows(),
-                max_rows: max_chunk_size,
+                max_rows: max_chunk_rows,
                 rows_seen: rows_already_seen,
+                bytes_remaining: batch.get_array_memory_size(),
+                max_bytes: max_chunk_size,
+                bytes_seen: bytes_already_seen,
                 batch: Some(batch),
             };
             rows_already_seen = (state.rows_seen + state.rows_remaining) % state.max_rows;
+            bytes_already_seen = (state.bytes_seen + state.bytes_remaining) % state.max_bytes;
 
             futures::stream::unfold(state, move |state| std::future::ready(state.next())).boxed()
         })
@@ -255,7 +276,7 @@ mod tests {
         assert_eq!(chunked[1].num_rows(), 10);
         assert_eq!(chunked[2].num_rows(), 8);
 
-        let chunked = super::break_stream(make_stream(), 10)
+        let chunked = super::break_stream(make_stream(), 10, 10000000)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
