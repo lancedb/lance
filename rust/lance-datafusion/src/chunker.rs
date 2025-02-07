@@ -116,15 +116,14 @@ struct BreakStreamState {
 
 impl BreakStreamState {
     fn next(mut self) -> Option<(Result<RecordBatch>, Self)> {
-        if self.rows_remaining == 0 || self.bytes_remaining <= 0 {
+        if self.rows_remaining == 0 || self.bytes_remaining == 0 {
             return None;
         }
-        if self.rows_remaining + self.rows_seen <= self.max_rows {
+        if self.rows_remaining + self.rows_seen <= self.max_rows
+            && self.bytes_remaining + self.bytes_seen <= self.max_bytes
+        {
             self.rows_seen = (self.rows_seen + self.rows_remaining) % self.max_rows;
             self.rows_remaining = 0;
-            let next = self.batch.take().unwrap();
-            Some((Ok(next), self))
-        } else if self.bytes_remaining + self.bytes_seen <= self.max_bytes {
             self.bytes_seen = (self.bytes_seen + self.bytes_remaining) % self.max_bytes;
             self.bytes_remaining = 0;
             let next = self.batch.take().unwrap();
