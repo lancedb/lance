@@ -112,9 +112,10 @@ impl<'a> FragmentCreateBuilder<'a> {
 
         progress.begin(&fragment).await?;
 
-        let break_limit = (128 * 1024).min(params.max_rows_per_file);
+        let break_row_limit = (128 * 1024).min(params.max_rows_per_file);
+        let break_bytes_limit = (1024 * 1024 * 1024).min(params.max_bytes_per_file);
 
-        let mut broken_stream = break_stream(stream, break_limit)
+        let mut broken_stream = break_stream(stream, break_row_limit, break_bytes_limit)
             .map_ok(|batch| vec![batch])
             .boxed();
         while let Some(batched_chunk) = broken_stream.next().await {
