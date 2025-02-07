@@ -252,6 +252,7 @@ pub async fn do_write_fragments(
     let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
+    let mut num_bytes_in_current_file = 0;
     let mut fragments = Vec::new();
     while let Some(batch_chunk) = buffered_reader.next().await {
         let batch_chunk = batch_chunk?;
@@ -266,10 +267,11 @@ pub async fn do_write_fragments(
         writer.as_mut().unwrap().write(&batch_chunk).await?;
         for batch in batch_chunk {
             num_rows_in_current_file += batch.num_rows() as u32;
+            num_bytes_in_current_file += batch.get_array_memory_size() as u64;
         }
 
         if num_rows_in_current_file >= params.max_rows_per_file as u32
-            || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
+            || num_bytes_in_current_file >= params.max_bytes_per_file as u64
         {
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
             debug_assert_eq!(num_rows, num_rows_in_current_file);
@@ -278,6 +280,7 @@ pub async fn do_write_fragments(
             last_fragment.physical_rows = Some(num_rows as usize);
             last_fragment.files.push(data_file);
             num_rows_in_current_file = 0;
+            num_bytes_in_current_file = 0;
         }
     }
 
@@ -434,11 +437,6 @@ pub async fn write_fragments_internal(
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
-    /// Get the current position in the file
-    ///
-    /// We use this to know when the file is too large and we need to start
-    /// a new file
-    async fn tell(&mut self) -> Result<u64>;
     /// Finish writing the file (flush the remaining data and write footer)
     async fn finish(&mut self) -> Result<(u32, DataFile)>;
 }
@@ -448,9 +446,7 @@ impl<M: ManifestProvider + Send + Sync> GenericWriter for (FileWriter<M>, String
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.0.write(batches).await
     }
-    async fn tell(&mut self) -> Result<u64> {
-        Ok(self.0.tell().await? as u64)
-    }
+
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         Ok((
             self.0.finish().await? as u32,
@@ -472,9 +468,7 @@ impl GenericWriter for V2WriterAdapter {
         }
         Ok(())
     }
-    async fn tell(&mut self) -> Result<u64> {
-        Ok(self.writer.tell().await?)
-    }
+
     async fn finish(&mut self) -> Result<(u32, DataFile)> {
         let field_ids = self
             .writer
@@ -718,7 +712,7 @@ mod tests {
 
             let write_params = WriteParams {
                 max_rows_per_file: 1024 * 1024, // Won't be limited by this
-                max_bytes_per_file: 2 * 1024,
+                max_bytes_per_file: 15 * 1024 * 1024,
                 mode: WriteMode::Create,
                 ..Default::default()
             };
