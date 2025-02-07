@@ -124,7 +124,7 @@ impl BreakStreamState {
             self.rows_remaining = 0;
             let next = self.batch.take().unwrap();
             Some((Ok(next), self))
-        } else if self.bytes_remaining + self.bytes_seen <= self.max_bytes{
+        } else if self.bytes_remaining + self.bytes_seen <= self.max_bytes {
             self.bytes_seen = (self.bytes_seen + self.bytes_remaining) % self.max_bytes;
             self.bytes_remaining = 0;
             let next = self.batch.take().unwrap();
