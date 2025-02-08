@@ -827,7 +827,6 @@ impl ExecutionPlan for MultivectorScoringExec {
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
-        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
