@@ -13,7 +13,9 @@ use snafu::{location, Location};
 use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, NullableDataBlock, VariableWidthBlock},
-    decoder::{MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder},
+    decoder::{
+        MiniBlockDecompressor, PageScheduler, PrimitivePageDecoder, VariablePerValueDecompressor,
+    },
     encoder::{
         ArrayEncoder, EncodedArray, MiniBlockCompressed, MiniBlockCompressor, PerValueCompressor,
         PerValueDataBlock,
@@ -30,11 +32,11 @@ use super::binary::{BinaryMiniBlockDecompressor, BinaryMiniBlockEncoder};
 #[derive(Debug)]
 pub struct FsstPageScheduler {
     inner_scheduler: Box<dyn PageScheduler>,
-    symbol_table: Vec<u8>,
+    symbol_table: LanceBuffer,
 }
 
 impl FsstPageScheduler {
-    pub fn new(inner_scheduler: Box<dyn PageScheduler>, symbol_table: Vec<u8>) -> Self {
+    pub fn new(inner_scheduler: Box<dyn PageScheduler>, symbol_table: LanceBuffer) -> Self {
         Self {
             inner_scheduler,
             symbol_table,
@@ -52,7 +54,7 @@ impl PageScheduler for FsstPageScheduler {
         let inner_decoder = self
             .inner_scheduler
             .schedule_ranges(ranges, scheduler, top_level_row);
-        let symbol_table = self.symbol_table.clone();
+        let symbol_table = self.symbol_table.try_clone().unwrap();
 
         async move {
             let inner_decoder = inner_decoder.await?;
@@ -67,7 +69,7 @@ impl PageScheduler for FsstPageScheduler {
 
 struct FsstPageDecoder {
     inner_decoder: Box<dyn PrimitivePageDecoder>,
-    symbol_table: Vec<u8>,
+    symbol_table: LanceBuffer,
 }
 
 impl PrimitivePageDecoder for FsstPageDecoder {
@@ -312,14 +314,72 @@ impl PerValueCompressor for FsstPerValueEncoder {
 }
 
 #[derive(Debug)]
+pub struct FsstPerValueDecompressor {
+    symbol_table: LanceBuffer,
+    inner_decompressor: Box<dyn VariablePerValueDecompressor>,
+}
+
+impl FsstPerValueDecompressor {
+    pub fn new(
+        symbol_table: LanceBuffer,
+        inner_decompressor: Box<dyn VariablePerValueDecompressor>,
+    ) -> Self {
+        Self {
+            symbol_table,
+            inner_decompressor,
+        }
+    }
+}
+
+impl VariablePerValueDecompressor for FsstPerValueDecompressor {
+    fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock> {
+        // Step 1. Run inner decompressor
+        let mut compressed_variable_data = self
+            .inner_decompressor
+            .decompress(data)?
+            .as_variable_width()
+            .unwrap();
+
+        // Step 2. FSST decompress
+        let bytes = compressed_variable_data.data.borrow_to_typed_slice::<u8>();
+        let bytes = bytes.as_ref();
+        let offsets = compressed_variable_data
+            .offsets
+            .borrow_to_typed_slice::<i32>();
+        let offsets = offsets.as_ref();
+        let num_values = compressed_variable_data.num_values;
+
+        // The data will expand at most 8 times
+        // The offsets will be the same size because we have the same # of strings
+        let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+        let mut decompress_offset_buf = vec![0i32; offsets.len()];
+        fsst::fsst::decompress(
+            &self.symbol_table,
+            bytes,
+            offsets,
+            &mut decompress_bytes_buf,
+            &mut decompress_offset_buf,
+        )?;
+
+        Ok(DataBlock::VariableWidth(VariableWidthBlock {
+            data: LanceBuffer::Owned(decompress_bytes_buf),
+            offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
+            bits_per_offset: 32,
+            num_values,
+            block_info: BlockInfo::new(),
+        }))
+    }
+}
+
+#[derive(Debug)]
 pub struct FsstMiniBlockDecompressor {
-    symbol_table: Vec<u8>,
+    symbol_table: LanceBuffer,
 }
 
 impl FsstMiniBlockDecompressor {
     pub fn new(description: &pb::Fsst) -> Self {
         Self {
-            symbol_table: description.symbol_table.clone(),
+            symbol_table: LanceBuffer::from_bytes(description.symbol_table.clone(), 1),
         }
     }
 }

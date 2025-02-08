@@ -164,6 +164,14 @@ impl LanceBuffer {
         }
     }
 
+    /// Convert a buffer into a bytes::Bytes object
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            Self::Owned(buf) => buf.into(),
+            Self::Borrowed(buf) => buf.into_vec::<u8>().unwrap().into(),
+        }
+    }
+
     /// Convert into a borrowed buffer, this is a zero-copy operation
     ///
     /// This is often called before cloning the buffer

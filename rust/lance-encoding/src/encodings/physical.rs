@@ -12,6 +12,7 @@ use self::{
     dictionary::DictionaryPageScheduler, fixed_size_list::FixedListScheduler,
     value::ValuePageScheduler,
 };
+use crate::buffer::LanceBuffer;
 use crate::encodings::physical::block_compress::CompressionScheme;
 use crate::{
     decoder::PageScheduler,
@@ -236,7 +237,10 @@ pub fn decoder_from_array_encoding(
             let inner =
                 decoder_from_array_encoding(fsst.binary.as_ref().unwrap(), buffers, data_type);
 
-            Box::new(FsstPageScheduler::new(inner, fsst.symbol_table.clone()))
+            Box::new(FsstPageScheduler::new(
+                inner,
+                LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
+            ))
         }
         pb::array_encoding::ArrayEncoding::Dictionary(dictionary) => {
             let indices_encoding = dictionary.indices.as_ref().unwrap();
