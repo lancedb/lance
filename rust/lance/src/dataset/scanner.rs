@@ -63,6 +63,7 @@ use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
+use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
@@ -1656,13 +1657,13 @@ impl Scanner {
 
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let (ann_node, is_multivec) = match vector_type {
-                DataType::FixedSizeList(_, _) => (self.ann(q, &deltas, filter_plan).await?, false),
-                DataType::List(_) => (self.multivec_ann(q, &deltas, filter_plan).await?, true),
+            let ann_node = match vector_type {
+                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
                 _ => unreachable!(),
             };
 
-            let mut knn_node = if q.refine_factor.is_some() || is_multivec {
+            let mut knn_node = if q.refine_factor.is_some() {
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -2130,7 +2131,6 @@ impl Scanner {
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
 
-        // collect the candidates
         let num_queries = q.key.len() / dim;
         let new_queries = (0..num_queries)
             .map(|i| q.key.slice(i * dim, dim))
@@ -2147,72 +2147,19 @@ impl Scanner {
                 &query,
                 prefilter_source.clone(),
             )?;
-            // for single query vector, it's possible to retrieve multiple rows with the same row id
-            // need to max-reduce the results
-            let schema = ann_node.schema();
-            let group_expr = vec![(
-                expressions::col(ROW_ID, ann_node.schema().as_ref())?,
-                ROW_ID.to_string(),
-            )];
-            // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
-            let max_expr = AggregateExprBuilder::new(
-                functions_aggregate::min_max::max_udaf(),
-                vec![expressions::binary(
-                    expressions::lit(1.0),
-                    datafusion_expr::Operator::Minus,
-                    expressions::cast(
-                        expressions::col(DIST_COL, &schema)?,
-                        &schema,
-                        DataType::Float64,
-                    )?,
-                    &schema,
-                )?],
-            )
-            .schema(schema.clone())
-            .alias(DIST_COL)
-            .build()?;
-            let ann_node = Arc::new(AggregateExec::try_new(
-                AggregateMode::Single,
-                PhysicalGroupBy::new_single(group_expr),
-                vec![Arc::new(max_expr)],
-                vec![None],
-                ann_node,
-                schema,
-            )?);
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
-        let ann_node = Arc::new(UnionExec::new(ann_nodes));
-        let ann_node = Arc::new(RepartitionExec::try_new(
-            ann_node,
-            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?);
-        let schema = ann_node.schema();
-        // unique by row ids, and get the min distance although it is not used.
-        let group_expr = vec![(
-            expressions::col(ROW_ID, schema.as_ref())?,
-            ROW_ID.to_string(),
-        )];
-        // calculate the sum across all rows with the same row id.
-        let sum_expr = AggregateExprBuilder::new(
-            functions_aggregate::sum::sum_udaf(),
-            vec![expressions::col(DIST_COL, &schema)?],
-        )
-        .schema(schema.clone())
-        .alias(DIST_COL)
-        .build()?;
-        let ann_node: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
-            AggregateMode::Single,
-            PhysicalGroupBy::new_single(group_expr),
-            vec![Arc::new(sum_expr)],
-            vec![None],
-            ann_node,
-            schema,
+
+        let ann_node = Arc::new(MultivectorScoringExec::try_new(
+            self.dataset.clone(),
+            ann_nodes,
+            q.clone(),
         )?);
 
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
             options: SortOptions {
-                descending: true,
+                descending: false,
                 nulls_first: false,
             },
         };

@@ -39,7 +39,7 @@ use snafu::{location, Location};
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
-use crate::index::vector::utils::{get_vector_dim, get_vector_type};
+use crate::index::vector::utils::get_vector_type;
 use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
@@ -656,9 +656,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 #[derive(Debug)]
 pub struct MultivectorScoringExec {
     dataset: Arc<Dataset>,
+    // the inputs are sorted ANN search results
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     query: Query,
-    dim: usize,
     properties: PlanProperties,
 }
 
@@ -668,7 +668,6 @@ impl MultivectorScoringExec {
         inputs: Vec<Arc<dyn ExecutionPlan>>,
         query: Query,
     ) -> Result<Self> {
-        let dim = get_vector_dim(dataset.schema(), &query.column)?;
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -680,7 +679,6 @@ impl MultivectorScoringExec {
             dataset,
             inputs,
             query,
-            dim,
             properties,
         })
     }
@@ -706,7 +704,7 @@ impl ExecutionPlan for MultivectorScoringExec {
     }
 
     fn schema(&self) -> arrow_schema::SchemaRef {
-        self.inputs[0].schema()
+        KNN_INDEX_SCHEMA.clone()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -715,7 +713,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let plan =
             MultivectorScoringExec::try_new(self.dataset.clone(), children, self.query.clone())?;
@@ -733,53 +731,91 @@ impl ExecutionPlan for MultivectorScoringExec {
             .map(|input| input.execute(partition, context.clone()))
             .collect::<DataFusionResult<Vec<_>>>()?;
 
-        let mut results = HashMap::with_capacity(self.query.k);
-
-        let num_queries = self.query.key.len() / self.dim;
-        let mut min_dists = vec![0; num_queries];
-
         // collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
-        let reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
+        let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
             stream.map(|batch| {
                 let batch = batch?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
 
                 // max-reduce for the same row id
-                let min_dist = dists.values().last().cloned().unwrap_or(0.0);
+                let min_sim = dists.values().last().map(|dist| 1.0 - *dist).unwrap_or(0.0);
                 let mut new_row_ids = Vec::with_capacity(row_ids.len());
-                let mut new_dists = Vec::with_capacity(row_ids.len());
+                let mut new_sims = Vec::with_capacity(row_ids.len());
                 let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
 
                 for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
+                    // the results are sorted by distance, so we can skip if we have seen this row id before
                     if visited_row_ids.contains(row_id) {
                         continue;
                     }
                     visited_row_ids.insert(row_id);
                     new_row_ids.push(*row_id);
-                    new_dists.push(*dist);
+                    // it's cosine distance, so we need to convert it to similarity
+                    new_sims.push(1.0 - *dist);
                 }
                 let new_row_ids = UInt64Array::from(new_row_ids);
-                let new_dists = Float32Array::from(new_dists);
+                let new_dists = Float32Array::from(new_sims);
 
                 let batch = RecordBatch::try_new(
                     KNN_INDEX_SCHEMA.clone(),
                     vec![Arc::new(new_dists), Arc::new(new_row_ids)],
                 )?;
 
-                Ok((min_dist, batch))
+                Ok::<_, DataFusionError>((min_sim, batch))
             })
         }));
 
+        let k = self.query.k;
+        let refactor = self.query.refine_factor.unwrap_or(1) as usize;
         let stream = stream::once(async move {
-            let mut results = HashMap::with_capacity(self.query.k);
-            while let Some(res) = reduced_inputs.next().await {
-                let (min_dist, batch) = res?;
+            // at most, we will have k * refine_factor results for each query
+            let mut results = HashMap::with_capacity(k * refactor);
+            let mut missed_similarities = 0.0;
+            while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let dists = batch[DIST_COL].as_primitive::<Float32Type>();
+                let sims = batch[DIST_COL].as_primitive::<Float32Type>();
+
+                let query_results = row_ids
+                    .values()
+                    .iter()
+                    .copied()
+                    .zip(sims.values().iter().copied())
+                    .collect::<HashMap<_, _>>();
+                results.iter_mut().for_each(|(row_id, sim)| {
+                    if let Some(new_dist) = query_results.get(row_id) {
+                        *sim += new_dist;
+                    } else {
+                        *sim += min_sim;
+                    }
+                });
+                query_results.into_iter().for_each(|(row_id, sim)| {
+                    if !results.contains_key(&row_id) {
+                        results.insert(row_id, sim + missed_similarities);
+                    }
+                });
+                missed_similarities += min_sim;
             }
+
+            let results = results.into_iter().collect::<Vec<_>>();
+            let row_ids = results
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>();
+            let dists = results
+                .iter()
+                // it's similarity, so we need to convert it back to distance
+                .map(|(_, sim)| 1.0 - *sim)
+                .collect::<Vec<_>>();
+            let row_ids = UInt64Array::from(row_ids);
+            let dists = Float32Array::from(dists);
+            let batch = RecordBatch::try_new(
+                KNN_INDEX_SCHEMA.clone(),
+                vec![Arc::new(dists), Arc::new(row_ids)],
+            )?;
+            Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -788,16 +824,10 @@ impl ExecutionPlan for MultivectorScoringExec {
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
-        let inner_stats = self.input.statistics()?;
-        let dist_col_stats = inner_stats.column_statistics[0].clone();
-        let column_statistics = inner_stats
-            .column_statistics
-            .into_iter()
-            .chain([dist_col_stats])
-            .collect::<Vec<_>>();
         Ok(Statistics {
-            num_rows: inner_stats.num_rows,
-            column_statistics,
+            num_rows: Precision::Inexact(
+                self.query.k * self.query.refine_factor.unwrap_or(1) as usize,
+            ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
         // self.input.statistics()
