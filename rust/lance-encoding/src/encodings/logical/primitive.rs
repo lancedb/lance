@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
+    any::Any,
     collections::{HashMap, VecDeque},
     fmt::Debug,
     iter,
@@ -20,7 +21,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, TryStreamE
 use itertools::Itertools;
 use lance_arrow::deepcopy::deep_copy_array;
 use lance_core::{
-    cache::{Context, DeepSizeOf, FileMetadataCache},
+    cache::{Context, DeepSizeOf},
     datatypes::{
         STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
     },
@@ -286,8 +287,9 @@ trait StructuralPageScheduler: std::fmt::Debug + Send {
     fn initialize<'a>(
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
-        cache: &Arc<FileMetadataCache>,
-    ) -> BoxFuture<'a, Result<()>>;
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>>;
+    /// Loads metadata from a previous initialize call
+    fn load(&mut self, data: &Arc<dyn CachedPageData>);
     /// Schedules the read of the given ranges in the page
     fn schedule_ranges(
         &self,
@@ -822,6 +824,25 @@ impl StructuralPageDecoder for MiniBlockDecoder {
     }
 }
 
+#[derive(Debug)]
+struct CachedComplexAllNullState {
+    rep: Option<ScalarBuffer<u16>>,
+    def: Option<ScalarBuffer<u16>>,
+}
+
+impl DeepSizeOf for CachedComplexAllNullState {
+    fn deep_size_of_children(&self, _ctx: &mut Context) -> usize {
+        self.rep.as_ref().map(|buf| buf.len() * 2).unwrap_or(0)
+            + self.def.as_ref().map(|buf| buf.len() * 2).unwrap_or(0)
+    }
+}
+
+impl CachedPageData for CachedComplexAllNullState {
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
+        self
+    }
+}
+
 /// A scheduler for all-null data that has repetition and definition levels
 ///
 /// We still need to do some I/O in this case because we need to figure out what kind of null we
@@ -836,9 +857,7 @@ pub struct ComplexAllNullScheduler {
     buffer_offsets_and_sizes: Arc<[(u64, u64)]>,
     def_meaning: Arc<[DefinitionInterpretation]>,
     items_per_row: u64,
-    // Set during initialization
-    rep: Option<ScalarBuffer<u16>>,
-    def: Option<ScalarBuffer<u16>>,
+    repdef: Option<Arc<CachedComplexAllNullState>>,
 }
 
 impl ComplexAllNullScheduler {
@@ -851,8 +870,7 @@ impl ComplexAllNullScheduler {
             buffer_offsets_and_sizes,
             def_meaning,
             items_per_row,
-            rep: None,
-            def: None,
+            repdef: None,
         }
     }
 }
@@ -861,9 +879,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
     fn initialize<'a>(
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
-        // TODO: Utilize cache here
-        _: &Arc<FileMetadataCache>,
-    ) -> BoxFuture<'a, Result<()>> {
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         // Fully load the rep & def buffers, as needed
         let (rep_pos, rep_size) = self.buffer_offsets_and_sizes[0];
         let (def_pos, def_size) = self.buffer_offsets_and_sizes[1];
@@ -884,27 +900,40 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             let data = data.await?;
             let mut data_iter = data.into_iter();
 
-            if has_rep {
+            let rep = if has_rep {
                 let rep = data_iter.next().unwrap();
                 let mut rep = LanceBuffer::from_bytes(rep, 2);
                 let rep = rep.borrow_to_typed_slice::<u16>();
-                self.rep = Some(rep);
+                Some(rep)
             } else {
-                self.rep = None
+                None
             };
 
-            if has_def {
+            let def = if has_def {
                 let def = data_iter.next().unwrap();
                 let mut def = LanceBuffer::from_bytes(def, 2);
                 let def = def.borrow_to_typed_slice::<u16>();
-                self.def = Some(def);
+                Some(def)
             } else {
-                self.def = None;
-            }
+                None
+            };
 
-            Ok(())
+            let repdef = Arc::new(CachedComplexAllNullState { rep, def });
+
+            self.repdef = Some(repdef.clone());
+
+            Ok(repdef as Arc<dyn CachedPageData>)
         }
         .boxed()
+    }
+
+    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+        self.repdef = Some(
+            data.clone()
+                .as_arc_any()
+                .downcast::<CachedComplexAllNullState>()
+                .unwrap(),
+        );
     }
 
     fn schedule_ranges(
@@ -920,8 +949,8 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
             .collect();
         Ok(std::future::ready(Ok(Box::new(ComplexAllNullPageDecoder {
             ranges: item_ranges,
-            rep: self.rep.clone(),
-            def: self.def.clone(),
+            rep: self.repdef.as_ref().unwrap().rep.clone(),
+            def: self.repdef.as_ref().unwrap().def.clone(),
             items_per_row: self.items_per_row,
             num_rows,
             def_meaning: self.def_meaning.clone(),
@@ -1036,10 +1065,11 @@ impl StructuralPageScheduler for SimpleAllNullScheduler {
     fn initialize<'a>(
         &'a mut self,
         _io: &Arc<dyn EncodingsIo>,
-        _cache: &Arc<FileMetadataCache>,
-    ) -> BoxFuture<'a, Result<()>> {
-        std::future::ready(Ok(())).boxed()
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
+
+    fn load(&mut self, _cache: &Arc<dyn CachedPageData>) {}
 
     fn schedule_ranges(
         &self,
@@ -1101,17 +1131,78 @@ struct MiniBlockSchedulerDictionary {
     dictionary_data_alignment: u64,
 }
 
+#[derive(Debug)]
+struct RepIndexBlock {
+    // The first row in the block, if there is a preamble then this is the offset
+    // of the row after the preamble (that row may not exist if the block is entirely)
+    // preamble
+    first_row: u64,
+    // The number of rows in the block, including the trailer but not the preamble.
+    // Can be 0 if the block is entirely preamble
+    starts_including_trailer: u64,
+    // Whether the block has a preamble
+    has_preamble: bool,
+    // Whether the block has a trailer
+    has_trailer: bool,
+}
+
+impl DeepSizeOf for RepIndexBlock {
+    fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+        0
+    }
+}
+
+#[derive(Debug)]
+struct RepetitionIndex {
+    blocks: Vec<RepIndexBlock>,
+}
+
+impl DeepSizeOf for RepetitionIndex {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.blocks.deep_size_of_children(context)
+    }
+}
+
+impl RepetitionIndex {
+    fn decode(rep_index: &[Vec<u64>]) -> Self {
+        let mut chunk_has_preamble = false;
+        let mut offset = 0;
+        let mut blocks = Vec::with_capacity(rep_index.len());
+        for chunk_rep in rep_index {
+            let ends_count = chunk_rep[0];
+            let partial_count = chunk_rep[1];
+
+            let chunk_has_trailer = partial_count > 0;
+            let mut starts_including_trailer = ends_count;
+            if chunk_has_trailer {
+                starts_including_trailer += 1;
+            }
+            if chunk_has_preamble {
+                starts_including_trailer -= 1;
+            }
+
+            blocks.push(RepIndexBlock {
+                first_row: offset,
+                starts_including_trailer,
+                has_preamble: chunk_has_preamble,
+                has_trailer: chunk_has_trailer,
+            });
+
+            chunk_has_preamble = chunk_has_trailer;
+            offset += starts_including_trailer;
+        }
+
+        Self { blocks }
+    }
+}
+
 /// State that is loaded once and cached for future lookups
 #[derive(Debug)]
 struct MiniBlockCacheableState {
     /// Metadata that describes each chunk in the page
     chunk_meta: Vec<ChunkMeta>,
-    /// The repetition index for each chunk
-    ///
-    /// There will be one element per chunk if no repetition (# items)
-    /// Otherwise, there will be one element plus N elements where N
-    ///   is the maximum nested random access supported
-    rep_index: Vec<Vec<u64>>,
+    /// The decoded repetition index
+    rep_index: RepetitionIndex,
     /// The dictionary for the page, if any
     dictionary: Option<Arc<DataBlock>>,
 }
@@ -1124,6 +1215,12 @@ impl DeepSizeOf for MiniBlockCacheableState {
                 .as_ref()
                 .map(|dict| dict.data_size() as usize)
                 .unwrap_or(0)
+    }
+}
+
+impl CachedPageData for MiniBlockCacheableState {
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
+        self
     }
 }
 
@@ -1161,7 +1258,6 @@ pub struct MiniBlockScheduler {
     items_in_page: u64,
     items_per_row: u64,
     repetition_index_depth: u16,
-    cache_key: String,
     rep_decompressor: Arc<dyn BlockDecompressor>,
     def_decompressor: Arc<dyn BlockDecompressor>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -1172,14 +1268,11 @@ pub struct MiniBlockScheduler {
 }
 
 impl MiniBlockScheduler {
-    #[allow(clippy::too_many_arguments)]
     fn try_new(
         buffer_offsets_and_sizes: &[(u64, u64)],
         priority: u64,
         items_in_page: u64,
         items_per_row: u64,
-        page_number: usize,
-        column_number: usize,
         layout: &pb::MiniBlockLayout,
         decompressors: &dyn DecompressorStrategy,
     ) -> Result<Self> {
@@ -1220,8 +1313,6 @@ impl MiniBlockScheduler {
             None
         };
 
-        let cache_key = format!("{}-{}", page_number, column_number);
-
         Ok(Self {
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
             rep_decompressor: rep_decompressor.into(),
@@ -1229,7 +1320,6 @@ impl MiniBlockScheduler {
             value_decompressor: value_decompressor.into(),
             repetition_index_depth: layout.repetition_index_depth as u16,
             priority,
-            cache_key,
             items_in_page,
             items_per_row,
             dictionary,
@@ -1326,88 +1416,76 @@ impl ChunkInstructions {
     // We assume that `user_ranges` are in sorted order and non-overlapping
     //
     // The output will be a set of `ChunkInstructions` which tell us how to read from the chunks
-    fn schedule_instructions(rep_index: &[Vec<u64>], user_ranges: &[Range<u64>]) -> Vec<Self> {
-        let rep_len = rep_index.len();
-        let mut rep_iter = rep_index.iter().enumerate();
-
-        let (mut cur_rep_idx, mut cur_rep) = rep_iter.next().unwrap();
-        let mut offset = 0;
-        let mut chunk_has_preamble = false;
-        let mut chunk_has_trailer = cur_rep[1] > 0;
-
-        let mut chunk_instructions = Vec::with_capacity(rep_len + user_ranges.len());
+    fn schedule_instructions(rep_index: &RepetitionIndex, user_ranges: &[Range<u64>]) -> Vec<Self> {
+        // This is an in-exact capacity guess but pretty good.  The actual capacity can be
+        // smaller if instructions are merged.  It can be larger if there are multiple instructions
+        // per row which can happen with lists.
+        let mut chunk_instructions = Vec::with_capacity(user_ranges.len());
 
         for user_range in user_ranges {
-            let mut to_skip = user_range.start - offset;
             let mut rows_needed = user_range.end - user_range.start;
             let mut need_preamble = false;
 
-            while rows_needed > 0 || need_preamble {
-                let mut rows_in_chunk_incl_trailer = cur_rep[0];
-                if chunk_has_trailer {
-                    rows_in_chunk_incl_trailer += 1;
-                }
-
-                if chunk_has_preamble {
-                    rows_in_chunk_incl_trailer -= 1;
-                }
-
-                let mut consumed_chunk = false;
-                if rows_in_chunk_incl_trailer <= to_skip {
-                    consumed_chunk = true;
-                    need_preamble = false;
-                } else {
-                    // We have overlap with the current chunk
-                    let rows_available = rows_in_chunk_incl_trailer - to_skip;
-                    let rows_to_take = if rows_available > rows_needed {
-                        rows_needed
-                    } else {
-                        consumed_chunk = true;
-                        rows_available
-                    };
-                    rows_needed -= rows_to_take;
-                    let mut take_trailer = false;
-                    let preamble = if chunk_has_preamble {
-                        if need_preamble {
-                            PreambleAction::Take
-                        } else {
-                            PreambleAction::Skip
-                        }
-                    } else {
-                        PreambleAction::Absent
-                    };
-                    let mut rows_to_take_no_trailer = rows_to_take;
-
-                    // Are we taking the trailer?  If so, make sure we mark that we need the preamble
-                    if rows_to_take == rows_available && chunk_has_trailer {
-                        take_trailer = true;
-                        need_preamble = true;
-                        rows_to_take_no_trailer -= 1;
-                    } else {
-                        need_preamble = false;
-                    };
-
-                    chunk_instructions.push(Self {
-                        preamble,
-                        chunk_idx: cur_rep_idx,
-                        rows_to_skip: to_skip,
-                        rows_to_take: rows_to_take_no_trailer,
-                        take_trailer,
-                    });
-                }
-
-                if consumed_chunk {
-                    to_skip = to_skip.saturating_sub(rows_in_chunk_incl_trailer);
-                    offset += rows_in_chunk_incl_trailer;
-                    // The next chunk has a preamble if the current chunk has a trailer
-                    chunk_has_preamble = chunk_has_trailer;
-                    // This branch could fail on the very last iteration if we are consuming the last row
-                    if let Some((next_rep_idx, next_rep)) = rep_iter.next() {
-                        cur_rep_idx = next_rep_idx;
-                        cur_rep = next_rep;
-                        chunk_has_trailer = cur_rep[1] > 0;
+            // Need to find the first chunk with a first row >= user_range.start.  If there are
+            // multiple chunks with the same first row we need to take the first one.
+            let mut block_index = match rep_index
+                .blocks
+                .binary_search_by_key(&user_range.start, |block| block.first_row)
+            {
+                Ok(idx) => {
+                    // Slightly tricky case, we may need to walk backwards a bit to make sure we
+                    // are grabbing first eligible chunk
+                    let mut idx = idx;
+                    while idx > 0 && rep_index.blocks[idx - 1].first_row == user_range.start {
+                        idx -= 1;
                     }
+                    idx
                 }
+                // Easy case.  idx is greater, and idx - 1 is smaller, so idx - 1 contains the start
+                Err(idx) => idx - 1,
+            };
+
+            let mut to_skip = user_range.start - &rep_index.blocks[block_index].first_row;
+
+            while rows_needed > 0 || need_preamble {
+                let chunk = &rep_index.blocks[block_index];
+                let rows_avail = chunk.starts_including_trailer - to_skip;
+                debug_assert!(rows_avail > 0);
+
+                let rows_to_take = rows_avail.min(rows_needed);
+                rows_needed -= rows_to_take;
+
+                let mut take_trailer = false;
+                let preamble = if chunk.has_preamble {
+                    if need_preamble {
+                        PreambleAction::Take
+                    } else {
+                        PreambleAction::Skip
+                    }
+                } else {
+                    PreambleAction::Absent
+                };
+                let mut rows_to_take_no_trailer = rows_to_take;
+
+                // Are we taking the trailer?  If so, make sure we mark that we need the preamble
+                if rows_to_take == rows_avail && chunk.has_trailer {
+                    take_trailer = true;
+                    need_preamble = true;
+                    rows_to_take_no_trailer -= 1;
+                } else {
+                    need_preamble = false;
+                };
+
+                chunk_instructions.push(Self {
+                    preamble,
+                    chunk_idx: block_index,
+                    rows_to_skip: to_skip,
+                    rows_to_take: rows_to_take_no_trailer,
+                    take_trailer,
+                });
+
+                to_skip = 0;
+                block_index += 1;
             }
         }
 
@@ -1500,13 +1578,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
     fn initialize<'a>(
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
-        cache: &Arc<FileMetadataCache>,
-    ) -> BoxFuture<'a, Result<()>> {
-        if let Some(cached_state) = cache.get_by_str(&self.cache_key) {
-            self.page_meta = Some(cached_state);
-            return Box::pin(std::future::ready(Ok(())));
-        }
-
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
         // need.
@@ -1534,7 +1606,6 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         }
         let io_req = io.submit_request(required_ranges, 0);
 
-        let cache = cache.clone();
         async move {
             let mut buffers = io_req.await?.into_iter().fuse();
             let meta_bytes = buffers.next().unwrap();
@@ -1546,11 +1617,9 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let mut bytes = LanceBuffer::from_bytes(meta_bytes, 2);
             let words = bytes.borrow_to_typed_slice::<u16>();
             let words = words.as_ref();
-            let mut page_meta = MiniBlockCacheableState {
-                chunk_meta: Vec::with_capacity(words.len()),
-                rep_index: Vec::with_capacity(words.len()),
-                dictionary: None,
-            };
+
+            let mut chunk_meta = Vec::with_capacity(words.len());
+
             let mut rows_counter = 0;
             let mut offset_bytes = value_buf_position;
             for (word_idx, word) in words.iter().enumerate() {
@@ -1567,7 +1636,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                 };
                 rows_counter += num_values;
 
-                page_meta.chunk_meta.push(ChunkMeta {
+                chunk_meta.push(ChunkMeta {
                     num_values,
                     chunk_size_bytes: num_bytes as u64,
                     offset_bytes,
@@ -1576,26 +1645,31 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             }
 
             // Build the repetition index
-            if let Some(rep_index_data) = rep_index_bytes {
+            let rep_index = if let Some(rep_index_data) = rep_index_bytes {
                 // If we have a repetition index then we use that
                 // TODO: Compress the repetition index :)
                 assert!(rep_index_data.len() % 8 == 0);
                 let mut repetition_index_vals = LanceBuffer::from_bytes(rep_index_data, 8);
                 let repetition_index_vals = repetition_index_vals.borrow_to_typed_slice::<u64>();
                 // Unflatten
-                page_meta.rep_index = repetition_index_vals
+                repetition_index_vals
                     .as_ref()
                     .chunks_exact(self.repetition_index_depth as usize + 1)
                     .map(|c| c.to_vec())
-                    .collect();
+                    .collect::<Vec<_>>()
             } else {
                 // Default rep index is just the number of items in each chunk
                 // with 0 partials/leftovers
-                page_meta.rep_index = page_meta
-                    .chunk_meta
+                chunk_meta
                     .iter()
                     .map(|c| vec![c.num_values, 0])
-                    .collect();
+                    .collect::<Vec<_>>()
+            };
+
+            let mut page_meta = MiniBlockCacheableState {
+                chunk_meta,
+                rep_index: RepetitionIndex::decode(&rep_index),
+                dictionary: None,
             };
 
             // decode dictionary
@@ -1610,11 +1684,19 @@ impl StructuralPageScheduler for MiniBlockScheduler {
                     )?));
             };
             let page_meta = Arc::new(page_meta);
-            cache.insert_by_str(&self.cache_key, page_meta.clone());
-            self.page_meta = Some(page_meta);
-            Ok(())
+            self.page_meta = Some(page_meta.clone());
+            Ok(page_meta as Arc<dyn CachedPageData>)
         }
         .boxed()
+    }
+
+    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+        self.page_meta = Some(
+            data.clone()
+                .as_arc_any()
+                .downcast::<MiniBlockCacheableState>()
+                .unwrap(),
+        );
     }
 
     fn schedule_ranges(
@@ -1989,13 +2071,15 @@ impl FullZipScheduler {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
+    // TODO: Add opt-in caching of repetition index
     fn initialize<'a>(
         &'a mut self,
         _io: &Arc<dyn EncodingsIo>,
-        _: &Arc<FileMetadataCache>,
-    ) -> BoxFuture<'a, Result<()>> {
-        std::future::ready(Ok(())).boxed()
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
     }
+
+    fn load(&mut self, _cache: &Arc<dyn CachedPageData>) {}
 
     fn schedule_ranges(
         &self,
@@ -2697,7 +2781,7 @@ impl StructuralPrimitiveFieldScheduler {
     fn page_info_to_scheduler(
         page_info: &PageInfo,
         page_index: usize,
-        column_index: usize,
+        _column_index: usize,
         decompressors: &dyn DecompressorStrategy,
         items_per_row: u64,
     ) -> Result<PageInfoAndScheduler> {
@@ -2709,8 +2793,6 @@ impl StructuralPrimitiveFieldScheduler {
                         page_info.priority,
                         mini_block.num_items,
                         items_per_row,
-                        page_index,
-                        column_index,
                         mini_block,
                         decompressors,
                     )?)
@@ -2755,19 +2837,61 @@ impl StructuralPrimitiveFieldScheduler {
     }
 }
 
+pub trait CachedPageData: Any + Send + Sync + DeepSizeOf + 'static {
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static>;
+}
+
+pub struct NoCachedPageData;
+
+impl DeepSizeOf for NoCachedPageData {
+    fn deep_size_of_children(&self, _ctx: &mut Context) -> usize {
+        0
+    }
+}
+impl CachedPageData for NoCachedPageData {
+    fn as_arc_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync + 'static> {
+        self
+    }
+}
+
+pub struct CachedFieldData {
+    pages: Vec<Arc<dyn CachedPageData>>,
+}
+
+impl DeepSizeOf for CachedFieldData {
+    fn deep_size_of_children(&self, ctx: &mut Context) -> usize {
+        self.pages.deep_size_of_children(ctx)
+    }
+}
+
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     fn initialize<'a>(
         &'a mut self,
         _filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        let page_init = self
+        let cache_key = self.column_index.to_string();
+        if let Some(cached_data) = context.cache().get_by_str::<CachedFieldData>(&cache_key) {
+            self.page_schedulers
+                .iter_mut()
+                .zip(cached_data.pages.iter())
+                .for_each(|(page_scheduler, cached_data)| {
+                    page_scheduler.scheduler.load(&cached_data);
+                });
+            return std::future::ready(Ok(())).boxed();
+        };
+
+        let cache = context.cache().clone();
+        let page_data = self
             .page_schedulers
             .iter_mut()
-            .map(|s| s.scheduler.initialize(context.io(), context.cache()))
+            .map(|s| s.scheduler.initialize(context.io()))
             .collect::<FuturesUnordered<_>>();
+
         async move {
-            page_init.try_collect::<Vec<_>>().await?;
+            let page_data = page_data.try_collect::<Vec<_>>().await?;
+            let cached_data = Arc::new(CachedFieldData { pages: page_data });
+            cache.insert_by_str::<CachedFieldData>(&cache_key, cached_data.clone());
             Ok(())
         }
         .boxed()
@@ -4458,7 +4582,9 @@ mod tests {
         ChunkDrainInstructions, PrimitiveStructuralEncoder,
     };
 
-    use super::{ChunkInstructions, DataBlock, DecodeMiniBlockTask, PreambleAction};
+    use super::{
+        ChunkInstructions, DataBlock, DecodeMiniBlockTask, PreambleAction, RepetitionIndex,
+    };
 
     #[test]
     fn test_is_narrow() {
@@ -4765,6 +4891,7 @@ mod tests {
     #[test]
     fn test_schedule_instructions() {
         let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
+        let repetition_index = RepetitionIndex::decode(&repetition_index);
 
         let check = |user_ranges, expected_instructions| {
             let instructions =
@@ -4918,6 +5045,7 @@ mod tests {
         }
 
         let repetition_index = vec![vec![5, 2], vec![3, 0], vec![4, 7], vec![2, 0]];
+        let repetition_index = RepetitionIndex::decode(&repetition_index);
         let user_ranges = vec![1..7, 10..14];
 
         // First, schedule the ranges
@@ -5001,6 +5129,7 @@ mod tests {
 
         // Regression case.  Need a chunk with preamble, rows, and trailer (the middle chunk here)
         let repetition_index = vec![vec![5, 2], vec![3, 3], vec![20, 0]];
+        let repetition_index = RepetitionIndex::decode(&repetition_index);
         let user_ranges = vec![0..28];
 
         // First, schedule the ranges

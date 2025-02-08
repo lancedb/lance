@@ -554,7 +554,7 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
             }
             pb::array_encoding::ArrayEncoding::Fsst(ref fsst) => {
                 Ok(Box::new(FsstPerValueDecompressor::new(
-                    fsst.symbol_table.clone(),
+                    LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
                     Box::new(VariableDecoder::default()),
                 )))
             }
@@ -571,7 +571,7 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
                 Ok(Box::new(ValueDecompressor::new(flat)))
             }
             pb::array_encoding::ArrayEncoding::Constant(constant) => {
-                let scalar = LanceBuffer::Owned(constant.value.clone());
+                let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
                 Ok(Box::new(ConstantDecompressor::new(
                     scalar,
                     constant.num_values,
