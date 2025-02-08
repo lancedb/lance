@@ -251,7 +251,7 @@ use crate::encodings::logical::r#struct::{
 use crate::encodings::physical::binary::{
     BinaryBlockDecompressor, BinaryMiniBlockDecompressor, VariableDecoder,
 };
-use crate::encodings::physical::bitpack_fastlanes::BitpackMiniBlockDecompressor;
+use crate::encodings::physical::bitpack_fastlanes::InlineBitpacking;
 use crate::encodings::physical::fsst::{FsstMiniBlockDecompressor, FsstPerValueDecompressor};
 use crate::encodings::physical::struct_encoding::PackedStructFixedWidthMiniBlockDecompressor;
 use crate::encodings::physical::value::{ConstantDecompressor, ValueDecompressor};
@@ -458,12 +458,12 @@ impl<'a> ColumnInfoIter<'a> {
 }
 
 pub trait MiniBlockDecompressor: std::fmt::Debug + Send + Sync {
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock>;
 }
 
 pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
-    fn decompress(&self, data: FixedWidthDataBlock) -> Result<DataBlock>;
+    fn decompress(&self, data: FixedWidthDataBlock, num_values: u64) -> Result<DataBlock>;
     /// The number of bits in each value
     ///
     /// Currently (and probably long term) this must be a multiple of 8
@@ -476,7 +476,7 @@ pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
 }
 
 pub trait BlockDecompressor: std::fmt::Debug + Send + Sync {
-    fn decompress(&self, data: LanceBuffer) -> Result<DataBlock>;
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock>;
 }
 
 pub trait DecompressorStrategy: std::fmt::Debug + Send + Sync {
@@ -511,10 +511,10 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
     ) -> Result<Box<dyn MiniBlockDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::new(flat)))
+                Ok(Box::new(ValueDecompressor::from_flat(flat)))
             }
-            pb::array_encoding::ArrayEncoding::Bitpack2(description) => {
-                Ok(Box::new(BitpackMiniBlockDecompressor::new(description)))
+            pb::array_encoding::ArrayEncoding::InlineBitpacking(description) => {
+                Ok(Box::new(InlineBitpacking::from_description(description)))
             }
             pb::array_encoding::ArrayEncoding::Variable(_) => {
                 Ok(Box::new(BinaryMiniBlockDecompressor::default()))
@@ -527,6 +527,11 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
                     description,
                 )))
             }
+            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
+                // In the future, we might need to do something more complex here if FSL supports
+                // compression.
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
+            }
             _ => todo!(),
         }
     }
@@ -537,7 +542,10 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
     ) -> Result<Box<dyn FixedPerValueDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::new(flat)))
+                Ok(Box::new(ValueDecompressor::from_flat(flat)))
+            }
+            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => {
+                Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
             _ => todo!("fixed-per-value decompressor for {:?}", description),
         }
@@ -568,14 +576,11 @@ impl DecompressorStrategy for CoreDecompressorStrategy {
     ) -> Result<Box<dyn BlockDecompressor>> {
         match description.array_encoding.as_ref().unwrap() {
             pb::array_encoding::ArrayEncoding::Flat(flat) => {
-                Ok(Box::new(ValueDecompressor::new(flat)))
+                Ok(Box::new(ValueDecompressor::from_flat(flat)))
             }
             pb::array_encoding::ArrayEncoding::Constant(constant) => {
                 let scalar = LanceBuffer::from_bytes(constant.value.clone(), 1);
-                Ok(Box::new(ConstantDecompressor::new(
-                    scalar,
-                    constant.num_values,
-                )))
+                Ok(Box::new(ConstantDecompressor::new(scalar)))
             }
             pb::array_encoding::ArrayEncoding::Variable(_) => {
                 Ok(Box::new(BinaryBlockDecompressor::default()))
@@ -766,15 +771,6 @@ impl CoreFieldDecoderStrategy {
         }
     }
 
-    fn items_per_row(data_type: &DataType) -> u64 {
-        match data_type {
-            DataType::FixedSizeList(inner, dimension) => {
-                Self::items_per_row(inner.data_type()) * *dimension as u64
-            }
-            _ => 1,
-        }
-    }
-
     fn create_structural_field_scheduler(
         &self,
         field: &Field,
@@ -783,10 +779,8 @@ impl CoreFieldDecoderStrategy {
         let data_type = field.data_type();
         if Self::is_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let items_per_row = Self::items_per_row(&data_type);
             let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                 column_info.as_ref(),
-                items_per_row,
                 self.decompressor_strategy.as_ref(),
             )?);
 
@@ -801,7 +795,6 @@ impl CoreFieldDecoderStrategy {
                     let column_info = column_infos.expect_next()?;
                     let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                         column_info.as_ref(),
-                        1, // items_per_row is always 1, any FSL will get transposed into 1 row
                         self.decompressor_strategy.as_ref(),
                     )?);
 
@@ -827,7 +820,6 @@ impl CoreFieldDecoderStrategy {
                 let column_info = column_infos.expect_next()?;
                 let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new(
                     column_info.as_ref(),
-                    /*items_per_row=*/ 1,
                     self.decompressor_strategy.as_ref(),
                 )?);
                 column_infos.next_top_level();
