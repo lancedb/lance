@@ -20,9 +20,10 @@ use pb::{
     full_zip_layout,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, Bitpack2, Bitpacked, BitpackedForNonNeg, Dictionary,
-    FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct,
-    PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer, Variable,
+    AllNullLayout, ArrayEncoding, Binary, Bitpacked, BitpackedForNonNeg, Block, Dictionary,
+    FixedSizeBinary, FixedSizeList, Flat, Fsst, InlineBitpacking, MiniBlockLayout, Nullable,
+    OutOfLineBitpacking, PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer,
+    Variable,
 };
 
 use crate::{
@@ -35,11 +36,10 @@ use self::pb::Constant;
 pub struct ProtobufUtils {}
 
 impl ProtobufUtils {
-    pub fn constant(value: Vec<u8>, num_values: u64) -> ArrayEncoding {
+    pub fn constant(value: Vec<u8>) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Constant(Constant {
                 value: value.into(),
-                num_values,
             })),
         }
     }
@@ -76,6 +76,14 @@ impl ProtobufUtils {
         }
     }
 
+    pub fn block(scheme: &str) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::Block(Block {
+                scheme: scheme.to_string(),
+            })),
+        }
+    }
+
     pub fn flat_encoding(
         bits_per_value: u64,
         buffer_index: u32,
@@ -96,11 +104,12 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn fsl_encoding(dimension: u64, items: ArrayEncoding) -> ArrayEncoding {
+    pub fn fsl_encoding(dimension: u64, items: ArrayEncoding, has_validity: bool) -> ArrayEncoding {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
                 dimension: dimension.try_into().unwrap(),
                 items: Some(Box::new(items)),
+                has_validity,
             }))),
         }
     }
@@ -140,11 +149,24 @@ impl ProtobufUtils {
             })),
         }
     }
-    pub fn bitpack2(uncompressed_bits_per_value: u64) -> ArrayEncoding {
+    pub fn inline_bitpacking(uncompressed_bits_per_value: u64) -> ArrayEncoding {
         ArrayEncoding {
-            array_encoding: Some(ArrayEncodingEnum::Bitpack2(Bitpack2 {
+            array_encoding: Some(ArrayEncodingEnum::InlineBitpacking(InlineBitpacking {
                 uncompressed_bits_per_value,
             })),
+        }
+    }
+    pub fn out_of_line_bitpacking(
+        uncompressed_bits_per_value: u64,
+        compressed_bits_per_value: u64,
+    ) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::OutOfLineBitpacking(
+                OutOfLineBitpacking {
+                    uncompressed_bits_per_value,
+                    compressed_bits_per_value,
+                },
+            )),
         }
     }
 
@@ -236,15 +258,6 @@ impl ProtobufUtils {
         }
     }
 
-    pub fn fixed_size_list(data: ArrayEncoding, dimension: u64) -> ArrayEncoding {
-        ArrayEncoding {
-            array_encoding: Some(ArrayEncodingEnum::FixedSizeList(Box::new(FixedSizeList {
-                dimension: dimension.try_into().unwrap(),
-                items: Some(Box::new(data)),
-            }))),
-        }
-    }
-
     fn def_inter_to_repdef_layer(def: DefinitionInterpretation) -> i32 {
         match def {
             DefinitionInterpretation::AllValidItem => RepDefLayer::RepdefAllValidItem as i32,
@@ -274,22 +287,28 @@ impl ProtobufUtils {
     }
 
     pub fn miniblock_layout(
-        rep_encoding: ArrayEncoding,
-        def_encoding: ArrayEncoding,
+        rep_encoding: Option<ArrayEncoding>,
+        def_encoding: Option<ArrayEncoding>,
         value_encoding: ArrayEncoding,
         repetition_index_depth: u32,
-        dictionary_encoding: Option<ArrayEncoding>,
+        num_buffers: u64,
+        dictionary_encoding: Option<(ArrayEncoding, u64)>,
         def_meaning: &[DefinitionInterpretation],
         num_items: u64,
     ) -> PageLayout {
         assert!(!def_meaning.is_empty());
+        let (dictionary, num_dictionary_items) = dictionary_encoding
+            .map(|(d, i)| (Some(d), i))
+            .unwrap_or((None, 0));
         PageLayout {
             layout: Some(Layout::MiniBlockLayout(MiniBlockLayout {
-                def_compression: Some(def_encoding),
-                rep_compression: Some(rep_encoding),
+                def_compression: def_encoding,
+                rep_compression: rep_encoding,
                 value_compression: Some(value_encoding),
                 repetition_index_depth,
-                dictionary: dictionary_encoding,
+                num_buffers,
+                dictionary,
+                num_dictionary_items,
                 layers: def_meaning
                     .iter()
                     .map(|&def| Self::def_inter_to_repdef_layer(def))
