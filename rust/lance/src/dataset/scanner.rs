@@ -2123,8 +2123,14 @@ impl Scanner {
         index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // we split the query procedure into two steps:
+        // 1. collect the candidates by vector searching on each query vector
+        // 2. scoring the candidates
+
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
-        // split the query multivectors
+
+        // collect the candidates
         let num_queries = q.key.len() / dim;
         let new_queries = (0..num_queries)
             .map(|i| q.key.slice(i * dim, dim))
@@ -2134,7 +2140,6 @@ impl Scanner {
                 new_query
             });
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
-        let prefilter_source = self.prefilter_source(filter_plan).await?;
         for query in new_queries {
             let ann_node = new_knn_exec(
                 self.dataset.clone(),
@@ -2142,7 +2147,39 @@ impl Scanner {
                 &query,
                 prefilter_source.clone(),
             )?;
-            ann_nodes.push(ann_node);
+            // for single query vector, it's possible to retrieve multiple rows with the same row id
+            // need to max-reduce the results
+            let schema = ann_node.schema();
+            let group_expr = vec![(
+                expressions::col(ROW_ID, ann_node.schema().as_ref())?,
+                ROW_ID.to_string(),
+            )];
+            // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
+            let max_expr = AggregateExprBuilder::new(
+                functions_aggregate::min_max::max_udaf(),
+                vec![expressions::binary(
+                    expressions::lit(1.0),
+                    datafusion_expr::Operator::Minus,
+                    expressions::cast(
+                        expressions::col(DIST_COL, &schema)?,
+                        &schema,
+                        DataType::Float64,
+                    )?,
+                    &schema,
+                )?],
+            )
+            .schema(schema.clone())
+            .alias(DIST_COL)
+            .build()?;
+            let ann_node = Arc::new(AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(group_expr),
+                vec![Arc::new(max_expr)],
+                vec![None],
+                ann_node,
+                schema,
+            )?);
+            ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
         let ann_node = Arc::new(UnionExec::new(ann_nodes));
         let ann_node = Arc::new(RepartitionExec::try_new(
@@ -2155,20 +2192,10 @@ impl Scanner {
             expressions::col(ROW_ID, schema.as_ref())?,
             ROW_ID.to_string(),
         )];
-        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
-        // and calculate the sum across all rows with the same row id.
+        // calculate the sum across all rows with the same row id.
         let sum_expr = AggregateExprBuilder::new(
             functions_aggregate::sum::sum_udaf(),
-            vec![expressions::binary(
-                expressions::lit(1.0),
-                datafusion_expr::Operator::Minus,
-                expressions::cast(
-                    expressions::col(DIST_COL, &schema)?,
-                    &schema,
-                    DataType::Float64,
-                )?,
-                &schema,
-            )?],
+            vec![expressions::col(DIST_COL, &schema)?],
         )
         .schema(schema.clone())
         .alias(DIST_COL)
