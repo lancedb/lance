@@ -715,8 +715,7 @@ impl ExecutionPlan for MultivectorScoringExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let plan =
-            MultivectorScoringExec::try_new(self.dataset.clone(), children, self.query.clone())?;
+        let plan = Self::try_new(self.dataset.clone(), children, self.query.clone())?;
         Ok(Arc::new(plan))
     }
 
@@ -792,9 +791,7 @@ impl ExecutionPlan for MultivectorScoringExec {
                     }
                 });
                 query_results.into_iter().for_each(|(row_id, sim)| {
-                    if !results.contains_key(&row_id) {
-                        results.insert(row_id, sim + missed_similarities);
-                    }
+                    results.entry(row_id).or_insert(sim + missed_similarities);
                 });
                 missed_similarities += min_sim;
             }
