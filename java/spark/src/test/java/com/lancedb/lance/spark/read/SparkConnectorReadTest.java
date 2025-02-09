@@ -185,4 +185,35 @@ public class SparkConnectorReadTest {
     assertEquals(1, desc.size());
     assertTrue(desc.get(0).getString(0).contains("BroadcastHashJoin"));
   }
+
+  @Test
+  void supportReadOptions() {
+    Dataset<Row> df =
+        spark
+            .read()
+            .format("lance")
+            .option("version", "1")
+            .load(LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName));
+    // first version has 2 rows
+    assertEquals(2, df.count());
+
+    df =
+        spark
+            .read()
+            .format("lance")
+            .option("version", "6")
+            .load(LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName));
+    // 6 is the last version
+    validateData(df, TestUtils.TestTable1Config.expectedValues);
+  }
+
+  @Test
+  void versionInSQL() {
+    String uri = LanceConfig.getDatasetUri(dbPath, TestUtils.TestTable1Config.datasetName);
+    uri += "#version=1";
+    String sql = "SELECT * FROM lance.`" + uri + "`";
+    Dataset<Row> df = spark.sql(sql);
+    // first version has 2 rows
+    assertEquals(2, df.count());
+  }
 }
