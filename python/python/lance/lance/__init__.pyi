@@ -452,3 +452,12 @@ def bfloat16_array(values: List[str | None]) -> BFloat16Array: ...
 
 __version__: str
 language_model_home: Callable[[], str]
+
+class LanceScanStats:
+    start: int
+    end: int
+    wall_clock_duration: float
+    wall_clock_throughput: float
+    output_rows: int
+    estimated_output_bytes: int
+    plan: Optional[str]

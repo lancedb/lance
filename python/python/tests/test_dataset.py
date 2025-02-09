@@ -2279,6 +2279,31 @@ def test_dataset_restore(tmp_path: Path):
     assert dataset.count_rows() == 100
 
 
+def test_scan_stats(tmp_path: Path):
+    data = pa.table({"a": range(100)})
+    dataset = lance.write_dataset(data, tmp_path)
+
+    dataset.to_table(stats_handler="full")
+    dataset.to_table(stats_handler="brief")
+
+    now = datetime.now()
+    unix_now = time.mktime(now.timetuple())
+
+    def assert_stats(stats: lance.lance.LanceScanStats):
+        # Start/end should be within 5 minutes of now
+        assert stats.start / 1000 < unix_now + 300
+        assert stats.start / 1000 > unix_now - 300
+        assert stats.end / 1000 < unix_now + 300
+        assert stats.end / 1000 > unix_now - 300
+        assert stats.wall_clock_duration > 0
+        assert stats.wall_clock_throughput > 0
+        assert stats.output_rows == 100
+        assert stats.estimated_output_bytes == 800
+        assert stats.plan is not None
+
+    dataset.to_table(stats_handler=assert_stats)
+
+
 def test_mixed_mode_overwrite(tmp_path: Path):
     data = pa.table({"a": range(100)})
     dataset = lance.write_dataset(data, tmp_path, data_storage_version="legacy")
