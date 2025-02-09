@@ -12,7 +12,7 @@ use deepsize::DeepSizeOf;
 use lance_arrow::bfloat16::{
     is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 mod field;
 mod schema;

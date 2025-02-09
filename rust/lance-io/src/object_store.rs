@@ -32,7 +32,7 @@ use object_store::{
 };
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
 use shellexpand::tilde;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use url::Url;

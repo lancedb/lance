@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
 use log::trace;
 use num_traits::{AsPrimitive, PrimInt, ToPrimitive};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};

@@ -38,7 +38,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::tempdir;
 use tracing::instrument;
 use utils::get_vector_type;

@@ -28,7 +28,7 @@ use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::format::Fragment;
 use log::debug;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::fragment::{FileFragment, FragReadConfig, FragmentReader};
 use crate::dataset::scanner::{

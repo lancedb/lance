@@ -15,7 +15,7 @@ use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::fragment::FileFragment;
 use super::{

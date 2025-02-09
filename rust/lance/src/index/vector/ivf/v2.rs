@@ -51,7 +51,7 @@ use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::index::vector::builder::{index_type_string, IvfIndexBuilder};

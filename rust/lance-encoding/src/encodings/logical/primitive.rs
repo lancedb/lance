@@ -29,7 +29,7 @@ use lance_core::{
     utils::hash::U8SliceKey,
 };
 use log::{debug, trace};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::repdef::{
     build_control_word_iterator, CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser,

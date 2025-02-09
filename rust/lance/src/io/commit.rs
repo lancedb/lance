@@ -33,7 +33,7 @@ use lance_table::format::{
 use lance_table::io::commit::{CommitConfig, CommitError, CommitHandler, ManifestNamingScheme};
 use lance_table::io::deletion::read_deletion_file;
 use rand::{thread_rng, Rng};
-use snafu::{location, Location};
+use snafu::location;
 
 use futures::future::Either;
 use futures::{FutureExt, StreamExt, TryStreamExt};

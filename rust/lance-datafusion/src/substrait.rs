@@ -24,7 +24,7 @@ use datafusion_substrait::substrait::proto::{
 };
 use lance_core::{Error, Result};
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use std::collections::HashMap;
 use std::sync::Arc;
 

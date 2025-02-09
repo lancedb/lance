@@ -12,7 +12,7 @@ use bytemuck::{cast_slice, try_cast_slice};
 use byteorder::{ByteOrder, LittleEndian};
 use futures::TryFutureExt;
 use lance_core::utils::bit::pad_bytes;
-use snafu::{location, Location};
+use snafu::location;
 
 use futures::{future::BoxFuture, FutureExt};
 

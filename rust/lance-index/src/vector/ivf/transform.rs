@@ -11,7 +11,7 @@ use arrow_array::{
 };
 use arrow_schema::Field;
 use lance_table::utils::LanceIteratorExtension;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use lance_arrow::RecordBatchExt;

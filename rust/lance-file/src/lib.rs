@@ -15,7 +15,7 @@ use lance_core::{Error, Result};
 use lance_encoding::version::LanceFileVersion;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 
 pub async fn determine_file_version(
     store: &ObjectStore,

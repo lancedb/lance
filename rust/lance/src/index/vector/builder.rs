@@ -51,7 +51,7 @@ use lance_linalg::distance::DistanceType;
 use log::info;
 use object_store::path::Path;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::{tempdir, TempDir};
 use tracing::{span, Level};
 

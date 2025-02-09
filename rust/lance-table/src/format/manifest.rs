@@ -23,7 +23,7 @@ use lance_core::datatypes::{Schema, StorageClass};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::utils::read_struct;
-use snafu::{location, Location};
+use snafu::location;
 
 /// Manifest of a dataset
 ///

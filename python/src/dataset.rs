@@ -74,7 +74,7 @@ use pyo3::{
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;

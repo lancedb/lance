@@ -5,7 +5,7 @@ use std::{env, path::PathBuf};
 
 use lance_core::{Error, Result};
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 #[cfg(feature = "tokenizer-lindera")]
 mod lindera;

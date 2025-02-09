@@ -14,7 +14,7 @@ use arrow_schema::DataType;
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 use std::collections::HashMap;
 
 use crate::buffer::LanceBuffer;

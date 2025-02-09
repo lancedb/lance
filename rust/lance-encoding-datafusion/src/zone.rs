@@ -43,7 +43,7 @@ use lance_file::{
     v2::{reader::EncodedBatchReaderExt, writer::EncodedBatchWriteExt},
     version::LanceFileVersion,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::substrait::FilterExpressionExt;
 

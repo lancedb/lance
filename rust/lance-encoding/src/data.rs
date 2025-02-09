@@ -25,7 +25,7 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuf
 use arrow_schema::DataType;
 use bytemuck::try_cast_slice;
 use lance_arrow::DataTypeExt;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result};
 

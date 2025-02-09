@@ -8,7 +8,7 @@ use deepsize::DeepSizeOf;
 use lance_core::cache::FileMetadataCache;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::index::cache::IndexCache;

@@ -70,7 +70,7 @@ use lance_index::DatasetIndexExt;
 use lance_table::format::{Fragment, Index};
 use log::info;
 use roaring::RoaringTreemap;
-use snafu::{location, Location, ResultExt};
+use snafu::{location, ResultExt};
 use tokio::task::JoinSet;
 
 use crate::{
@@ -152,11 +152,15 @@ impl WhenNotMatchedBySource {
         let expr = planner
             .parse_filter(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
         Ok(Self::DeleteIf(expr))
     }
 }
@@ -185,11 +189,15 @@ impl WhenMatched {
         let expr = planner
             .parse_filter(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
         let expr = planner
             .optimize_expr(expr)
             .map_err(box_error)
-            .context(InvalidInputSnafu)?;
+            .context(InvalidInputSnafu {
+                location: location!(),
+            })?;
         Ok(Self::UpdateIf(expr))
     }
 }

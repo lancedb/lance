@@ -18,7 +18,7 @@ use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use super::transform::Transformer;

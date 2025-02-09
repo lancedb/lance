@@ -67,7 +67,7 @@ use lance_table::{
 };
 use object_store::path::Path;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 use super::ManifestWriteConfig;

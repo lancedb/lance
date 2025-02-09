@@ -13,7 +13,7 @@ use arrow_select::interleave::interleave;
 use dashmap::{DashMap, ReadOnlyView};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::task;
 
 use crate::datatypes::lance_supports_nulls;

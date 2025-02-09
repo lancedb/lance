@@ -19,7 +19,7 @@ use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{

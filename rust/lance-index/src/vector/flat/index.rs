@@ -15,7 +15,7 @@ use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::DistanceType;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     prefilter::PreFilter,

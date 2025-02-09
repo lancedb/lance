@@ -4,7 +4,7 @@
 use std::str::FromStr;
 
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 pub const LEGACY_FORMAT_VERSION: &str = "0.1";
 pub const V2_FORMAT_2_0: &str = "2.0";

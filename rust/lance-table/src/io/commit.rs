@@ -34,7 +34,7 @@ use futures::{
 };
 use log::warn;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
-use snafu::{location, Location};
+use snafu::location;
 use url::Url;
 
 #[cfg(feature = "dynamodb")]

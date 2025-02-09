@@ -43,7 +43,7 @@ use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::TempDir;
 
 use crate::vector::ivf::IvfTransformer;

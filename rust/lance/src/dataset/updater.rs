@@ -8,7 +8,7 @@ use lance_core::utils::deletion::DeletionVector;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_table::format::Fragment;
 use lance_table::utils::stream::ReadBatchFutStream;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
