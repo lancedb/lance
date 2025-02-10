@@ -9,10 +9,10 @@ use std::sync::Arc;
 use arrow_array::ArrayRef;
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use deepsize::DeepSizeOf;
+use http::StatusCode;
 use lance_arrow::bfloat16::{
     is_bfloat16_field, ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY, BFLOAT16_EXT_NAME,
 };
-use snafu::{location, Location};
 
 mod field;
 mod schema;
@@ -90,10 +90,10 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
         "ms" => Ok(TimeUnit::Millisecond),
         "us" => Ok(TimeUnit::Microsecond),
         "ns" => Ok(TimeUnit::Nanosecond),
-        _ => Err(Error::Arrow {
-            message: format!("Unsupported TimeUnit: {unit}"),
-            location: location!(),
-        }),
+        _ => Err(Error::bad_request(
+            "Unsupported timeunit",
+            format!("Got '{unit}'. Supported: 's', 'ms', 'us', 'ns'"),
+        )),
     }
 }
 
@@ -166,10 +166,10 @@ impl TryFrom<&DataType> for LogicalType {
             }
             DataType::FixedSizeBinary(len) => format!("fixed_size_binary:{}", *len),
             _ => {
-                return Err(Error::Schema {
-                    message: format!("Unsupported data type: {:?}", dt),
-                    location: location!(),
-                })
+                return Err(Error::bad_request(
+                    "Unsupported data type",
+                    format!("{:?}", dt),
+                ))
             }
         };
 
@@ -218,21 +218,18 @@ impl TryFrom<&LogicalType> for DataType {
             match splits[0] {
                 "fixed_size_list" => {
                     if splits.len() < 3 {
-                        return Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
-                            location: location!(),
-                        });
+                        return Err(Error::bad_request(
+                            "Unsupported logical type",
+                            format!("Fixed size list should have three parts. Got: '{}'", lt),
+                        ));
                     }
 
-                    let size: i32 =
-                        splits
-                            .last()
-                            .unwrap()
-                            .parse::<i32>()
-                            .map_err(|e: _| Error::Schema {
-                                message: e.to_string(),
-                                location: location!(),
-                            })?;
+                    let size: i32 = splits.last().unwrap().parse::<i32>().map_err(|e| {
+                        Error::bad_request(
+                            "Unsupported logical type",
+                            format!("Couldn't parse list size: {}", e),
+                        )
+                    })?;
 
                     let inner_type = splits[1..splits.len() - 1].join(":");
 
@@ -260,24 +257,26 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "fixed_size_binary" => {
                     if splits.len() != 2 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported logical type: {}", lt),
-                            location: location!(),
-                        })
+                        return Err(Error::bad_request(
+                            "Unsupported logical type",
+                            format!("Fixed size binary should have two parts. Got: '{}'", lt),
+                        ));
                     } else {
-                        let size: i32 = splits[1].parse::<i32>().map_err(|e: _| Error::Schema {
-                            message: e.to_string(),
-                            location: location!(),
+                        let size: i32 = splits[1].parse::<i32>().map_err(|e| {
+                            Error::bad_request(
+                                "Unsupported logical type",
+                                format!("Couldn't parse binary size: {}", e),
+                            )
                         })?;
                         Ok(FixedSizeBinary(size))
                     }
                 }
                 "dict" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported dictionary type: {}", lt),
-                            location: location!(),
-                        })
+                        Err(Error::bad_request(
+                            "Unsupported logical type",
+                            format!("Dictionary should have four parts. Got: '{}'", lt),
+                        ))
                     } else {
                         let value_type: Self = (&LogicalType::from(splits[1])).try_into()?;
                         let index_type: Self = (&LogicalType::from(splits[2])).try_into()?;
@@ -286,23 +285,28 @@ impl TryFrom<&LogicalType> for DataType {
                 }
                 "decimal" => {
                     if splits.len() != 4 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported decimal type: {}", lt),
-                            location: location!(),
-                        })
+                        Err(Error::bad_request(
+                            "Unsupported logical type",
+                            format!("Decimal should have four parts. Got: '{}'", lt),
+                        ))
                     } else {
-                        let bits: i16 = splits[1].parse::<i16>().map_err(|err| Error::Schema {
-                            message: err.to_string(),
-                            location: location!(),
+                        let bits: i16 = splits[1].parse::<i16>().map_err(|err| {
+                            Error::bad_request(
+                                "Unsupported logical type",
+                                format!("Couldn't parse decimal bits: {}", err),
+                            )
                         })?;
-                        let precision: u8 =
-                            splits[2].parse::<u8>().map_err(|err| Error::Schema {
-                                message: err.to_string(),
-                                location: location!(),
-                            })?;
-                        let scale: i8 = splits[3].parse::<i8>().map_err(|err| Error::Schema {
-                            message: err.to_string(),
-                            location: location!(),
+                        let precision: u8 = splits[2].parse::<u8>().map_err(|err| {
+                            Error::bad_request(
+                                "Unsupported logical type",
+                                format!("Couldn't parse decimal precision: {}", err),
+                            )
+                        })?;
+                        let scale: i8 = splits[3].parse::<i8>().map_err(|err| {
+                            Error::bad_request(
+                                "Unsupported logical type",
+                                format!("Couldn't parse decimal scale: {}", err),
+                            )
                         })?;
 
                         if bits == 128 {
@@ -310,21 +314,24 @@ impl TryFrom<&LogicalType> for DataType {
                         } else if bits == 256 {
                             Ok(Decimal256(precision, scale))
                         } else {
-                            Err(Error::Schema {
-                                message: format!(
+                            Err(Error::bad_request(
+                                "Unsupported logical type",
+                                format!(
                                     "Only Decimal128 and Decimal256 is supported. Found {bits}"
                                 ),
-                                location: location!(),
-                            })
+                            ))
                         }
                     }
                 }
                 "timestamp" => {
                     if splits.len() != 3 {
-                        Err(Error::Schema {
-                            message: format!("Unsupported timestamp type: {}", lt),
-                            location: location!(),
-                        })
+                        return Err(Error::bad_request(
+                            "Unsupported logical type",
+                            format!(
+                                "Got '{}'. Expected format: 'timestamp:<timeunit>:<timezone>'",
+                                lt
+                            ),
+                        ));
                     } else {
                         let timeunit = parse_timeunit(splits[1])?;
                         let tz: Option<Arc<str>> = if splits[2] == "-" {
@@ -335,10 +342,10 @@ impl TryFrom<&LogicalType> for DataType {
                         Ok(Timestamp(timeunit, tz))
                     }
                 }
-                _ => Err(Error::Schema {
-                    message: format!("Unsupported logical type: {}", lt),
-                    location: location!(),
-                }),
+                _ => Err(Error::bad_request(
+                    "Unsupported logical type",
+                    format!("Got '{}'", lt),
+                )),
             }
         }
     }
