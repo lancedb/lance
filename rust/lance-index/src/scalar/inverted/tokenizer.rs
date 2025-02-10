@@ -18,6 +18,7 @@ mod jieba;
 pub struct TokenizerConfig {
     /// base tokenizer:
     /// - `simple`: splits tokens on whitespace and punctuation
+    /// - `trigram`: splits tokens on trigrams
     /// - `whitespace`: splits tokens on whitespace
     /// - `raw`: no tokenization
     /// - `lindera/*`: Lindera tokenizer
@@ -141,6 +142,10 @@ fn build_base_tokenizer_builder(name: &str) -> Result<tantivy::tokenizer::TextAn
     match name {
         "simple" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
             tantivy::tokenizer::SimpleTokenizer::default(),
+        )
+        .dynamic()),
+        "trigram" => Ok(tantivy::tokenizer::TextAnalyzer::builder(
+            tantivy::tokenizer::NgramTokenizer::new(1, 3, false).unwrap(),
         )
         .dynamic()),
         "whitespace" => Ok(tantivy::tokenizer::TextAnalyzer::builder(

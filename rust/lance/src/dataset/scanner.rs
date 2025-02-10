@@ -1267,8 +1267,13 @@ impl Scanner {
         let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
             let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
             let index_info = self.dataset.scalar_index_info().await?;
+            println!("Index info is {:?}", index_info);
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
+
+            println!("Possibly wrap here");
+
+            println!("Filter plan index query {:?}", filter_plan.index_query);
 
             // This tests if any of the fragments are missing the physical_rows property (old style)
             // If they are then we cannot use scalar indices
@@ -1501,6 +1506,23 @@ impl Scanner {
             plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
         }
 
+        self.traverse_plan(
+            plan.as_ref(),
+            |node| match node.name() {
+                "MaterializeIndexExec" => {
+                    let exec = node
+                        .as_any()
+                        .downcast_ref::<MaterializeIndexExec>()
+                        .unwrap();
+                    println!("Got MaterializeIndexExec {:?}", exec);
+                }
+                _ => {}
+            },
+            |node| {
+                //println!("Post plan node {:?}", node);
+            },
+        );
+
         // Stage 7: final projection
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
@@ -1511,6 +1533,19 @@ impl Scanner {
         }
 
         Ok(plan)
+    }
+
+    fn traverse_plan(
+        &self,
+        plan: &dyn ExecutionPlan,
+        pre: fn(node: &dyn ExecutionPlan),
+        post: fn(node: &dyn ExecutionPlan),
+    ) {
+        pre(plan);
+        for child in plan.children() {
+            self.traverse_plan(child.as_ref(), pre, post);
+        }
+        post(plan);
     }
 
     // Create an execution plan to do full text search
@@ -1838,24 +1873,39 @@ impl Scanner {
     async fn fragments_covered_by_index_query(
         &self,
         index_expr: &ScalarIndexExpr,
-    ) -> Result<RoaringBitmap> {
+    ) -> Result<(RoaringBitmap, bool)> {
         match index_expr {
             ScalarIndexExpr::And(lhs, rhs) => {
-                Ok(self.fragments_covered_by_index_query(lhs).await?
-                    & self.fragments_covered_by_index_query(rhs).await?)
+                let (lhs_bitmap, lhs_recheck) = self.fragments_covered_by_index_query(lhs).await?;
+                let (rhs_bitmap, rhs_recheck) = self.fragments_covered_by_index_query(rhs).await?;
+                Ok((lhs_bitmap & rhs_bitmap, lhs_recheck || rhs_recheck));
             }
             ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
                 & self.fragments_covered_by_index_query(rhs).await?),
             ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
-            ScalarIndexExpr::Query(column, _) => {
+            ScalarIndexExpr::Query(column, expr) => {
+                // right here - we know the column, the expr, and the index. Can
+                // we figure out what we need?
                 let idx = self
                     .dataset
                     .load_scalar_index_for_column(column)
                     .await?
                     .expect("Index not found even though it must have been found earlier");
-                Ok(idx
-                    .fragment_bitmap
-                    .expect("scalar indices should always have a fragment bitmap"))
+
+                let index_type =
+                    detect_scalar_index_type(&self.dataset, &idx, column, &self.dataset.session)
+                        .await?;
+
+                // infer recheck guidance
+                match (index_type, expr) {
+                    (ScalarIndexType::Inverted, _) => {
+                        return Ok((idx.fragment_bitmap, true));
+                    }
+
+                    (_, _) => {
+                        return Ok((idx.fragment_bitmap, false));
+                    }
+                }
             }
         }
     }
@@ -1893,6 +1943,8 @@ impl Scanner {
             index_expr.clone(),
             Arc::new(relevant_frags),
         ));
+
+        // If we know the index is lossy, then wrap with a recheck here.
 
         // If there is more than just _rowid in projection
         let needs_take = match projection.fields.len() {
@@ -1944,6 +1996,7 @@ impl Scanner {
                 None,
                 false,
             );
+
             let filtered = Arc::new(FilterExec::try_new(physical_refine_expr, new_data_scan)?);
             Some(Arc::new(project(filtered, plan.schema().as_ref())?))
         } else {

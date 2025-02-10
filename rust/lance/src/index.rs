@@ -948,9 +948,9 @@ impl DatasetIndexInternalExt for Dataset {
                         detect_scalar_index_type(self, index, &field.name, self.session.as_ref())
                             .await?;
                     // Inverted index can't be used for filtering
-                    if matches!(index_type, ScalarIndexType::Inverted) {
-                        continue;
-                    }
+                    //if matches!(index_type, ScalarIndexType::Inverted) {
+                    //    continue;
+                    //}
                     Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
                 }
                 _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,

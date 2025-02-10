@@ -367,7 +367,6 @@ impl<'a> FragIdIter<'a> {
 
 impl Iterator for FragIdIter<'_> {
     type Item = u64;
-
     fn next(&mut self) -> Option<Self::Item> {
         while self.frag_idx < self.src.len() {
             let frag = &self.src[self.frag_idx];
