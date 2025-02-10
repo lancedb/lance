@@ -63,6 +63,7 @@ use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
+use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
@@ -1656,13 +1657,13 @@ impl Scanner {
 
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let (ann_node, is_multivec) = match vector_type {
-                DataType::FixedSizeList(_, _) => (self.ann(q, &deltas, filter_plan).await?, false),
-                DataType::List(_) => (self.multivec_ann(q, &deltas, filter_plan).await?, true),
+            let ann_node = match vector_type {
+                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
                 _ => unreachable!(),
             };
 
-            let mut knn_node = if q.refine_factor.is_some() || is_multivec {
+            let mut knn_node = if q.refine_factor.is_some() {
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -2123,18 +2124,28 @@ impl Scanner {
         index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // we split the query procedure into two steps:
+        // 1. collect the candidates by vector searching on each query vector
+        // 2. scoring the candidates
+
+        let over_fetch_factor = q.refine_factor.unwrap_or(10);
+
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
-        // split the query multivectors
+
         let num_queries = q.key.len() / dim;
         let new_queries = (0..num_queries)
             .map(|i| q.key.slice(i * dim, dim))
             .map(|query_vec| {
                 let mut new_query = q.clone();
                 new_query.key = query_vec;
+                // with XTR, we don't need to refine the result with original vectors,
+                // but here we really need to over-fetch the candidates to reach good enough recall.
+                // TODO: improve the recall with WARP, expose this parameter to the users.
+                new_query.refine_factor = Some(over_fetch_factor);
                 new_query
             });
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
-        let prefilter_source = self.prefilter_source(filter_plan).await?;
         for query in new_queries {
             let ann_node = new_knn_exec(
                 self.dataset.clone(),
@@ -2142,50 +2153,30 @@ impl Scanner {
                 &query,
                 prefilter_source.clone(),
             )?;
-            ann_nodes.push(ann_node);
+            let sort_expr = PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            let ann_node = Arc::new(
+                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
+                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
+            );
+            ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
-        let ann_node = Arc::new(UnionExec::new(ann_nodes));
-        let ann_node = Arc::new(RepartitionExec::try_new(
-            ann_node,
-            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?);
-        let schema = ann_node.schema();
-        // unique by row ids, and get the min distance although it is not used.
-        let group_expr = vec![(
-            expressions::col(ROW_ID, schema.as_ref())?,
-            ROW_ID.to_string(),
-        )];
-        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
-        // and calculate the sum across all rows with the same row id.
-        let sum_expr = AggregateExprBuilder::new(
-            functions_aggregate::sum::sum_udaf(),
-            vec![expressions::binary(
-                expressions::lit(1.0),
-                datafusion_expr::Operator::Minus,
-                expressions::cast(
-                    expressions::col(DIST_COL, &schema)?,
-                    &schema,
-                    DataType::Float64,
-                )?,
-                &schema,
-            )?],
-        )
-        .schema(schema.clone())
-        .alias(DIST_COL)
-        .build()?;
-        let ann_node: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
-            AggregateMode::Single,
-            PhysicalGroupBy::new_single(group_expr),
-            vec![Arc::new(sum_expr)],
-            vec![None],
-            ann_node,
-            schema,
+
+        let ann_node = Arc::new(MultivectorScoringExec::try_new(
+            self.dataset.clone(),
+            ann_nodes,
+            q.clone(),
         )?);
 
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
             options: SortOptions {
-                descending: true,
+                descending: false,
                 nulls_first: false,
             },
         };
