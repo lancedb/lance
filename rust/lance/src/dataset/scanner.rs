@@ -2128,6 +2128,8 @@ impl Scanner {
         // 1. collect the candidates by vector searching on each query vector
         // 2. scoring the candidates
 
+        let over_fetch_factor = q.refine_factor.unwrap_or(10);
+
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
 
@@ -2137,6 +2139,10 @@ impl Scanner {
             .map(|query_vec| {
                 let mut new_query = q.clone();
                 new_query.key = query_vec;
+                // with XTR, we don't need to refine the result with original vectors,
+                // but here we really need to over-fetch the candidates to reach good enough recall.
+                // TODO: improve the recall with WARP, expose this parameter to the users.
+                new_query.refine_factor = Some(over_fetch_factor);
                 new_query
             });
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
@@ -2147,6 +2153,17 @@ impl Scanner {
                 &query,
                 prefilter_source.clone(),
             )?;
+            let sort_expr = PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            let ann_node = Arc::new(
+                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
+                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
+            );
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
 

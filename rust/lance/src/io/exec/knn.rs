@@ -740,7 +740,7 @@ impl ExecutionPlan for MultivectorScoringExec {
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
 
                 // max-reduce for the same row id
-                let min_sim = dists.values().last().map(|dist| 1.0 - *dist).unwrap_or(0.0);
+                let min_sim = 1.0 - dists.values().last().copied().unwrap_or(2.0);
                 let mut new_row_ids = Vec::with_capacity(row_ids.len());
                 let mut new_sims = Vec::with_capacity(row_ids.len());
                 let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
@@ -796,15 +796,11 @@ impl ExecutionPlan for MultivectorScoringExec {
                 missed_similarities += min_sim;
             }
 
-            let results = results.into_iter().collect::<Vec<_>>();
-            let row_ids = results
-                .iter()
-                .map(|(row_id, _)| *row_id)
-                .collect::<Vec<_>>();
-            let dists = results
-                .iter()
+            let (row_ids, sims): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+            let dists = sims
+                .into_iter()
                 // it's similarity, so we need to convert it back to distance
-                .map(|(_, sim)| 1.0 - *sim)
+                .map(|sim| 1.0 - sim)
                 .collect::<Vec<_>>();
             let row_ids = UInt64Array::from(row_ids);
             let dists = Float32Array::from(dists);
