@@ -31,6 +31,10 @@ impl Error {
         Self::new(StatusCode::BAD_REQUEST, title, details)
     }
 
+    pub fn internal(title: &'static str, details: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, title, details)
+    }
+
     pub fn unexpected(title: &'static str, details: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, title, details)
     }
@@ -40,6 +44,11 @@ impl Error {
         self
     }
 
+    /// Capture a backtrace for this error.
+    ///
+    /// Backtraces aren't captured by default because they can be expensive to
+    /// capture. They are most helpful in functions that can be called from
+    /// many different code paths. For example, low-level IO functions.
     pub fn with_backtrace(mut self) -> Self {
         self.0.backtrace = MaybeBacktrace::Captured(Backtrace::capture());
         self
