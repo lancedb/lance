@@ -18,7 +18,7 @@ Why you should use Lance
 
 ## Quick start
 
-Introduce the Lance SDK for Java Maven dependency(It is recommended to choose the latest version.):
+Introduce the Lance SDK Java Maven dependency(It is recommended to choose the latest version.):
 
 ```shell
 <dependency>
@@ -34,7 +34,6 @@ Introduce the Lance SDK for Java Maven dependency(It is recommended to choose th
 
 ```java
 void createDataset() throws IOException, URISyntaxException {
-    Path path = Paths.get(DatasetDemoTest.class.getResource(DATA_FILE).toURI());
     String datasetPath = tempDir.resolve("write_stream").toString();
     Schema schema =
             new Schema(
@@ -56,7 +55,7 @@ void createDataset() throws IOException, URISyntaxException {
 
 ```java
 void createAndWriteDataset() throws IOException, URISyntaxException {
-    Path path = Paths.get(DatasetDemoTest.class.getResource(DATA_FILE).toURI());
+    Path path = "";     // the original source path
     String datasetPath = "";    // specify a path point to a dataset
     try (BufferAllocator allocator = new RootAllocator();
          ArrowFileReader reader =
@@ -133,12 +132,6 @@ void randomAccess() {
 }
 ```
 
-### Indexing and Searching
-
-```java
-
-```
-
 ### Schema evolution
 
 * add columns
@@ -202,11 +195,48 @@ More details please see the ![README](https://github.com/lancedb/lance/blob/main
 ## Contributing
 
 From the codebase dimension, the lance project is a multiple-lang project. Everything about java language is hosted in `java` dir.
-And the `java` is a standard maven project(named `lance-parent`) can be imported into any IDEs support java project.
+And the whole `java` dir is a standard maven project(named `lance-parent`) can be imported into any IDEs support java project.
 
 Overview, it contains two maven sub-modules:
 
-* lance-core:
-* lance-spark: 
+* lance-core: the core module of Lance Java binding, including `lance-jni`.
+* lance-spark: the spark connector module.
+
+to build the project, you can run the following command:
+
+```shell
+mvn clean package
+```
+
+if you only want to build rust code(`lance-jni`), you can run the following command:
+
+```shell
+cargo build
+```
+
+The java module uses `spotless` maven plugin to format the code and check the license header. 
+And it is applied in the `validate` phase automatically.
 
 ### Environment(IDE) setup
+
+Firstly, clone the repository into your local machine:
+
+```shell
+git clone https://github.com/lancedb/lance.git
+```
+
+Then, import the `java` directory into your favorite IDEs, such as IntelliJ IDEA, Eclipse, etc.
+
+Due to the java module depends on the features provided by rust module. So, you also need to make sure you have installed rust in your local.
+
+To install rust, please refer to the [official documentation](https://www.rust-lang.org/tools/install).
+
+And you also need to install the rust plugin for your IDE.
+
+Then, you can build the whole java module:
+
+```shell
+mvn clean package
+```
+
+Running this commands, it builds the rust jni binding codes automatically.
