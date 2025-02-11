@@ -103,8 +103,13 @@ public class FilterTest {
   }
 
   private void testFilter(String filter, int expectedCount) throws Exception {
-    try (LanceScanner scanner = dataset
-        .newScan(new ScanOptions.Builder().columns(Arrays.asList()).withRowId(true).filter(filter).build())) {
+    try (LanceScanner scanner =
+        dataset.newScan(
+            new ScanOptions.Builder()
+                .columns(Arrays.asList())
+                .withRowId(true)
+                .filter(filter)
+                .build())) {
       assertEquals(expectedCount, scanner.countRows());
     }
   }
