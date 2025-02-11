@@ -162,7 +162,12 @@ public class ScannerTest {
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
         try (LanceScanner scanner =
-            dataset.newScan(new ScanOptions.Builder().columns(Arrays.asList()).withRowId(true).filter("id < 20").build())) {
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .columns(Arrays.asList())
+                    .withRowId(true)
+                    .filter("id < 20")
+                    .build())) {
           assertEquals(20, scanner.countRows());
         }
       }
