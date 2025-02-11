@@ -741,7 +741,11 @@ impl ExecutionPlan for MultivectorScoringExec {
                 debug_assert_eq!(dists.null_count(), 0);
 
                 // max-reduce for the same row id
-                let min_sim = 1.0 - dists.values().last().copied().unwrap_or(2.0);
+                let min_sim = dists
+                    .values()
+                    .last()
+                    .map(|dist| 1.0 - *dist)
+                    .unwrap_or_default();
                 let mut new_row_ids = Vec::with_capacity(row_ids.len());
                 let mut new_sims = Vec::with_capacity(row_ids.len());
                 let mut visited_row_ids = HashSet::with_capacity(row_ids.len());

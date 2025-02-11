@@ -89,6 +89,9 @@ pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 lazy_static::lazy_static! {
     pub static ref DEFAULT_FRAGMENT_READAHEAD: Option<usize> = std::env::var("LANCE_DEFAULT_FRAGMENT_READAHEAD")
         .map(|val| Some(val.parse().unwrap())).unwrap_or(None);
+
+    pub static ref DEFAULT_XTR_OVERFETCH: u32 = std::env::var("LANCE_XTR_OVERFETCH")
+        .map(|val| val.parse().unwrap()).unwrap_or(10);
 }
 
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
@@ -2128,7 +2131,7 @@ impl Scanner {
         // 1. collect the candidates by vector searching on each query vector
         // 2. scoring the candidates
 
-        let over_fetch_factor = q.refine_factor.unwrap_or(10);
+        let over_fetch_factor = *DEFAULT_XTR_OVERFETCH;
 
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
@@ -2147,6 +2150,7 @@ impl Scanner {
             });
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
         for query in new_queries {
+            // this produces `nprobes * k * over_fetch_factor * num_indices` candidates
             let ann_node = new_knn_exec(
                 self.dataset.clone(),
                 index,
