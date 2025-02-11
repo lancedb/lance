@@ -2210,7 +2210,7 @@ def test_scan_count_rows(tmp_path: Path):
     df = pd.DataFrame({"a": range(42), "b": range(42)})
     dataset = lance.write_dataset(df, base_dir)
 
-    assert dataset.scanner().count_rows() == 42
+    assert dataset.scanner(columns=[], with_row_id=True).count_rows() == 42
     assert dataset.count_rows(filter="a < 10") == 10
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 

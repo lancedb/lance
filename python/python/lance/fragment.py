@@ -354,8 +354,10 @@ class LanceFragment(pa.dataset.Fragment):
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
-        if filter is not None:
-            return self.scanner(filter=filter).count_rows()
+        if isinstance(filter, pa.compute.Expression):
+            return self.scanner(
+                with_row_id=True, columns=[], filter=filter
+            ).count_rows()
         return self._fragment.count_rows(filter)
 
     @property
@@ -540,10 +542,12 @@ class LanceFragment(pa.dataset.Fragment):
 
     def merge_columns(
         self,
-        value_func: Dict[str, str]
-        | BatchUDF
-        | ReaderLike
-        | Callable[[pa.RecordBatch], pa.RecordBatch],
+        value_func: (
+            Dict[str, str]
+            | BatchUDF
+            | ReaderLike
+            | Callable[[pa.RecordBatch], pa.RecordBatch]
+        ),
         columns: Optional[list[str]] = None,
         batch_size: Optional[int] = None,
         reader_schema: Optional[pa.Schema] = None,
@@ -681,7 +685,8 @@ if TYPE_CHECKING:
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_move_stable_row_ids: bool = False,
-    ) -> Transaction: ...
+    ) -> Transaction:
+        ...
 
     @overload
     def write_fragments(
@@ -699,7 +704,8 @@ if TYPE_CHECKING:
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
         enable_move_stable_row_ids: bool = False,
-    ) -> List[FragmentMetadata]: ...
+    ) -> List[FragmentMetadata]:
+        ...
 
 
 def write_fragments(
