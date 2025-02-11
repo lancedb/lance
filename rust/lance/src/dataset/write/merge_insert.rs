@@ -1816,10 +1816,7 @@ mod tests {
 
         // Check that the data is as expected
         let updated = ds
-            .scan()
-            .filter("value = 9999999")
-            .unwrap()
-            .count_rows()
+            .count_rows(Some("value = 9999999".to_string()))
             .await
             .unwrap();
         assert_eq!(updated, 2048);
