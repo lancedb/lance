@@ -1523,7 +1523,7 @@ impl Scanner {
             .limit(self.limit);
 
         // load indices
-        let mut column_inputs = HashMap::with_capacity(columns.len());
+        let mut column_inputs = Vec::with_capacity(columns.len());
         for column in columns {
             let index = self
                 .dataset
@@ -1571,12 +1571,12 @@ impl Scanner {
                 scan_node
             };
 
-            column_inputs.insert(column.clone(), (index_uuids, unindexed_scan_node));
+            column_inputs.push((column.clone(), index_uuids, unindexed_scan_node));
         }
 
         let indices = column_inputs
             .iter()
-            .map(|(col, (idx, _))| (col.clone(), idx.clone()))
+            .map(|(col, idx, _)| (col.clone(), idx.clone()))
             .collect();
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let fts_plan = Arc::new(FtsExec::new(
