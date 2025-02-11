@@ -11,7 +11,7 @@ use arrow_array::{
     cast::AsArray,
     ArrayRef, RecordBatch, StringArray,
 };
-use arrow_array::{Float32Array, UInt64Array};
+use arrow_array::{Array, Float32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::PlanProperties;
@@ -738,6 +738,7 @@ impl ExecutionPlan for MultivectorScoringExec {
                 let batch = batch?;
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
+                debug_assert_eq!(dists.null_count(), 0);
 
                 // max-reduce for the same row id
                 let min_sim = 1.0 - dists.values().last().copied().unwrap_or(2.0);
@@ -783,6 +784,12 @@ impl ExecutionPlan for MultivectorScoringExec {
                     .copied()
                     .zip(sims.values().iter().copied())
                     .collect::<HashMap<_, _>>();
+
+                // for a row `r`:
+                // if `r` is in only `results``, then `results[r] += min_sim`
+                // if `r` is in only `query_results`, then `results[r] = query_results[r] + missed_similarities`,
+                // here `missed_similarities` is the sum of `min_sim` from previous iterations
+                // if `r` is in both, then `results[r] += query_results[r]`
                 results.iter_mut().for_each(|(row_id, sim)| {
                     if let Some(new_dist) = query_results.get(row_id) {
                         *sim += new_dist;
