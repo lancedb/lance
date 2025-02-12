@@ -1542,7 +1542,7 @@ impl RootDecoderType for SimpleStructDecoder {
     }
 }
 
-/// A blocking back decoder that performs synchronous decoding
+/// A blocking batch decoder that performs synchronous decoding
 struct BatchDecodeIterator<T: RootDecoderType> {
     messages: VecDeque<Result<DecoderMessage>>,
     root_decoder: T,

@@ -1133,9 +1133,9 @@ struct MiniBlockSchedulerDictionary {
 
 #[derive(Debug)]
 struct RepIndexBlock {
-    // The first row in the block, if there is a preamble then this is the offset
-    // of the row after the preamble (that row may not exist if the block is entirely)
-    // preamble
+    // The index of the first row that starts after the beginning of this block.  If the block
+    // has a preamble this will be the row after the preamble.  If the block is entirely preamble
+    // then this will be a row that starts in some future block.
     first_row: u64,
     // The number of rows in the block, including the trailer but not the preamble.
     // Can be 0 if the block is entirely preamble
