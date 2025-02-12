@@ -18,6 +18,7 @@ if TYPE_CHECKING:
         pa.Table,
         pa.dataset.Dataset,
         pa.dataset.Scanner,
+        pa.RecordBatch,
         Iterable[RecordBatch],
         pa.RecordBatchReader,
     ]

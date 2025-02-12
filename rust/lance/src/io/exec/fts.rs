@@ -99,9 +99,46 @@ impl ExecutionPlan for FtsExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        todo!()
+        let plan = match children.len() {
+            0 => Self {
+                dataset: self.dataset.clone(),
+                indices: self.indices.clone(),
+                query: self.query.clone(),
+                prefilter_source: PreFilterSource::None,
+                properties: self.properties.clone(),
+            },
+            1 => {
+                let src = children.pop().unwrap();
+                let prefilter_source = match &self.prefilter_source {
+                    PreFilterSource::FilteredRowIds(_) => {
+                        PreFilterSource::FilteredRowIds(src.clone())
+                    }
+                    PreFilterSource::ScalarIndexQuery(_) => {
+                        PreFilterSource::ScalarIndexQuery(src.clone())
+                    }
+                    PreFilterSource::None => {
+                        return Err(DataFusionError::Internal(
+                            "Unexpected prefilter source".to_string(),
+                        ));
+                    }
+                };
+                Self {
+                    dataset: self.dataset.clone(),
+                    indices: self.indices.clone(),
+                    query: self.query.clone(),
+                    prefilter_source,
+                    properties: self.properties.clone(),
+                }
+            }
+            _ => {
+                return Err(DataFusionError::Internal(
+                    "Unexpected number of children".to_string(),
+                ));
+            }
+        };
+        Ok(Arc::new(plan))
     }
 
     #[instrument(name = "fts_exec", level = "debug", skip_all)]
@@ -194,8 +231,8 @@ impl ExecutionPlan for FtsExec {
 #[derive(Debug)]
 pub struct FlatFtsExec {
     dataset: Arc<Dataset>,
-    // column -> (indices, unindexed input stream)
-    column_inputs: HashMap<String, (Vec<Index>, Arc<dyn ExecutionPlan>)>,
+    // (column, indices, unindexed input stream)
+    column_inputs: Vec<(String, Vec<Index>, Arc<dyn ExecutionPlan>)>,
     query: FullTextSearchQuery,
     properties: PlanProperties,
 }
@@ -213,7 +250,7 @@ impl DisplayAs for FlatFtsExec {
 impl FlatFtsExec {
     pub fn new(
         dataset: Arc<Dataset>,
-        column_inputs: HashMap<String, (Vec<Index>, Arc<dyn ExecutionPlan>)>,
+        column_inputs: Vec<(String, Vec<Index>, Arc<dyn ExecutionPlan>)>,
         query: FullTextSearchQuery,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -246,16 +283,33 @@ impl ExecutionPlan for FlatFtsExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.column_inputs
-            .values()
-            .map(|(_, input)| input)
+            .iter()
+            .map(|(_, _, input)| input)
             .collect()
     }
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if self.column_inputs.len() != children.len() {
+            return Err(DataFusionError::Internal(
+                "Unexpected number of children".to_string(),
+            ));
+        }
+
+        let column_inputs = self
+            .column_inputs
+            .iter()
+            .zip(children)
+            .map(|((column, indices, _), input)| (column.clone(), indices.clone(), input))
+            .collect();
+        Ok(Arc::new(Self {
+            dataset: self.dataset.clone(),
+            column_inputs,
+            query: self.query.clone(),
+            properties: self.properties.clone(),
+        }))
     }
 
     #[instrument(name = "flat_fts_exec", level = "debug", skip_all)]
@@ -269,7 +323,7 @@ impl ExecutionPlan for FlatFtsExec {
         let column_inputs = self.column_inputs.clone();
 
         let stream = stream::iter(column_inputs)
-            .map(move |(column, (indices, input))| {
+            .map(move |(column, indices, input)| {
                 let index_meta = indices[0].clone();
                 let uuid = index_meta.uuid.to_string();
                 let query = query.clone();

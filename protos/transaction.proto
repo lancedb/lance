@@ -173,6 +173,16 @@ message Transaction {
     }
   }
 
+  message DataReplacementGroup {
+    uint64 fragment_id = 1;
+    DataFile new_file = 2;
+  }
+
+  // An operation that replaces the data in a region of the table with new data.
+  message DataReplacement {
+    repeated DataReplacementGroup replacements = 1;
+  }
+
   // The operation of this transaction.
   oneof operation {
     Append append = 100;
@@ -186,6 +196,7 @@ message Transaction {
     Update update = 108;
     Project project = 109;
     UpdateConfig update_config = 110;
+    DataReplacement data_replacement = 111;
   }
 
   // An operation to apply to the blob dataset

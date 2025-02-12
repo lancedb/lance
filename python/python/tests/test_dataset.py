@@ -778,6 +778,16 @@ def test_count_rows(tmp_path: Path):
     assert dataset.count_rows(filter="a < 50") == 50
 
 
+def test_select_none(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+
+    assert "projection=[a]" in ds.scanner(
+        columns=[], filter="a < 50", with_row_id=True
+    ).explain_plan(True)
+
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -2200,7 +2210,7 @@ def test_scan_count_rows(tmp_path: Path):
     df = pd.DataFrame({"a": range(42), "b": range(42)})
     dataset = lance.write_dataset(df, base_dir)
 
-    assert dataset.scanner().count_rows() == 42
+    assert dataset.scanner(columns=[], with_row_id=True).count_rows() == 42
     assert dataset.count_rows(filter="a < 10") == 10
     assert dataset.count_rows(filter=pa_ds.field("a") < 20) == 20
 
@@ -2913,3 +2923,28 @@ def test_dataset_schema(tmp_path: Path):
     ds = lance.write_dataset(table, str(tmp_path))  # noqa: F841
     ds._default_scan_options = {"with_row_id": True}
     assert ds.schema == ds.to_table().schema
+
+
+def test_data_replacement(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(100, 200)})
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    data_file = fragment.files[0]
+    data_replacement = lance.LanceOperation.DataReplacement(
+        [lance.LanceOperation.DataReplacementGroup(0, data_file)]
+    )
+    dataset = lance.LanceDataset.commit(dataset, data_replacement, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100, 200)),
+            "b": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected

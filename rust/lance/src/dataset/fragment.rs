@@ -903,6 +903,9 @@ impl FileFragment {
         match filter {
             Some(expr) => self
                 .scan()
+                .project(&Vec::<String>::default())
+                .unwrap()
+                .with_row_id()
                 .filter(&expr)?
                 .count_rows()
                 .await

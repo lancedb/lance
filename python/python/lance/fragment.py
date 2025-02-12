@@ -24,8 +24,6 @@ from typing import (
 
 import pyarrow as pa
 
-from .dependencies import _check_for_pandas
-from .dependencies import pandas as pd
 from .lance import (
     DeletionFile as DeletionFile,
 )
@@ -257,7 +255,7 @@ class LanceFragment(pa.dataset.Fragment):
     @staticmethod
     def create(
         dataset_uri: Union[str, Path],
-        data: Union[pa.Table, pa.RecordBatchReader],
+        data: ReaderLike,
         fragment_id: Optional[int] = None,
         schema: Optional[pa.Schema] = None,
         max_rows_per_group: int = 1024,
@@ -331,16 +329,7 @@ class LanceFragment(pa.dataset.Fragment):
             else:
                 data_storage_version = "stable"
 
-        if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
-            reader = pa.Table.from_pandas(data, schema=schema).to_reader()
-        elif isinstance(data, pa.Table):
-            reader = data.to_reader()
-        elif isinstance(data, pa.dataset.Scanner):
-            reader = data.to_reader()
-        elif isinstance(data, pa.RecordBatchReader):
-            reader = data
-        else:
-            raise TypeError(f"Unknown data_obj type {type(data)}")
+        reader = _coerce_reader(data, schema)
 
         if isinstance(dataset_uri, Path):
             dataset_uri = str(dataset_uri)
@@ -365,8 +354,10 @@ class LanceFragment(pa.dataset.Fragment):
     def count_rows(
         self, filter: Optional[Union[pa.compute.Expression, str]] = None
     ) -> int:
-        if filter is not None:
-            return self.scanner(filter=filter).count_rows()
+        if isinstance(filter, pa.compute.Expression):
+            return self.scanner(
+                with_row_id=True, columns=[], filter=filter
+            ).count_rows()
         return self._fragment.count_rows(filter)
 
     @property
@@ -551,10 +542,12 @@ class LanceFragment(pa.dataset.Fragment):
 
     def merge_columns(
         self,
-        value_func: Dict[str, str]
-        | BatchUDF
-        | ReaderLike
-        | Callable[[pa.RecordBatch], pa.RecordBatch],
+        value_func: (
+            Dict[str, str]
+            | BatchUDF
+            | ReaderLike
+            | Callable[[pa.RecordBatch], pa.RecordBatch]
+        ),
         columns: Optional[list[str]] = None,
         batch_size: Optional[int] = None,
         reader_schema: Optional[pa.Schema] = None,
@@ -797,16 +790,7 @@ def write_fragments(
     """
     from .dataset import LanceDataset
 
-    if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
-        reader = pa.Table.from_pandas(data, schema=schema).to_reader()
-    elif isinstance(data, pa.Table):
-        reader = data.to_reader()
-    elif isinstance(data, pa.dataset.Scanner):
-        reader = data.to_reader()
-    elif isinstance(data, pa.RecordBatchReader):
-        reader = data
-    else:
-        raise TypeError(f"Unknown data_obj type {type(data)}")
+    reader = _coerce_reader(data, schema)
 
     if isinstance(dataset_uri, Path):
         dataset_uri = str(dataset_uri)
