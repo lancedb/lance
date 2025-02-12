@@ -19,6 +19,7 @@ from .dataset import (
     __version__,
     batch_udf,
     write_dataset,
+    Index,
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import bytes_read_counter, iops_counter
@@ -47,6 +48,7 @@ __all__ = [
     "LanceScanner",
     "MergeInsertBuilder",
     "Transaction",
+    "Index",
     "__version__",
     "bytes_read_counter",
     "iops_counter",

@@ -11,7 +11,6 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-
 @pytest.fixture()
 def test_table():
     num_rows = 1000
@@ -57,11 +56,14 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     # Commit the index to dataset_without_index
     field_idx = dataset_without_index.schema.get_field_index("meta")
     create_index_op = lance.LanceOperation.CreateIndex(
-        index_id,
-        "meta_idx",
-        [field_idx],
-        dataset_without_index.version,
-        set([f.fragment_id for f in dataset_without_index.get_fragments()]),
+        new_indices=[lance.Index(
+            uuid=index_id,
+            name="meta_idx",
+            fields=[field_idx],
+            version=dataset_without_index.version,
+            fragment_ids=set([f.fragment_id for f in dataset_without_index.get_fragments()]),
+        )],
+        removed_indices=[],
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,

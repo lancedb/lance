@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
@@ -35,6 +36,7 @@ use crate::{
 struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
+    fragment_ids: Option<Vec<u32>>
 }
 
 #[async_trait]
@@ -61,7 +63,20 @@ impl TrainingRequest {
         sort: bool,
     ) -> Result<SendableRecordBatchStream> {
         let mut scan = self.dataset.scan();
-
+        if let Some(fragment_ids) = self.fragment_ids {
+            let fragment_ids = fragment_ids.into_iter().dedup().collect_vec();
+            let frags = self.dataset.get_frags_from_ordered_ids(&fragment_ids);
+            let frags: Result<Vec<_>> = fragment_ids.iter().zip(frags).map(|(id, frag)| {
+                let Some(frag) = frag else {
+                    return Err(Error::InvalidInput {
+                        source: format!("No fragment with id {}", id).into(),
+                        location: location!(),
+                    });
+                };
+                Ok(frag.metadata().clone())
+            }).collect();
+            scan.with_fragments(frags?);
+        }
         let ordering = match sort {
             true => Some(vec![ColumnOrdering::asc_nulls_first(self.column.clone())]),
             false => None,
@@ -166,11 +181,13 @@ pub(super) async fn build_scalar_index(
     dataset: &Dataset,
     column: &str,
     uuid: &str,
+    fragment_ids: Option<&Vec<u32>>,
     params: &ScalarIndexParams,
 ) -> Result<prost_types::Any> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
+        fragment_ids: fragment_ids.cloned(),
     });
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
@@ -244,11 +261,13 @@ pub(super) async fn build_inverted_index(
     dataset: &Dataset,
     column: &str,
     uuid: &str,
+    fragment_ids: Option<Vec<u32>>,
     params: &InvertedIndexParams,
 ) -> Result<()> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
+        fragment_ids,
     });
     let index_store = LanceIndexStore::from_dataset(dataset, uuid);
     train_inverted_index(training_request, &index_store, params.clone()).await

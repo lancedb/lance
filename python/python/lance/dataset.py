@@ -2250,7 +2250,7 @@ class LanceDataset(pa.dataset.Dataset):
             "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
             DeprecationWarning,
         )
-        return LanceDataset.commit(base_uri, operation, read_version, commit_lock)
+        return LanceDataset.commit(base_uri, operation, read_version=read_version, commit_lock=commit_lock)
 
     @staticmethod
     def commit(
@@ -2584,9 +2584,8 @@ class ExecuteResult(TypedDict):
 
 class Index(TypedDict):
     name: str
-    type: str
     uuid: str
-    fields: List[str]
+    fields: List[int]
     version: int
     fragment_ids: Set[int]
 
@@ -2927,12 +2926,8 @@ class LanceOperation:
         """
         Operation that creates an index on the dataset.
         """
-
-        uuid: str
-        name: str
-        fields: List[int]
-        dataset_version: int
-        fragment_ids: Set[int]
+        new_indices: List[Index]
+        removed_indices: List[Index]
 
     @dataclass
     class DataReplacementGroup:
