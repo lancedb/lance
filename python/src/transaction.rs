@@ -92,6 +92,12 @@ impl ToPyObject for PyLance<&Index> {
     }
 }
 
+impl ToPyObject for PyLance<Index> {
+    fn to_object(&self, py: Python<'_>) -> PyObject {
+        PyLance(&self.0).to_object(py)
+    }
+}
+
 impl FromPyObject<'_> for PyLance<Operation> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
         match class_name(ob)? {

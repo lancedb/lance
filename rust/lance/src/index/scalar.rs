@@ -181,13 +181,13 @@ pub(super) async fn build_scalar_index(
     dataset: &Dataset,
     column: &str,
     uuid: &str,
-    fragment_ids: Option<&Vec<u32>>,
+    fragment_ids: Option<Vec<u32>>,
     params: &ScalarIndexParams,
 ) -> Result<prost_types::Any> {
     let training_request = Box::new(TrainingRequest {
         dataset: Arc::new(dataset.clone()),
         column: column.to_string(),
-        fragment_ids: fragment_ids.cloned(),
+        fragment_ids,
     });
     let field = dataset.schema().field(column).ok_or(Error::InvalidInput {
         source: format!("No column with name {}", column).into(),
