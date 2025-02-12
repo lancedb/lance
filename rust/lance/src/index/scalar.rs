@@ -23,7 +23,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use lance_table::format::Index;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::session::Session;

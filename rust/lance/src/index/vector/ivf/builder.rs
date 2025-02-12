@@ -24,7 +24,7 @@ use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use lance_core::{traits::DatasetTakeRows, Error, Result, ROW_ID};

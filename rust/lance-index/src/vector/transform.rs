@@ -14,7 +14,7 @@ use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32A
 use arrow_schema::{DataType, Field, Schema};
 use lance_arrow::RecordBatchExt;
 use num_traits::Float;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_linalg::kernels::normalize_fsl;

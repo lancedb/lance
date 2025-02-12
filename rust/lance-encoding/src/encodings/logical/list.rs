@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::list::ListArrayExt;
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::task::JoinHandle;
 
 use lance_core::{cache::FileMetadataCache, Error, Result};

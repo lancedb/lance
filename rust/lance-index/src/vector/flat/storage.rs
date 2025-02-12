@@ -20,7 +20,7 @@ use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
 use lance_linalg::distance::hamming::hamming;
 use lance_linalg::distance::DistanceType;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::index::FlatMetadata;
 

@@ -5,7 +5,7 @@
 
 use deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 use super::pb;

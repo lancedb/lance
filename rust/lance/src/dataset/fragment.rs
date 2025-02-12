@@ -42,7 +42,7 @@ use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use self::write::FragmentCreateBuilder;
 

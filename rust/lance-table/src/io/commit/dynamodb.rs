@@ -17,8 +17,8 @@ use aws_sdk_dynamodb::operation::{
 };
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
+use snafu::location;
 use snafu::OptionExt;
-use snafu::{location, Location};
 use tokio::sync::RwLock;
 
 use crate::io::commit::external_manifest::ExternalManifestStore;
@@ -259,6 +259,7 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                 "dynamodb not found: base_uri: {}; version: {}",
                 base_uri, version
             ),
+            location: location!(),
         })?;
 
         let path = item

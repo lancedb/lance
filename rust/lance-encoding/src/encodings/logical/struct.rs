@@ -17,7 +17,7 @@ use futures::{
 use itertools::Itertools;
 use lance_arrow::FieldExt;
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     decoder::{

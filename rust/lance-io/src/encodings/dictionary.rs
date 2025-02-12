@@ -15,7 +15,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, DictionaryArray, PrimitiveArray, UInt32Array};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     traits::{Reader, Writer},

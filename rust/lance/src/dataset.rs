@@ -37,7 +37,7 @@ use object_store::path::Path;
 use prost::Message;
 use rowids::get_row_id_index;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;

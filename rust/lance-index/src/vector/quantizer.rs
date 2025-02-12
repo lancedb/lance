@@ -15,7 +15,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
 use lance_table::format::SelfDescribingFileReader;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
 

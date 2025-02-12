@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use lance_core::{Error, Result};
 
 use crate::traits::Writer;
-use snafu::{location, Location};
+use snafu::location;
 
 /// Start at 5MB.
 const INITIAL_UPLOAD_STEP: usize = 1024 * 1024 * 5;

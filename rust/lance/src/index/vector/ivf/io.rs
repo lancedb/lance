@@ -38,7 +38,7 @@ use lance_linalg::kernels::normalize_fsl;
 use lance_table::format::SelfDescribingFileReader;
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
 

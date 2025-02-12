@@ -11,7 +11,7 @@ use arrow_buffer::{
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
 
