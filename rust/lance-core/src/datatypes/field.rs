@@ -20,8 +20,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use deepsize::DeepSizeOf;
+use http::StatusCode;
 use lance_arrow::{bfloat16::ARROW_EXT_NAME_KEY, *};
-use snafu::{location, Location};
 
 use super::{
     schema::{compare_fields, explain_fields_difference},
@@ -100,10 +100,10 @@ impl FromStr for StorageClass {
         match s {
             "default" | "" => Ok(Self::Default),
             "blob" => Ok(Self::Blob),
-            _ => Err(Error::Schema {
-                message: format!("Unknown storage class: {}", s),
-                location: location!(),
-            }),
+            _ => Err(Error::bad_request(
+                "Unknown storage class",
+                format!("Received: {}. Expected 'default' or 'blob'.", s),
+            )),
         }
     }
 }
@@ -562,16 +562,16 @@ impl Field {
     }
 
     /// Project by a field.
-    ///
     pub fn project_by_field(&self, other: &Self, on_type_mismatch: OnTypeMismatch) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Schema {
-                message: format!(
+            return Err(Error::internal(
+                "Bad projection",
+                format!(
                     "Attempt to project field by different names: {} and {}",
                     self.name, other.name,
                 ),
-                location: location!(),
-            });
+            )
+            .with_backtrace());
         };
 
         match (self.data_type(), other.data_type()) {
@@ -581,13 +581,14 @@ impl Field {
                     || (dt.is_binary_like() && other_dt.is_binary_like()) =>
             {
                 if dt != other_dt {
-                    return Err(Error::Schema {
-                        message: format!(
+                    return Err(Error::internal(
+                        "Bad projection",
+                        format!(
                             "Attempt to project field by different types: {} and {}",
                             dt, other_dt,
                         ),
-                        location: location!(),
-                    });
+                    )
+                    .with_backtrace());
                 }
                 Ok(self.clone())
             }
@@ -595,13 +596,14 @@ impl Field {
                 let mut fields = vec![];
                 for other_field in other.children.iter() {
                     let Some(child) = self.child(&other_field.name) else {
-                        return Err(Error::Schema {
-                            message: format!(
+                        return Err(Error::internal(
+                            "Bad projection",
+                            format!(
                                 "Attempt to project non-existed field: {} on {}",
                                 other_field.name, self,
                             ),
-                            location: location!(),
-                        });
+                        )
+                        .with_backtrace());
                     };
                     fields.push(child.project_by_field(other_field, on_type_mismatch)?);
                 }
@@ -633,13 +635,14 @@ impl Field {
                 Ok(self.clone())
             }
             _ => match on_type_mismatch {
-                OnTypeMismatch::Error => Err(Error::Schema {
-                    message: format!(
-                        "Attempt to project incompatible fields: {} and {}",
-                        self, other
+                OnTypeMismatch::Error => Err(Error::internal(
+                    "Bad projection",
+                    format!(
+                        "Attempt to project field by different types: {} and {}",
+                        self, other,
                     ),
-                    location: location!(),
-                }),
+                )
+                .with_backtrace()),
                 OnTypeMismatch::TakeSelf => Ok(self.clone()),
             },
         }
@@ -664,13 +667,14 @@ impl Field {
 
     pub(crate) fn do_intersection(&self, other: &Self, ignore_types: bool) -> Result<Self> {
         if self.name != other.name {
-            return Err(Error::Arrow {
-                message: format!(
+            return Err(Error::internal(
+                "Bad intersection",
+                format!(
                     "Attempt to intersect different fields: {} and {}",
                     self.name, other.name,
                 ),
-                location: location!(),
-            });
+            )
+            .with_backtrace());
         }
         let self_type = self.data_type();
         let other_type = other.data_type();
@@ -703,13 +707,14 @@ impl Field {
         }
 
         if (!ignore_types && self_type != other_type) || self.name != other.name {
-            return Err(Error::Arrow {
-                message: format!(
-                    "Attempt to intersect different fields: ({}, {}) and ({}, {})",
-                    self.name, self_type, other.name, other_type
+            return Err(Error::internal(
+                "Bad intersection",
+                format!(
+                    "Attempt to intersect different fields: {} and {}",
+                    self, other,
                 ),
-                location: location!(),
-            });
+            )
+            .with_backtrace());
         }
 
         Ok(if self.id >= 0 {
@@ -794,13 +799,14 @@ impl Field {
             }
             _ => {
                 if self.data_type() != other.data_type() {
-                    return Err(Error::Schema {
-                        message: format!(
+                    return Err(Error::internal(
+                        "Bad merge",
+                        format!(
                             "Attempt to merge incompatible fields: {} and {}",
-                            self, other
+                            self, other,
                         ),
-                        location: location!(),
-                    });
+                    )
+                    .with_backtrace());
                 }
             }
         }

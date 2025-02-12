@@ -13,7 +13,6 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use deepsize::DeepSizeOf;
 use lance_arrow::*;
-use snafu::{location, Location};
 
 use super::field::{Field, OnTypeMismatch, SchemaCompareOptions, StorageClass};
 use crate::{Error, Result, ROW_ADDR, ROW_ID};
@@ -136,11 +135,11 @@ impl Schema {
     pub fn check_compatible(&self, expected: &Self, options: &SchemaCompareOptions) -> Result<()> {
         if !self.compare_with_options(expected, options) {
             let difference = self.explain_difference(expected, options);
-            Err(Error::SchemaMismatch {
-                // unknown reason is messy but this shouldn't happen.
-                difference: difference.unwrap_or("unknown reason".to_string()),
-                location: location!(),
-            })
+            Err(Error::bad_request(
+                "Schema mismatch",
+                difference.unwrap_or("unknown reason".to_string()),
+            )
+            .with_backtrace())
         } else {
             Ok(())
         }

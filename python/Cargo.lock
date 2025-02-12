@@ -3058,7 +3058,7 @@ dependencies = [
  "lazy_static",
  "log",
  "moka",
- "object_store 0.10.2",
+ "object_store 0.11.1",
  "permutation",
  "pin-project",
  "prost 0.12.6",
@@ -3110,6 +3110,7 @@ dependencies = [
  "datafusion-sql",
  "deepsize",
  "futures",
+ "http 1.2.0",
  "lance-arrow",
  "lazy_static",
  "libc",
@@ -3117,13 +3118,12 @@ dependencies = [
  "mock_instant",
  "moka",
  "num_cpus",
- "object_store 0.10.2",
+ "object_store 0.11.1",
  "pin-project",
  "prost 0.13.4",
  "rand",
  "roaring",
  "serde_json",
- "snafu 0.7.5",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -3233,7 +3233,7 @@ dependencies = [
  "lance-io",
  "log",
  "num-traits",
- "object_store 0.10.2",
+ "object_store 0.11.1",
  "prost 0.13.4",
  "prost-build 0.13.4",
  "prost-types 0.13.4",
@@ -3283,7 +3283,7 @@ dependencies = [
  "log",
  "moka",
  "num-traits",
- "object_store 0.10.2",
+ "object_store 0.11.1",
  "prost 0.13.4",
  "prost-build 0.13.4",
  "rand",
@@ -3325,7 +3325,7 @@ dependencies = [
  "lance-core",
  "lazy_static",
  "log",
- "object_store 0.10.2",
+ "object_store 0.11.1",
  "path_abs",
  "pin-project",
  "prost 0.13.4",
@@ -3383,7 +3383,7 @@ dependencies = [
  "lance-io",
  "lazy_static",
  "log",
- "object_store 0.10.2",
+ "object_store 0.11.1",
  "prost 0.13.4",
  "prost-build 0.13.4",
  "prost-types 0.13.4",
@@ -3911,6 +3911,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6da452820c715ce78221e8202ccc599b4a52f3e1eb3eedb487b680c81a8e3f3"
 dependencies = [
  "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "humantime",
+ "itertools 0.13.0",
+ "parking_lot",
+ "percent-encoding",
+ "snafu 0.7.5",
+ "tokio",
+ "tracing",
+ "url",
+ "walkdir",
+]
+
+[[package]]
+name = "object_store"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6eb4c22c6154a1e759d7099f9ffad7cc5ef8245f9efbab4a41b92623079c82f3"
+dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -3928,27 +3949,6 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
- "snafu 0.7.5",
- "tokio",
- "tracing",
- "url",
- "walkdir",
-]
-
-[[package]]
-name = "object_store"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6eb4c22c6154a1e759d7099f9ffad7cc5ef8245f9efbab4a41b92623079c82f3"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "humantime",
- "itertools 0.13.0",
- "parking_lot",
- "percent-encoding",
  "snafu 0.8.5",
  "tokio",
  "tracing",
