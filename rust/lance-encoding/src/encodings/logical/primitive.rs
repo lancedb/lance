@@ -1445,7 +1445,7 @@ impl ChunkInstructions {
                 Err(idx) => idx - 1,
             };
 
-            let mut to_skip = user_range.start - &rep_index.blocks[block_index].first_row;
+            let mut to_skip = user_range.start - rep_index.blocks[block_index].first_row;
 
             while rows_needed > 0 || need_preamble {
                 let chunk = &rep_index.blocks[block_index];
@@ -2876,7 +2876,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
                 .iter_mut()
                 .zip(cached_data.pages.iter())
                 .for_each(|(page_scheduler, cached_data)| {
-                    page_scheduler.scheduler.load(&cached_data);
+                    page_scheduler.scheduler.load(cached_data);
                 });
             return std::future::ready(Ok(())).boxed();
         };
@@ -2891,7 +2891,7 @@ impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
         async move {
             let page_data = page_data.try_collect::<Vec<_>>().await?;
             let cached_data = Arc::new(CachedFieldData { pages: page_data });
-            cache.insert_by_str::<CachedFieldData>(&cache_key, cached_data.clone());
+            cache.insert_by_str::<CachedFieldData>(&cache_key, cached_data);
             Ok(())
         }
         .boxed()
