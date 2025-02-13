@@ -4435,7 +4435,7 @@ impl PrimitiveStructuralEncoder {
                     }
                 }
 
-                const DICTIONARY_ENCODING_THRESHOLD: u64 = 100;
+                let dictionary_encoding_threshold: u64 = 100.max(data_block.num_values() / 4);
                 let cardinality =
                     if let Some(cardinality_array) = data_block.get_stat(Stat::Cardinality) {
                         cardinality_array.as_primitive::<UInt64Type>().value(0)
@@ -4444,7 +4444,7 @@ impl PrimitiveStructuralEncoder {
                     };
 
                 // The triggering threshold for dictionary encoding can be further tuned.
-                if cardinality <= DICTIONARY_ENCODING_THRESHOLD
+                if cardinality <= dictionary_encoding_threshold
                     && data_block.num_values() >= 10 * cardinality
                 {
                     let (indices_data_block, dictionary_data_block) =
