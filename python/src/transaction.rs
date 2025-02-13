@@ -9,7 +9,7 @@ use lance::dataset::transaction::{
 use lance::datatypes::Schema;
 use lance_table::format::{DataFile, Fragment, Index};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyDict, PyNone, PySet};
+use pyo3::types::{PyDict, PyNone};
 use pyo3::{intern, prelude::*};
 use pyo3::{Bound, FromPyObject, PyAny, PyObject, PyResult, Python, ToPyObject};
 use uuid::Uuid;
@@ -45,16 +45,13 @@ impl ToPyObject for PyLance<&DataReplacementGroup> {
 
 impl FromPyObject<'_> for PyLance<Index> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let uuid = ob.getattr("uuid")?.extract()?;
-        let name = ob.getattr("name")?.extract()?;
-        let fields = ob.getattr("fields")?.extract()?;
-        let dataset_version = ob.getattr("dataset_version")?.extract()?;
+        let uuid = ob.get_item("uuid")?.extract()?;
+        let name = ob.get_item("name")?.extract()?;
+        let fields = ob.get_item("fields")?.extract()?;
+        let dataset_version = ob.get_item("dataset_version")?.extract()?;
 
-        let fragment_ids = ob.getattr("fragment_ids")?;
-        let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
-        let fragment_ids = fragment_ids_ref
-            .into_iter()
-            .map(|id| id.extract())
+        let fragment_ids = ob.get_item("fragment_ids")?;
+        let fragment_ids = fragment_ids.iter()?.map(|id| id?.extract::<u32>())
             .collect::<PyResult<Vec<u32>>>()?;
         let fragment_bitmap = Some(fragment_ids.into_iter().collect());
         Ok(Self(Index {

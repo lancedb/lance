@@ -236,6 +236,11 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
+        let fragment_bitmap = match &fragment_ids {
+            Some(fragment_ids) => Some(fragment_ids.iter().collect()),
+            None => Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+        };
+
         let index_id = Uuid::new_v4();
         let index_details: prost_types::Any = match (index_type, params.index_name()) {
             (
@@ -325,13 +330,12 @@ impl DatasetIndexExt for Dataset {
                 });
             }
         };
-
         Ok(IndexMetadata {
             uuid: index_id,
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.manifest.version,
-            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            fragment_bitmap,
             index_details: Some(index_details),
         })
     }
