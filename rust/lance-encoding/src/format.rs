@@ -20,9 +20,9 @@ use pb::{
     full_zip_layout,
     nullable::{AllNull, NoNull, Nullability, SomeNull},
     page_layout::Layout,
-    AllNullLayout, ArrayEncoding, Binary, Bitpack2, Bitpacked, BitpackedForNonNeg, Dictionary,
-    FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable, PackedStruct,
-    PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer, Variable,
+    AllNullLayout, ArrayEncoding, Binary, Bitpack2, Bitpacked, BitpackedForNonNeg, Block,
+    Dictionary, FixedSizeBinary, FixedSizeList, Flat, Fsst, MiniBlockLayout, Nullable,
+    PackedStruct, PackedStructFixedWidthMiniBlock, PageLayout, RepDefLayer, Variable,
 };
 
 use crate::{
@@ -73,6 +73,14 @@ impl ProtobufUtils {
                     values: Some(Box::new(values)),
                 }))),
             }))),
+        }
+    }
+
+    pub fn block(scheme: &str) -> ArrayEncoding {
+        ArrayEncoding {
+            array_encoding: Some(ArrayEncodingEnum::Block(Block {
+                scheme: scheme.to_string(),
+            })),
         }
     }
 

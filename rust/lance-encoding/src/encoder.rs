@@ -29,7 +29,9 @@ use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncode
 use crate::encodings::physical::bitpack_fastlanes::{
     compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
 };
-use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
+use crate::encodings::physical::block_compress::{
+    CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
 use crate::encodings::physical::fsst::{
     FsstArrayEncoder, FsstMiniBlockEncoder, FsstPerValueEncoder,
@@ -681,8 +683,12 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     }
     const PRECISION: u8 = 12;
 
+    let threshold = threshold.max(num_total_rows as u64 / 4);
+
     let mut hll: HyperLogLogPlus<String, RandomState> =
         HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+
+    println!("num_total_rows={} threshold={}", num_total_rows, threshold);
 
     for arr in arrays {
         let string_array = arrow_array::cast::as_string_array(arr);
@@ -690,6 +696,7 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
             hll.insert(value);
             let estimated_cardinality = hll.count() as u64;
             if estimated_cardinality >= threshold {
+                println!("estimated_cardinality={}", estimated_cardinality);
                 return false;
             }
         }
@@ -888,6 +895,16 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 Ok(encoder)
             }
             DataBlock::VariableWidth(variable_width) => {
+                let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
+                let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
+
+                // If values are very large then use zstd-per-value
+                //
+                // TODO: Could maybe use median here
+                if max_len > 4096 && data_size >= FSST_LEAST_INPUT_SIZE as u64 {
+                    return Ok(Box::new(CompressedBufferEncoder::default()));
+                }
+
                 if variable_width.bits_per_offset == 32 {
                     let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
                     let max_len = variable_width.expect_single_stat::<UInt64Type>(Stat::MaxLength);
