@@ -11,6 +11,7 @@ use arrow_array::{
     ArrayRef, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{
@@ -184,18 +185,20 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         let inner_stats = self.input.statistics()?;
-        let dist_col_stats = inner_stats.column_statistics[0].clone();
+        let schema = self.input.schema();
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
-            .chain([dist_col_stats])
+            .zip(schema.fields())
+            .filter(|(_, field)| field.name() != DIST_COL)
+            .map(|(stats, _)| stats)
+            .chain(std::iter::once(ColumnStatistics::new_unknown()))
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
-        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
