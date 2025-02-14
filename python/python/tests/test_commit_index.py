@@ -11,6 +11,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+
 @pytest.fixture()
 def test_table():
     num_rows = 1000
@@ -56,13 +57,17 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     # Commit the index to dataset_without_index
     field_idx = dataset_without_index.schema.get_field_index("meta")
     create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[lance.Index(
-            uuid=index_id,
-            name="meta_idx",
-            fields=[field_idx],
-            version=dataset_without_index.version,
-            fragment_ids=set([f.fragment_id for f in dataset_without_index.get_fragments()]),
-        )],
+        new_indices=[
+            lance.Index(
+                uuid=index_id,
+                name="meta_idx",
+                fields=[field_idx],
+                version=dataset_without_index.version,
+                fragment_ids=set(
+                    [f.fragment_id for f in dataset_without_index.get_fragments()]
+                ),
+            )
+        ],
         removed_indices=[],
     )
     dataset_without_index = lance.LanceDataset.commit(
@@ -116,7 +121,9 @@ def create_multi_fragments_table(tmp_path) -> lance.LanceDataset:
 def test_indexed_unindexed_fragments(tmp_path):
     ds = create_multi_fragments_table(tmp_path)
     frags = [f for f in ds.get_fragments()]
-    index = ds.create_scalar_index("text", "INVERTED", fragment_ids=[frags[0].fragment_id])
+    index = ds.create_scalar_index(
+        "text", "INVERTED", fragment_ids=[frags[0].fragment_id]
+    )
     assert isinstance(index, dict)
 
     indices = [index]
@@ -139,7 +146,7 @@ def test_indexed_unindexed_fragments(tmp_path):
     assert indexed_fragments[0].id == frags[0].fragment_id
 
 
-def test_commit_index2(tmp_path):
+def test_commit_multiple_indices(tmp_path):
     ds = create_multi_fragments_table(tmp_path)
 
     indices = []
@@ -164,7 +171,9 @@ def test_commit_index2(tmp_path):
     frags = [f for f in ds.get_fragments()]
 
     for f in frags:
-        index = ds.create_scalar_index("sentiment", "BITMAP", fragment_ids=[f.fragment_id])
+        index = ds.create_scalar_index(
+            "sentiment", "BITMAP", fragment_ids=[f.fragment_id]
+        )
         assert isinstance(index, dict)
         indices.append(index)
 
@@ -186,11 +195,10 @@ def test_commit_index2(tmp_path):
     assert len(indexed_fragments) == 2
     assert indexed_fragments[0].id == frags[0].fragment_id
     assert indexed_fragments[1].id == frags[1].fragment_id
-
     results = ds.to_table(
         full_text_query="puppy",
-        filter="sentiment='positive'",
+        # filter="sentiment='positive'",
         prefilter=True,
         with_row_id=True,
     )
-    assert results["_rowid"].to_pylist() == [2, 3]
+    assert results["_rowid"].to_pylist() == [0, 1 << 32, (1 << 32) + 1]

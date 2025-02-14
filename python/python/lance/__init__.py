@@ -11,6 +11,7 @@ from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
     FieldStatistics,
+    Index,
     LanceDataset,
     LanceOperation,
     LanceScanner,
@@ -19,7 +20,6 @@ from .dataset import (
     __version__,
     batch_udf,
     write_dataset,
-    Index,
 )
 from .fragment import FragmentMetadata, LanceFragment
 from .lance import bytes_read_counter, iops_counter

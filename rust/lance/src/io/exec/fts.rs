@@ -153,58 +153,62 @@ impl ExecutionPlan for FtsExec {
 
         let indices = self.indices.clone();
         let stream = stream::iter(indices)
-            .map(move |(column, indices)| {
-                let index_meta = indices[0].clone();
-                let uuid = index_meta.uuid.to_string();
-                let query = query.clone();
-                let ds = ds.clone();
-                let context = context.clone();
-                let prefilter_source = prefilter_source.clone();
+            .flat_map(move |(column, indices)| {
+                let mut all_batches = Vec::with_capacity(indices.len());
 
-                async move {
-                    let prefilter_loader = match &prefilter_source {
-                        PreFilterSource::FilteredRowIds(src_node) => {
-                            let stream = src_node.execute(partition, context.clone())?;
-                            Some(Box::new(FilteredRowIdsToPrefilter(stream))
-                                as Box<dyn FilterLoader>)
-                        }
-                        PreFilterSource::ScalarIndexQuery(src_node) => {
-                            let stream = src_node.execute(partition, context.clone())?;
-                            Some(Box::new(SelectionVectorToPrefilter(stream))
-                                as Box<dyn FilterLoader>)
-                        }
-                        PreFilterSource::None => None,
-                    };
-                    let pre_filter = Arc::new(DatasetPreFilter::new(
-                        ds.clone(),
-                        &[index_meta],
-                        prefilter_loader,
-                    ));
+                for index_meta in indices {
+                    let query = query.clone();
+                    let ds = ds.clone();
+                    let context = context.clone();
+                    let prefilter_source = prefilter_source.clone();
+                    let column = column.clone();
+                    all_batches.push(async move {
+                        let uuid = index_meta.uuid.to_string();
+                        let prefilter_loader = match &prefilter_source {
+                            PreFilterSource::FilteredRowIds(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(FilteredRowIdsToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::ScalarIndexQuery(src_node) => {
+                                let stream = src_node.execute(partition, context.clone())?;
+                                Some(Box::new(SelectionVectorToPrefilter(stream))
+                                    as Box<dyn FilterLoader>)
+                            }
+                            PreFilterSource::None => None,
+                        };
+                        let pre_filter = Arc::new(DatasetPreFilter::new(
+                            ds.clone(),
+                            &[index_meta],
+                            prefilter_loader,
+                        ));
 
-                    let index = ds.open_generic_index(&column, &uuid).await?;
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "Index {} is not an inverted index",
-                                    uuid,
-                                ))
-                            })?;
-                    pre_filter.wait_for_ready().await?;
-                    let results = index.full_text_search(&query, pre_filter).await?;
+                        let index = ds.open_generic_index(&column, &uuid).await?;
+                        let index =
+                            index
+                                .as_any()
+                                .downcast_ref::<InvertedIndex>()
+                                .ok_or_else(|| {
+                                    DataFusionError::Execution(format!(
+                                        "Index {} is not an inverted index",
+                                        uuid,
+                                    ))
+                                })?;
+                        pre_filter.wait_for_ready().await?;
+                        let results = index.full_text_search(&query, pre_filter).await?;
 
-                    let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
-                    let batch = RecordBatch::try_new(
-                        FTS_SCHEMA.clone(),
-                        vec![
-                            Arc::new(UInt64Array::from(row_ids)),
-                            Arc::new(Float32Array::from(scores)),
-                        ],
-                    )?;
-                    Ok::<_, DataFusionError>(batch)
+                        let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
+                        let batch = RecordBatch::try_new(
+                            FTS_SCHEMA.clone(),
+                            vec![
+                                Arc::new(UInt64Array::from(row_ids)),
+                                Arc::new(Float32Array::from(scores)),
+                            ],
+                        )?;
+                        Ok::<_, DataFusionError>(batch)
+                    });
                 }
+                stream::iter(all_batches)
             })
             .buffered(self.indices.len());
         let schema = self.schema();

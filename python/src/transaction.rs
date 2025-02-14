@@ -48,15 +48,16 @@ impl FromPyObject<'_> for PyLance<Index> {
         let uuid = ob.get_item("uuid")?.extract()?;
         let name = ob.get_item("name")?.extract()?;
         let fields = ob.get_item("fields")?.extract()?;
-        let dataset_version = ob.get_item("dataset_version")?.extract()?;
+        let dataset_version = ob.get_item("version")?.extract()?;
 
         let fragment_ids = ob.get_item("fragment_ids")?;
-        let fragment_ids = fragment_ids.iter()?.map(|id| id?.extract::<u32>())
+        let fragment_ids = fragment_ids
+            .iter()?
+            .map(|id| id?.extract::<u32>())
             .collect::<PyResult<Vec<u32>>>()?;
         let fragment_bitmap = Some(fragment_ids.into_iter().collect());
         Ok(Self(Index {
-            uuid: Uuid::parse_str(uuid)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            uuid: Uuid::parse_str(uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
             dataset_version,
@@ -83,7 +84,7 @@ impl ToPyObject for PyLance<&Index> {
         kwargs.set_item("uuid", uuid).unwrap();
         kwargs.set_item("name", name).unwrap();
         kwargs.set_item("fields", fields).unwrap();
-        kwargs.set_item("dataset_version", dataset_version).unwrap();
+        kwargs.set_item("version", dataset_version).unwrap();
         kwargs.set_item("fragment_ids", fragment_ids).unwrap();
         kwargs.into()
     }

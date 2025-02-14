@@ -34,7 +34,8 @@ pub trait DatasetIndexExt {
         replace: bool,
     ) -> Result<()>;
 
-    async fn create_fragment_index(&mut self,
+    async fn create_fragment_index(
+        &mut self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,

@@ -1162,7 +1162,7 @@ impl Dataset {
         Ok(())
     }
 
-
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, fragment_ids = None, kwargs = None))]
     fn create_fragment_index(
         &mut self,
@@ -1177,16 +1177,25 @@ impl Dataset {
         let index_type = index_type.to_uppercase();
         let idx_type = self.parse_index_type(&index_type)?;
         log::info!("Creating index: type={}", index_type);
-        let params: Box<dyn IndexParams> = self.parse_index_params(&columns, &index_type, storage_options, kwargs)?;
+        let params: Box<dyn IndexParams> =
+            self.parse_index_params(&columns, &index_type, storage_options, kwargs)?;
 
         let replace = replace.unwrap_or(true);
 
         let mut new_self = self.ds.as_ref().clone();
-        let res = RT.block_on(
-            None,
-            new_self.create_fragment_index(&columns, idx_type, name, params.as_ref(), replace, fragment_ids),
-        )?
-        .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        let res = RT
+            .block_on(
+                None,
+                new_self.create_fragment_index(
+                    &columns,
+                    idx_type,
+                    name,
+                    params.as_ref(),
+                    replace,
+                    fragment_ids,
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         self.ds = Arc::new(new_self);
         Ok(PyLance(res))
     }
@@ -1204,7 +1213,8 @@ impl Dataset {
         let index_type = index_type.to_uppercase();
         let idx_type = self.parse_index_type(&index_type)?;
         log::info!("Creating index: type={}", index_type);
-        let params: Box<dyn IndexParams> = self.parse_index_params(&columns, &index_type, storage_options, kwargs)?;
+        let params: Box<dyn IndexParams> =
+            self.parse_index_params(&columns, &index_type, storage_options, kwargs)?;
 
         let replace = replace.unwrap_or(true);
 
@@ -1229,22 +1239,23 @@ impl Dataset {
     }
 
     fn unindexed_fragments(&self, name: &str) -> PyResult<PyObject> {
-        let result = RT.block_on(None, self.ds.unindexed_fragments(name))?
+        let result = RT
+            .block_on(None, self.ds.unindexed_fragments(name))?
             .map_err(|err| PyIOError::new_err(err.to_string()));
 
-        Python::with_gil(|py| {
-            result.map(|vec| export_vec(py, &vec).to_object(py))
-        })
+        Python::with_gil(|py| result.map(|vec| export_vec(py, &vec).to_object(py)))
     }
 
     fn indexed_fragments(&self, name: &str) -> PyResult<PyObject> {
-        let result =RT.block_on(None, self.ds.indexed_fragments(name))?
+        let result = RT
+            .block_on(None, self.ds.indexed_fragments(name))?
             .map_err(|err| PyIOError::new_err(err.to_string()));
         Python::with_gil(|py| {
             result.map(|vec2| {
-                vec2.iter().map(|vec| {
-                    export_vec(py, vec).to_object(py)
-                }).collect::<Vec<_>>().to_object(py)
+                vec2.iter()
+                    .map(|vec| export_vec(py, vec).to_object(py))
+                    .collect::<Vec<_>>()
+                    .to_object(py)
             })
         })
     }
@@ -1559,7 +1570,7 @@ impl Dataset {
 
     fn parse_index_params(
         &mut self,
-        columns: &Vec<&str>,
+        columns: &[&str],
         index_type: &str,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
@@ -1626,7 +1637,7 @@ impl Dataset {
                         return Err(PyValueError::new_err("Column not found in dataset schema."))
                     }
                 };
-                prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)
+                prepare_vector_index_params(index_type, &column_type, storage_options, kwargs)
             }
         }
     }
@@ -1638,11 +1649,9 @@ impl Dataset {
             "LABEL_LIST" => Ok(IndexType::LabelList),
             "INVERTED" | "FTS" => Ok(IndexType::Inverted),
             "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => Ok(IndexType::Vector),
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Index type '{index_type}' is not supported."
-                )))
-            }
+            _ => Err(PyValueError::new_err(format!(
+                "Index type '{index_type}' is not supported."
+            ))),
         }
     }
 }

@@ -88,6 +88,7 @@ IndexType = Union[
     Literal["FTS"],
 ]
 
+
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
         """Executes the merge insert operation
@@ -1503,8 +1504,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids: List[int],
             replace: bool = True,
             **kwargs,
-        ) -> Index:
-            ...
+        ) -> Index: ...
 
         @overload
         def create_scalar_index(
@@ -1516,8 +1516,7 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids: None = None,
             replace: bool = True,
             **kwargs,
-        ) -> LanceDataset:
-            ...
+        ) -> LanceDataset: ...
 
     def create_scalar_index(
         self,
@@ -1735,6 +1734,7 @@ class LanceDataset(pa.dataset.Dataset):
         return self
 
     if TYPE_CHECKING:
+
         @overload
         def create_index(
             self,
@@ -1764,8 +1764,7 @@ class LanceDataset(pa.dataset.Dataset):
             *,
             fragment_ids: List[int],
             **kwargs,
-        ) -> Index:
-            ...
+        ) -> Index: ...
 
         @overload
         def create_index(
@@ -1796,8 +1795,7 @@ class LanceDataset(pa.dataset.Dataset):
             *,
             fragment_ids: None = None,
             **kwargs,
-        ) -> LanceDataset:
-            ...
+        ) -> LanceDataset: ...
 
     def create_index(
         self,
@@ -2382,7 +2380,9 @@ class LanceDataset(pa.dataset.Dataset):
             "LanceDataset._commit() is deprecated, use LanceDataset.commit() instead",
             DeprecationWarning,
         )
-        return LanceDataset.commit(base_uri, operation, read_version=read_version, commit_lock=commit_lock)
+        return LanceDataset.commit(
+            base_uri, operation, read_version=read_version, commit_lock=commit_lock
+        )
 
     @staticmethod
     def commit(
@@ -3058,6 +3058,7 @@ class LanceOperation:
         """
         Operation that creates an index on the dataset.
         """
+
         new_indices: List[Index]
         removed_indices: List[Index]
 

@@ -36,7 +36,7 @@ use crate::{
 struct TrainingRequest {
     dataset: Arc<Dataset>,
     column: String,
-    fragment_ids: Option<Vec<u32>>
+    fragment_ids: Option<Vec<u32>>,
 }
 
 #[async_trait]
@@ -66,15 +66,19 @@ impl TrainingRequest {
         if let Some(fragment_ids) = self.fragment_ids {
             let fragment_ids = fragment_ids.into_iter().dedup().collect_vec();
             let frags = self.dataset.get_frags_from_ordered_ids(&fragment_ids);
-            let frags: Result<Vec<_>> = fragment_ids.iter().zip(frags).map(|(id, frag)| {
-                let Some(frag) = frag else {
-                    return Err(Error::InvalidInput {
-                        source: format!("No fragment with id {}", id).into(),
-                        location: location!(),
-                    });
-                };
-                Ok(frag.metadata().clone())
-            }).collect();
+            let frags: Result<Vec<_>> = fragment_ids
+                .iter()
+                .zip(frags)
+                .map(|(id, frag)| {
+                    let Some(frag) = frag else {
+                        return Err(Error::InvalidInput {
+                            source: format!("No fragment with id {}", id).into(),
+                            location: location!(),
+                        });
+                    };
+                    Ok(frag.metadata().clone())
+                })
+                .collect();
             scan.with_fragments(frags?);
         }
         let ordering = match sort {
