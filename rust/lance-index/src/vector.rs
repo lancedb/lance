@@ -139,6 +139,20 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
 
+    async fn search_in_partitions(
+        &self,
+        partition_ids: Vec<u32>,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut results = Vec::with_capacity(partition_ids.len());
+        for partition_id in partition_ids {
+            let result = self.search_in_partition(partition_id as usize, query, pre_filter.clone()).await?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     async fn search_in_partition(
         &self,
         partition_id: usize,
@@ -215,3 +229,4 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
 }
+
