@@ -152,6 +152,8 @@ message List {
 message FixedSizeList {
   /// The number of items in each list
   uint32 dimension = 1;
+  /// True if the list is nullable
+  bool has_validity = 3;
   /// The items in the list
   ArrayEncoding items = 2;
 }
@@ -180,8 +182,6 @@ message Flat {
 message Constant {
   // The value (TODO: define encoding for literals?)
   bytes value = 1;
-  // The number of values
-  uint64 num_values = 2;
 }
 
 // Items are bitpacked in a buffer
@@ -211,9 +211,18 @@ message BitpackedForNonNeg {
   Buffer buffer = 3;
 }
 
-message Bitpack2 {
+// Opaque bitpacking variant where the bits per value are stored inline in the chunks themselves
+message InlineBitpacking {
   // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
   uint64 uncompressed_bits_per_value = 2;
+}
+
+// Transparent bitpacking variant where the number of bits per value is fixed through the whole buffer
+message OutOfLineBitpacking {
+  // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
+  uint64 uncompressed_bits_per_value = 2;
+  // The number of compressed bits per value, fixed across the entire buffer
+  uint64 compressed_bits_per_value = 3;
 }
 
 // An array encoding for shredded structs that will never be null
@@ -277,9 +286,10 @@ message ArrayEncoding {
         FixedSizeBinary fixed_size_binary = 11;
         BitpackedForNonNeg bitpacked_for_non_neg = 12;
         Constant constant = 13;
-        Bitpack2 bitpack2 = 14;
-        Variable variable = 15;
-        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 16;
+        InlineBitpacking inline_bitpacking = 14;
+        OutOfLineBitpacking out_of_line_bitpacking = 15;
+        Variable variable = 16;
+        PackedStructFixedWidthMiniBlock packed_struct_fixed_width_mini_block = 17;
     }
 }
 
@@ -359,15 +369,25 @@ enum RepDefLayer {
 /// chunks (called mini blocks) which are roughly the size of a disk sector.
 message MiniBlockLayout {
   // Description of the compression of repetition levels (e.g. how many bits per rep)
+  //
+  // Optional, if there is no repetition then this field is not present
   ArrayEncoding rep_compression = 1;
   // Description of the compression of definition levels (e.g. how many bits per def)
+  //
+  // Optional, if there is no definition then this field is not present
   ArrayEncoding def_compression = 2;
   // Description of the compression of values
   ArrayEncoding value_compression = 3;
   // Dictionary data
   ArrayEncoding dictionary = 4;
+  // Number of items in the dictionary
+  uint64 num_dictionary_items = 5;
   // The meaning of each repdef layer, used to interpret repdef buffers correctly
-  repeated RepDefLayer layers = 5;
+  repeated RepDefLayer layers = 6;
+  // The number of buffers in each mini-block, this is determined by the compression and does
+  // NOT include the repetition or definition buffers (the presence of these buffers can be determined
+  // by looking at the rep_compression and def_compression fields)
+  uint64 num_buffers = 7;
   // The depth of the repetition index.
   //
   // If there is repetition then the depth must be at least 1.  If there are many layers
@@ -379,10 +399,10 @@ message MiniBlockLayout {
   // index if the `repetition_index_depth` is greater than 0.  The +1 is because we need to store
   // the number of "leftover items" at the end of the chunk.  Otherwise, we wouldn't have any way
   // to know if the final item in a chunk is valid or not.
-  uint32 repetition_index_depth = 6;
+  uint32 repetition_index_depth = 8;
   // The page already records how many rows are in the page.  For mini-block we also need to know how
   // many "items" are in the page.  A row and an item are the same thing unless the page has lists.
-  uint64 num_items = 7;
+  uint64 num_items = 9;
 }
 
 /// A layout used for pages where the data is large

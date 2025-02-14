@@ -624,7 +624,7 @@ impl BinaryMiniBlockEncoder {
                 });
                 chunks.push(MiniBlockChunk {
                     log_num_values: 0,
-                    num_bytes: padded_chunk_size as u16,
+                    buffer_sizes: vec![padded_chunk_size as u16],
                 });
                 break;
             } else {
@@ -650,7 +650,7 @@ impl BinaryMiniBlockEncoder {
 
                 chunks.push(MiniBlockChunk {
                     log_num_values: num_values_in_this_chunk.trailing_zeros() as u8,
-                    num_bytes: padded_chunk_size as u16,
+                    buffer_sizes: vec![padded_chunk_size as u16],
                 });
 
                 last_offset_in_orig_idx = this_last_offset_in_orig_idx;
@@ -688,7 +688,7 @@ impl BinaryMiniBlockEncoder {
 
         (
             MiniBlockCompressed {
-                data: LanceBuffer::reinterpret_vec(output),
+                data: vec![LanceBuffer::reinterpret_vec(output)],
                 chunks,
                 num_values: data.num_values,
             },
@@ -720,7 +720,9 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
     // decompress a MiniBlock of binary data, the num_values must be less than or equal
     // to the number of values this MiniBlock has, BinaryMiniBlock doesn't store `the number of values`
     // it has so assertion can not be done here and the caller of `decompress` must ensure `num_values` <= number of values in the chunk.
-    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
+    fn decompress(&self, data: Vec<LanceBuffer>, num_values: u64) -> Result<DataBlock> {
+        assert_eq!(data.len(), 1);
+        let data = data.into_iter().next().unwrap();
         assert!(data.len() >= 8);
         let offsets: &[u32] = try_cast_slice(&data)
             .expect("casting buffer failed during BinaryMiniBlock decompression");
@@ -813,9 +815,9 @@ impl VariablePerValueDecompressor for VariableDecoder {
 pub struct BinaryBlockDecompressor {}
 
 impl BlockDecompressor for BinaryBlockDecompressor {
-    fn decompress(&self, data: LanceBuffer) -> Result<DataBlock> {
+    fn decompress(&self, data: LanceBuffer, num_values: u64) -> Result<DataBlock> {
         // the first 4 bytes in the BinaryBlock compressed buffer stores the num_values this block has.
-        let num_values = LittleEndian::read_u32(&data[..4]) as u64;
+        debug_assert_eq!(num_values, LittleEndian::read_u32(&data[..4]) as u64);
 
         // the next 4 bytes in the BinaryBlock compressed buffer stores the bytes_start_offset.
         let bytes_start_offset = LittleEndian::read_u32(&data[4..8]);
