@@ -186,13 +186,23 @@ impl ExecutionPlan for KNNVectorDistanceExec {
     fn statistics(&self) -> DataFusionResult<Statistics> {
         let inner_stats = self.input.statistics()?;
         let schema = self.input.schema();
+        let dist_stats = inner_stats
+            .column_statistics
+            .iter()
+            .zip(schema.fields())
+            .find(|(_, field)| field.name() == &self.column)
+            .map(|(stats, _)| ColumnStatistics {
+                null_count: stats.null_count,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
             .zip(schema.fields())
             .filter(|(_, field)| field.name() != DIST_COL)
             .map(|(stats, _)| stats)
-            .chain(std::iter::once(ColumnStatistics::new_unknown()))
+            .chain(std::iter::once(dist_stats))
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
