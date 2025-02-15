@@ -27,7 +27,7 @@ use crate::encodings::logical::r#struct::StructStructuralEncoder;
 use crate::encodings::physical::binary::{BinaryMiniBlockEncoder, VariableEncoder};
 use crate::encodings::physical::bitpack_fastlanes::BitpackedForNonNegArrayEncoder;
 use crate::encodings::physical::bitpack_fastlanes::{
-    compute_compressed_bit_width_for_non_neg, BitpackMiniBlockEncoder,
+    compute_compressed_bit_width_for_non_neg, InlineBitpacking,
 };
 use crate::encodings::physical::block_compress::{CompressionConfig, CompressionScheme};
 use crate::encodings::physical::dictionary::AlreadyDictionaryEncoder;
@@ -148,9 +148,10 @@ pub const MAX_MINIBLOCK_VALUES: u64 = 4096;
 
 /// Page data that has been compressed into a series of chunks put into
 /// a single buffer.
+#[derive(Debug)]
 pub struct MiniBlockCompressed {
-    /// The buffer of compressed data
-    pub data: LanceBuffer,
+    /// The buffers of compressed data
+    pub data: Vec<LanceBuffer>,
     /// Describes the size of each chunk
     pub chunks: Vec<MiniBlockChunk>,
     /// The number of values in the entire page
@@ -168,10 +169,10 @@ pub struct MiniBlockCompressed {
 /// data (values, repetition, and definition) per mini-block.
 #[derive(Debug)]
 pub struct MiniBlockChunk {
-    // The number of bytes that make up the chunk
+    // The size in bytes of each buffer in the chunk.
     //
-    // This value must be less than or equal to 8Ki - 6 (8188)
-    pub num_bytes: u16,
+    // The total size must be less than or equal to 8Ki - 6 (8188)
+    pub buffer_sizes: Vec<u16>,
     // The log (base 2) of the number of values in the chunk.  If this is the final chunk
     // then this should be 0 (the number of values will be calculated by subtracting the
     // size of all other chunks from the total size of the page)
@@ -806,20 +807,24 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         match data {
             DataBlock::FixedWidth(fixed_width_data) => {
                 let bit_widths = data.expect_stat(Stat::BitWidth);
+                let bit_widths = bit_widths.as_primitive::<UInt64Type>();
                 // Temporary hack to work around https://github.com/lancedb/lance/issues/3102
                 // Ideally we should still be able to bit-pack here (either to 0 or 1 bit per value)
-                let has_all_zeros = bit_widths
-                    .as_primitive::<UInt64Type>()
-                    .values()
-                    .iter()
-                    .any(|v| *v == 0);
+                let has_all_zeros = bit_widths.values().iter().any(|v| *v == 0);
+                // The minimum bit packing size is a block of 1024 values.  For very small pages the uncompressed
+                // size might be smaller than the compressed size.
+                let too_small = bit_widths.len() == 1
+                    && InlineBitpacking::min_size_bytes(bit_widths.value(0)) >= data.data_size();
                 if !has_all_zeros
+                    && !too_small
                     && (fixed_width_data.bits_per_value == 8
                         || fixed_width_data.bits_per_value == 16
                         || fixed_width_data.bits_per_value == 32
                         || fixed_width_data.bits_per_value == 64)
                 {
-                    Ok(Box::new(BitpackMiniBlockEncoder::default()))
+                    Ok(Box::new(InlineBitpacking::new(
+                        fixed_width_data.bits_per_value,
+                    )))
                 } else {
                     Ok(Box::new(ValueEncoder::default()))
                 }
@@ -855,16 +860,14 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                 Ok(Box::new(PackedStructFixedWidthMiniBlockEncoder::default()))
             }
             DataBlock::FixedSizeList(_) => {
-                // In theory we could use something like bitpacking here but it's not clear it would
-                // be very effective.  At most we would shave a few bytes off the first item in the
-                // list.  It might be more sophisticated to treat the FSL as a table and bitpack each
-                // column but that would be expensive as well so it's not clear that would be a win.  For
-                // now we just don't compress FSL
-                if data.is_variable() {
-                    todo!("Implement MiniBlockCompression for variable width FSL")
-                } else {
-                    Ok(Box::new(ValueEncoder::default()))
-                }
+                // Ideally we would compress the list items but this creates something of a challenge.
+                // We don't want to break lists across chunks and we need to worry about inner validity
+                // layers.  If we try and use a compression scheme then it is unlikely to respect these
+                // constraints.
+                //
+                // For now, we just don't compress.  In the future, we might want to consider a more
+                // sophisticated approach.
+                Ok(Box::new(ValueEncoder::default()))
             }
             _ => Err(Error::NotSupported {
                 source: format!(
@@ -883,10 +886,8 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>> {
         match data {
-            DataBlock::FixedWidth(_) => {
-                let encoder = Box::new(ValueEncoder::default());
-                Ok(encoder)
-            }
+            DataBlock::FixedWidth(_) => Ok(Box::new(ValueEncoder::default())),
+            DataBlock::FixedSizeList(_) => Ok(Box::new(ValueEncoder::default())),
             DataBlock::VariableWidth(variable_width) => {
                 if variable_width.bits_per_offset == 32 {
                     let data_size = variable_width.expect_single_stat::<UInt64Type>(Stat::DataSize);
@@ -905,7 +906,10 @@ impl CompressionStrategy for CoreArrayEncodingStrategy {
                     todo!("Implement MiniBlockCompression for VariableWidth DataBlock with 64 bits offsets.")
                 }
             }
-            _ => unreachable!(),
+            _ => unreachable!(
+                "Per-value compression not yet supported for block type: {}",
+                data.name()
+            ),
         }
     }
 
