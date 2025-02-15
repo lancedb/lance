@@ -289,3 +289,9 @@ pub fn class_name<'a>(ob: &'a Bound<'_, PyAny>) -> PyResult<&'a str> {
         None => Ok(full_name),
     }
 }
+
+impl ToPyObject for PyLance<&i32> {
+    fn to_object(&self, py: Python) -> PyObject {
+        self.0.to_object(py)
+    }
+}

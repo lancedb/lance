@@ -57,11 +57,18 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
     # Commit the index to dataset_without_index
     field_idx = dataset_without_index.schema.get_field_index("meta")
     create_index_op = lance.LanceOperation.CreateIndex(
-        index_id,
-        "meta_idx",
-        [field_idx],
-        dataset_without_index.version,
-        set([f.fragment_id for f in dataset_without_index.get_fragments()]),
+        new_indices=[
+            lance.Index(
+                uuid=index_id,
+                name="meta_idx",
+                fields=[field_idx],
+                version=dataset_without_index.version,
+                fragment_ids=set(
+                    [f.fragment_id for f in dataset_without_index.get_fragments()]
+                ),
+            )
+        ],
+        removed_indices=[],
     )
     dataset_without_index = lance.LanceDataset.commit(
         dataset_without_index.uri,
@@ -84,3 +91,114 @@ def test_commit_index(dataset_with_index, test_table, tmp_path):
         )
         plan = scanner.explain_plan()
         assert "MaterializeIndex" in plan
+
+
+def create_multi_fragments_table(tmp_path) -> lance.LanceDataset:
+    data = pa.table(
+        {
+            "text": [
+                "Frodo was a puppy",
+                "There were several kittens playing",
+            ],
+            "sentiment": ["neutral", "neutral"],
+        }
+    )
+    data2 = pa.table(
+        {
+            "text": [
+                "Frodo was a happy puppy",
+                "Frodo was a very happy puppy",
+            ],
+            "sentiment": ["positive", "positive"],
+        }
+    )
+
+    ds = lance.write_dataset(data, tmp_path, mode="overwrite")
+    ds = lance.write_dataset(data2, tmp_path, mode="append")
+    return ds
+
+
+def test_indexed_unindexed_fragments(tmp_path):
+    ds = create_multi_fragments_table(tmp_path)
+    frags = [f for f in ds.get_fragments()]
+    index = ds.create_scalar_index(
+        "text", "INVERTED", fragment_ids=[frags[0].fragment_id]
+    )
+    assert isinstance(index, dict)
+
+    indices = [index]
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    unindexed_fragments = ds.unindexed_fragments("text_idx")
+    assert len(unindexed_fragments) == 1
+    assert unindexed_fragments[0].id == frags[1].fragment_id
+
+    indexed_fragments = [f for fs in ds.indexed_fragments("text_idx") for f in fs]
+    assert len(indexed_fragments) == 1
+    assert indexed_fragments[0].id == frags[0].fragment_id
+
+
+def test_commit_multiple_indices(tmp_path):
+    ds = create_multi_fragments_table(tmp_path)
+
+    indices = []
+    for f in ds.get_fragments():
+        # we can create an inverted index distributely
+        index = ds.create_scalar_index("text", "INVERTED", fragment_ids=[f.fragment_id])
+        assert isinstance(index, dict)
+        indices.append(index)
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    indices = []
+    frags = [f for f in ds.get_fragments()]
+
+    for f in frags:
+        index = ds.create_scalar_index(
+            "sentiment", "BITMAP", fragment_ids=[f.fragment_id]
+        )
+        assert isinstance(index, dict)
+        indices.append(index)
+
+    create_index_op = lance.LanceOperation.CreateIndex(
+        new_indices=indices,
+        removed_indices=[],
+    )
+
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        create_index_op,
+        read_version=ds.version,
+    )
+
+    unindexed_fragments = ds.unindexed_fragments("text_idx")
+    assert len(unindexed_fragments) == 0
+
+    indexed_fragments = [f for fs in ds.indexed_fragments("text_idx") for f in fs]
+    assert len(indexed_fragments) == 2
+    assert indexed_fragments[0].id == frags[0].fragment_id
+    assert indexed_fragments[1].id == frags[1].fragment_id
+    results = ds.to_table(
+        full_text_query="puppy",
+        # filter="sentiment='positive'",
+        prefilter=True,
+        with_row_id=True,
+    )
+    assert results["_rowid"].to_pylist() == [0, 1 << 32, (1 << 32) + 1]
