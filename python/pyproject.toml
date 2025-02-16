@@ -77,6 +77,9 @@ include = [
     "python/lance/debug.py",
     "python/lance/tracing.py",
     "python/lance/dependencies.py",
+    "python/lance/schema.py",
+    "python/lance/file.py",
+    "python/lance/util.py",
 ]
 # Dependencies like pyarrow make this difficult to enforce strictly.
 reportMissingTypeStubs = "warning"
