@@ -136,8 +136,6 @@ impl ScalarQueryParser for SargableQueryParser {
             _ => unreachable!(),
         };
 
-        // HERE, we might wanna modify. To return a refine, if warranted by our
-        // index. But how do we know that here?
         Some(IndexedExpression::index_query(
             column.to_string(),
             Arc::new(query),
@@ -412,7 +410,6 @@ impl ScalarIndexExpr {
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
                 let matching_row_ids = index.search(query.as_ref()).await?;
-                // Infer here if a recheck will be required?
                 Ok(RowIdMask {
                     block_list: None,
                     allow_list: Some(matching_row_ids),

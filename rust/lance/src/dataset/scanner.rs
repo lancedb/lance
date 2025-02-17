@@ -64,7 +64,7 @@ use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
-use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
+use crate::io::exec::{get_physical_optimizer, recheck, LanceScanConfig};
 use crate::io::exec::{
     knn::new_knn_exec, project, AddRowAddrExec, FilterPlan, KNNVectorDistanceExec,
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
@@ -1267,11 +1267,8 @@ impl Scanner {
         let mut filter_plan = if let Some(filter) = self.filter.as_ref() {
             let filter = filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?;
             let index_info = self.dataset.scalar_index_info().await?;
-            println!("Index info is {:?}", index_info);
             let filter_plan =
                 planner.create_filter_plan(filter.clone(), &index_info, use_scalar_index)?;
-
-            println!("Possibly wrap here");
 
             println!("Filter plan index query {:?}", filter_plan.index_query);
 
@@ -1506,23 +1503,6 @@ impl Scanner {
             plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
         }
 
-        self.traverse_plan(
-            plan.as_ref(),
-            |node| match node.name() {
-                "MaterializeIndexExec" => {
-                    let exec = node
-                        .as_any()
-                        .downcast_ref::<MaterializeIndexExec>()
-                        .unwrap();
-                    println!("Got MaterializeIndexExec {:?}", exec);
-                }
-                _ => {}
-            },
-            |node| {
-                //println!("Post plan node {:?}", node);
-            },
-        );
-
         // Stage 7: final projection
         plan = Arc::new(DFProjectionExec::try_new(self.output_expr()?, plan)?);
 
@@ -1533,19 +1513,6 @@ impl Scanner {
         }
 
         Ok(plan)
-    }
-
-    fn traverse_plan(
-        &self,
-        plan: &dyn ExecutionPlan,
-        pre: fn(node: &dyn ExecutionPlan),
-        post: fn(node: &dyn ExecutionPlan),
-    ) {
-        pre(plan);
-        for child in plan.children() {
-            self.traverse_plan(child.as_ref(), pre, post);
-        }
-        post(plan);
     }
 
     // Create an execution plan to do full text search
@@ -1876,38 +1843,55 @@ impl Scanner {
     ) -> Result<(RoaringBitmap, bool)> {
         match index_expr {
             ScalarIndexExpr::And(lhs, rhs) => {
-                let (lhs_bitmap, lhs_recheck) = self.fragments_covered_by_index_query(lhs).await?;
-                let (rhs_bitmap, rhs_recheck) = self.fragments_covered_by_index_query(rhs).await?;
-                Ok((lhs_bitmap & rhs_bitmap, lhs_recheck || rhs_recheck));
+                let (lhs_bitmap, lhs_recheck) =
+                    self.fragments_covered_by_index_query(lhs).await.unwrap();
+                let (rhs_bitmap, rhs_recheck) =
+                    self.fragments_covered_by_index_query(rhs).await.unwrap();
+                Ok((lhs_bitmap & rhs_bitmap, lhs_recheck || rhs_recheck))
             }
-            ScalarIndexExpr::Or(lhs, rhs) => Ok(self.fragments_covered_by_index_query(lhs).await?
-                & self.fragments_covered_by_index_query(rhs).await?),
-            ScalarIndexExpr::Not(expr) => self.fragments_covered_by_index_query(expr).await,
+            ScalarIndexExpr::Or(lhs, rhs) => {
+                let (lhs_bitmap, lhs_recheck) =
+                    self.fragments_covered_by_index_query(lhs).await.unwrap();
+                let (rhs_bitmap, rhs_recheck) =
+                    self.fragments_covered_by_index_query(rhs).await.unwrap();
+                Ok((lhs_bitmap | rhs_bitmap, lhs_recheck || rhs_recheck))
+            }
+            ScalarIndexExpr::Not(expr) => {
+                let (bitmap, recheck) = self.fragments_covered_by_index_query(expr).await.unwrap();
+                Ok((bitmap, recheck))
+            }
             ScalarIndexExpr::Query(column, expr) => {
                 // right here - we know the column, the expr, and the index. Can
                 // we figure out what we need?
                 let idx = self
                     .dataset
                     .load_scalar_index_for_column(column)
-                    .await?
-                    .expect("Index not found even though it must have been found earlier");
+                    .await
+                    .expect("Index not found even though it must have been found earlier")
+                    .unwrap();
 
                 let index_type =
                     detect_scalar_index_type(&self.dataset, &idx, column, &self.dataset.session)
-                        .await?;
+                        .await;
 
                 // infer recheck guidance
                 match (index_type, expr) {
-                    (ScalarIndexType::Inverted, _) => {
-                        return Ok((idx.fragment_bitmap, true));
+                    (Ok(ScalarIndexType::Inverted), expr) => {
+                        Ok((idx.fragment_bitmap.unwrap(), true))
                     }
-
-                    (_, _) => {
-                        return Ok((idx.fragment_bitmap, false));
-                    }
+                    (_, _) => Ok((idx.fragment_bitmap.unwrap(), false)),
                 }
             }
         }
+    }
+
+    fn wrap_with_recheck(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        index_expr: ScalarIndexExpr,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        println!("Wrapping with recheck here");
+        Ok(plan)
     }
 
     // First perform a lookup in a scalar index for ids and then perform a take on the
@@ -1927,7 +1911,8 @@ impl Scanner {
         };
 
         // Figure out which fragments are covered by ALL of the indices we are using
-        let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
+        let (covered_frags, recheck) = self.fragments_covered_by_index_query(index_expr).await?;
+        println!("should recheck: {}", recheck);
         let mut relevant_frags = Vec::with_capacity(fragments.len());
         let mut missing_frags = Vec::with_capacity(fragments.len());
         for fragment in fragments {
@@ -1944,7 +1929,10 @@ impl Scanner {
             Arc::new(relevant_frags),
         ));
 
-        // If we know the index is lossy, then wrap with a recheck here.
+        // If we know the index is lossy, then wrap with a recheck node here.
+        if recheck {
+            plan = self.wrap_with_recheck(plan, index_expr.clone())?;
+        }
 
         // If there is more than just _rowid in projection
         let needs_take = match projection.fields.len() {

@@ -10,6 +10,7 @@ pub(crate) mod knn;
 mod optimizer;
 mod projection;
 mod pushdown_scan;
+pub mod recheck;
 mod rowids;
 pub mod scalar_index;
 mod scan;

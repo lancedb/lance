@@ -143,7 +143,6 @@ impl InvertedIndex {
         let tokens = collect_tokens(query.as_str(), &mut tokenizer, None);
         let token_ids = self.map(&tokens).into_iter();
         let mask = prefilter.mask();
-        println!("Tokens {:?}", tokens);
         let postings = stream::iter(token_ids)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
@@ -156,9 +155,7 @@ impl InvertedIndex {
             .try_collect::<Vec<_>>()
             .await?;
 
-        println!("enumerated tokens");
         if postings.is_empty() {
-            println!("empty tokens");
             return Ok(Vec::new());
         }
 
@@ -168,9 +165,7 @@ impl InvertedIndex {
             row_sets.push(row_ids);
         }
 
-        println!("Intersecting");
         let row_ids = self.intersect_vectors(row_sets);
-        println!("Intersected {:?}", row_ids.len());
         Ok(row_ids)
     }
 
@@ -651,26 +646,6 @@ impl PostingList {
         self.len() == 0
     }
 
-    pub fn intersect_rowids(&self, other: &PostingList) -> Vec<u64> {
-        let mut result = Vec::new();
-        let mut i = 0;
-        let mut j = 0;
-        while i < self.len() && j < other.len() {
-            let row_id1 = self.row_ids[i];
-            let row_id2 = other.row_ids[j];
-            if row_id1 == row_id2 {
-                result.push(row_id1);
-                i += 1;
-                j += 1;
-            } else if row_id1 < row_id2 {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
-        result
-    }
-
     pub fn doc(&self, i: usize) -> DocInfo {
         DocInfo::new(self.row_ids[i], self.frequencies[i])
     }
@@ -746,7 +721,6 @@ impl PostingListBuilder {
             positions = Some(position_builder);
         }
 
-        println!("Row ids {:?}", row_ids);
         Self {
             row_ids,
             frequencies,
