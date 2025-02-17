@@ -534,7 +534,7 @@ impl Scanner {
         Ok(self)
     }
 
-    pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+    pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter = Some(LanceFilter::Datafusion(filter));
         self
     }
