@@ -6,7 +6,9 @@ use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc};
 use arrow::{
     array::{ArrayData, AsArray},
     buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer},
-    datatypes::{ArrowPrimitiveType, Int32Type, Int64Type, IntervalDayTime, IntervalMonthDayNano},
+    datatypes::{
+        ArrowPrimitiveType, Int32Type, Int64Type, IntervalDayTime, IntervalMonthDayNano, UInt32Type,
+    },
 };
 use arrow_array::{
     make_array,
@@ -492,6 +494,67 @@ impl ArrayGenerator for CycleVectorGenerator {
         self.underlying_gen
             .element_size_bytes()
             .map(|byte_count| ByteCount::from(byte_count.0 * self.dimension.0 as u64))
+    }
+}
+
+#[derive(Debug)]
+pub struct CycleListGenerator {
+    underlying_gen: Box<dyn ArrayGenerator>,
+    lengths_gen: Box<dyn ArrayGenerator>,
+    data_type: DataType,
+}
+
+impl CycleListGenerator {
+    pub fn new(
+        underlying_gen: Box<dyn ArrayGenerator>,
+        min_list_size: Dimension,
+        max_list_size: Dimension,
+    ) -> Self {
+        let data_type = DataType::List(Arc::new(Field::new(
+            "item",
+            underlying_gen.data_type().clone(),
+            true,
+        )));
+        let lengths_dist = Uniform::new(
+            u32::try_from(min_list_size.0).unwrap(),
+            u32::try_from(max_list_size.0).unwrap(),
+        );
+        let lengths_gen = rand_with_distribution::<UInt32Type, Uniform<u32>>(lengths_dist);
+        Self {
+            underlying_gen,
+            lengths_gen,
+            data_type,
+        }
+    }
+}
+
+impl ArrayGenerator for CycleListGenerator {
+    fn generate(
+        &mut self,
+        length: RowCount,
+        rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+    ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        let lengths = self.lengths_gen.generate(length, rng)?;
+        let lengths = lengths.as_primitive::<UInt32Type>();
+        let total_length = lengths.values().iter().map(|i| *i as u64).sum::<u64>();
+        let offsets = OffsetBuffer::from_lengths(lengths.values().iter().map(|v| *v as usize));
+        let values = self
+            .underlying_gen
+            .generate(RowCount::from(total_length), rng)?;
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let values = Arc::new(values);
+
+        let array = ListArray::try_new(field, offsets, values, None)?;
+
+        Ok(Arc::new(array))
+    }
+
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    fn element_size_bytes(&self) -> Option<ByteCount> {
+        None
     }
 }
 
@@ -1486,6 +1549,22 @@ pub mod array {
         dimension: Dimension,
     ) -> Box<dyn ArrayGenerator> {
         Box::new(CycleVectorGenerator::new(generator, dimension))
+    }
+
+    /// Create a generator of list vectors by continuously calling the given generator
+    ///
+    /// The lists will have lengths uniformly distributed between `min_list_size` (inclusive) and
+    /// `max_list_size` (exclusive).
+    pub fn cycle_vec_var(
+        generator: Box<dyn ArrayGenerator>,
+        min_list_size: Dimension,
+        max_list_size: Dimension,
+    ) -> Box<dyn ArrayGenerator> {
+        Box::new(CycleListGenerator::new(
+            generator,
+            min_list_size,
+            max_list_size,
+        ))
     }
 
     /// Create a generator from a vector of values
