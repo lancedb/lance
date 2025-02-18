@@ -24,6 +24,7 @@ pub struct PostingIterator {
     index: usize,
     mask: Arc<RowIdMask>,
     approximate_upper_bound: f32,
+    len: usize,
 }
 
 impl PartialEq for PostingIterator {
@@ -70,6 +71,7 @@ impl PostingIterator {
         while index < list.len() && !mask.selected(list.row_id(index)) {
             index += 1;
         }
+        let len = list.len();
 
         Self {
             token_id,
@@ -78,6 +80,7 @@ impl PostingIterator {
             index,
             mask,
             approximate_upper_bound,
+            len,
         }
     }
 
