@@ -112,6 +112,21 @@ impl DeepSizeOf for InvertedIndex {
 }
 
 impl InvertedIndex {
+
+    pub fn num_tokens(&self) -> u64 {
+        self.docs.total_tokens
+    }
+
+    pub fn num_docs(&self) -> usize {
+        self.docs.token_count.len()
+    }
+
+    pub fn posting_len(&self, token: &String) -> usize {
+        match self.tokens.get(token) {
+            Some(token_id) => self.inverted_list.posting_len(token_id),
+            None => 0
+        }
+    }
     // map tokens to token ids
     // ignore tokens that are not in the index cause they won't contribute to the search
     #[instrument(level = "debug", skip_all)]

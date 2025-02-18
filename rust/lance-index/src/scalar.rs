@@ -235,6 +235,12 @@ impl PartialEq for dyn AnyQuery {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SearchType {
+    QueryThenFetch,
+    DfsQueryThenFetch,
+}
+
 /// A full text search query
 #[derive(Debug, Clone, PartialEq)]
 pub struct FullTextSearchQuery {
@@ -250,6 +256,8 @@ pub struct FullTextSearchQuery {
     /// Increasing this value will reduce the recall and improve the performance
     /// 1.0 is the value that would give the best performance without recall loss
     pub wand_factor: Option<f32>,
+
+    pub search_type: SearchType,
 }
 
 impl FullTextSearchQuery {
@@ -259,6 +267,7 @@ impl FullTextSearchQuery {
             limit: None,
             columns: vec![],
             wand_factor: None,
+            search_type: SearchType::QueryThenFetch,
         }
     }
 
