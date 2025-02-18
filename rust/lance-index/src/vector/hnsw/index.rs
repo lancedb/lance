@@ -184,6 +184,15 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         unimplemented!("only for IVF")
     }
 
+    async fn search_in_partitions(
+        &self,
+        partition_ids: Vec<u32>,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Vec<RecordBatch>> {
+        unimplemented!("only for IVF")
+    }
+
     fn is_loadable(&self) -> bool {
         true
     }

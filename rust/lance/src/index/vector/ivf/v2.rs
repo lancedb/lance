@@ -37,6 +37,7 @@ use lance_index::{
     vector::{
         ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
         v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY, DIST_COL,
+        parallel_search_in_partitions, ParallelSearchInPartitionFunctions,
     },
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
@@ -80,6 +81,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     ivf: IvfModel,
 
     reader: FileReader,
+    object_store: Arc<ObjectStore>,
     sub_index_metadata: Vec<String>,
     storage: IvfQuantizationStorage,
 
@@ -114,7 +116,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         session: Weak<Session>,
     ) -> Result<Self> {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let scheduler = ScanScheduler::new(object_store.clone(), scheduler_config);
 
         let file_metadata_cache = session
             .upgrade()
@@ -191,6 +193,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             uuid,
             ivf,
             reader: index_reader,
+            object_store : object_store.clone(),
             storage,
             partition_cache: Cache::new(index_cache_capacity),
             partition_locks: PartitionLoadLock::new(num_partitions),
@@ -364,6 +367,44 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 }
 
 #[async_trait]
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> ParallelSearchInPartitionFunctions for IVFIndex<S, Q> {
+    type PartitionRepresentation = Arc<PartitionEntry<S, Q>>;
+
+    #[instrument(level = "debug", skip(self, pre_filter))]
+    async fn search_in_loaded_partition(
+        &self,
+        partition_id: usize,
+        partition: Self::PartitionRepresentation,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        pre_filter.wait_for_ready().await?;
+        let query = self.preprocess_query(partition_id, query)?;
+
+        spawn_cpu(move || {
+            let param = (&query).into();
+            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
+            let k = query.k * refine_factor;
+            partition
+                .index
+                .search(query.key, k, param, &partition.storage, pre_filter)
+        })
+        .await
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.object_store.io_parallelism()
+    }
+
+    async fn load_partition(
+        &self,
+        partition_id: usize,
+    ) -> Result<Self::PartitionRepresentation> {
+        self.load_partition(partition_id, true).await
+    }
+}
+
+#[async_trait]
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
         let mut query = query.clone();
@@ -375,11 +416,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let partition_ids = self.find_partitions(&query)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
-        let batches = stream::iter(part_ids)
-            .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
-            .buffer_unordered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let batches = self.search_in_partitions(part_ids, &query, pre_filter).await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
         let dist_col = batch.column_by_name(DIST_COL).ok_or_else(|| {
@@ -418,18 +455,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true).await?;
-        pre_filter.wait_for_ready().await?;
-        let query = self.preprocess_query(partition_id, query)?;
+        self.search_in_loaded_partition(partition_id, part_entry, query, pre_filter)
+            .await
+    }
 
-        spawn_cpu(move || {
-            let param = (&query).into();
-            let refine_factor = query.refine_factor.unwrap_or(1) as usize;
-            let k = query.k * refine_factor;
-            part_entry
-                .index
-                .search(query.key, k, param, &part_entry.storage, pre_filter)
-        })
-        .await
+    async fn search_in_partitions(
+        &self,
+        partition_ids: Vec<u32>,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Vec<RecordBatch>> {
+        parallel_search_in_partitions(self, partition_ids, query, pre_filter).await
     }
 
     fn is_loadable(&self) -> bool {
