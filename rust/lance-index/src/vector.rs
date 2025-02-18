@@ -253,9 +253,6 @@ pub async fn parallel_search_in_partitions<T: Send + Sync + std::fmt::Debug>(
     query: &Query,
     pre_filter: Arc<dyn PreFilter>,
 ) -> Result<Vec<RecordBatch>> {
-    // Really want these to go in parallel. First should add to a
-    // queue that the second consumes. Otherwise it is not
-    // searching when it could be.
     stream::iter(partition_ids)
         .map(|part_id| {
             let part_id = part_id as usize;
