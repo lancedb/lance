@@ -28,7 +28,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error, Result,
+    traits::DatasetTakeRows, Error, Result,
     ROW_ID_FIELD,
 };
 use lance_file::{

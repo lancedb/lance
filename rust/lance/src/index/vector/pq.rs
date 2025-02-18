@@ -282,9 +282,9 @@ impl VectorIndex for PQIndex {
 
     async fn search_in_partitions(
         &self,
-        partition_ids: Vec<u32>,
-        query: &Query,
-        pre_filter: Arc<dyn PreFilter>,
+        _: Vec<u32>,
+        _: &Query,
+        _: Arc<dyn PreFilter>,
     ) -> Result<Vec<RecordBatch>> {
         unimplemented!("only for IVF")
     }
