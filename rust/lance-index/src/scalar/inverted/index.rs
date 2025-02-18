@@ -18,7 +18,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion_common::DataFusionError;
+use datafusion_common::{DataFusionError, HashMap};
 use deepsize::DeepSizeOf;
 use futures::stream::repeat_with;
 use futures::{stream, StreamExt, TryStreamExt};
@@ -38,7 +38,7 @@ use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, SargableQuery,
-    ScalarIndex,
+    ScalarIndex, SearchType,
 };
 use crate::Index;
 
@@ -85,6 +85,29 @@ macro_rules! as_inverted_index {
 }
 
 #[derive(Clone)]
+pub struct ParsedQuery<'a> {
+    raw: &'a FullTextSearchQuery,
+    tokens: Vec<String>,
+    postings: Option<HashMap<String, usize>>,
+}
+
+impl ParsedQuery<'_> {
+    fn add_posting_len(&mut self, index: &InvertedIndex) {
+        if let Some(postings) = &mut self.postings {
+            for token in &self.tokens {
+                let len = index.posting_len(token);
+                if len > 0 {
+                    match postings.get_mut(token) {
+                        Some(v) => {(*v) += len;},
+                        None => {postings.insert(token.clone(), len);}
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,
     tokenizer: tantivy::tokenizer::TextAnalyzer,
@@ -112,6 +135,26 @@ impl DeepSizeOf for InvertedIndex {
 }
 
 impl InvertedIndex {
+
+    pub fn parse<'a>(
+        &self,
+        raw: &'a FullTextSearchQuery
+    ) -> Result<ParsedQuery<'a>> {
+        let mut tokenizer = self.tokenizer.clone();
+        let tokens = collect_tokens(&raw.query, &mut tokenizer, None);
+        let postings = match raw.search_type {
+            SearchType::DfsQueryThenFetch => Some(tokens.iter().map(|token| {
+                let posting_len = self.posting_len(token);
+                (token.clone(), posting_len)
+            }).collect()),
+            SearchType::QueryThenFetch => None,
+        };
+        Ok(ParsedQuery{
+            raw,
+            tokens,
+            postings
+        })
+    }
 
     pub fn num_tokens(&self) -> u64 {
         self.docs.total_tokens
