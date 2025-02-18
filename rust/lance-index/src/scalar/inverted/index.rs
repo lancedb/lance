@@ -69,6 +69,21 @@ lazy_static! {
         .unwrap_or(512 * 1024 * 1024);
 }
 
+#[macro_export]
+macro_rules! as_inverted_index {
+    ($index:expr, $uuid:expr) => {
+        $index
+            .as_any()
+            .downcast_ref::<InvertedIndex>()
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Index {} is not an inverted index",
+                    $uuid,
+                ))
+            })
+    };
+}
+
 #[derive(Clone)]
 pub struct InvertedIndex {
     params: InvertedIndexParams,

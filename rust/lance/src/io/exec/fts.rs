@@ -15,6 +15,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
+use lance_index::as_inverted_index;
 use lance_index::prefilter::{FilterLoader, PreFilter};
 use lance_index::scalar::inverted::{flat_bm25_search_stream, InvertedIndex, FTS_SCHEMA};
 use lance_index::scalar::FullTextSearchQuery;
@@ -184,16 +185,7 @@ impl ExecutionPlan for FtsExec {
                         ));
 
                         let index = ds.open_generic_index(&column, &uuid).await?;
-                        let index =
-                            index
-                                .as_any()
-                                .downcast_ref::<InvertedIndex>()
-                                .ok_or_else(|| {
-                                    DataFusionError::Execution(format!(
-                                        "Index {} is not an inverted index",
-                                        uuid,
-                                    ))
-                                })?;
+                        let index = as_inverted_index!(index, uuid)?;
                         pre_filter.wait_for_ready().await?;
                         let results = index.full_text_search(&query, pre_filter).await?;
 
@@ -336,17 +328,7 @@ impl ExecutionPlan for FlatFtsExec {
 
                 async move {
                     let index = ds.open_generic_index(&column, &uuid).await?;
-                    let index =
-                        index
-                            .as_any()
-                            .downcast_ref::<InvertedIndex>()
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "Index {} is not an inverted index",
-                                    uuid,
-                                ))
-                            })?;
-
+                    let index = as_inverted_index!(index, uuid)?;
                     let unindexed_stream = input.execute(partition, context)?;
                     let unindexed_result_stream =
                         flat_bm25_search_stream(unindexed_stream, column, query, index);
