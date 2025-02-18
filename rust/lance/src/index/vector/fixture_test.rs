@@ -113,6 +113,15 @@ mod test {
             unimplemented!("only for IVF")
         }
 
+        async fn search_in_partitions(
+            &self,
+            _: Vec<u32>,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+        ) -> Result<Vec<RecordBatch>> {
+            unimplemented!("only for IVF")
+        }
+
         fn is_loadable(&self) -> bool {
             true
         }

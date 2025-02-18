@@ -174,7 +174,7 @@ impl IVFIndex {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn load_partition(
+    pub async fn load_partition(
         &self,
         partition_id: usize,
         write_cache: bool,
