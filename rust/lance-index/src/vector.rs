@@ -253,7 +253,10 @@ pub async fn parallel_search_in_partitions<T: Send + Sync + std::fmt::Debug>(
     query: &Query,
     pre_filter: Arc<dyn PreFilter>,
 ) -> Result<Vec<RecordBatch>> {
-    let partitions = stream::iter(partition_ids)
+    // Really want these to go in parallel. First should add to a
+    // queue that the second consumes. Otherwise it is not
+    // searching when it could be.
+    stream::iter(partition_ids)
         .map(|part_id| {
             let part_id = part_id as usize;
             async move {
@@ -262,15 +265,14 @@ pub async fn parallel_search_in_partitions<T: Send + Sync + std::fmt::Debug>(
             }
         })
         .buffer_unordered(helper.io_parallelism())
-        .try_collect::<Vec<_>>()
-        .await?;
-    stream::iter(partitions)
-        .map(|(part_id, partition)| {
+        .map(|result| {
             let pre_filter = pre_filter.clone();
             async move {
-                helper
+                let (part_id, partition) = result?;
+                let ret = helper
                     .search_in_loaded_partition(part_id, partition, &query, pre_filter)
-                    .await
+                    .await;
+                ret
             }
         })
         .buffer_unordered(get_num_compute_intensive_cpus())
