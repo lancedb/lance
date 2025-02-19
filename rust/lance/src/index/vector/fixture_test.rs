@@ -143,7 +143,7 @@ mod test {
             Ok(())
         }
 
-        async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
             unimplemented!("only for SubIndex")
         }
 

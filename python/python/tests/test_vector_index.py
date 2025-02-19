@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
+from lance.dataset import VectorIndexReader
 
 torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
@@ -1129,3 +1130,16 @@ def test_drop_indices(indexed_dataset):
     )
 
     assert len(results) == 15
+
+
+def test_read_partition(indexed_dataset):
+    idx_name = indexed_dataset.list_indices()[0]["name"]
+    reader = VectorIndexReader(indexed_dataset, idx_name)
+
+    num_rows = indexed_dataset.count_rows()
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        part_reader = reader.partition_reader(part_id)
+        for batch in part_reader:
+            row_sum += batch.num_rows
+    assert row_sum == num_rows

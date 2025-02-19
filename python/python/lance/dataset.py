@@ -3849,6 +3849,7 @@ class VectorIndexReader:
         stats = dataset.stats.index_stats(index_name)
 
         self.dataset = dataset
+        self.index_name = index_name
         self.stats = stats
 
     def num_partitions(self) -> int:
@@ -3874,7 +3875,7 @@ class VectorIndexReader:
         )
 
     def partition_reader(
-        self, partition_id: int, with_vector: bool = False
+        self, partition_id: int, *, with_vector: bool = False
     ) -> pa.RecordBatchReader:
         """
         Returns a reader for the given IVF partition
@@ -3893,6 +3894,6 @@ class VectorIndexReader:
             A record batch reader for the given partition
         """
 
-        return self.dataset._ds.partition_reader(
-            self.stats["indices"][0]["partitions"][partition_id]
+        return self.dataset._ds.read_index_partition(
+            self.index_name, partition_id, with_vector
         )
