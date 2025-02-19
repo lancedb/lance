@@ -2212,11 +2212,7 @@ impl Scanner {
             ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
 
-        let ann_node = Arc::new(MultivectorScoringExec::try_new(
-            self.dataset.clone(),
-            ann_nodes,
-            q.clone(),
-        )?);
+        let ann_node = Arc::new(MultivectorScoringExec::try_new(ann_nodes, q.clone())?);
 
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,

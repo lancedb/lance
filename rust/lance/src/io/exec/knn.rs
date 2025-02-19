@@ -668,7 +668,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
 
 #[derive(Debug)]
 pub struct MultivectorScoringExec {
-    dataset: Arc<Dataset>,
     // the inputs are sorted ANN search results
     inputs: Vec<Arc<dyn ExecutionPlan>>,
     query: Query,
@@ -676,11 +675,7 @@ pub struct MultivectorScoringExec {
 }
 
 impl MultivectorScoringExec {
-    pub fn try_new(
-        dataset: Arc<Dataset>,
-        inputs: Vec<Arc<dyn ExecutionPlan>>,
-        query: Query,
-    ) -> Result<Self> {
+    pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>, query: Query) -> Result<Self> {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(KNN_INDEX_SCHEMA.clone()),
             Partitioning::RoundRobinBatch(1),
@@ -689,7 +684,6 @@ impl MultivectorScoringExec {
         );
 
         Ok(Self {
-            dataset,
             inputs,
             query,
             properties,
@@ -728,7 +722,7 @@ impl ExecutionPlan for MultivectorScoringExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let plan = Self::try_new(self.dataset.clone(), children, self.query.clone())?;
+        let plan = Self::try_new(children, self.query.clone())?;
         Ok(Arc::new(plan))
     }
 
@@ -790,7 +784,7 @@ impl ExecutionPlan for MultivectorScoringExec {
         let stream = stream::once(async move {
             // at most, we will have k * refine_factor results for each query
             let mut results = HashMap::with_capacity(k * refactor);
-            let mut missed_similarities = 0.0;
+            let mut missed_sim_sum = 0.0;
             while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let sims = batch[DIST_COL].as_primitive::<Float32Type>();
@@ -815,9 +809,9 @@ impl ExecutionPlan for MultivectorScoringExec {
                     }
                 });
                 query_results.into_iter().for_each(|(row_id, sim)| {
-                    results.entry(row_id).or_insert(sim + missed_similarities);
+                    results.entry(row_id).or_insert(sim + missed_sim_sum);
                 });
-                missed_similarities += min_sim;
+                missed_sim_sum += min_sim;
             }
 
             let (row_ids, sims): (Vec<_>, Vec<_>) = results.into_iter().unzip();
@@ -992,5 +986,82 @@ mod tests {
                 ArrowField::new(DIST_COL, DataType::Float32, true),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn test_multivector_score() {
+        let query = Query {
+            column: "vector".to_string(),
+            key: Arc::new(generate_random_array(1)),
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            nprobes: 1,
+            ef: None,
+            refine_factor: None,
+            metric_type: DistanceType::Cosine,
+            use_index: true,
+        };
+
+        async fn multivector_scoring(
+            inputs: Vec<Arc<dyn ExecutionPlan>>,
+            query: Query,
+        ) -> Result<HashMap<u64, f32>> {
+            let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+            let plan = MultivectorScoringExec::try_new(inputs, query.clone())?;
+            let batches = plan
+                .execute(0, ctx.clone())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await?;
+            let mut results = HashMap::new();
+            for batch in batches {
+                let row_ids = batch
+                    .column_by_name(ROW_ID)
+                    .unwrap()
+                    .as_primitive::<UInt64Type>();
+                let dists = batch
+                    .column_by_name(DIST_COL)
+                    .unwrap()
+                    .as_primitive::<Float32Type>();
+                for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
+                    results.insert(*row_id, *dist);
+                }
+            }
+            Ok(results)
+        }
+
+        let batches = (0..3)
+            .map(|i| {
+                RecordBatch::try_new(
+                    KNN_INDEX_SCHEMA.clone(),
+                    vec![
+                        Arc::new(Float32Array::from(vec![i as f32 + 1.0, i as f32 + 2.0])),
+                        Arc::new(UInt64Array::from(vec![i + 1, i + 2])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let mut res: Option<HashMap<_, _>> = None;
+        for perm in batches.into_iter().permutations(3) {
+            let inputs = perm
+                .into_iter()
+                .map(|batch| {
+                    let input: Arc<dyn ExecutionPlan> =
+                        Arc::new(TestingExec::new(vec![batch.clone()]));
+                    input
+                })
+                .collect::<Vec<_>>();
+            let new_res = multivector_scoring(inputs, query.clone()).await.unwrap();
+            if let Some(res) = &res {
+                for (row_id, dist) in new_res.iter() {
+                    assert_eq!(res.get(row_id).unwrap(), dist)
+                }
+            } else {
+                res = Some(new_res);
+            }
+        }
     }
 }
