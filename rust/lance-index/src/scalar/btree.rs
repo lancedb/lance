@@ -41,7 +41,7 @@ use log::debug;
 use moka::sync::Cache;
 use roaring::RoaringBitmap;
 use serde::{Serialize, Serializer};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{Index, IndexType};
 

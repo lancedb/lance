@@ -16,7 +16,7 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 use std::convert::TryFrom;
 
 pub mod optimize;

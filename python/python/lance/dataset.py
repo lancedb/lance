@@ -914,7 +914,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
-            return self.scanner(filter=filter).count_rows()
+            return self.scanner(
+                columns=[], with_row_id=True, filter=filter
+            ).count_rows()
 
         return self._ds.count_rows(filter)
 

@@ -476,7 +476,7 @@ mod tests {
     use lance_linalg::distance::MetricType;
     use lance_table::io::commit::RenameCommitHandler;
     use lance_testing::datagen::{some_batch, BatchGenerator, IncrementingInt32};
-    use snafu::{location, Location};
+    use snafu::location;
 
     use crate::{
         dataset::{builder::DatasetBuilder, ReadParams, WriteMode, WriteParams},

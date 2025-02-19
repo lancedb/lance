@@ -29,6 +29,7 @@ use lance_datafusion::utils::StreamingWriteSource;
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{read_batch, FileReader};
 use lance_file::v2::reader::{CachedFileMetadata, FileReaderOptions, ReaderProjection};
+use lance_file::v2::LanceEncodingsIo;
 use lance_file::version::LanceFileVersion;
 use lance_file::{determine_file_version, v2};
 use lance_io::object_store::ObjectStore;
@@ -41,7 +42,7 @@ use lance_table::utils::stream::{
     wrap_with_row_id_and_delete, ReadBatchFutStream, ReadBatchTask, ReadBatchTaskStream,
     RowIdAndDeletesConfig,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use self::write::FragmentCreateBuilder;
 
@@ -833,9 +834,11 @@ impl FileFragment {
                 .open_file_with_priority(&path, priority_offset)
                 .await?;
             let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+            let path = file_scheduler.reader().path().clone();
             let reader = Arc::new(
                 v2::reader::FileReader::try_open_with_file_metadata(
-                    file_scheduler,
+                    Arc::new(LanceEncodingsIo(file_scheduler)),
+                    path,
                     None,
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
@@ -903,6 +906,9 @@ impl FileFragment {
         match filter {
             Some(expr) => self
                 .scan()
+                .project(&Vec::<String>::default())
+                .unwrap()
+                .with_row_id()
                 .filter(&expr)?
                 .count_rows()
                 .await

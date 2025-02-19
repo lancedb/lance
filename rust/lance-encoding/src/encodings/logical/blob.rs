@@ -11,7 +11,7 @@ use arrow_buffer::{
 use arrow_schema::DataType;
 use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{datatypes::BLOB_DESC_FIELDS, Error, Result};
 
@@ -231,7 +231,6 @@ impl LogicalPageDecoder for BlobFieldDecoder {
         let validity = self.drain_validity(num_rows as usize)?;
         self.rows_drained += num_rows;
         Ok(NextDecodeTask {
-            has_more: self.rows_drained < self.num_rows,
             num_rows,
             task: Box::new(BlobArrayDecodeTask::new(bytes, validity)),
         })

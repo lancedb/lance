@@ -16,7 +16,7 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::distance::{Dot, Normalize, L2};
 use rand::SeedableRng;
 use rayon::prelude::*;
-use snafu::{location, Location};
+use snafu::location;
 
 use super::utils::divide_to_subvectors;
 use super::ProductQuantizer;

@@ -3,7 +3,7 @@
 
 //! Feature flags
 
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::format::Manifest;
 use lance_core::{Error, Result};

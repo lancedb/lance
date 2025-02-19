@@ -30,7 +30,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use super::builder::inverted_list_schema;

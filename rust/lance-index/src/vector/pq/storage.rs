@@ -30,7 +30,7 @@ use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescri
 use object_store::path::Path;
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
 use super::ProductQuantizer;

@@ -162,7 +162,12 @@ public class ScannerTest {
       // write id with value from 0 to 39
       try (Dataset dataset = testDataset.write(1, 40)) {
         try (LanceScanner scanner =
-            dataset.newScan(new ScanOptions.Builder().filter("id < 20").build())) {
+            dataset.newScan(
+                new ScanOptions.Builder()
+                    .columns(Arrays.asList())
+                    .withRowId(true)
+                    .filter("id < 20")
+                    .build())) {
           assertEquals(20, scanner.countRows());
         }
       }
@@ -387,7 +392,6 @@ public class ScannerTest {
           // This test is more about ensuring that the batchReadahead parameter is accepted
           // and doesn't cause errors. The actual effect of batchReadahead might not be
           // directly observable in this test.
-          assertEquals(totalRows, scanner.countRows());
           try (ArrowReader reader = scanner.scanBatches()) {
             int rowCount = 0;
             while (reader.loadNextBatch()) {

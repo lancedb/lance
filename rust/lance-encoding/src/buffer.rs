@@ -7,7 +7,7 @@ use std::{ops::Deref, panic::RefUnwindSafe, ptr::NonNull, sync::Arc};
 
 use arrow_buffer::{ArrowNativeType, Buffer, MutableBuffer, ScalarBuffer};
 use itertools::Either;
-use snafu::{location, Location};
+use snafu::location;
 
 use lance_core::{utils::bit::is_pwr_two, Error, Result};
 
@@ -161,6 +161,14 @@ impl LanceBuffer {
                     Arc::new(bytes),
                 ))
             }
+        }
+    }
+
+    /// Convert a buffer into a bytes::Bytes object
+    pub fn into_bytes(self) -> bytes::Bytes {
+        match self {
+            Self::Owned(buf) => buf.into(),
+            Self::Borrowed(buf) => buf.into_vec::<u8>().unwrap().into(),
         }
     }
 

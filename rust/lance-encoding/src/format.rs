@@ -37,7 +37,10 @@ pub struct ProtobufUtils {}
 impl ProtobufUtils {
     pub fn constant(value: Vec<u8>, num_values: u64) -> ArrayEncoding {
         ArrayEncoding {
-            array_encoding: Some(ArrayEncodingEnum::Constant(Constant { value, num_values })),
+            array_encoding: Some(ArrayEncodingEnum::Constant(Constant {
+                value: value.into(),
+                num_values,
+            })),
         }
     }
 
@@ -160,7 +163,7 @@ impl ProtobufUtils {
         ArrayEncoding {
             array_encoding: Some(ArrayEncodingEnum::Fsst(Box::new(Fsst {
                 binary: Some(Box::new(data)),
-                symbol_table,
+                symbol_table: symbol_table.into(),
             }))),
         }
     }

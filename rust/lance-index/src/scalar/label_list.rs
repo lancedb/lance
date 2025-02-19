@@ -14,7 +14,7 @@ use deepsize::DeepSizeOf;
 use futures::{stream::BoxStream, StreamExt, TryStream, TryStreamExt};
 use lance_core::{utils::mask::RowIdTreeMap, Error, Result};
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::{Index, IndexType};

@@ -71,7 +71,7 @@ use crate::io::exec::{
     LancePushdownScanExec, LanceScanExec, Planner, PreFilterSource, ScanConfig, TakeExec,
 };
 use crate::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
@@ -193,6 +193,7 @@ impl MaterializationStyle {
 }
 
 /// Filter for filtering rows
+#[derive(Debug)]
 pub enum LanceFilter {
     /// The filter is an SQL string
     Sql(String),
@@ -537,7 +538,7 @@ impl Scanner {
         Ok(self)
     }
 
-    pub(crate) fn filter_expr(&mut self, filter: Expr) -> &mut Self {
+    pub fn filter_expr(&mut self, filter: Expr) -> &mut Self {
         self.filter = Some(LanceFilter::Datafusion(filter));
         self
     }
@@ -1031,11 +1032,22 @@ impl Scanner {
         Ok(concat_batches(&schema, &batches)?)
     }
 
-    /// Scan and return the number of matching rows
-    #[instrument(skip_all)]
-    pub fn count_rows(&self) -> BoxFuture<Result<u64>> {
+    fn create_count_plan(&self) -> BoxFuture<Result<Arc<dyn ExecutionPlan>>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
+            if !self.projection_plan.physical_schema.fields.is_empty() {
+                return Err(Error::invalid_input(
+                    "count_rows should not be called on a plan selecting columns".to_string(),
+                    location!(),
+                ));
+            }
+
+            if self.limit.is_some() || self.offset.is_some() {
+                log::warn!(
+                    "count_rows called with limit or offset which could have surprising results"
+                );
+            }
+
             let plan = self.create_plan().await?;
             // Datafusion interprets COUNT(*) as COUNT(1)
             let one = Arc::new(Literal::new(ScalarValue::UInt8(Some(1))));
@@ -1050,14 +1062,27 @@ impl Scanner {
             let count_expr = builder.build()?;
 
             let plan_schema = plan.schema();
-            let count_plan = Arc::new(AggregateExec::try_new(
+            Ok(Arc::new(AggregateExec::try_new(
                 AggregateMode::Single,
                 PhysicalGroupBy::new_single(Vec::new()),
                 vec![Arc::new(count_expr)],
                 vec![None],
                 plan,
                 plan_schema,
-            )?);
+            )?) as Arc<dyn ExecutionPlan>)
+        }
+        .boxed()
+    }
+
+    /// Scan and return the number of matching rows
+    ///
+    /// Note: calling [`Dataset::count_rows`] can be more efficient than calling this method
+    /// especially if there is no filter.
+    #[instrument(skip_all)]
+    pub fn count_rows(&self) -> BoxFuture<Result<u64>> {
+        // Future intentionally boxed here to avoid large futures on the stack
+        async move {
+            let count_plan = self.create_count_plan().await?;
             let mut stream = execute_plan(count_plan, LanceExecutionOptions::default())?;
 
             // A count plan will always return a single batch with a single row.
@@ -1131,15 +1156,25 @@ impl Scanner {
         }
     }
 
-    fn calc_eager_columns(&self, filter_plan: &FilterPlan) -> Result<Arc<Schema>> {
-        let columns = filter_plan.refine_columns();
+    // If we are going to filter on `filter_plan`, then which columns are so small it is
+    // cheaper to read the entire column and filter in memory.
+    //
+    // Note: only add columns that we actually need to read
+    fn calc_eager_columns(
+        &self,
+        filter_plan: &FilterPlan,
+        desired_schema: &Schema,
+    ) -> Result<Arc<Schema>> {
+        let filter_columns = filter_plan.refine_columns();
         let early_schema = self
             .dataset
             .empty_projection()
-            // We need the filter columns
-            .union_columns(columns, OnMissing::Error)?
-            // And also any columns that are eager
-            .union_predicate(|f| self.is_early_field(f))
+            // Start with the desired schema
+            .union_schema(desired_schema)
+            // Subtract columns that are expensive
+            .subtract_predicate(|f| !self.is_early_field(f))
+            // Add back columns that we need for filtering
+            .union_columns(filter_columns, OnMissing::Error)?
             .into_schema_ref();
 
         if early_schema.fields.iter().any(|f| !f.is_default_storage()) {
@@ -1344,7 +1379,10 @@ impl Scanner {
                     (Some(index_query), Some(_)) => {
                         // If there is a filter then just load the eager columns and
                         // "take" the other columns later.
-                        let eager_schema = self.calc_eager_columns(&filter_plan)?;
+                        let eager_schema = self.calc_eager_columns(
+                            &filter_plan,
+                            self.projection_plan.physical_schema.as_ref(),
+                        )?;
                         self.scalar_indexed_scan(&eager_schema, index_query).await?
                     }
                     (None, Some(_)) if use_stats && self.batch_size.is_none() => {
@@ -1356,7 +1394,10 @@ impl Scanner {
                         let eager_schema = if filter_plan.has_refine() {
                             // If there is a filter then only load the filter columns in the
                             // initial scan.  We will `take` the remaining columns later
-                            self.calc_eager_columns(&filter_plan)?
+                            self.calc_eager_columns(
+                                &filter_plan,
+                                self.projection_plan.physical_schema.as_ref(),
+                            )?
                         } else {
                             // If there is no filter we eagerly load everything
                             self.projection_plan.physical_schema.clone()
@@ -1527,7 +1568,7 @@ impl Scanner {
             .limit(self.limit);
 
         // load indices
-        let mut column_inputs = HashMap::with_capacity(columns.len());
+        let mut column_inputs = Vec::with_capacity(columns.len());
         for column in columns {
             let index = self
                 .dataset
@@ -1575,12 +1616,12 @@ impl Scanner {
                 scan_node
             };
 
-            column_inputs.insert(column.clone(), (index_uuids, unindexed_scan_node));
+            column_inputs.push((column.clone(), index_uuids, unindexed_scan_node));
         }
 
         let indices = column_inputs
             .iter()
-            .map(|(col, (idx, _))| (col.clone(), idx.clone()))
+            .map(|(col, idx, _)| (col.clone(), idx.clone()))
             .collect();
         let prefilter_source = self.prefilter_source(filter_plan).await?;
         let fts_plan = Arc::new(FtsExec::new(
@@ -3908,14 +3949,11 @@ mod test {
         .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(32, dataset.scan().count_rows().await.unwrap());
+        assert_eq!(32, dataset.count_rows(None).await.unwrap());
         assert_eq!(
             16,
             dataset
-                .scan()
-                .filter("`Filter_me` > 15")
-                .unwrap()
-                .count_rows()
+                .count_rows(Some("`Filter_me` > 15".to_string()))
                 .await
                 .unwrap()
         );
@@ -3943,7 +3981,7 @@ mod test {
         .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(32, dataset.scan().count_rows().await.unwrap());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 32);
 
         let mut scanner = dataset.scan();
 
@@ -3991,7 +4029,7 @@ mod test {
         .unwrap();
 
         let dataset = Dataset::open(test_uri).await.unwrap();
-        assert_eq!(32, dataset.scan().count_rows().await.unwrap());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 32);
 
         let mut scanner = dataset.scan();
 
@@ -4514,20 +4552,13 @@ mod test {
         }
     }
 
-    /// Assert that the plan when formatted matches the expected string.
-    ///
-    /// Within expected, you can use `...` to match any number of characters.
-    async fn assert_plan_equals(
-        dataset: &Dataset,
-        plan: impl Fn(&mut Scanner) -> Result<&mut Scanner>,
+    async fn assert_plan_node_equals(
+        plan_node: Arc<dyn ExecutionPlan>,
         expected: &str,
     ) -> Result<()> {
-        let mut scan = dataset.scan();
-        plan(&mut scan)?;
-        let exec_plan = scan.create_plan().await?;
         let plan_desc = format!(
             "{}",
-            datafusion::physical_plan::displayable(exec_plan.as_ref()).indent(true)
+            datafusion::physical_plan::displayable(plan_node.as_ref()).indent(true)
         );
 
         let to_match = expected.split("...").collect::<Vec<_>>();
@@ -4552,6 +4583,71 @@ mod test {
             )
         }
         Ok(())
+    }
+
+    /// Assert that the plan when formatted matches the expected string.
+    ///
+    /// Within expected, you can use `...` to match any number of characters.
+    async fn assert_plan_equals(
+        dataset: &Dataset,
+        plan: impl Fn(&mut Scanner) -> Result<&mut Scanner>,
+        expected: &str,
+    ) -> Result<()> {
+        let mut scan = dataset.scan();
+        plan(&mut scan)?;
+        let exec_plan = scan.create_plan().await?;
+        assert_plan_node_equals(exec_plan, expected).await
+    }
+
+    #[tokio::test]
+    async fn test_count_plan() {
+        // A count rows operation should load the minimal amount of data
+        let dim = 256;
+        let fixture = TestVectorDataset::new_with_dimension(LanceFileVersion::Stable, true, dim)
+            .await
+            .unwrap();
+
+        // By default, all columns are returned, this is bad for a count_rows op
+        let err = fixture
+            .dataset
+            .scan()
+            .create_count_plan()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        let mut scan = fixture.dataset.scan();
+        scan.project(&Vec::<String>::default()).unwrap();
+
+        // with_row_id needs to be specified
+        let err = scan.create_count_plan().await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }));
+
+        scan.with_row_id();
+
+        let plan = scan.create_count_plan().await.unwrap();
+
+        assert_plan_node_equals(
+            plan,
+            "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
+  LanceScan: uri=..., projection=[], row_id=true, row_addr=false, ordered=true",
+        )
+        .await
+        .unwrap();
+
+        scan.filter("s == ''").unwrap();
+
+        let plan = scan.create_count_plan().await.unwrap();
+
+        assert_plan_node_equals(
+            plan,
+            "AggregateExec: mode=Single, gby=[], aggr=[count_rows]
+  ProjectionExec: expr=[_rowid@1 as _rowid]
+    FilterExec: s@0 = 
+      LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true",
+        )
+        .await
+        .unwrap();
     }
 
     #[rstest]

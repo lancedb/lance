@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::DataType;
-use snafu::{location, Location};
+use snafu::location;
 use std::{
     io::{Cursor, Write},
     str::FromStr,
@@ -40,12 +40,14 @@ impl Default for CompressionConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompressionScheme {
     None,
+    Fsst,
     Zstd,
 }
 
 impl std::fmt::Display for CompressionScheme {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let scheme_str = match self {
+            Self::Fsst => "fsst",
             Self::Zstd => "zstd",
             Self::None => "none",
         };
@@ -121,6 +123,8 @@ pub struct GeneralBufferCompressor {}
 impl GeneralBufferCompressor {
     pub fn get_compressor(compression_config: CompressionConfig) -> Box<dyn BufferCompressor> {
         match compression_config.scheme {
+            // FSST has its own compression path and isn't implemented as a generic buffer compressor
+            CompressionScheme::Fsst => unimplemented!(),
             CompressionScheme::Zstd => Box::new(ZstdBufferCompressor::new(
                 compression_config.level.unwrap_or(0),
             )),

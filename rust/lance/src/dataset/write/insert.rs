@@ -15,7 +15,7 @@ use lance_io::object_store::ObjectStore;
 use lance_table::feature_flags::can_write_dataset;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::Operation;

@@ -1057,3 +1057,50 @@ fn inner_add_columns_by_sql_expressions(
     )?;
     Ok(())
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeAddColumnsByReader(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    arrow_array_stream_addr: jlong,
+    batch_size: JObject, // Optional<Long>
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_add_columns_by_reader(&mut env, java_dataset, arrow_array_stream_addr, batch_size)
+    )
+}
+
+fn inner_add_columns_by_reader(
+    env: &mut JNIEnv,
+    java_dataset: JObject,
+    arrow_array_stream_addr: jlong,
+    batch_size: JObject, // Optional<Long>
+) -> Result<()> {
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+
+    let transform = NewColumnTransform::Reader(Box::new(reader));
+
+    let batch_size = if env.call_method(&batch_size, "isPresent", "()Z", &[])?.z()? {
+        let batch_size_value = env.get_long_opt(&batch_size)?;
+        match batch_size_value {
+            Some(value) => Some(
+                value
+                    .try_into()
+                    .map_err(|_| Error::input_error("Batch size conversion error".to_string()))?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+
+    RT.block_on(dataset_guard.inner.add_columns(transform, None, batch_size))?;
+
+    Ok(())
+}

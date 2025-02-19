@@ -13,7 +13,7 @@ use lance_table::{
 };
 use object_store::{aws::AwsCredentialProvider, path::Path, DynObjectStore};
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 use url::Url;
 

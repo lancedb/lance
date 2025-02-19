@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::BufferExt;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use super::ReadBatchParams;

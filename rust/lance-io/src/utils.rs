@@ -12,7 +12,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use lance_arrow::*;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     encodings::{binary::BinaryDecoder, plain::PlainDecoder, AsyncIndex, Decoder},

@@ -45,7 +45,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
@@ -1515,11 +1515,25 @@ mod tests {
             .await
             .unwrap();
 
+        async fn assert_indexed_rows(dataset: &Dataset, expected_indexed_rows: usize) {
+            let stats = dataset.index_statistics("text_idx").await.unwrap();
+            let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+            let indexed_rows = stats["num_indexed_rows"].as_u64().unwrap() as usize;
+            let unindexed_rows = stats["num_unindexed_rows"].as_u64().unwrap() as usize;
+            let num_rows = dataset.count_all_rows().await.unwrap();
+            assert_eq!(indexed_rows, expected_indexed_rows);
+            assert_eq!(unindexed_rows, num_rows - expected_indexed_rows);
+        }
+
+        let num_rows = dataset.count_all_rows().await.unwrap();
+        assert_indexed_rows(&dataset, num_rows).await;
+
         let new_words = ["elephant", "fig", "grape", "honeydew"];
         let new_data = StringArray::from_iter_values(new_words.iter().map(|s| s.to_string()));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
         let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         dataset.append(batch_iter, None).await.unwrap();
+        assert_indexed_rows(&dataset, num_rows).await;
 
         dataset
             .optimize_indices(&OptimizeOptions {
@@ -1528,6 +1542,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let num_rows = dataset.count_all_rows().await.unwrap();
+        assert_indexed_rows(&dataset, num_rows).await;
 
         for &word in words.iter().chain(new_words.iter()) {
             let query_result = dataset
@@ -1584,6 +1600,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(new_data)]).unwrap();
         let batch_iter = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
         dataset.append(batch_iter, None).await.unwrap();
+        assert_indexed_rows(&dataset, num_rows).await;
 
         // we should be able to query the new words
         for &word in uppercase_words.iter() {
@@ -1619,6 +1636,8 @@ mod tests {
             })
             .await
             .unwrap();
+        let num_rows = dataset.count_all_rows().await.unwrap();
+        assert_indexed_rows(&dataset, num_rows).await;
 
         // we should be able to query the new words after optimization
         for &word in uppercase_words.iter() {
@@ -1671,6 +1690,7 @@ mod tests {
                 assert_eq!(texts.len(), 1, "query: {}, texts: {:?}", word, texts);
                 assert_eq!(texts[0], word, "query: {}, texts: {:?}", word, texts);
             }
+            assert_indexed_rows(&dataset, num_rows).await;
         }
     }
 
