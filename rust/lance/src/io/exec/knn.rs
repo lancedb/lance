@@ -1016,14 +1016,8 @@ mod tests {
                 .await?;
             let mut results = HashMap::new();
             for batch in batches {
-                let row_ids = batch
-                    .column_by_name(ROW_ID)
-                    .unwrap()
-                    .as_primitive::<UInt64Type>();
-                let dists = batch
-                    .column_by_name(DIST_COL)
-                    .unwrap()
-                    .as_primitive::<Float32Type>();
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
                     results.insert(*row_id, *dist);
                 }
@@ -1055,6 +1049,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let new_res = multivector_scoring(inputs, query.clone()).await.unwrap();
+            assert_eq!(new_res.len(), 4);
             if let Some(res) = &res {
                 for (row_id, dist) in new_res.iter() {
                     assert_eq!(res.get(row_id).unwrap(), dist)
