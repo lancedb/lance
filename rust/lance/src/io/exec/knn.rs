@@ -1043,8 +1043,7 @@ mod tests {
             let inputs = perm
                 .into_iter()
                 .map(|batch| {
-                    let input: Arc<dyn ExecutionPlan> =
-                        Arc::new(TestingExec::new(vec![batch.clone()]));
+                    let input: Arc<dyn ExecutionPlan> = Arc::new(TestingExec::new(vec![batch]));
                     input
                 })
                 .collect::<Vec<_>>();

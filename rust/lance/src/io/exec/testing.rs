@@ -78,7 +78,7 @@ impl ExecutionPlan for TestingExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        let stream = futures::stream::iter(self.batches.clone().into_iter().map(|batch| Ok(batch)));
+        let stream = futures::stream::iter(self.batches.clone().into_iter().map(Ok));
         let stream = RecordBatchStreamAdapter::new(self.schema(), stream.boxed());
         Ok(Box::pin(stream))
     }
