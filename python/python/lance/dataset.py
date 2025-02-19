@@ -3841,3 +3841,58 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+class VectorIndexReader:
+    def __init__(self, dataset: LanceDataset, index_name: str):
+        # we don't use `dataset.stats.index_stats` because it returns a large dict
+        stats = dataset.stats.index_stats(index_name)
+
+        self.dataset = dataset
+        self.stats = stats
+
+    def num_partitions(self) -> int:
+        """
+        Returns the number of partitions in the index
+        """
+        return self.stats["indices"][0]["num_partitions"]
+
+    def centroids(self) -> np.ndarray:
+        """
+        Returns the centroids of the index
+
+        Returns
+        -------
+        np.ndarray
+            The centroids of IVF
+            with shape (num_partitions, dim)
+        """
+        # when we have more delta indices,
+        # they are with the same centroids
+        return np.array(
+            self.dataset._ds.get_index_centroids(self.stats["indices"][0]["centroids"])
+        )
+
+    def partition_reader(
+        self, partition_id: int, with_vector: bool = False
+    ) -> pa.RecordBatchReader:
+        """
+        Returns a reader for the given IVF partition
+
+        Parameters
+        ----------
+        partition_id: int
+            The id of the partition to read
+        with_vector: bool, default False
+            Whether to include the vector column in the reader,
+            for IVF_PQ, the vector column is PQ codes
+
+        Returns
+        -------
+        pa.RecordBatchReader
+            A record batch reader for the given partition
+        """
+
+        return self.dataset._ds.partition_reader(
+            self.stats["indices"][0]["partitions"][partition_id]
+        )

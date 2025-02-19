@@ -17,6 +17,8 @@ use arrow::{
 use arrow_arith::numeric::sub;
 use arrow_array::{RecordBatch, StructArray, UInt32Array};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
@@ -31,6 +33,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     pb,
@@ -276,6 +279,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
     pub async fn load_partition_storage(&self, partition_id: usize) -> Result<Q::Storage> {
         self.storage.load_partition::<Q>(partition_id).await
+    }
+
+    async fn partition_reader(
+        &self,
+        reader: Arc<dyn Reader>,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let store = self.load_partition_storage(partition_id).await?;
+        let batches = stream::iter(store.to_batches()?);
+        let stream = RecordBatchStreamAdapter::new(store.schema().clone(), batches);
+        Ok(Box::pin(stream))
     }
 
     /// preprocess the query vector given the partition id.

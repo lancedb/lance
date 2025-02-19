@@ -10,6 +10,8 @@ use std::{
 
 use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
@@ -261,6 +263,17 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
         }))
+    }
+
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        let store = self.storage.as_ref().ok_or(Error::Index {
+            message: "vector storage not loaded".to_string(),
+            location: location!(),
+        })?;
+
+        let stream = futures::stream::iter(store.to_batches());
+        let stream = RecordBatchStreamAdapter::new(store.schema().clone(), stream);
+        Ok(Box::pin(stream))
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {

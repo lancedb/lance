@@ -9,6 +9,7 @@ use std::sync::{Arc, OnceLock};
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::parse::str_is_truthy;
@@ -685,6 +686,35 @@ impl DatasetIndexExt for Dataset {
             message: format!("Failed to serialize index statistics: {}", e),
             location: location!(),
         })
+    }
+
+    async fn read_index_partition(
+        &self,
+        index_name: &str,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let indices = self.load_indices_by_name(index_name).await?;
+        if indices.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", index_name),
+                location: location!(),
+            });
+        }
+        let column = self
+            .schema()
+            .field_by_id(indices[0].fields[0])
+            .ok_or(|e| Error::Index {
+                message: format!("Column {} does not exist", indices[0].fields[0]),
+                location: location!(),
+            })?;
+
+        let partition_streams = Vec::with_capacity(indices.len());
+        for index in indices {
+            let index = self
+                .open_vector_index(index.fields[0], &column.name, &index.uuid.to_string())
+                .await?;
+        }
     }
 }
 

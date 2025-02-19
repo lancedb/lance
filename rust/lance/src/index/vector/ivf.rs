@@ -910,6 +910,20 @@ impl VectorIndex for IVFIndex {
         })
     }
 
+    async fn partition_reader(
+        &self,
+        reader: Arc<dyn Reader>,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let partition = self.load_partition(partition_id, false).await?;
+        partition.to_batch_stream(with_vector).await
+    }
+
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        unimplemented!("this method is for only sub index")
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }

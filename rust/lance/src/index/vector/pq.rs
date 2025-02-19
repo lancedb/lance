@@ -15,6 +15,7 @@ use arrow_schema::DataType;
 use arrow_select::take::take;
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
+use futures::StreamExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::ROW_ID;
@@ -327,6 +328,23 @@ impl VectorIndex for PQIndex {
             pq: self.pq.clone(),
             metric_type: self.metric_type,
         }))
+    }
+
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        let row_ids = self.row_ids.clone().ok_or(Error::Index {
+            message: "PQIndex::to_batch_stream: row ids not loaded for PQ".to_string(),
+            location: location!(),
+        })?;
+
+        let transposed_codes = self.code.clone().ok_or(Error::Index {
+            message: "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
+            location: location!(),
+        })?;
+
+        let stream = futures::stream::iter(row_ids.values().iter()).map(|row_id| {
+            let code = self.get_pq_codes(transposed_codes, *row_id as usize, row_ids.len());
+            (*row_id, code)
+        });
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
