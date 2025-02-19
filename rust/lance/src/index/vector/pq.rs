@@ -9,16 +9,17 @@ use arrow_array::{
     cast::{as_primitive_array, AsArray},
     Array, FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array,
 };
-use arrow_array::{Float32Array, UInt32Array};
+use arrow_array::{ArrayRef, Float32Array, UInt32Array};
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 use arrow_select::take::take;
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
-use futures::StreamExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_core::ROW_ID;
+use lance_core::{ROW_ID, ROW_ID_FIELD};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::{transpose, ProductQuantizationStorage};
 use lance_index::vector::quantizer::{Quantization, QuantizationType, Quantizer};
@@ -336,15 +337,35 @@ impl VectorIndex for PQIndex {
             location: location!(),
         })?;
 
-        let transposed_codes = self.code.clone().ok_or(Error::Index {
-            message: "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
-            location: location!(),
-        })?;
+        let num_rows = row_ids.len();
+        let mut fields = vec![ROW_ID_FIELD.clone()];
+        let mut columns: Vec<ArrayRef> = vec![row_ids];
+        if with_vector {
+            let transposed_codes = self.code.clone().ok_or(Error::Index {
+                message: "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
+                location: location!(),
+            })?;
+            let original_codes = transpose(&transposed_codes, self.pq.num_sub_vectors, num_rows);
+            fields.push(Field::new(
+                self.pq.column(),
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    self.pq.code_dim() as i32,
+                ),
+                true,
+            ));
+            columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
+                original_codes,
+                self.pq.code_dim() as i32,
+            )?));
+        }
 
-        let stream = futures::stream::iter(row_ids.values().iter()).map(|row_id| {
-            let code = self.get_pq_codes(transposed_codes, *row_id as usize, row_ids.len());
-            (*row_id, code)
-        });
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        let stream = RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::once(futures::future::ready(Ok(batch))),
+        );
+        Ok(Box::pin(stream))
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {

@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_arrow::RecordBatchExt;
+use lance_core::ROW_ID;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
@@ -271,8 +273,23 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             location: location!(),
         })?;
 
-        let stream = futures::stream::iter(store.to_batches());
-        let stream = RecordBatchStreamAdapter::new(store.schema().clone(), stream);
+        let schema = if with_vector {
+            store.schema().clone()
+        } else {
+            let schema = store.schema();
+            let row_id_idx = schema.index_of(ROW_ID)?;
+            Arc::new(schema.project(&[row_id_idx])?)
+        };
+
+        let batches = store
+            .to_batches()?
+            .map(|b| {
+                let batch = b.project_by_schema(&schema)?;
+                Ok(batch)
+            })
+            .collect::<Vec<_>>();
+        let stream = futures::stream::iter(batches);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
         Ok(Box::pin(stream))
     }
 

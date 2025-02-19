@@ -20,6 +20,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
@@ -912,7 +913,6 @@ impl VectorIndex for IVFIndex {
 
     async fn partition_reader(
         &self,
-        reader: Arc<dyn Reader>,
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream> {
@@ -920,7 +920,7 @@ impl VectorIndex for IVFIndex {
         partition.to_batch_stream(with_vector).await
     }
 
-    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+    async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
         unimplemented!("this method is for only sub index")
     }
 

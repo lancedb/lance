@@ -183,7 +183,6 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     // for IVF only
     async fn partition_reader(
         &self,
-        _reader: Arc<dyn Reader>,
         _partition_id: usize,
         _with_vector: bool,
     ) -> Result<SendableRecordBatchStream> {
