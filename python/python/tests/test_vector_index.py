@@ -1142,4 +1142,15 @@ def test_read_partition(indexed_dataset):
         part_reader = reader.partition_reader(part_id)
         for batch in part_reader:
             row_sum += batch.num_rows
+            assert "_rowid" in batch.column_names
+    assert row_sum == num_rows
+
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        part_reader = reader.partition_reader(part_id, with_vector=True)
+        for batch in part_reader:
+            row_sum += batch.num_rows
+            pq_column = batch["__pq_code"]
+            assert "_rowid" in batch.column_names
+            assert pq_column.type == pa.list_(pa.uint8(), 16)
     assert row_sum == num_rows
