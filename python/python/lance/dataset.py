@@ -3845,7 +3845,6 @@ def _validate_metadata(metadata: dict):
 
 class VectorIndexReader:
     def __init__(self, dataset: LanceDataset, index_name: str):
-        # we don't use `dataset.stats.index_stats` because it returns a large dict
         stats = dataset.stats.index_stats(index_name)
 
         self.dataset = dataset
