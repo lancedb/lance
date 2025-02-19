@@ -13,11 +13,16 @@
  */
 package com.lancedb.lance;
 
+import com.lancedb.lance.ipc.LanceScanner;
 import com.lancedb.lance.schema.ColumnAlteration;
 import com.lancedb.lance.schema.SqlExpressions;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -348,6 +353,107 @@ public class DatasetTest {
           dataset.getSchema().getFields().stream()
               .map(Field::getName)
               .collect(Collectors.toList()));
+    }
+  }
+
+  @Test
+  void testAddColumnsByStream() throws IOException {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      try (Dataset initialDataset = testDataset.createEmptyDataset()) {
+        try (Dataset datasetV1 = testDataset.write(1, 3)) {
+          assertEquals(3, datasetV1.countRows());
+        }
+      }
+
+      dataset = Dataset.open(datasetPath, allocator);
+
+      Schema newColumnSchema =
+          new Schema(
+              Collections.singletonList(Field.nullable("age", new ArrowType.Int(32, true))), null);
+
+      try (VectorSchemaRoot vector = VectorSchemaRoot.create(newColumnSchema, allocator);
+          ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+
+        IntVector ageVector = (IntVector) vector.getVector("age");
+        ageVector.allocateNew(3);
+        ageVector.set(0, 25);
+        ageVector.set(1, 30);
+        ageVector.set(2, 35);
+        vector.setRowCount(3);
+
+        class SimpleVectorReader extends ArrowReader {
+          private boolean batchLoaded = false;
+
+          protected SimpleVectorReader(BufferAllocator allocator) {
+            super(allocator);
+          }
+
+          @Override
+          public boolean loadNextBatch() {
+            if (!batchLoaded) {
+              batchLoaded = true;
+              return true;
+            }
+            return false;
+          }
+
+          @Override
+          public VectorSchemaRoot getVectorSchemaRoot() {
+            return vector;
+          }
+
+          @Override
+          public long bytesRead() {
+            return vector.getFieldVectors().stream().mapToLong(FieldVector::getBufferSize).sum();
+          }
+
+          @Override
+          protected void closeReadSource() {}
+
+          @Override
+          protected Schema readSchema() {
+            return newColumnSchema;
+          }
+        }
+
+        try (ArrowReader reader = new SimpleVectorReader(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+
+          dataset.addColumns(stream, Optional.of(3L));
+
+          Schema expectedSchema =
+              new Schema(
+                  Arrays.asList(
+                      Field.nullable("id", new ArrowType.Int(32, true)),
+                      Field.nullable("name", new ArrowType.Utf8()),
+                      Field.nullable("age", new ArrowType.Int(32, true))),
+                  null);
+          Schema actualSchema = dataset.getSchema();
+          assertEquals(expectedSchema.getFields(), actualSchema.getFields());
+
+          try (LanceScanner scanner = dataset.newScan()) {
+            try (ArrowReader resultReader = scanner.scanBatches()) {
+              assertTrue(resultReader.loadNextBatch());
+              VectorSchemaRoot root = resultReader.getVectorSchemaRoot();
+              assertEquals(3, root.getRowCount());
+
+              IntVector idVector = (IntVector) root.getVector("id");
+              IntVector ageVectorResult = (IntVector) root.getVector("age");
+              for (int i = 0; i < 3; i++) {
+                assertEquals(i, idVector.get(i));
+                assertEquals(25 + i * 5, ageVectorResult.get(i));
+              }
+            }
+          }
+        }
+      }
+    } catch (Exception e) {
+      fail("Exception occurred during test: " + e.getMessage(), e);
     }
   }
 
