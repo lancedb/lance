@@ -50,7 +50,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
-use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::{InvertedIndexParams, SearchType};
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
@@ -559,7 +559,13 @@ impl Dataset {
             } else {
                 None
             };
-            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+            let search_type = full_text_query.get_item("search_type")?.ok_or("QueryThenFetch").map_err(|err| PyValueError::new_err(err.to_string()))?.to_string();
+            let search_type = if search_type.to_lowercase() == "dfsquerythenfetch" {
+                SearchType::DfsQueryThenFetch
+            } else {
+                SearchType::QueryThenFetch
+            };
+            let full_text_query = FullTextSearchQuery::new(query).columns(columns).search_type(search_type);
             scanner
                 .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

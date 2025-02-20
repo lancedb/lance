@@ -3385,6 +3385,7 @@ class ScannerBuilder:
         self,
         query: str,
         columns: Optional[List[str]] = None,
+        search_type: Literal["DfsQueryThenFetch", "QueryThenFetch"] = "QueryThenFetch",
     ) -> ScannerBuilder:
         """
         Filter rows by full text searching. *Experimental API*,
@@ -3392,7 +3393,7 @@ class ScannerBuilder:
 
         Must create inverted index on the given column before searching,
         """
-        self._full_text_query = {"query": query, "columns": columns}
+        self._full_text_query = {"query": query, "columns": columns, "search_type": search_type}
         return self
 
     def to_scanner(self) -> LanceScanner:

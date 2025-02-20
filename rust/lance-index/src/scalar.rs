@@ -278,6 +278,11 @@ impl FullTextSearchQuery {
         self
     }
 
+    pub fn search_type(mut self, search_type: SearchType) -> Self {
+        self.search_type = search_type;
+        self
+    }
+
     pub fn limit(mut self, limit: Option<i64>) -> Self {
         self.limit = limit;
         self

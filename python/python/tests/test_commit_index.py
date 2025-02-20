@@ -112,9 +112,19 @@ def create_multi_fragments_table(tmp_path) -> lance.LanceDataset:
             "sentiment": ["positive", "positive"],
         }
     )
+    data3 = pa.table(
+        {
+            "text": [
+                "Frodo was a sad puppy",
+                "Frodo was a very sad puppy",
+            ],
+            "sentiment": ["negative", "negative"],
+        }
+    )
 
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
     ds = lance.write_dataset(data2, tmp_path, mode="append")
+    ds = lance.write_dataset(data3, tmp_path, mode="append")
     return ds
 
 
@@ -138,8 +148,9 @@ def test_indexed_unindexed_fragments(tmp_path):
     )
 
     unindexed_fragments = ds.unindexed_fragments("text_idx")
-    assert len(unindexed_fragments) == 1
+    assert len(unindexed_fragments) == 2
     assert unindexed_fragments[0].id == frags[1].fragment_id
+    assert unindexed_fragments[1].id == frags[2].fragment_id
 
     indexed_fragments = [f for fs in ds.indexed_fragments("text_idx") for f in fs]
     assert len(indexed_fragments) == 1
@@ -150,7 +161,7 @@ def test_commit_multiple_indices(tmp_path):
     ds = create_multi_fragments_table(tmp_path)
 
     indices = []
-    for f in ds.get_fragments():
+    for f in ds.get_fragments()[:2]:
         # we can create an inverted index distributely
         index = ds.create_scalar_index("text", "INVERTED", fragment_ids=[f.fragment_id])
         assert isinstance(index, dict)
@@ -189,7 +200,7 @@ def test_commit_multiple_indices(tmp_path):
     )
 
     unindexed_fragments = ds.unindexed_fragments("text_idx")
-    assert len(unindexed_fragments) == 0
+    assert len(unindexed_fragments) == 1
 
     indexed_fragments = [f for fs in ds.indexed_fragments("text_idx") for f in fs]
     assert len(indexed_fragments) == 2

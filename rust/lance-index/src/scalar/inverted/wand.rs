@@ -17,6 +17,18 @@ use super::index::{idf, K1};
 use super::{DocInfo, PostingList};
 
 #[derive(Clone)]
+pub struct PostingDistributedFrequency {
+    pub num_docs: usize,
+    pub len: usize,
+}
+
+impl PostingDistributedFrequency {
+    pub fn new(num_docs: usize, len: usize) -> Self {
+        Self { num_docs, len }
+    }
+}
+
+#[derive(Clone)]
 pub struct PostingIterator {
     token_id: u32,
     position: i32,
@@ -24,7 +36,6 @@ pub struct PostingIterator {
     index: usize,
     mask: Arc<RowIdMask>,
     approximate_upper_bound: f32,
-    len: usize,
 }
 
 impl PartialEq for PostingIterator {
@@ -59,10 +70,12 @@ impl PostingIterator {
         list: PostingList,
         num_doc: usize,
         mask: Arc<RowIdMask>,
+        dfs: Option<PostingDistributedFrequency>,
     ) -> Self {
-        let approximate_upper_bound = match list.max_score() {
-            Some(max_score) => max_score,
-            None => idf(list.len(), num_doc) * (K1 + 1.0),
+        let approximate_upper_bound = match (&dfs, list.max_score()) {
+            (None , Some(max_score)) => max_score,
+            (None, None) => idf(list.len(), num_doc) * (K1 + 1.0),
+            (Some(dfs), _) => idf(dfs.len, dfs.num_docs) * (K1 + 1.0)
         };
 
         // move the iterator to the first selected document. This is important
@@ -71,7 +84,6 @@ impl PostingIterator {
         while index < list.len() && !mask.selected(list.row_id(index)) {
             index += 1;
         }
-        let len = list.len();
 
         Self {
             token_id,
@@ -80,7 +92,6 @@ impl PostingIterator {
             index,
             mask,
             approximate_upper_bound,
-            len,
         }
     }
 
