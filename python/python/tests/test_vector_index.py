@@ -1139,18 +1139,24 @@ def test_read_partition(indexed_dataset):
     num_rows = indexed_dataset.count_rows()
     row_sum = 0
     for part_id in range(reader.num_partitions()):
-        part_reader = reader.partition_reader(part_id)
-        for batch in part_reader:
-            row_sum += batch.num_rows
-            assert "_rowid" in batch.column_names
+        res = reader.read_partition(part_id)
+        row_sum += res.num_rows
+        assert "_rowid" in res.column_names
     assert row_sum == num_rows
 
     row_sum = 0
     for part_id in range(reader.num_partitions()):
-        part_reader = reader.partition_reader(part_id, with_vector=True)
-        for batch in part_reader:
-            row_sum += batch.num_rows
-            pq_column = batch["__pq_code"]
-            assert "_rowid" in batch.column_names
-            assert pq_column.type == pa.list_(pa.uint8(), 16)
+        res = reader.read_partition(part_id, with_vector=True)
+        row_sum += res.num_rows
+        pq_column = res["__pq_code"]
+        assert "_rowid" in res.column_names
+        assert pq_column.type == pa.list_(pa.uint8(), 16)
     assert row_sum == num_rows
+
+    # error tests
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_partition(reader.num_partitions() + 1)
+
+    with pytest.raises(ValueError, match="not vector index"):
+        indexed_dataset.create_scalar_index("id", index_type="BTREE")
+        VectorIndexReader(indexed_dataset, "id_idx")

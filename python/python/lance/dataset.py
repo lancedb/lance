@@ -3846,15 +3846,24 @@ def _validate_metadata(metadata: dict):
 class VectorIndexReader:
     def __init__(self, dataset: LanceDataset, index_name: str):
         stats = dataset.stats.index_stats(index_name)
-
         self.dataset = dataset
         self.index_name = index_name
         self.stats = stats
+        try:
+            self.num_partitions()
+        except KeyError:
+            raise ValueError(f"Index {index_name} is not vector index")
 
     def num_partitions(self) -> int:
         """
-        Returns the number of partitions in the index
+        Returns the number of partitions in the dataset.
+
+        Returns
+        -------
+        int
+            The number of partitions.
         """
+
         return self.stats["indices"][0]["num_partitions"]
 
     def centroids(self) -> np.ndarray:
@@ -3873,11 +3882,11 @@ class VectorIndexReader:
             self.dataset._ds.get_index_centroids(self.stats["indices"][0]["centroids"])
         )
 
-    def partition_reader(
+    def read_partition(
         self, partition_id: int, *, with_vector: bool = False
-    ) -> pa.RecordBatchReader:
+    ) -> pa.Table:
         """
-        Returns a reader for the given IVF partition
+        Returns a pyarrow table for the given IVF partition
 
         Parameters
         ----------
@@ -3889,10 +3898,17 @@ class VectorIndexReader:
 
         Returns
         -------
-        pa.RecordBatchReader
-            A record batch reader for the given partition
+        pa.Table
+            A pyarrow table for the given partition,
+            containing the row IDs, and quantized vectors (if with_vector is True).
         """
+
+        if partition_id < 0 or partition_id >= self.num_partitions():
+            raise IndexError(
+                f"Partition id {partition_id} is out of range, "
+                f"expected 0 <= partition_id < {self.num_partitions()}"
+            )
 
         return self.dataset._ds.read_index_partition(
             self.index_name, partition_id, with_vector
-        )
+        ).read_all()
