@@ -4,11 +4,14 @@
 //! Vector Index
 //!
 
+use std::any::Any;
+use std::fmt::Debug;
 use std::{collections::HashMap, sync::Arc};
 
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
+use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
 use lance_core::{Result, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
@@ -214,4 +217,9 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+}
+
+// it can be an IVF index or a partition of IVF index
+pub trait VectorIndexCacheEntry: Debug + Send + Sync + DeepSizeOf {
+    fn as_any(&self) -> &dyn Any;
 }
