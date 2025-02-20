@@ -119,7 +119,7 @@ impl From<DistanceType> for pb::VectorMetricType {
 /// It's always the IVF index, any other index types without partitioning will be treated as IVF with one partition.
 #[async_trait]
 #[allow(clippy::redundant_pub_crate)]
-pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index + VectorIndexCacheEntry {
+pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Search the vector for nearest neighbors.
     ///
     /// It returns a [RecordBatch] with Schema of:
