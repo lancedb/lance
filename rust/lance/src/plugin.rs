@@ -3,6 +3,7 @@
 
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
+use std::ffi::{c_char, CStr, CString};
 use std::path::Path;
 use serde_json::Value;
 use std::fmt;
@@ -18,7 +19,7 @@ pub struct PluginMetadata {
 
 pub trait PluginInstance {
     fn init(&mut self, config: &Value) -> Result<(), String>;
-    fn execute(&self, input: &str) -> String;
+    fn execute(&self, input: Value) -> Result<Value, String>;
     fn metadata(&self) -> PluginMetadata;
 }
 
@@ -26,11 +27,12 @@ pub trait PluginInstance {
 pub struct PluginInterface {
     pub create_plugin: unsafe extern "C" fn() -> *mut dyn PluginInstance,
     pub destroy_plugin: unsafe extern "C" fn(*mut dyn PluginInstance),
+    pub execute_plugin: unsafe extern "C" fn(*mut dyn PluginInstance, *const c_char) -> *const c_char,
     pub api_version: u32,
 }
 
 pub struct PluginManager {
-    plugins: HashMap<String, (Box<dyn PluginInstance>, Library)>,
+    plugins: HashMap<String, (*mut dyn PluginInstance, Library, &'static PluginInterface)>,
 }
 
 #[derive(Debug)]
@@ -66,6 +68,7 @@ impl PluginManager {
     pub fn load_plugin(&mut self, path: &Path) -> Result<(), PluginError> {
         unsafe {
             log::debug!("Loading plugin from: {}", path.display());
+            println!("Loading plugin from: {}", path.display());
 
             let lib = Library::new(path).map_err(PluginError::LibraryLoad)?;
 
@@ -89,39 +92,24 @@ impl PluginManager {
             let mut plugin = Box::from_raw(plugin_ptr);
 
             plugin.init(&Value::Null).map_err(|e| PluginError::SymbolError(format!(
-                "Failed to get plugin_interface for '{}': {:?}", path.display(), e
+                "Failed to initialize plugin: {}", e
             )))?;
 
             let metadata = plugin.metadata();
-            self.plugins.insert(metadata.name.clone(), (plugin, lib));
+            let raw_ptr = Box::into_raw(plugin);
+            self.plugins.insert(metadata.name.clone(), (raw_ptr, lib, interface));
 
             Ok(())
         }
     }
 
     pub fn unload_plugin(&mut self, name: &str) -> Result<(), PluginError> {
-        let (plugin, lib) = self.plugins.remove(name)
+        let (ptr, lib, interface) = self.plugins.remove(name)
             .ok_or_else(|| PluginError::NotFound(format!("Plugin '{}' not loaded", name)))?;
 
         unsafe {
-            let interface_ptr: Symbol<unsafe extern "C" fn() -> &'static PluginInterface> = lib
-                .get(b"get_plugin_interface")
-                .map_err(|e| PluginError::SymbolError(format!(
-                    "Failed to get plugin_interface for '{}': {:?}", name, e
-                )))?;
-            let interface = interface_ptr();
-
-            assert_eq!(
-                std::mem::size_of::<PluginInterface>(),
-                std::mem::size_of_val(&*interface),
-                "ABI mismatch in unload (size {} vs {})",
-                std::mem::size_of::<PluginInterface>(),
-                std::mem::size_of_val(&*interface)
-            );
-
-            let raw_ptr = Box::into_raw(plugin);
-            if !raw_ptr.is_null() {
-                (interface.destroy_plugin)(raw_ptr);
+            if !ptr.is_null() {
+                (interface.destroy_plugin)(ptr);
             } else {
                 return Err(PluginError::NullPointer(
                     format!("Null pointer when unloading '{}'", name)
@@ -136,27 +124,42 @@ impl PluginManager {
         Ok(())
     }
 
-    pub fn execute_plugin(&self, name: &str, input: &str) -> Result<String, String> {
-        self.plugins
-            .get(name)
-            .map(|(p, _)| p.execute(input))
-            .ok_or_else(|| format!("Plugin {} not found", name))
+    pub fn execute_plugin(&self, name: &str, input: &Value) -> Result<Value, String> {
+        let (ptr, _, interface) = self.plugins.get(name)
+            .ok_or_else(|| format!("Plugin {} not found", name))?;
+
+        unsafe {
+            let input_str = serde_json::to_string(input).map_err(|e| e.to_string())?;
+            let c_input = CString::new(input_str).map_err(|e| e.to_string())?;
+
+            let c_output = (interface.execute_plugin)(*ptr, c_input.as_ptr());
+
+            let output_str = CStr::from_ptr(c_output)
+                .to_str()
+                .map_err(|e| e.to_string())?;
+
+            serde_json::from_str(output_str).map_err(|e| e.to_string())
+        }
     }
 
     pub fn get_metadata(&self, name: &str) -> Option<PluginMetadata> {
-        self.plugins.get(name).map(|(p, _)| p.metadata())
+        self.plugins.get(name).map(|(ptr, _, _)| {
+            let plugin = unsafe { &**ptr };
+            plugin.metadata()
+        })
     }
 }
 
 impl Drop for PluginManager {
     fn drop(&mut self) {
-        let plugins = std::mem::take(&mut self.plugins);
-        for (name, (plugin, lib)) in plugins.into_iter() {
+        for (name, (ptr, lib, interface)) in self.plugins.drain() {
             unsafe {
-                if let Ok(interface) = lib.get::<PluginInterface>(b"plugin_interface") {
-                    log::debug!("Dropping plugin: {}", name);
-                    (interface.destroy_plugin)(Box::into_raw(plugin));
+                if !ptr.is_null() {
+                    (interface.destroy_plugin)(ptr);
                 }
+                lib.close().unwrap_or_else(|e| {
+                    log::error!("Failed to close library for {}: {:?}", name, e);
+                });
             }
         }
     }
@@ -228,16 +231,18 @@ mod tests {
         let path = get_plugin_path();
         manager.load_plugin(path).unwrap();
 
-        let result = manager.execute_plugin("test_plugin", "test_input");
+        let input = serde_json::json!({"input": "test"});
+        let result = manager.execute_plugin("test_plugin", &input);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "Processed: test_input");
+        assert_eq!(result.unwrap(), serde_json::json!({"result": "Processed: test"}));
     }
 
     #[test]
     fn test_execute_nonexistent_plugin() {
         let manager = PluginManager::new();
 
-        let result = manager.execute_plugin("nonexistent_plugin", "input");
+        let input = serde_json::json!({"input": "test"});
+        let result = manager.execute_plugin("nonexistent_plugin", &input);
         assert!(
             result.is_err(),
             "Should return error for nonexistent plugin"
@@ -248,7 +253,7 @@ mod tests {
     fn test_unload_plugin() {
         let mut manager = PluginManager::new();
         let path = get_plugin_path();
-        manager.load_plugin(path).unwrap();
+        manager.load_plugin(path);
 
         let result = manager.unload_plugin("test_plugin");
         println!("{:?}", result);
