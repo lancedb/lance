@@ -63,6 +63,11 @@ impl DeepSizeOf for IndexCache {
                 .map(|(_, v)| v.deep_size_of_children(context))
                 .sum::<usize>()
             + self
+                .vector_partition_cache
+                .iter()
+                .map(|(_, v)| v.deep_size_of_children(context))
+                .sum::<usize>()
+            + self
                 .metadata_cache
                 .iter()
                 .map(|(_, v)| v.deep_size_of_children(context))
@@ -92,9 +97,11 @@ impl IndexCache {
     pub(crate) fn get_size(&self) -> usize {
         self.scalar_cache.run_pending_tasks();
         self.vector_cache.run_pending_tasks();
+        self.vector_partition_cache.run_pending_tasks();
         self.metadata_cache.run_pending_tasks();
         (self.scalar_cache.entry_count()
             + self.vector_cache.entry_count()
+            + self.vector_partition_cache.entry_count()
             + self.metadata_cache.entry_count()) as usize
     }
 
