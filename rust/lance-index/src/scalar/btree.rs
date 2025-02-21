@@ -1265,6 +1265,13 @@ impl TrainingSource for BTreeUpdater {
         self: Box<Self>,
         chunk_size: u32,
     ) -> Result<SendableRecordBatchStream> {
+        let data_type = self.new_data.schema().field(0).data_type().clone();
+        // Datafusion currently has bugs with spilling on string columns
+        // See https://github.com/apache/datafusion/issues/10073
+        //
+        // One we upgrade we can remove this
+        let use_spilling = !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8);
+
         let new_input = Arc::new(OneShotExec::new(self.new_data));
         let old_input = Self::into_old_input(self.index);
         debug_assert_eq!(
@@ -1285,10 +1292,11 @@ impl TrainingSource for BTreeUpdater {
             LexOrdering::new(vec![sort_expr]),
             all_data,
         ));
+
         let unchunked = execute_plan(
             ordered,
             LanceExecutionOptions {
-                use_spilling: true,
+                use_spilling,
                 ..Default::default()
             },
         )?;
