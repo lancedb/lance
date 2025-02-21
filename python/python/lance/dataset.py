@@ -3844,6 +3844,32 @@ def _validate_metadata(metadata: dict):
 
 
 class VectorIndexReader:
+    """
+    This class allows you to initialize a reader for a specific vector index,
+    retrieve the number of partitions,
+    access the centroids of the index,
+    and read specific partitions of the index.
+
+    Parameters
+    ----------
+    dataset: LanceDataset
+        The dataset containing the index.
+    index_name: str
+        The name of the vector index to read.
+
+    Examples
+    --------
+    >>> dataset = lance.dataset(uri)
+    >>> reader = VectorIndexReader(dataset, "vector_idx")
+    >>> partition = reader.read_partition(0)
+    >>> assert "_rowid" in partition.column_names
+
+    Exceptions
+    ----------
+    ValueError
+        If the specified index is not a vector index.
+    """
+
     def __init__(self, dataset: LanceDataset, index_name: str):
         stats = dataset.stats.index_stats(index_name)
         self.dataset = dataset
