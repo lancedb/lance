@@ -1176,6 +1176,7 @@ impl Dataset {
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
             "BITMAP" => IndexType::Bitmap,
+            "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
@@ -1192,6 +1193,9 @@ impl Dataset {
             "BITMAP" => Box::new(ScalarIndexParams {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
+            }),
+            "NGRAM" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::NGram),
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),

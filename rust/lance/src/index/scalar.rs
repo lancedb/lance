@@ -12,6 +12,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
+use lance_index::scalar::ngram::{train_ngram_index, NGramIndex};
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::{
     bitmap::{train_bitmap_index, BitmapIndex, BITMAP_LOOKUP_NAME},
@@ -125,6 +126,11 @@ fn label_list_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
+fn ngram_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::NGramIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
 pub(super) fn inverted_index_details() -> prost_types::Any {
     let details = lance_table::format::pb::InvertedIndexDetails::default();
     prost_types::Any::from_msg(&details).unwrap()
@@ -154,6 +160,12 @@ impl ScalarIndexDetails for lance_table::format::pb::InvertedIndexDetails {
     }
 }
 
+impl ScalarIndexDetails for lance_table::format::pb::NGramIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::NGram
+    }
+}
+
 fn get_scalar_index_details(
     details: &prost_types::Any,
 ) -> Result<Option<Box<dyn ScalarIndexDetails>>> {
@@ -172,6 +184,10 @@ fn get_scalar_index_details(
     } else if details.type_url.ends_with("InvertedIndexDetails") {
         Ok(Some(Box::new(
             details.to_msg::<lance_table::format::pb::InvertedIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("NGramIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::NGramIndexDetails>()?,
         )))
     } else {
         Ok(None)
@@ -242,6 +258,16 @@ pub(super) async fn build_scalar_index(
             .await?;
             Ok(inverted_index_details())
         }
+        Some(ScalarIndexType::NGram) => {
+            if field.data_type() != DataType::Utf8 {
+                return Err(Error::InvalidInput {
+                    source: "NGram index can only be created on Utf8 type columns".into(),
+                    location: location!(),
+                });
+            }
+            train_ngram_index(training_request, &index_store).await?;
+            Ok(ngram_index_details())
+        }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
             train_btree_index(
@@ -292,6 +318,10 @@ pub async fn open_scalar_index(
         ScalarIndexType::Inverted => {
             let inverted_index = InvertedIndex::load(index_store).await?;
             Ok(inverted_index as Arc<dyn ScalarIndex>)
+        }
+        ScalarIndexType::NGram => {
+            let ngram_index = NGramIndex::load(index_store).await?;
+            Ok(ngram_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::BTree => {
             let btree_index = BTreeIndex::load(index_store).await?;
