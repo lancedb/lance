@@ -3867,8 +3867,8 @@ class VectorIndexReader:
     >>> data = pa.table({"vector": pa.array(vectors.tolist(), \\
     ...    type=pa.list_(pa.float32(), 2))})
     >>> dataset = lance.write_dataset(data, "/tmp/index_reader_demo")
-    >>> dataset.create_index( \\
-            "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2)
+    >>> dataset.create_index("vector", \\
+    ...    index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2)
     >>> reader = VectorIndexReader(dataset, "vector_idx")
     >>> assert reader.num_partitions() == 4
     >>> partition = reader.read_partition(0)
