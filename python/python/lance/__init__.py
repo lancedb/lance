@@ -11,6 +11,7 @@ from .blob import BlobColumn, BlobFile
 from .dataset import (
     DataStatistics,
     FieldStatistics,
+    Index,
     LanceDataset,
     LanceOperation,
     LanceScanner,
@@ -47,6 +48,7 @@ __all__ = [
     "LanceScanner",
     "MergeInsertBuilder",
     "Transaction",
+    "Index",
     "__version__",
     "bytes_read_counter",
     "iops_counter",
