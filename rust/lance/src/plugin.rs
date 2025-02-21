@@ -68,7 +68,6 @@ impl PluginManager {
     pub fn load_plugin(&mut self, path: &Path) -> Result<(), PluginError> {
         unsafe {
             log::debug!("Loading plugin from: {}", path.display());
-            println!("Loading plugin from: {}", path.display());
 
             let lib = Library::new(path).map_err(PluginError::LibraryLoad)?;
 
