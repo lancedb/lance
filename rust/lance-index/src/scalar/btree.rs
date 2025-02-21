@@ -47,7 +47,7 @@ use crate::{Index, IndexType};
 
 use super::{
     flat::FlatIndexMetadata, AnyQuery, IndexReader, IndexStore, IndexWriter, SargableQuery,
-    ScalarIndex,
+    ScalarIndex, SearchResult,
 };
 
 const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
@@ -781,7 +781,13 @@ impl BTreeIndex {
         // values that might be in the page.  E.g. if we are searching for X IN [5, 3, 7] and five is in pages
         // 1 and 2 and three is in page 2 and seven is in pages 8 and 9 then when we search page 2 we only need
         // to search for X IN [5, 3]
-        subindex.search(query).await
+        match subindex.search(query).await? {
+            SearchResult::Exact(map) => Ok(map),
+            _ => Err(Error::Internal {
+                message: "BTree sub-indices need to return exact results".to_string(),
+                location: location!(),
+            }),
+        }
     }
 
     fn try_from_serialized(
@@ -943,7 +949,7 @@ impl Index for BTreeIndex {
 
 #[async_trait]
 impl ScalarIndex for BTreeIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let pages = match query {
             SargableQuery::Equals(val) => self
@@ -970,12 +976,17 @@ impl ScalarIndex for BTreeIndex {
             })
             .collect::<Vec<_>>();
         debug!("Searching {} btree pages", page_tasks.len());
-        stream::iter(page_tasks)
+        let row_ids = stream::iter(page_tasks)
             // I/O and compute mixed here but important case is index in cache so
             // use compute intensive thread count
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<RowIdTreeMap>()
-            .await
+            .await?;
+        Ok(SearchResult::Exact(row_ids))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {

@@ -828,6 +828,16 @@ impl Projection {
         }
     }
 
+    pub fn with_row_id(mut self) -> Self {
+        self.with_row_id = true;
+        self
+    }
+
+    pub fn with_row_addr(mut self) -> Self {
+        self.with_row_addr = true;
+        self
+    }
+
     /// Add a column (and any of its parents) to the projection from a string reference
     pub fn union_column(mut self, column: impl AsRef<str>, on_missing: OnMissing) -> Result<Self> {
         let column = column.as_ref();
@@ -853,6 +863,11 @@ impl Projection {
     /// True if the projection selects the given field id
     pub fn contains_field_id(&self, id: i32) -> bool {
         self.field_ids.contains(&id)
+    }
+
+    /// True if the projection selects fields other than the row id / addr
+    pub fn has_data_fields(&self) -> bool {
+        !self.field_ids.is_empty()
     }
 
     /// Add multiple columns (and their parents) to the projection

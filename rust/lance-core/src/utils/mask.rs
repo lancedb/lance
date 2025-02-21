@@ -10,7 +10,7 @@ use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use deepsize::DeepSizeOf;
-use roaring::{MultiOps, RoaringBitmap};
+use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
 use crate::Result;
 
@@ -703,6 +703,16 @@ impl FromIterator<u64> for RowIdTreeMap {
 impl<'a> FromIterator<&'a u64> for RowIdTreeMap {
     fn from_iter<T: IntoIterator<Item = &'a u64>>(iter: T) -> Self {
         Self::from_iter(iter.into_iter().copied())
+    }
+}
+
+impl From<RoaringTreemap> for RowIdTreeMap {
+    fn from(roaring: RoaringTreemap) -> Self {
+        let mut inner = BTreeMap::new();
+        for (fragment, set) in roaring.bitmaps() {
+            inner.insert(fragment, RowIdSelection::Partial(set.clone()));
+        }
+        Self { inner }
     }
 }
 

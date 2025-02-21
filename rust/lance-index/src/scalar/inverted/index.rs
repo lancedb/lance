@@ -38,7 +38,7 @@ use super::{wand::*, InvertedIndexBuilder, TokenizerConfig};
 use crate::prefilter::{NoFilter, PreFilter};
 use crate::scalar::{
     AnyQuery, FullTextSearchQuery, IndexReader, IndexStore, InvertedIndexParams, SargableQuery,
-    ScalarIndex,
+    ScalarIndex, SearchResult,
 };
 use crate::Index;
 
@@ -63,7 +63,7 @@ pub const K1: f32 = 1.2;
 pub const B: f32 = 0.75;
 
 lazy_static! {
-    static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
+    pub static ref CACHE_SIZE: usize = std::env::var("LANCE_INVERTED_CACHE_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(512 * 1024 * 1024);
@@ -224,7 +224,7 @@ impl Index for InvertedIndex {
 impl ScalarIndex for InvertedIndex {
     // return the row ids of the documents that contain the query
     #[instrument(level = "debug", skip_all)]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let row_ids = match query {
             SargableQuery::FullTextSearch(query) => self
@@ -240,7 +240,11 @@ impl ScalarIndex for InvertedIndex {
             }
         };
 
-        Ok(RowIdTreeMap::from_iter(row_ids))
+        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(row_ids)))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
@@ -325,6 +329,20 @@ pub struct TokenSet {
 }
 
 impl TokenSet {
+    pub(crate) fn new(tokens: HashMap<String, u32>) -> Self {
+        let next_id = tokens.values().max().copied().unwrap_or(0) + 1;
+        let total_length = tokens.keys().map(|s| s.len()).sum();
+        Self {
+            tokens,
+            next_id,
+            total_length,
+        }
+    }
+
+    pub fn num_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
     pub fn to_batch(self) -> Result<RecordBatch> {
         let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
         let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
@@ -389,6 +407,10 @@ impl TokenSet {
 
     pub fn get(&self, token: &str) -> Option<u32> {
         self.tokens.get(token).copied()
+    }
+
+    pub fn all_tokens(&self) -> impl Iterator<Item = u32> + '_ {
+        self.tokens.values().copied()
     }
 
     pub fn next_id(&self) -> u32 {

@@ -19,6 +19,7 @@ use tracing::instrument;
 
 use crate::{Index, IndexType};
 
+use super::SearchResult;
 use super::{bitmap::train_bitmap_index, SargableQuery};
 use super::{
     bitmap::BitmapIndex, btree::TrainingSource, AnyQuery, IndexStore, LabelListQuery, ScalarIndex,
@@ -26,7 +27,19 @@ use super::{
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
 
-trait LabelListSubIndex: ScalarIndex + DeepSizeOf {}
+#[async_trait]
+trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
+    async fn search_exact(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+        let result = self.search(query).await?;
+        match result {
+            SearchResult::Exact(row_ids) => Ok(row_ids),
+            _ => Err(Error::Internal {
+                message: "Label list sub-index should return exact results".to_string(),
+                location: location!(),
+            }),
+        }
+    }
+}
 
 impl<T: ScalarIndex + DeepSizeOf> LabelListSubIndex for T {}
 
@@ -82,7 +95,7 @@ impl LabelListIndex {
         futures::stream::iter(values)
             .then(move |value| {
                 let value_query = SargableQuery::Equals(value.clone());
-                async move { self.values_index.search(&value_query).await }
+                async move { self.values_index.search_exact(&value_query).await }
             })
             .boxed()
     }
@@ -121,10 +134,10 @@ impl LabelListIndex {
 #[async_trait]
 impl ScalarIndex for LabelListIndex {
     #[instrument(skip(self), level = "debug")]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
-        match query {
+        let row_ids = match query {
             LabelListQuery::HasAllLabels(labels) => {
                 let values_results = self.search_values(labels);
                 self.set_intersection(values_results, labels.len() == 1)
@@ -134,7 +147,12 @@ impl ScalarIndex for LabelListIndex {
                 let values_results = self.search_values(labels);
                 self.set_union(values_results, labels.len() == 1).await
             }
-        }
+        }?;
+        Ok(SearchResult::Exact(row_ids))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {
