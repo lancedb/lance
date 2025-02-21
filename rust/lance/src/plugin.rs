@@ -298,4 +298,54 @@ mod tests {
             "Reloading same plugin should replace existing entry"
         );
     }
+
+
+    fn get_plugins_dir_path() -> &'static Path {
+        PLUGIN_PATH.get_or_init(|| {
+            let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let project_root = manifest_dir
+                .parent().unwrap();
+
+            let mut path = project_root.join("lance").join("plugins");
+
+            #[cfg(target_os = "linux")]
+            path.push("libdemo_plugin.so");
+            #[cfg(target_os = "macos")]
+            path.push("libdemo_plugin.dylib");
+            #[cfg(target_os = "windows")]
+            path.push("demo_plugin.dll");
+
+            assert!(
+                path.exists(),
+                "Plugin not found in plugins dir: {}\nHINT: Run `cargo build --example demo_plugin --features demo-plugin` first",
+                path.display()
+            );
+            path
+        })
+    }
+
+    #[test]
+    fn test_load_from_plugins_dir() {
+        init_logger();
+        let mut manager = PluginManager::new();
+        let path = get_plugins_dir_path();
+
+        let load_result = manager.load_plugin(path);
+        assert!(load_result.is_ok(), "Failed to load from plugins dir: {:?}", load_result);
+
+        let metadata = manager.get_metadata("demo_plugin").unwrap();
+        assert_eq!(metadata.version, "1.0");
+        assert_eq!(metadata.description, "Test Plugin");
+
+        let input = serde_json::json!({"input": "from_plugins_dir"});
+        let output = manager.execute_plugin("demo_plugin", &input).unwrap();
+        assert_eq!(
+            output,
+            serde_json::json!({"result": "Processed: from_plugins_dir"}),
+            "Execution result mismatch"
+        );
+
+        let unload_result = manager.unload_plugin("demo_plugin");
+        assert!(unload_result.is_ok(), "Unload failed: {:?}", unload_result);
+    }
 }
