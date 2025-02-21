@@ -76,15 +76,12 @@ macro_rules! as_inverted_index {
             .as_any()
             .downcast_ref::<InvertedIndex>()
             .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Index {} is not an inverted index",
-                    $uuid,
-                ))
+                DataFusionError::Execution(format!("Index {} is not an inverted index", $uuid,))
             })
     };
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DistributedFrequency {
     posting_lens: HashMap<String, usize>,
     num_tokens: u64,
@@ -96,13 +93,13 @@ impl DistributedFrequency {
         self.num_tokens as f32 / self.num_docs as f32
     }
     fn posting_frequency(&self, token: &String) -> Option<PostingDistributedFrequency> {
-        self.posting_lens.get(token).map(|posting_len| {
-            PostingDistributedFrequency::new(self.num_docs, *posting_len)
-        })
+        self.posting_lens
+            .get(token)
+            .map(|posting_len| PostingDistributedFrequency::new(self.num_docs, *posting_len))
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ParsedQuery {
     query: FullTextSearchQuery,
     tokens: Vec<String>,
@@ -111,19 +108,21 @@ pub struct ParsedQuery {
 
 impl ParsedQuery {
     pub fn count(&mut self, index: &InvertedIndex) {
-        if self.query.search_type == SearchType::DfsQueryThenFetch {
-            for token in &self.tokens {
-                let len = index.posting_len(token);
-                if len > 0 {
-                    match self.dfs.posting_lens.get_mut(token) {
-                        Some(v) => {(*v) += len;},
-                        None => {self.dfs.posting_lens.insert(token.clone(), len);}
+        for token in &self.tokens {
+            let len = index.posting_len(token);
+            if len > 0 {
+                match self.dfs.posting_lens.get_mut(token) {
+                    Some(v) => {
+                        (*v) += len;
+                    }
+                    None => {
+                        self.dfs.posting_lens.insert(token.clone(), len);
                     }
                 }
             }
-            self.dfs.num_tokens += index.num_tokens();
-            self.dfs.num_docs = index.num_docs();
         }
+        self.dfs.num_tokens += index.num_tokens();
+        self.dfs.num_docs += index.num_docs();
     }
 }
 
@@ -155,24 +154,27 @@ impl DeepSizeOf for InvertedIndex {
 }
 
 impl InvertedIndex {
-
-    pub fn parse(
-        &self,
-        query: &FullTextSearchQuery
-    ) -> Result<ParsedQuery> {
+    pub fn parse(&self, query: &FullTextSearchQuery) -> Result<ParsedQuery> {
         let mut tokenizer = self.tokenizer.clone();
         let tokens = collect_tokens(&query.query, &mut tokenizer, None);
-        let posting_lens = tokens.iter().map(|token| {
-            let posting_len = self.posting_len(token);
-            (token.clone(), posting_len)
-        }).collect();
+        let posting_lens = tokens
+            .iter()
+            .map(|token| {
+                let posting_len = self.posting_len(token);
+                (token.clone(), posting_len)
+            })
+            .collect();
         let num_docs = self.num_docs();
         let num_tokens = self.num_tokens();
-        let dfs = DistributedFrequency{posting_lens, num_docs, num_tokens};
-        Ok(ParsedQuery{
+        let dfs = DistributedFrequency {
+            posting_lens,
+            num_docs,
+            num_tokens,
+        };
+        Ok(ParsedQuery {
             query: query.clone(),
             tokens,
-            dfs
+            dfs,
         })
     }
 
@@ -187,7 +189,7 @@ impl InvertedIndex {
     pub fn posting_len(&self, token: &String) -> usize {
         match self.tokens.get(token) {
             Some(token_id) => self.inverted_list.posting_len(token_id),
-            None => 0
+            None => 0,
         }
     }
     // map tokens to token ids
@@ -225,9 +227,9 @@ impl InvertedIndex {
     }
 
     pub async fn parsed_search(
-        &self, 
-        parsed: &ParsedQuery, 
-        prefilter: Arc<dyn PreFilter>
+        &self,
+        parsed: &ParsedQuery,
+        prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
         let token_ids = self.token_ids(&parsed.tokens, is_phrase_query(&parsed.query.query))?;
         self.bm25_search(token_ids, parsed, prefilter).await
@@ -253,7 +255,8 @@ impl InvertedIndex {
         parsed: &ParsedQuery,
         prefilter: Arc<dyn PreFilter>,
     ) -> Result<Vec<(u64, f32)>> {
-        let limit = parsed.query
+        let limit = parsed
+            .query
             .limit
             .map(|limit| limit as usize)
             .unwrap_or(usize::MAX);
@@ -261,39 +264,43 @@ impl InvertedIndex {
 
         let mask = prefilter.mask();
         let is_phrase_query = is_phrase_query(&parsed.query.query);
-        let token_id_dfs: Vec<(u32, Option<PostingDistributedFrequency>)> = token_ids.into_iter().map(|(token, id)| {
-            let dfs = if parsed.query.search_type == SearchType::DfsQueryThenFetch {
-                parsed.dfs.posting_frequency(&token)
-            } else {
-                None
-            };
-            (id, dfs)
-        }).collect();
+        let token_id_dfs: Vec<(u32, Option<PostingDistributedFrequency>)> = token_ids
+            .into_iter()
+            .map(|(token, id)| {
+                let dfs = if parsed.query.search_type == SearchType::DfsQueryThenFetch {
+                    parsed.dfs.posting_frequency(&token)
+                } else {
+                    None
+                };
+                (id, dfs)
+            })
+            .collect();
         let postings = stream::iter(token_id_dfs)
             .enumerate()
             .zip(repeat_with(|| (self.inverted_list.clone(), mask.clone())))
-            .map(|((position, (token_id, posting_frequency)), (inverted_list, mask))| async move {
-                let posting = inverted_list
-                    .posting_list(token_id, is_phrase_query)
-                    .await?;
-                Result::Ok(PostingIterator::new(
-                    token_id,
-                    position as i32,
-                    posting,
-                    self.docs.len(),
-                    mask,
-                    posting_frequency,
-                ))
-            })
+            .map(
+                |((position, (token_id, posting_frequency)), (inverted_list, mask))| async move {
+                    let posting = inverted_list
+                        .posting_list(token_id, is_phrase_query)
+                        .await?;
+                    Result::Ok(PostingIterator::new(
+                        token_id,
+                        position as i32,
+                        posting,
+                        parsed.dfs.num_docs,
+                        mask,
+                        posting_frequency.map(|dfs| dfs.len),
+                    ))
+                },
+            )
             // Use compute count since data hopefully cached
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
         let avgdl = parsed.dfs.avgdl();
-        let mut wand = Wand::new(self.docs.len(), postings.into_iter());
+        let mut wand = Wand::new(parsed.dfs.num_docs, postings.into_iter());
         wand.search(is_phrase_query, limit, wand_factor, |doc, freq| {
-            let doc_norm =
-                K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / avgdl);
+            let doc_norm = K1 * (1.0 - B + B * self.docs.num_tokens(doc) as f32 / avgdl);
             freq / (freq + doc_norm)
         })
         .await
@@ -1165,7 +1172,6 @@ pub fn flat_bm25_search(
         }
         let mut score = 0.0;
         for token in query_tokens.iter() {
-
             let freq = doc_token_count.get(token).copied().unwrap_or_default() as f32;
             let idf = if let Some(freq) = parsed.dfs.posting_frequency(token) {
                 idf(freq.len, freq.num_docs)
@@ -1195,12 +1201,7 @@ pub fn flat_bm25_search_stream(
     let mut tokenizer = index.tokenizer.clone();
     let stream = input.map(move |batch| {
         let batch = batch?;
-        let scored_batch = flat_bm25_search(
-            batch,
-            &doc_col,
-            &parsed,
-            &mut tokenizer,
-        )?;
+        let scored_batch = flat_bm25_search(batch, &doc_col, &parsed, &mut tokenizer)?;
 
         // filter out rows with score 0
         let score_col = scored_batch[SCORE_COL].as_primitive::<Float32Type>();

@@ -16,7 +16,7 @@ use super::builder::OrderedDoc;
 use super::index::{idf, K1};
 use super::{DocInfo, PostingList};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PostingDistributedFrequency {
     pub num_docs: usize,
     pub len: usize,
@@ -36,6 +36,7 @@ pub struct PostingIterator {
     index: usize,
     mask: Arc<RowIdMask>,
     approximate_upper_bound: f32,
+    len: usize,
 }
 
 impl PartialEq for PostingIterator {
@@ -70,14 +71,17 @@ impl PostingIterator {
         list: PostingList,
         num_doc: usize,
         mask: Arc<RowIdMask>,
-        dfs: Option<PostingDistributedFrequency>,
+        dfs_len: Option<usize>,
     ) -> Self {
-        let approximate_upper_bound = match (&dfs, list.max_score()) {
-            (None , Some(max_score)) => max_score,
-            (None, None) => idf(list.len(), num_doc) * (K1 + 1.0),
-            (Some(dfs), _) => idf(dfs.len, dfs.num_docs) * (K1 + 1.0)
+        let len: usize = match &dfs_len {
+            Some(dfs_len) => *dfs_len,
+            None => list.len(),
         };
-
+        let approximate_upper_bound = match (&dfs_len, list.max_score()) {
+            (None, Some(max_score)) => max_score,
+            (None, None) => idf(list.len(), num_doc) * (K1 + 1.0),
+            (Some(dfs_len), _) => idf(*dfs_len, num_doc) * (K1 + 1.0),
+        };
         // move the iterator to the first selected document. This is important
         // because caller might directly call `doc()` without calling `next()`.
         let mut index = 0;
@@ -92,6 +96,7 @@ impl PostingIterator {
             index,
             mask,
             approximate_upper_bound,
+            len,
         }
     }
 
@@ -206,7 +211,7 @@ impl Wand {
                 break;
             }
             debug_assert!(cur_doc.row_id == doc_id);
-            let idf = idf(posting.list.len(), self.num_docs);
+            let idf = idf(posting.len, self.num_docs);
             score += idf * (K1 + 1.0) * scorer(doc_id, cur_doc.frequency);
         }
         score

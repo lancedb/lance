@@ -4,7 +4,7 @@
 //! Scalar indices for metadata search & filtering
 
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::{any::Any, ops::Bound, sync::Arc};
 
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
@@ -239,6 +239,15 @@ impl PartialEq for dyn AnyQuery {
 pub enum SearchType {
     QueryThenFetch,
     DfsQueryThenFetch,
+}
+
+impl Display for SearchType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SearchType::QueryThenFetch => write!(f, "QueryThenFetch"),
+            SearchType::DfsQueryThenFetch => write!(f, "DfsQueryThenFetch"),
+        }
+    }
 }
 
 /// A full text search query

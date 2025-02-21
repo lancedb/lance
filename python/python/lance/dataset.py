@@ -88,6 +88,8 @@ IndexType = Union[
     Literal["FTS"],
 ]
 
+SearchType = Literal["DfsQueryThenFetch", "QueryThenFetch"]
+
 
 class MergeInsertBuilder(_MergeInsertBuilder):
     def execute(self, data_obj: ReaderLike, *, schema: Optional[pa.Schema] = None):
@@ -420,6 +422,11 @@ class LanceDataset(pa.dataset.Dataset):
                 currently only supports a single column in the columns list.
             - query: str
                 The query string to search for.
+            - search_type: SearchType
+                The search type to use, default is QueryThenFetch.
+                QueryThenFetch: filter the results directly.
+                DfsQueryThenFetch: collect frequency of the indexed column first,
+                    then filter the results. Cost more time but more accurate.
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
@@ -621,6 +628,11 @@ class LanceDataset(pa.dataset.Dataset):
                 currently only supports a single column in the columns list.
             - query: str
                 The query string to search for.
+            - search_type: SearchType
+                The search type to use, default is QueryThenFetch.
+                QueryThenFetch: filter the results directly.
+                DfsQueryThenFetch: collect frequency of the indexed column first,
+                    then filter the results. Cost more time but more accurate.
 
         Notes
         -----
@@ -3385,7 +3397,7 @@ class ScannerBuilder:
         self,
         query: str,
         columns: Optional[List[str]] = None,
-        search_type: Literal["DfsQueryThenFetch", "QueryThenFetch"] = "QueryThenFetch",
+        search_type: SearchType = "QueryThenFetch",
     ) -> ScannerBuilder:
         """
         Filter rows by full text searching. *Experimental API*,
@@ -3393,7 +3405,11 @@ class ScannerBuilder:
 
         Must create inverted index on the given column before searching,
         """
-        self._full_text_query = {"query": query, "columns": columns, "search_type": search_type}
+        self._full_text_query = {
+            "query": query,
+            "columns": columns,
+            "search_type": search_type,
+        }
         return self
 
     def to_scanner(self) -> LanceScanner:

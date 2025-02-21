@@ -559,13 +559,21 @@ impl Dataset {
             } else {
                 None
             };
-            let search_type = full_text_query.get_item("search_type")?.ok_or("QueryThenFetch").map_err(|err| PyValueError::new_err(err.to_string()))?.to_string();
-            let search_type = if search_type.to_lowercase() == "dfsquerythenfetch" {
-                SearchType::DfsQueryThenFetch
-            } else {
-                SearchType::QueryThenFetch
+            let search_type = full_text_query.get_item("search_type")?;
+            let search_type = match search_type {
+                Some(search_type) => {
+                    let search_type = search_type.to_string().to_lowercase();
+                    if search_type == SearchType::DfsQueryThenFetch.to_string().to_lowercase() {
+                        SearchType::DfsQueryThenFetch
+                    } else {
+                        SearchType::QueryThenFetch
+                    }
+                }
+                None => SearchType::QueryThenFetch,
             };
-            let full_text_query = FullTextSearchQuery::new(query).columns(columns).search_type(search_type);
+            let full_text_query = FullTextSearchQuery::new(query)
+                .columns(columns)
+                .search_type(search_type);
             scanner
                 .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;

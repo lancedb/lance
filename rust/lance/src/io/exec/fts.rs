@@ -17,7 +17,9 @@ use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
 use lance_index::as_inverted_index;
 use lance_index::prefilter::{FilterLoader, PreFilter};
-use lance_index::scalar::inverted::{flat_bm25_search_stream, InvertedIndex, ParsedQuery, FTS_SCHEMA};
+use lance_index::scalar::inverted::{
+    flat_bm25_search_stream, InvertedIndex, ParsedQuery, FTS_SCHEMA,
+};
 use lance_index::scalar::{FullTextSearchQuery, SearchType};
 use lance_table::format::Index;
 use tracing::instrument;
@@ -28,7 +30,12 @@ use crate::{index::DatasetIndexInternalExt, Dataset};
 use super::utils::{FilteredRowIdsToPrefilter, SelectionVectorToPrefilter};
 use super::PreFilterSource;
 
-async fn parse_query(query: &FullTextSearchQuery, column: &String, indices: &[Index], ds: &Arc<Dataset>) -> DataFusionResult<ParsedQuery> {
+async fn parse_query(
+    query: &FullTextSearchQuery,
+    column: &String,
+    indices: &[Index],
+    ds: &Arc<Dataset>,
+) -> DataFusionResult<ParsedQuery> {
     let mut parsed = None;
     for index in indices {
         let uuid = index.uuid.to_string();
@@ -43,7 +50,7 @@ async fn parse_query(query: &FullTextSearchQuery, column: &String, indices: &[In
         Some(parsed) => Ok(parsed),
         None => Err(DataFusionError::Execution(
             "Unable to parse query".to_string(),
-        ))
+        )),
     }
 }
 
@@ -171,15 +178,32 @@ impl ExecutionPlan for FtsExec {
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
 
-        let indices = self.indices.clone().into_iter().map(|(column, indices)| {
-            let handle = tokio::runtime::Handle::current();
-            let parsed = match query.search_type {
-                SearchType::DfsQueryThenFetch => Some(handle.block_on(parse_query(&query, &column, &indices, &ds))?),
-                SearchType::QueryThenFetch => None
-            };
-            Ok::<_, DataFusionError>((column, indices, parsed))
-        }).collect::<DataFusionResult<Vec<_>>>();
-        let stream = stream::iter(indices?)
+        let stream = stream::iter(self.indices.clone());
+
+        let stream = match query.search_type {
+            SearchType::QueryThenFetch => stream
+                .map(|(column, indices)| (column, indices, Option::<ParsedQuery>::None))
+                .boxed(),
+            SearchType::DfsQueryThenFetch => {
+                let ds = ds.clone();
+                let query = query.clone();
+                stream
+                    .then(move |(column, indices)| {
+                        let ds = ds.clone();
+                        let query = query.clone();
+                        async move {
+                            match parse_query(&query, &column, &indices, &ds).await {
+                                Ok(parsed) => (column, indices, Some(parsed)),
+                                // use query then fetch if distributed frequency collection failed
+                                Err(_) => (column, indices, Option::<ParsedQuery>::None),
+                            }
+                        }
+                    })
+                    .boxed()
+            }
+        };
+
+        let stream = stream
             .flat_map(move |(column, indices, parsed)| {
                 let mut all_batches = Vec::with_capacity(indices.len());
 
@@ -215,10 +239,12 @@ impl ExecutionPlan for FtsExec {
                         let index = as_inverted_index!(index, uuid)?;
                         pre_filter.wait_for_ready().await?;
 
-                        let results = match parsed {
-                            Some(parsed) => index.parsed_search(&parsed, pre_filter).await?,
-                            None => index.full_text_search(&query, pre_filter).await?
+                        let parsed = match parsed {
+                            Some(parsed) => parsed,
+                            None => index.parse(&query)?,
                         };
+
+                        let results = index.parsed_search(&parsed, pre_filter).await?;
 
                         let (row_ids, scores): (Vec<u64>, Vec<f32>) = results.into_iter().unzip();
                         let batch = RecordBatch::try_new(
@@ -347,35 +373,26 @@ impl ExecutionPlan for FlatFtsExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
         let ds = self.dataset.clone();
-        let column_inputs = self.column_inputs.clone().into_iter().map(|(column, indices, input)| {
-            let handle = tokio::runtime::Handle::current();
-            let parsed = match query.search_type {
-                SearchType::DfsQueryThenFetch => Some(handle.block_on(parse_query(&query, &column, &indices, &ds))?),
-                SearchType::QueryThenFetch => None
-            };
-            Ok::<_, DataFusionError>((column, indices, input, parsed))
-        }).collect::<DataFusionResult<Vec<_>>>()?;
 
-        let stream = stream::iter(column_inputs)
-            .map(move |(column, indices, input, parsed)| {
+        let stream = stream::iter(self.column_inputs.clone())
+            .map(move |(column, indices, input)| {
                 let index_meta = indices[0].clone();
                 let uuid = index_meta.uuid.to_string();
-                let parsed = parsed.clone();
                 let query = query.clone();
                 let ds = ds.clone();
                 let context = context.clone();
-
                 async move {
                     let unindexed_stream = input.execute(partition, context)?;
                     let index = ds.open_generic_index(&column, &uuid).await?;
                     let index = as_inverted_index!(index, uuid)?;
-                    let parsed = match parsed {
-                        None => {
-                            index.parse(&query)?
-                        },
-                        Some(parsed) => parsed
+                    let parsed = match query.search_type {
+                        SearchType::DfsQueryThenFetch => {
+                            parse_query(&query, &column, &indices, &ds).await?
+                        }
+                        SearchType::QueryThenFetch => index.parse(&query)?,
                     };
-                    let unindexed_result_stream = flat_bm25_search_stream(unindexed_stream, column, parsed, index);
+                    let unindexed_result_stream =
+                        flat_bm25_search_stream(unindexed_stream, column, parsed, index);
                     Ok::<_, DataFusionError>(unindexed_result_stream)
                 }
             })
