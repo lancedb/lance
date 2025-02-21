@@ -32,7 +32,7 @@ use super::PreFilterSource;
 
 async fn parse_query(
     query: &FullTextSearchQuery,
-    column: &String,
+    column: &str,
     indices: &[Index],
     ds: &Arc<Dataset>,
 ) -> DataFusionResult<ParsedQuery> {

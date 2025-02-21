@@ -186,7 +186,7 @@ impl InvertedIndex {
         self.docs.token_count.len()
     }
 
-    pub fn posting_len(&self, token: &String) -> usize {
+    pub fn posting_len(&self, token: &str) -> usize {
         match self.tokens.get(token) {
             Some(token_id) => self.inverted_list.posting_len(token_id),
             None => 0,
@@ -210,7 +210,7 @@ impl InvertedIndex {
     }
 
     fn token_ids(&self, tokens: &[String], is_phrase_query: bool) -> Result<Vec<(String, u32)>> {
-        let token_ids = self.zip_with_id(&tokens).into_iter();
+        let token_ids = self.zip_with_id(tokens).into_iter();
         if !is_phrase_query {
             Ok(token_ids.dedup_by(|x, y| x.1 == y.1).collect())
         } else {
