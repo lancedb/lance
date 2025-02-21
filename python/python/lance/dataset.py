@@ -3863,8 +3863,8 @@ class VectorIndexReader:
     >>> from lance.dataset import VectorIndexReader
     >>> import numpy as np
     >>> import pyarrow as pa
-    >>> vectors = np.random.rand(256,2)
-    >>> data = pa.table({"vector": pa.array(vectors)})
+    >>> vectors = np.random.rand(size=(256, 2))
+    >>> data = pa.table({"vector": pa.array(vectors, type=pa.list_(pa.float32(), 2))})
     >>> dataset = lance.write_dataset(data, "/tmp/index_reader_demo")
     >>> dataset.create_index(   \\
     ...     "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=2  \\
