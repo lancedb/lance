@@ -22,7 +22,7 @@ impl PluginInstance for TestPlugin {
 
     fn metadata(&self) -> PluginMetadata {
         PluginMetadata {
-            name: "test_plugin".into(),
+            name: "demo_plugin".into(),
             version: "1.0".into(),
             description: "Test Plugin".into(),
         }

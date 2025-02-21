@@ -116,7 +116,7 @@ protoc = [
     "lance-index/protoc",
     "lance-table/protoc",
 ]
-test-plugin = []
+demo-plugin = []
 
 [[bin]]
 name = "lq"
@@ -146,7 +146,7 @@ harness = false
 workspace = true
 
 [[example]]
-name = "test_plugin"
+name = "demo_plugin"
 crate-type = ["cdylib"]
-path = "src/plugin/test_plugin.rs"
-required-features = ["test-plugin"]
+path = "examples/demo_plugin.rs"
+required-features = ["demo-plugin"]

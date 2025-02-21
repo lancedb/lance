@@ -189,11 +189,11 @@ mod tests {
             let mut path = target_dir.join("debug").join("examples");
 
             #[cfg(target_os = "linux")]
-            path.push("libtest_plugin.so");
+            path.push("libdemo_plugin.so");
             #[cfg(target_os = "macos")]
-            path.push("libtest_plugin.dylib");
+            path.push("libdemo_plugin.dylib");
             #[cfg(target_os = "windows")]
-            path.push("test_plugin.dll");
+            path.push("demo_plugin.dll");
 
             assert!(path.exists(), "Plugin not found at: {}", path.display());
             path
@@ -209,7 +209,7 @@ mod tests {
         let result = manager.load_plugin(path);
         assert!(result.is_ok(), "Load failed: {:?}", result.err());
 
-        let metadata = manager.get_metadata("test_plugin").unwrap();
+        let metadata = manager.get_metadata("demo_plugin").unwrap();
         assert_eq!(metadata.version, "1.0");
     }
 
@@ -232,7 +232,7 @@ mod tests {
         manager.load_plugin(path).unwrap();
 
         let input = serde_json::json!({"input": "test"});
-        let result = manager.execute_plugin("test_plugin", &input);
+        let result = manager.execute_plugin("demo_plugin", &input);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), serde_json::json!({"result": "Processed: test"}));
     }
@@ -255,11 +255,11 @@ mod tests {
         let path = get_plugin_path();
         manager.load_plugin(path);
 
-        let result = manager.unload_plugin("test_plugin");
+        let result = manager.unload_plugin("demo_plugin");
         println!("{:?}", result);
         assert!(result.is_ok(), "Unload failed");
         assert!(
-            manager.get_metadata("test_plugin").is_none(),
+            manager.get_metadata("demo_plugin").is_none(),
             "Plugin metadata still present after unload"
         );
     }
@@ -279,7 +279,7 @@ mod tests {
         let path = get_plugin_path();
         manager.load_plugin(path).unwrap();
 
-        let metadata = manager.get_metadata("test_plugin").unwrap();
+        let metadata = manager.get_metadata("demo_plugin").unwrap();
         assert_eq!(metadata.description, "Test Plugin");
     }
 
