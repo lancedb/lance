@@ -17,12 +17,14 @@ use arrow::{
 use arrow_arith::numeric::sub;
 use arrow_array::{RecordBatch, StructArray, UInt32Array};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::{self, StreamExt, TryStreamExt};
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, ROW_ID};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::{FileReader, FileReaderOptions};
 use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
@@ -31,6 +33,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
+use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     pb,
@@ -454,6 +457,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
+    }
+
+    async fn partition_reader(
+        &self,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let partition = self.load_partition(partition_id, false).await?;
+        let store = &partition.storage;
+        let schema = if with_vector {
+            store.schema().clone()
+        } else {
+            let schema = store.schema();
+            let row_id_idx = schema.index_of(ROW_ID)?;
+            Arc::new(store.schema().project(&[row_id_idx])?)
+        };
+
+        let batches = store
+            .to_batches()?
+            .map(|b| {
+                let batch = b.project_by_schema(&schema)?;
+                Ok(batch)
+            })
+            .collect::<Vec<_>>();
+        let stream = RecordBatchStreamAdapter::new(schema, stream::iter(batches));
+        Ok(Box::pin(stream))
+    }
+
+    async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+        unimplemented!("this method is for only sub index");
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
