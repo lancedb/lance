@@ -18,7 +18,7 @@ use lance_core::{utils::mask::RowIdMask, Result};
 use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
 use tracing::instrument;
 
-use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex};
+use super::{AnyQuery, LabelListQuery, SargableQuery, ScalarIndex, SearchResult, TextQuery};
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -214,6 +214,57 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct TextQueryParser {}
+
+impl ScalarQueryParser for TextQueryParser {
+    fn visit_between(&self, _: &str, _: ScalarValue, _: ScalarValue) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: Vec<ScalarValue>) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, _: &str) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_comparison(&self, _: &str, _: ScalarValue, _: &Operator) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        if args.len() != 2 {
+            return None;
+        }
+        let scalar = maybe_scalar(&args[1], data_type)?;
+        if let ScalarValue::Utf8(Some(scalar_str)) = scalar {
+            if func.name() == "contains" {
+                let query = TextQuery::StringContains(scalar_str);
+                Some(IndexedExpression::index_query(
+                    column.to_string(),
+                    Arc::new(query),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
 impl IndexedExpression {
     /// Create an expression that only does refine
     fn refine_only(refine_expr: Expr) -> Self {
@@ -379,6 +430,19 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
+pub enum IndexExprResult {
+    // The answer is exactly the rows in the allow list minus the rows in the block list
+    Exact(RowIdMask),
+    // The answer is at most the rows in the allow list minus the rows in the block list
+    // Some of the rows in the allow list may not be in the result and will need to be filtered
+    // by a recheck.  Every row in the block list is definitely not in the result.
+    AtMost(RowIdMask),
+    // The answer is at least the rows in the allow list minus the rows in the block list
+    // Some of the rows in the block list might be in the result.  Every row in the allow list is
+    // definitely in the result.
+    AtLeast(RowIdMask),
+}
+
 impl ScalarIndexExpr {
     /// Evaluates the scalar index expression
     ///
@@ -388,31 +452,106 @@ impl ScalarIndexExpr {
     /// any situations where the session cache has been disabled.
     #[async_recursion]
     #[instrument(level = "debug", skip_all)]
-    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<RowIdMask> {
+    pub async fn evaluate(&self, index_loader: &dyn ScalarIndexLoader) -> Result<IndexExprResult> {
         match self {
             Self::Not(inner) => {
                 let result = inner.evaluate(index_loader).await?;
-                Ok(!result)
+                match result {
+                    IndexExprResult::Exact(mask) => Ok(IndexExprResult::Exact(!mask)),
+                    IndexExprResult::AtMost(mask) => Ok(IndexExprResult::AtLeast(!mask)),
+                    IndexExprResult::AtLeast(mask) => Ok(IndexExprResult::AtMost(!mask)),
+                }
             }
             Self::And(lhs, rhs) => {
                 let lhs_result = lhs.evaluate(index_loader);
                 let rhs_result = rhs.evaluate(index_loader);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                Ok(lhs_result? & rhs_result?)
+                match (lhs_result?, rhs_result?) {
+                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::Exact(lhs & rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
+                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::AtMost(lhs & rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(_)) => {
+                        // We could do better here, elements in both lhs and rhs are known
+                        // to be true and don't require a recheck.  We only need to recheck
+                        // elements in lhs that are not in rhs
+                        Ok(IndexExprResult::AtMost(lhs))
+                    }
+                    (IndexExprResult::AtLeast(_), IndexExprResult::Exact(rhs)) => {
+                        // We could do better here (see above)
+                        Ok(IndexExprResult::AtMost(rhs))
+                    }
+                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
+                        Ok(IndexExprResult::AtMost(lhs & rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs & rhs))
+                    }
+                    (IndexExprResult::AtLeast(_), IndexExprResult::AtMost(rhs)) => {
+                        Ok(IndexExprResult::AtMost(rhs))
+                    }
+                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtLeast(_)) => {
+                        Ok(IndexExprResult::AtMost(lhs))
+                    }
+                }
             }
             Self::Or(lhs, rhs) => {
                 let lhs_result = lhs.evaluate(index_loader);
                 let rhs_result = rhs.evaluate(index_loader);
                 let (lhs_result, rhs_result) = join!(lhs_result, rhs_result);
-                Ok(lhs_result? | rhs_result?)
+                match (lhs_result?, rhs_result?) {
+                    (IndexExprResult::Exact(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::Exact(lhs | rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtMost(rhs))
+                    | (IndexExprResult::AtMost(lhs), IndexExprResult::Exact(rhs)) => {
+                        // We could do better here.  Elements in the exact side don't need
+                        // re-check.  We only need to recheck elements exclusively in the
+                        // at-most side
+                        Ok(IndexExprResult::AtMost(lhs | rhs))
+                    }
+                    (IndexExprResult::Exact(lhs), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs | rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::Exact(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs | rhs))
+                    }
+                    (IndexExprResult::AtMost(lhs), IndexExprResult::AtMost(rhs)) => {
+                        Ok(IndexExprResult::AtMost(lhs | rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(lhs | rhs))
+                    }
+                    (IndexExprResult::AtLeast(lhs), IndexExprResult::AtMost(_)) => {
+                        Ok(IndexExprResult::AtLeast(lhs))
+                    }
+                    (IndexExprResult::AtMost(_), IndexExprResult::AtLeast(rhs)) => {
+                        Ok(IndexExprResult::AtLeast(rhs))
+                    }
+                }
             }
             Self::Query(column, query) => {
                 let index = index_loader.load_index(column).await?;
-                let matching_row_ids = index.search(query.as_ref()).await?;
-                Ok(RowIdMask {
-                    block_list: None,
-                    allow_list: Some(matching_row_ids),
-                })
+                let search_result = index.search(query.as_ref()).await?;
+                match search_result {
+                    SearchResult::Exact(matching_row_ids) => {
+                        Ok(IndexExprResult::Exact(RowIdMask {
+                            block_list: None,
+                            allow_list: Some(matching_row_ids),
+                        }))
+                    }
+                    SearchResult::AtMost(row_ids) => Ok(IndexExprResult::AtMost(RowIdMask {
+                        block_list: None,
+                        allow_list: Some(row_ids),
+                    })),
+                    SearchResult::AtLeast(row_ids) => Ok(IndexExprResult::AtLeast(RowIdMask {
+                        block_list: None,
+                        allow_list: Some(row_ids),
+                    })),
+                }
             }
         }
     }
@@ -431,6 +570,14 @@ impl ScalarIndexExpr {
                 lhs.or(rhs)
             }
             Self::Query(column, query) => query.to_expr(column.clone()),
+        }
+    }
+
+    pub fn needs_recheck(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.needs_recheck(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
+            Self::Query(_, query) => query.needs_recheck(),
         }
     }
 }
@@ -732,6 +879,8 @@ pub fn apply_scalar_indices(
 #[derive(Default, Debug)]
 pub struct FilterPlan {
     pub index_query: Option<ScalarIndexExpr>,
+    /// True if the index query is guaranteed to return exact results
+    pub skip_recheck: bool,
     pub refine_expr: Option<Expr>,
     pub full_expr: Option<Expr>,
 }
@@ -784,14 +933,20 @@ impl PlannerIndexExt for Planner {
         let logical_expr = self.optimize_expr(filter)?;
         if use_scalar_index {
             let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info);
+            let mut skip_recheck = false;
+            if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
+                skip_recheck = !scalar_query.needs_recheck();
+            }
             Ok(FilterPlan {
                 index_query: indexed_expr.scalar_query,
                 refine_expr: indexed_expr.refine_expr,
                 full_expr: Some(logical_expr),
+                skip_recheck,
             })
         } else {
             Ok(FilterPlan {
                 index_query: None,
+                skip_recheck: true,
                 refine_expr: Some(logical_expr.clone()),
                 full_expr: Some(logical_expr),
             })

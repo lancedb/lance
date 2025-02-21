@@ -19,7 +19,7 @@ use lance_index::scalar::{
     btree::{train_btree_index, BTreeIndex, TrainingSource, DEFAULT_BTREE_BATCH_SIZE},
     flat::FlatIndexMetadata,
     lance_format::LanceIndexStore,
-    IndexStore, SargableQuery, ScalarIndex,
+    IndexStore, SargableQuery, ScalarIndex, SearchResult,
 };
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
@@ -125,10 +125,13 @@ async fn baseline_equality_search(fixture: &BenchmarkFixture) {
 }
 
 async fn warm_indexed_equality_search(index: &BTreeIndex) {
-    let row_ids = index
+    let result = index
         .search(&SargableQuery::Equals(ScalarValue::UInt32(Some(10000))))
         .await
         .unwrap();
+    let SearchResult::Exact(row_ids) = result else {
+        panic!("Expected exact results")
+    };
     assert_eq!(row_ids.len(), Some(1));
 }
 
@@ -151,19 +154,23 @@ async fn baseline_inequality_search(fixture: &BenchmarkFixture) {
 }
 
 async fn warm_indexed_inequality_search(index: &BTreeIndex) {
-    let row_ids = index
+    let result = index
         .search(&SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::UInt32(Some(50_000_000))),
             std::ops::Bound::Unbounded,
         ))
         .await
         .unwrap();
+    let SearchResult::Exact(row_ids) = result else {
+        panic!("Expected exact results")
+    };
+
     // 100Mi - 50M = 54,857,600
     assert_eq!(row_ids.len(), Some(54857600));
 }
 
 async fn warm_indexed_isin_search(index: &BTreeIndex) {
-    let row_ids = index
+    let result = index
         .search(&SargableQuery::IsIn(vec![
             ScalarValue::UInt32(Some(10000)),
             ScalarValue::UInt32(Some(50000000)),
@@ -172,6 +179,10 @@ async fn warm_indexed_isin_search(index: &BTreeIndex) {
         ]))
         .await
         .unwrap();
+    let SearchResult::Exact(row_ids) = result else {
+        panic!("Expected exact results")
+    };
+
     // Only 3 because 150M is not in dataset
     assert_eq!(row_ids.len(), Some(3));
 }
