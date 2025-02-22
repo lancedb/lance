@@ -792,7 +792,6 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        **kwargs,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -804,8 +803,6 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
-        **kwargs : dict, optional
-            See :py:method::scanner method for full parameter description.
 
         Returns
         -------
