@@ -306,7 +306,7 @@ def test_indexed_filter_with_fts_index(tmp_path):
     # append more data to test flat FTS
     data = pa.table(
         {
-            "text": ["Frodo", "puppy"],
+            "text": ["flat", "search"],
             "sentiment": ["positive", "positive"],
         }
     )
