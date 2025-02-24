@@ -303,6 +303,15 @@ def test_indexed_filter_with_fts_index(tmp_path):
     ds.create_scalar_index("text", "INVERTED")
     ds.create_scalar_index("sentiment", "BITMAP")
 
+    # append more data to test flat FTS
+    data = pa.table(
+        {
+            "text": ["flat", "search"],
+            "sentiment": ["positive", "positive"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="append")
+
     results = ds.to_table(
         full_text_query="puppy",
         filter="sentiment='positive'",
