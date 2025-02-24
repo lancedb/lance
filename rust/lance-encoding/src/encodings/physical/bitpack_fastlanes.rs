@@ -1719,10 +1719,9 @@ impl MiniBlockDecompressor for BitpackMiniBlockDecompressor {
                 let mut decompressed = vec![0 as $type; ELEMS_PER_CHUNK as usize];
 
                 // Copy for memory alignment
-                let chunk_in_u8: Vec<u8> = data.to_vec();
-                let bit_width_bytes = &chunk_in_u8[..std::mem::size_of::<$type>()];
+                let bit_width_bytes = &data[..std::mem::size_of::<$type>()];
                 let bit_width_value = LittleEndian::read_uint(bit_width_bytes, std::mem::size_of::<$type>());
-                let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<$type>()..]);
+                let chunk = cast_slice(&data[std::mem::size_of::<$type>()..]);
 
                 // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
                 assert!(chunk.len() * std::mem::size_of::<$type>() == (bit_width_value * ELEMS_PER_CHUNK as u64) as usize / 8);
