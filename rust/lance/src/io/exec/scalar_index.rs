@@ -129,9 +129,15 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(datafusion::error::DataFusionError::Internal(
+                "ScalarIndexExec does not have children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
@@ -294,9 +300,19 @@ impl ExecutionPlan for MapIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        if children.len() != 1 {
+            Err(datafusion::error::DataFusionError::Internal(
+                "MapIndexExec requires exactly one child".to_string(),
+            ))
+        } else {
+            Ok(Arc::new(Self::new(
+                self.dataset.clone(),
+                self.column_name.clone(),
+                children.into_iter().next().unwrap(),
+            )))
+        }
     }
 
     fn execute(
@@ -567,9 +583,15 @@ impl ExecutionPlan for MaterializeIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(datafusion::error::DataFusionError::Internal(
+                "MaterializeIndexExec does not have children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
