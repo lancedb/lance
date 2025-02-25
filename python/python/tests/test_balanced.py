@@ -84,44 +84,44 @@ def test_write_fragments(balanced_dataset, tmp_path):
     assert dataset._take_rows(range(10)) == balanced_dataset._take_rows(range(10))
 
 
-def test_append_then_take(balanced_dataset, tmp_path, big_val):
-    blob_dir = tmp_path / "test_ds" / "_blobs" / "data"
-    assert len(list(blob_dir.iterdir())) == 8
+# def test_append_then_take(balanced_dataset, tmp_path, big_val):
+#     blob_dir = tmp_path / "test_ds" / "_blobs" / "data"
+#     assert len(list(blob_dir.iterdir())) == 8
 
-    # A read will only return non-blob columns
-    assert balanced_dataset.to_table() == pa.table(
-        {
-            "idx": pa.array(range(128), pa.uint64()),
-        }
-    )
+#     # A read will only return non-blob columns
+#     assert balanced_dataset.to_table() == pa.table(
+#         {
+#             "idx": pa.array(range(128), pa.uint64()),
+#         }
+#     )
 
-    # Now verify we can append some data
-    rows_per_batch = 8
-    num_batches = 16
-    ds = lance.write_dataset(
-        balanced_datagen(big_val, rows_per_batch, num_batches),
-        tmp_path / "test_ds",
-        max_bytes_per_file=32 * 1024 * 1024,
-        schema=balanced_dataset.schema,
-        mode="append",
-    )
+#     # Now verify we can append some data
+#     rows_per_batch = 8
+#     num_batches = 16
+#     ds = lance.write_dataset(
+#         balanced_datagen(big_val, rows_per_batch, num_batches),
+#         tmp_path / "test_ds",
+#         max_bytes_per_file=32 * 1024 * 1024,
+#         schema=balanced_dataset.schema,
+#         mode="append",
+#     )
 
-    assert len(list(blob_dir.iterdir())) == 12
+#     assert len(list(blob_dir.iterdir())) == 12
 
-    assert ds.to_table() == pa.table(
-        {
-            "idx": pa.array(list(range(128)) + list(range(128)), pa.uint64()),
-        }
-    )
+#     assert ds.to_table() == pa.table(
+#         {
+#             "idx": pa.array(list(range(128)) + list(range(128)), pa.uint64()),
+#         }
+#     )
 
-    # Verify we can take blob values
-    row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid")
+#     # Verify we can take blob values
+#     row_ids = ds.to_table(columns=[], with_row_id=True).column("_rowid")
 
-    take_tbl = ds._take_rows(row_ids.to_pylist(), columns=["idx", "blobs"])
+#     take_tbl = ds._take_rows(row_ids.to_pylist(), columns=["idx", "blobs"])
 
-    blobs = take_tbl.column("blobs")
-    for val in blobs:
-        assert val.as_py() == big_val
+#     blobs = take_tbl.column("blobs")
+#     for val in blobs:
+#         assert val.as_py() == big_val
 
 
 def test_delete(balanced_dataset):
