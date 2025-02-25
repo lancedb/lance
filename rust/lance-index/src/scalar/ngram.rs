@@ -531,7 +531,7 @@ mod tests {
         let tokens = collect_tokens(&tokenizer, "café");
         assert_eq!(
             tokens,
-            vec!["c", "ca", "calf", "a", "af", "afe", "f", "fe", "e"]
+            vec!["c", "ca", "caf", "a", "af", "afe", "f", "fe", "e"] // spellchecker:disable-line
         );
 
         // Allow numbers
