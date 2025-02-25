@@ -535,6 +535,43 @@ def test_bitmap_index(tmp_path: Path):
     assert indices[0]["type"] == "Bitmap"
 
 
+def test_ngram_index(tmp_path: Path):
+    """Test create ngram index"""
+    tbl = pa.Table.from_arrays(
+        [
+            pa.array(
+                [["apple", "apples", "banana", "coconut"][i % 4] for i in range(100)]
+            )
+        ],
+        names=["words"],
+    )
+    dataset = lance.write_dataset(tbl, tmp_path / "dataset")
+    dataset.create_scalar_index("words", index_type="NGRAM")
+    indices = dataset.list_indices()
+    assert len(indices) == 1
+    assert indices[0]["type"] == "NGram"
+
+    scan_plan = dataset.scanner(filter="contains(words, 'apple')").explain_plan(True)
+    assert "MaterializeIndex" in scan_plan
+
+    assert dataset.to_table(filter="contains(words, 'apple')").num_rows == 50
+    assert dataset.to_table(filter="contains(words, 'banana')").num_rows == 25
+    assert dataset.to_table(filter="contains(words, 'coconut')").num_rows == 25
+    assert dataset.to_table(filter="contains(words, 'apples')").num_rows == 25
+    assert (
+        dataset.to_table(
+            filter="contains(words, 'apple') AND contains(words, 'banana')"
+        ).num_rows
+        == 0
+    )
+    assert (
+        dataset.to_table(
+            filter="contains(words, 'apple') OR contains(words, 'banana')"
+        ).num_rows
+        == 75
+    )
+
+
 def test_null_handling(tmp_path: Path):
     tbl = pa.table(
         {
@@ -577,6 +614,7 @@ def test_scalar_index_with_nulls(tmp_path):
             "numeric_float": [0.1, None] * (test_table_size // 2),
             "boolean_col": [True, None] * (test_table_size // 2),
             "timestamp_col": [datetime(2023, 1, 1), None] * (test_table_size // 2),
+            "ngram_col": ["apple", None] * (test_table_size // 2),
         }
     )
     ds = lance.write_dataset(test_table, tmp_path)
@@ -584,6 +622,7 @@ def test_scalar_index_with_nulls(tmp_path):
     ds.create_scalar_index("category", index_type="BTREE")
     ds.create_scalar_index("boolean_col", index_type="BTREE")
     ds.create_scalar_index("timestamp_col", index_type="BTREE")
+    ds.create_scalar_index("ngram_col", index_type="NGRAM")
     # Test querying with filters on columns with nulls.
     k = test_table_size // 2
     result = ds.to_table(filter="category = 'a'", limit=k)
@@ -592,6 +631,14 @@ def test_scalar_index_with_nulls(tmp_path):
     result = ds.to_table(filter="boolean_col IS TRUE", limit=k)
     assert len(result) == k
     result = ds.to_table(filter="timestamp_col IS NOT NULL", limit=k)
+    assert len(result) == k
+
+    # Ensure ngram index works with nulls
+    result = ds.to_table(filter="ngram_col = 'apple'")
+    assert len(result) == k
+    result = ds.to_table(filter="ngram_col IS NULL")
+    assert len(result) == k
+    result = ds.to_table(filter="contains(ngram_col, 'appl')")
     assert len(result) == k
 
 
@@ -615,11 +662,12 @@ def test_create_index_empty_dataset(tmp_path: Path):
             pa.field("bitmap", pa.int32()),
             pa.field("label_list", pa.list_(pa.string())),
             pa.field("inverted", pa.string()),
+            pa.field("ngram", pa.string()),
         ]
     )
     ds = lance.write_dataset([], tmp_path, schema=schema)
 
-    for index_type in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+    for index_type in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED", "NGRAM"]:
         ds.create_scalar_index(index_type.lower(), index_type=index_type)
 
     # Make sure the empty index doesn't cause searches to fail
@@ -630,6 +678,7 @@ def test_create_index_empty_dataset(tmp_path: Path):
                 "bitmap": pa.array([1], pa.int32()),
                 "label_list": [["foo", "bar"]],
                 "inverted": ["blah"],
+                "ngram": ["apple"],
             }
         )
     )
@@ -643,6 +692,9 @@ def test_create_index_empty_dataset(tmp_path: Path):
         assert ds.to_table(filter="array_has_any(label_list, ['oof'])").num_rows == 0
         assert ds.to_table(filter="inverted = 'blah'").num_rows == 1
         assert ds.to_table(filter="inverted = 'halb'").num_rows == 0
+        assert ds.to_table(filter="contains(ngram, 'apple')").num_rows == 1
+        assert ds.to_table(filter="contains(ngram, 'banana')").num_rows == 0
+        assert ds.to_table(filter="ngram = 'apple'").num_rows == 1
 
     test_searches()
 
@@ -659,32 +711,47 @@ def test_create_index_empty_dataset(tmp_path: Path):
 
 def test_optimize_no_new_data(tmp_path: Path):
     tbl = pa.table(
-        {"btree": pa.array([None], pa.int64()), "bitmap": pa.array([None], pa.int64())}
+        {
+            "btree": pa.array([None], pa.int64()),
+            "bitmap": pa.array([None], pa.int64()),
+            "ngram": pa.array([None], pa.string()),
+        }
     )
     dataset = lance.write_dataset(tbl, tmp_path)
     dataset.create_scalar_index("btree", index_type="BTREE")
     dataset.create_scalar_index("bitmap", index_type="BITMAP")
+    dataset.create_scalar_index("ngram", index_type="NGRAM")
 
     assert dataset.to_table(filter="btree IS NULL").num_rows == 1
     assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+    assert dataset.to_table(filter="ngram IS NULL").num_rows == 1
 
     dataset.insert([], schema=tbl.schema)
     dataset.optimize.optimize_indices()
 
     assert dataset.to_table(filter="btree IS NULL").num_rows == 1
     assert dataset.to_table(filter="bitmap IS NULL").num_rows == 1
+    assert dataset.to_table(filter="ngram IS NULL").num_rows == 1
 
     dataset.insert(pa.table({"btree": [2]}))
     dataset.optimize.optimize_indices()
 
     assert dataset.to_table(filter="btree IS NULL").num_rows == 1
     assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
+    assert dataset.to_table(filter="ngram IS NULL").num_rows == 2
 
     dataset.insert(pa.table({"bitmap": [2]}))
     dataset.optimize.optimize_indices()
 
     assert dataset.to_table(filter="btree IS NULL").num_rows == 2
     assert dataset.to_table(filter="bitmap IS NULL").num_rows == 2
+    assert dataset.to_table(filter="ngram IS NULL").num_rows == 3
+
+    dataset.insert(pa.table({"ngram": ["apple"]}))
+
+    assert dataset.to_table(filter="btree IS NULL").num_rows == 3
+    assert dataset.to_table(filter="bitmap IS NULL").num_rows == 3
+    assert dataset.to_table(filter="ngram IS NULL").num_rows == 3
 
 
 def test_drop_index(tmp_path):
@@ -694,14 +761,16 @@ def test_drop_index(tmp_path):
             "btree": list(range(test_table_size)),
             "bitmap": list(range(test_table_size)),
             "fts": ["a" for _ in range(test_table_size)],
+            "ngram": ["a" for _ in range(test_table_size)],
         }
     )
     ds = lance.write_dataset(test_table, tmp_path)
     ds.create_scalar_index("btree", index_type="BTREE")
     ds.create_scalar_index("bitmap", index_type="BITMAP")
     ds.create_scalar_index("fts", index_type="INVERTED")
+    ds.create_scalar_index("ngram", index_type="NGRAM")
 
-    assert len(ds.list_indices()) == 3
+    assert len(ds.list_indices()) == 4
 
     # Attempt to drop index (name does not exist)
     with pytest.raises(RuntimeError, match="index not found"):
@@ -717,3 +786,4 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="btree = 1").num_rows == 1
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
+    assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size

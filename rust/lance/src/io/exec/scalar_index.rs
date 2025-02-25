@@ -27,7 +27,7 @@ use lance_core::{
 use lance_datafusion::chunker::break_stream;
 use lance_index::{
     scalar::{
-        expression::{ScalarIndexExpr, ScalarIndexLoader},
+        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader},
         SargableQuery, ScalarIndex,
     },
     DatasetIndexExt,
@@ -102,10 +102,13 @@ impl ScalarIndexExec {
 
     async fn do_execute(expr: ScalarIndexExpr, dataset: Arc<Dataset>) -> Result<RecordBatch> {
         let query_result = expr.evaluate(dataset.as_ref()).await?;
-        let query_result_arr = query_result.into_arrow()?;
+        let IndexExprResult::Exact(row_id_mask) = query_result else {
+            todo!("Support for non-exact query results as pre-filter for vector search")
+        };
+        let row_id_mask_arr = row_id_mask.into_arrow()?;
         Ok(RecordBatch::try_new(
             SCALAR_INDEX_SCHEMA.clone(),
-            vec![Arc::new(query_result_arr)],
+            vec![Arc::new(row_id_mask_arr)],
         )?)
     }
 }
@@ -223,15 +226,18 @@ impl MapIndexExec {
             column_name.clone(),
             Arc::new(SargableQuery::IsIn(index_vals)),
         );
-        let mut row_addresses = query.evaluate(dataset.as_ref()).await?;
+        let query_result = query.evaluate(dataset.as_ref()).await?;
+        let IndexExprResult::Exact(mut row_id_mask) = query_result else {
+            todo!("Support for non-exact query results as input for merge_insert")
+        };
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_addresses = row_addresses & deletion_mask.as_ref().clone();
+            row_id_mask = row_id_mask & deletion_mask.as_ref().clone();
         }
 
-        if let Some(mut allow_list) = row_addresses.allow_list {
+        if let Some(mut allow_list) = row_id_mask.allow_list {
             // Flatten the allow list
-            if let Some(block_list) = row_addresses.block_list {
+            if let Some(block_list) = row_id_mask.block_list {
                 allow_list -= &block_list;
             }
 
@@ -430,7 +436,7 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
-        let mask = expr.evaluate(dataset.as_ref());
+        let expr_result = expr.evaluate(dataset.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -441,10 +447,20 @@ impl MaterializeIndexExec {
             DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
         });
         let mask = if let Some(prefilter) = prefilter {
-            let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
+            let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
+            let mask = match expr_result {
+                IndexExprResult::Exact(mask) => mask,
+                IndexExprResult::AtMost(mask) => mask,
+                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
+            };
             mask & (*prefilter).clone()
         } else {
-            mask.await?
+            let expr_result = expr_result.await?;
+            match expr_result {
+                IndexExprResult::Exact(mask) => mask,
+                IndexExprResult::AtMost(mask) => mask,
+                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
+            }
         };
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
