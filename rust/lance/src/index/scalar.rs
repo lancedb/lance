@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use async_trait::async_trait;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::SendableRecordBatchStream;
+use futures::TryStreamExt;
 use lance_core::{Error, Result};
 use lance_datafusion::{chunker::chunk_concat_stream, exec::LanceExecutionOptions};
 use lance_index::scalar::btree::DEFAULT_BTREE_BATCH_SIZE;
@@ -24,6 +26,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use lance_table::format::Index;
+use log::info;
 use snafu::location;
 use tracing::instrument;
 
@@ -32,6 +35,9 @@ use crate::{
     dataset::{index::LanceIndexStoreExt, scanner::ColumnOrdering},
     Dataset,
 };
+
+// Log an update every TRAINING_UPDATE_FREQ million rows processed
+const TRAINING_UPDATE_FREQ: usize = 1000000;
 
 struct TrainingRequest {
     dataset: Arc<Dataset>,
@@ -61,6 +67,8 @@ impl TrainingRequest {
         chunk_size: u32,
         sort: bool,
     ) -> Result<SendableRecordBatchStream> {
+        let num_rows = self.dataset.count_all_rows().await?;
+
         let mut scan = self.dataset.scan();
 
         let column_field =
@@ -97,7 +105,30 @@ impl TrainingRequest {
                 ..Default::default()
             })
             .await?;
-        Ok(chunk_concat_stream(batches, chunk_size as usize))
+        let batches = chunk_concat_stream(batches, chunk_size as usize);
+
+        let schema = batches.schema();
+        let mut rows_processed = 0;
+        let mut next_update = TRAINING_UPDATE_FREQ;
+        let training_uuid = uuid::Uuid::new_v4().to_string();
+        info!(
+            "Starting index training job with id {} on column {}",
+            training_uuid, self.column
+        );
+        info!("Training index (job_id={}): 0/{}", training_uuid, num_rows);
+        let batches = batches.map_ok(move |batch| {
+            rows_processed += batch.num_rows();
+            if rows_processed >= next_update {
+                next_update += TRAINING_UPDATE_FREQ;
+                info!(
+                    "Training index (job_id={}): {}/{}",
+                    training_uuid, self.column, rows_processed
+                );
+            }
+            batch
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
     }
 }
 

@@ -35,29 +35,30 @@ const POSTING_LIST_COL: &str = "posting_list";
 const POSTINGS_FILENAME: &str = "ngram_postings.lance";
 
 lazy_static::lazy_static! {
-    pub static ref TOKENS_FIELD: Field = Field::new(TOKENS_COL, DataType::Utf8, false);
+    pub static ref TOKENS_FIELD: Field = Field::new(TOKENS_COL, DataType::Utf8, true);
     pub static ref POSTINGS_FIELD: Field = Field::new(POSTING_LIST_COL, DataType::Binary, false);
     pub static ref POSTINGS_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![TOKENS_FIELD.clone(), POSTINGS_FIELD.clone()]));
     /// Currently we ALWAYS use trigrams with ascii folding and lower casing.  We may want to make this configurable in the future.
     pub static ref NGRAM_TOKENIZER: TextAnalyzer = TextAnalyzer::builder(tantivy::tokenizer::NgramTokenizer::all_ngrams(1, 3).unwrap())
     .filter(tantivy::tokenizer::LowerCaser)
-    .filter(tantivy::tokenizer::AlphaNumOnlyFilter)
     .filter(tantivy::tokenizer::AsciiFoldingFilter)
+    .filter(tantivy::tokenizer::AlphaNumOnlyFilter)
     .build();
 }
-trait TextAnalyzerExt {
-    fn tokenize(self, text: &str) -> Vec<String>;
-}
 
-impl TextAnalyzerExt for TextAnalyzer {
-    fn tokenize(mut self, text: &str) -> Vec<String> {
-        let mut stream = self.token_stream(text);
-        let mut tokens = Vec::new();
-        while stream.advance() {
-            let token = stream.token();
-            tokens.push(token.text.clone());
-        }
-        tokens
+// Helper function to apply a function to each token in a text
+fn tokenize_visitor(analyzer: &TextAnalyzer, text: &str, mut visitor: impl FnMut(&String) -> ()) {
+    // The token_stream method is mutable.  As far as I can tell this is to enforce exclusivity and not
+    // true mutability.  For example, the object returned by `token_stream` has thread-local state but
+    // it is reset each time `token_stream` is called.
+    //
+    // However, I don't see this documented anywhere and I'm not sure about relying on it.  For now, we
+    // make a clone as that seems to be the safer option.  All the tokenizers we use here should be trivially
+    // cloneable (although it requires a heap allocation so may be worth investigating in the future)
+    let mut this = analyzer.clone();
+    let mut stream = this.token_stream(text);
+    while stream.advance() {
+        visitor(&stream.token().text);
     }
 }
 
@@ -141,11 +142,32 @@ impl NGramPostingListReader {
             .await
             .map_err(|e| Error::io(e.to_string(), location!()))?)
     }
+
+    pub async fn load_all_lists(&self) -> Result<Vec<RoaringTreemap>> {
+        let num_rows = self.reader.num_rows();
+        let batch = self
+            .reader
+            .read_range(0..num_rows, Some(&[POSTING_LIST_COL]))
+            .await?;
+        let arr = batch.column(0).as_binary::<i32>();
+        arr.iter()
+            .map(|bytes| {
+                RoaringTreemap::deserialize_from(
+                    bytes.expect("should not be any null values in ngram posting lists"),
+                )
+                .map_err(|e| Error::Internal {
+                    message: format!("Error deserializing ngram list: {}", e),
+                    location: location!(),
+                })
+            })
+            .collect()
+    }
 }
 
 /// An ngram index
 ///
-/// This index stores a mapping from ngrams to the row ids that contain them.
+/// At a high level this is an inverted index that maps ngrams (small fixed size substrings) to the
+/// row ids that contain them.
 ///
 /// As a simple example consider a 1-gram index.  It would basically be a mapping from
 /// each letter to the row ids that contain that letter.  Then, if the user searches for
@@ -198,7 +220,8 @@ impl NGramIndex {
                 .as_string::<i32>()
                 .iter()
                 .enumerate()
-                .map(|(i, token)| (token.unwrap().to_owned(), i as u32)),
+                // Filter out the null token
+                .filter_map(|(i, token)| token.map(|token| (token.to_owned(), i as u32))),
         );
         let tokens = TokenSet::new(tokens_map);
 
@@ -218,15 +241,15 @@ impl NGramIndex {
         })
     }
 
-    fn tokenize(&self, text: &str) -> Vec<String> {
-        let mut tokenizer = self.tokenizer.clone();
-        let mut stream = tokenizer.token_stream(text);
-        let mut tokens = Vec::new();
-        while stream.advance() {
-            let token = stream.token();
-            tokens.push(token.text.clone());
-        }
-        tokens
+    async fn to_builder(&self) -> Result<NGramIndexBuilder> {
+        let tokens_map = self.tokens.tokens.clone();
+        let tokenizer = self.tokenizer.clone();
+        let bitmaps = self.list_reader.load_all_lists().await?;
+        Ok(NGramIndexBuilder {
+            tokens_map,
+            tokenizer,
+            bitmaps,
+        })
     }
 }
 
@@ -288,14 +311,19 @@ impl ScalarIndex for NGramIndex {
                 })?;
         match query {
             TextQuery::StringContains(substr) => {
-                let tokens = self.tokenize(substr);
-                let token_ids = tokens
-                    .into_iter()
-                    .map(|t| self.tokens.get(&t))
-                    .collect::<Option<Vec<_>>>();
-                let Some(token_ids) = token_ids else {
+                let mut token_ids = Vec::with_capacity(substr.len() * 3);
+                let mut missing = false;
+                tokenize_visitor(&self.tokenizer, substr, |token| {
+                    if let Some(token_id) = self.tokens.get(token) {
+                        token_ids.push(token_id);
+                    } else {
+                        missing = true;
+                    }
+                });
+                // At least one token was missing, so we know there are zero results
+                if missing {
                     return Ok(SearchResult::Exact(RowIdTreeMap::new()));
-                };
+                }
                 let posting_lists = futures::stream::iter(
                     token_ids
                         .into_iter()
@@ -315,7 +343,6 @@ impl ScalarIndex for NGramIndex {
         false
     }
 
-    /// Load the scalar index from storage
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>>
     where
         Self: Sized,
@@ -323,29 +350,45 @@ impl ScalarIndex for NGramIndex {
         Ok(Arc::new(Self::from_store(store.as_ref()).await?))
     }
 
-    /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
-        _dest_store: &dyn IndexStore,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        todo!()
+        let mut builder = self.to_builder().await?;
+        let lists = std::mem::take(&mut builder.bitmaps);
+        let remapped_lists = lists
+            .into_iter()
+            .map(|list| {
+                RoaringTreemap::from_iter(list.iter().filter_map(|row_id| {
+                    if let Some(mapped) = mapping.get(&row_id) {
+                        // Mapped to either new value or None (delete)
+                        *mapped
+                    } else {
+                        // Not mapped to new value, keep original value
+                        Some(row_id)
+                    }
+                }))
+            })
+            .collect::<Vec<_>>();
+        builder.bitmaps = remapped_lists;
+        builder.write(dest_store).await
     }
 
-    /// Add the new data into the index, creating an updated version of the index in `dest_store`
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        todo!()
+        let mut builder = self.to_builder().await?;
+        builder.train(new_data).await?;
+        builder.write(dest_store).await
     }
 }
 
 pub struct NGramIndexBuilder {
     tokenizer: TextAnalyzer,
     tokens_map: HashMap<String, u32>,
-    tokens_counter: u32,
     bitmaps: Vec<RoaringTreemap>,
 }
 
@@ -358,12 +401,14 @@ impl Default for NGramIndexBuilder {
 impl NGramIndexBuilder {
     pub fn new() -> Self {
         let tokenizer = NGRAM_TOKENIZER.clone();
+        let mut bitmaps = Vec::with_capacity(36 * 36 * 36 + 1);
+        // Token 0 is always the NULL bitmap
+        bitmaps.push(RoaringTreemap::new());
         Self {
             tokenizer,
-            // Default capacity loosely based on case insensitive ascii ngrams with punctuation stripped
-            tokens_map: HashMap::with_capacity(4 * 26 * 26 * 26),
-            bitmaps: Vec::with_capacity(4 * 26 * 26 * 26),
-            tokens_counter: 0,
+            // Default capacity loosely based on case insensitive ascii trigrams with punctuation stripped
+            tokens_map: HashMap::with_capacity(36 * 36 * 36),
+            bitmaps,
         }
     }
 
@@ -393,16 +438,26 @@ impl NGramIndexBuilder {
         let text_col = batch.column(0).as_string::<i32>();
         let row_id_col = batch.column(1).as_primitive::<UInt64Type>();
         for (text, row_id) in text_col.iter().zip(row_id_col.values()) {
-            let text = text.unwrap();
-            let tokens = self.tokenizer.clone().tokenize(text);
-            for token in tokens {
-                let token_id = *self.tokens_map.entry(token).or_insert_with(|| {
-                    let token_id = self.tokens_counter;
-                    self.tokens_counter += 1;
-                    self.bitmaps.push(RoaringTreemap::new());
-                    token_id
+            if let Some(text) = text {
+                tokenize_visitor(&self.tokenizer, text, |token| {
+                    // This would be a bit simpler with entry API but, at scale, the vast majority
+                    // of cases will be a hit and we want to avoid cloning the string if we can.  So
+                    // for now we do the double-hash.  We can simplify in the future with raw_entry
+                    // when it stabilizes.
+                    let tokens_list = self.tokens_map.get(token);
+                    if let Some(token_id) = tokens_list {
+                        self.bitmaps[*token_id as usize].insert(*row_id);
+                        return;
+                    }
+
+                    let mut new_map = RoaringTreemap::new();
+                    let token_id = self.bitmaps.len() as u32;
+                    self.tokens_map.insert(token.to_owned(), token_id);
+                    new_map.insert(*row_id);
+                    self.bitmaps.push(new_map);
                 });
-                self.bitmaps[token_id as usize].insert(*row_id);
+            } else {
+                self.bitmaps[0].insert(*row_id);
             }
         }
     }
@@ -420,8 +475,10 @@ impl NGramIndexBuilder {
     pub async fn write(self, store: &dyn IndexStore) -> Result<()> {
         let mut ordered_tokens = self.tokens_map.into_iter().collect::<Vec<_>>();
         ordered_tokens.sort_by_key(|(_, id)| *id);
-        let tokens_array =
-            StringArray::from_iter_values(ordered_tokens.into_iter().map(|(t, _)| t));
+        // Prepend NULL token
+        let tokens_array = StringArray::from_iter(
+            std::iter::once(None).chain(ordered_tokens.into_iter().map(|(t, _)| Some(t))),
+        );
 
         let bitmap_array = BinaryArray::from_iter_values(self.bitmaps.into_iter().map(|bitmap| {
             let mut buf = Vec::with_capacity(bitmap.serialized_size());
@@ -453,4 +510,54 @@ pub async fn train_ngram_index(
     builder.train(batches_source).await?;
 
     builder.write(index_store).await
+}
+
+#[cfg(test)]
+mod tests {
+    use tantivy::tokenizer::TextAnalyzer;
+
+    use super::{tokenize_visitor, NGRAM_TOKENIZER};
+
+    fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
+        let mut tokens = Vec::with_capacity(text.len() * 3);
+        tokenize_visitor(analyzer, text, |token| tokens.push(token.to_owned()));
+        tokens
+    }
+
+    #[test]
+    fn test_tokenizer() {
+        let tokenizer = NGRAM_TOKENIZER.clone();
+
+        // ASCII folding
+        let tokens = collect_tokens(&tokenizer, "café");
+        assert_eq!(
+            tokens,
+            vec!["c", "ca", "calf", "a", "af", "afe", "f", "fe", "e"]
+        );
+
+        // Allow numbers
+        let tokens = collect_tokens(&tokenizer, "a1b2");
+        assert_eq!(
+            tokens,
+            vec!["a", "a1", "a1b", "1", "1b", "1b2", "b", "b2", "2"]
+        );
+
+        // Remove symbols and UTF-8 that doesn't map to characters
+        let tokens = collect_tokens(&tokenizer, "a👍b!c");
+
+        assert_eq!(tokens, vec!["a", "b", "c"]);
+
+        // Lower casing
+        let tokens = collect_tokens(&tokenizer, "ABC");
+        assert_eq!(tokens, vec!["a", "ab", "abc", "b", "bc", "c"]);
+
+        // Duplicate tokens
+        let tokens = collect_tokens(&tokenizer, "abab");
+        // Confirming that the tokenizer doesn't deduplicate tokens (this can be taken into consideration
+        // when training the index)
+        assert_eq!(
+            tokens,
+            vec!["a", "ab", "aba", "b", "ba", "bab", "a", "ab", "b"] // spellchecker:disable-line
+        );
+    }
 }

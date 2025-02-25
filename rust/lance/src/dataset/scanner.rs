@@ -1147,14 +1147,28 @@ impl Scanner {
         desired_schema: &Schema,
     ) -> Result<Projection> {
         let filter_columns = filter_plan.refine_columns();
-        self.dataset
+
+        let filter_schema = self
+            .dataset
+            .empty_projection()
+            .union_columns(filter_columns, OnMissing::Error)?
+            .into_schema();
+        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
+            return Err(Error::NotSupported {
+                source: "non-default storage columns cannot be used as filters".into(),
+                location: location!(),
+            });
+        }
+
+        Ok(self
+            .dataset
             .empty_projection()
             // Start with the desired schema
             .union_schema(desired_schema)
             // Subtract columns that are expensive
             .subtract_predicate(|f| !self.is_early_field(f))
             // Add back columns that we need for filtering
-            .union_columns(filter_columns, OnMissing::Error)
+            .union_schema(&filter_schema))
     }
 
     /// Create [`ExecutionPlan`] for Scan.
@@ -1478,6 +1492,8 @@ impl Scanner {
         let output_arrow_schema = physical_schema.as_ref().into();
 
         if plan.schema().as_ref() != &output_arrow_schema {
+            println!("plan schema: {:#?}", plan.schema());
+            println!("output schema: {:#?}", output_arrow_schema);
             plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
         }
 
