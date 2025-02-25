@@ -25,7 +25,7 @@ use tracing::instrument;
 
 use crate::{Index, IndexType};
 
-use super::{btree::OrderableScalarValue, SargableQuery};
+use super::{btree::OrderableScalarValue, SargableQuery, SearchResult};
 use super::{btree::TrainingSource, AnyQuery, IndexStore, ScalarIndex};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
@@ -171,7 +171,7 @@ impl Index for BitmapIndex {
 #[async_trait]
 impl ScalarIndex for BitmapIndex {
     #[instrument(name = "bitmap_search", level = "debug", skip_all)]
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
 
         let row_ids = match query {
@@ -228,7 +228,11 @@ impl ScalarIndex for BitmapIndex {
             }
         };
 
-        Ok(row_ids)
+        Ok(SearchResult::Exact(row_ids))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     async fn load(store: Arc<dyn IndexStore>) -> Result<Arc<Self>> {

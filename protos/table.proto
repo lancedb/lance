@@ -361,4 +361,5 @@ message BTreeIndexDetails {}
 message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message InvertedIndexDetails {}
+message NGramIndexDetails {}
 message VectorIndexDetails {}

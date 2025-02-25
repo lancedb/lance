@@ -730,7 +730,7 @@ mod tests {
 
     use crate::scalar::inverted::TokenizerConfig;
     use crate::scalar::lance_format::LanceIndexStore;
-    use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex};
+    use crate::scalar::{FullTextSearchQuery, SargableQuery, ScalarIndex, SearchResult};
 
     use super::InvertedIndex;
 
@@ -781,34 +781,41 @@ mod tests {
 
     async fn test_inverted_index<Offset: arrow::array::OffsetSizeTrait>() {
         let invert_index = create_index::<Offset>(false, TokenizerConfig::default()).await;
-        let row_ids = invert_index
+        let search_result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("lance".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        let SearchResult::Exact(row_ids) = search_result else {
+            panic!("unexpected search result")
+        };
         assert_eq!(row_ids.len(), Some(3));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(2));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("database".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(3));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("unknown null".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
         // test phrase query
@@ -831,50 +838,60 @@ mod tests {
 
         // recreate the index with position
         let invert_index = create_index::<Offset>(true, TokenizerConfig::default()).await;
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("lance database".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(4));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(2));
         assert!(row_ids.contains(3));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("\"lance database\"".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(2));
         assert!(row_ids.contains(0));
         assert!(row_ids.contains(1));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("\"database lance\"".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("\"lance unknown\"".to_owned()).limit(Some(10)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("\"unknown null\"".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
     }
 
@@ -891,39 +908,47 @@ mod tests {
     #[tokio::test]
     async fn test_accented_chars() {
         let invert_index = create_index::<i32>(false, TokenizerConfig::default()).await;
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(1));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(0));
 
         // with ascii folding enabled, the search should be accent-insensitive
         let invert_index =
             create_index::<i32>(true, TokenizerConfig::default().ascii_folding(true)).await;
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("accentués".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(1));
 
-        let row_ids = invert_index
+        let result = invert_index
             .search(&SargableQuery::FullTextSearch(
                 FullTextSearchQuery::new("accentues".to_owned()).limit(Some(3)),
             ))
             .await
             .unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(1));
     }
 }
