@@ -190,14 +190,15 @@ fn vector_index_details() -> prost_types::Any {
 #[async_trait]
 impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
-    async fn create_index(
+    async fn create_fragment_index(
         &mut self,
         columns: &[&str],
         index_type: IndexType,
         name: Option<String>,
         params: &dyn IndexParams,
         replace: bool,
-    ) -> Result<()> {
+        fragment_ids: Option<Vec<u32>>,
+    ) -> Result<lance_table::format::Index> {
         if columns.len() != 1 {
             return Err(Error::Index {
                 message: "Only support building index on 1 column at the moment".to_string(),
@@ -236,6 +237,11 @@ impl DatasetIndexExt for Dataset {
             }
         }
 
+        let fragment_bitmap = match &fragment_ids {
+            Some(fragment_ids) => Some(fragment_ids.iter().collect()),
+            None => Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+        };
+
         let index_id = Uuid::new_v4();
         let index_details: prost_types::Any = match (index_type, params.index_name()) {
             (
@@ -243,7 +249,8 @@ impl DatasetIndexExt for Dataset {
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(index_type.try_into()?);
-                build_scalar_index(self, column, &index_id.to_string(), &params).await?
+                build_scalar_index(self, column, &index_id.to_string(), fragment_ids, &params)
+                    .await?
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -254,7 +261,8 @@ impl DatasetIndexExt for Dataset {
                         message: "Scalar index type must take a ScalarIndexParams".to_string(),
                         location: location!(),
                     })?;
-                build_scalar_index(self, column, &index_id.to_string(), params).await?
+                build_scalar_index(self, column, &index_id.to_string(), fragment_ids, params)
+                    .await?
             }
             (IndexType::Inverted, _) => {
                 // Inverted index params.
@@ -266,7 +274,14 @@ impl DatasetIndexExt for Dataset {
                         location: location!(),
                     })?;
 
-                build_inverted_index(self, column, &index_id.to_string(), inverted_params).await?;
+                build_inverted_index(
+                    self,
+                    column,
+                    &index_id.to_string(),
+                    fragment_ids,
+                    inverted_params,
+                )
+                .await?;
                 inverted_index_details()
             }
             (IndexType::Vector, LANCE_VECTOR_INDEX) => {
@@ -325,15 +340,28 @@ impl DatasetIndexExt for Dataset {
                 });
             }
         };
-
-        let new_idx = IndexMetadata {
+        Ok(IndexMetadata {
             uuid: index_id,
             name: index_name,
             fields: vec![field.id],
             dataset_version: self.manifest.version,
-            fragment_bitmap: Some(self.get_fragments().iter().map(|f| f.id() as u32).collect()),
+            fragment_bitmap,
             index_details: Some(index_details),
-        };
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn create_index(
+        &mut self,
+        columns: &[&str],
+        index_type: IndexType,
+        name: Option<String>,
+        params: &dyn IndexParams,
+        replace: bool,
+    ) -> Result<()> {
+        let new_idx = self
+            .create_fragment_index(columns, index_type, name, params, replace, None)
+            .await?;
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
