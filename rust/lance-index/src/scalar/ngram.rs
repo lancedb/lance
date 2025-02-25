@@ -47,7 +47,7 @@ lazy_static::lazy_static! {
 }
 
 // Helper function to apply a function to each token in a text
-fn tokenize_visitor(analyzer: &TextAnalyzer, text: &str, mut visitor: impl FnMut(&String) -> ()) {
+fn tokenize_visitor(analyzer: &TextAnalyzer, text: &str, mut visitor: impl FnMut(&String)) {
     // The token_stream method is mutable.  As far as I can tell this is to enforce exclusivity and not
     // true mutability.  For example, the object returned by `token_stream` has thread-local state but
     // it is reset each time `token_stream` is called.
@@ -76,7 +76,7 @@ struct NGramPostingList {
 
 impl DeepSizeOf for NGramPostingList {
     fn deep_size_of_children(&self, _: &mut deepsize::Context) -> usize {
-        self.bitmap.serialized_size() as usize
+        self.bitmap.serialized_size()
     }
 }
 
@@ -127,8 +127,7 @@ impl std::fmt::Debug for NGramPostingListReader {
 impl NGramPostingListReader {
     #[instrument(level = "debug", skip(self))]
     pub async fn ngram_list(&self, token_id: u32) -> Result<Arc<NGramPostingList>> {
-        Ok(self
-            .cache
+        self.cache
             .try_get_with(token_id, async move {
                 let batch = self
                     .reader
@@ -140,7 +139,7 @@ impl NGramPostingListReader {
                 Result::Ok(Arc::new(NGramPostingList::try_from_batch(batch)?))
             })
             .await
-            .map_err(|e| Error::io(e.to_string(), location!()))?)
+            .map_err(|e| Error::io(e.to_string(), location!()))
     }
 
     pub async fn load_all_lists(&self) -> Result<Vec<RoaringTreemap>> {

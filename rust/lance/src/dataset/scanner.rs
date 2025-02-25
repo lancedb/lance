@@ -1732,7 +1732,7 @@ impl Scanner {
                 .empty_projection()
                 .union_columns(&columns, OnMissing::Error)?;
             let mut plan = if filter_plan.index_query.is_some() {
-                self.scalar_indexed_scan(vector_scan_projection, &filter_plan)
+                self.scalar_indexed_scan(vector_scan_projection, filter_plan)
                     .await?
             } else {
                 self.scan(
@@ -1917,7 +1917,7 @@ impl Scanner {
                 take_projection = take_projection.union_columns(filter_cols, OnMissing::Error)?;
             }
             if let Some(refine_expr) = refine_expr {
-                let refine_cols = Planner::column_names_in_expr(&refine_expr);
+                let refine_cols = Planner::column_names_in_expr(refine_expr);
                 take_projection = take_projection.union_columns(refine_cols, OnMissing::Error)?;
             }
             plan = self.take(plan, take_projection, self.batch_readahead)?;
@@ -2285,10 +2285,7 @@ impl Scanner {
                 // is a refine expression that needs to be applied to the results so we need to do a full
                 // filtered scan
                 let filtered_row_ids = self
-                    .scalar_indexed_scan(
-                        self.dataset.empty_projection().with_row_id(),
-                        &filter_plan,
-                    )
+                    .scalar_indexed_scan(self.dataset.empty_projection().with_row_id(), filter_plan)
                     .await?;
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
