@@ -1379,18 +1379,17 @@ impl Scanner {
                     (false, _) => {
                         // The source is a full scan of the table
                         let with_row_id = filter_plan.has_refine() || self.with_row_id;
-                        let eager_projection = if filter_plan.has_refine() {
+                        let eager_schema = if filter_plan.has_refine() {
                             // If there is a filter then only load the filter columns in the
                             // initial scan.  We will `take` the remaining columns later
                             self.calc_eager_projection(
                                 &filter_plan,
                                 self.projection_plan.physical_schema.as_ref(),
                             )?
+                            .into_schema_ref()
                         } else {
                             // If there is no filter we eagerly load everything
-                            self.dataset
-                                .empty_projection()
-                                .union_schema(&self.projection_plan.physical_schema)
+                            self.projection_plan.physical_schema.clone()
                         };
                         if scan_range.is_some() && !self.dataset.is_legacy_storage() {
                             // If this is a v2 dataset with no filter then we can pushdown
@@ -1403,7 +1402,7 @@ impl Scanner {
                             self.with_row_address,
                             false,
                             scan_range,
-                            eager_projection.into_schema_ref(),
+                            eager_schema,
                         )
                     }
                 }
@@ -1492,8 +1491,6 @@ impl Scanner {
         let output_arrow_schema = physical_schema.as_ref().into();
 
         if plan.schema().as_ref() != &output_arrow_schema {
-            println!("plan schema: {:#?}", plan.schema());
-            println!("output schema: {:#?}", output_arrow_schema);
             plan = Arc::new(project(plan, &physical_schema.as_ref().into())?);
         }
 
