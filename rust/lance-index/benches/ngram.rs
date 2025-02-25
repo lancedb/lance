@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Benchmark of HNSW graph.
-//!
-//!
 
 use std::{sync::Arc, time::Duration};
 
