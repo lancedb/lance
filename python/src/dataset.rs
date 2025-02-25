@@ -31,7 +31,7 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::scanner::MaterializationStyle;
+use lance::dataset::scanner::{DatasetRecordBatchStream, MaterializationStyle};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
@@ -74,7 +74,7 @@ use pyo3::{
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::error::PythonErrorExt;
 use crate::file::object_store_from_uri_or_path;
@@ -1556,6 +1556,27 @@ impl Dataset {
         self.ds = Arc::new(new_self);
 
         Ok(())
+    }
+
+    #[pyo3(signature = (index_name,partition_id, with_vector=false))]
+    fn read_index_partition(
+        &self,
+        index_name: String,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = RT
+            .block_on(
+                None,
+                self.ds
+                    .read_index_partition(&index_name, partition_id, with_vector),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
     }
 }
 

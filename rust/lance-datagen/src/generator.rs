@@ -55,7 +55,7 @@ impl From<u32> for Dimension {
 }
 
 /// A trait for anything that can generate arrays of data
-pub trait ArrayGenerator: Send + Sync {
+pub trait ArrayGenerator: Send + Sync + std::fmt::Debug {
     /// Generate an array of the given length
     ///
     /// # Arguments
@@ -92,6 +92,7 @@ pub trait ArrayGenerator: Send + Sync {
     fn element_size_bytes(&self) -> Option<ByteCount>;
 }
 
+#[derive(Debug)]
 pub struct CycleNullGenerator {
     generator: Box<dyn ArrayGenerator>,
     validity: Vec<bool>,
@@ -139,6 +140,7 @@ impl ArrayGenerator for CycleNullGenerator {
     }
 }
 
+#[derive(Debug)]
 pub struct MetadataGenerator {
     generator: Box<dyn ArrayGenerator>,
     metadata: HashMap<String, String>,
@@ -166,6 +168,7 @@ impl ArrayGenerator for MetadataGenerator {
     }
 }
 
+#[derive(Debug)]
 pub struct NullGenerator {
     generator: Box<dyn ArrayGenerator>,
     null_probability: f64,
@@ -243,6 +246,10 @@ impl ArrayGenerator for NullGenerator {
             );
             Ok(make_array(new_data))
         }
+    }
+
+    fn metadata(&self) -> Option<HashMap<String, String>> {
+        self.generator.metadata()
     }
 
     fn data_type(&self) -> &DataType {
@@ -349,6 +356,23 @@ where
     element_size_bytes: Option<ByteCount>,
 }
 
+impl<T, ArrayType, F: FnMut(&mut rand_xoshiro::Xoshiro256PlusPlus) -> T> std::fmt::Debug
+    for FnGen<T, ArrayType, F>
+where
+    T: Copy + Default,
+    ArrayType: arrow_array::Array + From<Vec<T>>,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FnGen")
+            .field("data_type", &self.data_type)
+            .field("array_type", &self.array_type)
+            .field("repeat", &self.repeat)
+            .field("leftover_count", &self.leftover_count)
+            .field("element_size_bytes", &self.element_size_bytes)
+            .finish()
+    }
+}
+
 impl<T, ArrayType, F: FnMut(&mut rand_xoshiro::Xoshiro256PlusPlus) -> T> FnGen<T, ArrayType, F>
 where
     T: Copy + Default,
@@ -422,6 +446,7 @@ impl From<u64> for Seed {
     }
 }
 
+#[derive(Debug)]
 pub struct CycleVectorGenerator {
     underlying_gen: Box<dyn ArrayGenerator>,
     dimension: Dimension,
@@ -470,7 +495,7 @@ impl ArrayGenerator for CycleVectorGenerator {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PseudoUuidGenerator {}
 
 impl ArrayGenerator for PseudoUuidGenerator {
@@ -497,7 +522,7 @@ impl ArrayGenerator for PseudoUuidGenerator {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PseudoUuidHexGenerator {}
 
 impl ArrayGenerator for PseudoUuidHexGenerator {
@@ -524,7 +549,7 @@ impl ArrayGenerator for PseudoUuidHexGenerator {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct RandomBooleanGenerator {}
 
 impl ArrayGenerator for RandomBooleanGenerator {
@@ -556,6 +581,14 @@ impl ArrayGenerator for RandomBooleanGenerator {
 pub struct RandomBytesGenerator<T: ArrowPrimitiveType + Send + Sync> {
     phantom: PhantomData<T>,
     data_type: DataType,
+}
+
+impl<T: ArrowPrimitiveType + Send + Sync> std::fmt::Debug for RandomBytesGenerator<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RandomBytesGenerator")
+            .field("data_type", &self.data_type)
+            .finish()
+    }
 }
 
 impl<T: ArrowPrimitiveType + Send + Sync> RandomBytesGenerator<T> {
@@ -597,6 +630,7 @@ impl<T: ArrowPrimitiveType + Send + Sync> ArrayGenerator for RandomBytesGenerato
 
 // This is pretty much the same thing as RandomBinaryGenerator but we can't use that
 // because there is no ArrowPrimitiveType for FixedSizeBinary
+#[derive(Debug)]
 pub struct RandomFixedSizeBinaryGenerator {
     data_type: DataType,
     size: i32,
@@ -636,6 +670,7 @@ impl ArrayGenerator for RandomFixedSizeBinaryGenerator {
     }
 }
 
+#[derive(Debug)]
 pub struct RandomIntervalGenerator {
     unit: IntervalUnit,
     data_type: DataType,
@@ -688,6 +723,7 @@ impl ArrayGenerator for RandomIntervalGenerator {
         Some(ByteCount::from(12))
     }
 }
+#[derive(Debug)]
 pub struct RandomBinaryGenerator {
     bytes_per_element: ByteCount,
     scale_to_utf8: bool,
@@ -776,6 +812,7 @@ impl ArrayGenerator for RandomBinaryGenerator {
     }
 }
 
+#[derive(Debug)]
 pub struct VariableRandomBinaryGenerator {
     lengths_gen: Box<dyn ArrayGenerator>,
     data_type: DataType,
@@ -828,6 +865,18 @@ pub struct CycleBinaryGenerator<T: ByteArrayType> {
     array_type: PhantomData<T>,
     width: Option<ByteCount>,
     idx: usize,
+}
+
+impl<T: ByteArrayType> std::fmt::Debug for CycleBinaryGenerator<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CycleBinaryGenerator")
+            .field("values", &self.values)
+            .field("lengths", &self.lengths)
+            .field("data_type", &self.data_type)
+            .field("width", &self.width)
+            .field("idx", &self.idx)
+            .finish()
+    }
 }
 
 impl<T: ByteArrayType> CycleBinaryGenerator<T> {
@@ -905,6 +954,15 @@ pub struct FixedBinaryGenerator<T: ByteArrayType> {
     array_type: PhantomData<T>,
 }
 
+impl<T: ByteArrayType> std::fmt::Debug for FixedBinaryGenerator<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FixedBinaryGenerator")
+            .field("value", &self.value)
+            .field("data_type", &self.data_type)
+            .finish()
+    }
+}
+
 impl<T: ByteArrayType> FixedBinaryGenerator<T> {
     pub fn new(value: Vec<u8>) -> Self {
         Self {
@@ -954,6 +1012,16 @@ pub struct DictionaryGenerator<K: ArrowDictionaryKeyType> {
     key_width: u64,
 }
 
+impl<K: ArrowDictionaryKeyType> std::fmt::Debug for DictionaryGenerator<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DictionaryGenerator")
+            .field("generator", &self.generator)
+            .field("data_type", &self.data_type)
+            .field("key_width", &self.key_width)
+            .finish()
+    }
+}
+
 impl<K: ArrowDictionaryKeyType> DictionaryGenerator<K> {
     fn new(generator: Box<dyn ArrayGenerator>) -> Self {
         let key_type = Box::new(K::DATA_TYPE);
@@ -993,6 +1061,7 @@ impl<K: ArrowDictionaryKeyType + Send + Sync> ArrayGenerator for DictionaryGener
     }
 }
 
+#[derive(Debug)]
 struct RandomListGenerator {
     field: Arc<Field>,
     child_field: Arc<Field>,
@@ -1069,6 +1138,7 @@ impl ArrayGenerator for RandomListGenerator {
     }
 }
 
+#[derive(Debug)]
 struct NullArrayGenerator {}
 
 impl ArrayGenerator for NullArrayGenerator {
@@ -1089,6 +1159,7 @@ impl ArrayGenerator for NullArrayGenerator {
     }
 }
 
+#[derive(Debug)]
 struct RandomStructGenerator {
     fields: Fields,
     data_type: DataType,

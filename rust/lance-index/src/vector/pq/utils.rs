@@ -3,7 +3,7 @@
 
 use arrow_array::{cast::AsArray, types::ArrowPrimitiveType, Array, FixedSizeListArray};
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 /// Divide a 2D vector in [`T::Array`] to `m` sub-vectors.
 ///

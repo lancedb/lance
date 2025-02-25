@@ -7,8 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::parse::str_is_truthy;
@@ -45,7 +47,7 @@ use lance_table::io::manifest::read_manifest_indexes;
 use roaring::RoaringBitmap;
 use scalar::{build_inverted_index, detect_scalar_index_type, inverted_index_details};
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
 use vector::ivf::v2::IVFIndex;
@@ -714,6 +716,48 @@ impl DatasetIndexExt for Dataset {
             location: location!(),
         })
     }
+
+    async fn read_index_partition(
+        &self,
+        index_name: &str,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let indices = self.load_indices_by_name(index_name).await?;
+        if indices.is_empty() {
+            return Err(Error::IndexNotFound {
+                identity: format!("name={}", index_name),
+                location: location!(),
+            });
+        }
+        let column = self.schema().field_by_id(indices[0].fields[0]).unwrap();
+
+        let mut schema: Option<Arc<Schema>> = None;
+        let mut partition_streams = Vec::with_capacity(indices.len());
+        for index in indices {
+            let index = self
+                .open_vector_index(&column.name, &index.uuid.to_string())
+                .await?;
+
+            let stream = index.partition_reader(partition_id, with_vector).await?;
+            if schema.is_none() {
+                schema = Some(stream.schema());
+            }
+            partition_streams.push(stream);
+        }
+
+        match schema {
+            Some(schema) => {
+                let merged = stream::select_all(partition_streams);
+                let stream = RecordBatchStreamAdapter::new(schema, merged);
+                Ok(Box::pin(stream))
+            }
+            None => Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                stream::empty(),
+            ))),
+        }
+    }
 }
 
 /// A trait for internal dataset utilities
@@ -803,14 +847,8 @@ impl DatasetIndexInternalExt for Dataset {
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
                         let dataset = Arc::new(self.clone());
-                        crate::index::vector::open_vector_index(
-                            dataset,
-                            column,
-                            uuid,
-                            vector_index,
-                            reader,
-                        )
-                        .await
+                        crate::index::vector::open_vector_index(dataset, uuid, vector_index, reader)
+                            .await
                     }
                     None => Err(Error::Internal {
                         message: "Index proto was missing implementation field".into(),

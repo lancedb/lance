@@ -20,7 +20,7 @@ use lance_file::v2::reader::FileReader;
 use lance_io::ReadBatchParams;
 use lance_linalg::distance::DistanceType;
 use prost::Message;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::{
     pb,

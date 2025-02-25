@@ -28,7 +28,7 @@ use log::debug;
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Any;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 

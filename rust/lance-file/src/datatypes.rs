@@ -11,7 +11,7 @@ use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 use lance_io::utils::{read_binary_array, read_fixed_stride_array};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::format::pb;
 

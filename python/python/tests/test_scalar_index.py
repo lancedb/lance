@@ -233,25 +233,26 @@ def test_all_null_chunk(tmp_path):
 # environment variable.  This test ensures that the environment variable
 # is respected.
 def test_lance_mem_pool_env_var(tmp_path):
-    strings = pa.array([f"string-{i}" * 10 for i in range(100 * 1024)])
-    table = pa.Table.from_arrays([strings], ["str"])
+    ints = pa.array([i * 10 for i in range(100 * 1024)])
+    table = pa.Table.from_arrays([ints], ["int"])
     dataset = lance.write_dataset(table, tmp_path)
 
     # Should succeed
-    dataset.create_scalar_index("str", index_type="BTREE")
+    dataset.create_scalar_index("int", index_type="BTREE")
 
     try:
         # Should fail if we intentionally use a very small memory pool
         os.environ["LANCE_MEM_POOL_SIZE"] = "1024"
         with pytest.raises(Exception):
-            dataset.create_scalar_index("str", index_type="BTREE", replace=True)
+            dataset.create_scalar_index("int", index_type="BTREE", replace=True)
 
         # Should succeed again since bypassing spilling takes precedence
         os.environ["LANCE_BYPASS_SPILLING"] = "1"
-        dataset.create_scalar_index("str", index_type="BTREE", replace=True)
+        dataset.create_scalar_index("int", index_type="BTREE", replace=True)
     finally:
         del os.environ["LANCE_MEM_POOL_SIZE"]
-        del os.environ["LANCE_BYPASS_SPILLING"]
+        if "LANCE_BYPASS_SPILLING" in os.environ:
+            del os.environ["LANCE_BYPASS_SPILLING"]
 
 
 @pytest.mark.parametrize("with_position", [True, False])
@@ -302,6 +303,15 @@ def test_indexed_filter_with_fts_index(tmp_path):
     ds = lance.write_dataset(data, tmp_path, mode="overwrite")
     ds.create_scalar_index("text", "INVERTED")
     ds.create_scalar_index("sentiment", "BITMAP")
+
+    # append more data to test flat FTS
+    data = pa.table(
+        {
+            "text": ["flat", "search"],
+            "sentiment": ["positive", "positive"],
+        }
+    )
+    ds = lance.write_dataset(data, tmp_path, mode="append")
 
     results = ds.to_table(
         full_text_query="puppy",

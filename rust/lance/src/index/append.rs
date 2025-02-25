@@ -9,7 +9,7 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::IndexType;
 use lance_table::format::Index as IndexMetadata;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use uuid::Uuid;
 
 use super::vector::ivf::optimize_vector_indices;

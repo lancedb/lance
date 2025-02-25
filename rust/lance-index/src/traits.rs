@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use lance_core::Result;
 
 use crate::{optimize::OptimizeOptions, IndexParams, IndexType};
@@ -107,4 +108,11 @@ pub trait DatasetIndexExt {
         column: &str,
         index_id: Uuid,
     ) -> Result<()>;
+
+    async fn read_index_partition(
+        &self,
+        index_name: &str,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream>;
 }

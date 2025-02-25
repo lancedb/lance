@@ -14,7 +14,7 @@ use lance_core::datatypes::{
 };
 use lance_core::utils::bit::{is_pwr_two, pad_bytes_to};
 use lance_core::{Error, Result};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::buffer::LanceBuffer;
 use crate::data::{DataBlock, FixedWidthDataBlock, VariableWidthBlock};
@@ -247,28 +247,6 @@ pub trait PerValueCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Also returns a description of the compression that can be used to decompress when reading the data back
     fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)>;
-}
-
-/// Trait for compression algorithms that are suitable for use in the zipped structural encoding
-///
-/// This encoding is useful for non-short strings, binary, and variable length lists
-/// (i.e. when the average value is >= 128 bytes)
-///
-/// These compressors can be extremely generic.  They only need to produce one buffer of bytes
-/// and another buffer of offsets into the bytes, one offset for each value.  Both of these buffers
-/// will be stored.
-///
-/// Note: It is perfectly legal for a value to have 0 bytes.  However, we still need to store the
-/// offset itself.  This means that this compressor, when implemented by something like RLE will not
-/// be as efficient (space-wise) as a block version (which could skip the offsets for runs).
-///
-/// Accessing this data will require 2 IOPS and accessing in a random-access fashion will require
-/// a repetition index.
-pub trait VariablePerValueCompressor: std::fmt::Debug + Send + Sync {
-    /// Compress the data into a single buffer where each value is encoded with a different size
-    ///
-    /// Also returns a description of the compression that can be used to decompress when reading the data back
-    fn compress(&self, data: DataBlock) -> Result<(VariableWidthBlock, pb::ArrayEncoding)>;
 }
 
 /// Trait for compression algorithms that compress an entire block of data into one opaque
@@ -515,13 +493,26 @@ impl CoreArrayEncodingStrategy {
         let bin_indices_encoder =
             Self::choose_array_encoder(arrays, &DataType::UInt64, data_size, false, version, None)?;
 
-        let compression = field_meta.and_then(Self::get_field_compression);
-
-        let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, compression));
-        if compression.is_none() && Self::can_use_fsst(data_type, data_size, version) {
-            Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+        if let Some(compression) = field_meta.and_then(Self::get_field_compression) {
+            if compression.scheme == CompressionScheme::Fsst {
+                // User requested FSST
+                let raw_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, None));
+                Ok(Box::new(FsstArrayEncoder::new(raw_encoder)))
+            } else {
+                // Generic compression
+                Ok(Box::new(BinaryEncoder::new(
+                    bin_indices_encoder,
+                    Some(compression),
+                )))
+            }
         } else {
-            Ok(bin_encoder)
+            // No user-specified compression, use FSST if we can
+            let bin_encoder = Box::new(BinaryEncoder::new(bin_indices_encoder, None));
+            if Self::can_use_fsst(data_type, data_size, version) {
+                Ok(Box::new(FsstArrayEncoder::new(bin_encoder)))
+            } else {
+                Ok(bin_encoder)
+            }
         }
     }
 

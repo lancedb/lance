@@ -24,7 +24,7 @@ use lance_index::scalar::{
     ScalarIndex, ScalarIndexParams, ScalarIndexType,
 };
 use lance_table::format::Index;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::session::Session;
@@ -81,6 +81,25 @@ impl TrainingRequest {
                 .collect();
             scan.with_fragments(frags?);
         }
+
+        let column_field =
+            self.dataset
+                .schema()
+                .field(&self.column)
+                .ok_or(Error::InvalidInput {
+                    source: format!("No column with name {}", self.column).into(),
+                    location: location!(),
+                })?;
+
+        // Datafusion currently has bugs with spilling on string columns
+        // See https://github.com/apache/datafusion/issues/10073
+        //
+        // One we upgrade we can remove this
+        let use_spilling = !matches!(
+            column_field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8
+        );
+
         let ordering = match sort {
             true => Some(vec![ColumnOrdering::asc_nulls_first(self.column.clone())]),
             false => None,
@@ -93,7 +112,7 @@ impl TrainingRequest {
 
         let batches = scan
             .try_into_dfstream(LanceExecutionOptions {
-                use_spilling: true,
+                use_spilling,
                 ..Default::default()
             })
             .await?;

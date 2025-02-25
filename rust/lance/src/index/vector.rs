@@ -38,7 +38,7 @@ use lance_io::traits::Reader;
 use lance_linalg::distance::*;
 use lance_table::format::Index as IndexMetadata;
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tempfile::tempdir;
 use tracing::instrument;
 use utils::get_vector_type;
@@ -445,7 +445,6 @@ pub(crate) async fn remap_vector_index(
 #[instrument(level = "debug", skip(dataset, vec_idx, reader))]
 pub(crate) async fn open_vector_index(
     dataset: Arc<Dataset>,
-    column: &str,
     uuid: &str,
     vec_idx: &lance_index::pb::VectorIndex,
     reader: Arc<dyn Reader>,

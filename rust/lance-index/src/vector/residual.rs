@@ -18,7 +18,7 @@ use lance_linalg::distance::{DistanceType, Dot, L2};
 use lance_linalg::kmeans::{compute_partitions, KMeansAlgoFloat};
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::{Float, FromPrimitive, Num};
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use super::transform::Transformer;
@@ -91,9 +91,10 @@ where
             let c = &centroids_slice[part_id * dimension..(part_id + 1) * dimension];
             iter::zip(vector, c).map(|(v, cent)| *v - *cent)
         })
-        .exact_size(vectors.len() * dimension)
+        .exact_size(vectors.len())
         .collect::<Vec<_>>();
     let residual_arr = PrimitiveArray::<T>::from_iter_values(residuals);
+    debug_assert_eq!(residual_arr.len(), vectors.len());
     Ok(FixedSizeListArray::try_new_from_values(
         residual_arr,
         dimension as i32,

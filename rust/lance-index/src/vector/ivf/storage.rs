@@ -14,7 +14,7 @@ use lance_linalg::distance::DistanceType;
 use lance_table::io::manifest::ManifestDescribing;
 use log::debug;
 use serde::{Deserialize, Serialize};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::pb::Ivf as PbIvf;
 

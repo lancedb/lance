@@ -33,7 +33,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID_FIELD};
 use lance_io::ReadBatchParams;
 use lance_table::format::Fragment;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::scanner::LEGACY_DEFAULT_FRAGMENT_READAHEAD;
@@ -168,9 +168,15 @@ impl ExecutionPlan for LancePushdownScanExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "LancePushdownScanExec does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {

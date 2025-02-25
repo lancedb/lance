@@ -30,7 +30,7 @@ use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lazy_static::lazy_static;
 use moka::future::Cache;
 use roaring::RoaringBitmap;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use super::builder::inverted_list_schema;
@@ -1187,8 +1187,8 @@ pub fn flat_bm25_search(
 
     let score_col = Arc::new(Float32Array::from(scores)) as ArrayRef;
     let batch = batch
-        .drop_column(doc_col)?
-        .try_with_column(SCORE_FIELD.clone(), score_col)?;
+        .try_with_column(SCORE_FIELD.clone(), score_col)?
+        .project_by_schema(&FTS_SCHEMA)?; // the scan node would probably scan some extra columns for prefilter, drop them here
     Ok(batch)
 }
 

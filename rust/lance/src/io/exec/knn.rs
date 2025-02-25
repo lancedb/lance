@@ -11,6 +11,7 @@ use arrow_array::{
     ArrayRef, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{
@@ -32,7 +33,7 @@ use lance_index::vector::{
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::Index;
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::Dataset;
 use crate::index::prefilter::{DatasetPreFilter, FilterLoader};
@@ -184,18 +185,30 @@ impl ExecutionPlan for KNNVectorDistanceExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         let inner_stats = self.input.statistics()?;
-        let dist_col_stats = inner_stats.column_statistics[0].clone();
+        let schema = self.input.schema();
+        let dist_stats = inner_stats
+            .column_statistics
+            .iter()
+            .zip(schema.fields())
+            .find(|(_, field)| field.name() == &self.column)
+            .map(|(stats, _)| ColumnStatistics {
+                null_count: stats.null_count,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let column_statistics = inner_stats
             .column_statistics
             .into_iter()
-            .chain([dist_col_stats])
+            .zip(schema.fields())
+            .filter(|(_, field)| field.name() != DIST_COL)
+            .map(|(stats, _)| stats)
+            .chain(std::iter::once(dist_stats))
             .collect::<Vec<_>>();
         Ok(Statistics {
             num_rows: inner_stats.num_rows,
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
-        // self.input.statistics()
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -339,11 +352,15 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Internal(
-            "ANNIVFPartitionExec: with_new_children called, but no children to replace".to_string(),
-        ))
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "ANNIVFPartitionExec node does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(

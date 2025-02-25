@@ -25,7 +25,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::object_writer::ObjectWriter;
 use lance_io::traits::{WriteExt, Writer};
 use object_store::path::Path;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::io::AsyncWriteExt;
 
 use crate::format::metadata::{Metadata, StatisticsMetadata};

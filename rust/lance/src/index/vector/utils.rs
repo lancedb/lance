@@ -11,7 +11,7 @@ use log::info;
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::SeedableRng;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::sync::Mutex;
 
 use crate::dataset::Dataset;

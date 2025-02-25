@@ -29,7 +29,7 @@ use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
-use snafu::{location, Location};
+use snafu::location;
 
 use crate::dataset::{get_write_params, transforms_from_python};
 use crate::error::PythonErrorExt;

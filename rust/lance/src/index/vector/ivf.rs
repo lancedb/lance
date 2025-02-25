@@ -20,6 +20,7 @@ use arrow_ord::sort::sort_to_indices;
 use arrow_schema::{DataType, Schema};
 use arrow_select::{concat::concat_batches, take::take};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{
     stream::{self, StreamExt},
@@ -75,7 +76,7 @@ use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::Serialize;
 use serde_json::json;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -908,6 +909,19 @@ impl VectorIndex for IVFIndex {
             message: "Flat index does not support load".to_string(),
             location: location!(),
         })
+    }
+
+    async fn partition_reader(
+        &self,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        let partition = self.load_partition(partition_id, false).await?;
+        partition.to_batch_stream(with_vector).await
+    }
+
+    async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+        unimplemented!("this method is for only sub index")
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {

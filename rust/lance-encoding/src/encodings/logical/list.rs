@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Fields};
 use futures::{future::BoxFuture, FutureExt};
 use lance_arrow::list::ListArrayExt;
 use log::trace;
-use snafu::{location, Location};
+use snafu::location;
 use tokio::task::JoinHandle;
 
 use lance_core::{cache::FileMetadataCache, Error, Result};
@@ -786,9 +786,7 @@ impl LogicalPageDecoder for ListPageDecoder {
         };
 
         self.rows_drained += num_rows;
-        let has_more = self.rows_left() > 0;
         Ok(NextDecodeTask {
-            has_more,
             num_rows,
             task: Box::new(ListDecodeTask {
                 offsets,
