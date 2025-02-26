@@ -168,9 +168,15 @@ impl ExecutionPlan for LancePushdownScanExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "LancePushdownScanExec does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {

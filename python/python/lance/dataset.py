@@ -1494,6 +1494,7 @@ class LanceDataset(pa.dataset.Dataset):
             Literal["LABEL_LIST"],
             Literal["INVERTED"],
             Literal["FTS"],
+            Literal["NGRAM"],
         ],
         name: Optional[str] = None,
         *,
@@ -1547,6 +1548,10 @@ class LanceDataset(pa.dataset.Dataset):
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
           with a ``LABEL_LIST`` index.  This index can only speedup queries with
           ``array_has_any`` or ``array_has_all`` filters.
+        * ``NGRAM``. A special index that is used to index string columns.  This index
+          creates a bitmap for each ngram in the string.  By default we use trigrams.
+          This index can currently speed up queries using the ``contains`` function
+          in filters.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
@@ -1564,7 +1569,7 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, "FTS" or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"FTS"`` or ``"INVERTED"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1651,10 +1656,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
             raise NotImplementedError(
                 (
-                    'Only "BTREE", "LABEL_LIST", "INVERTED", '
+                    'Only "BTREE", "LABEL_LIST", "INVERTED", "NGRAM", '
                     'or "BITMAP" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
@@ -1676,6 +1681,9 @@ class LanceDataset(pa.dataset.Dataset):
         elif index_type == "LABEL_LIST":
             if not pa.types.is_list(field.type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
+        elif index_type == "NGRAM":
+            if not pa.types.is_string(field.type):
+                raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
             if not pa.types.is_string(field.type) and not pa.types.is_large_string(
                 field.type
@@ -3841,3 +3849,112 @@ def _validate_metadata(metadata: dict):
                 )
         elif isinstance(v, dict):
             _validate_metadata(v)
+
+
+class VectorIndexReader:
+    """
+    This class allows you to initialize a reader for a specific vector index,
+    retrieve the number of partitions,
+    access the centroids of the index,
+    and read specific partitions of the index.
+
+    Parameters
+    ----------
+    dataset: LanceDataset
+        The dataset containing the index.
+    index_name: str
+        The name of the vector index to read.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        import lance
+        from lance.dataset import VectorIndexReader
+        import numpy as np
+        import pyarrow as pa
+        vectors = np.random.rand(256, 2)
+        data = pa.table({"vector": pa.array(vectors.tolist(),
+            type=pa.list_(pa.float32(), 2))})
+        dataset = lance.write_dataset(data, "/tmp/index_reader_demo")
+        dataset.create_index("vector", index_type="IVF_PQ",
+            num_partitions=4, num_sub_vectors=2)
+        reader = VectorIndexReader(dataset, "vector_idx")
+        assert reader.num_partitions() == 4
+        partition = reader.read_partition(0)
+        assert "_rowid" in partition.column_names
+
+    Exceptions
+    ----------
+    ValueError
+        If the specified index is not a vector index.
+    """
+
+    def __init__(self, dataset: LanceDataset, index_name: str):
+        stats = dataset.stats.index_stats(index_name)
+        self.dataset = dataset
+        self.index_name = index_name
+        self.stats = stats
+        try:
+            self.num_partitions()
+        except KeyError:
+            raise ValueError(f"Index {index_name} is not vector index")
+
+    def num_partitions(self) -> int:
+        """
+        Returns the number of partitions in the dataset.
+
+        Returns
+        -------
+        int
+            The number of partitions.
+        """
+
+        return self.stats["indices"][0]["num_partitions"]
+
+    def centroids(self) -> np.ndarray:
+        """
+        Returns the centroids of the index
+
+        Returns
+        -------
+        np.ndarray
+            The centroids of IVF
+            with shape (num_partitions, dim)
+        """
+        # when we have more delta indices,
+        # they are with the same centroids
+        return np.array(
+            self.dataset._ds.get_index_centroids(self.stats["indices"][0]["centroids"])
+        )
+
+    def read_partition(
+        self, partition_id: int, *, with_vector: bool = False
+    ) -> pa.Table:
+        """
+        Returns a pyarrow table for the given IVF partition
+
+        Parameters
+        ----------
+        partition_id: int
+            The id of the partition to read
+        with_vector: bool, default False
+            Whether to include the vector column in the reader,
+            for IVF_PQ, the vector column is PQ codes
+
+        Returns
+        -------
+        pa.Table
+            A pyarrow table for the given partition,
+            containing the row IDs, and quantized vectors (if with_vector is True).
+        """
+
+        if partition_id < 0 or partition_id >= self.num_partitions():
+            raise IndexError(
+                f"Partition id {partition_id} is out of range, "
+                f"expected 0 <= partition_id < {self.num_partitions()}"
+            )
+
+        return self.dataset._ds.read_index_partition(
+            self.index_name, partition_id, with_vector
+        ).read_all()

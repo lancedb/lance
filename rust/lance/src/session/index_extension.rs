@@ -67,6 +67,7 @@ mod test {
 
     use arrow_array::{RecordBatch, UInt32Array};
     use arrow_schema::Schema;
+    use datafusion::execution::SendableRecordBatchStream;
     use deepsize::DeepSizeOf;
     use lance_file::version::LanceFileVersion;
     use lance_file::writer::{FileWriter, FileWriterOptions};
@@ -176,6 +177,10 @@ mod test {
 
         async fn remap(&mut self, _: &HashMap<u64, Option<u64>>) -> Result<()> {
             Ok(())
+        }
+
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
         }
 
         fn ivf_model(&self) -> IvfModel {

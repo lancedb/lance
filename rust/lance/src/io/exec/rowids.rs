@@ -184,9 +184,19 @@ impl ExecutionPlan for AddRowAddrExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if children.len() != 1 {
+            Err(DataFusionError::Internal(
+                "AddRowAddrExec: invalid number of children".into(),
+            ))
+        } else {
+            Ok(Arc::new(Self::try_new(
+                children.into_iter().next().unwrap(),
+                self.dataset.clone(),
+                self.rowaddr_pos,
+            )?))
+        }
     }
 
     fn execute(

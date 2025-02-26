@@ -31,7 +31,7 @@ use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::refs::{Ref, TagContents};
-use lance::dataset::scanner::MaterializationStyle;
+use lance::dataset::scanner::{DatasetRecordBatchStream, MaterializationStyle};
 use lance::dataset::statistics::{DataStatistics, DatasetStatisticsExt};
 use lance::dataset::{
     fragment::FileFragment as LanceFileFragment,
@@ -1176,6 +1176,7 @@ impl Dataset {
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
             "BITMAP" => IndexType::Bitmap,
+            "NGRAM" => IndexType::NGram,
             "LABEL_LIST" => IndexType::LabelList,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
@@ -1192,6 +1193,9 @@ impl Dataset {
             "BITMAP" => Box::new(ScalarIndexParams {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
+            }),
+            "NGRAM" => Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::NGram),
             }),
             "LABEL_LIST" => Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
@@ -1557,6 +1561,27 @@ impl Dataset {
         self.ds = Arc::new(new_self);
 
         Ok(())
+    }
+
+    #[pyo3(signature = (index_name,partition_id, with_vector=false))]
+    fn read_index_partition(
+        &self,
+        index_name: String,
+        partition_id: usize,
+        with_vector: bool,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let stream = RT
+            .block_on(
+                None,
+                self.ds
+                    .read_index_partition(&index_name, partition_id, with_vector),
+            )?
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        let reader = Box::new(LanceReader::from_stream(DatasetRecordBatchStream::new(
+            stream,
+        )));
+        Ok(PyArrowType(reader))
     }
 }
 

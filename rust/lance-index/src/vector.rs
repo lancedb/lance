@@ -9,6 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
 use futures::{
     stream::{self, StreamExt},
     TryStreamExt,
@@ -191,6 +192,18 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     ) -> Result<Box<dyn VectorIndex>> {
         self.load(reader, offset, length).await
     }
+
+    // for IVF only
+    async fn partition_reader(
+        &self,
+        _partition_id: usize,
+        _with_vector: bool,
+    ) -> Result<SendableRecordBatchStream> {
+        unimplemented!("only for IVF")
+    }
+
+    // for SubIndex only
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream>;
 
     /// Return the IDs of rows in the index.
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_>;

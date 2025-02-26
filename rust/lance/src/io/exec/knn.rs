@@ -351,11 +351,15 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Internal(
-            "ANNIVFPartitionExec: with_new_children called, but no children to replace".to_string(),
-        ))
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "ANNIVFPartitionExec node does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
