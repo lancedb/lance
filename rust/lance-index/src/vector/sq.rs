@@ -88,7 +88,7 @@ impl ScalarQuantizer {
             .as_slice();
 
         self.bounds = data.iter().fold(self.bounds.clone(), |f, v| {
-            f.start.min(v.to_f64().unwrap())..f.end.max(v.to_f64().unwrap())
+            f.start.min(v.as_())..f.end.max(v.as_())
         });
 
         Ok(self.bounds.clone())
@@ -347,5 +347,16 @@ mod tests {
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
             assert_eq!(*v, (i * 17) as u8,);
         });
+    }
+
+    #[tokio::test]
+    async fn test_scale_to_u8_with_nan() {
+        let values = vec![0.0, 1.0, 2.0, 3.0, f64::NAN];
+        let bounds = Range::<f64> {
+            start: 0.0,
+            end: 3.0,
+        };
+        let u8_values = scale_to_u8::<Float64Type>(&values, &bounds);
+        assert_eq!(u8_values, vec![0, 85, 170, 255, 0]);
     }
 }
