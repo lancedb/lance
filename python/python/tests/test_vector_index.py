@@ -13,6 +13,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pytest
 from lance import LanceFragment
+from lance.dataset import VectorIndexReader
 
 torch = pytest.importorskip("torch")
 from lance.util import validate_vector_index  # noqa: E402
@@ -1129,3 +1130,33 @@ def test_drop_indices(indexed_dataset):
     )
 
     assert len(results) == 15
+
+
+def test_read_partition(indexed_dataset):
+    idx_name = indexed_dataset.list_indices()[0]["name"]
+    reader = VectorIndexReader(indexed_dataset, idx_name)
+
+    num_rows = indexed_dataset.count_rows()
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        res = reader.read_partition(part_id)
+        row_sum += res.num_rows
+        assert "_rowid" in res.column_names
+    assert row_sum == num_rows
+
+    row_sum = 0
+    for part_id in range(reader.num_partitions()):
+        res = reader.read_partition(part_id, with_vector=True)
+        row_sum += res.num_rows
+        pq_column = res["__pq_code"]
+        assert "_rowid" in res.column_names
+        assert pq_column.type == pa.list_(pa.uint8(), 16)
+    assert row_sum == num_rows
+
+    # error tests
+    with pytest.raises(IndexError, match="out of range"):
+        reader.read_partition(reader.num_partitions() + 1)
+
+    with pytest.raises(ValueError, match="not vector index"):
+        indexed_dataset.create_scalar_index("id", index_type="BTREE")
+        VectorIndexReader(indexed_dataset, "id_idx")

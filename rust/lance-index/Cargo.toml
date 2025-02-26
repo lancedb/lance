@@ -114,6 +114,10 @@ name = "sq"
 harness = false
 
 [[bench]]
+name = "ngram"
+harness = false
+
+[[bench]]
 name = "inverted"
 harness = false
 
