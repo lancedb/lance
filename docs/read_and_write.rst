@@ -300,7 +300,7 @@ at the cost of lower precision:
     })
     dataset = lance.write_dataset(table, "embeddings")
     dataset.alter_columns({"path": "embedding",
-                           "type": pa.list_(pa.float16(), 128)})
+                           "data_type": pa.list_(pa.float16(), 128)})
     dataset.schema()
 
 .. testoutput::
