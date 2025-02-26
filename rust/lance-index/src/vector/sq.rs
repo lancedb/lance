@@ -233,19 +233,17 @@ impl Quantization for ScalarQuantizer {
 }
 
 pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Range<f64>) -> Vec<u8> {
+    if bounds.start == bounds.end {
+        return vec![0; values.len()];
+    }
+
     let range = bounds.end - bounds.start;
     values
         .iter()
         .map(|&v| {
             let v = v.to_f64().unwrap();
-            match v {
-                v if v < bounds.start => 0,
-                v if v > bounds.end => 255,
-                _ => ((v - bounds.start) * f64::from_u32(255).unwrap() / range)
-                    .round()
-                    .to_u8()
-                    .unwrap(),
-            }
+            let v = ((v - bounds.start) * 255.0 / range).round();
+            v as u8 // rust `as` performs saturating cast when casting float to int, so it's safe and expected here
         })
         .collect_vec()
 }
