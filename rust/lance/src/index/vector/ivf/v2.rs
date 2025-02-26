@@ -480,6 +480,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream> {
         let partition = self.load_partition(partition_id, false).await?;
+        let partition = partition
+            .as_any()
+            .downcast_ref::<PartitionEntry<S, Q>>()
+            .ok_or(Error::Internal {
+                message: "failed to downcast partition entry".to_string(),
+                location: location!(),
+            })?;
         let store = &partition.storage;
         let schema = if with_vector {
             store.schema().clone()
