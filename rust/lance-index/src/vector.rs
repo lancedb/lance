@@ -228,7 +228,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 }
 
 #[async_trait]
-pub trait ParallelSearchInPartitionFunctions : Send + Sync{
+pub trait PartitionSearcher : Send + Sync{
     type PartitionRepresentation: Send + Sync + std::fmt::Debug;
 
     async fn search_in_loaded_partition(
@@ -248,7 +248,7 @@ pub trait ParallelSearchInPartitionFunctions : Send + Sync{
 }
 
 pub async fn parallel_search_in_partitions<T: Send + Sync + std::fmt::Debug>(
-    helper: &dyn ParallelSearchInPartitionFunctions<PartitionRepresentation = T>,
+    helper: &dyn PartitionSearcher<PartitionRepresentation = T>,
     partition_ids: Vec<u32>,
     query: &Query,
     pre_filter: Arc<dyn PreFilter>,
