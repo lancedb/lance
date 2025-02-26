@@ -82,6 +82,7 @@ pub mod io;
 pub mod session;
 pub mod table;
 pub mod utils;
+pub mod plugin;
 
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;

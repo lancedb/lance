@@ -3435,6 +3435,7 @@ dependencies = [
  "lance-testing",
  "lapack",
  "lazy_static",
+ "libloading",
  "log",
  "lzma-sys",
  "mock_instant",
@@ -4038,6 +4039,16 @@ dependencies = [
  "core2",
  "hashbrown 0.14.5",
  "rle-decode-fast",
+]
+
+[[package]]
+name = "libloading"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
+dependencies = [
+ "cfg-if",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
