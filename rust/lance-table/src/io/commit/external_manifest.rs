@@ -38,6 +38,22 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     /// Get the manifest path for a given base_uri and version
     async fn get(&self, base_uri: &str, version: u64) -> Result<String>;
 
+    async fn get_manifest_location(
+        &self,
+        base_uri: &str,
+        version: u64,
+    ) -> Result<ManifestLocation> {
+        let path = self.get(base_uri, version).await?;
+        let path = Path::from(path);
+        let naming_scheme = detect_naming_scheme_from_path(&path)?;
+        Ok(ManifestLocation {
+            version,
+            path,
+            size: None,
+            naming_scheme,
+        })
+    }
+
     /// Get the latest version of a dataset at the base_uri, and the path to the manifest.
     /// The path is provided as an optimization. The path is deterministic based on
     /// the version and the store should not customize it.
@@ -79,7 +95,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
     }
 }
 
-fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNamingScheme> {
+pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNamingScheme> {
     path.filename()
         .and_then(ManifestNamingScheme::detect_scheme)
         .ok_or_else(|| {
@@ -292,16 +308,8 @@ impl CommitHandler for ExternalManifestCommitHandler {
         version: u64,
         object_store: &dyn OSObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
-        let path = self
-            .resolve_version(base_path, version, object_store)
-            .await?;
-        let naming_scheme = detect_naming_scheme_from_path(&path)?;
-        Ok(ManifestLocation {
-            version,
-            path,
-            size: None,
-            naming_scheme,
-        })
+        self.resolve_version_location(base_path, version, object_store)
+            .await
     }
 
     async fn commit(

@@ -166,18 +166,24 @@ impl Tags {
 
         let manifest_file = self
             .commit_handler
-            .resolve_version(&self.base, version, &self.object_store.inner)
+            .resolve_version_location(&self.base, version, &self.object_store.inner)
             .await?;
 
-        if !self.object_store().exists(&manifest_file).await? {
+        if !self.object_store().exists(&manifest_file.path).await? {
             return Err(Error::VersionNotFound {
                 message: format!("version {} does not exist", version),
             });
         }
 
+        let manifest_size = if let Some(size) = manifest_file.size {
+            size as usize
+        } else {
+            self.object_store().size(&manifest_file.path).await?
+        };
+
         let tag_contents = TagContents {
             version,
-            manifest_size: self.object_store().size(&manifest_file).await?,
+            manifest_size,
         };
 
         self.object_store()

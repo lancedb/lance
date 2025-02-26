@@ -13,10 +13,7 @@
 //! strategies. The default implementation for most object stores is
 //! [RenameCommitHandler], which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
-//! at the final path. This is an atomic operation in most object stores, but
-//! not in AWS S3. So for AWS S3, the default commit handler is
-//! [UnsafeCommitHandler], which writes the manifest to the final path without
-//! any checks.
+//! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler

@@ -17,6 +17,7 @@ use aws_sdk_dynamodb::operation::{
 };
 use aws_sdk_dynamodb::types::{AttributeValue, KeyType};
 use aws_sdk_dynamodb::Client;
+use object_store::path::Path;
 use snafu::location;
 use snafu::OptionExt;
 use tokio::sync::RwLock;
@@ -25,6 +26,9 @@ use crate::io::commit::external_manifest::ExternalManifestStore;
 use lance_core::error::box_error;
 use lance_core::error::NotFoundSnafu;
 use lance_core::{Error, Result};
+
+use super::external_manifest::detect_naming_scheme_from_path;
+use super::ManifestLocation;
 
 #[derive(Debug)]
 struct WrappedSdkError<E>(SdkError<E>);
@@ -275,8 +279,60 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
         }
     }
 
+    async fn get_manifest_location(
+        &self,
+        base_uri: &str,
+        version: u64,
+    ) -> Result<ManifestLocation> {
+        let get_item_result = self
+            .ddb_get()
+            .key(base_uri!(), AttributeValue::S(base_uri.into()))
+            .key(version!(), AttributeValue::N(version.to_string()))
+            .send()
+            .await
+            .wrap_err()?;
+
+        let item = get_item_result.item.context(NotFoundSnafu {
+            uri: format!(
+                "dynamodb not found: base_uri: {}; version: {}",
+                base_uri, version
+            ),
+            location: location!(),
+        })?;
+
+        let path = item
+            .get(path!())
+            .ok_or_else(|| Error::io(format!("key {} is not present", path!()), location!()))?
+            .as_s()
+            .map_err(|_| Error::io(format!("key {} is not a string", path!()), location!()))?
+            .as_str();
+        let path = Path::from(path);
+
+        let size = item
+            .get("size")
+            .and_then(|attr| attr.as_n().ok().and_then(|v| v.parse().ok()));
+
+        let naming_scheme = detect_naming_scheme_from_path(&path)?;
+
+        Ok(ManifestLocation {
+            version,
+            path,
+            size,
+            naming_scheme,
+        })
+    }
+
     /// Get the latest version of a dataset at the base_uri
     async fn get_latest_version(&self, base_uri: &str) -> Result<Option<(u64, String)>> {
+        self.get_latest_manifest_location(base_uri)
+            .await
+            .map(|location| location.map(|loc| (loc.version, loc.path.to_string())))
+    }
+
+    async fn get_latest_manifest_location(
+        &self,
+        base_uri: &str,
+    ) -> Result<Option<ManifestLocation>> {
         let query_result = self
             .ddb_query()
             .key_condition_expression(format!("{} = :{}", base_uri!(), base_uri!()))
@@ -324,14 +380,27 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
                     )
                 )?;
 
+                let size = item.get("size").and_then(|attr| match attr {
+                    AttributeValue::N(size) => size.parse().ok(),
+                    _ => None,
+                });
+
                 match (version_attribute, path_attribute) {
-                    (AttributeValue::N(version), AttributeValue::S(path)) => Ok(Some((
-                        version.parse().map_err(|e| Error::io(
+                    (AttributeValue::N(version), AttributeValue::S(path)) => {
+                        let version = version.parse().map_err(|e| Error::io(
                             format!("dynamodb error: could not parse the version number returned {}, error: {}", version, e),
                             location!(),
-                        ))?,
-                        path.clone(),
-                    ))),
+                        ))?;
+                        let path = Path::from(path.as_str());
+                        let naming_scheme = detect_naming_scheme_from_path(&path)?;
+                        let location = ManifestLocation {
+                            version,
+                            path,
+                            size,
+                            naming_scheme,
+                        };
+                        Ok(Some(location))
+                    },
                     _ => Err(Error::io(
                         format!("dynamodb error: found entries for {base_uri} but the returned data is not number type"),
                         location!(),
