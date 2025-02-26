@@ -579,6 +579,7 @@ mod tests {
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::UpdateBuilder;
+    use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
     const DIM: usize = 32;
@@ -721,13 +722,26 @@ mod tests {
             .collect()
     }
 
-    async fn test_index(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+    async fn test_index(
+        params: VectorIndexParams,
+        nlist: usize,
+        recall_requirement: f32,
+        dataset: Option<(Dataset, Arc<FixedSizeListArray>)>,
+    ) {
         match params.metric_type {
             DistanceType::Hamming => {
-                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..255).await;
+                test_index_impl::<UInt8Type>(params, nlist, recall_requirement, 0..255, dataset)
+                    .await;
             }
             _ => {
-                test_index_impl::<Float32Type>(params, nlist, recall_requirement, 0.0..1.0).await;
+                test_index_impl::<Float32Type>(
+                    params,
+                    nlist,
+                    recall_requirement,
+                    0.0..1.0,
+                    dataset,
+                )
+                .await;
             }
         }
     }
@@ -737,12 +751,16 @@ mod tests {
         nlist: usize,
         recall_requirement: f32,
         range: Range<T::Native>,
+        dataset: Option<(Dataset, Arc<FixedSizeListArray>)>,
     ) where
         T::Native: SampleUniform,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
-        let (mut dataset, vectors) = generate_test_dataset::<T>(test_uri, range).await;
+        let (mut dataset, vectors) = match dataset {
+            Some((dataset, vectors)) => (dataset, vectors),
+            None => generate_test_dataset::<T>(test_uri, range).await,
+        };
 
         let vector_column = "vector";
         dataset
@@ -874,7 +892,7 @@ mod tests {
         #[case] recall_requirement: f32,
     ) {
         let params = VectorIndexParams::ivf_flat(nlist, distance_type);
-        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -894,8 +912,10 @@ mod tests {
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
-        test_index(params.clone(), nlist, recall_requirement).await;
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
+            .version(crate::index::vector::IndexFileVersion::Legacy)
+            .clone();
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -915,10 +935,8 @@ mod tests {
     ) {
         let ivf_params = IvfBuildParams::new(nlist);
         let pq_params = PQBuildParams::default();
-        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
-            .version(crate::index::vector::IndexFileVersion::V3)
-            .clone();
-        test_index(params.clone(), nlist, recall_requirement).await;
+        let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params);
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -941,7 +959,7 @@ mod tests {
         let params = VectorIndexParams::with_ivf_pq_params(distance_type, ivf_params, pq_params)
             .version(crate::index::vector::IndexFileVersion::V3)
             .clone();
-        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params.clone(), nlist, recall_requirement).await;
         }
@@ -967,7 +985,7 @@ mod tests {
             hnsw_params,
             sq_params,
         );
-        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params, nlist, recall_requirement).await;
         }
@@ -992,7 +1010,7 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params, nlist, recall_requirement).await;
         }
@@ -1017,7 +1035,7 @@ mod tests {
             hnsw_params,
             pq_params,
         );
-        test_index(params.clone(), nlist, recall_requirement).await;
+        test_index(params.clone(), nlist, recall_requirement, None).await;
         if distance_type == DistanceType::Cosine {
             test_index_multivec(params, nlist, recall_requirement).await;
         }
@@ -1102,6 +1120,55 @@ mod tests {
             results,
             gt
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_migrate_v1_to_v3() {
+        // only test the case of IVF_PQ
+        // because only IVF_PQ is supported in v1
+        let nlist = 4;
+        let recall_requirement = 0.9;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let pq_params = PQBuildParams::default();
+        let v1_params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::Cosine, ivf_params, pq_params)
+                .version(crate::index::vector::IndexFileVersion::Legacy)
+                .clone();
+
+        let v3_params = v1_params
+            .clone()
+            .version(crate::index::vector::IndexFileVersion::V3)
+            .clone();
+
+        let test_dir = tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        test_index(
+            v1_params,
+            nlist,
+            recall_requirement,
+            Some((dataset.clone(), vectors.clone())),
+        )
+        .await;
+        // retest with v3 params on the same dataset
+        test_index(
+            v3_params,
+            nlist,
+            recall_requirement,
+            Some((dataset.clone(), vectors)),
+        )
+        .await;
+
+        dataset.checkout_latest().await.unwrap();
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert_eq!(indices.len(), 1); // v1 index should be replaced by v3 index
+        let index = dataset
+            .open_vector_index("vector", indices[0].uuid.to_string().as_str())
+            .await
+            .unwrap();
+        let v3_index = index.as_any().downcast_ref::<super::IvfPq>();
+        assert!(v3_index.is_some());
     }
 
     #[rstest]
