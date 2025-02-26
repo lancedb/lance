@@ -11,7 +11,6 @@ use arrow_array::{
     ArrayRef, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use arrow_select::concat::concat_batches;
 use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::physical_plan::PlanProperties;
@@ -617,21 +616,18 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             let key = normalize_arrow(&query.key)?;
                             query.key = key;
                         };
-
-                        let batches = index
+                        index
                             .search_in_partitions(part_ids, &query, pre_filter)
                             .map_err(|e| {
                                 DataFusionError::Execution(format!(
                                     "Failed to calculate KNN: {}",
                                     e
                                 ))
-                            })
-                            .await?;
-                        concat_batches(&batches[0].schema(), &batches).map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to calculate KNN: {}", e))
-                        })
+                            }).await
                     }
                 })
+                .map_ok(|vec_of_batches| futures::stream::iter(vec_of_batches.into_iter().map(Ok)))
+                .try_flatten()
                 .boxed(),
         )))
     }

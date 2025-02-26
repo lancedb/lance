@@ -37,7 +37,7 @@ use lance_index::{
     vector::{
         ivf::storage::IVF_METADATA_KEY, quantizer::Quantization, storage::IvfQuantizationStorage,
         v3::subindex::IvfSubIndex, Query, DISTANCE_TYPE_KEY, DIST_COL,
-        parallel_search_in_partitions, ParallelSearchInPartitionFunctions,
+        parallel_search_in_partitions, PartitionSearcher,
     },
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
@@ -367,7 +367,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 }
 
 #[async_trait]
-impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> ParallelSearchInPartitionFunctions for IVFIndex<S, Q> {
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearcher for IVFIndex<S, Q> {
     type PartitionRepresentation = Arc<PartitionEntry<S, Q>>;
 
     #[instrument(level = "debug", skip(self, pre_filter))]

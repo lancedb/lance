@@ -53,7 +53,7 @@ use lance_index::{
         pq::{PQBuildParams, ProductQuantizer},
         quantizer::{Quantization, QuantizationMetadata, Quantizer},
         sq::ScalarQuantizer,
-        ParallelSearchInPartitionFunctions, Query, VectorIndex, DIST_COL,
+        PartitionSearcher, Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -815,7 +815,7 @@ impl Index for IVFIndex {
 }
 
 #[async_trait]
-impl ParallelSearchInPartitionFunctions for IVFIndex {
+impl PartitionSearcher for IVFIndex {
     type PartitionRepresentation = Arc<dyn VectorIndex>;
 
     async fn search_in_loaded_partition(
