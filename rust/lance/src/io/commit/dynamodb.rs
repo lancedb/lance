@@ -133,16 +133,16 @@ mod test {
             .to_string()
             .starts_with("Not found: dynamodb not found: base_uri: test; version: 1"));
         // try to use the API for finalizing should return err when the version is DNE
-        assert!(store.put_if_exists("test", 1, "test").await.is_err());
+        assert!(store.put_if_exists("test", 1, "test", 4).await.is_err());
 
         // Put a new version should work
         assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized")
+            .put_if_not_exists("test", 1, "test.unfinalized", 4)
             .await
             .is_ok());
         // put again should get err
         assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized_1")
+            .put_if_not_exists("test", 1, "test.unfinalized_1", 4)
             .await
             .is_err());
 
@@ -155,7 +155,7 @@ mod test {
 
         // Put a new version should work again
         assert!(store
-            .put_if_not_exists("test", 2, "test.unfinalized_2")
+            .put_if_not_exists("test", 2, "test.unfinalized_2", 4)
             .await
             .is_ok());
         // latest should see update
@@ -165,7 +165,7 @@ mod test {
         );
 
         // try to finalize should work on existing version
-        assert!(store.put_if_exists("test", 2, "test").await.is_ok());
+        assert!(store.put_if_exists("test", 2, "test", 4).await.is_ok());
 
         // latest should see update
         assert_eq!(
@@ -317,8 +317,18 @@ mod test {
             )
             .await
             .unwrap();
+        let size = localfs
+            .head(&version_six_staging_location)
+            .await
+            .unwrap()
+            .size as u64;
         store
-            .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref())
+            .put_if_exists(
+                ds.base.as_ref(),
+                6,
+                version_six_staging_location.as_ref(),
+                size,
+            )
             .await
             .unwrap();
 
