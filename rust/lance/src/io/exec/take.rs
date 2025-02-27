@@ -10,6 +10,7 @@ use arrow_array::{cast::as_primitive_array, RecordBatch, UInt64Array};
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream,
@@ -35,6 +36,7 @@ pub struct Take {
     rx: Receiver<Result<RecordBatch>>,
     bg_thread: Option<JoinHandle<()>>,
     output_schema: SchemaRef,
+    baseline_metrics: BaselineMetrics,
 }
 
 impl Take {
@@ -52,6 +54,7 @@ impl Take {
         output_schema: SchemaRef,
         child: SendableRecordBatchStream,
         batch_readahead: usize,
+        baseline_metrics: BaselineMetrics,
     ) -> Self {
         let (tx, rx) = mpsc::channel(4);
 
@@ -100,6 +103,7 @@ impl Take {
             rx,
             bg_thread: Some(bg_thread),
             output_schema,
+            baseline_metrics,
         }
     }
 
@@ -138,6 +142,7 @@ impl Stream for Take {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = Pin::into_inner(self);
+        let timer = this.baseline_metrics.elapsed_compute().timer();
         // We need to check the JoinHandle to make sure the thread hasn't panicked.
         let bg_thread_completed = if let Some(bg_thread) = &mut this.bg_thread {
             match bg_thread.poll_unpin(cx) {
@@ -158,7 +163,8 @@ impl Stream for Take {
             this.bg_thread.take();
         }
         // this.rx.
-        this.rx.poll_recv(cx)
+        timer.done();
+        this.baseline_metrics.record_poll(this.rx.poll_recv(cx))
     }
 }
 
@@ -195,6 +201,8 @@ pub struct TakeExec {
     batch_readahead: usize,
 
     properties: PlanProperties,
+
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for TakeExec {
@@ -280,6 +288,7 @@ impl TakeExec {
             output_schema,
             batch_readahead,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
 
@@ -397,6 +406,7 @@ impl ExecutionPlan for TakeExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let input_stream = self.input.execute(partition, context)?;
         let output_schema_arrow = Arc::new(ArrowSchema::from(self.output_schema.as_ref()));
         Ok(Box::pin(Take::new(
@@ -405,7 +415,12 @@ impl ExecutionPlan for TakeExec {
             output_schema_arrow,
             input_stream,
             self.batch_readahead,
+            baseline_metrics,
         )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn statistics(&self) -> Result<datafusion::physical_plan::Statistics> {

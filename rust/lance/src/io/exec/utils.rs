@@ -1,12 +1,18 @@
+use log::Record;
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+use pin_project::pin_project;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::Context;
+use std::task::Poll;
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
@@ -192,6 +198,60 @@ impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> Stream
 
 impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
     for ShareableRecordBatchStreamAdapter<S>
+{
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+// instrmented record batch stream adapter
+#[pin_project]
+pub struct InstrumentedRecordBatchStreamAdapter<S> {
+    schema: SchemaRef,
+
+    #[pin]
+    stream: S,
+    baseline_metrics: BaselineMetrics,
+}
+
+impl<S> InstrumentedRecordBatchStreamAdapter<S> {
+    pub fn new(schema: SchemaRef, stream: S, baseline_metrics: BaselineMetrics) -> Self {
+        Self {
+            schema,
+            stream,
+            baseline_metrics,
+        }
+    }
+}
+
+impl<S> Stream for InstrumentedRecordBatchStreamAdapter<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>>,
+{
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.as_mut().project();
+        let timer = this.baseline_metrics.elapsed_compute().timer();
+        let poll = match this.stream.poll_next(cx) {
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Some(res)) => std::task::Poll::Ready(Some(
+                res.map_err(|e| DataFusionError::External(e.to_string().into())),
+            )),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        };
+
+        timer.done();
+        this.baseline_metrics.record_poll(poll)
+    }
+}
+
+impl<S> RecordBatchStream for InstrumentedRecordBatchStreamAdapter<S>
+where
+    S: Stream<Item = DataFusionResult<RecordBatch>>,
 {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
