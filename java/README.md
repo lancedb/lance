@@ -58,12 +58,11 @@ void createAndWriteDataset() throws IOException, URISyntaxException {
     Path path = "";     // the original source path
     String datasetPath = "";    // specify a path point to a dataset
     try (BufferAllocator allocator = new RootAllocator();
-         ArrowFileReader reader =
-                 new ArrowFileReader(
-                         new SeekableReadChannel(
-                                 new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))),
-                         allocator);
-         ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
+        ArrowFileReader reader =
+            new ArrowFileReader(
+                new SeekableReadChannel(
+                    new ByteArrayReadableSeekableByteChannel(Files.readAllBytes(path))), allocator);
+        ArrowArrayStream arrowStream = ArrowArrayStream.allocateNew(allocator)) {
         Data.exportArrayStream(allocator, reader, arrowStream);
         try (Dataset dataset =
                      Dataset.create(
@@ -188,21 +187,21 @@ With the integration, users are able to access lance dataset with other technolo
 
 ### Spark connector
 
-The ![spark](https://github.com/lancedb/lance/tree/main/java/spark) module is a standard maven module.
+The [spark](https://github.com/lancedb/lance/tree/main/java/spark) module is a standard maven module.
 It is the implementation of spark-lance connector that allows Apache Spark to efficiently access datasets stored in Lance format.
-More details please see the ![README](https://github.com/lancedb/lance/blob/main/java/spark/README.md) file.
+More details please see the [README](https://github.com/lancedb/lance/blob/main/java/spark/README.md) file.
 
 ## Contributing
 
-From the codebase dimension, the lance project is a multiple-lang project. Everything about java language is hosted in `java` dir.
+From the codebase dimension, the lance project is a multiple-lang project. All Java-related code is located in the `java` directory.
 And the whole `java` dir is a standard maven project(named `lance-parent`) can be imported into any IDEs support java project.
 
-Overview, it contains two maven sub-modules:
+Overall, it contains two Maven sub-modules:
 
 * lance-core: the core module of Lance Java binding, including `lance-jni`.
 * lance-spark: the spark connector module.
 
-to build the project, you can run the following command:
+To build the project, you can run the following command:
 
 ```shell
 mvn clean package
@@ -239,4 +238,4 @@ Then, you can build the whole java module:
 mvn clean package
 ```
 
-Running this commands, it builds the rust jni binding codes automatically.
+Running these commands, it builds the rust jni binding codes automatically.
