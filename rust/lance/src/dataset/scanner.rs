@@ -2365,8 +2365,8 @@ impl Scanner {
         let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
         let ctx = Arc::new(TaskContext::default());
         // fully execute the plan
-        if let Ok(mut rbs) = analyze.execute(0, ctx) {
-            while (rbs.next().await).is_some() {}
+        if let Ok(mut stream) = analyze.execute(0, ctx) {
+            while (stream.next().await).is_some() {}
         } else {
             return Err(Error::Execution {
                 message: "Failed to execute analyze plan".to_string(),
