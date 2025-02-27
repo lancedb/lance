@@ -169,12 +169,14 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 }
 
 /// Function that writes the manifest to the object store.
+///
+/// Returns the size of the written manifest.
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<()>>;
+) -> BoxFuture<'a, Result<u64>>;
 
 #[derive(Debug)]
 pub struct ManifestLocation {

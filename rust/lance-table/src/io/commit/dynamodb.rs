@@ -412,12 +412,19 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
     }
 
     /// Put the manifest path for a given base_uri and version, should fail if the version already exists
-    async fn put_if_not_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()> {
+    async fn put_if_not_exists(
+        &self,
+        base_uri: &str,
+        version: u64,
+        path: &str,
+        size: u64,
+    ) -> Result<()> {
         self.ddb_put()
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
             .item(path!(), AttributeValue::S(path.to_string()))
             .item(committer!(), AttributeValue::S(self.committer_name.clone()))
+            .item("size", AttributeValue::N(size.to_string()))
             .condition_expression(format!(
                 "attribute_not_exists({}) AND attribute_not_exists({})",
                 base_uri!(),
@@ -431,12 +438,19 @@ impl ExternalManifestStore for DynamoDBExternalManifestStore {
     }
 
     /// Put the manifest path for a given base_uri and version, should fail if the version **does not** already exist
-    async fn put_if_exists(&self, base_uri: &str, version: u64, path: &str) -> Result<()> {
+    async fn put_if_exists(
+        &self,
+        base_uri: &str,
+        version: u64,
+        path: &str,
+        size: u64,
+    ) -> Result<()> {
         self.ddb_put()
             .item(base_uri!(), AttributeValue::S(base_uri.into()))
             .item(version!(), AttributeValue::N(version.to_string()))
             .item(path!(), AttributeValue::S(path.to_string()))
             .item(committer!(), AttributeValue::S(self.committer_name.clone()))
+            .item("size", AttributeValue::N(size.to_string()))
             .condition_expression(format!(
                 "attribute_exists({}) AND attribute_exists({})",
                 base_uri!(),

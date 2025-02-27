@@ -72,7 +72,13 @@ mod test {
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_not_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+        async fn put_if_not_exists(
+            &self,
+            uri: &str,
+            version: u64,
+            path: &str,
+            _size: u64,
+        ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
@@ -92,7 +98,13 @@ mod test {
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+        async fn put_if_exists(
+            &self,
+            uri: &str,
+            version: u64,
+            path: &str,
+            _size: u64,
+        ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
