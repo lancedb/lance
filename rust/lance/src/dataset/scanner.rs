@@ -2366,7 +2366,7 @@ impl Scanner {
         let ctx = Arc::new(TaskContext::default());
         // fully execute the plan
         if let Ok(mut rbs) = analyze.execute(0, ctx) {
-            while let Some(_) = rbs.next().await {}
+            while (rbs.next().await).is_some() {}
         } else {
             return Err(Error::Execution {
                 message: "Failed to execute analyze plan".to_string(),

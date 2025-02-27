@@ -1,18 +1,14 @@
-use log::Record;
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use pin_project::pin_project;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::Context;
-use std::task::Poll;
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::BaselineMetrics;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };

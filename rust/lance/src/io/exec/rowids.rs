@@ -10,7 +10,6 @@ use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::StreamExt;
