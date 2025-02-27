@@ -1,21 +1,18 @@
 version: "3.9"
 services:
-  minio:
-    image: lazybit/minio
+  localstack:
+    image: localstack/localstack:3.3
     ports:
-      - 9000:9000
+      - 4566:4566
     environment:
-      - MINIO_ACCESS_KEY=ACCESSKEY
-      - MINIO_SECRET_KEY=SECRETKEY
+      - SERVICES=s3,dynamodb,kms
+      - DEBUG=1
+      - LS_LOG=trace
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_ACCESS_KEY_ID=ACCESSKEY
+      - AWS_SECRET_ACCESS_KEY=SECRETKEY
     healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:9000/minio/health/live" ]
+      test: [ "CMD", "curl", "-s", "http://localhost:4566/_localstack/health" ]
       interval: 5s
       retries: 3
       start_period: 10s
-  dynamodb-local:
-    image: amazon/dynamodb-local
-    ports:
-      - 8000:8000
-    environment:
-      - AWS_ACCESS_KEY_ID=ACCESSKEY
-      - AWS_SECRET_ACCESS_KEY=SECRETKEY

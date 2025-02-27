@@ -47,10 +47,12 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;
 
-#[cfg(all(feature = "dynamodb", test))]
+#[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+#[cfg(all(feature = "dynamodb_tests", test))]
+mod s3_test;
 
 /// Read the transaction data from a transaction file.
 async fn read_transaction_file(
