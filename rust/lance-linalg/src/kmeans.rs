@@ -103,6 +103,9 @@ pub struct KMeans {
 
     /// How to calculate distance between two vectors.
     pub distance_type: DistanceType,
+
+    /// The loss of the last training.
+    pub loss: f64,
 }
 
 /// Randomly initialize kmeans centroids.
@@ -127,6 +130,7 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
         centroids: Arc::new(centroids),
         dimension,
         distance_type,
+        loss: f64::MAX,
     }
 }
 
@@ -191,6 +195,7 @@ pub trait KMeansAlgo<T: Num> {
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
+        loss: f64,
     ) -> KMeans;
 }
 
@@ -245,6 +250,7 @@ where
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
+        loss: f64,
     ) -> KMeans {
         let mut cluster_cnts = vec![0_u64; k];
         let mut new_centroids = vec![T::Native::zero(); k * dimension];
@@ -293,6 +299,7 @@ where
             centroids: Arc::new(PrimitiveArray::<T>::from_iter_values(new_centroids)),
             dimension,
             distance_type,
+            loss,
         }
     }
 }
@@ -337,6 +344,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
+        loss: f64,
     ) -> KMeans {
         assert_eq!(distance_type, DistanceType::Hamming);
 
@@ -379,6 +387,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
             centroids: Arc::new(UInt8Array::from(centroids)),
             dimension,
             distance_type,
+            loss,
         }
     }
 }
@@ -389,6 +398,7 @@ impl KMeans {
             centroids: arrow_array::array::new_empty_array(&DataType::Float32),
             dimension,
             distance_type,
+            loss: f64::MAX,
         }
     }
 
@@ -398,6 +408,7 @@ impl KMeans {
         centroids: ArrayRef,
         dimension: usize,
         distance_type: DistanceType,
+        loss: f64,
     ) -> Self {
         assert!(matches!(
             centroids.data_type(),
@@ -407,6 +418,7 @@ impl KMeans {
             centroids,
             dimension,
             distance_type,
+            loss,
         }
     }
 
@@ -496,6 +508,7 @@ impl KMeans {
                     k,
                     &membership,
                     params.distance_type,
+                    last_loss,
                 );
                 last_membership = Some(membership);
                 if (loss - last_loss).abs() / last_loss < params.tolerance {
