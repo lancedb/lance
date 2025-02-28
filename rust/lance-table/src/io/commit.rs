@@ -914,7 +914,6 @@ impl CommitHandler for ConditionalPutCommitHandler {
     ) -> std::result::Result<Path, CommitError> {
         let path = naming_scheme.manifest_path(base_path, manifest.version);
 
-        // Write the manifest to the path
         let memory_store = ObjectStore::memory();
         let dummy_path = "dummy";
         manifest_writer(&memory_store, manifest, indices, &dummy_path.into()).await?;
@@ -930,12 +929,11 @@ impl CommitHandler for ConditionalPutCommitHandler {
                 },
             )
             .await
-            .map_err(|err| {
-                if let ObjectStoreError::AlreadyExists { .. } = err {
+            .map_err(|err| match err {
+                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
                     CommitError::CommitConflict
-                } else {
-                    CommitError::OtherError(err.into())
                 }
+                _ => CommitError::OtherError(err.into()),
             })?;
 
         Ok(path)
