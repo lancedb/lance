@@ -818,9 +818,9 @@ def test_analyze_vector_search(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
     dataset.delete("id = 0")
     plan = dataset.scanner(
-        nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}).analyze_plan()
+        nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}
+    ).analyze_plan()
     assert "KNNVectorDistance: metric=l2, metrics=[output_rows=10" in plan
-
 
 
 def test_get_fragments(tmp_path: Path):
