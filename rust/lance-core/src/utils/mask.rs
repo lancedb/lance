@@ -518,7 +518,7 @@ impl RowIdTreeMap {
     ///   * u32: fragment_id
     ///   * u32: bitmap size
     ///   * \[u8\]: bitmap
-    /// If bitmap size is zero then the entire fragment is selected.
+    ///     If bitmap size is zero then the entire fragment is selected.
     pub fn serialize_into<W: Write>(&self, mut writer: W) -> Result<()> {
         writer.write_u32::<byteorder::LittleEndian>(self.inner.len() as u32)?;
         for (fragment, set) in &self.inner {
