@@ -103,6 +103,6 @@ criterion_group!(
     config = Criterion::default()
         .measurement_time(Duration::from_secs(10))
         .sample_size(10);
-    targets = bench_inverted);
+    targets = bench_ngram);
 
 criterion_main!(benches);
