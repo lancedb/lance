@@ -110,7 +110,10 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
 
 pub(crate) fn detect_naming_scheme_from_path(path: &Path) -> Result<ManifestNamingScheme> {
     path.filename()
-        .and_then(ManifestNamingScheme::detect_scheme)
+        .and_then(|name| {
+            ManifestNamingScheme::detect_scheme(name)
+                .or_else(|| Some(ManifestNamingScheme::detect_scheme_staging(name)))
+        })
         .ok_or_else(|| {
             Error::corrupt_file(
                 path.clone(),

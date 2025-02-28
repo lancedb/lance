@@ -606,7 +606,9 @@ pub async fn commit_handler_from_url(
     };
 
     match url.scheme() {
-        "s3" => Ok(Arc::new(ConditionalPutCommitHandler)),
+        "s3" | "gs" | "az" | "memory" | "file" | "file-object-store" => {
+            Ok(Arc::new(ConditionalPutCommitHandler))
+        }
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -670,7 +672,6 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(RenameCommitHandler)),
         _ => Ok(Arc::new(UnsafeCommitHandler)),
     }
 }

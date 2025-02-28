@@ -64,10 +64,10 @@ mod test {
             .behavior_version_latest()
             .endpoint_url(
                 // url for dynamodb-local
-                "http://localhost:8000",
+                "http://localhost:4566",
             )
             .region(Some(Region::new("us-east-1")))
-            .credentials_provider(Credentials::new("DUMMYKEY", "DUMMYKEY", None, None, ""))
+            .credentials_provider(Credentials::new("ACCESS_KEY", "SECRET_KEY", None, None, ""))
             .build();
 
         let table_name = uuid::Uuid::new_v4().to_string();
