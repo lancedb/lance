@@ -174,7 +174,7 @@ mod test {
             unimplemented!()
         }
 
-        fn ivf_model(&self) -> IvfModel {
+        fn ivf_model(&self) -> &IvfModel {
             unimplemented!()
         }
         fn quantizer(&self) -> Quantizer {
