@@ -9,6 +9,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     dataframe::DataFrame,
+    datasource::streaming::StreamingTable,
     execution::{
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
