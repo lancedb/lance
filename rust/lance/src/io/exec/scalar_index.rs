@@ -10,6 +10,7 @@ use datafusion::{
     common::{stats::Precision, Statistics},
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
@@ -43,6 +44,8 @@ use crate::{
     Dataset,
 };
 
+use super::utils::InstrumentedRecordBatchStreamAdapter;
+
 lazy_static::lazy_static! {
     pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
 }
@@ -73,6 +76,7 @@ pub struct ScalarIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -97,6 +101,7 @@ impl ScalarIndexExec {
             dataset,
             expr,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -145,17 +150,19 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone());
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             SCALAR_INDEX_SCHEMA.clone(),
             stream,
+            baseline_metrics,
         )))
     }
 
@@ -164,6 +171,10 @@ impl ExecutionPlan for ScalarIndexExec {
             num_rows: Precision::Exact(2),
             ..Statistics::new_unknown(&SCALAR_INDEX_SCHEMA)
         })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -184,6 +195,7 @@ pub struct MapIndexExec {
     column_name: String,
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for MapIndexExec {
@@ -209,6 +221,7 @@ impl MapIndexExec {
             column_name,
             input,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -327,15 +340,17 @@ impl ExecutionPlan for MapIndexExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let index_vals = self.input.execute(partition, context)?;
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream_fut =
             Self::do_execute(index_vals, self.dataset.clone(), self.column_name.clone());
         let stream = futures::stream::iter(vec![stream_fut])
             .then(|stream_fut| stream_fut)
             .try_flatten()
             .boxed();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             INDEX_LOOKUP_SCHEMA.clone(),
             stream,
+            baseline_metrics,
         )))
     }
 
@@ -359,6 +374,7 @@ pub struct MaterializeIndexExec {
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for MaterializeIndexExec {
@@ -427,6 +443,7 @@ impl MaterializeIndexExec {
             expr,
             fragments,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -612,9 +629,10 @@ impl ExecutionPlan for MaterializeIndexExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),
@@ -629,14 +647,19 @@ impl ExecutionPlan for MaterializeIndexExec {
             stream,
         ));
         let stream = break_stream(stream, 64 * 1024);
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream.map_err(|err| err.into()),
+            baseline_metrics,
         )))
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics::new_unknown(&MATERIALIZE_INDEX_SCHEMA))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {

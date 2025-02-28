@@ -3412,6 +3412,21 @@ class LanceScanner(pa.dataset.Scanner):
 
         return self._scanner.explain_plan(verbose=verbose)
 
+    def analyze_plan(self) -> str:
+        """Execute the plan for this scanner and display with runtime metrics.
+
+        Parameters
+        ----------
+        verbose : bool, default False
+            Use a verbose output format.
+
+        Returns
+        -------
+        plan : str
+        """
+
+        return self._scanner.analyze_plan()
+
 
 class DatasetOptimizer:
     def __init__(self, dataset: LanceDataset):
