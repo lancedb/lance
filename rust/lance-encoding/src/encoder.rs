@@ -689,15 +689,12 @@ fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     let mut hll: HyperLogLogPlus<String, RandomState> =
         HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
 
-    println!("num_total_rows={} threshold={}", num_total_rows, threshold);
-
     for arr in arrays {
         let string_array = arrow_array::cast::as_string_array(arr);
         for value in string_array.iter().flatten() {
             hll.insert(value);
             let estimated_cardinality = hll.count() as u64;
             if estimated_cardinality >= threshold {
-                println!("estimated_cardinality={}", estimated_cardinality);
                 return false;
             }
         }

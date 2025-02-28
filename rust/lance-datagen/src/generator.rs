@@ -515,10 +515,7 @@ impl CycleListGenerator {
             underlying_gen.data_type().clone(),
             true,
         )));
-        let lengths_dist = Uniform::new(
-            u32::try_from(min_list_size.0).unwrap(),
-            u32::try_from(max_list_size.0).unwrap(),
-        );
+        let lengths_dist = Uniform::new(min_list_size.0, max_list_size.0);
         let lengths_gen = rand_with_distribution::<UInt32Type, Uniform<u32>>(lengths_dist);
         Self {
             underlying_gen,
