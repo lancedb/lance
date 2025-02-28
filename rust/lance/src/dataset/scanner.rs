@@ -2359,22 +2359,23 @@ impl Scanner {
     }
 
     #[instrument(level = "info", skip(self))]
-    pub async fn analyze_plan(&self, verbose: bool) -> Result<String> {
+    pub async fn analyze_plan(&self) -> Result<String> {
         let plan = self.create_plan().await?;
         let schema = plan.schema();
         let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
         let ctx = Arc::new(TaskContext::default());
+        let mut stream = analyze.execute(0, ctx).map_err(|err| {
+            Error::io(
+                format!("Failed to execute analyze plan: {}", err),
+                location!(),
+            )
+        })?;
+
         // fully execute the plan
-        if let Ok(mut stream) = analyze.execute(0, ctx) {
-            while (stream.next().await).is_some() {}
-        } else {
-            return Err(Error::Execution {
-                message: "Failed to execute analyze plan".to_string(),
-                location: location!(),
-            });
-        }
+        while (stream.next().await).is_some() {}
+
         let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
-        Ok(format!("{}", display.indent(verbose)))
+        Ok(format!("{}", display.indent(true)))
     }
 
     #[instrument(level = "info", skip(self))]

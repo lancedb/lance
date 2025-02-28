@@ -200,7 +200,6 @@ impl<S: Stream<Item = CloneableResult<RecordBatch>> + Unpin> RecordBatchStream
     }
 }
 
-// instrmented record batch stream adapter
 #[pin_project]
 pub struct InstrumentedRecordBatchStreamAdapter<S> {
     schema: SchemaRef,
@@ -232,14 +231,7 @@ where
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.as_mut().project();
         let timer = this.baseline_metrics.elapsed_compute().timer();
-        let poll = match this.stream.poll_next(cx) {
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Ready(Some(res)) => std::task::Poll::Ready(Some(
-                res.map_err(|e| DataFusionError::External(e.to_string().into())),
-            )),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        };
-
+        let poll = this.stream.poll_next(cx);
         timer.done();
         this.baseline_metrics.record_poll(poll)
     }

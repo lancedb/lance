@@ -68,12 +68,12 @@ impl Scanner {
         Ok(res)
     }
 
-    #[pyo3(signature = (*, verbose = false))]
-    fn analyze_plan(self_: PyRef<'_, Self>, verbose: bool) -> PyResult<String> {
+    #[pyo3(signature = (*))]
+    fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
         let scanner = self_.scanner.clone();
         let res = RT
             .spawn(Some(self_.py()), async move {
-                scanner.analyze_plan(verbose).await
+                scanner.analyze_plan().await
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 

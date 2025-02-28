@@ -792,7 +792,7 @@ def test_analyze_filtered_scan(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
     ds = lance.write_dataset(table, base_dir)
-    plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan(True)
+    plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
     print(plan)
     assert re.search(r"^\s*LanceScan:.*output_rows=100.*$", plan, re.MULTILINE)
     assert re.search(r"^\s*FilterExec:.*output_rows=50.*$", plan, re.MULTILINE)
@@ -802,7 +802,7 @@ def test_analyze_index_scan(tmp_path: Path):
     table = pa.table({"filter": range(100)})
     dataset = lance.write_dataset(table, tmp_path)
     dataset.create_scalar_index("filter", "BTREE")
-    plan = dataset.scanner(filter="filter = 10").analyze_plan(True)
+    plan = dataset.scanner(filter="filter = 10").analyze_plan()
     assert "MaterializeIndex: query=filter = 10, metrics=[output_rows=1" in plan
 
 
@@ -818,7 +818,7 @@ def test_analyze_vector_search(tmp_path: Path):
     dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
     dataset.delete("id = 0")
     plan = dataset.scanner(
-        nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}).analyze_plan(True)
+        nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}).analyze_plan()
     assert "KNNVectorDistance: metric=l2, metrics=[output_rows=10" in plan
 
 
