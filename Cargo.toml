@@ -87,7 +87,7 @@ byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
 # Version temporarily pinned to work around unlabeled breaking change
 # https://github.com/apache/arrow-rs/commit/2fddf85afcd20110ce783ed5b4cdeb82293da30b
-chrono = { version = "0.4.39", default-features = false, features = [
+chrono = { version = "=0.4.39", default-features = false, features = [
     "std",
     "now",
 ] }
