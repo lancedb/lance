@@ -1756,7 +1756,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         let page_meta = self.page_meta.as_ref().unwrap();
 
         let chunk_instructions =
-            ChunkInstructions::schedule_instructions(&page_meta.rep_index, &ranges);
+            ChunkInstructions::schedule_instructions(&page_meta.rep_index, ranges);
 
         debug_assert_eq!(
             num_rows,
@@ -2598,7 +2598,7 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 // values into `values` (which contains the compressed values)
                 let mut values = Vec::with_capacity(
                     fixed_data.data.len()
-                        - (self.details.ctrl_word_parser.bytes_per_word() * num_values as usize),
+                        - (self.details.ctrl_word_parser.bytes_per_word() * num_values),
                 );
                 let mut visible_items = 0;
                 for _ in 0..num_values {
@@ -3683,7 +3683,7 @@ impl PrimitiveStructuralEncoder {
             }
 
             for buffer_size in &chunk.buffer_sizes {
-                let bytes = u16::try_from(*buffer_size).unwrap();
+                let bytes = *buffer_size;
                 data_buffer.extend_from_slice(&bytes.to_le_bytes());
             }
 

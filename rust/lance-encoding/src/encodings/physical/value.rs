@@ -318,7 +318,7 @@ impl ValueEncoder {
         let mut encoding = ProtobufUtils::flat_encoding(bits_per_value, 0, None);
         for layer in layers.iter().rev() {
             let has_validity = layer.validity.is_some();
-            let dimension = layer.dimension as u64;
+            let dimension = layer.dimension;
             encoding = ProtobufUtils::fsl_encoding(dimension, encoding, has_validity);
         }
         encoding
@@ -329,7 +329,7 @@ impl ValueEncoder {
         layers: &[MiniblockFslLayer],
         row_offset: usize,
         num_rows: usize,
-        validity_buffers: &mut Vec<Vec<u8>>,
+        validity_buffers: &mut [Vec<u8>],
     ) -> Vec<u16> {
         let mut row_offset = row_offset;
         let mut num_values = num_rows;
@@ -430,7 +430,7 @@ impl ValueEncoder {
         // Finally, add the data buffer
         let buffers = validity_buffers
             .into_iter()
-            .map(|buf| LanceBuffer::Owned(buf))
+            .map(LanceBuffer::Owned)
             .chain(std::iter::once(data.data))
             .collect::<Vec<_>>();
 
@@ -526,7 +526,7 @@ impl ValueEncoder {
                 DataBlock::FixedWidth(inner) => {
                     let data = FixedWidthDataBlock {
                         bits_per_value: inner.bits_per_value * cum_dim,
-                        num_values: num_values,
+                        num_values,
                         data: inner.data,
                         block_info: BlockInfo::new(),
                     };
@@ -552,18 +552,15 @@ impl ValueEncoder {
         loop {
             cum_dim *= current.dimension;
             let mut child = *current.child;
-            match child {
-                DataBlock::Nullable(nullable) => {
-                    // Each item will need this many bytes of validity prepended to it
-                    bytes_per_row += cum_dim.div_ceil(8) as usize;
-                    validity_iters.push(PerValueFslValidityIter {
-                        buffer: nullable.nulls,
-                        bits_per_row: cum_dim as usize,
-                        offset: 0,
-                    });
-                    child = *nullable.data;
-                }
-                _ => {}
+            if let DataBlock::Nullable(nullable) = child {
+                // Each item will need this many bytes of validity prepended to it
+                bytes_per_row += cum_dim.div_ceil(8) as usize;
+                validity_iters.push(PerValueFslValidityIter {
+                    buffer: nullable.nulls,
+                    bits_per_row: cum_dim as usize,
+                    offset: 0,
+                });
+                child = *nullable.data;
             };
             match child {
                 DataBlock::FixedSizeList(inner) => {
@@ -1185,9 +1182,10 @@ pub(crate) mod tests {
         assert_eq!(data.chunks[0].buffer_sizes, vec![1, 2, 48]);
         assert_eq!(data.chunks[0].log_num_values, 0);
 
-        let fsl = match compression.array_encoding.unwrap() {
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => fsl,
-            _ => panic!(),
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
         };
 
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
@@ -1221,9 +1219,10 @@ pub(crate) mod tests {
         assert_eq!(data.num_values, 3);
         assert_eq!(data.data.len(), 18 * 3);
 
-        let fsl = match compression.array_encoding.unwrap() {
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => fsl,
-            _ => panic!(),
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
         };
 
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
@@ -1266,9 +1265,10 @@ pub(crate) mod tests {
         let encoder = ValueEncoder::default();
         let (data, compression) = MiniBlockCompressor::compress(&encoder, starting_data).unwrap();
 
-        let fsl = match compression.array_encoding.unwrap() {
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => fsl,
-            _ => panic!(),
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
         };
 
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());
@@ -1295,9 +1295,10 @@ pub(crate) mod tests {
         let encoder = ValueEncoder::default();
         let (data, compression) = PerValueCompressor::compress(&encoder, starting_data).unwrap();
 
-        let fsl = match compression.array_encoding.unwrap() {
-            pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) => fsl,
-            _ => panic!(),
+        let pb::array_encoding::ArrayEncoding::FixedSizeList(fsl) =
+            compression.array_encoding.unwrap()
+        else {
+            panic!()
         };
 
         let decompressor = ValueDecompressor::from_fsl(fsl.as_ref());

@@ -661,21 +661,25 @@ impl InlineBitpacking {
         let mut output: Vec<T> = Vec::with_capacity(total_size);
         let mut chunks = Vec::with_capacity(bit_widths_array.len());
 
-        for i in 0..bit_widths_array.len() - 1 {
+        for (i, packed_chunk_size) in packed_chunk_sizes
+            .iter()
+            .enumerate()
+            .take(bit_widths_array.len() - 1)
+        {
             let start_elem = i * ELEMS_PER_CHUNK as usize;
             let bit_width = bit_widths_array.value(i) as usize;
             output.push(T::from_usize(bit_width).unwrap());
             let output_len = output.len();
             unsafe {
-                output.set_len(output_len + packed_chunk_sizes[i]);
+                output.set_len(output_len + *packed_chunk_size);
                 BitPacking::unchecked_pack(
                     bit_width,
                     &data_buffer[start_elem..][..ELEMS_PER_CHUNK as usize],
-                    &mut output[output_len..][..packed_chunk_sizes[i]],
+                    &mut output[output_len..][..*packed_chunk_size],
                 );
             }
             chunks.push(MiniBlockChunk {
-                buffer_sizes: vec![((1 + packed_chunk_sizes[i]) * std::mem::size_of::<T>()) as u16],
+                buffer_sizes: vec![((1 + *packed_chunk_size) * std::mem::size_of::<T>()) as u16],
                 log_num_values: LOG_ELEMS_PER_CHUNK,
             });
         }
@@ -751,10 +755,7 @@ impl InlineBitpacking {
         let chunk = cast_slice(&chunk_in_u8[std::mem::size_of::<T>()..]);
 
         // The bit-packed chunk should have number of bytes (bit_width_value * ELEMS_PER_CHUNK / 8)
-        assert!(
-            chunk.len() * std::mem::size_of::<T>()
-                == (bit_width_value * ELEMS_PER_CHUNK as u64) as usize / 8
-        );
+        assert!(std::mem::size_of_val(chunk) == (bit_width_value * ELEMS_PER_CHUNK) as usize / 8);
 
         unsafe {
             BitPacking::unchecked_unpack(bit_width_value as usize, chunk, &mut decompressed);
@@ -791,7 +792,6 @@ impl MiniBlockCompressor for InlineBitpacking {
 
 impl BlockCompressor for InlineBitpacking {
     fn compress(&self, data: DataBlock) -> Result<LanceBuffer> {
-        println!("Compressing rep-def levels with inline bitpacking");
         let fixed_width = data.as_fixed_width().unwrap();
         let (chunked, _) = self.chunk_data(fixed_width);
         Ok(chunked.data.into_iter().next().unwrap())
@@ -843,7 +843,9 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let last_chunk_is_runt = data_buffer.len() % ELEMS_PER_CHUNK as usize != 0;
     let words_per_chunk =
         (ELEMS_PER_CHUNK as usize * bit_width).div_ceil(data.bits_per_value as usize);
+    #[allow(clippy::uninit_vec)]
     let mut output: Vec<T> = Vec::with_capacity(num_chunks * words_per_chunk);
+    #[allow(clippy::uninit_vec)]
     unsafe {
         output.set_len(num_chunks * words_per_chunk);
     }
@@ -878,7 +880,7 @@ fn bitpack_out_of_line<T: ArrowNativeType + BitPacking>(
     let last_chunk_start = num_whole_chunks * ELEMS_PER_CHUNK as usize;
 
     let mut last_chunk: Vec<T> = vec![T::from_usize(0).unwrap(); ELEMS_PER_CHUNK as usize];
-    last_chunk[..remaining_items as usize].clone_from_slice(&data_buffer[last_chunk_start..]);
+    last_chunk[..remaining_items].clone_from_slice(&data_buffer[last_chunk_start..]);
     let output_start = num_whole_chunks * words_per_chunk;
     unsafe {
         BitPacking::unchecked_pack(bit_width, &last_chunk, &mut output[output_start..]);
@@ -901,7 +903,9 @@ fn unpack_out_of_line<T: ArrowNativeType + BitPacking>(
     debug_assert_eq!(data.num_values as usize % words_per_chunk, 0);
 
     // This is slightly larger than num_values because the last chunk has some padding, we will truncate at the end
+    #[allow(clippy::uninit_vec)]
     let mut decompressed = Vec::with_capacity(num_chunks * ELEMS_PER_CHUNK as usize);
+    #[allow(clippy::uninit_vec)]
     unsafe {
         decompressed.set_len(num_chunks * ELEMS_PER_CHUNK as usize);
     }

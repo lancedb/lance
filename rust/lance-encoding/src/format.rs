@@ -286,6 +286,7 @@ impl ProtobufUtils {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn miniblock_layout(
         rep_encoding: Option<ArrayEncoding>,
         def_encoding: Option<ArrayEncoding>,
