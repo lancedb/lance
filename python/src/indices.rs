@@ -138,6 +138,7 @@ fn train_pq_model(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
     let codebook = RT.block_on(
         Some(py),
@@ -357,6 +358,7 @@ pub fn load_shuffled_vectors(
         centroids: Some(ivf_centroids),
         offsets: vec![],
         lengths: vec![],
+        loss: None,
     };
 
     let codebook = pq_codebook.0;
