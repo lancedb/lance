@@ -5,7 +5,9 @@ use std::{ops::DerefMut, sync::Arc};
 use arrow::datatypes::Int32Type;
 
 use crate::{
-    dataset::{builder::DatasetBuilder, CommitBuilder, InsertBuilder, WriteMode, WriteParams},
+    dataset::{
+        builder::DatasetBuilder, CommitBuilder, InsertBuilder, ReadParams, WriteMode, WriteParams,
+    },
     io::ObjectStoreParams,
 };
 use aws_config::{BehaviorVersion, ConfigLoader, Region, SdkConfig};
@@ -295,13 +297,22 @@ async fn test_ddb_open_iops() {
         .execute(transaction)
         .await
         .unwrap();
-    // Commit: 2 IOPs. 1 for transaction file, 1 for manifest file
+    // Commit: 4 write IOPs:
+    // * 1 for transaction file
+    // * 3 for manifest file
+    //    * write staged file
+    //    * copy to final file
+    //    * delete staged file
     let stats = incremental_stats();
-    assert_eq!(stats.write_iops, 2);
+
+    assert_eq!(stats.write_iops, 4);
     assert_eq!(stats.read_iops, 1);
 
     let dataset = DatasetBuilder::from_uri(&uri)
-        .with_storage_options(store_params.storage_options.unwrap())
+        .with_read_params(ReadParams {
+            store_options: Some(store_params.clone()),
+            ..Default::default()
+        })
         .load()
         .await
         .unwrap();
@@ -313,12 +324,16 @@ async fn test_ddb_open_iops() {
 
     // Append
     let dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
         .execute(vec![data.clone()])
         .await
         .unwrap();
     let stats = incremental_stats();
-    // Append: 3 IOPS: data file, transaction file, manifest file
-    assert_eq!(stats.write_iops, 1);
+    // Append: 5 IOPS: data file, transaction file, 3x manifest file
+    assert_eq!(stats.write_iops, 5);
     assert_eq!(stats.read_iops, 0);
 
     // Checkout original version

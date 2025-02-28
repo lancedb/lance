@@ -892,9 +892,9 @@ async fn configure_store(
 
             // This will be default in next version of object store.
             // https://github.com/apache/arrow-rs/pull/7181
-            if !storage_options.contains_key(&AmazonS3ConfigKey::ConditionalPut) {
-                storage_options.insert(AmazonS3ConfigKey::ConditionalPut, "etag".to_string());
-            }
+            storage_options
+                .entry(AmazonS3ConfigKey::ConditionalPut)
+                .or_insert_with(|| "etag".to_string());
 
             // Cloudflare does not support varying part sizes.
             let use_constant_size_upload_parts = storage_options

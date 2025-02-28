@@ -186,24 +186,6 @@ impl CommitHandler for ExternalManifestCommitHandler {
         base_path: &Path,
         object_store: &ObjectStore,
     ) -> std::result::Result<ManifestLocation, Error> {
-        let path = self.resolve_latest_version(base_path, object_store).await?;
-        let naming_scheme = detect_naming_scheme_from_path(&path)?;
-        Ok(ManifestLocation {
-            version: self
-                .resolve_latest_version_id(base_path, object_store)
-                .await?,
-            path,
-            size: None,
-            naming_scheme,
-        })
-    }
-
-    /// Get the latest version of a dataset at the path
-    async fn resolve_latest_version(
-        &self,
-        base_path: &Path,
-        object_store: &ObjectStore,
-    ) -> std::result::Result<Path, Error> {
         let location = self
             .external_manifest_store
             .get_latest_manifest_location(base_path.as_ref())
@@ -214,11 +196,16 @@ impl CommitHandler for ExternalManifestCommitHandler {
                 version,
                 path,
                 size,
-                ..
+                naming_scheme,
             }) => {
                 // The path is finalized, no need to check object store
                 if path.extension() == Some(MANIFEST_EXTENSION) {
-                    return Ok(path);
+                    return Ok(ManifestLocation {
+                        version,
+                        path,
+                        size,
+                        naming_scheme,
+                    });
                 }
 
                 let size = if let Some(size) = size {
@@ -227,24 +214,39 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     object_store.size(&path).await? as u64
                 };
 
-                // Detect naming scheme based on presence of zero padding.
-                let naming_scheme =
-                    ManifestNamingScheme::detect_scheme_staging(path.filename().unwrap());
+                let final_path = self
+                    .finalize_manifest(
+                        base_path,
+                        &path,
+                        version,
+                        size,
+                        &object_store.inner,
+                        naming_scheme,
+                    )
+                    .await?;
 
-                self.finalize_manifest(
-                    base_path,
-                    &path,
+                Ok(ManifestLocation {
                     version,
-                    size,
-                    &object_store.inner,
+                    path: final_path,
+                    size: Some(size),
                     naming_scheme,
-                )
-                .await
+                })
             }
             // Dataset not found in the external store, this could be because the dataset did not
             // use external store for commit before. In this case, we search for the latest manifest
-            None => Ok(current_manifest_path(object_store, base_path).await?.path),
+            None => current_manifest_path(object_store, base_path).await,
         }
+    }
+
+    /// Get the latest version of a dataset at the path
+    async fn resolve_latest_version(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> std::result::Result<Path, Error> {
+        self.resolve_latest_location(base_path, object_store)
+            .await
+            .map(|l| l.path)
     }
 
     async fn resolve_latest_version_id(
