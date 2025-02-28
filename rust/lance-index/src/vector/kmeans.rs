@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
+
 use arrow_array::{types::ArrowPrimitiveType, ArrayRef, FixedSizeListArray, PrimitiveArray};
 use lance_arrow::FixedSizeListArrayExt;
 use log::info;
@@ -16,6 +18,7 @@ use lance_linalg::{
 /// Train KMeans model and returns the centroids of each cluster.
 #[allow(clippy::too_many_arguments)]
 pub fn train_kmeans<T: ArrowPrimitiveType>(
+    centroids: Option<Arc<FixedSizeListArray>>,
     array: &[T::Native],
     dimension: usize,
     k: usize,
@@ -57,12 +60,7 @@ where
         PrimitiveArray::<T>::from(array.to_vec())
     };
 
-    let params = KMeansParams {
-        max_iters: max_iterations,
-        distance_type,
-        redos,
-        ..Default::default()
-    };
+    let params = KMeansParams::new(centroids, max_iterations, redos, distance_type);
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
     let model = KMeans::new_with_params(&data, k, &params)?;
     Ok(model.centroids.clone())

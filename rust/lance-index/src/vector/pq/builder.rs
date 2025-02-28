@@ -111,6 +111,7 @@ impl PQBuildParams {
             .map(|sub_vec| {
                 let rng = rand::rngs::SmallRng::from_entropy();
                 train_kmeans::<T>(
+                    None,
                     &sub_vec,
                     sub_vector_dimension,
                     num_centroids,

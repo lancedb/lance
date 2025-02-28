@@ -70,6 +70,7 @@ use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
 };
+use lazy_static::lazy_static;
 use log::info;
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
@@ -92,6 +93,13 @@ use crate::{
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
     session::Session,
 };
+
+lazy_static! {
+    static ref AVG_LOSS_RETRAIN_THRESHOLD: f64 = std::env::var("LANCE_AVG_LOSS_RETRAIN_THRESHOLD")
+        .unwrap_or("1.1".to_string())
+        .parse()
+        .expect("LANCE_AVG_LOSS_RETRAIN_THRESHOLD must be a float number");
+}
 
 pub mod builder;
 pub mod io;
@@ -358,13 +366,34 @@ pub(crate) async fn optimize_vector_indices_v2(
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
 
+    let original_avg_loss = ivf_model.avg_loss().unwrap_or_default();
+    let total_loss = existing_indices
+        .iter()
+        .map(|idx| idx.ivf_model().loss.unwrap_or_default())
+        .sum::<f64>();
+    let total_rows = existing_indices
+        .iter()
+        .map(|idx| idx.ivf_model().num_rows())
+        .sum::<u64>();
+    let avg_loss = total_loss / total_rows as f64;
+
+    const AVG_LOSS_THRESHOLD: f64 = 1.1;
+    let mut num_indices_to_merge = options.num_indices_to_merge;
+    if avg_loss >= original_avg_loss * AVG_LOSS_THRESHOLD {
+        info!(
+            "average loss {} of the indices is too high (> {} * {}), retrain the index",
+            avg_loss, original_avg_loss, AVG_LOSS_THRESHOLD
+        );
+        num_indices_to_merge = existing_indices.len();
+    }
+
     let temp_dir = tempfile::tempdir()?;
     let temp_dir = temp_dir.path().to_str().unwrap().into();
     let shuffler = Box::new(IvfShuffler::new(temp_dir, num_partitions));
-    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
+    let start_pos = if num_indices_to_merge > existing_indices.len() {
         0
     } else {
-        existing_indices.len() - options.num_indices_to_merge
+        existing_indices.len() - num_indices_to_merge
     };
     let indices_to_merge = existing_indices[start_pos..].to_vec();
     let merged_num = indices_to_merge.len();
@@ -379,7 +408,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
             )?
-            .with_ivf(ivf_model)
+            .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
             .shuffle_data(unindexed)
@@ -397,7 +426,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 shuffler,
                 (),
             )?
-            .with_ivf(ivf_model)
+            .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
             .shuffle_data(unindexed)
@@ -418,7 +447,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
             )?
-            .with_ivf(ivf_model)
+            .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
             .shuffle_data(unindexed)
@@ -439,7 +468,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 // TODO: get the HNSW parameters from the existing indices
                 HnswBuildParams::default(),
             )?
-            .with_ivf(ivf_model)
+            .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
             .shuffle_data(unindexed)
@@ -941,8 +970,8 @@ impl VectorIndex for IVFIndex {
         })
     }
 
-    fn ivf_model(&self) -> IvfModel {
-        self.ivf.clone()
+    fn ivf_model(&self) -> &IvfModel {
+        &self.ivf
     }
 
     fn quantizer(&self) -> Quantizer {
@@ -1124,7 +1153,9 @@ pub async fn build_ivf_model(
     metric_type: MetricType,
     params: &IvfBuildParams,
 ) -> Result<IvfModel> {
-    if let Some(centroids) = params.centroids.as_ref() {
+    let centroids = params.centroids.clone();
+    if centroids.is_some() && !params.retrain {
+        let centroids = centroids.unwrap();
         info!("Pre-computed IVF centroids is provided, skip IVF training");
         if centroids.values().len() != params.num_partitions * dim {
             return Err(Error::Index {
@@ -1162,7 +1193,7 @@ pub async fn build_ivf_model(
 
     info!("Start to train IVF model");
     let start = std::time::Instant::now();
-    let ivf = train_ivf_model(&training_data, mt, params).await?;
+    let ivf = train_ivf_model(centroids, &training_data, mt, params).await?;
     info!(
         "Trained IVF model in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -1660,6 +1691,7 @@ async fn write_ivf_hnsw_file(
 }
 
 async fn do_train_ivf_model<T: ArrowPrimitiveType>(
+    centroids: Option<Arc<FixedSizeListArray>>,
     data: &[T::Native],
     dimension: usize,
     metric_type: MetricType,
@@ -1672,6 +1704,7 @@ where
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
     let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
+        centroids,
         data,
         dimension,
         params.num_partitions,
@@ -1689,6 +1722,7 @@ where
 
 /// Train IVF partitions using kmeans.
 async fn train_ivf_model(
+    centroids: Option<Arc<FixedSizeListArray>>,
     data: &FixedSizeListArray,
     distance_type: DistanceType,
     params: &IvfBuildParams,
@@ -1702,6 +1736,7 @@ async fn train_ivf_model(
     match (values.data_type(), distance_type) {
         (DataType::Float16, _) => {
             do_train_ivf_model::<Float16Type>(
+                centroids,
                 values.as_primitive::<Float16Type>().values(),
                 dim,
                 distance_type,
@@ -1711,6 +1746,7 @@ async fn train_ivf_model(
         }
         (DataType::Float32, _) => {
             do_train_ivf_model::<Float32Type>(
+                centroids,
                 values.as_primitive::<Float32Type>().values(),
                 dim,
                 distance_type,
@@ -1720,6 +1756,7 @@ async fn train_ivf_model(
         }
         (DataType::Float64, _) => {
             do_train_ivf_model::<Float64Type>(
+                centroids,
                 values.as_primitive::<Float64Type>().values(),
                 dim,
                 distance_type,
@@ -1729,6 +1766,7 @@ async fn train_ivf_model(
         }
         (DataType::UInt8, DistanceType::Hamming) => {
             do_train_ivf_model::<UInt8Type>(
+                centroids,
                 values.as_primitive::<UInt8Type>().values(),
                 dim,
                 distance_type,

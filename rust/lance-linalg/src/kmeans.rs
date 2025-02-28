@@ -41,10 +41,10 @@ use crate::{
 use crate::{Error, Result};
 
 /// KMean initialization method.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum KMeanInit {
     Random,
-    KMeanPlusPlus,
+    Incremental(Arc<FixedSizeListArray>),
 }
 
 /// KMean Training Parameters
@@ -80,11 +80,21 @@ impl Default for KMeansParams {
 }
 
 impl KMeansParams {
-    /// Create a new KMeansParams with cosine distance.
-    #[allow(dead_code)]
-    fn cosine() -> Self {
+    pub fn new(
+        centroids: Option<Arc<FixedSizeListArray>>,
+        max_iters: u32,
+        redos: usize,
+        distance_type: DistanceType,
+    ) -> Self {
+        let init = match centroids {
+            Some(centroids) => KMeanInit::Incremental(centroids),
+            None => KMeanInit::Random,
+        };
         Self {
-            distance_type: DistanceType::Cosine,
+            max_iters,
+            redos,
+            distance_type,
+            init,
             ..Default::default()
         }
     }
@@ -474,7 +484,7 @@ impl KMeans {
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
-            let mut kmeans: Self = match params.init {
+            let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
                     data.values(),
                     dimension,
@@ -482,9 +492,12 @@ impl KMeans {
                     rng.clone(),
                     params.distance_type,
                 ),
-                KMeanInit::KMeanPlusPlus => {
-                    unimplemented!()
-                }
+                KMeanInit::Incremental(centroids) => Self::with_centroids(
+                    centroids.values().clone(),
+                    dimension,
+                    params.distance_type,
+                    f64::MAX,
+                ),
             };
 
             let mut loss = f64::MAX;

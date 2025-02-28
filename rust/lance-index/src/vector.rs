@@ -222,7 +222,7 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// The metric type of this vector index.
     fn metric_type(&self) -> DistanceType;
 
-    fn ivf_model(&self) -> IvfModel;
+    fn ivf_model(&self) -> &IvfModel;
     fn quantizer(&self) -> Quantizer;
 
     /// the index type of this vector index.
