@@ -10,6 +10,7 @@ use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
     catalog::streaming::StreamingTable,
     dataframe::DataFrame,
+    datasource::streaming::StreamingTable,
     execution::{
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
