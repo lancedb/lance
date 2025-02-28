@@ -1403,6 +1403,7 @@ pub(crate) async fn remap_index_file(
         centroids: index.ivf.centroids.clone(),
         offsets: Vec::with_capacity(index.ivf.offsets.len()),
         lengths: Vec::with_capacity(index.ivf.lengths.len()),
+        loss: index.ivf.loss,
     };
     while let Some(write_task) = task_stream.try_next().await? {
         write_task.write(&mut writer, &mut ivf).await?;
