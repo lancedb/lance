@@ -72,9 +72,10 @@ impl Scanner {
     fn analyze_plan(self_: PyRef<'_, Self>) -> PyResult<String> {
         let scanner = self_.scanner.clone();
         let res = RT
-            .spawn(Some(self_.py()), async move {
-                scanner.analyze_plan().await
-            })?
+            .spawn(
+                Some(self_.py()),
+                async move { scanner.analyze_plan().await },
+            )?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
         Ok(res)
