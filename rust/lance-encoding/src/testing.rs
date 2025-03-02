@@ -668,7 +668,6 @@ async fn check_round_trip_encoding_inner(
             })
         };
 
-        dbg!(&expected);
         let scheduler = scheduler.clone();
         let indices = indices.clone();
         test_decode(
