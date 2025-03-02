@@ -1525,6 +1525,11 @@ pub mod tests {
             .copied()
             .collect::<BTreeMap<_, _>>();
 
+        let empty_projection = ReaderProjection {
+            column_indices: Vec::default(),
+            schema: Arc::new(Schema::default()),
+        };
+
         for columns in [
             vec!["score"],
             vec!["location"],
@@ -1606,12 +1611,17 @@ pub mod tests {
                 })),
             )
             .await;
-        }
 
-        let empty_projection = ReaderProjection {
-            column_indices: Vec::default(),
-            schema: Arc::new(Schema::default()),
-        };
+            assert!(file_reader
+                .read_stream_projected(
+                    lance_io::ReadBatchParams::RangeFull,
+                    1024,
+                    16,
+                    empty_projection.clone(),
+                    FilterExpression::no_filter(),
+                )
+                .is_err());
+        }
 
         assert!(FileReader::try_open(
             file_scheduler.clone(),
