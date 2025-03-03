@@ -27,6 +27,7 @@ use crate::vector::VectorIndex;
 use crate::{Index, IndexType};
 
 use super::btree::TrainingSource;
+use super::inverted::builder::LANCE_FTS_NUM_SHARDS;
 use super::inverted::TokenSet;
 use super::{AnyQuery, IndexReader, IndexStore, ScalarIndex, SearchResult, TextQuery};
 
@@ -465,10 +466,50 @@ impl NGramIndexBuilder {
         let schema = data.schema();
         Self::validate_schema(schema.as_ref())?;
 
-        while let Some(batch) = data.try_next().await? {
-            self.process_batch(&batch);
+        let num_shards = *LANCE_FTS_NUM_SHARDS;
+        let mut senders = Vec::with_capacity(num_shards);
+        let mut builders = Vec::with_capacity(num_shards);
+        for _ in 0..*LANCE_FTS_NUM_SHARDS {
+            let (send, mut recv) = tokio::sync::mpsc::channel(2);
+            senders.push(send);
+
+            let mut builder = Self::new();
+            let future = tokio::spawn(async move {
+                while let Some(batch) = recv.recv().await {
+                    builder.process_batch(&batch);
+                }
+                builder
+            });
+            builders.push(future);
         }
+
+        let mut idx = 0;
+        while let Some(batch) = data.try_next().await? {
+            senders[idx % num_shards].send(batch).await.unwrap();
+            idx += 1;
+        }
+
+        std::mem::drop(senders);
+        let builders = futures::future::try_join_all(builders).await?;
+        for builder in builders {
+            self.merge(builder);
+        }
+
         Ok(())
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        for (token, new_token_id) in other.tokens_map {
+            if let Some(token_id) = self.tokens_map.get(&token) {
+                self.bitmaps[*token_id as usize] |=
+                    std::mem::take(&mut other.bitmaps[new_token_id as usize]);
+            } else {
+                // This is a new token
+                self.tokens_map.insert(token, self.bitmaps.len() as u32);
+                self.bitmaps
+                    .push(std::mem::take(&mut other.bitmaps[new_token_id as usize]));
+            }
+        }
     }
 
     pub async fn write(self, store: &dyn IndexStore) -> Result<()> {
