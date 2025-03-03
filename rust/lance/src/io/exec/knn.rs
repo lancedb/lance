@@ -13,6 +13,7 @@ use arrow_array::{
 };
 use arrow_array::{Array, Float32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{metrics::BaselineMetrics, PlanProperties};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
