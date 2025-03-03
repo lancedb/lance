@@ -2149,6 +2149,7 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
+                    dtype=element_type.to_pandas_dtype(),
                 )
                 timers["pq_train:end"] = time.time()
                 pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
