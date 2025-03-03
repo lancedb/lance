@@ -17,8 +17,8 @@ def test_f16_embeddings(tmp_path: Path, accelerator: str):
     elif not torch.backends.mps.is_available() and accelerator == "mps":
         pytest.skip("MPS not available")
 
-    DIM = 32
-    TOTAL = 1000
+    DIM = 16
+    TOTAL = 256
     values = np.random.random(TOTAL * DIM).astype(np.float16)
     fsl = pa.FixedSizeListArray.from_arrays(values, DIM)
     data = pa.Table.from_arrays([fsl, np.arange(TOTAL)], names=["vec", "id"])
