@@ -23,6 +23,12 @@ use super::{
     Dataset,
 };
 
+mod optimize;
+
+use optimize::{
+    ChainedNewColumnTransformOptimizer, NewColumnTransformOptimizer, SqlToAllNullsOptimizer,
+};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchInfo {
     pub fragment_id: u32,
@@ -149,6 +155,16 @@ pub(super) async fn add_columns_to_fragments(
         Ok(())
     };
 
+    // ALlNull transform can not performed on legacy files
+    let has_legacy_files = has_legacy_files(fragments);
+
+    // Optimize the transforms
+    let mut optimizer = ChainedNewColumnTransformOptimizer::new(vec![]);
+    if has_legacy_files {
+        optimizer.add_optimizer(Box::new(SqlToAllNullsOptimizer::new()));
+    }
+    let transforms = optimizer.optimize(dataset, transforms)?;
+
     let (output_schema, fragments) = match transforms {
         NewColumnTransform::BatchUDF(udf) => {
             check_names(udf.output_schema.as_ref())?;
@@ -262,17 +278,7 @@ pub(super) async fn add_columns_to_fragments(
             // can't add all-null columns as a metadata-only operation. The reason is because we
             // use the NullReader for fragments that have missing columns and we can't mix legacy
             // and non-legacy readers when reading the fragment.
-            if fragments.iter().any(|fragment| {
-                fragment.files.iter().any(|file| {
-                    matches!(
-                        LanceFileVersion::try_from_major_minor(
-                            file.file_major_version,
-                            file.file_minor_version
-                        ),
-                        Ok(LanceFileVersion::Legacy)
-                    )
-                })
-            }) {
+            if has_legacy_files {
                 return Err(Error::NotSupported {
                     source: "Cannot add all-null columns to legacy dataset version.".into(),
                     location: location!(),
@@ -287,6 +293,24 @@ pub(super) async fn add_columns_to_fragments(
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
     Ok((fragments, schema))
+}
+
+fn has_legacy_files(fragments: &[FileFragment]) -> bool {
+    let has_legacy_files = fragments
+        .iter()
+        .map(|f| &f.metadata)
+        .flat_map(|fragment_meta| fragment_meta.files.iter())
+        .any(|file_meta| {
+            matches!(
+                LanceFileVersion::try_from_major_minor(
+                    file_meta.file_major_version,
+                    file_meta.file_minor_version
+                ),
+                Ok(LanceFileVersion::Legacy)
+            )
+        });
+
+    !has_legacy_files
 }
 
 pub(super) async fn add_columns(
@@ -1743,5 +1767,10 @@ mod test {
         assert_eq!(data, expected_data);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_new_column_sql_to_all_nulls_transform_optimizer() {
+        // TODO: write a test to ensure the optimizer for all null sql gets used
     }
 }
