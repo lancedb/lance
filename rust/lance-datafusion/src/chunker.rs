@@ -138,10 +138,10 @@ impl BreakStreamState {
             };
             self.rows_seen = 0;
             self.rows_remaining -= rows_to_emit;
+            self.bytes_seen = 0;
+            self.bytes_remaining -= (rows_to_emit as f64 * avg_bytes_row) as usize;
             let batch = self.batch.as_mut().unwrap();
             let next = batch.slice(0, rows_to_emit);
-            self.bytes_seen = 0;
-            self.bytes_remaining -= next.get_array_memory_size();
             *batch = batch.slice(rows_to_emit, batch.num_rows() - rows_to_emit);
             Some((Ok(next), self))
         }
