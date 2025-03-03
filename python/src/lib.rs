@@ -18,6 +18,10 @@
 //! automatic versioning, optimized for computer vision, bioinformatics, spatial and ML data.
 //! [Apache Arrow](https://arrow.apache.org/) and DuckDB compatible.
 
+// Workaround for https://github.com/rust-lang/rust-clippy/issues/12039
+// Remove after upgrading pyo3 to 0.23
+#![allow(clippy::useless_conversion)]
+
 use std::env;
 use std::sync::Arc;
 

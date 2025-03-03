@@ -10,7 +10,11 @@ use std::{
 
 use arrow_array::{RecordBatch, UInt32Array};
 use async_trait::async_trait;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use deepsize::DeepSizeOf;
+use lance_arrow::RecordBatchExt;
+use lance_core::ROW_ID;
 use lance_core::{datatypes::Schema, Error, Result};
 use lance_file::reader::FileReader;
 use lance_io::traits::Reader;
@@ -261,6 +265,32 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
             partition_metadata: self.partition_metadata.clone(),
             options: self.options.clone(),
         }))
+    }
+
+    async fn to_batch_stream(&self, with_vector: bool) -> Result<SendableRecordBatchStream> {
+        let store = self.storage.as_ref().ok_or(Error::Index {
+            message: "vector storage not loaded".to_string(),
+            location: location!(),
+        })?;
+
+        let schema = if with_vector {
+            store.schema().clone()
+        } else {
+            let schema = store.schema();
+            let row_id_idx = schema.index_of(ROW_ID)?;
+            Arc::new(schema.project(&[row_id_idx])?)
+        };
+
+        let batches = store
+            .to_batches()?
+            .map(|b| {
+                let batch = b.project_by_schema(&schema)?;
+                Ok(batch)
+            })
+            .collect::<Vec<_>>();
+        let stream = futures::stream::iter(batches);
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
+        Ok(Box::pin(stream))
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {

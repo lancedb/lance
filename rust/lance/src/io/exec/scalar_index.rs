@@ -10,6 +10,7 @@ use datafusion::{
     common::{stats::Precision, Statistics},
     physical_plan::{
         execution_plan::{Boundedness, EmissionType},
+        metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
@@ -27,7 +28,7 @@ use lance_core::{
 use lance_datafusion::chunker::break_stream;
 use lance_index::{
     scalar::{
-        expression::{ScalarIndexExpr, ScalarIndexLoader},
+        expression::{IndexExprResult, ScalarIndexExpr, ScalarIndexLoader},
         SargableQuery, ScalarIndex,
     },
     DatasetIndexExt,
@@ -42,6 +43,8 @@ use crate::{
     index::{prefilter::DatasetPreFilter, DatasetIndexInternalExt},
     Dataset,
 };
+
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 
 lazy_static::lazy_static! {
     pub static ref SCALAR_INDEX_SCHEMA: SchemaRef = Arc::new(Schema::new(vec![Field::new("result".to_string(), DataType::Binary, true)]));
@@ -73,6 +76,7 @@ pub struct ScalarIndexExec {
     dataset: Arc<Dataset>,
     expr: ScalarIndexExpr,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for ScalarIndexExec {
@@ -97,15 +101,19 @@ impl ScalarIndexExec {
             dataset,
             expr,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
     async fn do_execute(expr: ScalarIndexExpr, dataset: Arc<Dataset>) -> Result<RecordBatch> {
         let query_result = expr.evaluate(dataset.as_ref()).await?;
-        let query_result_arr = query_result.into_arrow()?;
+        let IndexExprResult::Exact(row_id_mask) = query_result else {
+            todo!("Support for non-exact query results as pre-filter for vector search")
+        };
+        let row_id_mask_arr = row_id_mask.into_arrow()?;
         Ok(RecordBatch::try_new(
             SCALAR_INDEX_SCHEMA.clone(),
-            vec![Arc::new(query_result_arr)],
+            vec![Arc::new(row_id_mask_arr)],
         )?)
     }
 }
@@ -129,24 +137,32 @@ impl ExecutionPlan for ScalarIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(datafusion::error::DataFusionError::Internal(
+                "ScalarIndexExec does not have children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let batch_fut = Self::do_execute(self.expr.clone(), self.dataset.clone());
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream = futures::stream::iter(vec![batch_fut])
             .then(|batch_fut| batch_fut.map_err(|err| err.into()))
             .boxed()
             as BoxStream<'static, datafusion::common::Result<RecordBatch>>;
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             SCALAR_INDEX_SCHEMA.clone(),
             stream,
+            baseline_metrics,
         )))
     }
 
@@ -155,6 +171,10 @@ impl ExecutionPlan for ScalarIndexExec {
             num_rows: Precision::Exact(2),
             ..Statistics::new_unknown(&SCALAR_INDEX_SCHEMA)
         })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -175,6 +195,7 @@ pub struct MapIndexExec {
     column_name: String,
     input: Arc<dyn ExecutionPlan>,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for MapIndexExec {
@@ -200,6 +221,7 @@ impl MapIndexExec {
             column_name,
             input,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -217,15 +239,18 @@ impl MapIndexExec {
             column_name.clone(),
             Arc::new(SargableQuery::IsIn(index_vals)),
         );
-        let mut row_addresses = query.evaluate(dataset.as_ref()).await?;
+        let query_result = query.evaluate(dataset.as_ref()).await?;
+        let IndexExprResult::Exact(mut row_id_mask) = query_result else {
+            todo!("Support for non-exact query results as input for merge_insert")
+        };
 
         if let Some(deletion_mask) = deletion_mask.as_ref() {
-            row_addresses = row_addresses & deletion_mask.as_ref().clone();
+            row_id_mask = row_id_mask & deletion_mask.as_ref().clone();
         }
 
-        if let Some(mut allow_list) = row_addresses.allow_list {
+        if let Some(mut allow_list) = row_id_mask.allow_list {
             // Flatten the allow list
-            if let Some(block_list) = row_addresses.block_list {
+            if let Some(block_list) = row_id_mask.block_list {
                 allow_list -= &block_list;
             }
 
@@ -294,9 +319,19 @@ impl ExecutionPlan for MapIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        unimplemented!()
+        if children.len() != 1 {
+            Err(datafusion::error::DataFusionError::Internal(
+                "MapIndexExec requires exactly one child".to_string(),
+            ))
+        } else {
+            Ok(Arc::new(Self::new(
+                self.dataset.clone(),
+                self.column_name.clone(),
+                children.into_iter().next().unwrap(),
+            )))
+        }
     }
 
     fn execute(
@@ -305,15 +340,17 @@ impl ExecutionPlan for MapIndexExec {
         context: Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
         let index_vals = self.input.execute(partition, context)?;
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let stream_fut =
             Self::do_execute(index_vals, self.dataset.clone(), self.column_name.clone());
         let stream = futures::stream::iter(vec![stream_fut])
             .then(|stream_fut| stream_fut)
             .try_flatten()
             .boxed();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             INDEX_LOOKUP_SCHEMA.clone(),
             stream,
+            baseline_metrics,
         )))
     }
 
@@ -337,6 +374,7 @@ pub struct MaterializeIndexExec {
     expr: ScalarIndexExpr,
     fragments: Arc<Vec<Fragment>>,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for MaterializeIndexExec {
@@ -405,6 +443,7 @@ impl MaterializeIndexExec {
             expr,
             fragments,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -414,7 +453,7 @@ impl MaterializeIndexExec {
         dataset: Arc<Dataset>,
         fragments: Arc<Vec<Fragment>>,
     ) -> Result<RecordBatch> {
-        let mask = expr.evaluate(dataset.as_ref());
+        let expr_result = expr.evaluate(dataset.as_ref());
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -425,10 +464,20 @@ impl MaterializeIndexExec {
             DatasetPreFilter::create_deletion_mask(dataset.clone(), fragment_bitmap)
         });
         let mask = if let Some(prefilter) = prefilter {
-            let (mask, prefilter) = futures::try_join!(mask, prefilter)?;
+            let (expr_result, prefilter) = futures::try_join!(expr_result, prefilter)?;
+            let mask = match expr_result {
+                IndexExprResult::Exact(mask) => mask,
+                IndexExprResult::AtMost(mask) => mask,
+                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
+            };
             mask & (*prefilter).clone()
         } else {
-            mask.await?
+            let expr_result = expr_result.await?;
+            match expr_result {
+                IndexExprResult::Exact(mask) => mask,
+                IndexExprResult::AtMost(mask) => mask,
+                IndexExprResult::AtLeast(_) => todo!("Support AtLeast in MaterializeIndexExec"),
+            }
         };
         let ids = row_ids_for_mask(mask, &dataset, &fragments).await?;
         let ids = UInt64Array::from(ids);
@@ -567,16 +616,23 @@ impl ExecutionPlan for MaterializeIndexExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        todo!()
+        if !children.is_empty() {
+            Err(datafusion::error::DataFusionError::Internal(
+                "MaterializeIndexExec does not have children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> datafusion::error::Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let batch_fut = Self::do_execute(
             self.expr.clone(),
             self.dataset.clone(),
@@ -591,14 +647,19 @@ impl ExecutionPlan for MaterializeIndexExec {
             stream,
         ));
         let stream = break_stream(stream, 64 * 1024);
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             MATERIALIZE_INDEX_SCHEMA.clone(),
             stream.map_err(|err| err.into()),
+            baseline_metrics,
         )))
     }
 
     fn statistics(&self) -> datafusion::error::Result<datafusion::physical_plan::Statistics> {
         Ok(Statistics::new_unknown(&MATERIALIZE_INDEX_SCHEMA))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {

@@ -13,16 +13,19 @@ use arrow_array::{
 };
 use arrow_array::{Array, Float32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::ColumnStatistics;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::physical_plan::PlanProperties;
+use datafusion::physical_plan::{metrics::BaselineMetrics, PlanProperties};
 use datafusion::physical_plan::{
-    stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
-    SendableRecordBatchStream, Statistics,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+    Statistics,
 };
 use datafusion::{
     common::stats::Precision,
     physical_plan::execution_plan::{Boundedness, EmissionType},
+};
+use datafusion::{common::ColumnStatistics, physical_plan::metrics::ExecutionPlanMetricsSet};
+use datafusion::{
+    error::{DataFusionError, Result as DataFusionResult},
+    physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::repeat_with;
@@ -45,7 +48,10 @@ use crate::index::DatasetIndexInternalExt;
 use crate::{Error, Result};
 use lance_arrow::*;
 
-use super::utils::{FilteredRowIdsToPrefilter, PreFilterSource, SelectionVectorToPrefilter};
+use super::utils::{
+    FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter, PreFilterSource,
+    SelectionVectorToPrefilter,
+};
 
 /// [ExecutionPlan] compute vector distance from a query vector.
 ///
@@ -66,6 +72,8 @@ pub struct KNNVectorDistanceExec {
 
     output_schema: SchemaRef,
     properties: PlanProperties,
+
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for KNNVectorDistanceExec {
@@ -117,6 +125,7 @@ impl KNNVectorDistanceExec {
             distance_type,
             output_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -163,7 +172,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
@@ -180,10 +189,11 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             })
             .buffer_unordered(get_num_compute_intensive_cpus());
         let schema = self.schema();
-        Ok(
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
-                as SendableRecordBatchStream,
-        )
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            schema,
+            stream.boxed(),
+            baseline_metrics,
+        )) as SendableRecordBatchStream)
     }
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
@@ -212,6 +222,10 @@ impl ExecutionPlan for KNNVectorDistanceExec {
             column_statistics,
             ..Statistics::new_unknown(self.schema().as_ref())
         })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -279,6 +293,8 @@ pub struct ANNIvfPartitionExec {
     pub index_uuids: Vec<String>,
 
     pub properties: PlanProperties,
+
+    pub metrics: ExecutionPlanMetricsSet,
 }
 
 impl ANNIvfPartitionExec {
@@ -305,6 +321,7 @@ impl ANNIvfPartitionExec {
             query,
             index_uuids,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -355,21 +372,25 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
     fn with_new_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Internal(
-            "ANNIVFPartitionExec: with_new_children called, but no children to replace".to_string(),
-        ))
+        if !children.is_empty() {
+            Err(DataFusionError::Internal(
+                "ANNIVFPartitionExec node does not accept children".to_string(),
+            ))
+        } else {
+            Ok(self)
+        }
     }
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let ds = self.dataset.clone();
-
         let stream = stream::iter(self.index_uuids.clone())
             .map(move |uuid| {
                 let query = query.clone();
@@ -402,10 +423,11 @@ impl ExecutionPlan for ANNIvfPartitionExec {
             })
             .buffered(self.index_uuids.len());
         let schema = self.schema();
-        Ok(
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
-                as SendableRecordBatchStream,
-        )
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            schema,
+            stream.boxed(),
+            baseline_metrics,
+        )) as SendableRecordBatchStream)
     }
 }
 
@@ -434,6 +456,8 @@ pub struct ANNIvfSubIndexExec {
 
     /// Datafusion Plan Properties
     properties: PlanProperties,
+
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl ANNIvfSubIndexExec {
@@ -466,6 +490,7 @@ impl ANNIvfSubIndexExec {
             query,
             prefilter_source,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 }
@@ -523,6 +548,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 query: self.query.clone(),
                 prefilter_source: self.prefilter_source.clone(),
                 properties: self.properties.clone(),
+                metrics: ExecutionPlanMetricsSet::new(),
             }
         } else {
             return Err(DataFusionError::Internal(
@@ -538,7 +564,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
-
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let schema = self.schema();
         let query = self.query.clone();
         let ds = self.dataset.clone();
@@ -577,7 +603,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             })
             .try_flatten();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             per_index_stream
                 .and_then(move |(part_ids, index_uuid)| {
@@ -647,6 +673,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 })
                 .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
+            baseline_metrics,
         )))
     }
 
@@ -659,6 +686,10 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
             ),
             ..Statistics::new_unknown(self.schema().as_ref())
         })
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {

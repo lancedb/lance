@@ -365,7 +365,7 @@ async fn indirect_schedule_task(
     // Create a new root scheduler, which has one column, which is our items data
     let root_fields = Fields::from(vec![Field::new("item", items_type, true)]);
     let indirect_root_scheduler =
-        SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone());
+        SimpleStructScheduler::new(vec![items_scheduler], root_fields.clone(), num_items);
     let mut indirect_scheduler = DecodeBatchScheduler::from_scheduler(
         Arc::new(indirect_root_scheduler),
         root_fields.clone(),

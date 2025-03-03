@@ -378,15 +378,17 @@ mod tests {
         train_index(&index_store, data, DataType::Int32, None).await;
         let index = BTreeIndex::load(index_store).await.unwrap();
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(10000));
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(-100))),
@@ -394,15 +396,21 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
         assert_eq!(Some(0), row_ids.len());
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(100))),
             ))
             .await
             .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
 
         assert_eq!(Some(100), row_ids.len());
     }
@@ -434,18 +442,24 @@ mod tests {
             .unwrap();
         let updated_index = BTreeIndex::load(updated_index_store).await.unwrap();
 
-        let row_ids = updated_index
+        let result = updated_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(10000));
 
-        let row_ids = updated_index
+        let result = updated_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(500_000))))
             .await
             .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
 
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(500_000));
@@ -453,8 +467,9 @@ mod tests {
 
     async fn check(index: &BTreeIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
+        assert!(results.is_exact());
         let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results, expected_arr);
+        assert_eq!(results.row_ids(), &expected_arr);
     }
 
     #[tokio::test]
@@ -727,10 +742,13 @@ mod tests {
             train_index(&index_store, training_data, data_type.clone(), None).await;
             let index = BTreeIndex::load(index_store).await.unwrap();
 
-            let row_ids = index
+            let result = index
                 .search(&SargableQuery::Equals(sample_value))
                 .await
                 .unwrap();
+
+            assert!(result.is_exact());
+            let row_ids = result.row_ids();
 
             // The random data may have had duplicates so there might be more than 1 result
             // but even for boolean we shouldn't match the entire thing
@@ -801,15 +819,21 @@ mod tests {
 
         let index = BTreeIndex::load(index_store).await.unwrap();
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "foo".to_string(),
             ))))
             .await
             .unwrap();
+
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
+
         assert!(row_ids.is_empty());
 
-        let row_ids = index.search(&SargableQuery::IsNull()).await.unwrap();
+        let result = index.search(&SargableQuery::IsNull()).await.unwrap();
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(row_ids.len(), Some(4096));
     }
 
@@ -861,21 +885,25 @@ mod tests {
 
         let index = BitmapIndex::load(index_store).await.unwrap();
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Equals(ScalarValue::Utf8(None)))
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(2));
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Equals(ScalarValue::Utf8(Some(
                 "abcd".to_string(),
             ))))
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(Some(3), row_ids.len());
         assert!(row_ids.contains(1));
         assert!(row_ids.contains(3));
@@ -893,15 +921,17 @@ mod tests {
         train_bitmap(&index_store, data).await;
         let index = BitmapIndex::load(index_store).await.unwrap();
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(10000))))
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(10000));
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(-100))),
@@ -909,9 +939,11 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert!(row_ids.is_empty());
 
-        let row_ids = index
+        let result = index
             .search(&SargableQuery::Range(
                 Bound::Unbounded,
                 Bound::Excluded(ScalarValue::Int32(Some(100))),
@@ -919,13 +951,16 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(Some(100), row_ids.len());
     }
 
     async fn check_bitmap(index: &BitmapIndex, query: SargableQuery, expected: &[u64]) {
         let results = index.search(&query).await.unwrap();
+        assert!(results.is_exact());
         let expected_arr = RowIdTreeMap::from_iter(expected);
-        assert_eq!(results, expected_arr);
+        assert_eq!(results.row_ids(), &expected_arr);
     }
 
     #[tokio::test]
@@ -1165,11 +1200,13 @@ mod tests {
             .unwrap();
         let updated_index = BitmapIndex::load(updated_index_store).await.unwrap();
 
-        let row_ids = updated_index
+        let result = updated_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5000))))
             .await
             .unwrap();
 
+        assert!(result.is_exact());
+        let row_ids = result.row_ids();
         assert_eq!(Some(1), row_ids.len());
         assert!(row_ids.contains(5000));
     }
@@ -1211,18 +1248,21 @@ mod tests {
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(5))))
             .await
             .unwrap()
+            .row_ids()
             .contains(65));
         // Deleted
         assert!(remapped_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(7))))
             .await
             .unwrap()
+            .row_ids()
             .is_empty());
         // Not remapped
         assert!(remapped_index
             .search(&SargableQuery::Equals(ScalarValue::Int32(Some(3))))
             .await
             .unwrap()
+            .row_ids()
             .contains(3));
     }
 
@@ -1267,7 +1307,9 @@ mod tests {
             let data = data.clone();
             async move {
                 let index = LabelListIndex::load(index_store).await.unwrap();
-                let row_ids = index.search(&query).await.unwrap();
+                let result = index.search(&query).await.unwrap();
+                assert!(result.is_exact());
+                let row_ids = result.row_ids();
 
                 let row_ids_set = row_ids
                     .row_ids()
