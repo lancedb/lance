@@ -262,6 +262,7 @@ impl ExecutionPlan for AddRowAddrExec {
         let row_addr_col_stats = ColumnStatistics {
             null_count: row_id_col_stats.null_count,
             distinct_count: row_id_col_stats.distinct_count,
+            sum_value: Precision::Absent,
             max_value: Precision::Absent,
             min_value: Precision::Absent,
         };
