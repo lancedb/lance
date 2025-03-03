@@ -65,7 +65,7 @@ fn bench_ngram(c: &mut Criterion) {
         b.to_async(&rt).iter(|| async {
             let stream = RecordBatchStreamAdapter::new(
                 batch.schema(),
-                stream::iter(batches.clone().into_iter().map(|b| Ok(b))),
+                stream::iter(batches.clone().into_iter().map(Ok)),
             );
             let stream = Box::pin(stream);
             let mut builder = NGramIndexBuilder::default();
