@@ -6,9 +6,10 @@ use std::{collections::BTreeMap, ops::Range, pin::Pin, sync::Arc};
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index;
 use crate::{Error, Result};
-use arrow::{array::as_struct_array, compute::concat_batches, datatypes::UInt64Type};
+use arrow::{compute::concat_batches, datatypes::UInt64Type};
 use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, StructArray, UInt64Array};
+use arrow_array::{Array, RecordBatch, StructArray, UInt64Array};
+use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -283,9 +284,13 @@ async fn do_take_rows(
         // Remove the rowaddr column.
         let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
         let one_batch = one_batch.project(&keep_indices)?;
+
+        // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
+        // so we need to handle it manually here.
+        // TODO: remove this once the bug is fixed.
         let struct_arr: StructArray = one_batch.into();
-        let reordered = arrow_select::take::take(&struct_arr, &remapping_index, None)?;
-        Ok(as_struct_array(&reordered).into())
+        let reordered = take_struct_array(&struct_arr, &remapping_index)?;
+        Ok(reordered.as_struct().into())
     }?;
 
     let batch = projection.project_batch(batch).await?;
@@ -551,6 +556,49 @@ impl TakeBuilder {
         }
         Ok(self.row_addrs.as_ref().unwrap())
     }
+}
+
+fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Arc<dyn Array>> {
+    let nulls = array.nulls().map(|nulls| {
+        let is_valid = indices.iter().map(|index| {
+            if let Some(index) = index {
+                nulls.is_valid(index.to_usize().unwrap())
+            } else {
+                false
+            }
+        });
+        NullBuffer::new(BooleanBuffer::new(
+            Buffer::from_iter(is_valid),
+            0,
+            indices.len(),
+        ))
+    });
+
+    if array.fields().is_empty() {
+        return Ok(Arc::new(StructArray::new_empty_fields(
+            indices.len(),
+            nulls,
+        )));
+    }
+
+    let arrays = array
+        .columns()
+        .iter()
+        .map(|array| {
+            let array = match array.data_type() {
+                arrow::datatypes::DataType::Struct(_) => {
+                    take_struct_array(array.as_struct(), indices)?
+                }
+                _ => arrow_select::take::take(array, indices, None)?,
+            };
+            Ok(array)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(StructArray::new(
+        array.fields().clone(),
+        arrays,
+        nulls,
+    )))
 }
 
 #[cfg(test)]
