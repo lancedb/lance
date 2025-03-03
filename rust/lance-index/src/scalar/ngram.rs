@@ -13,7 +13,6 @@ use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::Result;
 use lance_core::{utils::mask::RowIdTreeMap, Error};
 use moka::future::Cache;
