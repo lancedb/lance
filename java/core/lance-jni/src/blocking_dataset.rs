@@ -861,6 +861,23 @@ fn inner_take(
     Ok(**byte_array)
 }
 
+#[no_mangle]
+pub extern "system" fn Java_com_lancedb_lance_Dataset_nativeDelete(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+    predicate: JString,
+) {
+    ok_or_throw_without_return!(env, inner_delete(&mut env, java_dataset, predicate))
+}
+
+fn inner_delete(env: &mut JNIEnv, java_dataset: JObject, predicate: JString) -> Result<()> {
+    let predicate_str = predicate.extract(env)?;
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.delete(&predicate_str))?;
+    Ok(())
+}
+
 //////////////////////////////
 // Schema evolution Methods //
 //////////////////////////////

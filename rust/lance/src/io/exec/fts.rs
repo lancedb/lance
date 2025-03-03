@@ -10,7 +10,7 @@ use datafusion::common::Statistics;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::stream::{self};
@@ -24,7 +24,9 @@ use tracing::instrument;
 use crate::index::prefilter::DatasetPreFilter;
 use crate::{index::DatasetIndexInternalExt, Dataset};
 
-use super::utils::{FilteredRowIdsToPrefilter, SelectionVectorToPrefilter};
+use super::utils::{
+    FilteredRowIdsToPrefilter, InstrumentedRecordBatchStreamAdapter, SelectionVectorToPrefilter,
+};
 use super::PreFilterSource;
 
 /// An execution node that performs full text search
@@ -41,6 +43,8 @@ pub struct FtsExec {
     /// Prefiltering input
     prefilter_source: PreFilterSource,
     properties: PlanProperties,
+
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for FtsExec {
@@ -72,6 +76,7 @@ impl FtsExec {
             query,
             prefilter_source,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -108,6 +113,7 @@ impl ExecutionPlan for FtsExec {
                 query: self.query.clone(),
                 prefilter_source: PreFilterSource::None,
                 properties: self.properties.clone(),
+                metrics: ExecutionPlanMetricsSet::new(),
             },
             1 => {
                 let src = children.pop().unwrap();
@@ -130,6 +136,7 @@ impl ExecutionPlan for FtsExec {
                     query: self.query.clone(),
                     prefilter_source,
                     properties: self.properties.clone(),
+                    metrics: ExecutionPlanMetricsSet::new(),
                 }
             }
             _ => {
@@ -150,6 +157,7 @@ impl ExecutionPlan for FtsExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let prefilter_source = self.prefilter_source.clone();
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
         let indices = self.indices.clone();
         let stream = stream::iter(indices)
@@ -208,14 +216,19 @@ impl ExecutionPlan for FtsExec {
             })
             .buffered(self.indices.len());
         let schema = self.schema();
-        Ok(
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
-                as SendableRecordBatchStream,
-        )
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            schema,
+            stream.boxed(),
+            baseline_metrics,
+        )) as SendableRecordBatchStream)
     }
 
     fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
         Ok(Statistics::new_unknown(&FTS_SCHEMA))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {
@@ -235,6 +248,7 @@ pub struct FlatFtsExec {
     column_inputs: Vec<(String, Vec<Index>, Arc<dyn ExecutionPlan>)>,
     query: FullTextSearchQuery,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for FlatFtsExec {
@@ -264,6 +278,7 @@ impl FlatFtsExec {
             column_inputs,
             query,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -309,6 +324,7 @@ impl ExecutionPlan for FlatFtsExec {
             column_inputs,
             query: self.query.clone(),
             properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
         }))
     }
 
@@ -321,6 +337,7 @@ impl ExecutionPlan for FlatFtsExec {
         let query = self.query.clone();
         let ds = self.dataset.clone();
         let column_inputs = self.column_inputs.clone();
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
 
         let stream = stream::iter(column_inputs)
             .map(move |(column, indices, input)| {
@@ -353,14 +370,19 @@ impl ExecutionPlan for FlatFtsExec {
             .buffered(self.column_inputs.len())
             .try_flatten();
         let schema = self.schema();
-        Ok(
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream.boxed()))
-                as SendableRecordBatchStream,
-        )
+        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
+            schema,
+            stream.boxed(),
+            baseline_metrics,
+        )) as SendableRecordBatchStream)
     }
 
     fn statistics(&self) -> DataFusionResult<datafusion::physical_plan::Statistics> {
         Ok(Statistics::new_unknown(&FTS_SCHEMA))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {

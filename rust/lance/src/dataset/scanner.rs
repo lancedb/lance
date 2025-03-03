@@ -13,10 +13,12 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::SchemaExt;
+use datafusion::execution::TaskContext;
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
@@ -2354,6 +2356,26 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
+    }
+
+    #[instrument(level = "info", skip(self))]
+    pub async fn analyze_plan(&self) -> Result<String> {
+        let plan = self.create_plan().await?;
+        let schema = plan.schema();
+        let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = analyze.execute(0, ctx).map_err(|err| {
+            Error::io(
+                format!("Failed to execute analyze plan: {}", err),
+                location!(),
+            )
+        })?;
+
+        // fully execute the plan
+        while (stream.next().await).is_some() {}
+
+        let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
+        Ok(format!("{}", display.indent(true)))
     }
 
     #[instrument(level = "info", skip(self))]

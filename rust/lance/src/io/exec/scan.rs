@@ -12,6 +12,7 @@ use arrow_schema::{Schema as ArrowSchema, SchemaRef};
 use datafusion::common::stats::Precision;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
@@ -68,6 +69,8 @@ pub struct LanceStream {
     projection: Arc<Schema>,
 
     config: LanceScanConfig,
+
+    baseline_metrics: BaselineMetrics,
 }
 
 impl LanceStream {
@@ -95,6 +98,7 @@ impl LanceStream {
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        baseline_metrics: BaselineMetrics,
     ) -> Result<Self> {
         let is_v2_scan = fragments
             .iter()
@@ -102,9 +106,16 @@ impl LanceStream {
             .next()
             .unwrap_or(false);
         if is_v2_scan {
-            Self::try_new_v2(dataset, fragments, offsets, projection, config)
+            Self::try_new_v2(
+                dataset,
+                fragments,
+                offsets,
+                projection,
+                config,
+                baseline_metrics,
+            )
         } else {
-            Self::try_new_v1(dataset, fragments, projection, config)
+            Self::try_new_v1(dataset, fragments, projection, config, baseline_metrics)
         }
     }
 
@@ -115,7 +126,9 @@ impl LanceStream {
         offsets: Option<Range<u64>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        baseline_metrics: BaselineMetrics,
     ) -> Result<Self> {
+        let timer = baseline_metrics.elapsed_compute().timer();
         let project_schema = projection.clone();
         let io_parallelism = dataset.object_store.io_parallelism();
         // First, use the value specified by the user in the call
@@ -255,10 +268,12 @@ impl LanceStream {
             .stream_in_current_span()
             .boxed();
 
+        timer.done();
         Ok(Self {
             inner_stream: batches,
             projection,
             config,
+            baseline_metrics,
         })
     }
 
@@ -268,7 +283,9 @@ impl LanceStream {
         fragments: Arc<Vec<Fragment>>,
         projection: Arc<Schema>,
         config: LanceScanConfig,
+        baseline_metrics: BaselineMetrics,
     ) -> Result<Self> {
+        let timer = baseline_metrics.elapsed_compute().timer();
         let project_schema = projection.clone();
         let fragment_readahead = config
             .fragment_readahead
@@ -348,10 +365,12 @@ impl LanceStream {
             .map(|batch| batch.map_err(DataFusionError::from))
             .boxed();
 
+        timer.done();
         Ok(Self {
             inner_stream,
             projection,
             config,
+            baseline_metrics,
         })
     }
 }
@@ -383,7 +402,11 @@ impl Stream for LanceStream {
     type Item = std::result::Result<RecordBatch, datafusion::error::DataFusionError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::into_inner(self).inner_stream.poll_next_unpin(cx)
+        let this = self.get_mut();
+        let timer = this.baseline_metrics.elapsed_compute().timer();
+        let poll = Pin::new(&mut this.inner_stream).poll_next(cx);
+        timer.done();
+        this.baseline_metrics.record_poll(poll)
     }
 }
 
@@ -426,6 +449,7 @@ pub struct LanceScanExec {
     output_schema: Arc<ArrowSchema>,
     properties: PlanProperties,
     config: LanceScanConfig,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DisplayAs for LanceScanExec {
@@ -488,6 +512,7 @@ impl LanceScanExec {
             output_schema,
             properties,
             config,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -525,16 +550,22 @@ impl ExecutionPlan for LanceScanExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         Ok(Box::pin(LanceStream::try_new(
             self.dataset.clone(),
             self.fragments.clone(),
             self.range.clone(),
             self.projection.clone(),
             self.config.clone(),
+            baseline_metrics,
         )?))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn statistics(&self) -> datafusion::error::Result<Statistics> {

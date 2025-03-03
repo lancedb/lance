@@ -959,6 +959,11 @@ impl CoreFieldDecoderStrategy {
                 } else {
                     // use default struct encoding
                     Self::check_simple_struct(column_info, &field.name).unwrap();
+                    let num_rows = column_info
+                        .page_infos
+                        .iter()
+                        .map(|page| page.num_rows)
+                        .sum();
                     let mut child_schedulers = Vec::with_capacity(field.children.len());
                     for field in &field.children {
                         column_infos.next_top_level();
@@ -971,6 +976,7 @@ impl CoreFieldDecoderStrategy {
                     Ok(Box::new(SimpleStructScheduler::new(
                         child_schedulers,
                         fields,
+                        num_rows,
                     )))
                 }
             }

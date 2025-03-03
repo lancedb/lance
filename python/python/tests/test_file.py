@@ -359,6 +359,17 @@ def test_dictionary(tmp_path):
         assert round_tripped.type == dict_arr.type
 
 
+def test_empty_structs(tmp_path):
+    schema = pa.schema([pa.field("empties", pa.struct([]))])
+    table = pa.table({"empties": [{}] * 3}, schema=schema)
+    path = tmp_path / "foo.lance"
+    with LanceFileWriter(str(path)) as writer:
+        writer.write_batch(table)
+    reader = LanceFileReader(str(path))
+    round_tripped = reader.read_all().to_table()
+    assert round_tripped == table
+
+
 def test_write_read_global_buffer(tmp_path):
     table = pa.table({"a": [1, 2, 3]})
     path = tmp_path / "foo.lance"
