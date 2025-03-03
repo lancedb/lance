@@ -160,7 +160,7 @@ pub(super) async fn add_columns_to_fragments(
 
     // Optimize the transforms
     let mut optimizer = ChainedNewColumnTransformOptimizer::new(vec![]);
-    if has_legacy_files {
+    if !has_legacy_files {
         optimizer.add_optimizer(Box::new(SqlToAllNullsOptimizer::new()));
     }
     let transforms = optimizer.optimize(dataset, transforms)?;
@@ -296,7 +296,7 @@ pub(super) async fn add_columns_to_fragments(
 }
 
 fn has_legacy_files(fragments: &[FileFragment]) -> bool {
-    let has_legacy_files = fragments
+    fragments
         .iter()
         .map(|f| &f.metadata)
         .flat_map(|fragment_meta| fragment_meta.files.iter())
@@ -308,9 +308,7 @@ fn has_legacy_files(fragments: &[FileFragment]) -> bool {
                 ),
                 Ok(LanceFileVersion::Legacy)
             )
-        });
-
-    !has_legacy_files
+        })
 }
 
 pub(super) async fn add_columns(
@@ -1769,8 +1767,114 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_new_column_sql_to_all_nulls_transform_optimizer() {
-        // TODO: write a test to ensure the optimizer for all null sql gets used
+    #[tokio::test]
+    async fn test_new_column_sql_to_all_nulls_transform_optimizer() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter(0..100))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+
+        let manifest_before = dataset.manifest.clone();
+
+        // Add all null column
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "b".to_string(),
+                    "CAST(NULL AS int)".to_string(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let manifest_after = dataset.manifest.clone();
+
+        // Check that this is a metadata-only operation (the fragments don't change)
+        assert_eq!(&manifest_before.fragments, &manifest_after.fragments);
+
+        // check that the new field was added to the schema
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]);
+        assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
+    }
+
+    #[tokio::test]
+    async fn test_new_column_sql_to_all_nulls_transform_optimizer_legacy() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            DataType::Int32,
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter(0..100))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let test_dir = tempfile::tempdir().unwrap();
+        let test_uri = test_dir.path().to_str().unwrap();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 50,
+                max_rows_per_group: 25,
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.validate().await.unwrap();
+
+        // Add all null column ...
+        // This is basically a smoke test to ensure we don't try to use the all-nulls
+        // transform optimizer where it's not supported, and then blow up when we try
+        // to apply the transform
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(
+                    "b".to_string(),
+                    "CAST(NULL AS int)".to_string(),
+                )]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // check that the new field was added to the schema
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]);
+        assert_eq!(ArrowSchema::from(dataset.schema()), expected_schema);
     }
 }
