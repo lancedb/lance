@@ -80,14 +80,7 @@ if TYPE_CHECKING:
         Iterable[float],
     ]
 
-IndexType = Union[
-    Literal["BTREE", "BITMAP", "LABEL_LIST", "INVERTED", "FTS", "NGRAM"],
-    Literal[],
-    Literal[],
-    Literal[],
-    Literal[],
-    Literal[]
-]
+IndexType = Literal["BTREE", "BITMAP", "LABEL_LIST", "INVERTED", "FTS", "NGRAM"]
 
 SearchType = Literal["DfsQueryThenFetch", "QueryThenFetch"]
 
