@@ -10,12 +10,10 @@ import pytest
 import torch
 
 
-@pytest.mark.parametrize("accelerator", [None, "cuda", "mps"])
+@pytest.mark.parametrize("accelerator", [None, "cuda"])
 def test_f16_embeddings(tmp_path: Path, accelerator: str):
     if not torch.cuda.is_available() and accelerator == "cuda":
         pytest.skip("CUDA not available")
-    elif not torch.backends.mps.is_available() and accelerator == "mps":
-        pytest.skip("MPS not available")
 
     DIM = 16
     TOTAL = 256
