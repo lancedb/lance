@@ -468,14 +468,10 @@ impl NGramIndexBuilder {
         Self::validate_schema(schema.as_ref())?;
 
         let num_shards = *LANCE_FTS_NUM_SHARDS;
-        let buffer_size = get_num_compute_intensive_cpus()
-            .saturating_sub(num_shards)
-            .max(1)
-            .min(num_shards);
         let mut senders = Vec::with_capacity(num_shards);
         let mut builders = Vec::with_capacity(num_shards);
         for _ in 0..*LANCE_FTS_NUM_SHARDS {
-            let (send, mut recv) = tokio::sync::mpsc::channel(buffer_size);
+            let (send, mut recv) = tokio::sync::mpsc::channel(2);
             senders.push(send);
 
             let mut builder = Self::new();
