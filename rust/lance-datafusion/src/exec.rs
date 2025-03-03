@@ -8,19 +8,22 @@ use std::sync::{Arc, Mutex};
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use datafusion::{
-    catalog::streaming::StreamingTable, dataframe::DataFrame, execution::{
+    catalog::streaming::StreamingTable,
+    dataframe::DataFrame,
+    execution::{
         context::{SessionConfig, SessionContext},
         disk_manager::DiskManagerConfig,
         memory_pool::FairSpillPool,
         runtime_env::RuntimeEnvBuilder,
         TaskContext,
-    }, physical_plan::{
+    },
+    physical_plan::{
         display::DisplayableExecutionPlan,
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
         streaming::PartitionStream,
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    }
+    },
 };
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
