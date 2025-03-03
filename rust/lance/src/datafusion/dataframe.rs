@@ -9,9 +9,9 @@ use std::{
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    catalog::Session,
+    catalog::{streaming::StreamingTable, Session},
     dataframe::DataFrame,
-    datasource::{streaming::StreamingTable, TableProvider},
+    datasource::TableProvider,
     error::DataFusionError,
     execution::{context::SessionContext, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
