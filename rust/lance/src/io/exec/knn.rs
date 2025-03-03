@@ -26,7 +26,6 @@ use datafusion::{
     physical_plan::metrics::MetricsSet,
 };
 use datafusion_physical_expr::EquivalenceProperties;
-use futures::stream::repeat_with;
 use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::{utils::tokio::get_num_compute_intensive_cpus, ROW_ID_FIELD};
@@ -616,6 +615,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                         .unwrap()
                         .clone();
 
+                    let mut query = query.clone();
                     async move {
                         let prefilter_loader = match &prefilter_source {
                             PreFilterSource::FilteredRowIds(src_node) => {
@@ -636,39 +636,24 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             prefilter_loader,
                         ));
 
-                        let raw_index = ds.open_vector_index(&column, &index_uuid).await?;
+                        let index = ds.open_vector_index(&column, &index_uuid).await?;
 
-                        Ok::<_, DataFusionError>(
-                            stream::iter(part_ids)
-                                .zip(repeat_with(move || (raw_index.clone(), pre_filter.clone())))
-                                .map(Ok::<_, DataFusionError>),
-                        )
-                    }
-                })
-                .try_flatten()
-                .map(move |result| {
-                    let query = query.clone();
-                    async move {
-                        let (part_id, (index, pre_filter)) = result?;
-
-                        let mut query = query.clone();
                         if index.metric_type() == DistanceType::Cosine {
                             let key = normalize_arrow(&query.key)?;
                             query.key = key;
                         };
-
                         index
-                            .search_in_partition(part_id as usize, &query, pre_filter)
+                            .search_in_partitions(part_ids, &query, pre_filter)
                             .map_err(|e| {
                                 DataFusionError::Execution(format!(
                                     "Failed to calculate KNN: {}",
                                     e
                                 ))
-                            })
-                            .await
+                            }).await
                     }
                 })
-                .buffered(get_num_compute_intensive_cpus())
+                .map_ok(|vec_of_batches| futures::stream::iter(vec_of_batches.into_iter().map(Ok)))
+                .try_flatten()
                 .boxed(),
             baseline_metrics,
         )))

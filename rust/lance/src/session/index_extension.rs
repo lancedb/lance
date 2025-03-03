@@ -141,6 +141,15 @@ mod test {
             unimplemented!()
         }
 
+        async fn search_in_partitions(
+            &self,
+            _: Vec<u32>,
+            _: &Query,
+            _: Arc<dyn PreFilter>,
+        ) -> Result<Vec<RecordBatch>> {
+            unimplemented!()
+        }
+
         fn is_loadable(&self) -> bool {
             true
         }

@@ -29,7 +29,7 @@ use futures::{
 use io::write_hnsw_quantization_index_partitions;
 use lance_arrow::*;
 use lance_core::{
-    traits::DatasetTakeRows, utils::tokio::get_num_compute_intensive_cpus, Error, Result,
+    traits::DatasetTakeRows, Error, Result,
     ROW_ID_FIELD,
 };
 use lance_file::{
@@ -50,10 +50,11 @@ use lance_index::{
             builder::load_precomputed_partitions, shuffler::shuffle_dataset,
             storage::IVF_PARTITION_KEY, IvfBuildParams,
         },
+        parallel_search_in_partitions,
         pq::{PQBuildParams, ProductQuantizer},
         quantizer::{Quantization, QuantizationMetadata, Quantizer},
         sq::ScalarQuantizer,
-        Query, VectorIndex, DIST_COL,
+        PartitionSearcher, Query, VectorIndex, DIST_COL,
     },
     Index, IndexMetadata, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_METADATA_SCHEMA_KEY,
 };
@@ -158,13 +159,21 @@ impl IVFIndex {
         })
     }
 
-    /// Load one partition of the IVF sub-index.
+    /// preprocess the query vector given the partition id.
     ///
     /// Internal API with no stability guarantees.
-    ///
-    /// Parameters
-    /// ----------
-    ///  - partition_id: partition ID.
+    pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
+        if self.sub_index.use_residual() {
+            let partition_centroids = self.ivf.centroids.as_ref().unwrap().value(partition_id);
+            let residual_key = sub(&query.key, &partition_centroids)?;
+            let mut part_query = query.clone();
+            part_query.key = residual_key;
+            Ok(part_query)
+        } else {
+            Ok(query.clone())
+        }
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub async fn load_partition(
         &self,
@@ -215,21 +224,6 @@ impl IVFIndex {
             }
         };
         Ok(part_index)
-    }
-
-    /// preprocess the query vector given the partition id.
-    ///
-    /// Internal API with no stability guarantees.
-    pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
-        if self.sub_index.use_residual() {
-            let partition_centroids = self.ivf.centroids.as_ref().unwrap().value(partition_id);
-            let residual_key = sub(&query.key, &partition_centroids)?;
-            let mut part_query = query.clone();
-            part_query.key = residual_key;
-            Ok(part_query)
-        } else {
-            Ok(query.clone())
-        }
     }
 }
 
@@ -822,6 +816,34 @@ impl Index for IVFIndex {
 }
 
 #[async_trait]
+impl PartitionSearcher for IVFIndex {
+    type PartitionRepresentation = Arc<dyn VectorIndex>;
+
+    async fn search_in_loaded_partition(
+        &self,
+        partition_id: usize,
+        partition: Self::PartitionRepresentation,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch> {
+        let query = self.preprocess_query(partition_id, query)?;
+        let batch = partition.search(&query, pre_filter).await?;
+        Ok(batch)
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.reader.io_parallelism()
+    }
+
+    async fn load_partition(
+        &self,
+        partition_id: usize,
+    ) -> Result<Self::PartitionRepresentation> {
+        self.load_partition(partition_id, true).await
+    }
+}
+
+#[async_trait]
 impl VectorIndex for IVFIndex {
     #[instrument(level = "debug", skip_all, name = "IVFIndex::search")]
     async fn search(&self, query: &Query, pre_filter: Arc<dyn PreFilter>) -> Result<RecordBatch> {
@@ -834,10 +856,8 @@ impl VectorIndex for IVFIndex {
         let partition_ids = self.find_partitions(&query)?;
         assert!(partition_ids.len() <= query.nprobes);
         let part_ids = partition_ids.values().to_vec();
-        let batches = stream::iter(part_ids)
-            .map(|part_id| self.search_in_partition(part_id as usize, &query, pre_filter.clone()))
-            .buffer_unordered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
+        let batches = self
+            .search_in_partitions(part_ids, &query, pre_filter)
             .await?;
         let batch = concat_batches(&batches[0].schema(), &batches)?;
 
@@ -881,10 +901,17 @@ impl VectorIndex for IVFIndex {
         pre_filter: Arc<dyn PreFilter>,
     ) -> Result<RecordBatch> {
         let part_index = self.load_partition(partition_id, true).await?;
+        self.search_in_loaded_partition(partition_id, part_index, query, pre_filter)
+            .await
+    }
 
-        let query = self.preprocess_query(partition_id, query)?;
-        let batch = part_index.search(&query, pre_filter).await?;
-        Ok(batch)
+    async fn search_in_partitions(
+        &self,
+        partition_ids: Vec<u32>,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Vec<RecordBatch>> {
+        parallel_search_in_partitions(self, partition_ids, query, pre_filter).await
     }
 
     fn is_loadable(&self) -> bool {

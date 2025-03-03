@@ -10,8 +10,14 @@ use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::Field;
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
+use futures::{
+    stream::{self, StreamExt},
+    TryStreamExt,
+};
 use ivf::storage::IvfModel;
-use lance_core::{Result, ROW_ID_FIELD};
+use lance_core::{
+    utils::tokio::get_num_compute_intensive_cpus,
+    Error, Result, ROW_ID_FIELD};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -140,6 +146,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     fn find_partitions(&self, query: &Query) -> Result<UInt32Array>;
 
+    async fn search_in_partitions(
+        &self,
+        partition_ids: Vec<u32>,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<Vec<RecordBatch>>;
+
     async fn search_in_partition(
         &self,
         partition_id: usize,
@@ -227,4 +240,51 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
+}
+
+#[async_trait]
+pub trait PartitionSearcher: Send + Sync {
+    type PartitionRepresentation: Send + Sync + std::fmt::Debug;
+
+    async fn search_in_loaded_partition(
+        &self,
+        partition_id: usize,
+        partition: Self::PartitionRepresentation,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+    ) -> Result<RecordBatch>;
+
+    async fn load_partition(&self, partition_id: usize) -> Result<Self::PartitionRepresentation>;
+
+    fn io_parallelism(&self) -> usize;
+}
+
+pub async fn parallel_search_in_partitions<T: Send + Sync + std::fmt::Debug>(
+    helper: &dyn PartitionSearcher<PartitionRepresentation = T>,
+    partition_ids: Vec<u32>,
+    query: &Query,
+    pre_filter: Arc<dyn PreFilter>,
+) -> Result<Vec<RecordBatch>> {
+        stream::iter(partition_ids)
+            .map(|part_id| {
+                let part_id = part_id as usize;
+                async move {
+                    let partition = helper.load_partition(part_id).await?;
+                    Ok::<(usize, T), Error>((part_id, partition))
+                }
+            })
+            .buffer_unordered(helper.io_parallelism())
+            .map(|result| {
+                let pre_filter = pre_filter.clone();
+                async move {
+                    let (part_id, partition) = result?;
+                    let ret = helper
+                        .search_in_loaded_partition(part_id, partition, &query, pre_filter)
+                        .await;
+                     ret
+                }
+            })
+            .buffer_unordered(get_num_compute_intensive_cpus())
+            .try_collect::<Vec<RecordBatch>>()
+            .await
 }
