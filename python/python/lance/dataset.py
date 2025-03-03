@@ -81,11 +81,12 @@ if TYPE_CHECKING:
     ]
 
 IndexType = Union[
-    Literal["BTREE"],
-    Literal["BITMAP"],
-    Literal["LABEL_LIST"],
-    Literal["INVERTED"],
-    Literal["FTS"],
+    Literal["BTREE", "BITMAP", "LABEL_LIST", "INVERTED", "FTS", "NGRAM"],
+    Literal[],
+    Literal[],
+    Literal[],
+    Literal[],
+    Literal[]
 ]
 
 SearchType = Literal["DfsQueryThenFetch", "QueryThenFetch"]
@@ -813,7 +814,6 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        **kwargs,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -825,8 +825,6 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
-        **kwargs : dict, optional
-            See :py:method::scanner method for full parameter description.
 
         Returns
         -------
@@ -1589,6 +1587,10 @@ class LanceDataset(pa.dataset.Dataset):
           contains lists of tags (e.g. ``["tag1", "tag2", "tag3"]``) can be indexed
           with a ``LABEL_LIST`` index.  This index can only speedup queries with
           ``array_has_any`` or ``array_has_all`` filters.
+        * ``NGRAM``. A special index that is used to index string columns.  This index
+          creates a bitmap for each ngram in the string.  By default we use trigrams.
+          This index can currently speed up queries using the ``contains`` function
+          in filters.
         * ``FTS/INVERTED``. It is used to index document columns. This index
           can conduct full-text searches. For example, a column that contains any word
           of query string "hello world". The results will be ranked by BM25.
@@ -1606,7 +1608,7 @@ class LanceDataset(pa.dataset.Dataset):
             or string column.
         index_type : str
             The type of the index.  One of ``"BTREE"``, ``"BITMAP"``,
-            ``"LABEL_LIST"``, "FTS" or ``"INVERTED"``.
+            ``"LABEL_LIST"``, ``"NGRAM"``, ``"FTS"`` or ``"INVERTED"``.
         name : str, optional
             The index name. If not provided, it will be generated from the
             column name.
@@ -1703,10 +1705,10 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "LABEL_LIST", "INVERTED"]:
+        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
             raise NotImplementedError(
                 (
-                    'Only "BTREE", "LABEL_LIST", "INVERTED", '
+                    'Only "BTREE", "LABEL_LIST", "INVERTED", "NGRAM", '
                     'or "BITMAP" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
@@ -1728,6 +1730,9 @@ class LanceDataset(pa.dataset.Dataset):
         elif index_type == "LABEL_LIST":
             if not pa.types.is_list(field.type):
                 raise TypeError(f"LABEL_LIST index column {column} must be a list")
+        elif index_type == "NGRAM":
+            if not pa.types.is_string(field.type):
+                raise TypeError(f"NGRAM index column {column} must be a string")
         elif index_type in ["INVERTED", "FTS"]:
             if not pa.types.is_string(field.type) and not pa.types.is_large_string(
                 field.type
@@ -3551,6 +3556,21 @@ class LanceScanner(pa.dataset.Scanner):
         """
 
         return self._scanner.explain_plan(verbose=verbose)
+
+    def analyze_plan(self) -> str:
+        """Execute the plan for this scanner and display with runtime metrics.
+
+        Parameters
+        ----------
+        verbose : bool, default False
+            Use a verbose output format.
+
+        Returns
+        -------
+        plan : str
+        """
+
+        return self._scanner.analyze_plan()
 
 
 class DatasetOptimizer:

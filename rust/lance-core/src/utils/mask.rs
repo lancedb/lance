@@ -10,7 +10,7 @@ use arrow_array::{Array, BinaryArray, GenericBinaryArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use deepsize::DeepSizeOf;
-use roaring::{MultiOps, RoaringBitmap};
+use roaring::{MultiOps, RoaringBitmap, RoaringTreemap};
 
 use crate::Result;
 
@@ -517,7 +517,8 @@ impl RowIdTreeMap {
     /// for each entry:
     ///   * u32: fragment_id
     ///   * u32: bitmap size
-    ///   * [u8]: bitmap
+    ///   * \[u8\]: bitmap
+    ///
     /// If bitmap size is zero then the entire fragment is selected.
     pub fn serialize_into<W: Write>(&self, mut writer: W) -> Result<()> {
         writer.write_u32::<byteorder::LittleEndian>(self.inner.len() as u32)?;
@@ -703,6 +704,16 @@ impl FromIterator<u64> for RowIdTreeMap {
 impl<'a> FromIterator<&'a u64> for RowIdTreeMap {
     fn from_iter<T: IntoIterator<Item = &'a u64>>(iter: T) -> Self {
         Self::from_iter(iter.into_iter().copied())
+    }
+}
+
+impl From<RoaringTreemap> for RowIdTreeMap {
+    fn from(roaring: RoaringTreemap) -> Self {
+        let mut inner = BTreeMap::new();
+        for (fragment, set) in roaring.bitmaps() {
+            inner.insert(fragment, RowIdSelection::Partial(set.clone()));
+        }
+        Self { inner }
     }
 }
 

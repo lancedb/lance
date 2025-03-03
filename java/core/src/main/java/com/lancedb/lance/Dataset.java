@@ -392,6 +392,20 @@ public class Dataset implements Closeable {
   private native byte[] nativeTake(List<Long> indices, List<String> columns);
 
   /**
+   * Delete rows of data by predicate.
+   *
+   * @param predicate the predicate to delete
+   */
+  public void delete(String predicate) {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeDelete(predicate);
+    }
+  }
+
+  private native void nativeDelete(String predicate);
+
+  /**
    * Gets the URI of the dataset.
    *
    * @return the URI of the dataset

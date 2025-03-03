@@ -22,7 +22,7 @@ use snafu::location;
 use crate::{Index, IndexType};
 
 use super::{btree::BTreeSubIndex, IndexStore, ScalarIndex};
-use super::{AnyQuery, SargableQuery};
+use super::{AnyQuery, SargableQuery, SearchResult};
 
 /// A flat index is just a batch of value/row-id pairs
 ///
@@ -195,7 +195,7 @@ impl Index for FlatIndex {
 
 #[async_trait]
 impl ScalarIndex for FlatIndex {
-    async fn search(&self, query: &dyn AnyQuery) -> Result<RowIdTreeMap> {
+    async fn search(&self, query: &dyn AnyQuery) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
@@ -288,7 +288,13 @@ impl ScalarIndex for FlatIndex {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .expect("Result of arrow_select::filter::filter did not match input type");
-        Ok(RowIdTreeMap::from_iter(matching_ids.values()))
+        Ok(SearchResult::Exact(RowIdTreeMap::from_iter(
+            matching_ids.values(),
+        )))
+    }
+
+    fn can_answer_exact(&self, _: &dyn AnyQuery) -> bool {
+        true
     }
 
     // Note that there is no write/train method for flat index at the moment and so it isn't
@@ -356,8 +362,11 @@ mod tests {
     async fn check_index(query: &SargableQuery, expected: &[u64]) {
         let index = example_index();
         let actual = index.search(query).await.unwrap();
+        let SearchResult::Exact(actual_row_ids) = actual else {
+            panic! {"Expected exact search result"}
+        };
         let expected = RowIdTreeMap::from_iter(expected);
-        assert_eq!(actual, expected);
+        assert_eq!(actual_row_ids, expected);
     }
 
     #[tokio::test]

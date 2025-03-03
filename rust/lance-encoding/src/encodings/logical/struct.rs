@@ -8,7 +8,7 @@ use std::{
 };
 
 use arrow_array::{cast::AsArray, Array, ArrayRef, StructArray};
-use arrow_schema::{DataType, Fields};
+use arrow_schema::{DataType, Field, Fields};
 use futures::{
     future::BoxFuture,
     stream::{FuturesOrdered, FuturesUnordered},
@@ -61,6 +61,89 @@ impl Ord for SchedulingJobWithStatus<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Note this is reversed to make it min-heap
         other.rows_scheduled.cmp(&self.rows_scheduled)
+    }
+}
+
+#[derive(Debug)]
+struct EmptyStructDecodeTask {
+    num_rows: u64,
+}
+
+impl DecodeArrayTask for EmptyStructDecodeTask {
+    fn decode(self: Box<Self>) -> Result<ArrayRef> {
+        Ok(Arc::new(StructArray::new_empty_fields(
+            self.num_rows as usize,
+            None,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct EmptyStructDecoder {
+    num_rows: u64,
+    rows_drained: u64,
+    data_type: DataType,
+}
+
+impl EmptyStructDecoder {
+    fn new(num_rows: u64) -> Self {
+        Self {
+            num_rows,
+            rows_drained: 0,
+            data_type: DataType::Struct(Fields::from(Vec::<Field>::default())),
+        }
+    }
+}
+
+impl LogicalPageDecoder for EmptyStructDecoder {
+    fn wait_for_loaded(&mut self, _loaded_need: u64) -> BoxFuture<Result<()>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+    fn rows_loaded(&self) -> u64 {
+        self.num_rows
+    }
+    fn rows_unloaded(&self) -> u64 {
+        0
+    }
+    fn num_rows(&self) -> u64 {
+        self.num_rows
+    }
+    fn rows_drained(&self) -> u64 {
+        self.rows_drained
+    }
+    fn drain(&mut self, num_rows: u64) -> Result<NextDecodeTask> {
+        self.rows_drained += num_rows;
+        Ok(NextDecodeTask {
+            num_rows,
+            task: Box::new(EmptyStructDecodeTask { num_rows }),
+        })
+    }
+    fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+}
+
+#[derive(Debug)]
+struct EmptyStructSchedulerJob {
+    num_rows: u64,
+}
+
+impl SchedulingJob for EmptyStructSchedulerJob {
+    fn schedule_next(
+        &mut self,
+        context: &mut SchedulerContext,
+        _priority: &dyn PriorityRange,
+    ) -> Result<ScheduledScanLine> {
+        let empty_decoder = Box::new(EmptyStructDecoder::new(self.num_rows));
+        let struct_decoder = context.locate_decoder(empty_decoder);
+        Ok(ScheduledScanLine {
+            decoders: vec![MessageType::DecoderReady(struct_decoder)],
+            rows_scheduled: self.num_rows,
+        })
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.num_rows
     }
 }
 
@@ -175,9 +258,15 @@ pub struct SimpleStructScheduler {
 }
 
 impl SimpleStructScheduler {
-    pub fn new(children: Vec<Arc<dyn FieldScheduler>>, child_fields: Fields) -> Self {
-        debug_assert!(!children.is_empty());
-        let num_rows = children[0].num_rows();
+    pub fn new(
+        children: Vec<Arc<dyn FieldScheduler>>,
+        child_fields: Fields,
+        num_rows: u64,
+    ) -> Self {
+        let num_rows = children
+            .first()
+            .map(|child| child.num_rows())
+            .unwrap_or(num_rows);
         debug_assert!(children.iter().all(|child| child.num_rows() == num_rows));
         Self {
             children,
@@ -193,6 +282,11 @@ impl FieldScheduler for SimpleStructScheduler {
         ranges: &[Range<u64>],
         filter: &FilterExpression,
     ) -> Result<Box<dyn SchedulingJob + 'a>> {
+        if self.children.is_empty() {
+            return Ok(Box::new(EmptyStructSchedulerJob {
+                num_rows: ranges.iter().map(|r| r.end - r.start).sum(),
+            }));
+        }
         let child_schedulers = self
             .children
             .iter()
@@ -1116,6 +1210,15 @@ mod tests {
             ),
             Field::new("outer_int", DataType::Int32, true),
         ]));
+        let field = Field::new("row", data_type, false);
+        check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_empty_struct() {
+        // It's technically legal for a struct to have 0 children, need to
+        // make sure we support that
+        let data_type = DataType::Struct(Fields::from(Vec::<Field>::default()));
         let field = Field::new("row", data_type, false);
         check_round_trip_encoding_random(field, LanceFileVersion::V2_0).await;
     }

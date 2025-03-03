@@ -1616,6 +1616,9 @@ impl Dataset {
                 // Temporary workaround until we add support for auto-detection of scalar index type
                 force_index_type: Some(ScalarIndexType::Bitmap),
             })),
+            "NGRAM" => Ok(Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::NGram),
+            })),
             "LABEL_LIST" => Ok(Box::new(ScalarIndexParams {
                 force_index_type: Some(ScalarIndexType::LabelList),
             })),
@@ -1681,6 +1684,7 @@ impl Dataset {
         match index_type {
             "BTREE" => Ok(IndexType::Scalar),
             "BITMAP" => Ok(IndexType::Bitmap),
+            "NGRAM" => Ok(IndexType::NGram),
             "LABEL_LIST" => Ok(IndexType::LabelList),
             "INVERTED" | "FTS" => Ok(IndexType::Inverted),
             "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => Ok(IndexType::Vector),

@@ -21,6 +21,7 @@ use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
     IndexInformationProvider, LabelListQueryParser, SargableQueryParser, ScalarQueryParser,
+    TextQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndex, ScalarIndexType};
@@ -245,7 +246,11 @@ impl DatasetIndexExt for Dataset {
         let index_id = Uuid::new_v4();
         let index_details: prost_types::Any = match (index_type, params.index_name()) {
             (
-                IndexType::Bitmap | IndexType::BTree | IndexType::Inverted | IndexType::LabelList,
+                IndexType::Bitmap
+                | IndexType::BTree
+                | IndexType::Inverted
+                | IndexType::NGram
+                | IndexType::LabelList,
                 LANCE_SCALAR_INDEX,
             ) => {
                 let params = ScalarIndexParams::new(index_type.try_into()?);
@@ -1017,7 +1022,15 @@ impl DatasetIndexInternalExt for Dataset {
                     if matches!(index_type, ScalarIndexType::Inverted) {
                         continue;
                     }
-                    Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
+                    match index_type {
+                        ScalarIndexType::BTree | ScalarIndexType::Bitmap => {
+                            Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>
+                        }
+                        ScalarIndexType::NGram => {
+                            Box::<TextQueryParser>::default() as Box<dyn ScalarQueryParser>
+                        }
+                        _ => continue,
+                    }
                 }
                 _ => Box::<SargableQueryParser>::default() as Box<dyn ScalarQueryParser>,
             };

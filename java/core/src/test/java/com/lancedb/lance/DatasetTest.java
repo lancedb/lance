@@ -531,4 +531,39 @@ public class DatasetTest {
       }
     }
   }
+
+  @Test
+  void testDeleteRows() {
+    String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
+    String datasetPath = tempDir.resolve(testMethodName).toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+
+      try (Dataset dataset2 = testDataset.write(1, 5)) {
+        // Initially there are 5 rows
+        assertEquals(5, dataset2.countRows());
+
+        // Delete rows where id > 2 (should delete id=3, id=4)
+        dataset2.delete("id > 2");
+
+        // Now verify we have 3 rows left (id=0, id=1, id=2)
+        assertEquals(3, dataset2.countRows());
+
+        // Verify the rows that remain
+        assertEquals(0, dataset2.countRows("id > 2"));
+        assertEquals(3, dataset2.countRows("id <= 2"));
+
+        // Delete another row
+        dataset2.delete("id = 1");
+
+        // Now verify we have 2 rows left (id=0, id=2)
+        assertEquals(2, dataset2.countRows());
+        assertEquals(1, dataset2.countRows("id = 0"));
+        assertEquals(1, dataset2.countRows("id = 2"));
+        assertEquals(0, dataset2.countRows("id = 1"));
+      }
+    }
+  }
 }

@@ -13,10 +13,12 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use datafusion::common::SchemaExt;
+use datafusion::execution::TaskContext;
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions;
@@ -1100,21 +1102,6 @@ impl Scanner {
         .boxed()
     }
 
-    /// Given a base schema and a list of desired fields figure out which fields, if any, still need loaded
-    fn calc_new_fields<S: AsRef<str>>(
-        &self,
-        base_schema: &Schema,
-        columns: &[S],
-    ) -> Result<Option<Schema>> {
-        let new_schema = self.dataset.schema().project(columns)?;
-        let new_schema = new_schema.exclude(base_schema)?;
-        if new_schema.fields.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(new_schema))
-        }
-    }
-
     // A "narrow" field is a field that is so small that we are better off reading the
     // entire column and filtering in memory rather than "take"ing the column.
     //
@@ -1156,13 +1143,26 @@ impl Scanner {
     // cheaper to read the entire column and filter in memory.
     //
     // Note: only add columns that we actually need to read
-    fn calc_eager_columns(
+    fn calc_eager_projection(
         &self,
         filter_plan: &FilterPlan,
         desired_schema: &Schema,
-    ) -> Result<Arc<Schema>> {
+    ) -> Result<Projection> {
         let filter_columns = filter_plan.refine_columns();
-        let early_schema = self
+
+        let filter_schema = self
+            .dataset
+            .empty_projection()
+            .union_columns(filter_columns, OnMissing::Error)?
+            .into_schema();
+        if filter_schema.fields.iter().any(|f| !f.is_default_storage()) {
+            return Err(Error::NotSupported {
+                source: "non-default storage columns cannot be used as filters".into(),
+                location: location!(),
+            });
+        }
+
+        Ok(self
             .dataset
             .empty_projection()
             // Start with the desired schema
@@ -1170,17 +1170,7 @@ impl Scanner {
             // Subtract columns that are expensive
             .subtract_predicate(|f| !self.is_early_field(f))
             // Add back columns that we need for filtering
-            .union_columns(filter_columns, OnMissing::Error)?
-            .into_schema_ref();
-
-        if early_schema.fields.iter().any(|f| !f.is_default_storage()) {
-            return Err(Error::NotSupported {
-                source: "non-default storage columns cannot be used as filters".into(),
-                location: location!(),
-            });
-        }
-
-        Ok(early_schema)
+            .union_schema(&filter_schema))
     }
 
     /// Create [`ExecutionPlan`] for Scan.
@@ -1363,37 +1353,42 @@ impl Scanner {
                 } else {
                     self.use_stats
                 };
-                match (&filter_plan.index_query, &mut filter_plan.refine_expr) {
-                    (Some(index_query), None) => {
-                        self.scalar_indexed_scan(
-                            self.projection_plan.physical_schema.as_ref(),
-                            index_query,
-                        )
-                        .await?
+                match (
+                    filter_plan.index_query.is_some(),
+                    filter_plan.refine_expr.is_some(),
+                ) {
+                    (true, false) => {
+                        let projection = self
+                            .dataset
+                            .empty_projection()
+                            .union_schema(&self.projection_plan.physical_schema);
+                        self.scalar_indexed_scan(projection, &filter_plan).await?
                     }
                     // TODO: support combined pushdown and scalar index scan
-                    (Some(index_query), Some(_)) => {
+                    (true, true) => {
                         // If there is a filter then just load the eager columns and
                         // "take" the other columns later.
-                        let eager_schema = self.calc_eager_columns(
+                        let eager_projection = self.calc_eager_projection(
                             &filter_plan,
                             self.projection_plan.physical_schema.as_ref(),
                         )?;
-                        self.scalar_indexed_scan(&eager_schema, index_query).await?
+                        self.scalar_indexed_scan(eager_projection, &filter_plan)
+                            .await?
                     }
-                    (None, Some(_)) if use_stats && self.batch_size.is_none() => {
+                    (false, true) if use_stats && self.batch_size.is_none() => {
                         self.pushdown_scan(false, filter_plan.refine_expr.take().unwrap())?
                     }
-                    (None, _) => {
+                    (false, _) => {
                         // The source is a full scan of the table
                         let with_row_id = filter_plan.has_refine() || self.with_row_id;
                         let eager_schema = if filter_plan.has_refine() {
                             // If there is a filter then only load the filter columns in the
                             // initial scan.  We will `take` the remaining columns later
-                            self.calc_eager_columns(
+                            self.calc_eager_projection(
                                 &filter_plan,
                                 self.projection_plan.physical_schema.as_ref(),
                             )?
+                            .into_schema_ref()
                         } else {
                             // If there is no filter we eagerly load everything
                             self.projection_plan.physical_schema.clone()
@@ -1734,12 +1729,21 @@ impl Scanner {
             if let Some(refine_expr) = filter_plan.refine_expr.as_ref() {
                 columns.extend(Planner::column_names_in_expr(refine_expr));
             }
-            let vector_scan_projection = Arc::new(self.dataset.schema().project(&columns).unwrap());
-            let mut plan = if let Some(index_query) = &filter_plan.index_query {
-                self.scalar_indexed_scan(&vector_scan_projection, index_query)
+            let vector_scan_projection = self
+                .dataset
+                .empty_projection()
+                .union_columns(&columns, OnMissing::Error)?;
+            let mut plan = if filter_plan.index_query.is_some() {
+                self.scalar_indexed_scan(vector_scan_projection, filter_plan)
                     .await?
             } else {
-                self.scan(true, false, true, None, vector_scan_projection)
+                self.scan(
+                    true,
+                    false,
+                    true,
+                    None,
+                    vector_scan_projection.into_schema_ref(),
+                )
             };
             if let Some(refine_expr) = &filter_plan.refine_expr {
                 let planner = Planner::new(plan.schema());
@@ -1864,8 +1868,8 @@ impl Scanner {
     // target fragments with those ids
     async fn scalar_indexed_scan(
         &self,
-        projection: &Schema,
-        index_expr: &ScalarIndexExpr,
+        projection: Projection,
+        filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // One or more scalar indices cover this data and there is a filter which is
         // compatible with the indices.  Use that filter to perform a take instead of
@@ -1875,6 +1879,12 @@ impl Scanner {
         } else {
             (**self.dataset.fragments()).clone()
         };
+
+        // If this unwrap fails we have a bug because we shouldn't be using this function unless we've already
+        // checked that there is an index query
+        let index_expr = filter_plan.index_query.as_ref().unwrap();
+
+        let needs_recheck = index_expr.needs_recheck();
 
         // Figure out which fragments are covered by ALL of the indices we are using
         let covered_frags = self.fragments_covered_by_index_query(index_expr).await?;
@@ -1894,15 +1904,43 @@ impl Scanner {
             Arc::new(relevant_frags),
         ));
 
-        // If there is more than just _rowid in projection
-        let needs_take = match projection.fields.len() {
-            0 => false,
-            1 => projection.fields[0].name != ROW_ID,
-            _ => true,
-        };
+        let refine_expr = filter_plan.refine_expr.as_ref();
+
+        // If all we want is the row ids then we can skip the take.  However, if there is a refine
+        // or a recheck then we still need to do a take because we need filter columns.
+        let needs_take =
+            needs_recheck || projection.has_data_fields() || filter_plan.refine_expr.is_some();
         if needs_take {
-            let take_projection = self.dataset.empty_projection().union_schema(projection);
+            let mut take_projection = projection.clone();
+            if needs_recheck {
+                // If we need to recheck then we need to also take the columns used for the filter
+                let filter_expr = index_expr.to_expr();
+                let filter_cols = Planner::column_names_in_expr(&filter_expr);
+                take_projection = take_projection.union_columns(filter_cols, OnMissing::Error)?;
+            }
+            if let Some(refine_expr) = refine_expr {
+                let refine_cols = Planner::column_names_in_expr(refine_expr);
+                take_projection = take_projection.union_columns(refine_cols, OnMissing::Error)?;
+            }
             plan = self.take(plan, take_projection, self.batch_readahead)?;
+        }
+
+        let post_take_filter = match (needs_recheck, refine_expr) {
+            (false, None) => None,
+            (true, None) => {
+                // If we need to recheck then we need to apply the filter to the results
+                Some(index_expr.to_expr())
+            }
+            (true, Some(_)) => Some(filter_plan.full_expr.as_ref().unwrap().clone()),
+            (false, Some(refine_expr)) => Some(refine_expr.clone()),
+        };
+
+        if let Some(post_take_filter) = post_take_filter {
+            let planner = Planner::new(plan.schema());
+            let optimized_filter = planner.optimize_expr(post_take_filter)?;
+            let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
+
+            plan = Arc::new(FilterExec::try_new(physical_refine_expr, plan)?);
         }
 
         if self.with_row_address {
@@ -1922,23 +1960,21 @@ impl Scanner {
             // If there were no extra columns then we still need the project
             // because Materialize -> Take puts the row id at the left and
             // Scan puts the row id at the right
-            let filter_expr = index_expr.to_expr();
-            let filter_cols = Planner::column_names_in_expr(&filter_expr);
-            let full_schema = self
-                .calc_new_fields(projection, &filter_cols)?
-                .map(|filter_only_schema| projection.merge(&filter_only_schema))
-                .transpose()?;
-            let schema = full_schema.as_ref().unwrap_or(projection);
+            let filter = filter_plan.full_expr.as_ref().unwrap();
+            let filter_cols = Planner::column_names_in_expr(filter);
+            let scan_projection = projection.union_columns(filter_cols, OnMissing::Error)?;
 
-            let planner = Planner::new(Arc::new(schema.into()));
-            let optimized_filter = planner.optimize_expr(filter_expr)?;
+            let scan_schema = scan_projection.into_schema_ref();
+            let scan_arrow_schema = Arc::new(scan_schema.as_ref().into());
+            let planner = Planner::new(scan_arrow_schema);
+            let optimized_filter = planner.optimize_expr(filter.clone())?;
             let physical_refine_expr = planner.create_physical_expr(&optimized_filter)?;
 
             let new_data_scan = self.scan_fragments(
                 true,
                 self.with_row_address,
                 false,
-                Arc::new(schema.clone()),
+                scan_schema,
                 missing_frags.into(),
                 // No pushdown of limit/offset when doing scalar indexed scan
                 None,
@@ -2244,23 +2280,18 @@ impl Scanner {
             &filter_plan.index_query,
             &filter_plan.refine_expr,
             self.prefilter,
+            filter_plan.skip_recheck,
         ) {
-            (Some(index_query), Some(refine_expr), _) => {
-                // The filter is only partially satisfied by the index.  We need
-                // to do an indexed scan and then refine the results to determine
-                // the row ids.
-                let columns_in_filter = Planner::column_names_in_expr(refine_expr);
-                let filter_schema = Arc::new(self.dataset.schema().project(&columns_in_filter)?);
-                let filter_input = self
-                    .scalar_indexed_scan(&filter_schema, index_query)
+            (Some(_), Some(_), _, _) | (Some(_), None, true, false) => {
+                // Prefilter source is covered by an index but either that index needs a recheck or there
+                // is a refine expression that needs to be applied to the results so we need to do a full
+                // filtered scan
+                let filtered_row_ids = self
+                    .scalar_indexed_scan(self.dataset.empty_projection().with_row_id(), filter_plan)
                     .await?;
-                let planner = Planner::new(filter_input.schema());
-                let physical_refine_expr = planner.create_physical_expr(refine_expr)?;
-                let filtered_row_ids =
-                    Arc::new(FilterExec::try_new(physical_refine_expr, filter_input)?);
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             } // Should be index_scan -> filter
-            (Some(index_query), None, true) => {
+            (Some(index_query), None, true, true) => {
                 // Index scan doesn't honor the fragment allowlist today.
                 // TODO: we could filter the index scan results to only include the allowed fragments.
                 self.ensure_not_fragment_scan()?;
@@ -2274,7 +2305,7 @@ impl Scanner {
                 ));
                 PreFilterSource::ScalarIndexQuery(index_query)
             }
-            (None, Some(refine_expr), true) => {
+            (None, Some(refine_expr), true, _) => {
                 // No indices match the filter.  We need to do a full scan
                 // of the filter columns to determine the valid row ids.
                 let columns_in_filter = Planner::column_names_in_expr(refine_expr);
@@ -2287,8 +2318,8 @@ impl Scanner {
                 PreFilterSource::FilteredRowIds(filtered_row_ids)
             }
             // No prefilter
-            (None, None, true) => PreFilterSource::None,
-            (_, _, false) => PreFilterSource::None,
+            (None, None, true, _) => PreFilterSource::None,
+            (_, _, false, _) => PreFilterSource::None,
         };
 
         Ok(prefilter_source)
@@ -2325,6 +2356,26 @@ impl Scanner {
             *self.offset.as_ref().unwrap_or(&0) as usize,
             self.limit.map(|l| l as usize),
         ))
+    }
+
+    #[instrument(level = "info", skip(self))]
+    pub async fn analyze_plan(&self) -> Result<String> {
+        let plan = self.create_plan().await?;
+        let schema = plan.schema();
+        let analyze = Arc::new(AnalyzeExec::new(true, true, plan, schema));
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = analyze.execute(0, ctx).map_err(|err| {
+            Error::io(
+                format!("Failed to execute analyze plan: {}", err),
+                location!(),
+            )
+        })?;
+
+        // fully execute the plan
+        while (stream.next().await).is_some() {}
+
+        let display = DisplayableExecutionPlan::with_metrics(analyze.as_ref());
+        Ok(format!("{}", display.indent(true)))
     }
 
     #[instrument(level = "info", skip(self))]
@@ -4655,6 +4706,83 @@ mod test {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_inexact_scalar_index_plans() {
+        let data = gen()
+            .col("ngram", array::rand_utf8(ByteCount::from(5), false))
+            .col("exact", array::rand_type(&DataType::UInt32))
+            .col("no_index", array::rand_type(&DataType::UInt32))
+            .into_reader_rows(RowCount::from(1000), BatchCount::from(5));
+
+        let mut dataset = Dataset::write(data, "memory://test", None).await.unwrap();
+        dataset
+            .create_index(
+                &["ngram"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["exact"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Simple in-exact filter
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("contains(ngram, 'test string')"),
+            "ProjectionExec: expr=[ngram@1 as ngram, exact@2 as exact, no_index@3 as no_index]
+  FilterExec: contains(ngram@1, test string)
+    Take: columns=\"_rowid, (ngram), (exact), (no_index)\"
+      CoalesceBatchesExec: target_batch_size=8192
+        MaterializeIndex: query=contains(ngram, Utf8(\"test string\"))",
+        )
+        .await
+        .unwrap();
+
+        // Combined with exact filter
+        //
+        // TODO: The FilterExec _should_ be just contains(ngram, 'test string')
+        assert_plan_equals(
+            &dataset,
+            |scanner| scanner.filter("contains(ngram, 'test string') and exact < 50"),
+            "ProjectionExec: expr=[ngram@1 as ngram, exact@2 as exact, no_index@3 as no_index]
+  FilterExec: contains(ngram@1, test string) AND exact@2 < 50
+    Take: columns=\"_rowid, (ngram), (exact), (no_index)\"
+      CoalesceBatchesExec: target_batch_size=8192
+        MaterializeIndex: query=AND(contains(ngram, Utf8(\"test string\")),exact < 50)",
+        )
+        .await
+        .unwrap();
+
+        // All three filters
+        //
+        // TODO: Maybe an optimizer rule to combine the filters?  Not a big deal
+        assert_plan_equals(
+            &dataset,
+            |scanner| {
+                scanner.filter("contains(ngram, 'test string') and exact < 50 AND no_index > 100")
+            },
+            "ProjectionExec: expr=[ngram@1 as ngram, exact@2 as exact, no_index@3 as no_index]
+  FilterExec: no_index@3 > 100
+    FilterExec: contains(ngram@1, test string) AND exact@2 < 50 AND no_index@3 > 100
+      Take: columns=\"_rowid, (ngram), (exact), (no_index)\"
+        CoalesceBatchesExec: target_batch_size=8192
+          MaterializeIndex: query=AND(contains(ngram, Utf8(\"test string\")),exact < 50)",
+        )
+        .await
+        .unwrap();
+    }
+
     #[rstest]
     #[tokio::test]
     async fn test_late_materialization(
@@ -5312,9 +5440,9 @@ mod test {
       Take: columns=\"_rowid, (s)\"
         CoalesceBatchesExec: target_batch_size=8192
           MaterializeIndex: query=i > 10
-      ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
-        FilterExec: i@1 > 10
-          LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
+      ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+        FilterExec: i@0 > 10
+          LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 
@@ -5372,9 +5500,9 @@ mod test {
         Take: columns=\"_rowid, (s)\"
           CoalesceBatchesExec: target_batch_size=8192
             MaterializeIndex: query=i > 10
-        ProjectionExec: expr=[_rowid@2 as _rowid, s@0 as s]
-          FilterExec: i@1 > 10
-            LanceScan: uri=..., projection=[s, i], row_id=true, row_addr=false, ordered=false",
+        ProjectionExec: expr=[_rowid@2 as _rowid, s@1 as s]
+          FilterExec: i@0 > 10
+            LanceScan: uri=..., projection=[i, s], row_id=true, row_addr=false, ordered=false",
         )
         .await?;
 

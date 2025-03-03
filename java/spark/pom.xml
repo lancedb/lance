@@ -8,7 +8,7 @@
     <parent>
         <groupId>com.lancedb</groupId>
         <artifactId>lance-parent</artifactId>
-        <version>0.23.2</version>
+        <version>0.23.3</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -112,7 +112,7 @@
         <dependency>
             <groupId>com.lancedb</groupId>
             <artifactId>lance-core</artifactId>
-            <version>0.23.2</version>
+            <version>0.23.3</version>
         </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
