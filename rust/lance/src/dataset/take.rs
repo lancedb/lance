@@ -290,7 +290,7 @@ async fn do_take_rows(
         // TODO: remove this once the bug is fixed.
         let struct_arr: StructArray = one_batch.into();
         let reordered = take_struct_array(&struct_arr, &remapping_index)?;
-        Ok(reordered.as_struct().into())
+        Ok(reordered.into())
     }?;
 
     let batch = projection.project_batch(batch).await?;
@@ -558,7 +558,7 @@ impl TakeBuilder {
     }
 }
 
-fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Arc<dyn Array>> {
+fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<StructArray> {
     let nulls = array.nulls().map(|nulls| {
         let is_valid = indices.iter().map(|index| {
             if let Some(index) = index {
@@ -575,10 +575,7 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Arc<d
     });
 
     if array.fields().is_empty() {
-        return Ok(Arc::new(StructArray::new_empty_fields(
-            indices.len(),
-            nulls,
-        )));
+        return Ok(StructArray::new_empty_fields(indices.len(), nulls));
     }
 
     let arrays = array
@@ -587,18 +584,14 @@ fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<Arc<d
         .map(|array| {
             let array = match array.data_type() {
                 arrow::datatypes::DataType::Struct(_) => {
-                    take_struct_array(array.as_struct(), indices)?
+                    Arc::new(take_struct_array(array.as_struct(), indices)?)
                 }
                 _ => arrow_select::take::take(array, indices, None)?,
             };
             Ok(array)
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Arc::new(StructArray::new(
-        array.fields().clone(),
-        arrays,
-        nulls,
-    )))
+    Ok(StructArray::new(array.fields().clone(), arrays, nulls))
 }
 
 #[cfg(test)]
