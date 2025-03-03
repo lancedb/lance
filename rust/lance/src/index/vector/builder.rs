@@ -56,6 +56,7 @@ use tempfile::{tempdir, TempDir};
 use tracing::{span, Level};
 
 use crate::dataset::ProjectionRequest;
+use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::Dataset;
 
 use super::utils;
@@ -221,6 +222,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mapped = stream::iter(0..model.num_partitions())
             .map(|part_id| async move {
                 let part = ivf_index.load_partition(part_id, false).await?;
+                let part = part.as_any().downcast_ref::<PartitionEntry<S, Q>>().ok_or(
+                    Error::Internal {
+                        message: "failed to downcast partition entry".to_string(),
+                        location: location!(),
+                    },
+                )?;
                 Result::Ok((part.storage.remap(mapping)?, part.index.remap(mapping)?))
             })
             .buffered(get_num_compute_intensive_cpus())
