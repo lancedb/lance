@@ -13,7 +13,6 @@ use futures::stream::{StreamExt, TryStreamExt};
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{Field, Schema};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_encoding::version::LanceFileVersion;
 use lance_table::format::Fragment;
 use snafu::location;
 
@@ -155,12 +154,10 @@ pub(super) async fn add_columns_to_fragments(
         Ok(())
     };
 
-    // ALlNull transform can not performed on legacy files
-    let has_legacy_files = has_legacy_files(fragments);
-
     // Optimize the transforms
     let mut optimizer = ChainedNewColumnTransformOptimizer::new(vec![]);
-    if !has_legacy_files {
+    // ALlNull transform can not performed on legacy files
+    if !dataset.is_legacy_storage() {
         optimizer.add_optimizer(Box::new(SqlToAllNullsOptimizer::new()));
     }
     let transforms = optimizer.optimize(dataset, transforms)?;
@@ -278,7 +275,7 @@ pub(super) async fn add_columns_to_fragments(
             // can't add all-null columns as a metadata-only operation. The reason is because we
             // use the NullReader for fragments that have missing columns and we can't mix legacy
             // and non-legacy readers when reading the fragment.
-            if has_legacy_files {
+            if dataset.is_legacy_storage() {
                 return Err(Error::NotSupported {
                     source: "Cannot add all-null columns to legacy dataset version.".into(),
                     location: location!(),
@@ -293,22 +290,6 @@ pub(super) async fn add_columns_to_fragments(
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
     Ok((fragments, schema))
-}
-
-fn has_legacy_files(fragments: &[FileFragment]) -> bool {
-    fragments
-        .iter()
-        .map(|f| &f.metadata)
-        .flat_map(|fragment_meta| fragment_meta.files.iter())
-        .any(|file_meta| {
-            matches!(
-                LanceFileVersion::try_from_major_minor(
-                    file_meta.file_major_version,
-                    file_meta.file_minor_version
-                ),
-                Ok(LanceFileVersion::Legacy)
-            )
-        })
 }
 
 pub(super) async fn add_columns(
