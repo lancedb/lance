@@ -56,5 +56,65 @@ class DeletionFile:
         """
         ...
 
+    def json(self) -> str:
+        """Get a JSON representation of the deletion file.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @classmethod
+    def from_json(json: str) -> DeletionFile:
+        """
+        Load a deletion file from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the deletion file.
+
+        Returns
+        -------
+        DeletionFile
+        """
+        ...
+
+    def __reduce__(self) -> tuple: ...
+
 class RowIdMeta:
-    pass
+    def json(self) -> str:
+        """Get a JSON representation of the row id metadata.
+
+        Returns
+        -------
+        str
+
+        Warning
+        -------
+        The JSON representation is not guaranteed to be stable across versions.
+        """
+        ...
+
+    @classmethod
+    def from_json(json: str) -> RowIdMeta:
+        """
+        Load row id metadata from a JSON representation.
+
+        Parameters
+        ----------
+        json : str
+            The JSON representation of the row id metadata.
+
+        Returns
+        -------
+        RowIdMeta
+        """
+        ...
+
+    def __reduce__(self) -> tuple: ...
