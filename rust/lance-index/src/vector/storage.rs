@@ -215,7 +215,7 @@ impl IvfQuantizationStorage {
                 .metadata
                 .get(DISTANCE_TYPE_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", INDEX_METADATA_SCHEMA_KEY),
+                    message: format!("{} not found", DISTANCE_TYPE_KEY),
                     location: location!(),
                 })?
                 .as_str(),
@@ -255,8 +255,16 @@ impl IvfQuantizationStorage {
     }
 
     pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
-        let metadata = serde_json::from_str(&self.metadata[0])?;
+        let metadata = self.metadata::<Q>()?;
         Q::from_metadata(&metadata, self.distance_type)
+    }
+
+    pub fn metadata<Q: Quantization>(&self) -> Result<Q::Metadata> {
+        Ok(serde_json::from_str(&self.metadata[0])?)
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     pub fn schema(&self) -> SchemaRef {
