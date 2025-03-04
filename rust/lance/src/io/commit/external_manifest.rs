@@ -174,6 +174,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_can_create_dataset_with_external_store() {
         let sleepy_store = SleepyExternalManifestStore::new();
         let handler = ExternalManifestCommitHandler {
@@ -280,6 +281,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_out_of_sync_dataset_can_recover() {
         let sleepy_store = SleepyExternalManifestStore::new();
         let inner_store = sleepy_store.store.clone();
