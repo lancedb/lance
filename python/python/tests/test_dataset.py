@@ -2983,3 +2983,12 @@ def test_data_replacement(tmp_path: Path):
         }
     )
     assert tbl == expected
+
+
+def test_empty_structs(tmp_path):
+    schema = pa.schema([pa.field("id", pa.int32()), pa.field("empties", pa.struct([]))])
+    table = pa.table({"id": [0, 1, 2], "empties": [{}] * 3}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    res = ds.take([2, 0, 1])
+    assert res.num_rows == 3
+    assert res == table.take([2, 0, 1])
