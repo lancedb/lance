@@ -738,7 +738,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, dist)| (dist, i as u64))
-            .sorted_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+            .sorted_by(|a, b| a.0.total_cmp(&b.0))
             .take(k)
             .collect()
     }
@@ -1046,6 +1046,8 @@ mod tests {
     }
 
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
+        // we introduce XTR for performance, which would reduce the recall a little bit
+        let recall_requirement = recall_requirement * 0.9;
         match params.metric_type {
             DistanceType::Hamming => {
                 test_index_multivec_impl::<UInt8Type>(params, nlist, recall_requirement, 0..2)
@@ -1116,7 +1118,7 @@ mod tests {
         let gt = multivec_ground_truth(&vectors, &query, k, params.metric_type);
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
-        let recall = row_ids.intersection(&gt_set).count() as f32 / 10.0;
+        let recall = row_ids.intersection(&gt_set).count() as f32 / 100.0;
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
