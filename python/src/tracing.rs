@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+use std::sync::Mutex;
+
 use pyo3::exceptions::PyAssertionError;
 use pyo3::exceptions::PyValueError;
 use pyo3::pyclass;
@@ -29,8 +32,10 @@ use tracing_subscriber::Registry;
 
 #[pyclass]
 pub struct TraceGuard {
-    guard: Option<tracing_chrome::FlushGuard>,
+    guard: Option<Arc<Mutex<tracing_chrome::FlushGuard>>>,
 }
+
+unsafe impl Sync for TraceGuard {}
 
 #[pymethods]
 impl TraceGuard {
@@ -73,7 +78,7 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
         .with_target("pylance", level_filter);
     let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
     subscriber::set_global_default(subscriber)
-        .map(move |_| TraceGuard { guard: Some(guard) })
+        .map(move |_| TraceGuard { guard: Some(Arc::new(Mutex::new(guard))) })
         .map_err(|_| {
             PyAssertionError::new_err("Attempt to configure tracing when it is already configured")
         })

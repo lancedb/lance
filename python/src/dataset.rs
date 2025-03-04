@@ -244,7 +244,7 @@ impl MergeInsertBuilder {
 }
 
 pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColumnTransform> {
-    if let Ok(transforms) = transforms.extract::<&PyDict>() {
+    if let Ok(transforms) = transforms.downcast::<PyDict>() {
         let expressions = transforms
             .iter()
             .map(|(k, v)| {
@@ -333,7 +333,7 @@ impl Dataset {
                 let v: u64 = i.extract()?;
                 builder = builder.with_version(v);
             } else if let Ok(v) = ver.downcast_bound::<PyString>(py) {
-                let t: &str = v.extract()?;
+                let t: &str = &v.to_string_lossy();
                 builder = builder.with_tag(t);
             } else {
                 return Err(PyIOError::new_err(
@@ -972,8 +972,8 @@ impl Dataset {
         }
 
         for (key, value) in updates {
-            let column: &str = key.extract()?;
-            let expr: &str = value.extract()?;
+            let column: &str = &key.to_string();
+            let expr: &str = &value.to_string();
 
             builder = builder
                 .set(column, expr)
@@ -1042,7 +1042,7 @@ impl Dataset {
             let ref_: u64 = i.extract()?;
             self._checkout_version(ref_)
         } else if let Ok(v) = version.downcast_bound::<PyString>(py) {
-            let ref_: &str = v.extract()?;
+            let ref_: &str = &v.to_string_lossy();
             self._checkout_version(ref_)
         } else {
             Err(PyIOError::new_err(
@@ -1136,7 +1136,7 @@ impl Dataset {
     }
 
     #[pyo3(signature = (**kwargs))]
-    fn optimize_indices(&mut self, kwargs: Option<&PyDict>) -> PyResult<()> {
+    fn optimize_indices(&mut self, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let mut options: OptimizeOptions = Default::default();
         if let Some(kwargs) = kwargs {
@@ -1165,13 +1165,14 @@ impl Dataset {
     #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
     fn create_index(
         &mut self,
-        columns: Vec<&str>,
+        columns: Vec<String>,
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
+        let columns: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
@@ -1212,7 +1213,7 @@ impl Dataset {
                             .base_tokenizer(base_tokenizer.extract()?);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
-                        let language = language.extract()?;
+                        let language = &language.to_string();
                         params.tokenizer_config =
                             params.tokenizer_config.language(language).map_err(|e| {
                                 PyValueError::new_err(format!(
@@ -1400,7 +1401,7 @@ impl Dataset {
             let dataset: Self = dest.extract()?;
             WriteDestination::Dataset(dataset.ds.clone())
         } else {
-            WriteDestination::Uri(dest.extract()?)
+            WriteDestination::Uri(dest.to_string())
         };
 
         let mut builder = CommitBuilder::new(dest)
@@ -1459,7 +1460,7 @@ impl Dataset {
             let dataset: Self = dest.extract()?;
             WriteDestination::Dataset(dataset.ds.clone())
         } else {
-            WriteDestination::Uri(dest.extract()?)
+            WriteDestination::Uri(dest.to_string())
         };
 
         let mut builder = CommitBuilder::new(dest)
@@ -1505,8 +1506,9 @@ impl Dataset {
         Ok(())
     }
 
-    fn drop_columns(&mut self, columns: Vec<&str>) -> PyResult<()> {
+    fn drop_columns(&mut self, columns: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
+        let columns: Vec<_> = columns.iter().map(|s| s.as_str()).collect();
         RT.block_on(None, new_self.drop_columns(&columns))?
             .map_err(|err| match err {
                 lance::Error::InvalidInput { source, .. } => {
@@ -1615,13 +1617,13 @@ pub fn write_dataset(
     dest: &Bound<'_, PyAny>,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
-    let params = get_write_params(options.as_gil_ref())?;
+    let params = get_write_params(options)?;
     let py = options.py();
     let dest = if dest.is_instance_of::<Dataset>() {
         let dataset: Dataset = dest.extract()?;
         WriteDestination::Dataset(dataset.ds.clone())
     } else {
-        WriteDestination::Uri(dest.extract()?)
+        WriteDestination::Uri(dest.to_string())
     };
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
@@ -1651,16 +1653,16 @@ fn parse_write_mode(mode: &str) -> PyResult<WriteMode> {
     }
 }
 
-pub fn get_commit_handler(options: &PyDict) -> Option<Arc<dyn CommitHandler>> {
-    if options.is_none() {
+pub fn get_commit_handler(options: &Bound<'_, PyDict>) -> PyResult<Option<Arc<dyn CommitHandler>>> {
+    Ok(if options.is_none() {
         None
     } else if let Ok(Some(commit_handler)) = options.get_item("commit_handler") {
         Some(Arc::new(PyCommitLock::new(
-            commit_handler.to_object(options.py()),
+            commit_handler.into_pyobject(options.py())?.try_into()?,
         )))
     } else {
         None
-    }
+    })
 }
 
 // Gets a value from the dictionary and attempts to extract it to
@@ -1668,7 +1670,7 @@ pub fn get_commit_handler(options: &PyDict) -> Option<Arc<dyn CommitHandler>> {
 // it were never present in the dictionary.  If the value is not
 // None it will try and parse it and parsing failures will be
 // returned (e.g. a parsing failure is not considered `None`)
-fn get_dict_opt<'a, D: FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> PyResult<Option<D>> {
+fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(dict: &'a Bound<'py, PyDict>, key: &str) -> PyResult<Option<D>> {
     let value = dict.get_item(key)?;
     value
         .and_then(|v| {
@@ -1681,7 +1683,7 @@ fn get_dict_opt<'a, D: FromPyObject<'a>>(dict: &'a PyDict, key: &str) -> PyResul
         .transpose()
 }
 
-pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
+pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WriteParams>> {
     let params = if options.is_none() {
         None
     } else {
@@ -1726,7 +1728,7 @@ pub fn get_write_params(options: &PyDict) -> PyResult<Option<WriteParams>> {
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
-        p.commit_handler = get_commit_handler(options);
+        p.commit_handler = get_commit_handler(options)?;
 
         Some(p)
     };

@@ -29,8 +29,8 @@ use super::{resolve_commit_handler, WriteDestination};
 ///
 /// Transactions can be created using a write method like [`super::InsertBuilder::execute_uncommitted`].
 #[derive(Debug, Clone)]
-pub struct CommitBuilder<'a> {
-    dest: WriteDestination<'a>,
+pub struct CommitBuilder {
+    dest: WriteDestination,
     use_move_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
@@ -43,8 +43,8 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
 }
 
-impl<'a> CommitBuilder<'a> {
-    pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
+impl CommitBuilder {
+    pub fn new(dest: impl Into<WriteDestination>) -> Self {
         Self {
             dest: dest.into(),
             use_move_stable_row_ids: None,
@@ -218,7 +218,7 @@ impl<'a> CommitBuilder<'a> {
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri)
+                        WriteDestination::Uri(uri.clone())
                     }
                     Err(e) => return Err(e),
                 }

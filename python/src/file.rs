@@ -37,11 +37,10 @@ use lance_io::{
 };
 use object_store::path::Path;
 use pyo3::{
-    exceptions::{PyIOError, PyRuntimeError, PyValueError},
-    pyclass, pymethods, IntoPy, PyObject, PyResult, Python,
+    exceptions::{PyIOError, PyRuntimeError, PyValueError}, pyclass, pymethods, IntoPy, IntoPyObjectExt, PyObject, PyResult, Python
 };
 use serde::Serialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::{Mutex, MutexGuard}};
 use std::{pin::Pin, sync::Arc};
 use url::Url;
 
@@ -195,7 +194,7 @@ pub struct LanceFileMetadata {
 impl LanceFileMetadata {
     fn new(inner: &CachedFileMetadata, py: Python) -> Self {
         let arrow_schema = arrow_schema::Schema::from(inner.file_schema.as_ref());
-        let schema = Some(PyArrowType(arrow_schema).into_py(py));
+        let schema = PyArrowType(arrow_schema).into_py_any(py).ok();
         Self {
             major_version: inner.major_version,
             minor_version: inner.minor_version,
@@ -228,8 +227,10 @@ impl LanceFileMetadata {
 
 #[pyclass]
 pub struct LanceFileWriter {
-    inner: Box<FileWriter>,
+    inner: Arc<Mutex<Box<FileWriter>>>,
 }
+
+unsafe impl Sync for LanceFileReader {}
 
 impl LanceFileWriter {
     async fn open(
@@ -259,8 +260,12 @@ impl LanceFileWriter {
             Ok(FileWriter::new_lazy(object_writer, options))
         }?;
         Ok(Self {
-            inner: Box::new(inner),
+            inner: Arc::new(Mutex::new(Box::new(inner))),
         })
+    }
+
+    fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
+        self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -288,22 +293,22 @@ impl LanceFileWriter {
 
     pub fn write_batch(&mut self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
         RT.runtime
-            .block_on(self.inner.write_batch(&batch.0))
+            .block_on(self.inner_lock()?.write_batch(&batch.0))
             .infer_error()
     }
 
     pub fn finish(&mut self) -> PyResult<u64> {
-        RT.runtime.block_on(self.inner.finish()).infer_error()
+        RT.runtime.block_on(self.inner_lock()?.finish()).infer_error()
     }
 
     pub fn add_global_buffer(&mut self, bytes: Vec<u8>) -> PyResult<u32> {
         RT.runtime
-            .block_on(self.inner.add_global_buffer(Bytes::from(bytes)))
+            .block_on(self.inner_lock()?.add_global_buffer(Bytes::from(bytes)))
             .infer_error()
     }
 
-    pub fn add_schema_metadata(&mut self, key: String, value: String) {
-        self.inner.add_schema_metadata(key, value)
+    pub fn add_schema_metadata(&mut self, key: String, value: String) -> PyResult<()> {
+        Ok(self.inner_lock()?.add_schema_metadata(key, value))
     }
 }
 

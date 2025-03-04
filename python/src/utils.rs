@@ -279,13 +279,13 @@ where
         .collect::<Vec<_>>()
 }
 
-pub fn class_name<'a>(ob: &'a Bound<'_, PyAny>) -> PyResult<&'a str> {
-    let full_name: &str = ob
+pub fn class_name<'a>(ob: &'a Bound<'_, PyAny>) -> PyResult<String> {
+    let full_name: String = ob
         .getattr(intern!(ob.py(), "__class__"))?
         .getattr(intern!(ob.py(), "__name__"))?
         .extract()?;
     match full_name.rsplit_once('.') {
-        Some((_, name)) => Ok(name),
+        Some((_, name)) => Ok(name.to_string()),
         None => Ok(full_name),
     }
 }

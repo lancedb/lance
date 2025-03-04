@@ -99,7 +99,7 @@ impl FileFragment {
         dataset_uri: &str,
         fragment_id: Option<usize>,
         reader: &Bound<PyAny>,
-        kwargs: Option<&PyDict>,
+        kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyLance<Fragment>> {
         let params = if let Some(kw_params) = kwargs {
             get_write_params(kw_params)?
@@ -344,7 +344,7 @@ impl From<FileFragment> for LanceFragment {
 fn do_write_fragments(
     dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
-    kwargs: Option<&PyDict>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
@@ -357,7 +357,7 @@ fn do_write_fragments(
         let dataset: Dataset = dest.extract()?;
         WriteDestination::Dataset(dataset.ds.clone())
     } else {
-        WriteDestination::Uri(dest.extract()?)
+        WriteDestination::Uri(dest.to_string())
     };
 
     RT.block_on(
@@ -374,7 +374,7 @@ fn do_write_fragments(
 pub fn write_fragments(
     dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
-    kwargs: Option<&PyDict>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyObject>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
@@ -402,7 +402,7 @@ pub fn write_fragments(
 pub fn write_fragments_transaction(
     dest: &Bound<PyAny>,
     reader: &Bound<PyAny>,
-    kwargs: Option<&PyDict>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<PyObject> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 

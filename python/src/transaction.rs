@@ -45,7 +45,7 @@ impl ToPyObject for PyLance<&DataReplacementGroup> {
 
 impl FromPyObject<'_> for PyLance<Operation> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        match class_name(ob)? {
+        match class_name(ob)?.as_str() {
             "Overwrite" => {
                 let schema = extract_schema(&ob.getattr("new_schema")?)?;
 
@@ -115,7 +115,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 Ok(Self(op))
             }
             "CreateIndex" => {
-                let uuid = ob.getattr("uuid")?.extract()?;
+                let uuid = ob.getattr("uuid")?.to_string();
                 let name = ob.getattr("name")?.extract()?;
                 let fields = ob.getattr("fields")?.extract()?;
                 let dataset_version = ob.getattr("dataset_version")?.extract()?;
@@ -129,7 +129,7 @@ impl FromPyObject<'_> for PyLance<Operation> {
                 let fragment_bitmap = Some(fragment_ids.into_iter().collect());
 
                 let new_indices = vec![Index {
-                    uuid: Uuid::parse_str(uuid)
+                    uuid: Uuid::parse_str(&uuid)
                         .map_err(|e| PyValueError::new_err(e.to_string()))?,
                     name,
                     fields,
@@ -292,11 +292,11 @@ impl ToPyObject for PyLance<&RewriteGroup> {
 
 impl FromPyObject<'_> for PyLance<RewrittenIndex> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let old_id: &str = ob.getattr("old_id")?.extract()?;
-        let new_id: &str = ob.getattr("new_id")?.extract()?;
-        let old_id = Uuid::parse_str(old_id)
+        let old_id: String = ob.getattr("old_id")?.extract()?;
+        let new_id: String = ob.getattr("new_id")?.extract()?;
+        let old_id = Uuid::parse_str(&old_id)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
-        let new_id = Uuid::parse_str(new_id)
+        let new_id = Uuid::parse_str(&new_id)
             .map_err(|e| PyValueError::new_err(format!("Failed to parse UUID: {}", e)))?;
         Ok(Self(RewrittenIndex { old_id, new_id }))
     }
