@@ -137,6 +137,7 @@ def train_pq_codebook_on_accelerator(
     accelerator: Union[str, "torch.Device"],
     num_sub_vectors: int,
     batch_size: int = 1024 * 10 * 4,
+    dtype: np.dtype = np.float32,
 ) -> Tuple[np.ndarray, List[Any]]:
     """Use accelerator (GPU or MPS) to train pq codebook."""
 
@@ -192,7 +193,7 @@ def train_pq_codebook_on_accelerator(
         centroids_list.append(ivf_centroids_local)
         kmeans_list.append(kmeans_local)
 
-    pq_codebook = np.stack(centroids_list)
+    pq_codebook = np.stack(centroids_list).astype(dtype)
     return pq_codebook, kmeans_list
 
 
@@ -214,6 +215,7 @@ def train_ivf_centroids_on_accelerator(
     from .torch.kmeans import KMeans
 
     metric_type = _normalize_metric_type(metric_type)
+    vector_value_type = dataset.schema.field(column).type.value_type
 
     if isinstance(accelerator, str) and (
         not (CUDA_REGEX.match(accelerator) or accelerator == "mps")
@@ -264,7 +266,9 @@ def train_ivf_centroids_on_accelerator(
     )
     kmeans.fit(ds)
 
-    centroids = kmeans.centroids.cpu().numpy()
+    centroids = (
+        kmeans.centroids.cpu().numpy().astype(vector_value_type.to_pandas_dtype())
+    )
 
     with tempfile.NamedTemporaryFile(delete=False) as f:
         np.save(f, centroids)

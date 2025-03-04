@@ -6,11 +6,17 @@ from pathlib import Path
 import lance
 import numpy as np
 import pyarrow as pa
+import pytest
+import torch
 
 
-def test_f16_embeddings(tmp_path: Path):
-    DIM = 32
-    TOTAL = 1000
+@pytest.mark.parametrize("accelerator", [None, "cuda"])
+def test_f16_embeddings(tmp_path: Path, accelerator: str):
+    if not torch.cuda.is_available() and accelerator == "cuda":
+        pytest.skip("CUDA not available")
+
+    DIM = 16
+    TOTAL = 256
     values = np.random.random(TOTAL * DIM).astype(np.float16)
     fsl = pa.FixedSizeListArray.from_arrays(values, DIM)
     data = pa.Table.from_arrays([fsl, np.arange(TOTAL)], names=["vec", "id"])
@@ -19,7 +25,12 @@ def test_f16_embeddings(tmp_path: Path):
     assert ds.schema.field("vec").type.value_type == pa.float16()
 
     ds = ds.create_index(
-        "vec", "IVF_PQ", replace=True, num_partitions=2, num_sub_vectors=2
+        "vec",
+        "IVF_PQ",
+        replace=True,
+        num_partitions=2,
+        num_sub_vectors=2,
+        accelerator=accelerator,
     )
 
     # Can use float32 to search
