@@ -12,7 +12,7 @@ use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
@@ -345,7 +345,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
+        let quantizer = Q::build(&training_data, dt, quantizer_params)?;
         info!(
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
@@ -502,7 +502,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     partition,
                     existing_indices.as_ref(),
                     reader.as_ref(),
-                    dataset.as_ref(),
+                    &dataset,
                     &column,
                     &store,
                 )
@@ -522,6 +522,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     sub_index_params,
                     batch,
                     partition,
+                    &existing_indices,
                 )
                 .await
             }
@@ -548,6 +549,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         batch: RecordBatch,
         part_id: usize,
+        existing_indices: &[Arc<dyn VectorIndex>],
     ) -> Result<(usize, usize)> {
         let local_store = ObjectStore::local();
         // build quantized vector storage
@@ -556,6 +558,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 StorageBuilder::new(column.clone(), distance_type, quantizer).build(&batch)?;
             let path = temp_dir.child(format!("storage_part{}", part_id));
             let batches = storage.to_batches()?;
+            // let existing_indices_batches =
+            //     Self::take_existing_indices_storage(part_id, existing_indices).await?;
+            // let batches = batches.chain(existing_indices_batches);
             FileWriter::create_file_with_batches(
                 &local_store,
                 &path,
@@ -587,11 +592,31 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok((storage_len, index_len))
     }
 
+    async fn take_existing_indices_storage(
+        part_id: usize,
+        existing_indices: &[Arc<dyn VectorIndex>],
+    ) -> Result<Vec<RecordBatch>> {
+        let mut batches = Vec::with_capacity(existing_indices.len());
+        for existing_index in existing_indices.iter() {
+            let existing_index = existing_index
+                .as_any()
+                .downcast_ref::<IVFIndex<S, Q>>()
+                .ok_or(Error::invalid_input(
+                    "existing index is not IVF index",
+                    location!(),
+                ))?;
+            let part_storage = existing_index.load_partition_storage(part_id).await?;
+            batches.extend(part_storage.to_batches()?);
+        }
+
+        Ok(batches)
+    }
+
     async fn take_partition_batches(
         part_id: usize,
         existing_indices: &[Arc<dyn VectorIndex>],
         reader: &dyn ShuffleReader,
-        dataset: &Dataset,
+        dataset: &Arc<Dataset>,
         column: &str,
         store: &ObjectStore,
     ) -> Result<Vec<RecordBatch>> {
@@ -779,7 +804,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // take vectors from the dataset
     // used for reading vectors from existing indices
     async fn take_vectors(
-        dataset: &Dataset,
+        dataset: &Arc<Dataset>,
         column: &str,
         store: &ObjectStore,
         row_ids: &[u64],
@@ -787,6 +812,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let projection = Arc::new(dataset.schema().project(&[column])?);
         // arrow uses i32 for index, so we chunk the row ids to avoid large batch causing overflow
         let mut batches = Vec::new();
+        let row_ids = dataset.filter_deleted_ids(row_ids).await?;
         for chunk in row_ids.chunks(store.block_size()) {
             let batch = dataset
                 .take_rows(chunk, ProjectionRequest::Schema(projection.clone()))

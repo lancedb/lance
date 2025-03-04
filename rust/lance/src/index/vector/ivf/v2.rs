@@ -45,6 +45,7 @@ use lance_index::{
     Index, IndexType, INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME,
 };
 use lance_index::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
+use lance_io::local::to_local_path;
 use lance_io::scheduler::SchedulerConfig;
 use lance_io::{
     object_store::ObjectStore, scheduler::ScanScheduler, traits::Reader, ReadBatchParams,
@@ -85,6 +86,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndexCacheEntry
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
+    uri: String,
     uuid: String,
 
     /// Ivf model
@@ -128,10 +130,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .upgrade()
             .map(|sess| sess.file_metadata_cache.clone())
             .unwrap_or_else(FileMetadataCache::no_cache);
+        let uri = index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME);
         let index_reader = FileReader::try_open(
-            scheduler
-                .open_file(&index_dir.child(uuid.as_str()).child(INDEX_FILE_NAME))
-                .await?,
+            scheduler.open_file(&uri).await?,
             None,
             Arc::<DecoderPlugins>::default(),
             &file_metadata_cache,
@@ -195,6 +196,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
 
         let num_partitions = ivf.num_partitions();
         Ok(Self {
+            uri: to_local_path(&uri),
             uuid,
             ivf,
             reader: index_reader,
@@ -349,20 +351,52 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         let (sub_index_type, quantization_type) = self.sub_index_type();
         let index_type = index_type_string(sub_index_type, quantization_type);
-        let mut sub_index_stats: serde_json::Value =
+        let mut sub_index_stats: serde_json::Map<String, serde_json::Value> =
             if let Some(metadata) = self.sub_index_metadata.iter().find(|m| !m.is_empty()) {
                 serde_json::from_str(metadata)?
             } else {
-                json!({})
+                serde_json::map::Map::new()
             };
-        sub_index_stats["index_type"] = S::name().into();
+        let mut store_stats = serde_json::to_value(self.storage.metadata::<Q>()?)?;
+        let store_stats = store_stats.as_object_mut().ok_or(Error::Internal {
+            message: "failed to get storage metadata".to_string(),
+            location: location!(),
+        })?;
+
+        sub_index_stats.append(store_stats);
+        if S::name() == "FLAT" {
+            sub_index_stats.insert(
+                "index_type".to_string(),
+                Q::quantization_type().to_string().into(),
+            );
+        } else {
+            sub_index_stats.insert("index_type".to_string(), S::name().into());
+        }
+
+        let sub_index_distance_type = if matches!(Q::quantization_type(), QuantizationType::Product)
+            && self.distance_type == DistanceType::Cosine
+        {
+            DistanceType::L2
+        } else {
+            self.distance_type
+        };
+        sub_index_stats.insert(
+            "metric_type".to_string(),
+            sub_index_distance_type.to_string().into(),
+        );
+
+        // we need to drop some stats from the metadata
+        sub_index_stats.remove("codebook_position");
+        sub_index_stats.remove("codebook");
+        sub_index_stats.remove("codebook_tensor");
+
         Ok(serde_json::to_value(IvfIndexStatistics {
             index_type,
             uuid: self.uuid.clone(),
-            uri: self.uuid.clone(),
+            uri: self.uri.clone(),
             metric_type: self.distance_type.to_string(),
             num_partitions: self.ivf.num_partitions(),
-            sub_index: sub_index_stats,
+            sub_index: serde_json::Value::Object(sub_index_stats),
             partitions: partitions_statistics,
             centroids: centroid_vecs,
         })?)

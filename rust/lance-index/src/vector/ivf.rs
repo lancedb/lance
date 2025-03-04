@@ -21,6 +21,7 @@ use crate::vector::{pq::ProductQuantizer, residual::ResidualTransform, transform
 
 use super::pq::transform::PQTransformer;
 use super::quantizer::Quantization;
+use super::transform::KeepFiniteVectors;
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN};
 
@@ -113,8 +114,10 @@ impl IvfTransformer {
         vector_column: &str,
         range: Option<Range<u32>>,
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> =
-            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![
+            Arc::new(KeepFiniteVectors::new(vector_column)),
+            Arc::new(super::transform::Flatten::new(vector_column)),
+        ];
 
         let dt = if distance_type == DistanceType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
@@ -155,8 +158,10 @@ impl IvfTransformer {
         range: Option<Range<u32>>,
         with_pq_code: bool, // Pass true for v1 index format, otherwise false.
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> =
-            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![
+            Arc::new(KeepFiniteVectors::new(vector_column)),
+            Arc::new(super::transform::Flatten::new(vector_column)),
+        ];
 
         let mt = if distance_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
@@ -208,8 +213,10 @@ impl IvfTransformer {
         vector_column: &str,
         range: Option<Range<u32>>,
     ) -> Self {
-        let mut transforms: Vec<Arc<dyn Transformer>> =
-            vec![Arc::new(super::transform::Flatten::new(vector_column))];
+        let mut transforms: Vec<Arc<dyn Transformer>> = vec![
+            Arc::new(KeepFiniteVectors::new(vector_column)),
+            Arc::new(super::transform::Flatten::new(vector_column)),
+        ];
 
         let mt = if metric_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
