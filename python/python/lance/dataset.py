@@ -792,7 +792,6 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
-        **kwargs,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -804,8 +803,6 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
-        **kwargs : dict, optional
-            See :py:method::scanner method for full parameter description.
 
         Returns
         -------
@@ -3414,6 +3411,21 @@ class LanceScanner(pa.dataset.Scanner):
         """
 
         return self._scanner.explain_plan(verbose=verbose)
+
+    def analyze_plan(self) -> str:
+        """Execute the plan for this scanner and display with runtime metrics.
+
+        Parameters
+        ----------
+        verbose : bool, default False
+            Use a verbose output format.
+
+        Returns
+        -------
+        plan : str
+        """
+
+        return self._scanner.analyze_plan()
 
 
 class DatasetOptimizer:

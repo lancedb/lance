@@ -4,7 +4,7 @@
 use std::{cmp::Ordering, collections::HashMap, ops::Range, sync::Arc};
 
 use arrow::array::make_comparator;
-use arrow_array::{Array, UInt64Array};
+use arrow_array::{Array, StructArray, UInt64Array};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
 use bytes::{Bytes, BytesMut};
@@ -651,9 +651,23 @@ async fn check_round_trip_encoding_inner(
         }
         let num_rows = indices.len() as u64;
         let indices_arr = UInt64Array::from(indices.clone());
-        let expected = concat_data
-            .as_ref()
-            .map(|concat_data| arrow_select::take::take(&concat_data, &indices_arr, None).unwrap());
+
+        // There is a bug in arrow_select::take::take that causes it to return empty arrays
+        // if the data type is an empty struct.  This is a workaround for that.
+        let is_empty_struct = if let DataType::Struct(fields) = field.data_type() {
+            fields.is_empty()
+        } else {
+            false
+        };
+
+        let expected = if is_empty_struct {
+            Some(Arc::new(StructArray::new_empty_fields(indices_arr.len(), None)) as Arc<dyn Array>)
+        } else {
+            concat_data.as_ref().map(|concat_data| {
+                arrow_select::take::take(&concat_data, &indices_arr, None).unwrap()
+            })
+        };
+
         let scheduler = scheduler.clone();
         let indices = indices.clone();
         test_decode(

@@ -1183,6 +1183,12 @@ impl ArrayGenerator for RandomStructGenerator {
         length: RowCount,
         rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
     ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
+        if self.child_gens.is_empty() {
+            // Have to create empty struct arrays specially to ensure they have the correct
+            // row count
+            let struct_arr = StructArray::new_empty_fields(length.0 as usize, None);
+            return Ok(Arc::new(struct_arr));
+        }
         let child_arrays = self
             .child_gens
             .iter_mut()
