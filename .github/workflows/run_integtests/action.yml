@@ -12,7 +12,7 @@ runs:
   - name: Start localstack
     shell: bash
     run: |
-      docker-compose -f docker-compose.yml up -d --wait
+      docker compose -f docker-compose.yml up -d --wait
   - name: Run python tests
     shell: bash
     working-directory: python
