@@ -2993,7 +2993,7 @@ mod tests {
             .open_generic_index("vector", indices[0].uuid.to_string().as_str())
             .await
             .unwrap();
-        let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
+        let ivf_idx = idx.as_any().downcast_ref::<v2::IvfPq>().unwrap();
 
         assert!(ivf_idx
             .ivf_model()
