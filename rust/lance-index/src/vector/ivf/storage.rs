@@ -34,6 +34,9 @@ pub struct IvfModel {
 
     /// Number of vectors in each partition.
     pub lengths: Vec<u32>,
+
+    /// Kmeans loss
+    pub loss: Option<f64>,
 }
 
 impl DeepSizeOf for IvfModel {
@@ -53,6 +56,7 @@ impl IvfModel {
             centroids: None,
             offsets: vec![],
             lengths: vec![],
+            loss: None,
         }
     }
 
@@ -61,6 +65,7 @@ impl IvfModel {
             centroids: Some(centroids),
             offsets: vec![],
             lengths: vec![],
+            loss: None,
         }
     }
 
@@ -86,6 +91,14 @@ impl IvfModel {
 
     pub fn partition_size(&self, part: usize) -> usize {
         self.lengths[part] as usize
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        self.lengths.iter().map(|x| *x as u64).sum()
+    }
+
+    pub fn avg_loss(&self) -> Option<f64> {
+        self.loss.map(|loss| loss / self.num_rows() as f64)
     }
 
     /// Use the query vector to find `nprobes` closest partitions.
@@ -215,6 +228,7 @@ impl TryFrom<PbIvf> for IvfModel {
             centroids,
             offsets,
             lengths: proto.lengths,
+            loss: None,
         })
     }
 }

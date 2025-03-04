@@ -41,10 +41,10 @@ use crate::{
 use crate::{Error, Result};
 
 /// KMean initialization method.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum KMeanInit {
     Random,
-    KMeanPlusPlus,
+    Incremental(Arc<FixedSizeListArray>),
 }
 
 /// KMean Training Parameters
@@ -80,11 +80,21 @@ impl Default for KMeansParams {
 }
 
 impl KMeansParams {
-    /// Create a new KMeansParams with cosine distance.
-    #[allow(dead_code)]
-    fn cosine() -> Self {
+    pub fn new(
+        centroids: Option<Arc<FixedSizeListArray>>,
+        max_iters: u32,
+        redos: usize,
+        distance_type: DistanceType,
+    ) -> Self {
+        let init = match centroids {
+            Some(centroids) => KMeanInit::Incremental(centroids),
+            None => KMeanInit::Random,
+        };
         Self {
-            distance_type: DistanceType::Cosine,
+            max_iters,
+            redos,
+            distance_type,
+            init,
             ..Default::default()
         }
     }
@@ -103,6 +113,9 @@ pub struct KMeans {
 
     /// How to calculate distance between two vectors.
     pub distance_type: DistanceType,
+
+    /// The loss of the last training.
+    pub loss: f64,
 }
 
 /// Randomly initialize kmeans centroids.
@@ -127,6 +140,7 @@ fn kmeans_random_init<T: ArrowPrimitiveType>(
         centroids: Arc::new(centroids),
         dimension,
         distance_type,
+        loss: f64::MAX,
     }
 }
 
@@ -191,6 +205,7 @@ pub trait KMeansAlgo<T: Num> {
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
+        loss: f64,
     ) -> KMeans;
 }
 
@@ -245,6 +260,7 @@ where
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
+        loss: f64,
     ) -> KMeans {
         let mut cluster_cnts = vec![0_u64; k];
         let mut new_centroids = vec![T::Native::zero(); k * dimension];
@@ -293,6 +309,7 @@ where
             centroids: Arc::new(PrimitiveArray::<T>::from_iter_values(new_centroids)),
             dimension,
             distance_type,
+            loss,
         }
     }
 }
@@ -337,6 +354,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         k: usize,
         membership: &[Option<u32>],
         distance_type: DistanceType,
+        loss: f64,
     ) -> KMeans {
         assert_eq!(distance_type, DistanceType::Hamming);
 
@@ -379,6 +397,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
             centroids: Arc::new(UInt8Array::from(centroids)),
             dimension,
             distance_type,
+            loss,
         }
     }
 }
@@ -389,6 +408,7 @@ impl KMeans {
             centroids: arrow_array::array::new_empty_array(&DataType::Float32),
             dimension,
             distance_type,
+            loss: f64::MAX,
         }
     }
 
@@ -398,6 +418,7 @@ impl KMeans {
         centroids: ArrayRef,
         dimension: usize,
         distance_type: DistanceType,
+        loss: f64,
     ) -> Self {
         assert!(matches!(
             centroids.data_type(),
@@ -407,6 +428,7 @@ impl KMeans {
             centroids,
             dimension,
             distance_type,
+            loss,
         }
     }
 
@@ -462,7 +484,7 @@ impl KMeans {
         // TODO: use seed for Rng.
         let rng = SmallRng::from_entropy();
         for redo in 1..=params.redos {
-            let mut kmeans: Self = match params.init {
+            let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
                     data.values(),
                     dimension,
@@ -470,9 +492,12 @@ impl KMeans {
                     rng.clone(),
                     params.distance_type,
                 ),
-                KMeanInit::KMeanPlusPlus => {
-                    unimplemented!()
-                }
+                KMeanInit::Incremental(centroids) => Self::with_centroids(
+                    centroids.values().clone(),
+                    dimension,
+                    params.distance_type,
+                    f64::MAX,
+                ),
             };
 
             let mut loss = f64::MAX;
@@ -496,6 +521,7 @@ impl KMeans {
                     k,
                     &membership,
                     params.distance_type,
+                    last_loss,
                 );
                 last_membership = Some(membership);
                 if (loss - last_loss).abs() / last_loss < params.tolerance {

@@ -410,7 +410,7 @@ impl VectorIndex for PQIndex {
         Ok(())
     }
 
-    fn ivf_model(&self) -> IvfModel {
+    fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
     fn quantizer(&self) -> Quantizer {
