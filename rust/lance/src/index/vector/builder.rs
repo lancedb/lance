@@ -345,7 +345,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         info!("Start to train quantizer");
         let start = std::time::Instant::now();
-        let quantizer = Q::build(&training_data, dt, quantizer_params)?;
+        let quantizer = Q::build(&training_data, DistanceType::L2, quantizer_params)?;
         info!(
             "Trained quantizer in {:02} seconds",
             start.elapsed().as_secs_f32()
