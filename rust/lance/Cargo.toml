@@ -98,6 +98,9 @@ env_logger = "0.10.0"
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 random_word = { version = "0.4.3", features = ["en"] }
+# For S3 / DynamoDB tests
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 
 
 [features]

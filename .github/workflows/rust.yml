@@ -83,9 +83,8 @@ jobs:
           sudo apt update
           sudo apt install -y protobuf-compiler libssl-dev
           rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
-      - name: Start DynamoDB local for tests
-        run: |
-          docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
+      - name: Start DynamodDB and S3
+        run: docker compose -f docker-compose.yml up -d --wait
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Run tests
@@ -130,9 +129,8 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`
           cargo test --locked --features ${ALL_FEATURES} --no-run
-      - name: Start DynamoDB local for tests
-        run: |
-          docker run -d -e AWS_ACCESS_KEY_ID=DUMMYKEY -e AWS_SECRET_ACCESS_KEY=DUMMYKEY -p 8000:8000 amazon/dynamodb-local
+      - name: Start DynamodDB and S3
+        run: docker compose -f docker-compose.yml up -d --wait
       - name: Run tests
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v protoc | sort | uniq | paste -s -d "," -`

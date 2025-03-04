@@ -880,7 +880,7 @@ async fn configure_store(
                 max_retries,
                 retry_timeout: Duration::from_secs(retry_timeout),
             };
-            let storage_options = storage_options.as_s3_options();
+            let mut storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
@@ -889,6 +889,12 @@ async fn configure_store(
                 region,
             )
             .await?;
+
+            // This will be default in next version of object store.
+            // https://github.com/apache/arrow-rs/pull/7181
+            storage_options
+                .entry(AmazonS3ConfigKey::ConditionalPut)
+                .or_insert_with(|| "etag".to_string());
 
             // Cloudflare does not support varying part sizes.
             let use_constant_size_upload_parts = storage_options
