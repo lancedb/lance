@@ -3006,16 +3006,10 @@ mod tests {
             .iter()
             .all(|v| (0.0..=1.0).contains(v)));
 
-        let pq_idx = ivf_idx
-            .sub_index
-            .as_any()
-            .downcast_ref::<PQIndex>()
-            .unwrap();
-
         // PQ code is on residual space
-        pq_idx
-            .pq
-            .codebook
+        let pq_store = ivf_idx.load_partition_storage(0).await.unwrap();
+        pq_store
+            .codebook()
             .values()
             .as_primitive::<Float32Type>()
             .values()

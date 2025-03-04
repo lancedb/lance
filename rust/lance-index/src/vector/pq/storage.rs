@@ -247,6 +247,10 @@ impl ProductQuantizationStorage {
         )
     }
 
+    pub fn codebook(&self) -> &FixedSizeListArray {
+        &self.codebook
+    }
+
     /// Load full PQ storage from disk.
     ///
     /// Parameters
