@@ -66,7 +66,7 @@ use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::prelude::*;
+use pyo3::{prelude::*, IntoPyObjectExt};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
@@ -131,7 +131,7 @@ impl MergeInsertBuilder {
             .downcast::<PyString>()
             .map(|val| vec![val.to_string()])
             .or_else(|_| {
-                let iterator = on.iter().map_err(|_| {
+                let iterator = on.try_iter().map_err(|_| {
                     PyTypeError::new_err(
                         "The `on` argument to merge_insert must be a str or iterable of str",
                     )
@@ -235,7 +235,7 @@ impl MergeInsertBuilder {
 
 impl MergeInsertBuilder {
     fn build_stats<'a>(stats: &MergeStats, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
-        let dict = PyDict::new_bound(py);
+        let dict = PyDict::new(py);
         dict.set_item("num_inserted_rows", stats.num_inserted_rows)?;
         dict.set_item("num_updated_rows", stats.num_updated_rows)?;
         dict.set_item("num_deleted_rows", stats.num_deleted_rows)?;
@@ -262,7 +262,7 @@ pub fn transforms_from_python(transforms: &Bound<'_, PyAny>) -> PyResult<NewColu
         let result_checkpoint: Option<PyObject> = transforms.getattr("cache")?.extract()?;
         let result_checkpoint = result_checkpoint.map(|c| PyBatchUDFCheckpointWrapper { inner: c });
 
-        let udf_obj = transforms.to_object(transforms.py());
+        let udf_obj = transforms.into_py_any(transforms.py())?;
         let mapper = move |batch: &RecordBatch| -> lance::Result<RecordBatch> {
             Python::with_gil(|py| {
                 let py_batch: PyArrowType<RecordBatch> = PyArrowType(batch.clone());
@@ -428,7 +428,7 @@ impl Dataset {
 
     fn serialized_manifest(&self, py: Python) -> PyObject {
         let manifest_bytes = self.ds.manifest().serialized();
-        PyBytes::new_bound(py, &manifest_bytes).into()
+        PyBytes::new(py, &manifest_bytes).into()
     }
 
     /// Load index metadata.
@@ -442,7 +442,7 @@ impl Dataset {
         index_metadata
             .iter()
             .map(|idx| {
-                let dict = PyDict::new_bound(py);
+                let dict = PyDict::new(py);
                 let schema = self_.ds.schema();
 
                 let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
@@ -463,7 +463,7 @@ impl Dataset {
                     .map(|f| f.name.clone())
                     .collect::<Vec<_>>();
 
-                let fragment_set = PySet::empty_bound(py).unwrap();
+                let fragment_set = PySet::empty(py).unwrap();
                 if let Some(bitmap) = &idx.fragment_bitmap {
                     for fragment_id in bitmap.iter() {
                         fragment_set.add(fragment_id).unwrap();
@@ -479,7 +479,7 @@ impl Dataset {
                 dict.set_item("fields", field_names).unwrap();
                 dict.set_item("version", idx.dataset_version).unwrap();
                 dict.set_item("fragment_ids", fragment_set).unwrap();
-                Ok(dict.to_object(py))
+                dict.into_py_any(py)
             })
             .collect::<PyResult<Vec<_>>>()
     }
@@ -989,7 +989,7 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
         self.ds = new_self.new_dataset;
-        let update_dict = PyDict::new_bound(updates.py());
+        let update_dict = PyDict::new(updates.py());
         let num_rows_updated = new_self.rows_updated;
         update_dict.set_item("num_rows_updated", num_rows_updated)?;
         Ok(update_dict.into())
@@ -1008,7 +1008,7 @@ impl Dataset {
             let pyvers: Vec<PyObject> = versions
                 .iter()
                 .map(|v| {
-                    let dict = PyDict::new_bound(py);
+                    let dict = PyDict::new(py);
                     dict.set_item("version", v.version).unwrap();
                     dict.set_item(
                         "timestamp",
@@ -1016,13 +1016,11 @@ impl Dataset {
                     )
                     .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
-                    dict.set_item("metadata", tup.into_py_dict_bound(py))
+                    dict.set_item("metadata", tup.into_py_dict(py)?)
                         .unwrap();
-                    dict.to_object(py)
+                    dict.into_py_any(py)
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .collect();
+                .collect::<PyResult<Vec<_>>>()?;
             Ok(pyvers)
         })
     }
@@ -1090,15 +1088,14 @@ impl Dataset {
             .list_tags()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
         Python::with_gil(|py| {
-            let pytags = PyDict::new_bound(py);
+            let pytags = PyDict::new(py);
             for (k, v) in tags.iter() {
-                let dict = PyDict::new_bound(py);
+                let dict = PyDict::new(py);
                 dict.set_item("version", v.version).unwrap();
                 dict.set_item("manifest_size", v.manifest_size).unwrap();
-                dict.to_object(py);
-                pytags.set_item(k, dict).unwrap();
+                pytags.set_item(k, dict.into_py_any(py)?).unwrap();
             }
-            Ok(pytags.to_object(py))
+            pytags.into_py_any(py)
         })
     }
 
@@ -1393,9 +1390,8 @@ impl Dataset {
                 });
 
         let commit_handler = commit_lock.as_ref().map(|commit_lock| {
-            Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
-                as Arc<dyn CommitHandler>
-        });
+            commit_lock.into_py_any(commit_lock.py()).map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
+        }).transpose()?;
 
         let dest = if dest.is_instance_of::<Self>() {
             let dataset: Self = dest.extract()?;
@@ -1451,9 +1447,8 @@ impl Dataset {
                 });
 
         let commit_handler = commit_lock.map(|commit_lock| {
-            Arc::new(PyCommitLock::new(commit_lock.to_object(commit_lock.py())))
-                as Arc<dyn CommitHandler>
-        });
+            commit_lock.into_py_any(commit_lock.py()).map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
+        }).transpose()?;
 
         let py = dest.py();
         let dest = if dest.is_instance_of::<Self>() {
@@ -1705,7 +1700,7 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             p.data_storage_version = Some(data_storage_version.parse().infer_error()?);
         }
         if let Some(progress) = get_dict_opt::<PyObject>(options, "progress")? {
-            p.progress = Arc::new(PyWriteProgress::new(progress.to_object(options.py())));
+            p.progress = Arc::new(PyWriteProgress::new(progress.into_py_any(options.py())?));
         }
 
         if let Some(storage_options) =
@@ -1914,7 +1909,7 @@ impl WriteFragmentProgress for PyWriteProgress {
 
         Python::with_gil(|py| -> PyResult<()> {
             self.py_obj
-                .call_method_bound(py, "_do_begin", (json_str,), None)?;
+                .call_method(py, "_do_begin", (json_str,), None)?;
             Ok(())
         })
         .map_err(|e| {
@@ -1931,7 +1926,7 @@ impl WriteFragmentProgress for PyWriteProgress {
 
         Python::with_gil(|py| -> PyResult<()> {
             self.py_obj
-                .call_method_bound(py, "_do_complete", (json_str,), None)?;
+                .call_method(py, "_do_complete", (json_str,), None)?;
             Ok(())
         })
         .map_err(|e| {
@@ -1946,13 +1941,13 @@ impl WriteFragmentProgress for PyWriteProgress {
 
 /// Formats a Python error just as it would in Python interpreter.
 fn format_python_error(e: PyErr, py: Python) -> PyResult<String> {
-    let sys_mod = py.import_bound("sys")?;
+    let sys_mod = py.import("sys")?;
     // the traceback is the third element of the tuple returned by sys.exc_info()
     let traceback = sys_mod.call_method0("exc_info")?.get_item(2)?;
 
-    let tracback_mod = py.import_bound("traceback")?;
+    let tracback_mod = py.import("traceback")?;
     let fmt_func = tracback_mod.getattr("format_exception")?;
-    let e_type = e.get_type_bound(py).to_owned();
+    let e_type = e.get_type(py).to_owned();
     let formatted = fmt_func.call1((e_type, &e, traceback))?;
     let lines: Vec<String> = formatted.extract()?;
     Ok(lines.join(""))
