@@ -17,10 +17,9 @@ use lance_linalg::{
 use tracing::instrument;
 
 use crate::vector::ivf::transform::PartitionTransformer;
-use crate::vector::{pq::ProductQuantizer, residual::ResidualTransform, transform::Transformer};
+use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
 use super::pq::transform::PQTransformer;
-use super::quantizer::Quantization;
 use super::transform::KeepFiniteVectors;
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN};
