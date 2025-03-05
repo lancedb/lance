@@ -1530,7 +1530,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 4 types of scalar indices available today.
+        There are 5 types of scalar indices available today.
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -1573,8 +1573,6 @@ class LanceDataset(pa.dataset.Dataset):
         replace : bool, default True
             Replace the existing index if it exists.
 
-        Optional Parameters
-        -------------------
         with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
