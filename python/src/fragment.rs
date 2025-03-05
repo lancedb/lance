@@ -529,8 +529,8 @@ impl PyDeletionFile {
 
     fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.fragment")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.fragment")?
             .getattr("DeletionFile")?
             .getattr("from_json")?
             .extract()?;
@@ -578,8 +578,8 @@ impl PyRowIdMeta {
 
     fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.fragment")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.fragment")?
             .getattr("RowIdMeta")?
             .getattr("from_json")?
             .extract()?;
