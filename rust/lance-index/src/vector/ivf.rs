@@ -142,11 +142,7 @@ impl IvfTransformer {
             )));
         }
 
-        Self {
-            centroids,
-            distance_type,
-            transforms,
-        }
+        Self::new(centroids, distance_type, transforms)
     }
 
     /// Create a IVF_PQ struct.
@@ -200,11 +196,7 @@ impl IvfTransformer {
                 PQ_CODE_COLUMN,
             )));
         }
-        Self {
-            centroids,
-            distance_type,
-            transforms,
-        }
+        Self::new(centroids, distance_type, transforms)
     }
 
     fn with_sq(
@@ -218,7 +210,7 @@ impl IvfTransformer {
             Arc::new(super::transform::Flatten::new(vector_column)),
         ];
 
-        let mt = if metric_type == MetricType::Cosine {
+        let distance_type = if metric_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
                 vector_column,
             )));
@@ -229,7 +221,7 @@ impl IvfTransformer {
 
         let partition_transformer = Arc::new(PartitionTransformer::new(
             centroids.clone(),
-            mt,
+            distance_type,
             vector_column,
         ));
         transforms.push(partition_transformer);
@@ -241,11 +233,7 @@ impl IvfTransformer {
             )));
         }
 
-        Self {
-            centroids,
-            distance_type: metric_type,
-            transforms,
-        }
+        Self::new(centroids, distance_type, transforms)
     }
 
     #[inline]

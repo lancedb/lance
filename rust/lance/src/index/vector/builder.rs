@@ -358,22 +358,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "dataset not set before shuffling",
             location!(),
         ))?;
-        let is_nullable = dataset
-            .schema()
-            .field(&self.column)
-            .ok_or(Error::invalid_input(
-                format!("column {} not found in dataset", self.column).as_str(),
-                location!(),
-            ))?
-            .nullable;
         let mut builder = dataset.scan();
         builder
             .batch_readahead(get_num_compute_intensive_cpus())
             .project(&[self.column.as_str()])?
             .with_row_id();
-        if is_nullable {
-            builder.filter_expr(datafusion_expr::col(&self.column).is_not_null());
-        }
         let stream = builder.try_into_stream().await?;
         self.shuffle_data(Some(stream)).await?;
         Ok(())
@@ -522,7 +511,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     sub_index_params,
                     batch,
                     partition,
-                    &existing_indices,
                 )
                 .await
             }
@@ -549,7 +537,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         sub_index_params: S::BuildParams,
         batch: RecordBatch,
         part_id: usize,
-        existing_indices: &[Arc<dyn VectorIndex>],
     ) -> Result<(usize, usize)> {
         let local_store = ObjectStore::local();
         // build quantized vector storage
@@ -558,9 +545,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 StorageBuilder::new(column.clone(), distance_type, quantizer).build(&batch)?;
             let path = temp_dir.child(format!("storage_part{}", part_id));
             let batches = storage.to_batches()?;
-            // let existing_indices_batches =
-            //     Self::take_existing_indices_storage(part_id, existing_indices).await?;
-            // let batches = batches.chain(existing_indices_batches);
             FileWriter::create_file_with_batches(
                 &local_store,
                 &path,

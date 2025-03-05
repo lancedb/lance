@@ -180,7 +180,7 @@ impl Shuffler for IvfShuffler {
                             )
                         }
                     })
-                    .buffered(10)
+                    .buffered(self.object_store.io_parallelism())
                     .try_collect::<Vec<_>>()
                     .await?;
 

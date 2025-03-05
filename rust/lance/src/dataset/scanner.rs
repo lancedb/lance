@@ -2816,16 +2816,7 @@ mod test {
         scan.nearest("vec", &key, 5).unwrap();
         scan.refine(5);
 
-        let results = scan
-            .try_into_stream()
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        let batch = &results[0];
+        let batch = scan.try_into_batch().await.unwrap();
 
         assert_eq!(batch.num_rows(), 5);
         assert_eq!(
