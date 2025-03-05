@@ -66,7 +66,6 @@ use lance_table::format::Fragment;
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
-use pyo3::{prelude::*, IntoPyObjectExt};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
@@ -74,6 +73,7 @@ use pyo3::{
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
 };
+use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
 
 use crate::error::PythonErrorExt;
@@ -1016,8 +1016,7 @@ impl Dataset {
                     )
                     .unwrap();
                     let tup: Vec<(&String, &String)> = v.metadata.iter().collect();
-                    dict.set_item("metadata", tup.into_py_dict(py)?)
-                        .unwrap();
+                    dict.set_item("metadata", tup.into_py_dict(py)?).unwrap();
                     dict.into_py_any(py)
                 })
                 .collect::<PyResult<Vec<_>>>()?;
@@ -1389,9 +1388,14 @@ impl Dataset {
                     ..Default::default()
                 });
 
-        let commit_handler = commit_lock.as_ref().map(|commit_lock| {
-            commit_lock.into_py_any(commit_lock.py()).map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
-        }).transpose()?;
+        let commit_handler = commit_lock
+            .as_ref()
+            .map(|commit_lock| {
+                commit_lock
+                    .into_py_any(commit_lock.py())
+                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
+            })
+            .transpose()?;
 
         let dest = if dest.is_instance_of::<Self>() {
             let dataset: Self = dest.extract()?;
@@ -1446,9 +1450,13 @@ impl Dataset {
                     ..Default::default()
                 });
 
-        let commit_handler = commit_lock.map(|commit_lock| {
-            commit_lock.into_py_any(commit_lock.py()).map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
-        }).transpose()?;
+        let commit_handler = commit_lock
+            .map(|commit_lock| {
+                commit_lock
+                    .into_py_any(commit_lock.py())
+                    .map(|cl| Arc::new(PyCommitLock::new(cl)) as Arc<dyn CommitHandler>)
+            })
+            .transpose()?;
 
         let py = dest.py();
         let dest = if dest.is_instance_of::<Self>() {
@@ -1665,7 +1673,10 @@ pub fn get_commit_handler(options: &Bound<'_, PyDict>) -> PyResult<Option<Arc<dy
 // it were never present in the dictionary.  If the value is not
 // None it will try and parse it and parsing failures will be
 // returned (e.g. a parsing failure is not considered `None`)
-fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(dict: &'a Bound<'py, PyDict>, key: &str) -> PyResult<Option<D>> {
+fn get_dict_opt<'a, 'py, D: FromPyObject<'a>>(
+    dict: &'a Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Option<D>> {
     let value = dict.get_item(key)?;
     value
         .and_then(|v| {

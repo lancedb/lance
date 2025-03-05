@@ -287,9 +287,7 @@ pub fn shuffle_transformed_vectors(
     )?;
 
     match result {
-        Ok(partition_files) => {
-            PyList::new(py, partition_files).map(|py_list| py_list.into())
-        }
+        Ok(partition_files) => PyList::new(py, partition_files).map(|py_list| py_list.into()),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }

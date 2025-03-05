@@ -1190,8 +1190,7 @@ mod tests {
                     let batch = batch.clone();
                     let schema = schema.clone();
                     let test_uri = test_uri.clone();
-                    tokio::spawn(
-                        async move {
+                    tokio::spawn(async move {
                         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
                         Dataset::write(
                             reader,

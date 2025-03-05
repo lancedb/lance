@@ -68,14 +68,12 @@ fn unwrap_dataset(dataset: PyObject) -> PyResult<Py<Dataset>> {
 }
 
 fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
-    let fragment_metadata =
-        PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
+    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
     let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
         PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
     })?;
 
-    fragment_metadata
-        .call_method1("from_json", (fragment_json,))
+    fragment_metadata.call_method1("from_json", (fragment_json,))
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]

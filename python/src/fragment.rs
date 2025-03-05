@@ -657,7 +657,6 @@ impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
     }
 }
 
-
 impl FromPyObject<'_> for PyLance<DataFile> {
     fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
         Ok(Self(DataFile {

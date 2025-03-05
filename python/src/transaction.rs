@@ -255,13 +255,21 @@ impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
         let read_version = self.0.read_version;
         let uuid = &self.0.uuid;
         let operation = PyLance(&self.0.operation).into_pyobject(py)?;
-        let blobs_op = self.0.blobs_op.as_ref().map(|op| PyLance(op).into_pyobject(py)).transpose()?;
+        let blobs_op = self
+            .0
+            .blobs_op
+            .as_ref()
+            .map(|op| PyLance(op).into_pyobject(py))
+            .transpose()?;
 
         let cls = namespace
             .getattr("Transaction")
             .expect("Failed to get Transaction class");
         // Unwrap due to infallible
-        Ok(cls.call1((read_version, operation, uuid, blobs_op))?.into_pyobject(py).unwrap())
+        Ok(cls
+            .call1((read_version, operation, uuid, blobs_op))?
+            .into_pyobject(py)
+            .unwrap())
     }
 }
 

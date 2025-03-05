@@ -37,10 +37,14 @@ use lance_io::{
 };
 use object_store::path::Path;
 use pyo3::{
-    exceptions::{PyIOError, PyRuntimeError, PyValueError}, pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
+    pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python,
 };
 use serde::Serialize;
-use std::{collections::HashMap, sync::{Mutex, MutexGuard}};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, MutexGuard},
+};
 use std::{pin::Pin, sync::Arc};
 use url::Url;
 
@@ -265,7 +269,9 @@ impl LanceFileWriter {
     }
 
     fn inner_lock(&self) -> PyResult<MutexGuard<Box<FileWriter>>> {
-        self.inner.lock().map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        self.inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -298,7 +304,9 @@ impl LanceFileWriter {
     }
 
     pub fn finish(&mut self) -> PyResult<u64> {
-        RT.runtime.block_on(self.inner_lock()?.finish()).infer_error()
+        RT.runtime
+            .block_on(self.inner_lock()?.finish())
+            .infer_error()
     }
 
     pub fn add_global_buffer(&mut self, bytes: Vec<u8>) -> PyResult<u32> {
