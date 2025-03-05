@@ -41,7 +41,7 @@ categories = [
     "development-tools",
     "science",
 ]
-rust-version = "1.80.1"
+rust-version = "1.82.0"
 
 [workspace.dependencies]
 lance = { version = "=0.24.0", path = "./rust/lance" }
