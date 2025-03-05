@@ -167,6 +167,7 @@ mod tests {
     use lance_arrow::FixedSizeListArrayExt;
     use lance_index::vector::hnsw::builder::HnswBuildParams;
     use lance_index::vector::sq::builder::SQBuildParams;
+    use lance_index::vector::storage::VectorStore;
     use lance_index::{
         vector::{ivf::IvfBuildParams, pq::PQBuildParams},
         DatasetIndexExt, IndexType,
@@ -177,8 +178,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::dataset::builder::DatasetBuilder;
-    use crate::index::vector::ivf::IVFIndex;
-    use crate::index::vector::{pq::PQIndex, VectorIndexParams};
+    use crate::index::vector::ivf::v2;
+    use crate::index::vector::VectorIndexParams;
 
     #[tokio::test]
     async fn test_append_index() {
@@ -256,13 +257,7 @@ mod tests {
 
         // There should be two indices directories existed.
         let object_store = dataset.object_store();
-        let index_dirs = object_store
-            .read_dir_all(&dataset.indices_dir(), None)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
+        let index_dirs = object_store.read_dir(dataset.indices_dir()).await.unwrap();
         assert_eq!(index_dirs.len(), 2);
 
         let mut scanner = dataset.scan();
@@ -289,12 +284,11 @@ mod tests {
             .open_vector_index("vector", index.uuid.to_string().as_str())
             .await
             .unwrap();
-        let ivf_index = binding.as_any().downcast_ref::<IVFIndex>().unwrap();
+        let ivf_index = binding.as_any().downcast_ref::<v2::IvfPq>().unwrap();
         let row_in_index = stream::iter(0..IVF_PARTITIONS)
             .map(|part_id| async move {
-                let part = ivf_index.load_partition(part_id, true).await.unwrap();
-                let pq_idx = part.as_any().downcast_ref::<PQIndex>().unwrap();
-                pq_idx.row_ids.as_ref().unwrap().len()
+                let part = ivf_index.load_partition_storage(part_id).await.unwrap();
+                part.len()
             })
             .buffered(2)
             .collect::<Vec<usize>>()
