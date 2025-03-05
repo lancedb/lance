@@ -28,7 +28,6 @@ use crate::{
         ivf::storage::{IvfModel, IVF_METADATA_KEY},
         quantizer::Quantization,
     },
-    INDEX_METADATA_SCHEMA_KEY,
 };
 
 use super::quantizer::Quantizer;

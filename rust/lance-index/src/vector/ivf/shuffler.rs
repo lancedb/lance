@@ -243,7 +243,6 @@ impl PartitionListBuilder {
 #[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
-    column: &str,
     ivf: Arc<IvfTransformer>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
