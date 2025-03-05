@@ -670,6 +670,7 @@ impl DistCalculator for PQDistCalculator {
 
 #[cfg(test)]
 mod tests {
+    use crate::vector::ivf::storage::IvfModel;
     use crate::vector::storage::StorageBuilder;
 
     use super::*;
@@ -706,9 +707,14 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        StorageBuilder::new("vectors".to_owned(), pq.distance_type, pq)
-            .build(&batch)
-            .unwrap()
+        StorageBuilder::new(
+            &IvfModel::empty(),
+            "vectors".to_owned(),
+            pq.distance_type,
+            pq,
+        )
+        .build(&batch)
+        .unwrap()
     }
 
     #[tokio::test]

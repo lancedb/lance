@@ -30,8 +30,11 @@ use crate::{
     },
 };
 
-use super::quantizer::Quantizer;
-use super::DISTANCE_TYPE_KEY;
+use super::pq::ProductQuantizer;
+use super::quantizer::{QuantizationType, Quantizer};
+use super::residual::ResidualTransform;
+use super::transform::Transformer;
+use super::{DISTANCE_TYPE_KEY, PART_ID_COLUMN};
 
 /// <section class="warning">
 ///  Internal API
@@ -149,18 +152,36 @@ pub struct StorageBuilder<Q: Quantization> {
     column: String,
     distance_type: DistanceType,
     quantizer: Q,
+    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(column: String, distance_type: DistanceType, quantizer: Q) -> Self {
+    pub fn new(ivf: &IvfModel, column: String, distance_type: DistanceType, quantizer: Q) -> Self {
+        let mut transformers = vec![];
+        if matches!(Q::quantization_type(), QuantizationType::Product)
+            && ProductQuantizer::use_residual(distance_type)
+            && ivf.centroids.is_some()
+        {
+            transformers.push(Arc::new(ResidualTransform::new(
+                ivf.centroids.clone().unwrap(),
+                PART_ID_COLUMN,
+                &column,
+            )) as _);
+        }
         Self {
             column,
             distance_type,
             quantizer,
+            transformers,
         }
     }
 
     pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
+        let mut batch = batch.clone();
+        for transformer in &self.transformers {
+            batch = transformer.transform(&batch)?;
+        }
+
         let vectors = batch.column_by_name(&self.column).ok_or(Error::Schema {
             message: format!("column {} not found", self.column),
             location: location!(),

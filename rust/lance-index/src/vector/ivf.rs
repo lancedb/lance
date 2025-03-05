@@ -182,13 +182,6 @@ impl IvfTransformer {
             )));
         }
 
-        if ProductQuantizer::use_residual(distance_type) {
-            transforms.push(Arc::new(ResidualTransform::new(
-                centroids.clone(),
-                PART_ID_COLUMN,
-                vector_column,
-            )));
-        }
         if with_pq_code {
             transforms.push(Arc::new(PQTransformer::new(
                 pq,

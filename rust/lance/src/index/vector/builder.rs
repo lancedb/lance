@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{RecordBatch, UInt32Array, UInt64Array};
 use futures::prelude::stream::{StreamExt, TryStreamExt};
 use futures::{stream, FutureExt};
 use itertools::Itertools;
@@ -24,7 +24,7 @@ use lance_index::vector::quantizer::{
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::v3::shuffler::IvfShufflerReader;
 use lance_index::vector::v3::subindex::SubIndexType;
-use lance_index::vector::VectorIndex;
+use lance_index::vector::{VectorIndex, PART_ID_FIELD};
 use lance_index::{
     pb,
     vector::{
@@ -474,6 +474,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let dataset = Arc::new(dataset.clone());
         let reader = reader.clone();
+        let ivf = Arc::new(ivf.clone());
         let existing_indices = Arc::new(self.existing_indices.clone());
         let distance_type = self.distance_type;
         let mut partition_sizes = vec![(0, 0); ivf.num_partitions()];
@@ -484,6 +485,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let column = self.column.clone();
             let store = self.store.clone();
             let temp_dir = self.temp_dir.clone();
+            let ivf = ivf.clone();
             let quantizer = quantizer.clone();
             let sub_index_params = sub_index_params.clone();
             async move {
@@ -507,6 +509,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     &temp_dir,
                     column,
                     distance_type,
+                    &ivf,
                     quantizer,
                     sub_index_params,
                     batch,
@@ -533,6 +536,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         temp_dir: &Path,
         column: String,
         distance_type: DistanceType,
+        ivf: &IvfModel,
         quantizer: Q,
         sub_index_params: S::BuildParams,
         batch: RecordBatch,
@@ -542,7 +546,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // build quantized vector storage
         let storage_len = {
             let storage =
-                StorageBuilder::new(column.clone(), distance_type, quantizer).build(&batch)?;
+                StorageBuilder::new(ivf, column.clone(), distance_type, quantizer).build(&batch)?;
             let path = temp_dir.child(format!("storage_part{}", part_id));
             let batches = storage.to_batches()?;
             FileWriter::create_file_with_batches(
@@ -595,15 +599,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ))?;
 
             let part_storage = existing_index.load_partition_storage(part_id).await?;
-            batches.extend(
-                Self::take_vectors(
-                    dataset,
-                    column,
-                    store,
-                    part_storage.row_ids().cloned().collect_vec().as_ref(),
-                )
-                .await?,
-            );
+            let part_batches = Self::take_vectors(
+                dataset,
+                column,
+                store,
+                part_storage.row_ids().cloned().collect_vec().as_ref(),
+            )
+            .await?;
+            let part_batches = part_batches
+                .into_iter()
+                .map(|batch| {
+                    let part_ids = UInt32Array::from_iter_values(std::iter::repeat_n(
+                        part_id as u32,
+                        batch.num_rows(),
+                    ));
+                    Ok(batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            batches.extend(part_batches);
         }
 
         if reader.partition_size(part_id)? > 0 {
