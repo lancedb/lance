@@ -402,6 +402,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.delete(location).await
     }
 

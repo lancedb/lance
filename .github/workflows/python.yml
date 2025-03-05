@@ -27,6 +27,9 @@ env:
   RUSTFLAGS: "-C debuginfo=1"
   RUST_BACKTRACE: "1"
   CI: "true"
+  # Color output for pytest is off by default.
+  PYTEST_ADDOPTS: "--color=yes"
+  FORCE_COLOR: "1"
 
 jobs:
   lint:
@@ -203,22 +206,6 @@ jobs:
       run:
         shell: bash
         working-directory: python
-    services:
-      minio:
-        image: lazybit/minio
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ACCESS_KEY: ACCESSKEY
-          MINIO_SECRET_KEY: SECRETKEY
-        options: --name=minio --health-cmd "curl http://localhost:9000/minio/health/live"
-      dynamodb-local:
-        image: amazon/dynamodb-local
-        ports:
-          - 8000:8000
-        env:
-          AWS_ACCESS_KEY_ID: ACCESSKEY
-          AWS_SECRET_ACCESS_KEY: SECRETKEY
     steps:
       - uses: actions/checkout@v4
         with:

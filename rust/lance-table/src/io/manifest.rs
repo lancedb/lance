@@ -45,6 +45,13 @@ pub async fn read_manifest(
         end: file_size,
     };
     let buf = object_store.inner.get_range(path, range).await?;
+
+    // In case of corruption, the known_size might be wrong. We can retry without
+    // the size to be more robust.
+    if (buf.len() < 16 || !buf.ends_with(MAGIC)) && known_size.is_some() {
+        return Box::pin(read_manifest(object_store, path, None)).await;
+    }
+
     if buf.len() < 16 {
         return Err(Error::io(
             "Invalid format: file size is smaller than 16 bytes".to_string(),

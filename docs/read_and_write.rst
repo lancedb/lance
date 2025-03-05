@@ -841,6 +841,13 @@ To configure Lance to use an S3 Express endpoint, you must set the storage optio
 Committing mechanisms for S3
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+.. deprecated::
+
+  S3 now supports atomic put-if-not-exists, so this feature is no longer necessary.
+  It will be removed in a future version. You should migrate tables to use the 
+  new feature by removing the commit locks from all writers at the same time. Note
+  that it is unsafe to mix writers with and without commit locks on the same dataset.
+
 Most supported storage systems (e.g. local file system, Google Cloud Storage,
 Azure Blob Store) natively support atomic commits, which prevent concurrent
 writers from corrupting the dataset. However, S3 does not support this natively.

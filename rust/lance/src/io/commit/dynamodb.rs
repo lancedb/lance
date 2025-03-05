@@ -7,11 +7,8 @@
 // since these tests applies to all external manifest stores,
 // we should move them to a common place
 // https://github.com/lancedb/lance/issues/1208
-//
-// The tests are linux only because
-// GHA Mac runner doesn't have docker, which is required to run dynamodb-local
 // Windows FS can't handle concurrent copy
-#[cfg(all(test, target_os = "linux", feature = "dynamodb_tests"))]
+#[cfg(all(test, not(target_os = "windows")))]
 mod test {
     macro_rules! base_uri {
         () => {
@@ -69,10 +66,10 @@ mod test {
             .behavior_version_latest()
             .endpoint_url(
                 // url for dynamodb-local
-                "http://localhost:8000",
+                "http://localhost:4566",
             )
             .region(Some(Region::new("us-east-1")))
-            .credentials_provider(Credentials::new("DUMMYKEY", "DUMMYKEY", None, None, ""))
+            .credentials_provider(Credentials::new("ACCESS_KEY", "SECRET_KEY", None, None, ""))
             .build();
 
         let table_name = uuid::Uuid::new_v4().to_string();
@@ -138,16 +135,16 @@ mod test {
             .to_string()
             .starts_with("Not found: dynamodb not found: base_uri: test; version: 1"));
         // try to use the API for finalizing should return err when the version is DNE
-        assert!(store.put_if_exists("test", 1, "test").await.is_err());
+        assert!(store.put_if_exists("test", 1, "test", 4).await.is_err());
 
         // Put a new version should work
         assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized")
+            .put_if_not_exists("test", 1, "test.unfinalized", 4)
             .await
             .is_ok());
         // put again should get err
         assert!(store
-            .put_if_not_exists("test", 1, "test.unfinalized_1")
+            .put_if_not_exists("test", 1, "test.unfinalized_1", 4)
             .await
             .is_err());
 
@@ -160,7 +157,7 @@ mod test {
 
         // Put a new version should work again
         assert!(store
-            .put_if_not_exists("test", 2, "test.unfinalized_2")
+            .put_if_not_exists("test", 2, "test.unfinalized_2", 4)
             .await
             .is_ok());
         // latest should see update
@@ -170,7 +167,7 @@ mod test {
         );
 
         // try to finalize should work on existing version
-        assert!(store.put_if_exists("test", 2, "test").await.is_ok());
+        assert!(store.put_if_exists("test", 2, "test", 4).await.is_ok());
 
         // latest should see update
         assert_eq!(
@@ -322,8 +319,18 @@ mod test {
             )
             .await
             .unwrap();
+        let size = localfs
+            .head(&version_six_staging_location)
+            .await
+            .unwrap()
+            .size as u64;
         store
-            .put_if_exists(ds.base.as_ref(), 6, version_six_staging_location.as_ref())
+            .put_if_exists(
+                ds.base.as_ref(),
+                6,
+                version_six_staging_location.as_ref(),
+                size,
+            )
             .await
             .unwrap();
 
