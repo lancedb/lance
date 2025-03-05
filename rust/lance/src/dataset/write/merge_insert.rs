@@ -89,8 +89,8 @@ use crate::{
 
 use super::{write_fragments_internal, CommitBuilder, WriteParams};
 
+mod assign_action;
 mod merge_insert_exec;
-mod merger_exec;
 
 // "update if" expressions typically compare fields from the source table to the target table.
 // These tables have the same schema and so filter expressions need to differentiate.  To do that
