@@ -12,7 +12,7 @@ use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::cache::FileMetadataCache;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
+use lance_core::{Error, Result, ROW_ID_FIELD};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::v2::reader::FileReaderOptions;
 use lance_file::v2::{reader::FileReader, writer::FileWriter};
@@ -574,26 +574,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         Ok((storage_len, index_len))
-    }
-
-    async fn take_existing_indices_storage(
-        part_id: usize,
-        existing_indices: &[Arc<dyn VectorIndex>],
-    ) -> Result<Vec<RecordBatch>> {
-        let mut batches = Vec::with_capacity(existing_indices.len());
-        for existing_index in existing_indices.iter() {
-            let existing_index = existing_index
-                .as_any()
-                .downcast_ref::<IVFIndex<S, Q>>()
-                .ok_or(Error::invalid_input(
-                    "existing index is not IVF index",
-                    location!(),
-                ))?;
-            let part_storage = existing_index.load_partition_storage(part_id).await?;
-            batches.extend(part_storage.to_batches()?);
-        }
-
-        Ok(batches)
     }
 
     async fn take_partition_batches(

@@ -490,7 +490,6 @@ async fn optimize_ivf_pq_indices(
         Some(unindexed) => Some(
             shuffle_dataset(
                 unindexed,
-                vector_column,
                 ivf.into(),
                 None,
                 first_idx.ivf.num_partitions() as u32,
@@ -567,7 +566,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         Some(unindexed) => Some(
             shuffle_dataset(
                 unindexed,
-                vector_column,
                 Arc::new(ivf),
                 None,
                 first_idx.ivf.num_partitions() as u32,

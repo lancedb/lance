@@ -54,7 +54,6 @@ use lance_linalg::{distance::DistanceType, kernels::normalize_arrow};
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
-use serde_json::json;
 use snafu::location;
 use tracing::instrument;
 
