@@ -2478,6 +2478,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "186e05a59d4c50738528153b83b0b0194d3a29507dfec16eccd4b342903397d0"
 dependencies = [
  "log",
+ "regex",
 ]
 
 [[package]]
@@ -2502,6 +2503,7 @@ dependencies = [
  "anstream",
  "anstyle",
  "env_filter",
+ "humantime",
  "log",
 ]
 
@@ -3972,6 +3974,7 @@ dependencies = [
  "datafusion-sql",
  "deepsize",
  "dirs",
+ "env_logger 0.11.6",
  "futures",
  "half",
  "itertools 0.13.0",
