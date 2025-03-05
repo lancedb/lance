@@ -53,33 +53,33 @@ pub enum WriteDestination {
 impl WriteDestination {
     pub fn dataset(&self) -> Option<&Dataset> {
         match self {
-            WriteDestination::Dataset(dataset) => Some(dataset.as_ref()),
-            WriteDestination::Uri(_) => None,
+            Self::Dataset(dataset) => Some(dataset.as_ref()),
+            Self::Uri(_) => None,
         }
     }
 }
 
 impl From<Arc<Dataset>> for WriteDestination {
     fn from(dataset: Arc<Dataset>) -> Self {
-        WriteDestination::Dataset(dataset)
+        Self::Dataset(dataset)
     }
 }
 
 impl From<&str> for WriteDestination {
     fn from(uri: &str) -> Self {
-        WriteDestination::Uri(uri.to_string())
+        Self::Uri(uri.to_string())
     }
 }
 
 impl From<String> for WriteDestination {
     fn from(uri: String) -> Self {
-        WriteDestination::Uri(uri)
+        Self::Uri(uri)
     }
 }
 
 impl From<&Path> for WriteDestination {
     fn from(path: &Path) -> Self {
-        WriteDestination::Uri(path.to_string())
+        Self::Uri(path.to_string())
     }
 }
 
