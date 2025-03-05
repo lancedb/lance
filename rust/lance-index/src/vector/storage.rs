@@ -196,7 +196,8 @@ impl<Q: Quantization> StorageBuilder<Q> {
                 ),
                 code_array,
             )?
-            .drop_column(&self.column)?;
+            .drop_column(&self.column)?
+            .drop_column(PART_ID_COLUMN)?;
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
