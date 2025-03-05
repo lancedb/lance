@@ -532,6 +532,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(self)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build_partition(
         temp_dir: &Path,
         column: String,
