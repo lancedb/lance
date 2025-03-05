@@ -11,7 +11,7 @@ use lance_table::format::{DataFile, Fragment, Index};
 use pyo3::exceptions::PyValueError;
 use pyo3::types::PySet;
 use pyo3::{intern, prelude::*};
-use pyo3::{Bound, FromPyObject, PyAny, PyObject, PyResult, Python, ToPyObject};
+use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use uuid::Uuid;
 
 use crate::schema::LanceSchema;
@@ -26,20 +26,24 @@ impl FromPyObject<'_> for PyLance<DataReplacementGroup> {
     }
 }
 
-impl ToPyObject for PyLance<&DataReplacementGroup> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let namespace = py
-            .import_bound(intern!(py, "lance"))
+            .import(intern!(py, "lance"))
             .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .expect("Failed to import LanceOperation namespace");
 
         let fragment_id = self.0 .0;
-        let new_file = PyLance(&self.0 .1).to_object(py);
+        let new_file = PyLance(&self.0 .1).into_pyobject(py)?;
 
         let cls = namespace
             .getattr("DataReplacementGroup")
             .expect("Failed to get DataReplacementGroup class");
-        cls.call1((fragment_id, new_file)).unwrap().to_object(py)
+        cls.call1((fragment_id, new_file))
     }
 }
 
@@ -160,27 +164,31 @@ impl FromPyObject<'_> for PyLance<Operation> {
     }
 }
 
-impl ToPyObject for PyLance<&Operation> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let namespace = py
-            .import_bound(intern!(py, "lance"))
+            .import(intern!(py, "lance"))
             .and_then(|module| module.getattr(intern!(py, "LanceOperation")))
             .expect("Failed to import LanceOperation namespace");
 
         match self.0 {
             Operation::Append { ref fragments } => {
-                let fragments = export_vec(py, fragments.as_slice());
+                let fragments = export_vec(py, fragments.as_slice())?;
                 let cls = namespace
                     .getattr("Append")
                     .expect("Failed to get Append class");
-                cls.call1((fragments,)).unwrap().to_object(py)
+                cls.call1((fragments,))
             }
             Operation::Overwrite {
                 ref fragments,
                 ref schema,
                 ..
             } => {
-                let fragments_py = export_vec(py, fragments.as_slice());
+                let fragments_py = export_vec(py, fragments.as_slice())?;
 
                 let schema_py = LanceSchema(schema.clone());
 
@@ -189,30 +197,26 @@ impl ToPyObject for PyLance<&Operation> {
                     .expect("Failed to get Overwrite class");
 
                 cls.call1((schema_py, fragments_py))
-                    .expect("Failed to create Overwrite instance")
-                    .to_object(py)
             }
             Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
                 new_fragments,
             } => {
-                let removed_fragment_ids = removed_fragment_ids.to_object(py);
-                let updated_fragments = export_vec(py, updated_fragments.as_slice());
-                let new_fragments = export_vec(py, new_fragments.as_slice());
+                let removed_fragment_ids = removed_fragment_ids.into_pyobject(py)?;
+                let updated_fragments = export_vec(py, updated_fragments.as_slice())?;
+                let new_fragments = export_vec(py, new_fragments.as_slice())?;
                 let cls = namespace
                     .getattr("Update")
                     .expect("Failed to get Update class");
                 cls.call1((removed_fragment_ids, updated_fragments, new_fragments))
-                    .unwrap()
-                    .to_object(py)
             }
             Operation::DataReplacement { replacements } => {
-                let replacements = export_vec(py, replacements.as_slice());
+                let replacements = export_vec(py, replacements.as_slice())?;
                 let cls = namespace
                     .getattr("DataReplacement")
                     .expect("Failed to get DataReplacement class");
-                cls.call1((replacements,)).unwrap().to_object(py)
+                cls.call1((replacements,))
             }
             _ => todo!(),
         }
@@ -238,29 +242,36 @@ impl FromPyObject<'_> for PyLance<Transaction> {
     }
 }
 
-impl ToPyObject for PyLance<&Transaction> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&Transaction> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let namespace = py
-            .import_bound(intern!(py, "lance"))
+            .import(intern!(py, "lance"))
             .expect("Failed to import lance module");
 
         let read_version = self.0.read_version;
         let uuid = &self.0.uuid;
-        let operation = PyLance(&self.0.operation).to_object(py);
-        let blobs_op = self.0.blobs_op.as_ref().map(|op| PyLance(op).to_object(py));
+        let operation = PyLance(&self.0.operation).into_pyobject(py)?;
+        let blobs_op = self.0.blobs_op.as_ref().map(|op| PyLance(op).into_pyobject(py)).transpose()?;
 
         let cls = namespace
             .getattr("Transaction")
             .expect("Failed to get Transaction class");
-        cls.call1((read_version, operation, uuid, blobs_op))
-            .unwrap()
-            .to_object(py)
+        // Unwrap due to infallible
+        Ok(cls.call1((read_version, operation, uuid, blobs_op))?.into_pyobject(py).unwrap())
     }
 }
 
-impl ToPyObject for PyLance<Transaction> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        PyLance(&self.0).to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<Transaction> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }
 
@@ -273,20 +284,22 @@ impl FromPyObject<'_> for PyLance<RewriteGroup> {
     }
 }
 
-impl ToPyObject for PyLance<&RewriteGroup> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&RewriteGroup> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
-            .import_bound(intern!(py, "lance"))
+            .import(intern!(py, "lance"))
             .and_then(|module| module.getattr(intern!(py, "LanceTransaction")))
             .and_then(|cls| cls.getattr(intern!(py, "RewriteGroup")))
             .expect("Failed to get RewriteGroup class");
 
-        let old_fragments = export_vec(py, self.0.old_fragments.as_slice());
-        let new_fragments = export_vec(py, self.0.new_fragments.as_slice());
+        let old_fragments = export_vec(py, self.0.old_fragments.as_slice())?;
+        let new_fragments = export_vec(py, self.0.new_fragments.as_slice())?;
 
         cls.call1((old_fragments, new_fragments))
-            .unwrap()
-            .to_object(py)
     }
 }
 
@@ -302,17 +315,21 @@ impl FromPyObject<'_> for PyLance<RewrittenIndex> {
     }
 }
 
-impl ToPyObject for PyLance<&RewrittenIndex> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&RewrittenIndex> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
-            .import_bound(intern!(py, "lance"))
+            .import(intern!(py, "lance"))
             .and_then(|module| module.getattr(intern!(py, "LanceTransaction")))
             .and_then(|cls| cls.getattr(intern!(py, "RewrittenIndex")))
             .expect("Failed to get RewrittenIndex class");
 
         let old_id = self.0.old_id.to_string();
         let new_id = self.0.new_id.to_string();
-        cls.call1((old_id, new_id)).unwrap().to_object(py)
+        cls.call1((old_id, new_id))
     }
 }
 

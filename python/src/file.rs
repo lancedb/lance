@@ -37,7 +37,7 @@ use lance_io::{
 };
 use object_store::path::Path;
 use pyo3::{
-    exceptions::{PyIOError, PyRuntimeError, PyValueError}, pyclass, pymethods, IntoPy, IntoPyObjectExt, PyObject, PyResult, Python
+    exceptions::{PyIOError, PyRuntimeError, PyValueError}, pyclass, pymethods, IntoPyObjectExt, PyObject, PyResult, Python
 };
 use serde::Serialize;
 use std::{collections::HashMap, sync::{Mutex, MutexGuard}};
@@ -308,7 +308,8 @@ impl LanceFileWriter {
     }
 
     pub fn add_schema_metadata(&mut self, key: String, value: String) -> PyResult<()> {
-        Ok(self.inner_lock()?.add_schema_metadata(key, value))
+        self.inner_lock()?.add_schema_metadata(key, value);
+        Ok(())
     }
 }
 

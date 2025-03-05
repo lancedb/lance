@@ -39,6 +39,7 @@ use pyo3::{
     exceptions::{PyIOError, PyRuntimeError, PyValueError},
     prelude::*,
     types::PyIterator,
+    IntoPyObjectExt,
 };
 
 use crate::RT;
@@ -251,15 +252,6 @@ impl Hnsw {
 /// This is used for types that have a corresponding dataclass in Python.
 pub struct PyLance<T>(pub T);
 
-impl<T> IntoPy<PyObject> for PyLance<T>
-where
-    Self: ToPyObject,
-{
-    fn into_py(self, py: Python) -> PyObject {
-        self.to_object(py)
-    }
-}
-
 /// Extract a Vec of PyLance types from a Python object.
 pub fn extract_vec<'a, T>(ob: &Bound<'a, PyAny>) -> PyResult<Vec<T>>
 where
@@ -270,16 +262,16 @@ where
 }
 
 /// Export a Vec of Lance types to a Python object.
-pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> Vec<PyObject>
+pub fn export_vec<'a, T>(py: Python<'a>, vec: &'a [T]) -> PyResult<Vec<PyObject>>
 where
-    PyLance<&'a T>: ToPyObject,
+    PyLance<&'a T>: IntoPyObject<'a>,
 {
     vec.iter()
-        .map(|t| PyLance(t).to_object(py))
-        .collect::<Vec<_>>()
+        .map(|t| PyLance(t).into_py_any(py))
+        .collect::<std::result::Result<Vec<_>, _>>()
 }
 
-pub fn class_name<'a>(ob: &'a Bound<'_, PyAny>) -> PyResult<String> {
+pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
     let full_name: String = ob
         .getattr(intern!(ob.py(), "__class__"))?
         .getattr(intern!(ob.py(), "__name__"))?

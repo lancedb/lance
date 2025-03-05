@@ -1653,7 +1653,7 @@ pub fn get_commit_handler(options: &Bound<'_, PyDict>) -> PyResult<Option<Arc<dy
         None
     } else if let Ok(Some(commit_handler)) = options.get_item("commit_handler") {
         Some(Arc::new(PyCommitLock::new(
-            commit_handler.into_pyobject(options.py())?.try_into()?,
+            commit_handler.into_pyobject(options.py())?.into(),
         )))
     } else {
         None

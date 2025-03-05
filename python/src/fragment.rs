@@ -394,19 +394,19 @@ pub fn write_fragments(
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
-    Ok(export_vec(reader.py(), &fragments))
+    export_vec(reader.py(), &fragments)
 }
 
 #[pyfunction(name = "_write_fragments_transaction")]
 #[pyo3(signature = (dest, reader, **kwargs))]
-pub fn write_fragments_transaction(
-    dest: &Bound<PyAny>,
-    reader: &Bound<PyAny>,
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<PyObject> {
+pub fn write_fragments_transaction<'py>(
+    dest: &Bound<'py, PyAny>,
+    reader: &'py Bound<'py, PyAny>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyAny>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
-    Ok(PyLance(written).to_object(reader.py()))
+    PyLance(written).into_pyobject(reader.py())
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -452,7 +452,7 @@ impl PyDeletionFile {
     }
 
     fn asdict(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyDict>> {
-        let dict = PyDict::new_bound(slf.py());
+        let dict = PyDict::new(slf.py());
 
         dict.set_item(intern!(slf.py(), "read_version"), slf.0.read_version)?;
         dict.set_item(intern!(slf.py(), "id"), slf.0.id)?;
@@ -618,14 +618,18 @@ impl FromPyObject<'_> for PyLance<Fragment> {
     }
 }
 
-impl ToPyObject for PyLance<&Fragment> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
-            .import_bound(intern!(py, "lance.fragment"))
+            .import(intern!(py, "lance.fragment"))
             .and_then(|m| m.getattr("FragmentMetadata"))
             .expect("FragmentMetadata class not found");
 
-        let files = export_vec(py, &self.0.files);
+        let files = export_vec(py, &self.0.files)?;
         let deletion_file = self
             .0
             .deletion_file
@@ -640,16 +644,19 @@ impl ToPyObject for PyLance<&Fragment> {
             deletion_file,
             row_id_meta,
         ))
-        .unwrap()
-        .to_object(py)
     }
 }
 
-impl ToPyObject for PyLance<Fragment> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        PyLance(&self.0).to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }
+
 
 impl FromPyObject<'_> for PyLance<DataFile> {
     fn extract_bound(ob: &pyo3::Bound<'_, PyAny>) -> PyResult<Self> {
@@ -663,10 +670,14 @@ impl FromPyObject<'_> for PyLance<DataFile> {
     }
 }
 
-impl ToPyObject for PyLance<&DataFile> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
-            .import_bound(intern!(py, "lance.fragment"))
+            .import(intern!(py, "lance.fragment"))
             .and_then(|m| m.getattr("DataFile"))
             .expect("DataFile class not found");
 
@@ -677,13 +688,15 @@ impl ToPyObject for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
         ))
-        .unwrap()
-        .to_object(py)
     }
 }
 
-impl ToPyObject for PyLance<DataFile> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        PyLance(&self.0).to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<DataFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }
