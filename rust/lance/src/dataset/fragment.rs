@@ -3230,7 +3230,7 @@ mod tests {
         };
         let object_store_registry = Arc::new(ObjectStoreRegistry::default());
         let dataset = Dataset::commit(
-            &dataset.uri,
+            dataset.uri.as_str(),
             op,
             Some(dataset.version().version),
             None,

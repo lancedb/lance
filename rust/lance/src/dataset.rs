@@ -844,7 +844,7 @@ impl Dataset {
     /// # let reader = RecordBatchIterator::new(
     /// #    vec![batch].into_iter().map(Ok), schema
     /// # );
-    /// # let dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
+    /// # let dataset = Dataset::write(reader, uri, Some(write_params)).await.unwrap();
     /// #
     /// let schema = dataset.schema().clone();
     /// let row_ids = vec![0, 4, 7];

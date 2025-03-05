@@ -583,7 +583,7 @@ mod tests {
         ) -> Result<()> {
             Dataset::write(
                 data,
-                &self.dataset_path,
+                self.dataset_path.as_str(),
                 Some(WriteParams {
                     store_params: Some(self.os_params()),
                     commit_handler: Some(Arc::new(RenameCommitHandler)),
