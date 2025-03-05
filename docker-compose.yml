@@ -6,11 +6,10 @@ services:
       - 4566:4566
     environment:
       - SERVICES=s3,dynamodb,kms
-      - DEBUG=1
-      - LS_LOG=trace
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - AWS_ACCESS_KEY_ID=ACCESSKEY
-      - AWS_SECRET_ACCESS_KEY=SECRETKEY
+      # Note: localstack doesn't actually validate these.
+      - AWS_ACCESS_KEY_ID=ACCESS_KEY
+      - AWS_SECRET_ACCESS_KEY=SECRET_KEY
     healthcheck:
       test: [ "CMD", "curl", "-s", "http://localhost:4566/_localstack/health" ]
       interval: 5s

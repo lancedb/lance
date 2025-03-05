@@ -11,7 +11,7 @@
 //!
 //! The trait [CommitHandler] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [RenameCommitHandler], which writes the manifest to a temporary path, then
+//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
 //! at the final path.
 //!

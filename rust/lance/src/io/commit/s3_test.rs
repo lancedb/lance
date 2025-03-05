@@ -30,7 +30,7 @@ async fn aws_config() -> SdkConfig {
         .credentials_provider(credentials)
         .endpoint_url(CONFIG[2].1)
         .behavior_version(BehaviorVersion::latest())
-        .region(Region::new("us-east-1"))
+        .region(Region::new(CONFIG[5].1))
         .load()
         .await
 }
@@ -97,6 +97,7 @@ impl DynamoDBCommitTable {
 
         // In case it wasn't deleted earlier
         Self::delete_table(client.clone(), name).await;
+        // Dynamodb table drop is async, so we need to wait a bit
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         use aws_sdk_dynamodb::types::*;
@@ -247,6 +248,13 @@ async fn test_concurrent_writers() {
 
     let num_rows = dataset.count_rows(None).await.unwrap();
     assert_eq!(num_rows, data.num_rows() * (concurrency + 1));
+
+    dataset.validate().await.unwrap();
+    let half_rows = dataset
+        .count_rows(Some("values >= 50".into()))
+        .await
+        .unwrap();
+    assert_eq!(half_rows, num_rows / 2);
 }
 
 #[tokio::test]
@@ -255,7 +263,6 @@ async fn test_ddb_open_iops() {
 
     let bucket = S3Bucket::new("test-ddb-iops").await;
     let ddb_table = DynamoDBCommitTable::new("test-ddb-iops").await;
-    // let uri = format!("s3://{}/", bucket.0);
     let uri = format!("s3+ddb://{}/test?ddbTableName={}", bucket.0, ddb_table.0);
 
     let datagen = gen().col("values", array::step::<Int32Type>());

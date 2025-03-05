@@ -29,6 +29,7 @@ env:
   CI: "true"
   # Color output for pytest is off by default.
   PYTEST_ADDOPTS: "--color=yes"
+  FORCE_COLOR: "1"
 
 jobs:
   lint:
