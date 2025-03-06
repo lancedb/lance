@@ -20,6 +20,8 @@ use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
 use super::pq::transform::PQTransformer;
+use super::quantizer::Quantization;
+use super::residual::ResidualTransform;
 use super::transform::KeepFiniteVectors;
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN};
@@ -158,7 +160,7 @@ impl IvfTransformer {
             Arc::new(super::transform::Flatten::new(vector_column)),
         ];
 
-        let mt = if distance_type == MetricType::Cosine {
+        let distance_type = if distance_type == MetricType::Cosine {
             transforms.push(Arc::new(super::transform::NormalizeTransformer::new(
                 vector_column,
             )));
@@ -169,7 +171,7 @@ impl IvfTransformer {
 
         let partition_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),
-            mt,
+            distance_type,
             vector_column,
         ));
         transforms.push(partition_transform);
@@ -182,6 +184,13 @@ impl IvfTransformer {
         }
 
         if with_pq_code {
+            if ProductQuantizer::use_residual(distance_type) {
+                transforms.push(Arc::new(ResidualTransform::new(
+                    centroids.clone(),
+                    PART_ID_COLUMN,
+                    vector_column,
+                )));
+            }
             transforms.push(Arc::new(PQTransformer::new(
                 pq,
                 vector_column,
