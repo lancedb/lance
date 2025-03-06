@@ -35,8 +35,6 @@ pub struct TraceGuard {
     guard: Option<Arc<Mutex<tracing_chrome::FlushGuard>>>,
 }
 
-unsafe impl Sync for TraceGuard {}
-
 #[pymethods]
 impl TraceGuard {
     pub fn finish_tracing(&mut self) {

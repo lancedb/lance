@@ -234,8 +234,6 @@ pub struct LanceFileWriter {
     inner: Arc<Mutex<Box<FileWriter>>>,
 }
 
-unsafe impl Sync for LanceFileReader {}
-
 impl LanceFileWriter {
     async fn open(
         uri_or_path: String,
