@@ -803,7 +803,6 @@ mod tests {
         let gt_set = gt.iter().map(|r| r.1).collect::<HashSet<_>>();
 
         let recall = row_ids.intersection(&gt_set).count() as f32 / k as f32;
-        println!("recall: {}", recall);
         assert!(
             recall >= recall_requirement,
             "recall: {}\n results: {:?}\n\ngt: {:?}",
