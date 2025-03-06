@@ -816,7 +816,7 @@ impl Planner {
         for i in (start_idx..hex_bytes.len()).step_by(2) {
             let high = Self::try_decode_hex_char(hex_bytes[i])?;
             let low = Self::try_decode_hex_char(hex_bytes[i + 1])?;
-            decoded_bytes.push(high << 4 | low);
+            decoded_bytes.push((high << 4) | low);
         }
 
         Some(decoded_bytes)

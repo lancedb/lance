@@ -23,7 +23,7 @@ use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::object_writer::ObjectWriter;
-use lance_io::traits::WriteExt;
+use lance_io::traits::{WriteExt, Writer};
 use lance_io::utils::{read_last_block, read_metadata_offset, read_struct};
 use lance_table::format::{
     DataStorageFormat, Fragment, Index, Manifest, MAGIC, MAJOR_VERSION, MINOR_VERSION,
@@ -1694,15 +1694,16 @@ fn write_manifest_file_to_path<'a>(
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<()>> {
+) -> BoxFuture<'a, Result<u64>> {
     Box::pin(async {
         let mut object_writer = ObjectWriter::new(object_store, path).await?;
         let pos = write_manifest(&mut object_writer, manifest, indices).await?;
         object_writer
             .write_magics(pos, MAJOR_VERSION, MINOR_VERSION, MAGIC)
             .await?;
+        let size = object_writer.tell().await? as u64;
         object_writer.shutdown().await?;
-        Ok(())
+        Ok(size)
     })
 }
 

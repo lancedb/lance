@@ -27,6 +27,8 @@ use lance::Error;
 use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
 use object_store::path::Path;
+use pyo3::basic::CompareOp;
+use pyo3::types::PyTuple;
 use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 use snafu::location;
@@ -507,6 +509,43 @@ impl PyDeletionFile {
         };
         Ok(deletion_file_path(&base_path, fragment_id, &self.0).to_string())
     }
+
+    pub fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.0).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not dump CompactionPlan due to error: {}",
+                err
+            ))
+        })
+    }
+
+    #[staticmethod]
+    pub fn from_json(json: String) -> PyResult<Self> {
+        let deletion_file = serde_json::from_str(&json).map_err(|err| {
+            PyValueError::new_err(format!("Could not load DeletionFile due to error: {}", err))
+        })?;
+        Ok(Self(deletion_file))
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+        let state = self.json()?;
+        let state = PyTuple::new_bound(py, vec![state]).extract()?;
+        let from_json = PyModule::import_bound(py, "lance.fragment")?
+            .getattr("DeletionFile")?
+            .getattr("from_json")?
+            .extract()?;
+        Ok((from_json, state))
+    }
+
+    pub fn __richcmp__(&self, other: PyRef<'_, Self>, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.0 == other.0),
+            CompareOp::Ne => Ok(self.0 != other.0),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for CompactionTask",
+            )),
+        }
+    }
 }
 
 #[pyclass(name = "RowIdMeta", module = "lance.fragment")]
@@ -518,6 +557,43 @@ impl PyRowIdMeta {
         Err(PyNotImplementedError::new_err(
             "PyRowIdMeta.asdict is not yet supported.s",
         ))
+    }
+
+    pub fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.0).map_err(|err| {
+            PyValueError::new_err(format!(
+                "Could not dump CompactionPlan due to error: {}",
+                err
+            ))
+        })
+    }
+
+    #[staticmethod]
+    pub fn from_json(json: String) -> PyResult<Self> {
+        let row_id_meta = serde_json::from_str(&json).map_err(|err| {
+            PyValueError::new_err(format!("Could not load RowIdMeta due to error: {}", err))
+        })?;
+        Ok(Self(row_id_meta))
+    }
+
+    fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
+        let state = self.json()?;
+        let state = PyTuple::new_bound(py, vec![state]).extract()?;
+        let from_json = PyModule::import_bound(py, "lance.fragment")?
+            .getattr("RowIdMeta")?
+            .getattr("from_json")?
+            .extract()?;
+        Ok((from_json, state))
+    }
+
+    pub fn __richcmp__(&self, other: PyRef<'_, Self>, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self.0 == other.0),
+            CompareOp::Ne => Ok(self.0 != other.0),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only == and != are supported for CompactionTask",
+            )),
+        }
     }
 }
 

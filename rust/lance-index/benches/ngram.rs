@@ -58,18 +58,24 @@ fn bench_ngram(c: &mut Criterion) {
         vec![doc_col, row_id_col],
     )
     .unwrap();
-    let stream =
-        RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch.clone())]));
-    let stream = Box::pin(stream);
 
-    rt.block_on(async {
-        let mut builder = NGramIndexBuilder::default();
-        builder.train(stream).await.unwrap();
-        builder.write(store.as_ref()).await.unwrap();
+    let batches = (0..1000).map(|i| batch.slice(i * 1000, 1000)).collect_vec();
+
+    c.bench_function(format!("ngram_index({TOTAL})").as_str(), |b| {
+        b.to_async(&rt).iter(|| async {
+            let stream = RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(batches.clone().into_iter().map(Ok)),
+            );
+            let stream = Box::pin(stream);
+            let mut builder = NGramIndexBuilder::default();
+            builder.train(stream).await.unwrap();
+            builder.write(store.as_ref()).await.unwrap();
+        })
     });
-    let index = rt.block_on(NGramIndex::load(store)).unwrap();
 
-    c.bench_function(format!("invert({TOTAL})").as_str(), |b| {
+    let index = rt.block_on(NGramIndex::load(store)).unwrap();
+    c.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let sample_idx = rand::random::<usize>() % batch.num_rows();
             let sample = batch
@@ -103,6 +109,6 @@ criterion_group!(
     config = Criterion::default()
         .measurement_time(Duration::from_secs(10))
         .sample_size(10);
-    targets = bench_inverted);
+    targets = bench_ngram);
 
 criterion_main!(benches);

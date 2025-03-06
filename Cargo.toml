@@ -77,6 +77,7 @@ async-trait = "0.1"
 aws-config = "1.2.0"
 aws-credential-types = "1.2.0"
 aws-sdk-dynamodb = "1.38.0"
+aws-sdk-s3 = "1.38.0"
 half = { "version" = "2.4.1", default-features = false, features = [
     "num-traits",
     "std",
@@ -85,7 +86,9 @@ bitvec = "1"
 bytes = "1.4"
 byteorder = "1.5"
 clap = { version = "4", features = ["derive"] }
-chrono = { version = "0.4.25", default-features = false, features = [
+# Version temporarily pinned to work around unlabeled breaking change
+# https://github.com/apache/arrow-rs/commit/2fddf85afcd20110ce783ed5b4cdeb82293da30b
+chrono = { version = "=0.4.39", default-features = false, features = [
     "std",
     "now",
 ] }

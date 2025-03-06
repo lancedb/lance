@@ -9,7 +9,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::StreamExt;
@@ -19,6 +19,8 @@ use lance_table::rowids::RowIdIndex;
 use crate::dataset::rowids::get_row_id_index;
 use crate::utils::future::SharedPrerequisite;
 use crate::Dataset;
+
+use super::utils::InstrumentedRecordBatchStreamAdapter;
 
 /// Add a `_rowaddr` column to a stream of record batches that have a `_rowid`.
 ///
@@ -36,6 +38,8 @@ pub struct AddRowAddrExec {
     rowaddr_pos: usize,
     output_schema: SchemaRef,
     properties: PlanProperties,
+
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl std::fmt::Debug for AddRowAddrExec {
@@ -105,6 +109,7 @@ impl AddRowAddrExec {
             rowaddr_pos,
             output_schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         })
     }
 
@@ -204,6 +209,7 @@ impl ExecutionPlan for AddRowAddrExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let index_prereq = self
             .row_id_index
             .get_or_init(|| {
@@ -239,7 +245,11 @@ impl ExecutionPlan for AddRowAddrExec {
             }
         });
 
-        let stream = RecordBatchStreamAdapter::new(self.output_schema.clone(), stream.boxed());
+        let stream = InstrumentedRecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            stream.boxed(),
+            baseline_metrics,
+        );
         Ok(Box::pin(stream))
     }
 
@@ -278,6 +288,10 @@ impl ExecutionPlan for AddRowAddrExec {
             .insert(self.rowaddr_pos, row_addr_col_stats);
 
         Ok(stats)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn properties(&self) -> &PlanProperties {

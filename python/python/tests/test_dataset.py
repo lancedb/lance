@@ -788,6 +788,41 @@ def test_select_none(tmp_path: Path):
     ).explain_plan(True)
 
 
+def test_analyze_filtered_scan(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
+    base_dir = tmp_path / "test"
+    ds = lance.write_dataset(table, base_dir)
+    plan = ds.scanner(columns=[], filter="a < 50", with_row_id=True).analyze_plan()
+    print(plan)
+    assert re.search(r"^\s*LanceScan:.*output_rows=100.*$", plan, re.MULTILINE)
+    assert re.search(r"^\s*FilterExec:.*output_rows=50.*$", plan, re.MULTILINE)
+
+
+def test_analyze_index_scan(tmp_path: Path):
+    table = pa.table({"filter": range(100)})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("filter", "BTREE")
+    plan = dataset.scanner(filter="filter = 10").analyze_plan()
+    assert "MaterializeIndex: query=filter = 10, metrics=[output_rows=1" in plan
+
+
+def test_analyze_vector_search(tmp_path: Path):
+    table = pa.Table.from_pydict(
+        {
+            "id": [i for i in range(10)],
+            "vector": pa.array(
+                [[1.0, 1.0] for _ in range(10)], pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path / "dataset", mode="create")
+    dataset.delete("id = 0")
+    plan = dataset.scanner(
+        nearest={"column": "vector", "k": 10, "q": [1.0, 1.0]}
+    ).analyze_plan()
+    assert "KNNVectorDistance: metric=l2, metrics=[output_rows=10" in plan
+
+
 def test_get_fragments(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -2948,3 +2983,12 @@ def test_data_replacement(tmp_path: Path):
         }
     )
     assert tbl == expected
+
+
+def test_empty_structs(tmp_path):
+    schema = pa.schema([pa.field("id", pa.int32()), pa.field("empties", pa.struct([]))])
+    table = pa.table({"id": [0, 1, 2], "empties": [{}] * 3}, schema=schema)
+    ds = lance.write_dataset(table, tmp_path)
+    res = ds.take([2, 0, 1])
+    assert res.num_rows == 3
+    assert res == table.take([2, 0, 1])
