@@ -121,6 +121,7 @@ impl PQBuildParams {
                     distance_type,
                     self.sample_rate,
                 )
+                .map(|kmeans| kmeans.centroids)
             })
             .collect::<Result<Vec<_>>>()?;
         let mut codebook_builder = PrimitiveBuilder::<T>::with_capacity(num_centroids * dimension);

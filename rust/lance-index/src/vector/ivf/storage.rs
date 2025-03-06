@@ -60,12 +60,12 @@ impl IvfModel {
         }
     }
 
-    pub fn new(centroids: FixedSizeListArray) -> Self {
+    pub fn new(centroids: FixedSizeListArray, loss: Option<f64>) -> Self {
         Self {
             centroids: Some(centroids),
             offsets: vec![],
             lengths: vec![],
-            loss: None,
+            loss,
         }
     }
 
@@ -180,6 +180,7 @@ impl TryFrom<&IvfModel> for PbIvf {
             lengths,
             offsets: ivf.offsets.iter().map(|x| *x as u64).collect(),
             centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
+            loss: ivf.loss.unwrap_or_default(),
         })
     }
 }
@@ -228,7 +229,7 @@ impl TryFrom<PbIvf> for IvfModel {
             centroids,
             offsets,
             lengths: proto.lengths,
-            loss: None,
+            loss: Some(proto.loss),
         })
     }
 }
@@ -310,6 +311,7 @@ mod tests {
             lengths: vec![2, 2],
             offsets: vec![0, 2],
             centroids_tensor: None,
+            loss: 0.0,
         };
 
         let ivf = IvfModel::try_from(pb_ivf).unwrap();

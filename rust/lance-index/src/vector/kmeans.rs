@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{types::ArrowPrimitiveType, ArrayRef, FixedSizeListArray, PrimitiveArray};
+use arrow_array::{types::ArrowPrimitiveType, FixedSizeListArray, PrimitiveArray};
 use lance_arrow::FixedSizeListArrayExt;
 use log::info;
 use rand::{seq::IteratorRandom, Rng};
@@ -27,7 +27,7 @@ pub fn train_kmeans<T: ArrowPrimitiveType>(
     mut rng: impl Rng,
     distance_type: DistanceType,
     sample_rate: usize,
-) -> Result<ArrayRef>
+) -> Result<KMeans>
 where
     T::Native: Dot + L2 + Normalize,
     PrimitiveArray<T>: From<Vec<T::Native>>,
@@ -63,5 +63,5 @@ where
     let params = KMeansParams::new(centroids, max_iterations, redos, distance_type);
     let data = FixedSizeListArray::try_new_from_values(data, dimension as i32)?;
     let model = KMeans::new_with_params(&data, k, &params)?;
-    Ok(model.centroids.clone())
+    Ok(model)
 }

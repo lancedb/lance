@@ -380,7 +380,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     const AVG_LOSS_THRESHOLD: f64 = 1.1;
     let mut num_indices_to_merge = options.num_indices_to_merge;
     if avg_loss >= original_avg_loss * AVG_LOSS_THRESHOLD {
-        info!(
+        println!(
             "average loss {} of the indices is too high (> {} * {}), retrain the index",
             avg_loss, original_avg_loss, AVG_LOSS_THRESHOLD
         );
@@ -532,7 +532,7 @@ async fn optimize_ivf_pq_indices(
         None => None,
     };
 
-    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());
+    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
     let start_pos = existing_indices
         .len()
@@ -609,7 +609,7 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         None => None,
     };
 
-    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap());
+    let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
@@ -1167,7 +1167,7 @@ pub async fn build_ivf_model(
                 location: location!(),
             });
         }
-        return Ok(IvfModel::new(centroids.as_ref().clone()));
+        return Ok(IvfModel::new(centroids.as_ref().clone(), None));
     }
     let sample_size_hint = params.num_partitions * params.sample_rate;
 
@@ -1703,7 +1703,7 @@ where
 {
     let rng = SmallRng::from_entropy();
     const REDOS: usize = 1;
-    let centroids = lance_index::vector::kmeans::train_kmeans::<T>(
+    let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         centroids,
         data,
         dimension,
@@ -1714,10 +1714,10 @@ where
         metric_type,
         params.sample_rate,
     )?;
-    Ok(IvfModel::new(FixedSizeListArray::try_new_from_values(
-        centroids,
-        dimension as i32,
-    )?))
+    Ok(IvfModel::new(
+        FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?,
+        Some(kmeans.loss),
+    ))
 }
 
 /// Train IVF partitions using kmeans.
