@@ -380,7 +380,7 @@ pub(crate) async fn optimize_vector_indices_v2(
     const AVG_LOSS_THRESHOLD: f64 = 1.1;
     let mut num_indices_to_merge = options.num_indices_to_merge;
     if avg_loss >= original_avg_loss * AVG_LOSS_THRESHOLD {
-        println!(
+        info!(
             "average loss {} of the indices is too high (> {} * {}), retrain the index",
             avg_loss, original_avg_loss, AVG_LOSS_THRESHOLD
         );
