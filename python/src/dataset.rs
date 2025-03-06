@@ -50,7 +50,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
-use lance_index::scalar::InvertedIndexParams;
+use lance_index::scalar::{InvertedIndexParams, SearchType};
 use lance_index::{
     optimize::OptimizeOptions,
     scalar::{FullTextSearchQuery, ScalarIndexParams, ScalarIndexType},
@@ -62,7 +62,7 @@ use lance_index::{
 };
 use lance_io::object_store::ObjectStoreParams;
 use lance_linalg::distance::MetricType;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, Index};
 use lance_table::io::commit::CommitHandler;
 use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
@@ -81,7 +81,7 @@ use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::schema::LanceSchema;
 use crate::session::Session;
-use crate::utils::PyLance;
+use crate::utils::{export_vec, PyLance};
 use crate::RT;
 use crate::{LanceReader, Scanner};
 
@@ -559,7 +559,21 @@ impl Dataset {
             } else {
                 None
             };
-            let full_text_query = FullTextSearchQuery::new(query).columns(columns);
+            let search_type = full_text_query.get_item("search_type")?;
+            let search_type = match search_type {
+                Some(search_type) => {
+                    let search_type = search_type.to_string().to_lowercase();
+                    if search_type == SearchType::DfsQueryThenFetch.to_string().to_lowercase() {
+                        SearchType::DfsQueryThenFetch
+                    } else {
+                        SearchType::QueryThenFetch
+                    }
+                }
+                None => SearchType::QueryThenFetch,
+            };
+            let full_text_query = FullTextSearchQuery::new(query)
+                .columns(columns)
+                .search_type(search_type);
             scanner
                 .full_text_search(full_text_query)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -1162,6 +1176,44 @@ impl Dataset {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, fragment_ids = None, kwargs = None))]
+    fn create_fragment_index(
+        &mut self,
+        columns: Vec<&str>,
+        index_type: &str,
+        name: Option<String>,
+        replace: Option<bool>,
+        storage_options: Option<HashMap<String, String>>,
+        fragment_ids: Option<Vec<u32>>,
+        kwargs: Option<&Bound<PyDict>>,
+    ) -> PyResult<PyLance<Index>> {
+        let index_type = index_type.to_uppercase();
+        let idx_type = self.parse_index_type(&index_type)?;
+        log::info!("Creating index: type={}", index_type);
+        let params: Box<dyn IndexParams> =
+            self.parse_index_params(&columns, &index_type, storage_options, kwargs)?;
+
+        let replace = replace.unwrap_or(true);
+
+        let mut new_self = self.ds.as_ref().clone();
+        let res = RT
+            .block_on(
+                None,
+                new_self.create_fragment_index(
+                    &columns,
+                    idx_type,
+                    name,
+                    params.as_ref(),
+                    replace,
+                    fragment_ids,
+                ),
+            )?
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
+        self.ds = Arc::new(new_self);
+        Ok(PyLance(res))
+    }
+
     #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
     fn create_index(
         &mut self,
@@ -1173,89 +1225,10 @@ impl Dataset {
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
         let index_type = index_type.to_uppercase();
-        let idx_type = match index_type.as_str() {
-            "BTREE" => IndexType::Scalar,
-            "BITMAP" => IndexType::Bitmap,
-            "NGRAM" => IndexType::NGram,
-            "LABEL_LIST" => IndexType::LabelList,
-            "INVERTED" | "FTS" => IndexType::Inverted,
-            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => IndexType::Vector,
-            _ => {
-                return Err(PyValueError::new_err(format!(
-                    "Index type '{index_type}' is not supported."
-                )))
-            }
-        };
-
+        let idx_type = self.parse_index_type(&index_type)?;
         log::info!("Creating index: type={}", index_type);
-        let params: Box<dyn IndexParams> = match index_type.as_str() {
-            "BTREE" => Box::<ScalarIndexParams>::default(),
-            "BITMAP" => Box::new(ScalarIndexParams {
-                // Temporary workaround until we add support for auto-detection of scalar index type
-                force_index_type: Some(ScalarIndexType::Bitmap),
-            }),
-            "NGRAM" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::NGram),
-            }),
-            "LABEL_LIST" => Box::new(ScalarIndexParams {
-                force_index_type: Some(ScalarIndexType::LabelList),
-            }),
-            "INVERTED" | "FTS" => {
-                let mut params = InvertedIndexParams::default();
-                if let Some(kwargs) = kwargs {
-                    if let Some(with_position) = kwargs.get_item("with_position")? {
-                        params.with_position = with_position.extract()?;
-                    }
-                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .base_tokenizer(base_tokenizer.extract()?);
-                    }
-                    if let Some(language) = kwargs.get_item("language")? {
-                        let language = language.extract()?;
-                        params.tokenizer_config =
-                            params.tokenizer_config.language(language).map_err(|e| {
-                                PyValueError::new_err(format!(
-                                    "can't set tokenizer language to {}: {:?}",
-                                    language, e
-                                ))
-                            })?;
-                    }
-                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .max_token_length(max_token_length.extract()?);
-                    }
-                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
-                        params.tokenizer_config =
-                            params.tokenizer_config.lower_case(lower_case.extract()?);
-                    }
-                    if let Some(stem) = kwargs.get_item("stem")? {
-                        params.tokenizer_config = params.tokenizer_config.stem(stem.extract()?);
-                    }
-                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .remove_stop_words(remove_stop_words.extract()?);
-                    }
-                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
-                        params.tokenizer_config = params
-                            .tokenizer_config
-                            .ascii_folding(ascii_folding.extract()?);
-                    }
-                }
-                Box::new(params)
-            }
-            _ => {
-                let column_type = match self.ds.schema().field(columns[0]) {
-                    Some(f) => f.data_type().clone(),
-                    None => {
-                        return Err(PyValueError::new_err("Column not found in dataset schema."))
-                    }
-                };
-                prepare_vector_index_params(&index_type, &column_type, storage_options, kwargs)?
-            }
-        };
+        let params: Box<dyn IndexParams> =
+            self.parse_index_params(&columns, &index_type, storage_options, kwargs)?;
 
         let replace = replace.unwrap_or(true);
 
@@ -1277,6 +1250,28 @@ impl Dataset {
         self.ds = Arc::new(new_self);
 
         Ok(())
+    }
+
+    fn unindexed_fragments(&self, name: &str) -> PyResult<PyObject> {
+        let result = RT
+            .block_on(None, self.ds.unindexed_fragments(name))?
+            .map_err(|err| PyIOError::new_err(err.to_string()));
+
+        Python::with_gil(|py| result.map(|vec| export_vec(py, &vec).to_object(py)))
+    }
+
+    fn indexed_fragments(&self, name: &str) -> PyResult<PyObject> {
+        let result = RT
+            .block_on(None, self.ds.indexed_fragments(name))?
+            .map_err(|err| PyIOError::new_err(err.to_string()));
+        Python::with_gil(|py| {
+            result.map(|vec2| {
+                vec2.iter()
+                    .map(|vec| export_vec(py, vec).to_object(py))
+                    .collect::<Vec<_>>()
+                    .to_object(py)
+            })
+        })
     }
 
     fn count_fragments(&self) -> usize {
@@ -1606,6 +1601,97 @@ impl Dataset {
 
     fn list_tags(&self) -> ::lance::error::Result<HashMap<String, TagContents>> {
         RT.runtime.block_on(self.ds.tags.list())
+    }
+
+    fn parse_index_params(
+        &mut self,
+        columns: &[&str],
+        index_type: &str,
+        storage_options: Option<HashMap<String, String>>,
+        kwargs: Option<&Bound<PyDict>>,
+    ) -> PyResult<Box<dyn IndexParams>> {
+        match index_type {
+            "BTREE" => Ok(Box::<ScalarIndexParams>::default()),
+            "BITMAP" => Ok(Box::new(ScalarIndexParams {
+                // Temporary workaround until we add support for auto-detection of scalar index type
+                force_index_type: Some(ScalarIndexType::Bitmap),
+            })),
+            "NGRAM" => Ok(Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::NGram),
+            })),
+            "LABEL_LIST" => Ok(Box::new(ScalarIndexParams {
+                force_index_type: Some(ScalarIndexType::LabelList),
+            })),
+            "INVERTED" | "FTS" => {
+                let mut params = InvertedIndexParams::default();
+                if let Some(kwargs) = kwargs {
+                    if let Some(with_position) = kwargs.get_item("with_position")? {
+                        params.with_position = with_position.extract()?;
+                    }
+                    if let Some(base_tokenizer) = kwargs.get_item("base_tokenizer")? {
+                        params.tokenizer_config = params
+                            .tokenizer_config
+                            .base_tokenizer(base_tokenizer.extract()?);
+                    }
+                    if let Some(language) = kwargs.get_item("language")? {
+                        let language = language.extract()?;
+                        params.tokenizer_config =
+                            params.tokenizer_config.language(language).map_err(|e| {
+                                PyValueError::new_err(format!(
+                                    "can't set tokenizer language to {}: {:?}",
+                                    language, e
+                                ))
+                            })?;
+                    }
+                    if let Some(max_token_length) = kwargs.get_item("max_token_length")? {
+                        params.tokenizer_config = params
+                            .tokenizer_config
+                            .max_token_length(max_token_length.extract()?);
+                    }
+                    if let Some(lower_case) = kwargs.get_item("lower_case")? {
+                        params.tokenizer_config =
+                            params.tokenizer_config.lower_case(lower_case.extract()?);
+                    }
+                    if let Some(stem) = kwargs.get_item("stem")? {
+                        params.tokenizer_config = params.tokenizer_config.stem(stem.extract()?);
+                    }
+                    if let Some(remove_stop_words) = kwargs.get_item("remove_stop_words")? {
+                        params.tokenizer_config = params
+                            .tokenizer_config
+                            .remove_stop_words(remove_stop_words.extract()?);
+                    }
+                    if let Some(ascii_folding) = kwargs.get_item("ascii_folding")? {
+                        params.tokenizer_config = params
+                            .tokenizer_config
+                            .ascii_folding(ascii_folding.extract()?);
+                    }
+                }
+                Ok(Box::new(params))
+            }
+            _ => {
+                let column_type = match self.ds.schema().field(columns[0]) {
+                    Some(f) => f.data_type().clone(),
+                    None => {
+                        return Err(PyValueError::new_err("Column not found in dataset schema."))
+                    }
+                };
+                prepare_vector_index_params(index_type, &column_type, storage_options, kwargs)
+            }
+        }
+    }
+
+    fn parse_index_type(&self, index_type: &str) -> PyResult<IndexType> {
+        match index_type {
+            "BTREE" => Ok(IndexType::Scalar),
+            "BITMAP" => Ok(IndexType::Bitmap),
+            "NGRAM" => Ok(IndexType::NGram),
+            "LABEL_LIST" => Ok(IndexType::LabelList),
+            "INVERTED" | "FTS" => Ok(IndexType::Inverted),
+            "IVF_FLAT" | "IVF_PQ" | "IVF_HNSW_PQ" | "IVF_HNSW_SQ" => Ok(IndexType::Vector),
+            _ => Err(PyValueError::new_err(format!(
+                "Index type '{index_type}' is not supported."
+            ))),
+        }
     }
 }
 

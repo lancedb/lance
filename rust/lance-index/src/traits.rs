@@ -35,6 +35,16 @@ pub trait DatasetIndexExt {
         replace: bool,
     ) -> Result<()>;
 
+    async fn create_fragment_index(
+        &mut self,
+        columns: &[&str],
+        index_type: IndexType,
+        name: Option<String>,
+        params: &dyn IndexParams,
+        replace: bool,
+        fragment_ids: Option<Vec<u32>>,
+    ) -> Result<Index>;
+
     /// Drop indices by name.
     ///
     /// Upon finish, a new dataset version is generated.
