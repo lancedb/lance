@@ -973,11 +973,11 @@ impl Dataset {
         }
 
         for (key, value) in updates {
-            let column: &str = &key.to_string();
-            let expr: &str = &value.to_string();
+            let column: PyBackedStr = key.downcast::<PyString>()?.clone().try_into()?;
+            let expr: PyBackedStr = value.downcast::<PyString>()?.clone().try_into()?;
 
             builder = builder
-                .set(column, expr)
+                .set(column, &expr)
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
         }
 
