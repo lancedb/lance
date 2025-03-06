@@ -296,7 +296,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         match &self.ivf {
             Some(ivf) => {
                 if self.existing_indices.is_empty() {
-                    return Ok(ivf.clone());
+                    Ok(ivf.clone())
                 } else {
                     // retrain the IVF model with the existing indices
                     let mut ivf_params = ivf_params.clone();
