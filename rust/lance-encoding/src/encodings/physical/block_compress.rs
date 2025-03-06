@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use snafu::location;
 use std::{
@@ -11,9 +12,11 @@ use std::{
 use lance_core::{Error, Result};
 
 use crate::{
-    data::{BlockInfo, DataBlock, OpaqueBlock},
-    encoder::{ArrayEncoder, EncodedArray},
-    format::ProtobufUtils,
+    buffer::LanceBuffer,
+    data::{BlockInfo, DataBlock, OpaqueBlock, VariableWidthBlock},
+    decoder::VariablePerValueDecompressor,
+    encoder::{ArrayEncoder, EncodedArray, PerValueCompressor, PerValueDataBlock},
+    format::{pb, ProtobufUtils},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,7 +34,7 @@ impl CompressionConfig {
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            scheme: CompressionScheme::Zstd,
+            scheme: CompressionScheme::Lz4,
             level: Some(0),
         }
     }
@@ -42,6 +45,7 @@ pub enum CompressionScheme {
     None,
     Fsst,
     Zstd,
+    Lz4,
 }
 
 impl std::fmt::Display for CompressionScheme {
@@ -50,6 +54,7 @@ impl std::fmt::Display for CompressionScheme {
             Self::Fsst => "fsst",
             Self::Zstd => "zstd",
             Self::None => "none",
+            Self::Lz4 => "lz4",
         };
         write!(f, "{}", scheme_str)
     }
@@ -73,6 +78,7 @@ impl FromStr for CompressionScheme {
 pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
     fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()>;
+    fn name(&self) -> &str;
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +107,37 @@ impl BufferCompressor for ZstdBufferCompressor {
         zstd::stream::copy_decode(source, output_buf)?;
         Ok(())
     }
+
+    fn name(&self) -> &str {
+        "zstd"
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Lz4BufferCompressor {}
+
+impl BufferCompressor for Lz4BufferCompressor {
+    fn compress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        lz4::block::compress_to_buffer(input_buf, None, true, output_buf)
+            .map_err(|err| Error::Internal {
+                message: format!("LZ4 compression error: {}", err),
+                location: location!(),
+            })
+            .map(|_| ())
+    }
+
+    fn decompress(&self, input_buf: &[u8], output_buf: &mut Vec<u8>) -> Result<()> {
+        lz4::block::decompress_to_buffer(input_buf, None, output_buf)
+            .map_err(|err| Error::Internal {
+                message: format!("LZ4 decompression error: {}", err),
+                location: location!(),
+            })
+            .map(|_| ())
+    }
+
+    fn name(&self) -> &str {
+        "zstd"
+    }
 }
 
 #[derive(Debug, Default)]
@@ -116,6 +153,10 @@ impl BufferCompressor for NoopBufferCompressor {
         output_buf.extend_from_slice(input_buf);
         Ok(())
     }
+
+    fn name(&self) -> &str {
+        "none"
+    }
 }
 
 pub struct GeneralBufferCompressor {}
@@ -128,6 +169,7 @@ impl GeneralBufferCompressor {
             CompressionScheme::Zstd => Box::new(ZstdBufferCompressor::new(
                 compression_config.level.unwrap_or(0),
             )),
+            CompressionScheme::Lz4 => Box::new(Lz4BufferCompressor::default()),
             CompressionScheme::None => Box::new(NoopBufferCompressor {}),
         }
     }
@@ -154,6 +196,16 @@ impl CompressedBufferEncoder {
     pub fn new(compression_config: CompressionConfig) -> Self {
         let compressor = GeneralBufferCompressor::get_compressor(compression_config);
         Self { compressor }
+    }
+
+    pub fn from_scheme(scheme: &str) -> Result<Self> {
+        let scheme = CompressionScheme::from_str(scheme)?;
+        Ok(Self {
+            compressor: GeneralBufferCompressor::get_compressor(CompressionConfig {
+                scheme,
+                level: Some(0),
+            }),
+        })
     }
 }
 
@@ -189,6 +241,117 @@ impl ArrayEncoder for CompressedBufferEncoder {
             data: compressed_data,
             encoding,
         })
+    }
+}
+
+impl CompressedBufferEncoder {
+    pub fn per_value_compress<T: ArrowNativeType>(
+        &self,
+        data: &[u8],
+        offsets: &[T],
+        compressed: &mut Vec<u8>,
+    ) -> Result<LanceBuffer> {
+        let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
+        new_offsets.push(T::from_usize(0).unwrap());
+
+        for off in offsets.windows(2) {
+            let start = off[0].as_usize();
+            let end = off[1].as_usize();
+            self.compressor.compress(&data[start..end], compressed)?;
+            new_offsets.push(T::from_usize(compressed.len()).unwrap());
+        }
+
+        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+    }
+
+    pub fn per_value_decompress<T: ArrowNativeType>(
+        &self,
+        data: &[u8],
+        offsets: &[T],
+        decompressed: &mut Vec<u8>,
+    ) -> Result<LanceBuffer> {
+        let mut new_offsets: Vec<T> = Vec::with_capacity(offsets.len());
+        new_offsets.push(T::from_usize(0).unwrap());
+
+        for off in offsets.windows(2) {
+            let start = off[0].as_usize();
+            let end = off[1].as_usize();
+            self.compressor
+                .decompress(&data[start..end], decompressed)?;
+            new_offsets.push(T::from_usize(decompressed.len()).unwrap());
+        }
+
+        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+    }
+}
+
+impl PerValueCompressor for CompressedBufferEncoder {
+    fn compress(&self, data: DataBlock) -> Result<(PerValueDataBlock, pb::ArrayEncoding)> {
+        let data_type = data.name();
+        let mut data = data.as_variable_width().ok_or(Error::Internal {
+            message: format!(
+                "Attempt to use CompressedBufferEncoder on data of type {}",
+                data_type
+            ),
+            location: location!(),
+        })?;
+
+        let data_bytes = &data.data;
+        let mut compressed = Vec::with_capacity(data_bytes.len());
+
+        let new_offsets = match data.bits_per_offset {
+            32 => self.per_value_compress::<u32>(
+                data_bytes,
+                &data.offsets.borrow_to_typed_slice::<u32>(),
+                &mut compressed,
+            )?,
+            64 => self.per_value_compress::<u64>(
+                data_bytes,
+                &data.offsets.borrow_to_typed_slice::<u64>(),
+                &mut compressed,
+            )?,
+            _ => unreachable!(),
+        };
+
+        let compressed = PerValueDataBlock::Variable(VariableWidthBlock {
+            bits_per_offset: data.bits_per_offset,
+            data: LanceBuffer::from(compressed),
+            offsets: new_offsets,
+            num_values: data.num_values,
+            block_info: BlockInfo::new(),
+        });
+
+        let encoding = ProtobufUtils::block(self.compressor.name());
+
+        Ok((compressed, encoding))
+    }
+}
+
+impl VariablePerValueDecompressor for CompressedBufferEncoder {
+    fn decompress(&self, mut data: VariableWidthBlock) -> Result<DataBlock> {
+        let data_bytes = &data.data;
+        let mut decompressed = Vec::with_capacity(data_bytes.len() * 2);
+
+        let new_offsets = match data.bits_per_offset {
+            32 => self.per_value_decompress(
+                data_bytes,
+                &data.offsets.borrow_to_typed_slice::<u32>(),
+                &mut decompressed,
+            )?,
+            64 => self.per_value_decompress(
+                data_bytes,
+                &data.offsets.borrow_to_typed_slice::<u32>(),
+                &mut decompressed,
+            )?,
+            _ => unreachable!(),
+        };
+        Ok(DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: data.bits_per_offset,
+            data: LanceBuffer::from(decompressed),
+            offsets: new_offsets,
+            num_values: data.num_values,
+            block_info: BlockInfo::new(),
+        }))
     }
 }
 
