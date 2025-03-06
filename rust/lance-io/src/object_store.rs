@@ -22,7 +22,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
-use object_store::gcp::{GoogleCloudStorageBuilder, GcpCredential};
+use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
 use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
@@ -938,9 +938,10 @@ async fn configure_store(
             }
             let token_key = "google_storage_token";
             if let Some(storage_token) = storage_options.get(token_key) {
-                let credential = GcpCredential { bearer: storage_token.to_string() };
-                let credential_provider =
-                    Arc::new(StaticCredentialProvider::new(credential)) as _;
+                let credential = GcpCredential {
+                    bearer: storage_token.to_string(),
+                };
+                let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
                 builder = builder.with_credentials(credential_provider);
             }
             let store = builder.build()?;
