@@ -26,6 +26,7 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
+use assign_action::{collect_to_struct, merge_insert_action};
 use datafusion::{
     execution::{
         context::{SessionConfig, SessionContext},
@@ -130,7 +131,7 @@ fn unzip_batch(batch: &RecordBatch, schema: &Schema) -> RecordBatch {
 /// Describes how rows should be handled when there is no matching row in the source table
 ///
 /// These are old rows which do not match any new data
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WhenNotMatchedBySource {
     /// Do not delete rows from the target table
     ///
@@ -169,7 +170,7 @@ impl WhenNotMatchedBySource {
 }
 
 /// Describes how rows should be handled when there is a match between the target table and source table
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum WhenMatched {
     /// The row is deleted from the target table and a new row is inserted based on the source table
     ///
@@ -217,7 +218,7 @@ pub enum WhenNotMatched {
     DoNothing,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 struct MergeInsertParams {
     // The column(s) to join on
     on: Vec<String>,
@@ -1168,6 +1169,62 @@ impl MergeInsertJob {
         );
 
         Ok((transaction, stats))
+    }
+
+    async fn create_plan(
+        &self,
+        source: SendableRecordBatchStream,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // We produce a naive plan here, and rely on the optimizer to take
+        // advantage of indices.
+        let session_config = SessionConfig::default().with_target_partitions(1);
+        let session_ctx = SessionContext::new_with_config(session_config);
+        let new_data = session_ctx.read_one_shot(source)?;
+
+        let join_cols = self
+            .params
+            .on // columns to join on
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>(); // vector of strings of col names to join
+        let target_cols = self
+            .params
+            .on
+            .iter()
+            .map(|c| format!("__target_{}", c))
+            .collect::<Vec<_>>();
+        let target_cols = target_cols.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+
+        let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
+        let projected = Self::prefix_columns(existing, "__target_");
+
+        let joined = new_data.join(projected, JoinType::Full, &join_cols, &target_cols, None)?;
+
+        // The assign action function expects that all source columns are under
+        // `source`` struct and all target columns are under `target` struct.
+        let schema = joined.schema().inner().clone();
+        let mut source_cols = vec![];
+        let mut target_cols = vec![];
+        for field in schema.fields() {
+            if field.name().starts_with("__target_") {
+                target_cols.push(field.name().as_str());
+            } else if (field.name() != ROW_ID) && (field.name() != ROW_ADDR) {
+                source_cols.push(field.name().as_str());
+            }
+        }
+        // TODO: we should test this works even if user has a source and target column in their schema.
+        let joined = joined
+            .with_column("source", collect_to_struct(&source_cols, None))?
+            .with_column("target", collect_to_struct(&target_cols, Some("__target_")))?
+            .select_columns(&["source", "target", ROW_ID, ROW_ADDR])?;
+
+        let assigned = joined.with_column("action", merge_insert_action(&self.params)?)?;
+
+        let plan = todo!();
+
+        // TODO: optimize
+
+        Ok(plan)
     }
 
     // Delete a batch of rows by id, returns the fragments modified and the fragments removed
