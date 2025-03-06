@@ -32,13 +32,14 @@ use tracing_subscriber::Registry;
 
 #[pyclass]
 pub struct TraceGuard {
-    guard: Option<Arc<Mutex<tracing_chrome::FlushGuard>>>,
+    guard: Arc<Mutex<Option<tracing_chrome::FlushGuard>>>,
 }
 
 #[pymethods]
 impl TraceGuard {
-    pub fn finish_tracing(&mut self) {
-        self.guard.take();
+    pub fn finish_tracing(&self) {
+        // We're exiting anyways, so discard the result
+        let _ = self.guard.lock().map(|mut g| g.take());
     }
 }
 
@@ -77,7 +78,7 @@ pub fn trace_to_chrome(path: Option<&str>, level: Option<&str>) -> PyResult<Trac
     let subscriber = Registry::default().with(chrome_layer.with_filter(filter));
     subscriber::set_global_default(subscriber)
         .map(move |_| TraceGuard {
-            guard: Some(Arc::new(Mutex::new(guard))),
+            guard: Arc::new(Mutex::new(Some(guard))),
         })
         .map_err(|_| {
             PyAssertionError::new_err("Attempt to configure tracing when it is already configured")

@@ -295,25 +295,25 @@ impl LanceFileWriter {
         ))
     }
 
-    pub fn write_batch(&mut self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
+    pub fn write_batch(&self, batch: PyArrowType<RecordBatch>) -> PyResult<()> {
         RT.runtime
             .block_on(self.inner_lock()?.write_batch(&batch.0))
             .infer_error()
     }
 
-    pub fn finish(&mut self) -> PyResult<u64> {
+    pub fn finish(&self) -> PyResult<u64> {
         RT.runtime
             .block_on(self.inner_lock()?.finish())
             .infer_error()
     }
 
-    pub fn add_global_buffer(&mut self, bytes: Vec<u8>) -> PyResult<u32> {
+    pub fn add_global_buffer(&self, bytes: Vec<u8>) -> PyResult<u32> {
         RT.runtime
             .block_on(self.inner_lock()?.add_global_buffer(Bytes::from(bytes)))
             .infer_error()
     }
 
-    pub fn add_schema_metadata(&mut self, key: String, value: String) -> PyResult<()> {
+    pub fn add_schema_metadata(&self, key: String, value: String) -> PyResult<()> {
         self.inner_lock()?.add_schema_metadata(key, value);
         Ok(())
     }
