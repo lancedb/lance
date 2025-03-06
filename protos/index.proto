@@ -68,7 +68,7 @@ message IVF {
   Tensor centroids_tensor = 4;
 
   // KMeans loss.
-  double loss = 5;
+  optional double loss = 5;
 }
 
 // Product Quantization.

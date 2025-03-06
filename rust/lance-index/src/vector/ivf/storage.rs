@@ -180,7 +180,7 @@ impl TryFrom<&IvfModel> for PbIvf {
             lengths,
             offsets: ivf.offsets.iter().map(|x| *x as u64).collect(),
             centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
-            loss: ivf.loss.unwrap_or_default(),
+            loss: ivf.loss,
         })
     }
 }
@@ -229,7 +229,7 @@ impl TryFrom<PbIvf> for IvfModel {
             centroids,
             offsets,
             lengths: proto.lengths,
-            loss: Some(proto.loss),
+            loss: proto.loss,
         })
     }
 }
@@ -311,7 +311,7 @@ mod tests {
             lengths: vec![2, 2],
             offsets: vec![0, 2],
             centroids_tensor: None,
-            loss: 0.0,
+            loss: None,
         };
 
         let ivf = IvfModel::try_from(pb_ivf).unwrap();
