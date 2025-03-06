@@ -22,7 +22,7 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
+use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
 use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
@@ -33,7 +33,7 @@ use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 use snafu::location;
 
-use crate::dataset::{get_write_params, transforms_from_python};
+use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
 use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
 use crate::utils::{export_vec, extract_vec, PyLance};
@@ -342,7 +342,7 @@ impl From<FileFragment> for LanceFragment {
 }
 
 fn do_write_fragments(
-    dest: &Bound<PyAny>,
+    dest: PyWriteDest,
     reader: &Bound<PyAny>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Transaction> {
@@ -353,16 +353,9 @@ fn do_write_fragments(
         .transpose()?
         .unwrap_or_default();
 
-    let dest = if dest.is_instance_of::<Dataset>() {
-        let dataset: Dataset = dest.extract()?;
-        WriteDestination::Dataset(dataset.ds.clone())
-    } else {
-        WriteDestination::Uri(dest.to_string())
-    };
-
     RT.block_on(
         Some(reader.py()),
-        InsertBuilder::new(dest)
+        InsertBuilder::new(dest.as_dest())
             .with_params(&params)
             .execute_uncommitted_stream(batches),
     )?
@@ -372,7 +365,7 @@ fn do_write_fragments(
 #[pyfunction(name = "_write_fragments")]
 #[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
-    dest: &Bound<PyAny>,
+    dest: PyWriteDest,
     reader: &Bound<PyAny>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyObject>> {
@@ -400,7 +393,7 @@ pub fn write_fragments(
 #[pyfunction(name = "_write_fragments_transaction")]
 #[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments_transaction<'py>(
-    dest: &Bound<'py, PyAny>,
+    dest: PyWriteDest,
     reader: &'py Bound<'py, PyAny>,
     kwargs: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyAny>> {

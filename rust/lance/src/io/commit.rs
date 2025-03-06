@@ -1161,7 +1161,7 @@ mod tests {
         for write_mode in [WriteMode::Append, WriteMode::Overwrite] {
             // Create an empty table
             let test_dir = tempfile::tempdir().unwrap();
-            let test_uri = test_dir.path().to_str().unwrap().to_string();
+            let test_uri = test_dir.path().to_str().unwrap();
 
             let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "i",
@@ -1171,7 +1171,7 @@ mod tests {
 
             let dataset = Dataset::write(
                 RecordBatchIterator::new(vec![].into_iter().map(Ok), schema.clone()),
-                test_uri.clone(),
+                test_uri,
                 None,
             )
             .await
@@ -1189,12 +1189,12 @@ mod tests {
                 .map(|_| {
                     let batch = batch.clone();
                     let schema = schema.clone();
-                    let test_uri = test_uri.clone();
+                    let uri = test_uri.to_string();
                     tokio::spawn(async move {
                         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
                         Dataset::write(
                             reader,
-                            test_uri,
+                            &uri,
                             Some(WriteParams {
                                 mode: write_mode,
                                 ..Default::default()

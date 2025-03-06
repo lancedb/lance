@@ -458,7 +458,7 @@ impl Dataset {
     ///
     pub async fn write(
         batches: impl RecordBatchReader + Send + 'static,
-        dest: impl Into<WriteDestination>,
+        dest: impl Into<WriteDestination<'_>>,
         params: Option<WriteParams>,
     ) -> Result<Self> {
         let mut builder = InsertBuilder::new(dest);
@@ -647,7 +647,7 @@ impl Dataset {
 
     #[allow(clippy::too_many_arguments)]
     async fn do_commit(
-        base_uri: WriteDestination,
+        base_uri: WriteDestination<'_>,
         operation: Operation,
         blobs_op: Option<Operation>,
         read_version: Option<u64>,
@@ -721,7 +721,7 @@ impl Dataset {
     ///   this on will make the dataset unreadable for older versions of Lance
     ///   (prior to 0.17.0). Default is False.
     pub async fn commit(
-        dest: impl Into<WriteDestination>,
+        dest: impl Into<WriteDestination<'_>>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -754,7 +754,7 @@ impl Dataset {
     /// This can be used to stage changes or to handle "secondary" datasets whose
     /// lineage is tracked elsewhere.
     pub async fn commit_detached(
-        dest: impl Into<WriteDestination>,
+        dest: impl Into<WriteDestination<'_>>,
         operation: Operation,
         read_version: Option<u64>,
         store_params: Option<ObjectStoreParams>,
@@ -844,7 +844,7 @@ impl Dataset {
     /// # let reader = RecordBatchIterator::new(
     /// #    vec![batch].into_iter().map(Ok), schema
     /// # );
-    /// # let dataset = Dataset::write(reader, uri, Some(write_params)).await.unwrap();
+    /// # let dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
     /// #
     /// let schema = dataset.schema().clone();
     /// let row_ids = vec![0, 4, 7];

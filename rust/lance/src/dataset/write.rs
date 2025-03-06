@@ -43,43 +43,43 @@ pub use insert::InsertBuilder;
 
 /// The destination to write data to.
 #[derive(Debug, Clone)]
-pub enum WriteDestination {
+pub enum WriteDestination<'a> {
     /// An existing dataset to write to.
     Dataset(Arc<Dataset>),
     /// A URI to write to.
-    Uri(String),
+    Uri(&'a str),
 }
 
-impl WriteDestination {
+impl WriteDestination<'_> {
     pub fn dataset(&self) -> Option<&Dataset> {
         match self {
-            Self::Dataset(dataset) => Some(dataset.as_ref()),
-            Self::Uri(_) => None,
+            WriteDestination::Dataset(dataset) => Some(dataset.as_ref()),
+            WriteDestination::Uri(_) => None,
         }
     }
 }
 
-impl From<Arc<Dataset>> for WriteDestination {
+impl From<Arc<Dataset>> for WriteDestination<'_> {
     fn from(dataset: Arc<Dataset>) -> Self {
-        Self::Dataset(dataset)
+        WriteDestination::Dataset(dataset)
     }
 }
 
-impl From<&str> for WriteDestination {
-    fn from(uri: &str) -> Self {
-        Self::Uri(uri.to_string())
+impl<'a> From<&'a str> for WriteDestination<'a> {
+    fn from(uri: &'a str) -> Self {
+        WriteDestination::Uri(uri)
     }
 }
 
-impl From<String> for WriteDestination {
-    fn from(uri: String) -> Self {
-        Self::Uri(uri)
+impl<'a> From<&'a String> for WriteDestination<'a> {
+    fn from(uri: &'a String) -> Self {
+        WriteDestination::Uri(uri.as_str())
     }
 }
 
-impl From<&Path> for WriteDestination {
-    fn from(path: &Path) -> Self {
-        Self::Uri(path.to_string())
+impl<'a> From<&'a Path> for WriteDestination<'a> {
+    fn from(path: &'a Path) -> Self {
+        WriteDestination::Uri(path.as_ref())
     }
 }
 
@@ -220,7 +220,7 @@ impl WriteParams {
     note = "Use [`InsertBuilder::write_uncommitted_stream`] instead"
 )]
 pub async fn write_fragments(
-    dest: impl Into<WriteDestination>,
+    dest: impl Into<WriteDestination<'_>>,
     data: impl StreamingWriteSource,
     params: WriteParams,
 ) -> Result<Transaction> {

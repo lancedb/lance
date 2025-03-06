@@ -36,7 +36,7 @@
 //! # rt.block_on(async {
 //! #
 //! # let test_dir = tempfile::tempdir().unwrap();
-//! # let uri = test_dir.path().to_str().unwrap();
+//! # let uri = test_dir.path().to_str().unwrap().to_string();
 //! let schema = Arc::new(Schema::new(vec![Field::new("test", DataType::Int64, false)]));
 //! let data = RecordBatch::try_new(
 //!     schema.clone(),
@@ -46,7 +46,7 @@
 //!
 //! // Write 100 small files
 //! let write_params = WriteParams { max_rows_per_file: 100, ..Default::default()};
-//! let mut dataset = Dataset::write(reader, uri, Some(write_params)).await.unwrap();
+//! let mut dataset = Dataset::write(reader, &uri, Some(write_params)).await.unwrap();
 //! assert_eq!(dataset.get_fragments().len(), 100);
 //!
 //! // Use compact_files() to consolidate the data to 1 fragment

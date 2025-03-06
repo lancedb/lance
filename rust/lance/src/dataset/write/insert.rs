@@ -44,13 +44,13 @@ use super::WrittenFragments;
 /// they are passed to the [`CommitBuilder`].
 #[derive(Debug, Clone)]
 pub struct InsertBuilder<'a> {
-    dest: WriteDestination,
+    dest: WriteDestination<'a>,
     // TODO: make these parameters a part of the builder, and add specific methods.
     params: Option<&'a WriteParams>,
 }
 
 impl<'a> InsertBuilder<'a> {
-    pub fn new(dest: impl Into<WriteDestination>) -> Self {
+    pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
             params: None,
@@ -115,7 +115,7 @@ impl<'a> InsertBuilder<'a> {
         self.write_uncommitted_impl(data).await.map(|(t, _)| t)
     }
 
-    async fn do_commit(context: &WriteContext, transaction: Transaction) -> Result<Dataset> {
+    async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_move_stable_row_ids(context.params.enable_move_stable_row_ids)
             .with_storage_format(context.storage_version)
@@ -138,7 +138,7 @@ impl<'a> InsertBuilder<'a> {
     async fn write_uncommitted_impl(
         &self,
         data: Vec<RecordBatch>,
-    ) -> Result<(Transaction, WriteContext)> {
+    ) -> Result<(Transaction, WriteContext<'_>)> {
         // TODO: This should be able to split the data up based on max_rows_per_file
         // and write in parallel. https://github.com/lancedb/lance/issues/1980
         if data.is_empty() {
@@ -177,7 +177,7 @@ impl<'a> InsertBuilder<'a> {
         &self,
         stream: SendableRecordBatchStream,
         schema: Schema,
-    ) -> Result<(Transaction, WriteContext)> {
+    ) -> Result<(Transaction, WriteContext<'_>)> {
         let mut context = self.resolve_context().await?;
 
         self.validate_write(&mut context, &schema)?;
@@ -200,7 +200,7 @@ impl<'a> InsertBuilder<'a> {
     fn build_transaction(
         schema: Schema,
         written_frags: WrittenFragments,
-        context: &WriteContext,
+        context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
             WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
@@ -312,7 +312,7 @@ impl<'a> InsertBuilder<'a> {
         Ok(())
     }
 
-    async fn resolve_context(&self) -> Result<WriteContext> {
+    async fn resolve_context(&self) -> Result<WriteContext<'a>> {
         let params = self.params.cloned().unwrap_or_default();
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
@@ -350,7 +350,7 @@ impl<'a> InsertBuilder<'a> {
                 match builder.load().await {
                     Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
                     Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri.clone())
+                        WriteDestination::Uri(uri)
                     }
                     Err(e) => return Err(e),
                 }
@@ -387,9 +387,9 @@ impl<'a> InsertBuilder<'a> {
 }
 
 #[derive(Debug)]
-struct WriteContext {
+struct WriteContext<'a> {
     params: WriteParams,
-    dest: WriteDestination,
+    dest: WriteDestination<'a>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
     commit_handler: Arc<dyn CommitHandler>,

@@ -69,6 +69,7 @@ use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString};
 use pyo3::{
     exceptions::{PyIOError, PyKeyError, PyValueError},
+    pybacked::PyBackedStr,
     pyclass,
     types::{IntoPyDict, PyDict},
     PyObject, PyResult,
@@ -1161,14 +1162,14 @@ impl Dataset {
     #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, kwargs = None))]
     fn create_index(
         &mut self,
-        columns: Vec<String>,
+        columns: Vec<PyBackedStr>,
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
         storage_options: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<()> {
-        let columns: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
+        let columns: Vec<&str> = columns.iter().map(|s| &**s).collect();
         let index_type = index_type.to_uppercase();
         let idx_type = match index_type.as_str() {
             "BTREE" => IndexType::Scalar,
@@ -1209,9 +1210,10 @@ impl Dataset {
                             .base_tokenizer(base_tokenizer.extract()?);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
-                        let language = &language.to_string();
+                        let language: PyBackedStr =
+                            language.downcast::<PyString>()?.clone().try_into()?;
                         params.tokenizer_config =
-                            params.tokenizer_config.language(language).map_err(|e| {
+                            params.tokenizer_config.language(&language).map_err(|e| {
                                 PyValueError::new_err(format!(
                                     "can't set tokenizer language to {}: {:?}",
                                     language, e
@@ -1340,7 +1342,7 @@ impl Dataset {
     #[staticmethod]
     #[pyo3(signature = (dest, operation, blobs_op=None, read_version = None, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit(
-        dest: &Bound<PyAny>,
+        dest: PyWriteDest,
         operation: PyLance<Operation>,
         blobs_op: Option<PyLance<Operation>>,
         read_version: Option<u64>,
@@ -1372,7 +1374,7 @@ impl Dataset {
     #[staticmethod]
     #[pyo3(signature = (dest, transaction, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
     fn commit_transaction(
-        dest: &Bound<PyAny>,
+        dest: PyWriteDest,
         transaction: PyLance<Transaction>,
         commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
@@ -1397,14 +1399,7 @@ impl Dataset {
             })
             .transpose()?;
 
-        let dest = if dest.is_instance_of::<Self>() {
-            let dataset: Self = dest.extract()?;
-            WriteDestination::Dataset(dataset.ds.clone())
-        } else {
-            WriteDestination::Uri(dest.to_string())
-        };
-
-        let mut builder = CommitBuilder::new(dest)
+        let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20));
@@ -1433,10 +1428,10 @@ impl Dataset {
 
     #[staticmethod]
     #[pyo3(signature = (dest, transactions, commit_lock = None, storage_options = None, enable_v2_manifest_paths = None, detached = None, max_retries = None))]
-    fn commit_batch<'py>(
-        dest: &Bound<'py, PyAny>,
+    fn commit_batch(
+        dest: PyWriteDest,
         transactions: Vec<PyLance<Transaction>>,
-        commit_lock: Option<&Bound<'py, PyAny>>,
+        commit_lock: Option<&Bound<'_, PyAny>>,
         storage_options: Option<HashMap<String, String>>,
         enable_v2_manifest_paths: Option<bool>,
         detached: Option<bool>,
@@ -1458,15 +1453,7 @@ impl Dataset {
             })
             .transpose()?;
 
-        let py = dest.py();
-        let dest = if dest.is_instance_of::<Self>() {
-            let dataset: Self = dest.extract()?;
-            WriteDestination::Dataset(dataset.ds.clone())
-        } else {
-            WriteDestination::Uri(dest.to_string())
-        };
-
-        let mut builder = CommitBuilder::new(dest)
+        let mut builder = CommitBuilder::new(dest.as_dest())
             .enable_v2_manifest_paths(enable_v2_manifest_paths.unwrap_or(false))
             .with_detached(detached.unwrap_or(false))
             .with_max_retries(max_retries.unwrap_or(20));
@@ -1485,7 +1472,7 @@ impl Dataset {
             .collect();
 
         let res = RT
-            .block_on(Some(py), builder.execute_batch(transactions))?
+            .block_on(None, builder.execute_batch(transactions))?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         let uri = res.dataset.uri().to_string();
         let ds = Self {
@@ -1590,6 +1577,21 @@ impl Dataset {
     }
 }
 
+#[derive(FromPyObject)]
+pub enum PyWriteDest {
+    Dataset(Dataset),
+    Uri(PyBackedStr),
+}
+
+impl PyWriteDest {
+    pub fn as_dest(&self) -> WriteDestination<'_> {
+        match self {
+            Self::Dataset(ds) => WriteDestination::Dataset(ds.ds.clone()),
+            Self::Uri(uri) => WriteDestination::Uri(uri),
+        }
+    }
+}
+
 impl Dataset {
     fn _checkout_version(&self, version: impl Into<Ref> + std::marker::Send) -> PyResult<Self> {
         let ds = RT
@@ -1617,29 +1619,29 @@ impl Dataset {
 #[pyfunction(name = "_write_dataset")]
 pub fn write_dataset(
     reader: &Bound<'_, PyAny>,
-    dest: &Bound<'_, PyAny>,
+    dest: PyWriteDest,
     options: &Bound<'_, PyDict>,
 ) -> PyResult<Dataset> {
     let params = get_write_params(options)?;
     let py = options.py();
-    let dest = if dest.is_instance_of::<Dataset>() {
-        let dataset: Dataset = dest.extract()?;
-        WriteDestination::Dataset(dataset.ds.clone())
-    } else {
-        WriteDestination::Uri(dest.to_string())
-    };
     let ds = if reader.is_instance_of::<Scanner>() {
         let scanner: Scanner = reader.extract()?;
         let batches = RT
             .block_on(Some(py), scanner.to_reader())?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        RT.block_on(
+            Some(py),
+            LanceDataset::write(batches, dest.as_dest(), params),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?
     } else {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
-        RT.block_on(Some(py), LanceDataset::write(batches, dest, params))?
-            .map_err(|err| PyIOError::new_err(err.to_string()))?
+        RT.block_on(
+            Some(py),
+            LanceDataset::write(batches, dest.as_dest(), params),
+        )?
+        .map_err(|err| PyIOError::new_err(err.to_string()))?
     };
     Ok(Dataset {
         uri: ds.uri().to_string(),
