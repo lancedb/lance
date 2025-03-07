@@ -22,7 +22,7 @@ use arrow_schema::Schema as ArrowSchema;
 use futures::TryFutureExt;
 use lance::dataset::fragment::FileFragment as LanceFragment;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::{InsertBuilder, NewColumnTransform, WriteDestination};
+use lance::dataset::{InsertBuilder, NewColumnTransform};
 use lance::Error;
 use lance_table::format::{DataFile, DeletionFile, DeletionFileType, Fragment, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
@@ -33,7 +33,7 @@ use pyo3::{exceptions::*, types::PyDict};
 use pyo3::{intern, prelude::*};
 use snafu::location;
 
-use crate::dataset::{get_write_params, transforms_from_python};
+use crate::dataset::{get_write_params, transforms_from_python, PyWriteDest};
 use crate::error::PythonErrorExt;
 use crate::schema::LanceSchema;
 use crate::utils::{export_vec, extract_vec, PyLance};
@@ -99,7 +99,7 @@ impl FileFragment {
         dataset_uri: &str,
         fragment_id: Option<usize>,
         reader: &Bound<PyAny>,
-        kwargs: Option<&PyDict>,
+        kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyLance<Fragment>> {
         let params = if let Some(kw_params) = kwargs {
             get_write_params(kw_params)?
@@ -342,9 +342,9 @@ impl From<FileFragment> for LanceFragment {
 }
 
 fn do_write_fragments(
-    dest: &Bound<PyAny>,
+    dest: PyWriteDest,
     reader: &Bound<PyAny>,
-    kwargs: Option<&PyDict>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Transaction> {
     let batches = convert_reader(reader)?;
 
@@ -353,16 +353,9 @@ fn do_write_fragments(
         .transpose()?
         .unwrap_or_default();
 
-    let dest = if dest.is_instance_of::<Dataset>() {
-        let dataset: Dataset = dest.extract()?;
-        WriteDestination::Dataset(dataset.ds.clone())
-    } else {
-        WriteDestination::Uri(dest.extract()?)
-    };
-
     RT.block_on(
         Some(reader.py()),
-        InsertBuilder::new(dest)
+        InsertBuilder::new(dest.as_dest())
             .with_params(&params)
             .execute_uncommitted_stream(batches),
     )?
@@ -372,9 +365,9 @@ fn do_write_fragments(
 #[pyfunction(name = "_write_fragments")]
 #[pyo3(signature = (dest, reader, **kwargs))]
 pub fn write_fragments(
-    dest: &Bound<PyAny>,
+    dest: PyWriteDest,
     reader: &Bound<PyAny>,
-    kwargs: Option<&PyDict>,
+    kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Vec<PyObject>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
@@ -394,19 +387,19 @@ pub fn write_fragments(
     let fragments =
         get_fragments(written.operation).map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
-    Ok(export_vec(reader.py(), &fragments))
+    export_vec(reader.py(), &fragments)
 }
 
 #[pyfunction(name = "_write_fragments_transaction")]
 #[pyo3(signature = (dest, reader, **kwargs))]
-pub fn write_fragments_transaction(
-    dest: &Bound<PyAny>,
-    reader: &Bound<PyAny>,
-    kwargs: Option<&PyDict>,
-) -> PyResult<PyObject> {
+pub fn write_fragments_transaction<'py>(
+    dest: PyWriteDest,
+    reader: &'py Bound<'py, PyAny>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyAny>> {
     let written = do_write_fragments(dest, reader, kwargs)?;
 
-    Ok(PyLance(written).to_object(reader.py()))
+    PyLance(written).into_pyobject(reader.py())
 }
 
 fn convert_reader(reader: &Bound<PyAny>) -> PyResult<Box<dyn RecordBatchReader + Send + 'static>> {
@@ -452,7 +445,7 @@ impl PyDeletionFile {
     }
 
     fn asdict(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyDict>> {
-        let dict = PyDict::new_bound(slf.py());
+        let dict = PyDict::new(slf.py());
 
         dict.set_item(intern!(slf.py(), "read_version"), slf.0.read_version)?;
         dict.set_item(intern!(slf.py(), "id"), slf.0.id)?;
@@ -529,8 +522,8 @@ impl PyDeletionFile {
 
     fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.fragment")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.fragment")?
             .getattr("DeletionFile")?
             .getattr("from_json")?
             .extract()?;
@@ -578,8 +571,8 @@ impl PyRowIdMeta {
 
     fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.fragment")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.fragment")?
             .getattr("RowIdMeta")?
             .getattr("from_json")?
             .extract()?;
@@ -618,14 +611,18 @@ impl FromPyObject<'_> for PyLance<Fragment> {
     }
 }
 
-impl ToPyObject for PyLance<&Fragment> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&Fragment> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
-            .import_bound(intern!(py, "lance.fragment"))
+            .import(intern!(py, "lance.fragment"))
             .and_then(|m| m.getattr("FragmentMetadata"))
             .expect("FragmentMetadata class not found");
 
-        let files = export_vec(py, &self.0.files);
+        let files = export_vec(py, &self.0.files)?;
         let deletion_file = self
             .0
             .deletion_file
@@ -640,14 +637,16 @@ impl ToPyObject for PyLance<&Fragment> {
             deletion_file,
             row_id_meta,
         ))
-        .unwrap()
-        .to_object(py)
     }
 }
 
-impl ToPyObject for PyLance<Fragment> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        PyLance(&self.0).to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<Fragment> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }
 
@@ -663,10 +662,14 @@ impl FromPyObject<'_> for PyLance<DataFile> {
     }
 }
 
-impl ToPyObject for PyLance<&DataFile> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
+impl<'py> IntoPyObject<'py> for PyLance<&DataFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = py
-            .import_bound(intern!(py, "lance.fragment"))
+            .import(intern!(py, "lance.fragment"))
             .and_then(|m| m.getattr("DataFile"))
             .expect("DataFile class not found");
 
@@ -677,13 +680,15 @@ impl ToPyObject for PyLance<&DataFile> {
             self.0.file_major_version,
             self.0.file_minor_version,
         ))
-        .unwrap()
-        .to_object(py)
     }
 }
 
-impl ToPyObject for PyLance<DataFile> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        PyLance(&self.0).to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<DataFile> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }

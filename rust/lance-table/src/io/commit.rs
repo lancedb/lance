@@ -33,6 +33,7 @@ use futures::{
     StreamExt, TryStreamExt,
 };
 use log::warn;
+use object_store::PutOptions;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore as OSObjectStore};
 use snafu::location;
 use url::Url;
@@ -169,12 +170,14 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
 }
 
 /// Function that writes the manifest to the object store.
+///
+/// Returns the size of the written manifest.
 pub type ManifestWriter = for<'a> fn(
     object_store: &'a ObjectStore,
     manifest: &'a mut Manifest,
     indices: Option<Vec<Index>>,
     path: &'a Path,
-) -> BoxFuture<'a, Result<()>>;
+) -> BoxFuture<'a, Result<u64>>;
 
 #[derive(Debug)]
 pub struct ManifestLocation {
@@ -603,9 +606,9 @@ pub async fn commit_handler_from_url(
     };
 
     match url.scheme() {
-        // TODO: for Cloudflare R2 and Minio, we can provide a PutIfNotExist commit handler
-        // See: https://docs.rs/object_store/latest/object_store/aws/enum.S3ConditionalPut.html#variant.ETagMatch
-        "s3" => Ok(Arc::new(UnsafeCommitHandler)),
+        "s3" | "gs" | "az" | "memory" | "file" | "file-object-store" => {
+            Ok(Arc::new(ConditionalPutCommitHandler))
+        }
         #[cfg(not(feature = "dynamodb"))]
         "s3+ddb" => Err(Error::InvalidInput {
             source: "`s3+ddb://` scheme requires `dynamodb` feature to be enabled".into(),
@@ -669,7 +672,6 @@ pub async fn commit_handler_from_url(
                 .await?,
             }))
         }
-        "gs" | "az" | "file" | "file-object-store" | "memory" => Ok(Arc::new(RenameCommitHandler)),
         _ => Ok(Arc::new(UnsafeCommitHandler)),
     }
 }
@@ -894,6 +896,53 @@ impl CommitHandler for RenameCommitHandler {
 impl Debug for RenameCommitHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RenameCommitHandler").finish()
+    }
+}
+
+pub struct ConditionalPutCommitHandler;
+
+#[async_trait::async_trait]
+impl CommitHandler for ConditionalPutCommitHandler {
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<Index>>,
+        base_path: &Path,
+        object_store: &ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+    ) -> std::result::Result<Path, CommitError> {
+        let path = naming_scheme.manifest_path(base_path, manifest.version);
+
+        let memory_store = ObjectStore::memory();
+        let dummy_path = "dummy";
+        manifest_writer(&memory_store, manifest, indices, &dummy_path.into()).await?;
+        let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
+        object_store
+            .inner
+            .put_opts(
+                &path,
+                dummy_data.into(),
+                PutOptions {
+                    mode: object_store::PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                ObjectStoreError::AlreadyExists { .. } | ObjectStoreError::Precondition { .. } => {
+                    CommitError::CommitConflict
+                }
+                _ => CommitError::OtherError(err.into()),
+            })?;
+
+        Ok(path)
+    }
+}
+
+impl Debug for ConditionalPutCommitHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConditionalPutCommitHandler").finish()
     }
 }
 

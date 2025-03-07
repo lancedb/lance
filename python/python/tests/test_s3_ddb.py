@@ -24,11 +24,11 @@ from lance.fragment import write_fragments
 # These are all keys that are accepted by storage_options
 CONFIG = {
     "allow_http": "true",
-    "aws_access_key_id": "ACCESSKEY",
-    "aws_secret_access_key": "SECRETKEY",
-    "aws_endpoint": "http://localhost:9000",
-    "dynamodb_endpoint": "http://localhost:8000",
-    "aws_region": "us-west-2",
+    "aws_access_key_id": "ACCESS_KEY",
+    "aws_secret_access_key": "SECRET_KEY",
+    "aws_endpoint": "http://localhost:4566",
+    "dynamodb_endpoint": "http://localhost:4566",
+    "aws_region": "us-east-1",
 }
 
 

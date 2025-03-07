@@ -67,16 +67,13 @@ fn unwrap_dataset(dataset: PyObject) -> PyResult<Py<Dataset>> {
     Python::with_gil(|py| dataset.getattr(py, "_ds")?.extract::<Py<Dataset>>(py))
 }
 
-fn wrap_fragment(py: Python<'_>, fragment: &Fragment) -> PyResult<PyObject> {
-    let fragment_metadata =
-        PyModule::import_bound(py, "lance.fragment")?.getattr("FragmentMetadata")?;
+fn wrap_fragment<'py>(py: Python<'py>, fragment: &Fragment) -> PyResult<Bound<'py, PyAny>> {
+    let fragment_metadata = PyModule::import(py, "lance.fragment")?.getattr("FragmentMetadata")?;
     let fragment_json = serde_json::to_string(&fragment).map_err(|x| {
         PyValueError::new_err(format!("failed to serialize fragment metadata: {}", x))
     })?;
 
-    Ok(fragment_metadata
-        .call_method1("from_json", (fragment_json,))?
-        .to_object(py))
+    fragment_metadata.call_method1("from_json", (fragment_json,))
 }
 
 #[pyclass(name = "CompactionMetrics", module = "lance.optimize")]
@@ -191,8 +188,8 @@ impl PyCompactionPlan {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.optimize")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.optimize")?
             .getattr("CompactionPlan")?
             .getattr("from_json")?
             .extract()?;
@@ -220,7 +217,7 @@ impl PyCompactionTask {
         let fragment_reprs: String = self
             .fragments(py)?
             .iter()
-            .map(|f| f.call_method0(py, "__repr__")?.extract(py))
+            .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         Ok(format!(
@@ -237,7 +234,7 @@ impl PyCompactionTask {
 
     /// List[lance.fragment.FragmentMetadata] : The fragments that will be compacted.
     #[getter]
-    pub fn fragments(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    pub fn fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         self.0
             .task
             .fragments
@@ -303,8 +300,8 @@ impl PyCompactionTask {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.optimize")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.optimize")?
             .getattr("CompactionTask")?
             .getattr("from_json")?
             .extract()?;
@@ -338,13 +335,13 @@ impl PyRewriteResult {
         let orig_fragment_reprs: String = self
             .original_fragments(py)?
             .iter()
-            .map(|f| f.call_method0(py, "__repr__")?.extract(py))
+            .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
         let new_fragment_reprs: String = self
             .original_fragments(py)?
             .iter()
-            .map(|f| f.call_method0(py, "__repr__")?.extract(py))
+            .map(|f| f.call_method0("__repr__")?.extract())
             .collect::<PyResult<Vec<String>>>()?
             .join(", ");
 
@@ -362,7 +359,7 @@ impl PyRewriteResult {
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being replaced.
     #[getter]
-    pub fn original_fragments(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    pub fn original_fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         self.0
             .original_fragments
             .iter()
@@ -372,7 +369,7 @@ impl PyRewriteResult {
 
     /// List[lance.fragment.FragmentMetadata] : The metadata for fragments that are being added.
     #[getter]
-    pub fn new_fragments(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+    pub fn new_fragments<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyAny>>> {
         self.0
             .new_fragments
             .iter()
@@ -418,8 +415,8 @@ impl PyRewriteResult {
 
     pub fn __reduce__(&self, py: Python<'_>) -> PyResult<(PyObject, PyObject)> {
         let state = self.json()?;
-        let state = PyTuple::new_bound(py, vec![state]).extract()?;
-        let from_json = PyModule::import_bound(py, "lance.optimize")?
+        let state = PyTuple::new(py, vec![state])?.extract()?;
+        let from_json = PyModule::import(py, "lance.optimize")?
             .getattr("RewriteResult")?
             .getattr("from_json")?
             .extract()?;
