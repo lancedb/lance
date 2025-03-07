@@ -46,6 +46,7 @@ use file::{
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
+use log::LevelFilter;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use session::Session;
@@ -110,7 +111,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    env_logger::init_from_env(env);
+    let mut log_builder = env_logger::Builder::from_env(env);
+    log_builder.filter_module("tracing::span", LevelFilter::Off);
+    log_builder.try_init().unwrap();
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
