@@ -176,7 +176,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             sub_index_params: None,
             _temp_dir: temp_dir,
             temp_dir: temp_dir_path,
-            ivf: Some(ivf_index.ivf_model()),
+            ivf: Some(ivf_index.ivf_model().clone()),
             quantizer: Some(ivf_index.quantizer().try_into()?),
             shuffle_reader: None,
             partition_sizes: Vec::new(),
@@ -187,9 +187,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     // build the index with the all data in the dataset,
     pub async fn build(&mut self) -> Result<()> {
         // step 1. train IVF & quantizer
-        if self.ivf.is_none() {
-            self.with_ivf(self.load_or_build_ivf().await?);
-        }
+        self.with_ivf(self.load_or_build_ivf().await?);
+
         if self.quantizer.is_none() {
             self.with_quantizer(self.load_or_build_quantizer().await?);
         }
@@ -288,14 +287,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             "dataset not set before loading or building IVF",
             location!(),
         ))?;
-        let ivf_params = self.ivf_params.as_ref().ok_or(Error::invalid_input(
-            "IVF build params not set",
-            location!(),
-        ))?;
-        let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
-        super::build_ivf_model(dataset, &self.column, dim, self.distance_type, ivf_params).await
 
-        // TODO: load ivf model
+        let dim = utils::get_vector_dim(dataset.schema(), &self.column)?;
+        match &self.ivf {
+            Some(ivf) => {
+                if self.existing_indices.is_empty() {
+                    Ok(ivf.clone())
+                } else {
+                    // retrain the IVF model with the existing indices
+                    let mut ivf_params = IvfBuildParams::new(ivf.num_partitions());
+                    ivf_params.retrain = true;
+
+                    super::build_ivf_model(
+                        dataset,
+                        &self.column,
+                        dim,
+                        self.distance_type,
+                        &ivf_params,
+                    )
+                    .await
+                }
+            }
+            None => {
+                let ivf_params = self.ivf_params.as_ref().ok_or(Error::invalid_input(
+                    "IVF build params not set",
+                    location!(),
+                ))?;
+                super::build_ivf_model(dataset, &self.column, dim, self.distance_type, ivf_params)
+                    .await
+            }
+        }
     }
 
     async fn load_or_build_quantizer(&self) -> Result<Q> {
@@ -654,7 +675,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         // maintain the IVF partitions
         let mut storage_ivf = IvfModel::empty();
-        let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap());
+        let mut index_ivf = IvfModel::new(ivf.centroids.clone().unwrap(), ivf.loss);
         let mut partition_index_metadata = Vec::with_capacity(partition_sizes.len());
         let obj_store = Arc::new(ObjectStore::local());
         let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
