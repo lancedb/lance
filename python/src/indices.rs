@@ -287,10 +287,7 @@ pub fn shuffle_transformed_vectors(
     )?;
 
     match result {
-        Ok(partition_files) => {
-            let py_list = PyList::new_bound(py, partition_files);
-            Ok(py_list.into())
-        }
+        Ok(partition_files) => PyList::new(py, partition_files).map(|py_list| py_list.into()),
         Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
     }
 }
@@ -380,7 +377,7 @@ pub fn load_shuffled_vectors(
 }
 
 pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let indices = PyModule::new_bound(py, "indices")?;
+    let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
     indices.add_wrapped(wrap_pyfunction!(train_pq_model))?;
     indices.add_wrapped(wrap_pyfunction!(transform_vectors))?;

@@ -59,7 +59,7 @@ impl LanceBlobFile {
     pub fn readall<'a>(&'a self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {
         let inner = self.inner.clone();
         let data = RT.block_on(Some(py), inner.read())?.infer_error()?;
-        Ok(PyBytes::new_bound(py, &data))
+        Ok(PyBytes::new(py, &data))
     }
 
     pub fn read_into(&self, dst: Bound<'_, PyByteArray>) -> PyResult<usize> {
