@@ -172,6 +172,8 @@ pub struct WriteParams {
     pub object_store_registry: Arc<ObjectStoreRegistry>,
 
     pub session: Option<Arc<Session>>,
+
+    pub file_writer_options: Option<FileWriterOptions>,
 }
 
 impl Default for WriteParams {
@@ -191,6 +193,7 @@ impl Default for WriteParams {
             enable_v2_manifest_paths: false,
             object_store_registry: Arc::new(ObjectStoreRegistry::default()),
             session: None,
+            file_writer_options: None,
         }
     }
 }
@@ -249,7 +252,7 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version, params.clone());
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -508,6 +511,7 @@ pub async fn open_writer(
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
+    params: Option<&WriteParams>,
 ) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", Uuid::new_v4());
 
@@ -525,14 +529,17 @@ pub async fn open_writer(
             filename,
         ))
     } else {
+        let mut file_write_options = params
+            .as_ref()
+            .and_then(|wp| wp.file_writer_options.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        file_write_options.format_version = Some(storage_version);
         let writer = object_store.create(&full_path).await?;
         let file_writer = v2::writer::FileWriter::try_new(
             writer,
             schema.clone(),
-            FileWriterOptions {
-                format_version: Some(storage_version),
-                ..Default::default()
-            },
+            file_write_options,
         )?;
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
@@ -549,6 +556,7 @@ struct WriterGenerator {
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
+    params: WriteParams,
 }
 
 impl WriterGenerator {
@@ -557,12 +565,14 @@ impl WriterGenerator {
         base_dir: &Path,
         schema: &Schema,
         storage_version: LanceFileVersion,
+        params: WriteParams,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
+            params,
         }
     }
 
@@ -575,6 +585,7 @@ impl WriterGenerator {
             &self.schema,
             &self.base_dir,
             self.storage_version,
+            Some(&self.params)
         )
         .await?;
 

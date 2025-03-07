@@ -148,6 +148,7 @@ impl Updater {
             &schema,
             &self.fragment.dataset().base,
             data_storage_version,
+            None
         )
         .await
     }

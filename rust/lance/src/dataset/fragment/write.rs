@@ -99,11 +99,12 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let mut writer = lance_file::v2::writer::FileWriter::try_new(
-            obj_writer,
-            schema,
-            FileWriterOptions::default(),
-        )?;
+        let file_write_options = params
+            .file_writer_options
+            .clone()
+            .unwrap_or(FileWriterOptions::default());
+        let mut writer =
+            lance_file::v2::writer::FileWriter::try_new(obj_writer, schema, file_write_options)?;
 
         let (major, minor) = writer.version().to_numbers();
 

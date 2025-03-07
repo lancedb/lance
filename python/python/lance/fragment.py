@@ -265,6 +265,7 @@ class LanceFragment(pa.dataset.Fragment):
         data_storage_version: Optional[str] = None,
         use_legacy_format: Optional[bool] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        file_writer_options: Optional[Dict[str, str]] = None,
     ) -> FragmentMetadata:
         """Create a :class:`FragmentMetadata` from the given data.
 
@@ -304,7 +305,9 @@ class LanceFragment(pa.dataset.Fragment):
         storage_options : optional, dict
             Extra options that make sense for a particular storage connection. This is
             used to store connection parameters like credentials, endpoint, etc.
-
+        file_writer_options : optional, dict
+            Extra file write options that make sense to control lance data file. This is
+            used to set page size for file in disk.
         See Also
         --------
         lance.dataset.LanceOperation.Overwrite :
@@ -345,6 +348,7 @@ class LanceFragment(pa.dataset.Fragment):
             mode=mode,
             data_storage_version=data_storage_version,
             storage_options=storage_options,
+            file_writer_options=file_writer_options
         )
 
     @property

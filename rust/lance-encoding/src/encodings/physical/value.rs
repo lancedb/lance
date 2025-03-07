@@ -140,8 +140,9 @@ impl ValuePageDecoder {
         let bytes_u8: Vec<u8> = self.data[0].to_vec();
         let buffer_compressor = GeneralBufferCompressor::get_compressor(self.compression_config);
         let mut uncompressed_bytes: Vec<u8> = Vec::new();
+        println!("before decompress {}", bytes_u8.len());
         buffer_compressor.decompress(&bytes_u8, &mut uncompressed_bytes)?;
-
+        println!("after  decompress {}", uncompressed_bytes.len());
         let mut bytes_in_ranges: Vec<Bytes> =
             Vec::with_capacity(self.uncompressed_range_offsets.len());
         for range in &self.uncompressed_range_offsets {
