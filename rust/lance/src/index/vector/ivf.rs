@@ -359,8 +359,8 @@ pub(crate) async fn optimize_vector_indices_v2(
     let index_type = existing_indices[0].sub_index_type();
 
     let temp_dir = tempfile::tempdir()?;
-    let temp_dir = temp_dir.path().to_str().unwrap().into();
-    let shuffler = Box::new(IvfShuffler::new(temp_dir, num_partitions));
+    let temp_dir_path = temp_dir.path().to_str().unwrap().into();
+    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
     let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
     } else {
