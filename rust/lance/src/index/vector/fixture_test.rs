@@ -135,6 +135,10 @@ mod test {
             Ok(Box::new(self.clone()))
         }
 
+        fn num_rows(&self) -> u64 {
+            self.ret_val.num_rows() as u64
+        }
+
         fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
             todo!("this method is for only IVF_HNSW_* index");
         }

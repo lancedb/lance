@@ -59,6 +59,7 @@ impl PartitionTransformer {
     pub(super) fn compute_partitions(&self, data: &FixedSizeListArray) -> UInt32Array {
         compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
             .expect("failed to compute partitions")
+            .0
             .into()
     }
 }
@@ -91,9 +92,13 @@ impl Transformer for PartitionTransformer {
                 location: location!(),
             })?;
 
-        let part_ids = self.compute_partitions(fsl);
+        let (part_ids, loss) =
+            compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?;
+        let part_ids = UInt32Array::from(part_ids);
         let field = Field::new(PART_ID_COLUMN, part_ids.data_type().clone(), true);
-        Ok(batch.try_with_column(field, Arc::new(part_ids))?)
+        Ok(batch
+            .try_with_column(field, Arc::new(part_ids))?
+            .add_metadata("loss".to_owned(), loss.to_string())?)
     }
 }
 

@@ -162,6 +162,10 @@ mod test {
             unimplemented!()
         }
 
+        fn num_rows(&self) -> u64 {
+            unimplemented!()
+        }
+
         fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
             unimplemented!()
         }

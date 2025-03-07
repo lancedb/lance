@@ -254,6 +254,10 @@ impl IvfQuantizationStorage {
         })
     }
 
+    pub fn num_rows(&self) -> u64 {
+        self.reader.num_rows()
+    }
+
     pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
         let metadata = serde_json::from_str(&self.metadata[0])?;
         Q::from_metadata(&metadata, self.distance_type)

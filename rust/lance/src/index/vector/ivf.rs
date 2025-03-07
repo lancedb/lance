@@ -71,7 +71,7 @@ use lance_linalg::{
     kernels::{normalize_arrow, normalize_fsl},
 };
 use lazy_static::lazy_static;
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
@@ -366,25 +366,28 @@ pub(crate) async fn optimize_vector_indices_v2(
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
 
-    let original_avg_loss = ivf_model.avg_loss().unwrap_or_default();
+    let original_avg_loss = ivf_model
+        .loss()
+        .map(|loss| loss / existing_indices[0].num_rows() as f64);
     let total_loss = existing_indices
         .iter()
-        .map(|idx| idx.ivf_model().loss.unwrap_or_default())
+        .map(|idx| idx.ivf_model().loss().unwrap_or_default())
         .sum::<f64>();
     let total_rows = existing_indices
         .iter()
-        .map(|idx| idx.ivf_model().num_rows())
+        .map(|idx| idx.num_rows())
         .sum::<u64>();
     let avg_loss = total_loss / total_rows as f64;
 
-    const AVG_LOSS_THRESHOLD: f64 = 1.1;
     let mut num_indices_to_merge = options.num_indices_to_merge;
-    if avg_loss >= original_avg_loss * AVG_LOSS_THRESHOLD {
-        info!(
-            "average loss {} of the indices is too high (> {} * {}), retrain the index",
-            avg_loss, original_avg_loss, AVG_LOSS_THRESHOLD
-        );
-        num_indices_to_merge = existing_indices.len();
+    if let Some(original_avg_loss) = original_avg_loss {
+        if avg_loss >= original_avg_loss * *AVG_LOSS_RETRAIN_THRESHOLD {
+            warn!(
+                "average loss {} of the indices is too high (> {} * {}), retrain the index",
+                avg_loss, original_avg_loss, *AVG_LOSS_RETRAIN_THRESHOLD
+            );
+            num_indices_to_merge = existing_indices.len();
+        }
     }
 
     let temp_dir = tempfile::tempdir()?;
@@ -951,6 +954,10 @@ impl VectorIndex for IVFIndex {
 
     async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
         unimplemented!("this method is for only sub index")
+    }
+
+    fn num_rows(&self) -> u64 {
+        self.ivf.num_rows()
     }
 
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {

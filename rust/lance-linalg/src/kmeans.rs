@@ -695,7 +695,7 @@ pub fn compute_partitions_arrow_array(
     centroids: &FixedSizeListArray,
     vectors: &FixedSizeListArray,
     distance_type: DistanceType,
-) -> Result<Vec<Option<u32>>> {
+) -> Result<(Vec<Option<u32>>, f64)> {
     if centroids.value_length() != vectors.value_length() {
         return Err(ArrowError::InvalidArgumentError(
             "Centroids and vectors have different dimensions".to_string(),
@@ -749,18 +749,17 @@ pub fn compute_partitions<T: ArrowNumericType, K: KMeansAlgo<T::Native>>(
     vectors: &PrimitiveArray<T>,
     dimension: impl AsPrimitive<usize>,
     distance_type: DistanceType,
-) -> Vec<Option<u32>>
+) -> (Vec<Option<u32>>, f64)
 where
     T::Native: Num,
 {
     let dimension = dimension.as_();
-    let (membership, _) = K::compute_membership_and_loss(
+    K::compute_membership_and_loss(
         centroids.values(),
         vectors.values(),
         dimension,
         distance_type,
-    );
-    membership
+    )
 }
 
 #[inline]
@@ -826,7 +825,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let actual = compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+        let (actual, _) = compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
             &centroids,
             &data,
             DIM,
@@ -867,6 +866,7 @@ mod tests {
             DIM,
             DistanceType::L2,
         )
+        .0
         .iter()
         .for_each(|cd| {
             assert!(cd.is_none());

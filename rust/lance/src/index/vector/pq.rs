@@ -368,6 +368,12 @@ impl VectorIndex for PQIndex {
         Ok(Box::pin(stream))
     }
 
+    fn num_rows(&self) -> u64 {
+        self.row_ids
+            .as_ref()
+            .map_or(0, |row_ids| row_ids.len() as u64)
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
         todo!("this method is for only IVF_HNSW_* index");
     }

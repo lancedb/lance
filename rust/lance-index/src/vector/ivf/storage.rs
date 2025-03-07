@@ -97,8 +97,8 @@ impl IvfModel {
         self.lengths.iter().map(|x| *x as u64).sum()
     }
 
-    pub fn avg_loss(&self) -> Option<f64> {
-        self.loss.map(|loss| loss / self.num_rows() as f64)
+    pub fn loss(&self) -> Option<f64> {
+        self.loss
     }
 
     /// Use the query vector to find `nprobes` closest partitions.
