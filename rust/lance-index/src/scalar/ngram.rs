@@ -78,31 +78,45 @@ fn tokenize_visitor(tokenizer: &TextAnalyzer, text: &str, mut visitor: impl FnMu
     }
 }
 
-const ALPHA_SPAN: usize = b'z' as usize - b'0' as usize + 2;
+const ALPHA_SPAN: usize = 37;
 const MAX_TOKEN: usize = ALPHA_SPAN.pow(2) + ALPHA_SPAN;
 const MIN_TOKEN: usize = 0;
 const NGRAM_N: usize = 3;
 
-// There are 75 values between '0' (48) and 'z' (122) (inclusive)
-// We add 1 for the NULL token
+// Convert an ngram (string) to a token (u32).  This helps avoid heap allocations
+// and it makes it easier to partition the tokens for shuffling
+//
+// There are 36 alphanumeric values and we add 1 for the NULL token giving us 37^3
+// potential tokens.
 //
 // "" => 0
-// "?" => 76 * 2 * ?
-// "?$" => 76 * 2 * ? + 76 * $
-// "?$#" => 76 * 2 * ? + 76 * $ + #
+// "?" => 37^2 * ?
+// "?$" => 37^2 * ? + 37 * $
+// "?$#" => 37^2 * ? + 37 * $ + #
+// ...
 //
 // The ?,$,# represent the position in the alphabet (+1 to distinguish from NULL)
 //
 // Small strings get the larger multipliers because those ngrams are
 // less likely to be unique and will have larger bitmaps.  We want to
 // spread those out.
+//
+// NOTE: Today we hard-code trigrams and we do not include 1-grams or 2-grams so this
+// function is more general than it needs to be...just in case.
 fn ngram_to_token(ngram: &str, ngram_length: usize) -> u32 {
     let mut token = 0;
     // Empty string will get 0
     for (idx, byte) in ngram.bytes().enumerate() {
-        let pos = (byte - b'0') as u32 + 1;
+        let pos = if byte <= b'9' {
+            byte - b'0'
+        } else if byte <= b'z' {
+            byte - b'a' + 10
+        } else {
+            unreachable!()
+        } + 1;
+        debug_assert!(pos < ALPHA_SPAN as u8);
         let mult = ALPHA_SPAN.pow(ngram_length as u32 - idx as u32 - 1) as u32;
-        token += pos * mult;
+        token += pos as u32 * mult;
     }
     token
 }
@@ -332,7 +346,7 @@ impl ScalarIndex for NGramIndex {
                 let mut row_offsets = Vec::with_capacity(substr.len() * 3);
                 let mut missing = false;
                 tokenize_visitor(&self.tokenizer, substr, |ngram| {
-                    let token = ngram_to_token(&ngram, NGRAM_N);
+                    let token = ngram_to_token(ngram, NGRAM_N);
                     if let Some(row_offset) = self.tokens.get(&token) {
                         row_offsets.push(*row_offset);
                     } else {
@@ -375,24 +389,6 @@ impl ScalarIndex for NGramIndex {
         _dest_store: &dyn IndexStore,
     ) -> Result<()> {
         todo!()
-        // let mut builder = self.to_builder().await?;
-        // let lists = std::mem::take(&mut builder.state.bitmaps);
-        // let remapped_lists = lists
-        //     .into_iter()
-        //     .map(|list| {
-        //         RoaringTreemap::from_iter(list.iter().filter_map(|row_id| {
-        //             if let Some(mapped) = mapping.get(&row_id) {
-        //                 // Mapped to either new value or None (delete)
-        //                 *mapped
-        //             } else {
-        //                 // Not mapped to new value, keep original value
-        //                 Some(row_id)
-        //             }
-        //         }))
-        //     })
-        //     .collect::<Vec<_>>();
-        // builder.state.bitmaps = remapped_lists;
-        // builder.write_index(dest_store).await
     }
 
     async fn update(
@@ -415,9 +411,13 @@ lazy_static::lazy_static! {
         .unwrap_or_else(|_| "1000000000".to_string())
         .parse()
         .expect("failed to parse LANCE_NGRAM_TOKENS_PER_SPILL");
-
-    static ref DEFAULT_PARALLELISM: usize = std::env::var("LANCE_NGRAM_PARALLELISM").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM")).unwrap_or(get_num_compute_intensive_cpus());
-    // Just enough to so that tokenizing is faster than I/O
+    // How many partitions to use for shuffling out the work.  We slightly
+    // over-allocate this since the amount of work per-partition is not uniform.
+    //
+    // Increasing this may increase the performance but it could increase RAM (since we will spill less often)
+    // and could hurt performance (since there will be more files at the end for the final spill)
+    static ref DEFAULT_NUM_PARTITIONS: usize = std::env::var("LANCE_NGRAM_NUM_PARTITIONS").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM")).unwrap_or((get_num_compute_intensive_cpus() * 4).max(128));
+    // Just enough so that tokenizing is faster than I/O
     static ref DEFAULT_TOKENIZE_PARALLELISM: usize = std::env::var("LANCE_NGRAM_TOKENIZE_PARALLELISM").map(|s| s.parse().expect("failed to parse LANCE_NGRAM_TOKENIZE_PARALLELISM")).unwrap_or(8);
 }
 
@@ -429,6 +429,9 @@ impl Default for NGramIndexBuilderOptions {
     }
 }
 
+// An ordered list of tokens and bitmaps
+//
+// The `tokens` list is ordered by token value.  This makes it easier to merge spill files.
 struct NGramIndexSpillState {
     tokens: UInt32Array,
     bitmaps: Vec<RoaringTreemap>,
@@ -438,22 +441,20 @@ impl NGramIndexSpillState {
     fn try_from_batch(batch: RecordBatch) -> Result<Self> {
         let tokens = batch
             .column_by_name(TOKENS_COL)
-            .ok_or_lance()?
+            .expect_ok()?
             .as_primitive::<UInt32Type>()
             .clone();
         let postings = batch
             .column_by_name(POSTING_LIST_COL)
-            .unwrap()
+            .expect_ok()?
             .as_binary::<i32>();
 
         let bitmaps = postings
             .into_iter()
             .map(|bytes| {
-                RoaringTreemap::deserialize_from(bytes.ok_or_lance()?).map_err(|e| {
-                    Error::Internal {
-                        message: format!("Error deserializing ngram list: {}", e),
-                        location: location!(),
-                    }
+                RoaringTreemap::deserialize_from(bytes.expect_ok()?).map_err(|e| Error::Internal {
+                    message: format!("Error deserializing ngram list: {}", e),
+                    location: location!(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -474,6 +475,8 @@ impl NGramIndexSpillState {
     }
 }
 
+// As we're building we create a map from ngram to row ids.  When this map gets too large
+// we spill it to disk.
 struct NGramIndexBuildState {
     tokens_map: BTreeMap<u32, RoaringTreemap>,
 }
@@ -492,6 +495,7 @@ impl NGramIndexBuildState {
     }
 
     fn into_spill(self) -> NGramIndexSpillState {
+        // We can rely on these being in token order because of BTreeMap
         let tokens = UInt32Array::from_iter_values(self.tokens_map.keys().copied());
         let bitmaps = Vec::from_iter(self.tokens_map.into_values());
 
@@ -499,6 +503,18 @@ impl NGramIndexBuildState {
     }
 }
 
+/// A builder for an ngram index
+///
+/// The builder is a small pipeline.  First, we read in the data and tokenize it.  This
+/// stage uses fan-out parallelism to tokenize the data because tokenization may be a little
+/// slower than I/O.
+///
+/// The second stage fans out much wider.  It partitions the tokens into a number of partitions.
+/// Each partition has a BTreemap that maps tokens to row ids.  The partitions then build up
+/// roaring treemaps.  When a partition gets too full it will spill to disk.
+///
+/// Once all the data is processed we spill all the parititons to disk and then we merge the
+/// spill files into a single index file.
 pub struct NGramIndexBuilder {
     tokenizer: TextAnalyzer,
     options: NGramIndexBuilderOptions,
@@ -607,7 +623,11 @@ impl NGramIndexBuilder {
         format!("spill-{}.lance.tmp", id)
     }
 
-    async fn flush(&mut self, state: NGramIndexBuildState) -> Result<()> {
+    async fn flush(&mut self, state: NGramIndexBuildState) -> Result<bool> {
+        if self.tokens_seen == 0 {
+            assert!(state.tokens_map.is_empty());
+            return Ok(self.has_flushed);
+        }
         self.tokens_seen = 0;
         let spill_state = state.into_spill();
         let flush_start = Instant::now();
@@ -653,7 +673,7 @@ impl NGramIndexBuilder {
             self.worker_number,
             flush_time.as_millis()
         );
-        Ok(())
+        Ok(true)
     }
 
     fn tokenize_and_partition(
@@ -680,11 +700,11 @@ impl NGramIndexBuilder {
         partitions
     }
 
-    pub async fn train(&mut self, data: SendableRecordBatchStream) -> Result<usize> {
+    pub async fn train(&mut self, data: SendableRecordBatchStream) -> Result<Vec<usize>> {
         let schema = data.schema();
         Self::validate_schema(schema.as_ref())?;
 
-        let num_workers = *DEFAULT_PARALLELISM;
+        let num_workers = *DEFAULT_NUM_PARTITIONS;
         let mut senders = Vec::with_capacity(num_workers);
         let mut builders = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
@@ -696,9 +716,7 @@ impl NGramIndexBuilder {
                 while let Some(partition) = recv.recv().await {
                     builder.process_batch(partition).await?;
                 }
-                let state = builder.state.take();
-                builder.flush(state).await?;
-                Result::Ok(())
+                Result::Ok(builder)
             });
             builders.push(future);
         }
@@ -720,9 +738,22 @@ impl NGramIndexBuilder {
         }
 
         std::mem::drop(senders);
-        futures::future::try_join_all(builders).await?;
+        let builders = futures::future::try_join_all(builders).await?;
 
-        Ok(num_workers)
+        // Final flush is serialized.  If we kick this off in parallel it can
+        // use a lot of memory.
+
+        let mut to_spill = Vec::with_capacity(builders.len());
+
+        for builder in builders {
+            let mut builder = builder?;
+            let state = builder.state.take();
+            if builder.flush(state).await? {
+                to_spill.push(builder.worker_number);
+            }
+        }
+
+        Ok(to_spill)
     }
 
     async fn write(
@@ -857,14 +888,14 @@ impl NGramIndexBuilder {
         while left_state.is_some() || right_state.is_some() {
             if left_state.is_none() {
                 // Left is done, full drain right
-                let state = right_state.take().unwrap();
+                let state = right_state.take().expect_ok()?;
                 writer.write_record_batch(state.try_into_batch()?).await?;
                 while let Some(state) = right_stream.try_next().await? {
                     writer.write_record_batch(state.try_into_batch()?).await?;
                 }
             } else if right_state.is_none() {
                 // Right is done, full drain left
-                let state = left_state.take().unwrap();
+                let state = left_state.take().expect_ok()?;
                 writer.write_record_batch(state.try_into_batch()?).await?;
                 while let Some(state) = left_stream.try_next().await? {
                     writer.write_record_batch(state.try_into_batch()?).await?;
@@ -923,32 +954,35 @@ impl NGramIndexBuilder {
     // intermediate files
     //
     // Note: worker indices start at 1 and not 0 (hence all the +1's)
-    async fn merge_spills(&mut self, num_spills: usize) -> Result<usize> {
-        info!("Merging {} index files into one combined index", num_spills);
+    async fn merge_spills(&mut self, spill_files: Vec<usize>) -> Result<usize> {
+        info!(
+            "Merging {} index files into one combined index",
+            spill_files.len()
+        );
 
-        let mut spills_remaining = VecDeque::from_iter(1..=num_spills);
-        let mut spill_counter = num_spills + 1;
+        let mut spill_counter = spill_files.iter().max().expect_ok()? + 1;
+        let mut spills_remaining = VecDeque::from_iter(spill_files);
         while spills_remaining.len() > 1 {
-            let left = spills_remaining.pop_front().unwrap();
-            let right = spills_remaining.pop_front().unwrap();
+            let left = spills_remaining.pop_front().expect_ok()?;
+            let right = spills_remaining.pop_front().expect_ok()?;
             self.merge_spill_files(left, right, spill_counter).await?;
             spills_remaining.push_back(spill_counter);
             spill_counter += 1;
         }
 
-        return Ok(spills_remaining.pop_front().unwrap());
+        spills_remaining.pop_front().expect_ok()
     }
 
     pub async fn write_index(
         mut self,
         store: &dyn IndexStore,
-        num_spill_files: usize,
+        spill_files: Vec<usize>,
     ) -> Result<()> {
         let mut writer = store
             .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
             .await?;
 
-        let index_to_copy = self.merge_spills(num_spill_files).await?;
+        let index_to_copy = self.merge_spills(spill_files).await?;
 
         let reader = self
             .spill_store
@@ -976,9 +1010,9 @@ pub async fn train_ngram_index(
     let batches_source = data_source.scan_unordered_chunks(4096).await?;
     let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
 
-    let num_spill_files = builder.train(batches_source).await?;
+    let spill_files = builder.train(batches_source).await?;
 
-    builder.write_index(index_store, num_spill_files).await
+    builder.write_index(index_store, spill_files).await
 }
 
 #[cfg(test)]
@@ -1056,7 +1090,7 @@ mod tests {
         mut builder: NGramIndexBuilder,
         data: SendableRecordBatchStream,
     ) -> NGramIndex {
-        let num_spill_files = builder.train(data).await.unwrap();
+        let spill_files = builder.train(data).await.unwrap();
 
         let tmpdir = Arc::new(tempdir().unwrap());
         let test_store = LanceIndexStore::new(
@@ -1065,17 +1099,14 @@ mod tests {
             FileMetadataCache::no_cache(),
         );
 
-        builder
-            .write_index(&test_store, num_spill_files)
-            .await
-            .unwrap();
+        builder.write_index(&test_store, spill_files).await.unwrap();
 
         NGramIndex::from_store(&test_store).await.unwrap()
     }
 
     #[test_log::test(tokio::test)]
     async fn test_basic_ngram_index() {
-        let data = StringArray::from_iter_values(&[
+        let data = StringArray::from_iter_values([
             "cat",
             "dog",
             "cat dog",
