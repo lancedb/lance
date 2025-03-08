@@ -247,9 +247,14 @@ pub fn decoder_from_array_encoding(
             let items_encoding = dictionary.items.as_ref().unwrap();
             let num_dictionary_items = dictionary.num_dictionary_items;
 
+            let DataType::Dictionary(key_type, value_type) = data_type else {
+                panic!("Dictionary encoding must be applied to a dictionary type")
+            };
+
             let indices_scheduler =
-                decoder_from_array_encoding(indices_encoding, buffers, data_type);
-            let items_scheduler = decoder_from_array_encoding(items_encoding, buffers, data_type);
+                decoder_from_array_encoding(indices_encoding, buffers, key_type.as_ref());
+            let items_scheduler =
+                decoder_from_array_encoding(items_encoding, buffers, value_type.as_ref());
 
             let should_decode_dict = !data_type.is_dictionary();
 
