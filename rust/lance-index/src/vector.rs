@@ -56,6 +56,8 @@ lazy_static! {
             Field::new(DIST_COL, arrow_schema::DataType::Float32, false),
             ROW_ID_FIELD.clone(),
         ]));
+    pub static ref PART_ID_FIELD: arrow_schema::Field =
+        arrow_schema::Field::new(PART_ID_COLUMN, arrow_schema::DataType::UInt32, true);
 }
 
 /// Query parameters for the vector indices
