@@ -1227,7 +1227,7 @@ class LanceDataset(pa.dataset.Dataset):
     def merge_insert(
         self,
         on: Union[str, Iterable[str]],
-    ):
+    ) -> MergeInsertBuilder:
         """
         Returns a builder that can be used to create a "merge insert" operation
 
