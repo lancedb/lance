@@ -279,6 +279,18 @@ impl IndexStore for LanceIndexStore {
             Ok(())
         }
     }
+
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()> {
+        let path = self.index_dir.child(name);
+        let new_path = self.index_dir.child(new_name);
+        self.object_store.copy(&path, &new_path).await?;
+        self.object_store.delete(&path).await
+    }
+
+    async fn delete_index_file(&self, name: &str) -> Result<()> {
+        let path = self.index_dir.child(name);
+        self.object_store.delete(&path).await
+    }
 }
 
 #[cfg(test)]
