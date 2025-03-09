@@ -13,9 +13,9 @@ The key features of Lance include:
 
 * **High-performance random access:** 100x faster than Parquet.
 
-* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
+* **Zero-copy schema evolution:** add and drop columns without copying the entire dataset.
 
-* **Zero-copy, automatic versioning:** manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
+* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
 
 * **Ecosystem integrations:** Apache-Arrow, DuckDB and more on the way.
 
