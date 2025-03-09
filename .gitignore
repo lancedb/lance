@@ -93,3 +93,4 @@ python/venv
 test_data/venv
 
 **/*.profraw
+*.lance

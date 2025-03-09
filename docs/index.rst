@@ -2,11 +2,11 @@
 .. image:: _static/lance_logo.png
   :width: 400
 
-Lance: modern columnar data format for ML
-======================================================================================
+Lance: modern columnar format for ML workloads
+==============================================
 
 
-`Lance` is a columnar data format that is easy and fast to version, query and train on.
+`Lance` is a columnar format that is easy and fast to version, query and train on.
 It’s designed to be used with images, videos, 3D point clouds, audio and of course tabular data.
 It supports any POSIX file systems, and cloud storage like AWS S3 and Google Cloud Storage.
 The key features of Lance include:
