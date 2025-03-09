@@ -72,7 +72,7 @@ For example, to delete Bob's row from the dataset above, one could use:
 
 .. note::
 
-  `Lance Format is immutable <./format.html>`_. Each write operation creates a new version of the dataset,
+  :doc:`Lance Format is immutable <./format>`. Each write operation creates a new version of the dataset,
   so users must reopen the dataset to see the changes. Likewise, rows are removed by marking
   them as deleted in a separate deletion index, rather than rewriting the files. This approach
   is faster and avoids invalidating any indices that reference the files, ensuring that subsequent
