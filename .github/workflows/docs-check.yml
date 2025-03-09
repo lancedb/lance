@@ -44,6 +44,10 @@ jobs:
         run: |
           make nbconvert
           make html
+      - name: Run tests
+        working-directory: docs
+        run: |
+          make doctest
       - name: Check links
         working-directory: docs
         run: |
