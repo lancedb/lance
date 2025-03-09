@@ -1344,11 +1344,24 @@ impl DecodeBatchScheduler {
             return;
         }
         trace!("Scheduling take of {} rows", indices.len());
-        let ranges = indices
-            .iter()
-            .map(|&idx| idx..(idx + 1))
-            .collect::<Vec<_>>();
+        let ranges = Self::indices_to_ranges(indices);
         self.schedule_ranges(&ranges, filter, sink, scheduler)
+    }
+
+    // coalesce continuous indices if possible (the input indices must be sorted and non-empty)
+    fn indices_to_ranges(indices: &[u64]) -> Vec<Range<u64>> {
+        let mut ranges = Vec::new();
+        let mut start = indices[0];
+
+        for window in indices.windows(2) {
+            if window[1] != window[0] + 1 {
+                ranges.push(start..window[0] + 1);
+                start = window[1];
+            }
+        }
+
+        ranges.push(start..*indices.last().unwrap() + 1);
+        ranges
     }
 }
 
@@ -2767,4 +2780,31 @@ pub async fn decode_batch(
         rx,
     );
     decode_stream.next().await.unwrap().task.await
+}
+
+#[cfg(test)]
+// test coalesce indices to ranges
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_coalesce_indices_to_ranges_with_single_index() {
+        let indices = vec![1];
+        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        assert_eq!(ranges, vec![1..2]);
+    }
+
+    #[test]
+    fn test_coalesce_indices_to_ranges() {
+        let indices = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        assert_eq!(ranges, vec![1..10]);
+    }
+
+    #[test]
+    fn test_coalesce_indices_to_ranges_with_gaps() {
+        let indices = vec![1, 2, 3, 5, 6, 7, 9];
+        let ranges = DecodeBatchScheduler::indices_to_ranges(&indices);
+        assert_eq!(ranges, vec![1..4, 5..8, 9..10]);
+    }
 }
