@@ -1,58 +1,74 @@
-Read and Write Lance Dataset
-============================
-
-Lance dataset APIs follows the `PyArrow API <https://arrow.apache.org/docs/python/parquet.html>`_
-conventions.
+Read and Write Data
+===================
 
 Writing Lance Dataset
 ---------------------
 
-Similar to Apache Pyarrow, the simplest approach to create a Lance dataset is
-writing a :py:class:`pyarrow.Table` via :py:meth:`lance.write_dataset`.
+If you're familiar with `Apache PyArrow <https://arrow.apache.org/docs/python/getstarted.html>`_,
+you'll find that creating a Lance dataset is straightforward.
+Begin by writing a :py:class:`pyarrow.Table` using the :py:meth:`lance.write_dataset` function.
 
-.. code-block:: python
+.. testsetup::
 
-  import lance
-  import pyarrow as pa
+  >>> import shutil
+  >>> from typing import Iterator
+  >>> shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
 
-  table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
-                                {"name": "Bob", "age": 30}])
-  lance.write_dataset(table, "./alice_and_bob.lance")
+.. doctest::
 
-If the memory footprint of the dataset is too large to fit in memory, :py:meth:`lance.write_dataset`
-also supports writing a dataset in iterator of :py:class:`pyarrow.RecordBatch` es.
+  >>> import lance
+  >>> import pyarrow as pa
 
-.. code-block:: python
+  >>> table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+  ...                               {"name": "Bob", "age": 30}])
+  >>> ds = lance.write_dataset(table, "./alice_and_bob.lance")
 
-  import lance
-  import pyarrow as pa
+If the dataset is too large to fully load into memory, you can stream data using :py:meth:`lance.write_dataset`
+also supports :py:class:`~typing.Iterator` of :py:class:`pyarrow.RecordBatch` es.
+You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this case.
 
-  def producer():
-      yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
-      yield pa.RecordBatch.from_pylist([{"name": "Blob", "age": 30}])
+.. testsetup::
 
-  schema = pa.schema([
-          pa.field("name", pa.string()),
-          pa.field("age", pa.int64()),
-      ])
+  >>> shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
 
-    lance.write_dataset(reader, "./alice_and_bob.lance", schema)
+.. doctest::
+
+  >>> def producer() -> Iterator[pa.RecordBatch]:
+  ...     """An iterator of RecordBatches."""
+  ...     yield pa.RecordBatch.from_pylist([{"name": "Alice", "age": 20}])
+  ...     yield pa.RecordBatch.from_pylist([{"name": "Bob", "age": 30}])
+
+  >>> schema = pa.schema([
+  ...     ("name", pa.string()),
+  ...     ("age", pa.int32()),
+  ... ])
+
+  >>> ds = lance.write_dataset(producer(),
+  ...                          "./alice_and_bob.lance",
+  ...                          schema=schema)
+  >>> ds.count_rows()
+  2
 
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
-:py:class:`pyarrow.Dataset`, and ``Iterator[pyarrow.RecordBatch]``. Check its doc for more details.
+:py:class:`pyarrow.dataset.Dataset`, and ``Iterator[pyarrow.RecordBatch]``.
 
 Deleting rows
-~~~~~~~~~~~~~
+-------------
 
 Lance supports deleting rows from a dataset using a SQL filter. For example, to
 delete Bob's row from the dataset above, one could use:
 
-.. code-block:: python
+.. doctest::
 
-  import lance
+  >>> import lance
 
-  dataset = lance.dataset("./alice_and_bob.lance")
-  dataset.delete("name = 'Bob'")
+  >>> dataset = lance.dataset("./alice_and_bob.lance")
+  >>> dataset.delete("name = 'Bob'")
+  >>> dataset2 = lance.dataset("./alice_and_bob.lance")
+  >>> dataset2.to_table().to_pandas()
+      name  age
+  0  Alice   20
+
 
 :py:meth:`lance.LanceDataset.delete` supports the same filters as described in
 :ref:`filter-push-down`.
@@ -61,13 +77,8 @@ Rows are deleted by marking them as deleted in a separate deletion index. This i
 faster than rewriting the files and also avoids invaliding any indices that point
 to those files. Any subsequent queries will not return the deleted rows.
 
-.. warning::
-  
-  Do not read datasets with deleted rows using Lance versions prior to 0.5.0,
-  as they will return the deleted rows. This is fixed in 0.5.0 and later.
-
 Updating rows
-~~~~~~~~~~~~~
+-------------
 
 Lance supports updating rows based on SQL expressions with the
 :py:meth:`lance.LanceDataset.update` method. For example, if we notice
@@ -224,7 +235,7 @@ Lance supports schema evolution: adding, removing, and altering columns in a
 dataset. Most of these operations can be performed *without* rewriting the
 data files in the dataset, making them very efficient operations.
 
-In general, schema changes will conflict with most other concurrent write 
+In general, schema changes will conflict with most other concurrent write
 operations. For example, if you change the schema of the dataset while someone
 else is appending data to it, either your schema change or the append will fail,
 depending on the order of the operations. Thus, it's recommended to perform
@@ -318,7 +329,7 @@ how to populate the new columns: first, by providing a SQL expression for each
 new column, or second, by providing a function to generate the new column data.
 
 SQL expressions can either be independent expressions or reference existing
-columns. SQL literal values can be used to set a single value for all 
+columns. SQL literal values can be used to set a single value for all
 existing rows.
 
 .. testcode::
@@ -332,7 +343,7 @@ existing rows.
         "status": "'active'",
     })
     dataset.to_table().to_pandas()
-  
+
 .. testoutput::
 
         name         hash...   status
@@ -428,13 +439,13 @@ it very quick.
     dataset = lance.write_dataset(table, "names")
     dataset.drop_columns(["name"])
     dataset.schema()
-  
+
 .. testoutput::
 
     id: int64
 
 To actually remove the data from disk, the files must be rewritten to remove the
-columns and then the old files must be deleted. This can be done using 
+columns and then the old files must be deleted. This can be done using
 :py:meth:`lance.dataset.DatasetOptimizer.compact_files()` followed by
 :py:meth:`lance.LanceDataset.cleanup_old_versions()`.
 
@@ -520,13 +531,13 @@ For example, the following filter string is acceptable:
   ((label IN [10, 20]) AND (note['email'] IS NOT NULL))
       OR NOT note['created']
 
-Nested fields can be accessed using the subscripts. Struct fields can be 
+Nested fields can be accessed using the subscripts. Struct fields can be
 subscripted using field names, while list fields can be subscripted using
 indices.
 
 If your column name contains special characters or is a `SQL Keyword <https://docs.rs/sqlparser/latest/sqlparser/keywords/index.html>`_,
 you can use backtick (`````) to escape it. For nested fields, each segment of the
-path must be wrapped in backticks. 
+path must be wrapped in backticks.
 
 .. code-block:: SQL
 
@@ -638,7 +649,7 @@ ordering of the data will be preserved.
 
 .. note::
 
-  Compaction creates a new version of the table. It does not delete the old 
+  Compaction creates a new version of the table. It does not delete the old
   version of the table and the files referenced by it.
 
 .. code-block:: python
@@ -724,7 +735,7 @@ These options apply to all object stores.
      - PEM-formatted CA certificate for proxy connections
    * - ``proxy_excludes``
      - List of hosts that bypass proxy. This is a comma separated list of domains
-       and IP masks. Any subdomain of the provided domain will be bypassed. For 
+       and IP masks. Any subdomain of the provided domain will be bypassed. For
        example, ``example.com, 192.168.1.0/24`` would bypass ``https://api.example.com``,
        ``https://www.example.com``, and any IP in the range ``192.168.1.0/24``.
    * - ``client_max_retries``
@@ -844,7 +855,7 @@ Committing mechanisms for S3
 .. deprecated::
 
   S3 now supports atomic put-if-not-exists, so this feature is no longer necessary.
-  It will be removed in a future version. You should migrate tables to use the 
+  It will be removed in a future version. You should migrate tables to use the
   new feature by removing the commit locks from all writers at the same time. Note
   that it is unsafe to mix writers with and without commit locks on the same dataset.
 
@@ -888,12 +899,12 @@ eventually. The timeout should be no less than 30 seconds.
         failed = True
       finally:
         my_lock.release()
-  
+
   lance.write_dataset(data, "s3://bucket/path/", commit_lock=commit_lock)
 
 When the context manager is exited, it will raise an exception if the commit
 failed. This might be because of a network error or if the version has already
-been written. Either way, the context manager should release the lock. Use a 
+been written. Either way, the context manager should release the lock. Use a
 try/finally block to ensure that the lock is released.
 
 Concurrent Writer on S3 using DynamoDB
@@ -937,7 +948,7 @@ Alternatively, you can pass the path to the JSON file in the ``storage_options``
   )
 
 .. note::
-  
+
   By default, GCS uses HTTP/1 for communication, as opposed to HTTP/2. This improves
   maximum throughput significantly. However, if you wish to use HTTP/2 for some reason,
   you can set the environment variable ``HTTP1_ONLY`` to ``false``.
