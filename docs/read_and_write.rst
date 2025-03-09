@@ -55,8 +55,8 @@ You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this ca
 Deleting rows
 -------------
 
-Lance supports deleting rows from a dataset using a SQL filter. For example, to
-delete Bob's row from the dataset above, one could use:
+Lance supports deleting rows from a dataset using a SQL filter, as described in :ref:`filter-push-down`.
+For example, to delete Bob's row from the dataset above, one could use:
 
 .. doctest::
 
@@ -70,12 +70,11 @@ delete Bob's row from the dataset above, one could use:
   0  Alice   20
 
 
-:py:meth:`lance.LanceDataset.delete` supports the same filters as described in
-:ref:`filter-push-down`.
-
-Rows are deleted by marking them as deleted in a separate deletion index. This is
-faster than rewriting the files and also avoids invaliding any indices that point
-to those files. Any subsequent queries will not return the deleted rows.
+Lance Dataset is immutable. Each write operation creates a new version of the dataset,
+so users must reopen the dataset to see the changes. Likewise, rows are removed by marking
+them as deleted in a separate deletion index, rather than rewriting the files. This approach
+is faster and avoids invalidating any indices that reference the files, ensuring that subsequent
+queries do not return the deleted rows.
 
 Updating rows
 -------------
