@@ -17,7 +17,7 @@ def setup(app):
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = "2024, Lance Developer"
+copyright = "2025, Lance Developer"
 author = "Lance Developer"
 
 
@@ -49,6 +49,12 @@ templates_path = ["_templates"]
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+
+intersphinx_mapping = {
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "pyarrow": ("https://arrow.apache.org/docs/", None),
+    "pandas": ("https://pandas.pydata.org/pandas-docs/stable/", None),
+}
 
 
 # -- Options for HTML output -------------------------------------------------
