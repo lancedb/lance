@@ -211,6 +211,12 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     ///
     /// This is often useful when remapping or updating
     async fn copy_index_file(&self, name: &str, dest_store: &dyn IndexStore) -> Result<()>;
+
+    /// Rename an index file
+    async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<()>;
+
+    /// Delete an index file (used in the tmp spill store to keep tmp size down)
+    async fn delete_index_file(&self, name: &str) -> Result<()>;
 }
 
 /// Different scalar indices may support different kinds of queries
@@ -530,7 +536,7 @@ impl AnyQuery for TextQuery {
 }
 
 /// The result of a search operation against a scalar index
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum SearchResult {
     /// The exact row ids that satisfy the query
     Exact(RowIdTreeMap),
