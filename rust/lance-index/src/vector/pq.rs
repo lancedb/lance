@@ -447,7 +447,7 @@ impl Quantization for ProductQuantizer {
         let tensor = pb::Tensor::try_from(&self.codebook)?;
         Ok(serde_json::to_value(ProductQuantizationMetadata {
             codebook_position,
-            num_bits: self.num_bits,
+            nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: None,
@@ -457,6 +457,10 @@ impl Quantization for ProductQuantizer {
     }
 
     fn from_metadata(metadata: &Self::Metadata, distance_type: DistanceType) -> Result<Quantizer> {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         let codebook = match metadata.codebook.as_ref() {
             Some(fsl) => fsl.clone(),
             None => {
@@ -466,7 +470,7 @@ impl Quantization for ProductQuantizer {
         };
         Ok(Quantizer::Product(Self::new(
             metadata.num_sub_vectors,
-            metadata.num_bits,
+            metadata.nbits,
             metadata.dimension,
             codebook,
             distance_type,

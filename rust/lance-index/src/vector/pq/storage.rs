@@ -52,7 +52,7 @@ pub const PQ_METADATA_KEY: &str = "lance:pq";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
     pub codebook_position: usize,
-    pub num_bits: u32,
+    pub nbits: u32,
     pub num_sub_vectors: usize,
     pub dimension: usize,
 
@@ -247,6 +247,10 @@ impl ProductQuantizationStorage {
         )
     }
 
+    pub fn codebook(&self) -> &FixedSizeListArray {
+        &self.codebook
+    }
+
     /// Load full PQ storage from disk.
     ///
     /// Parameters
@@ -327,7 +331,7 @@ impl ProductQuantizationStorage {
 
         let metadata = ProductQuantizationMetadata {
             codebook_position: pos,
-            num_bits: self.num_bits,
+            nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: None,
@@ -411,7 +415,7 @@ impl QuantizerStorage for ProductQuantizationStorage {
         Self::new(
             codebook,
             batch,
-            metadata.num_bits,
+            metadata.nbits,
             metadata.num_sub_vectors,
             metadata.dimension,
             distance_type,
@@ -427,6 +431,10 @@ impl VectorStore for ProductQuantizationStorage {
     where
         Self: Sized,
     {
+        let distance_type = match distance_type {
+            DistanceType::Cosine => DistanceType::L2,
+            _ => distance_type,
+        };
         let metadata_json = batch
             .schema_ref()
             .metadata()
@@ -444,7 +452,7 @@ impl VectorStore for ProductQuantizationStorage {
         Self::new(
             codebook,
             batch,
-            metadata.num_bits,
+            metadata.nbits,
             metadata.num_sub_vectors,
             metadata.dimension,
             distance_type,
@@ -456,7 +464,7 @@ impl VectorStore for ProductQuantizationStorage {
         let codebook = pb::Tensor::try_from(&self.codebook)?.encode_to_vec();
         let metadata = ProductQuantizationMetadata {
             codebook_position: 0, // deprecated in new format
-            num_bits: self.num_bits,
+            nbits: self.num_bits,
             num_sub_vectors: self.num_sub_vectors,
             dimension: self.dimension,
             codebook: None,
@@ -662,6 +670,7 @@ impl DistCalculator for PQDistCalculator {
 
 #[cfg(test)]
 mod tests {
+    use crate::vector::ivf::storage::IvfModel;
     use crate::vector::storage::StorageBuilder;
 
     use super::*;
@@ -698,9 +707,14 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
-        StorageBuilder::new("vectors".to_owned(), pq.distance_type, pq)
-            .build(&batch)
-            .unwrap()
+        StorageBuilder::new(
+            &IvfModel::empty(),
+            "vectors".to_owned(),
+            pq.distance_type,
+            pq,
+        )
+        .build(&batch)
+        .unwrap()
     }
 
     #[tokio::test]
