@@ -82,6 +82,7 @@ html_css_files = ["custom.css"]
 # -- doctest configuration ---------------------------------------------------
 
 doctest_global_setup = """
+import os
 import shutil
 from typing import Iterator
 
