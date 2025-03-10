@@ -8,7 +8,6 @@ use lance_core::datatypes::Schema;
 use lance_core::Error;
 use lance_datafusion::chunker::{break_stream, chunk_stream};
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::v2::writer::FileWriterOptions;
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
@@ -99,10 +98,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let mut fragment = Fragment::new(id);
         let full_path = base_path.child(DATA_DIR).child(filename.clone());
         let obj_writer = object_store.create(&full_path).await?;
-        let file_write_options = params
-            .file_writer_options
-            .clone()
-            .unwrap_or_default();
+        let file_write_options = params.file_writer_options.clone().unwrap_or_default();
         let mut writer =
             lance_file::v2::writer::FileWriter::try_new(obj_writer, schema, file_write_options)?;
 
