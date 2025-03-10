@@ -265,7 +265,7 @@ impl ShuffleReader for IvfShufflerReader {
             Arc::new(schema),
             reader.read_stream(
                 lance_io::ReadBatchParams::RangeFull,
-                4096,
+                u32::MAX,
                 16,
                 FilterExpression::no_filter(),
             )?,

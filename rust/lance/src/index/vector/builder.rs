@@ -545,49 +545,42 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
     ) -> Result<(usize, usize)> {
         let local_store = ObjectStore::local();
         // build quantized vector storage
-        let storage_len = {
-            let storage =
-                StorageBuilder::new(ivf, column.clone(), distance_type, quantizer).build(&batch)?;
-            let path = temp_dir.child(format!("storage_part{}", part_id));
-            let batches = storage.to_batches()?;
-            FileWriter::create_file_with_batches(
-                &local_store,
-                &path,
-                storage.schema().as_ref().try_into()?,
-                batches,
-                Default::default(),
-            )
-            .await?
-        };
+        let storage =
+            StorageBuilder::new(ivf, column.clone(), distance_type, quantizer).build(&batch)?;
+
+        let path = temp_dir.child(format!("storage_part{}", part_id));
+        let batches = storage.to_batches()?;
+        let write_storage_fut = FileWriter::create_file_with_batches(
+            &local_store,
+            &path,
+            storage.schema().as_ref().try_into()?,
+            batches,
+            Default::default(),
+        );
 
         // build the sub index, with in-memory storage
-        let index_len = {
-            let vectors = batch[&column].as_fixed_size_list();
-            let flat_storage = FlatFloatStorage::new(vectors.clone(), distance_type);
-            let sub_index = S::index_vectors(&flat_storage, sub_index_params)?;
-            let path = temp_dir.child(format!("index_part{}", part_id));
-            let index_batch = sub_index.to_batch()?;
-            let schema = index_batch.schema().as_ref().try_into()?;
-            FileWriter::create_file_with_batches(
-                &local_store,
-                &path,
-                schema,
-                std::iter::once(index_batch),
-                Default::default(),
-            )
-            .await?
-        };
+        let sub_index = S::index_vectors(&storage, sub_index_params)?;
+        let path = temp_dir.child(format!("index_part{}", part_id));
+        let index_batch = sub_index.to_batch()?;
+        let schema = index_batch.schema().as_ref().try_into()?;
+        let write_index_fut = FileWriter::create_file_with_batches(
+            &local_store,
+            &path,
+            schema,
+            std::iter::once(index_batch),
+            Default::default(),
+        );
 
-        Ok((storage_len, index_len))
+        futures::try_join!(write_storage_fut, write_index_fut)
     }
 
     async fn take_partition_batches(
         part_id: usize,
         existing_indices: &[Arc<dyn VectorIndex>],
         reader: &dyn ShuffleReader,
-        dataset: &Arc<Dataset>,
-        column: &str,
-        store: &ObjectStore,
+        _dataset: &Arc<Dataset>,
+        _column: &str,
+        _store: &ObjectStore,
     ) -> Result<Vec<RecordBatch>> {
         let mut batches = Vec::new();
         for existing_index in existing_indices.iter() {
@@ -600,23 +593,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 ))?;
 
             let part_storage = existing_index.load_partition_storage(part_id).await?;
-            let part_batches = Self::take_vectors(
-                dataset,
-                column,
-                store,
-                part_storage.row_ids().cloned().collect_vec().as_ref(),
-            )
-            .await?;
-            let part_batches = part_batches
-                .into_iter()
-                .map(|batch| {
-                    let part_ids = UInt32Array::from_iter_values(
-                        std::iter::repeat(part_id as u32).take(batch.num_rows()),
-                    );
-                    Ok(batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?)
-                })
-                .collect::<Result<Vec<_>>>()?;
-
+            let part_batches = part_storage.to_batches()?;
+            // let part_batches = Self::take_vectors(
+            //     dataset,
+            //     column,
+            //     store,
+            //     part_storage.row_ids().cloned().collect_vec().as_ref(),
+            // )
+            // .await?;
+            // let part_batches = part_batches
+            //     .into_iter()
+            //     .map(|batch| {
+            //         let part_ids = UInt32Array::from_iter_values(
+            //             std::iter::repeat(part_id as u32).take(batch.num_rows()),
+            //         );
+            //         Ok(batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?)
+            //     })
+            //     .collect::<Result<Vec<_>>>()?;
             batches.extend(part_batches);
         }
 

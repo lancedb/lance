@@ -152,52 +152,19 @@ pub struct StorageBuilder<Q: Quantization> {
     column: String,
     distance_type: DistanceType,
     quantizer: Q,
-    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
     pub fn new(ivf: &IvfModel, column: String, distance_type: DistanceType, quantizer: Q) -> Self {
-        let mut transformers = vec![];
-        if matches!(Q::quantization_type(), QuantizationType::Product)
-            && ProductQuantizer::use_residual(distance_type)
-            && ivf.centroids.is_some()
-        {
-            transformers.push(Arc::new(ResidualTransform::new(
-                ivf.centroids.clone().unwrap(),
-                PART_ID_COLUMN,
-                &column,
-            )) as _);
-        }
         Self {
             column,
             distance_type,
             quantizer,
-            transformers,
         }
     }
 
     pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
-        let mut batch = batch.clone();
-        for transformer in &self.transformers {
-            batch = transformer.transform(&batch)?;
-        }
-
-        let vectors = batch.column_by_name(&self.column).ok_or(Error::Schema {
-            message: format!("column {} not found", self.column),
-            location: location!(),
-        })?;
-        let code_array = self.quantizer.quantize(vectors.as_ref())?;
-        let batch = batch
-            .try_with_column(
-                Field::new(
-                    self.quantizer.column(),
-                    code_array.data_type().clone(),
-                    true,
-                ),
-                code_array,
-            )?
-            .drop_column(&self.column)?
-            .drop_column(PART_ID_COLUMN)?;
+        let batch = batch.drop_column(PART_ID_COLUMN)?;
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),

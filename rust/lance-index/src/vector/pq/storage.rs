@@ -589,6 +589,16 @@ impl PQDistCalculator {
         }
     }
 
+    fn new_insample<T: L2 + Dot>(
+        codebook: &[T],
+        num_bits: u32,
+        num_sub_vectors: usize,
+        pq_code: Arc<UInt8Array>,
+        id: usize,
+        distance_type: DistanceType,
+    ) -> Self {
+    }
+
     fn get_pq_code(&self, id: u32) -> Vec<usize> {
         let num_sub_vectors_in_byte = if self.num_bits == 4 {
             self.num_sub_vectors / 2

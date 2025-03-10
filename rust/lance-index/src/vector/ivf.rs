@@ -19,12 +19,15 @@ use tracing::instrument;
 use crate::vector::ivf::transform::PartitionTransformer;
 use crate::vector::{pq::ProductQuantizer, transform::Transformer};
 
+use super::flat::transform::FlatTransformer;
 use super::pq::transform::PQTransformer;
 use super::quantizer::Quantization;
 use super::residual::ResidualTransform;
+use super::sq::transform::SQTransformer;
+use super::sq::ScalarQuantizer;
 use super::transform::KeepFiniteVectors;
 use super::{quantizer::Quantizer, residual::compute_residual};
-use super::{PART_ID_COLUMN, PQ_CODE_COLUMN};
+use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
 pub mod builder;
 pub mod shuffler;
@@ -68,12 +71,13 @@ pub fn new_ivf_transformer_with_quantizer(
             vector_column,
             pq,
             range,
-            false,
+            // false,
         )),
-        Quantizer::Scalar(_) => Ok(IvfTransformer::with_sq(
+        Quantizer::Scalar(sq) => Ok(IvfTransformer::with_sq(
             centroids,
             metric_type,
             vector_column,
+            sq,
             range,
         )),
     }
@@ -143,6 +147,8 @@ impl IvfTransformer {
             )));
         }
 
+        transforms.push(Arc::new(FlatTransformer::new(vector_column)));
+
         Self::new(centroids, distance_type, transforms)
     }
 
@@ -153,7 +159,6 @@ impl IvfTransformer {
         vector_column: &str,
         pq: ProductQuantizer,
         range: Option<Range<u32>>,
-        with_pq_code: bool, // Pass true for v1 index format, otherwise false.
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![
             Arc::new(KeepFiniteVectors::new(vector_column)),
@@ -183,20 +188,18 @@ impl IvfTransformer {
             )));
         }
 
-        if with_pq_code {
-            if ProductQuantizer::use_residual(distance_type) {
-                transforms.push(Arc::new(ResidualTransform::new(
-                    centroids.clone(),
-                    PART_ID_COLUMN,
-                    vector_column,
-                )));
-            }
-            transforms.push(Arc::new(PQTransformer::new(
-                pq,
+        if ProductQuantizer::use_residual(distance_type) {
+            transforms.push(Arc::new(ResidualTransform::new(
+                centroids.clone(),
+                PART_ID_COLUMN,
                 vector_column,
-                PQ_CODE_COLUMN,
             )));
         }
+        transforms.push(Arc::new(PQTransformer::new(
+            pq,
+            vector_column,
+            PQ_CODE_COLUMN,
+        )));
         Self::new(centroids, distance_type, transforms)
     }
 
@@ -204,6 +207,7 @@ impl IvfTransformer {
         centroids: FixedSizeListArray,
         metric_type: MetricType,
         vector_column: &str,
+        sq: ScalarQuantizer,
         range: Option<Range<u32>>,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> = vec![
@@ -233,6 +237,12 @@ impl IvfTransformer {
                 range,
             )));
         }
+
+        transforms.push(Arc::new(SQTransformer::new(
+            sq,
+            vector_column.to_owned(),
+            SQ_CODE_COLUMN.to_owned(),
+        )));
 
         Self::new(centroids, distance_type, transforms)
     }

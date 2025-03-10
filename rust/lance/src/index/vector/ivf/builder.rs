@@ -79,7 +79,7 @@ pub(super) async fn build_partitions(
         column,
         pq.clone(),
         Some(part_range),
-        true,
+        // true,
     );
 
     let stream = shuffle_dataset(
@@ -212,7 +212,7 @@ pub async fn write_vector_storage(
         column,
         pq,
         None,
-        true,
+        // true,
     ));
 
     let data = if let Some(partitions_ds_uri) = precomputed_partitions_ds_uri {
