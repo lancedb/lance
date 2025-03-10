@@ -610,9 +610,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             let part_batches = part_batches
                 .into_iter()
                 .map(|batch| {
-                    let part_ids = UInt32Array::from_iter_values(
-                        std::iter::repeat(part_id as u32).take(batch.num_rows()),
-                    );
+                    let part_ids =
+                        UInt32Array::from_iter_values(vec![part_id as u32; batch.num_rows()]);
                     Ok(batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?)
                 })
                 .collect::<Result<Vec<_>>>()?;
