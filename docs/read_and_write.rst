@@ -10,8 +10,6 @@ Begin by writing a :py:class:`pyarrow.Table` using the :py:meth:`lance.write_dat
 
 .. testsetup::
 
-  import shutil
-  from typing import Iterator
   shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
 
 .. doctest::
@@ -27,11 +25,11 @@ If the dataset is too large to fully load into memory, you can stream data using
 also supports :py:class:`~typing.Iterator` of :py:class:`pyarrow.RecordBatch` es.
 You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this case.
 
-.. testsetup::
+.. testsetup:: rst_generator
 
   shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
 
-.. doctest::
+.. doctest:: rst_generator
 
   >>> def producer() -> Iterator[pa.RecordBatch]:
   ...     """An iterator of RecordBatches."""
@@ -45,7 +43,7 @@ You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this ca
 
   >>> ds = lance.write_dataset(producer(),
   ...                          "./alice_and_bob.lance",
-  ...                          schema=schema)
+  ...                          schema=schema, mode="overwrite")
   >>> ds.count_rows()
   2
 
@@ -249,6 +247,10 @@ Renaming columns
 Columns can be renamed using the :py:meth:`lance.LanceDataset.alter_columns`
 method.
 
+.. testsetup::
+
+    shutil.rmtree("ids", ignore_errors=True)
+
 .. testcode::
 
     table = pa.table({"id": pa.array([1, 2, 3])})
@@ -266,6 +268,10 @@ method.
 This works for nested columns as well. To address a nested column, use a dot
 (``.``) to separate the levels of nesting. For example:
 
+.. testsetup::
+
+    shutil.rmtree("nested_rename", ignore_errors=True)
+
 .. testcode::
 
     data = [
@@ -278,14 +284,15 @@ This works for nested columns as well. To address a nested column, use a dot
             ("name", pa.string()),
         ]))
     ])
-    dataset = lance.write_dataset(data, "nested_rename", schema=schema)
+    dataset = lance.write_dataset(data, "nested_rename")
     dataset.alter_columns({"path": "meta.id", "name": "new_id"})
+    print(dataset.to_table().to_pandas())
 
 .. testoutput::
 
-        meta
-      0  {"new_id": 1, "name": "Alice"}
-      1  {"new_id": 2, "name": "Bob"}
+                                 meta
+    0  {'new_id': 1, 'name': 'Alice'}
+    1    {'new_id': 2, 'name': 'Bob'}
 
 
 Casting column data types
