@@ -162,6 +162,10 @@ mod test {
             unimplemented!()
         }
 
+        fn num_rows(&self) -> u64 {
+            unimplemented!()
+        }
+
         fn row_ids(&self) -> Box<dyn Iterator<Item = &u64>> {
             unimplemented!()
         }
@@ -174,7 +178,7 @@ mod test {
             unimplemented!()
         }
 
-        fn ivf_model(&self) -> IvfModel {
+        fn ivf_model(&self) -> &IvfModel {
             unimplemented!()
         }
         fn quantizer(&self) -> Quantizer {
