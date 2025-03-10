@@ -3,6 +3,7 @@
 import shutil
 import sys
 from pathlib import Path
+from datetime import datetime
 
 sys.path.insert(0, str(Path("..", "python/python").resolve()))
 
@@ -21,7 +22,7 @@ def setup(app):
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = "2025, Lance Developer"
+copyright = f"{datetime.today().year}, Lance Developer"
 author = "Lance Developer"
 
 
