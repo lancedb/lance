@@ -60,8 +60,6 @@ impl Transformer for SQTransformer {
                 ),
                 location: location!(),
             })?;
-        let batch = batch.drop_column(&self.input_column)?;
-
         let fsl = input.as_fixed_size_list_opt().ok_or(Error::Index {
             message: "input column is not vector type".to_string(),
             location: location!(),
@@ -79,7 +77,9 @@ impl Transformer for SQTransformer {
         };
 
         let sq_field = Field::new(&self.output_column, sq_code.data_type().clone(), false);
-        let batch = batch.try_with_column(sq_field, Arc::new(sq_code))?;
+        let batch = batch
+            .try_with_column(sq_field, Arc::new(sq_code))?
+            .drop_column(&self.input_column)?;
         Ok(batch)
     }
 }

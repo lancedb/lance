@@ -28,11 +28,13 @@ use crate::{
         ivf::storage::{IvfModel, IVF_METADATA_KEY},
         quantizer::Quantization,
     },
-    INDEX_METADATA_SCHEMA_KEY,
 };
 
-use super::quantizer::Quantizer;
-use super::DISTANCE_TYPE_KEY;
+use super::pq::ProductQuantizer;
+use super::quantizer::{QuantizationType, Quantizer};
+use super::residual::ResidualTransform;
+use super::transform::Transformer;
+use super::{DISTANCE_TYPE_KEY, PART_ID_COLUMN};
 
 /// <section class="warning">
 ///  Internal API
@@ -153,7 +155,7 @@ pub struct StorageBuilder<Q: Quantization> {
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(column: String, distance_type: DistanceType, quantizer: Q) -> Self {
+    pub fn new(ivf: &IvfModel, column: String, distance_type: DistanceType, quantizer: Q) -> Self {
         Self {
             column,
             distance_type,
@@ -162,21 +164,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
     }
 
     pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
-        let vectors = batch.column_by_name(&self.column).ok_or(Error::Schema {
-            message: format!("column {} not found", self.column),
-            location: location!(),
-        })?;
-        let code_array = self.quantizer.quantize(vectors.as_ref())?;
-        let batch = batch
-            .try_with_column(
-                Field::new(
-                    self.quantizer.column(),
-                    code_array.data_type().clone(),
-                    true,
-                ),
-                code_array,
-            )?
-            .drop_column(&self.column)?;
+        let batch = batch.drop_column(PART_ID_COLUMN)?;
         let batch = batch.add_metadata(
             STORAGE_METADATA_KEY.to_owned(),
             self.quantizer.metadata(None)?.to_string(),
@@ -215,7 +203,7 @@ impl IvfQuantizationStorage {
                 .metadata
                 .get(DISTANCE_TYPE_KEY)
                 .ok_or(Error::Index {
-                    message: format!("{} not found", INDEX_METADATA_SCHEMA_KEY),
+                    message: format!("{} not found", DISTANCE_TYPE_KEY),
                     location: location!(),
                 })?
                 .as_str(),
@@ -255,8 +243,16 @@ impl IvfQuantizationStorage {
     }
 
     pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
-        let metadata = serde_json::from_str(&self.metadata[0])?;
+        let metadata = self.metadata::<Q>()?;
         Q::from_metadata(&metadata, self.distance_type)
+    }
+
+    pub fn metadata<Q: Quantization>(&self) -> Result<Q::Metadata> {
+        Ok(serde_json::from_str(&self.metadata[0])?)
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
     }
 
     pub fn schema(&self) -> SchemaRef {
