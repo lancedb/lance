@@ -2992,3 +2992,22 @@ def test_empty_structs(tmp_path):
     res = ds.take([2, 0, 1])
     assert res.num_rows == 3
     assert res == table.take([2, 0, 1])
+
+
+def test_create_table_from_pylist(tmp_path):
+    data = [
+        {"foo": 1, "bar": "one"},
+        {"foo": 3, "bar": "three"},
+    ]
+    ds = lance.write_dataset(data, tmp_path)
+
+    assert ds.to_table() == pa.Table.from_pylist(data)
+
+
+def test_create_table_from_pydict(tmp_path):
+    dat = {
+        "foo": [1, 3],
+        "bar": ["one", "three"],
+    }
+    ds = lance.write_dataset(dat, tmp_path)
+    assert ds.to_table() == pa.Table.from_pydict(dat)
