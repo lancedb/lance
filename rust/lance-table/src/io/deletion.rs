@@ -17,7 +17,7 @@ use object_store::path::Path;
 use rand::Rng;
 use roaring::bitmap::RoaringBitmap;
 use snafu::{location, ResultExt};
-use tracing::instrument;
+use tracing::{info, instrument};
 
 use crate::format::{DeletionFile, DeletionFileType, Fragment};
 
@@ -56,8 +56,8 @@ pub async fn write_deletion_file(
     removed_rows: &DeletionVector,
     object_store: &ObjectStore,
 ) -> Result<Option<DeletionFile>> {
-    match removed_rows {
-        DeletionVector::NoDeletions => Ok(None),
+    let deletion_file = match removed_rows {
+        DeletionVector::NoDeletions => None,
         DeletionVector::Set(set) => {
             let id = rand::thread_rng().gen::<u64>();
             let deletion_file = DeletionFile {
@@ -90,7 +90,9 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            Ok(Some(deletion_file))
+            info!(target: "file_audit", mode="create", type="deletion", path = path.to_string());
+
+            Some(deletion_file)
         }
         DeletionVector::Bitmap(bitmap) => {
             let id = rand::thread_rng().gen::<u64>();
@@ -107,9 +109,12 @@ pub async fn write_deletion_file(
 
             object_store.put(&path, &out).await?;
 
-            Ok(Some(deletion_file))
+            info!(target: "file_audit", mode="create", type="deletion", path = path.to_string());
+
+            Some(deletion_file)
         }
-    }
+    };
+    Ok(deletion_file)
 }
 
 /// Read a deletion file for a fragment.
