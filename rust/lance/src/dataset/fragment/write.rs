@@ -102,7 +102,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let file_write_options = params
             .file_writer_options
             .clone()
-            .unwrap_or(FileWriterOptions::default());
+            .unwrap_or_default();
         let mut writer =
             lance_file::v2::writer::FileWriter::try_new(obj_writer, schema, file_write_options)?;
 
