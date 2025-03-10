@@ -1,11 +1,10 @@
 pyarrow
-# pin until breathe updates (https://github.com/sphinx-doc/sphinx/issues/11605, https://github.com/breathe-doc/breathe/issues/943)
-sphinx==7.1.2
+sphinx>=8
 breathe
 cython
 pandas
 piccolo-theme
-duckdb>=0.8
+duckdb>=1
 jupyterlab
 fastai
 xmltodict

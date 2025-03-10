@@ -1,6 +1,10 @@
 # Configuration file for the Sphinx documentation builder.
 
 import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path("..", "python/python").resolve()))
 
 
 def run_apidoc(_):
@@ -27,12 +31,12 @@ author = "Lance Developer"
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    "sphinx.ext.napoleon",
     "breathe",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
     "sphinx.ext.intersphinx",
+    "sphinx.ext.napoleon",
 ]
 
 napoleon_google_docstring = False
@@ -73,3 +77,14 @@ html_theme_options = {
     "source_icon": "github",
 }
 html_css_files = ["custom.css"]
+
+# -- doctest configuration ---------------------------------------------------
+
+doctest_global_setup = """
+import shutil
+from typing import Iterator
+
+import lance
+import pyarrow as pa
+import numpy as np
+"""

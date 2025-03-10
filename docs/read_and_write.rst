@@ -10,9 +10,9 @@ Begin by writing a :py:class:`pyarrow.Table` using the :py:meth:`lance.write_dat
 
 .. testsetup::
 
-  >>> import shutil
-  >>> from typing import Iterator
-  >>> shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
+  import shutil
+  from typing import Iterator
+  shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
 
 .. doctest::
 
@@ -29,7 +29,7 @@ You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this ca
 
 .. testsetup::
 
-  >>> shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
+  shutil.rmtree("./alice_and_bob.lance", ignore_errors=True)
 
 .. doctest::
 
@@ -251,12 +251,10 @@ method.
 
 .. testcode::
 
-    import lance
-    import pyarrow as pa
     table = pa.table({"id": pa.array([1, 2, 3])})
     dataset = lance.write_dataset(table, "ids")
     dataset.alter_columns({"path": "id", "name": "new_id"})
-    dataset.to_table().to_pandas()
+    print(dataset.to_table().to_pandas())
 
 .. testoutput::
 
@@ -274,7 +272,13 @@ This works for nested columns as well. To address a nested column, use a dot
       {"meta": {"id": 1, "name": "Alice"}},
       {"meta": {"id": 2, "name": "Bob"}},
     ]
-    dataset = lance.write_dataset(data, "nested_rename")
+    schema = pa.schema([
+        ("meta", pa.struct([
+            ("id", pa.int32()),
+            ("name", pa.string()),
+        ]))
+    ])
+    dataset = lance.write_dataset(data, "nested_rename", schema=schema)
     dataset.alter_columns({"path": "meta.id", "name": "new_id"})
 
 .. testoutput::
@@ -303,9 +307,6 @@ at the cost of lower precision:
 
 .. testcode::
 
-    import lance
-    import pyarrow as pa
-    import numpy as np
     table = pa.table({
        "id": pa.array([1, 2, 3]),
        "embedding": pa.FixedShapeTensorArray.from_numpy_ndarray(
@@ -314,12 +315,13 @@ at the cost of lower precision:
     dataset = lance.write_dataset(table, "embeddings")
     dataset.alter_columns({"path": "embedding",
                            "data_type": pa.list_(pa.float16(), 128)})
-    dataset.schema()
+    print(dataset.schema)
 
 .. testoutput::
 
     id: int64
-    embedding: fixed_size_list<item: float16, 128>
+    embedding: fixed_size_list<item: halffloat>[128]
+      child 0, item: halffloat
 
 
 Adding new columns
@@ -334,24 +336,26 @@ SQL expressions can either be independent expressions or reference existing
 columns. SQL literal values can be used to set a single value for all
 existing rows.
 
+.. testsetup::
+
+    shutil.rmtree("./names", ignore_errors=True)
+
 .. testcode::
 
-    import lance
-    import pyarrow as pa
     table = pa.table({"name": pa.array(["Alice", "Bob", "Carla"])})
     dataset = lance.write_dataset(table, "names")
     dataset.add_columns({
         "hash": "sha256(name)",
         "status": "'active'",
     })
-    dataset.to_table().to_pandas()
+    print(dataset.to_table().to_pandas())
 
 .. testoutput::
 
-        name         hash...   status
-    0  Alice  3bc51062973c...  active
-    1    Bob  cd9fb1e148cc...  active
-    2  Carla  ad8d83ffd82b...  active
+        name                                               hash  status
+    0  Alice  b';\xc5\x10b\x97<E\x8dZo-\x8dd\xa0#$cT\xad~\x0...  active
+    1    Bob  b'\xcd\x9f\xb1\xe1H\xcc\xd8D.Z\xa7I\x04\xccs\x...  active
+    2  Carla  b'\xad\x8d\x83\xff\xd8+Z\x8e\xd4)\xe8Y+\\\xb3\...  active
 
 You can also provide a Python function to generate the new column data. This can
 be used, for example, to compute a new embedding column. This function should
@@ -394,17 +398,18 @@ dataset.
 
 For example, imagine we have a dataset of embeddings and ids:
 
+.. testsetup::
+
+    shutil.rmtree("embeddings", ignore_errors=True)
+
 .. testcode::
 
-    import lance
-    import pyarrow as pa
-    import numpy as np
     table = pa.table({
        "id": pa.array([1, 2, 3]),
        "embedding": pa.array([np.array([1, 2, 3]), np.array([4, 5, 6]),
                               np.array([7, 8, 9])])
     })
-    dataset = lance.write_dataset(table, "embeddings")
+    dataset = lance.write_dataset(table, "embeddings", mode="overwrite")
 
 Now if we want to add a column of labels we have generated, we can do so by merging a new table:
 
@@ -415,7 +420,7 @@ Now if we want to add a column of labels we have generated, we can do so by merg
        "label": pa.array(["horse", "rabbit", "cat"])
     })
     dataset.merge(new_data, "id")
-    dataset.to_table().to_pandas()
+    print(dataset.to_table().to_pandas())
 
 .. testoutput::
 
@@ -432,19 +437,15 @@ Finally, you can drop columns from a dataset using the :py:meth:`lance.LanceData
 method. This is a metadata-only operation and does not delete the data on disk. This makes
 it very quick.
 
-.. testcode::
+.. doctest::
 
-    import lance
-    import pyarrow as pa
-    table = pa.table({"id": pa.array([1, 2, 3]),
-                      "name": pa.array(["Alice", "Bob", "Carla"])})
-    dataset = lance.write_dataset(table, "names")
-    dataset.drop_columns(["name"])
-    dataset.schema()
-
-.. testoutput::
-
+    >>> table = pa.table({"id": pa.array([1, 2, 3]),
+    ...                  "name": pa.array(["Alice", "Bob", "Carla"])})
+    >>> dataset = lance.write_dataset(table, "names", mode="overwrite")
+    >>> dataset.drop_columns(["name"])
+    >>> dataset.schema
     id: int64
+
 
 To actually remove the data from disk, the files must be rewritten to remove the
 columns and then the old files must be deleted. This can be done using
@@ -832,7 +833,7 @@ S3 Express
 
 Lance supports `S3 Express One Zone`_ endpoints, but requires additional configuration. Also,
 S3 Express endpoints only support connecting from an EC2 instance within the same
-region.
+region
 
 .. _S3 Express One Zone: https://aws.amazon.com/s3/storage-classes/express-one-zone/
 
