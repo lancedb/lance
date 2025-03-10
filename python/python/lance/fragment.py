@@ -348,7 +348,7 @@ class LanceFragment(pa.dataset.Fragment):
             mode=mode,
             data_storage_version=data_storage_version,
             storage_options=storage_options,
-            file_writer_options=file_writer_options
+            file_writer_options=file_writer_options,
         )
 
     @property

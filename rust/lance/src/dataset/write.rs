@@ -252,7 +252,13 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version, params.clone());
+    let writer_generator = WriterGenerator::new(
+        object_store,
+        base_dir,
+        schema,
+        storage_version,
+        params.clone(),
+    );
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -536,11 +542,8 @@ pub async fn open_writer(
             .unwrap_or_default();
         file_write_options.format_version = Some(storage_version);
         let writer = object_store.create(&full_path).await?;
-        let file_writer = v2::writer::FileWriter::try_new(
-            writer,
-            schema.clone(),
-            file_write_options,
-        )?;
+        let file_writer =
+            v2::writer::FileWriter::try_new(writer, schema.clone(), file_write_options)?;
         let writer_adapter = V2WriterAdapter {
             writer: file_writer,
             path: filename,
@@ -585,7 +588,7 @@ impl WriterGenerator {
             &self.schema,
             &self.base_dir,
             self.storage_version,
-            Some(&self.params)
+            Some(&self.params),
         )
         .await?;
 
