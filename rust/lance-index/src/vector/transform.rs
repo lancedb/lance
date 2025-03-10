@@ -7,7 +7,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow::datatypes::{UInt64Type, UInt8Type};
+use arrow::datatypes::UInt64Type;
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::UInt64Array;
 use arrow_array::{cast::AsArray, Array, ArrowPrimitiveType, RecordBatch, UInt32Array};
