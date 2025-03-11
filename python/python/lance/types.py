@@ -74,6 +74,17 @@ def _coerce_reader(
         and data_obj.__class__.__name__ == "DataFrame"
     ):
         return data_obj.to_arrow().to_reader()
+    elif isinstance(data_obj, dict):
+        batch = pa.RecordBatch.from_pydict(data_obj, schema=schema)
+        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
+    elif (
+        isinstance(data_obj, list)
+        and len(data_obj) > 0
+        and isinstance(data_obj[0], dict)
+    ):
+        # List of dictionaries
+        batch = pa.RecordBatch.from_pylist(data_obj, schema=schema)
+        return pa.RecordBatchReader.from_batches(batch.schema, [batch])
     # for other iterables, assume they are of type Iterable[RecordBatch]
     elif isinstance(data_obj, Iterable):
         if schema is not None:
