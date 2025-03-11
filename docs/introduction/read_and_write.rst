@@ -50,6 +50,44 @@ You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this ca
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
 :py:class:`pyarrow.dataset.Dataset`, and ``Iterator[pyarrow.RecordBatch]``.
 
+Adding data to an existing dataset
+----------------------------------
+
+To insert data into your dataset, you can use either :py:meth:`LanceDataset.insert <lance.LanceDataset.insert>`
+or :py:meth:`~lance.write_dataset` with ``mode=append``.
+
+.. testsetup::
+
+  shutil.rmtree("./insert_example.lance", ignore_errors=True)
+
+.. doctest::
+
+  >>> import lance
+  >>> import pyarrow as pa
+
+  >>> table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+  ...                               {"name": "Bob", "age": 30}])
+  >>> ds = lance.write_dataset(table, "./insert_example.lance")
+
+  >>> new_table = pa.Table.from_pylist([{"name": "Carla", "age": 37}])
+  >>> ds.insert(new_table)
+  >>> tbl = lance.dataset("./insert_example.lance").to_table()
+  >>> tbl.to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  2  Carla   37
+
+  >>> new_table2 = pa.Table.from_pylist([{"name": "David", "age": 42}])
+  >>> ds2 = lance.write_dataset(new_table2, "./insert_example.lance", mode="append")
+  >>> ds2.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  2  Carla   37
+  3  David   42
+
+
 Deleting rows
 -------------
 
