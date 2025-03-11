@@ -140,19 +140,12 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
     fn dist_calculator(&self, query: ArrayRef) -> Self::DistanceCalculator<'_>;
 
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
-
-    fn distance_between(&self, a: u32, b: u32) -> f32;
-
-    fn dist_calculator_from_native(&self, _query: ArrayRef) -> Self::DistanceCalculator<'_> {
-        todo!("Implement this")
-    }
 }
 
 pub struct StorageBuilder<Q: Quantization> {
     column: String,
     distance_type: DistanceType,
     quantizer: Q,
-    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -161,7 +154,6 @@ impl<Q: Quantization> StorageBuilder<Q> {
             column,
             distance_type,
             quantizer,
-            transformers,
         }
     }
 
