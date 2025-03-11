@@ -94,7 +94,7 @@ all_asserts = "2.3.1"
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-env_logger = "0.10.0"
+env_logger = "0.11.7"
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 random_word = { version = "0.4.3", features = ["en"] }

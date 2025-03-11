@@ -20,7 +20,7 @@ arrow-select = "54.1"
 object_store = "0.11.2"
 async-trait = "0.1"
 chrono = "0.4.31"
-env_logger = "0.10"
+env_logger = "0.11.7"
 futures = "0.3"
 half = { version = "2.3", default-features = false, features = [
     "num-traits",
@@ -36,7 +36,10 @@ lance-core = { path = "../rust/lance-core" }
 lance-datagen = { path = "../rust/lance-datagen", optional = true }
 lance-encoding = { path = "../rust/lance-encoding" }
 lance-file = { path = "../rust/lance-file" }
-lance-index = { path = "../rust/lance-index", features = ["tokenizer-lindera", "tokenizer-jieba"] }
+lance-index = { path = "../rust/lance-index", features = [
+    "tokenizer-lindera",
+    "tokenizer-jieba",
+] }
 lance-io = { path = "../rust/lance-io" }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-table = { path = "../rust/lance-table" }
