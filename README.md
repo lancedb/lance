@@ -66,7 +66,7 @@ pip install --pre --extra-index-url https://pypi.fury.io/lancedb/ pylance
 > [!TIP]
 > Preview releases are released more often than full releases and contain the
 > latest features and bug fixes. They receive the same level of testing as full releases.
-> We guarantee they will remain published and available for download for at 
+> We guarantee they will remain published and available for download for at
 > least 6 months. When you want to pin to a specific version, prefer a stable release.
 
 **Converting to Lance**
@@ -186,8 +186,8 @@ Support both CPUs (``x86_64`` and ``arm``) and GPU (``Nvidia (cuda)`` and ``Appl
 
 **Fast updates** (ROADMAP): Updates will be supported via write-ahead logs.
 
-**Rich secondary indices** (ROADMAP):
-  - Inverted index for fuzzy search over many label / annotation fields.
+**Rich secondary indices**: Support `BTree`, `Bitmap`, `Full text search`, `Label list`,
+`NGrams`, and more.
 
 ## Benchmarks
 
@@ -253,11 +253,16 @@ A comparison of different data formats in each stage of ML development cycle.
 
 Lance is currently used in production by:
 * [LanceDB](https://github.com/lancedb/lancedb), a serverless, low-latency vector database for ML applications
+* [LanceDB Enterprise](https://docs.lancedb.com/enterprise/introduction), hyperscale LanceDB with enterprise SLA.
+* Leading multimodal Gen AI companies for training over petabyte-scale multimodal data.
 * Self-driving car company for large-scale storage, retrieval and processing of multi-modal data.
 * E-commerce company for billion-scale+ vector personalized search.
 * and more.
 
-## Presentations and Talks
+## Presentations, Blogs and Talks
 
+* [Designing a Table Format for ML Workloads](https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/), Feb 2025.
+* [Transforming Multimodal Data Management with LanceDB, Ray Summit](https://www.youtube.com/watch?v=xmTFEzAh8ho), Oct 2024.
+* [https://blog.lancedb.com/lance-v2/](https://blog.lancedb.com/lance-v2/), Apr 2024.
 * [Lance Deep Dive](https://drive.google.com/file/d/1Orh9rK0Mpj9zN_gnQF1eJJFpAc6lStGm/view?usp=drive_link). July 2023.
 * [Lance: A New Columnar Data Format](https://docs.google.com/presentation/d/1a4nAiQAkPDBtOfXFpPg7lbeDAxcNDVKgoUkw3cUs2rE/edit#slide=id.p), [Scipy 2022, Austin, TX](https://www.scipy2022.scipy.org/posters). July, 2022.
