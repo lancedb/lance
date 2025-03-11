@@ -803,7 +803,6 @@ def test_optimize_index_recall(tmp_path: Path):
     def check_index(has_knn_combined, delete_has_happened):
         for query in sample_queries:
             results = dataset.to_table(nearest=query)
-            print(f"distances: {results['_distance']}")
             assert has_target(query["q"], results["vector"])
             plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
             assert ("KNNVectorDistance" in plan) == has_knn_combined

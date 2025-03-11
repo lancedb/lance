@@ -143,7 +143,7 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
 pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
-    _quantizer: Q,
+    quantizer: Q,
     transformers: Vec<Arc<dyn Transformer>>,
 }
 
@@ -157,23 +157,23 @@ impl<Q: Quantization> StorageBuilder<Q> {
         };
         Ok(Self {
             distance_type,
-            _quantizer: quantizer,
+            quantizer,
             transformers,
         })
     }
 
-    pub fn build(&self, batch: Vec<RecordBatch>) -> Result<Q::Storage> {
-        let batches = self
-            .transformers
-            .iter()
-            .try_fold(batch, |batches, transformer| {
-                batches
-                    .into_iter()
-                    .map(|b| transformer.transform(&b))
-                    .collect::<Result<Vec<_>>>()
-            })?;
+    pub fn build(&self, mut batches: Vec<RecordBatch>) -> Result<Q::Storage> {
+        for batch in batches.iter_mut() {
+            for transformer in &self.transformers {
+                *batch = transformer.transform(batch)?;
+            }
+        }
 
         let batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+        let batch = batch.add_metadata(
+            STORAGE_METADATA_KEY.to_owned(),
+            self.quantizer.metadata(None)?.to_string(),
+        )?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }
 }

@@ -436,7 +436,6 @@ impl VectorStore for ProductQuantizationStorage {
             _ => distance_type,
         };
         let metadata_json = batch
-            .schema_ref()
             .metadata()
             .get(STORAGE_METADATA_KEY)
             .ok_or(Error::Index {

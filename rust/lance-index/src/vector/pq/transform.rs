@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -77,6 +78,9 @@ impl Transformer for PQTransformer {
     }
 }
 
+// this transpose transformer would transform the PQ codes back to original codes,
+// we need this because if the PQ codes are stored in a transposed way,
+// then we can't directly concat the PQ codes from different batches.
 #[derive(Debug)]
 pub struct TransposeTransformer {
     metadata_json: String,
@@ -85,10 +89,7 @@ pub struct TransposeTransformer {
 
 impl TransposeTransformer {
     pub fn new(metadata_json: String) -> Result<Self> {
-        // the transposed flag is always true after transformation
-        let mut metadata: ProductQuantizationMetadata = serde_json::from_str(&metadata_json)?;
-        metadata.transposed = true;
-        let metadata_json = serde_json::to_string(&metadata)?;
+        let metadata: ProductQuantizationMetadata = serde_json::from_str(&metadata_json)?;
         Ok(Self {
             metadata_json,
             metadata,
@@ -106,8 +107,8 @@ impl Transformer for TransposeTransformer {
             .transpose()
             .unwrap_or_default()
             .is_some_and(|meta| meta.transposed);
-        if is_transposed {
-            return Ok(batch.clone());
+        if !is_transposed {
+            return Ok(batch.with_metadata(HashMap::new())?); // clear the metadata
         }
 
         let num_sub_vectors_in_byte = if self.metadata.nbits == 4 {
@@ -121,8 +122,8 @@ impl Transformer for TransposeTransformer {
                 .as_fixed_size_list()
                 .values()
                 .as_primitive::<UInt8Type>(),
-            batch.num_rows(),
             num_sub_vectors_in_byte,
+            batch.num_rows(),
         );
         let transposed_codes = FixedSizeListArray::try_new_from_values(
             transposed_codes,
@@ -130,7 +131,7 @@ impl Transformer for TransposeTransformer {
         )?;
         let batch = batch
             .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(transposed_codes))?
-            .add_metadata(STORAGE_METADATA_KEY.to_owned(), self.metadata_json.clone())?;
+            .with_metadata(HashMap::new())?; // clear the metadata
         Ok(batch)
     }
 }
