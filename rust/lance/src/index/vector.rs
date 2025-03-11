@@ -126,7 +126,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            version: IndexFileVersion::Legacy,
+            version: IndexFileVersion::V3,
         }
     }
 
@@ -140,7 +140,7 @@ impl VectorIndexParams {
         Self {
             stages,
             metric_type,
-            version: IndexFileVersion::Legacy,
+            version: IndexFileVersion::V3,
         }
     }
 

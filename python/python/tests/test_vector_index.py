@@ -589,6 +589,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     dataset_with_index = dataset.create_index(
         ["vector"],
         index_type="IVF_PQ",
+        metric="cosine",
         ivf_centroids=centroids,
         num_partitions=5,
         num_sub_vectors=8,
@@ -613,7 +614,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         "index_type": "IVF_PQ",
         "uuid": index_uuid,
         "uri": expected_filepath,
-        "metric_type": "l2",
+        "metric_type": "cosine",
         "num_partitions": 5,
         "sub_index": {
             "dimension": 128,
@@ -621,6 +622,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "metric_type": "l2",
             "nbits": 8,
             "num_sub_vectors": 8,
+            "transposed": True,
         },
     }
 
