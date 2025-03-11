@@ -44,6 +44,7 @@ Preview releases receive the same level of testing as regular releases.
 
    Quickstart <./notebooks/quickstart>
    ./introduction/read_and_write
+   ./introduction/schema_evolution
 
 .. toctree::
    :caption: Advanced Usage
