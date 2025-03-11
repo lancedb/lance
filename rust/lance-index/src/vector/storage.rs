@@ -10,7 +10,7 @@ use arrow::array::AsArray;
 use arrow::compute::concat_batches;
 use arrow::datatypes::UInt64Type;
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{Field, SchemaRef};
+use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
 use lance_arrow::RecordBatchExt;
@@ -30,10 +30,7 @@ use crate::{
     },
 };
 
-use super::pq::ProductQuantizer;
-use super::quantizer::{QuantizationType, Quantizer};
-use super::residual::ResidualTransform;
-use super::transform::Transformer;
+use super::quantizer::Quantizer;
 use super::{DISTANCE_TYPE_KEY, PART_ID_COLUMN};
 
 /// <section class="warning">
@@ -143,15 +140,13 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 }
 
 pub struct StorageBuilder<Q: Quantization> {
-    column: String,
     distance_type: DistanceType,
     quantizer: Q,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(ivf: &IvfModel, column: String, distance_type: DistanceType, quantizer: Q) -> Self {
+    pub fn new(distance_type: DistanceType, quantizer: Q) -> Self {
         Self {
-            column,
             distance_type,
             quantizer,
         }

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow::array::AsArray;
 use arrow_array::RecordBatch;
 use arrow_schema::Field;
 use lance_arrow::RecordBatchExt;
 use lance_core::Error;
-use snafu::{location, Location};
+use snafu::location;
 use tracing::instrument;
 
 use crate::vector::transform::Transformer;

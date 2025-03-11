@@ -14,7 +14,7 @@ use arrow_array::{
     types::{Float32Type, UInt64Type},
     Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt64Array,
 };
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::reader::FileReader;
