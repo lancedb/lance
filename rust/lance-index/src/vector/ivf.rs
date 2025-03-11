@@ -71,7 +71,6 @@ pub fn new_ivf_transformer_with_quantizer(
             vector_column,
             pq,
             range,
-            // false,
         )),
         Quantizer::Scalar(sq) => Ok(IvfTransformer::with_sq(
             centroids,
