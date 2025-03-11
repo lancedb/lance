@@ -14,7 +14,7 @@ a 32-bit float: ~1e-38 to ~1e38. By comparison, a 16-bit float has a range of
 ~5.96e-8 to 65504.
 
 Lance provides an Arrow extension array (:class:`lance.arrow.BFloat16Array`)
-and a Pandas extension array (:class:`lance.pandas.BFloat16Dtype`) for BFloat16.
+and a Pandas extension array (:class:`~lance._arrow.PandasBFloat16Type`) for BFloat16.
 These are compatible with the `ml_dtypes <https://github.com/jax-ml/ml_dtypes>`_
 bfloat16 NumPy extension array.
 
@@ -31,7 +31,7 @@ the array:
     2      3.40625
     dtype: lance.bfloat16
 
-To create an an arrow array, use the :func:`lance.arrow.bfloat16_array` function:
+To create an Arrow array, use the :func:`lance.arrow.bfloat16_array` function:
 
 .. code-block:: python
 

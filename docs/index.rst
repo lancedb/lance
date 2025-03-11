@@ -52,6 +52,7 @@ Preview releases receive the same level of testing as regular releases.
    Lance Format Spec <./format>
    Blob API <./blob>
    Performance Guide <./performance>
+   Tokenizer <./tokenizer>
    Extension Arrays <./arrays>
 
 .. toctree::

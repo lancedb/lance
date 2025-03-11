@@ -28,7 +28,6 @@ author = "Lance Developer"
 # ones.
 extensions = [
     "breathe",
-    "sphinx_copybutton",
     "sphinx_immaterial",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
@@ -78,6 +77,7 @@ html_theme_options = {
     "site_url": "https://github.com/lancedb/lance",
     "repo_url": "https://github.com/lancedb/lance",
     "repo_name": "Lance",
+
     "social": [
         {
             "icon": "fontawesome/brands/github",
