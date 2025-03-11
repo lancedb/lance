@@ -2,20 +2,20 @@
 .. image:: _static/lance_logo.png
   :width: 400
 
-Lance: modern columnar data format for ML
-======================================================================================
+Lance: modern columnar format for ML workloads
+==============================================
 
 
-`Lance` is a columnar data format that is easy and fast to version, query and train on.
+`Lance` is a columnar format that is easy and fast to version, query and train on.
 It’s designed to be used with images, videos, 3D point clouds, audio and of course tabular data.
 It supports any POSIX file systems, and cloud storage like AWS S3 and Google Cloud Storage.
 The key features of Lance include:
 
 * **High-performance random access:** 100x faster than Parquet.
 
-* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
+* **Zero-copy schema evolution:** add and drop columns without copying the entire dataset.
 
-* **Zero-copy, automatic versioning:** manage versions of your data automatically, and reduce redundancy with zero-copy logic built-in.
+* **Vector search:** find nearest neighbors in under 1 millisecond and combine OLAP-queries with vector search.
 
 * **Ecosystem integrations:** Apache-Arrow, DuckDB and more on the way.
 
@@ -39,15 +39,33 @@ Preview releases receive the same level of testing as regular releases.
 
 
 .. toctree::
-   :maxdepth: 1
+   :caption: Introduction
+   :maxdepth: 2
 
    Quickstart <./notebooks/quickstart>
    ./read_and_write
-   Lance Formats <./format>
-   Arrays <./arrays>
+
+.. toctree::
+   :caption: Advanced Usage
+   :maxdepth: 1
+
+   Lance Format Spec <./format>
    Blob API <./blob>
-   Integrations <./integrations/integrations>
    Performance Guide <./performance>
+   Tokenizer <./tokenizer>
+   Extension Arrays <./arrays>
+
+.. toctree::
+   :caption: Integrations
+
+   Huggingface <./integrations/huggingface>
+   Tensorflow <./integrations/tensorflow>
+   PyTorch <./integrations/pytorch>
+   Ray <./integrations/ray>
+
+.. toctree::
+   :maxdepth: 1
+
    API References <./api/api>
    Contributor Guide <./contributing>
    Examples <./examples/examples>

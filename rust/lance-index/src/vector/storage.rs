@@ -152,6 +152,7 @@ pub struct StorageBuilder<Q: Quantization> {
     column: String,
     distance_type: DistanceType,
     quantizer: Q,
+    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
@@ -160,6 +161,7 @@ impl<Q: Quantization> StorageBuilder<Q> {
             column,
             distance_type,
             quantizer,
+            transformers,
         }
     }
 

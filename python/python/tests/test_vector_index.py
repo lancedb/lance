@@ -558,6 +558,17 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
     assert len(results["vector"][0]) == 5
 
+    query = [query, query]
+    doubled_results = indexed_multivec_dataset.to_table(
+        nearest={"column": "vector", "q": query, "k": 100}
+    )
+    assert len(results) == len(doubled_results)
+    for i in range(len(results)):
+        assert (
+            results["_distance"][i].as_py() * 2
+            == doubled_results["_distance"][i].as_py()
+        )
+
     # query with a vector that dim not match
     query = np.random.rand(256)
     with pytest.raises(ValueError, match="does not match index column size"):

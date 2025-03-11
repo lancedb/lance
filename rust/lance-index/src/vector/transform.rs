@@ -100,10 +100,12 @@ fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array) -> bool
 where
     T::Native: Float,
 {
-    !arr.as_primitive::<T>()
-        .values()
-        .iter()
-        .any(|&v| !v.is_finite())
+    arr.null_count() == 0
+        && !arr
+            .as_primitive::<T>()
+            .values()
+            .iter()
+            .any(|&v| !v.is_finite())
 }
 
 impl Transformer for KeepFiniteVectors {
@@ -139,7 +141,7 @@ impl Transformer for KeepFiniteVectors {
                     DataType::Float16 => is_all_finite::<Float16Type>(&data),
                     DataType::Float32 => is_all_finite::<Float32Type>(&data),
                     DataType::Float64 => is_all_finite::<Float64Type>(&data),
-                    DataType::UInt8 => true,
+                    DataType::UInt8 => data.null_count() == 0,
                     _ => false,
                 };
                 if is_valid {

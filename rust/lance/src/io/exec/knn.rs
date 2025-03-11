@@ -813,6 +813,7 @@ impl ExecutionPlan for MultivectorScoringExec {
 
         let k = self.query.k;
         let refactor = self.query.refine_factor.unwrap_or(1) as usize;
+        let num_queries = self.inputs.len() as f32;
         let stream = stream::once(async move {
             // at most, we will have k * refine_factor results for each query
             let mut results = HashMap::with_capacity(k * refactor);
@@ -850,7 +851,7 @@ impl ExecutionPlan for MultivectorScoringExec {
             let dists = sims
                 .into_iter()
                 // it's similarity, so we need to convert it back to distance
-                .map(|sim| 1.0 - sim)
+                .map(|sim| num_queries - sim)
                 .collect::<Vec<_>>();
             let row_ids = UInt64Array::from(row_ids);
             let dists = Float32Array::from(dists);
