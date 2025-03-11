@@ -12,7 +12,7 @@ use itertools::Itertools;
 use lance_core::cache::FileMetadataCache;
 use lance_core::ROW_ID;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::ngram::{NGramIndex, NGramIndexBuilder};
+use lance_index::scalar::ngram::{NGramIndex, NGramIndexBuilder, NGramIndexBuilderOptions};
 use lance_index::scalar::{ScalarIndex, TextQuery};
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -21,6 +21,8 @@ use pprof::criterion::{Output, PProfProfiler};
 
 fn bench_ngram(c: &mut Criterion) {
     const TOTAL: usize = 1_000_000;
+
+    env_logger::init();
 
     let rt = tokio::runtime::Builder::new_multi_thread().build().unwrap();
 
@@ -61,21 +63,35 @@ fn bench_ngram(c: &mut Criterion) {
 
     let batches = (0..1000).map(|i| batch.slice(i * 1000, 1000)).collect_vec();
 
-    c.bench_function(format!("ngram_index({TOTAL})").as_str(), |b| {
+    let mut group = c.benchmark_group("train");
+
+    group.sample_size(10);
+    group.bench_function(format!("ngram_train({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let stream = RecordBatchStreamAdapter::new(
                 batch.schema(),
                 stream::iter(batches.clone().into_iter().map(Ok)),
             );
             let stream = Box::pin(stream);
-            let mut builder = NGramIndexBuilder::default();
-            builder.train(stream).await.unwrap();
-            builder.write(store.as_ref()).await.unwrap();
+            let mut builder =
+                NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+            let num_spill_files = builder.train(stream).await.unwrap();
+            builder
+                .write_index(store.as_ref(), num_spill_files, None)
+                .await
+                .unwrap();
         })
     });
 
+    drop(group);
+
+    let mut group = c.benchmark_group("search");
+
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
     let index = rt.block_on(NGramIndex::load(store)).unwrap();
-    c.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
+    group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {
             let sample_idx = rand::random::<usize>() % batch.num_rows();
             let sample = batch
