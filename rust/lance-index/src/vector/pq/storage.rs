@@ -737,13 +737,18 @@ fn get_centroids<T: Clone>(
     dimension: usize,
     codes: &[u8],
 ) -> Vec<T> {
+    // codebook[i][j] is the j-th centroid of the i-th sub-vector.
+    // the codebook is stored as a flat array, codebook[i * num_centroids + j] = codebook[i][j]
+
     let num_centroids: usize = 2_usize.pow(num_bits);
     let sub_vector_width = dimension / codes.len();
     let mut centroids = Vec::with_capacity(dimension);
-    for sub_vec_idx in codes {
-        let sub_vec_idx = *sub_vec_idx as usize;
+    for (sub_vec_idx, centroid_idx) in codes.iter().enumerate() {
+        let centroid_idx = *centroid_idx as usize;
         let centroid = &codebook[sub_vec_idx * num_centroids * sub_vector_width
-            ..(sub_vec_idx + 1) * num_centroids * sub_vector_width];
+            + centroid_idx * sub_vector_width
+            ..sub_vec_idx * num_centroids * sub_vector_width
+                + (centroid_idx + 1) * sub_vector_width];
         centroids.extend_from_slice(centroid);
     }
     centroids
