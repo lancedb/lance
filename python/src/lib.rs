@@ -46,6 +46,7 @@ use file::{
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
+use log::LevelFilter;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use session::Session;
@@ -94,7 +95,7 @@ pub fn is_datagen_supported() -> bool {
 // A fallback module for when datagen is not enabled
 #[cfg(not(feature = "datagen"))]
 fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let datagen = PyModule::new_bound(py, "datagen")?;
+    let datagen = PyModule::new(py, "datagen")?;
     datagen.add_wrapped(wrap_pyfunction!(is_datagen_supported))?;
     m.add_submodule(&datagen)?;
     Ok(())
@@ -110,7 +111,9 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    env_logger::init_from_env(env);
+    let mut log_builder = env_logger::Builder::from_env(env);
+    log_builder.filter_module("tracing::span", LevelFilter::Off);
+    log_builder.try_init().unwrap();
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;

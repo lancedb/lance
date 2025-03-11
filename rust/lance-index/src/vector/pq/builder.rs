@@ -156,6 +156,19 @@ impl PQBuildParams {
             ),
             location: location!(),
         })?;
+
+        let num_centroids = 2_usize.pow(self.num_bits as u32);
+        if data.len() < num_centroids {
+            return Err(Error::Index {
+                message: format!(
+                    "Not enough rows to train PQ. Requires {:?} rows but only {:?} available",
+                    num_centroids,
+                    data.len()
+                ),
+                location: location!(),
+            });
+        }
+
         // TODO: support bf16 later.
         match fsl.value_type() {
             DataType::Float16 => self.build_from_fsl::<Float16Type>(fsl, distance_type),

@@ -12,6 +12,7 @@ use pyo3::{
     exceptions::{PyNotImplementedError, PyValueError},
     prelude::*,
     types::PyTuple,
+    IntoPyObjectExt,
 };
 
 /// A Lance Schema.
@@ -69,15 +70,15 @@ impl LanceSchema {
         let mut states = Vec::new();
         let metadata_str = serde_json::to_string(&fields_with_meta.metadata)
             .map_err(|e| PyErr::new::<PyValueError, _>(format!("{}", e)))?
-            .into_py(py);
+            .into_py_any(py)?;
         states.push(metadata_str);
 
         for field in fields_with_meta.fields.0.iter() {
-            states.push(field.encode_to_vec().into_py(py));
+            states.push(field.encode_to_vec().into_py_any(py)?);
         }
 
-        let state = PyTuple::new_bound(py, states).extract()?;
-        let from_protos = PyModule::import_bound(py, "lance.schema")?
+        let state = PyTuple::new(py, states)?.extract()?;
+        let from_protos = PyModule::import(py, "lance.schema")?
             .getattr("LanceSchema")?
             .getattr("_from_protos")?
             .extract()?;

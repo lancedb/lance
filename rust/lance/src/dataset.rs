@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 mod blob;
 pub mod builder;
@@ -1703,6 +1703,7 @@ fn write_manifest_file_to_path<'a>(
             .await?;
         let size = object_writer.tell().await? as u64;
         object_writer.shutdown().await?;
+        info!(target: "file_audit", mode="create", type="manifest", path = path.to_string());
         Ok(size)
     })
 }

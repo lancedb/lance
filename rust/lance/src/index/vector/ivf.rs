@@ -391,9 +391,9 @@ pub(crate) async fn optimize_vector_indices_v2(
     }
 
     let temp_dir = tempfile::tempdir()?;
-    let temp_dir = temp_dir.path().to_str().unwrap().into();
-    let shuffler = Box::new(IvfShuffler::new(temp_dir, num_partitions));
-    let start_pos = if num_indices_to_merge > existing_indices.len() {
+    let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
+    let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
+    let start_pos = if options.num_indices_to_merge > existing_indices.len() {
         0
     } else {
         existing_indices.len() - num_indices_to_merge
@@ -522,7 +522,6 @@ async fn optimize_ivf_pq_indices(
         Some(unindexed) => Some(
             shuffle_dataset(
                 unindexed,
-                vector_column,
                 ivf.into(),
                 None,
                 first_idx.ivf.num_partitions() as u32,
@@ -599,7 +598,6 @@ async fn optimize_ivf_hnsw_indices<Q: Quantization>(
         Some(unindexed) => Some(
             shuffle_dataset(
                 unindexed,
-                vector_column,
                 Arc::new(ivf),
                 None,
                 first_idx.ivf.num_partitions() as u32,
@@ -3039,7 +3037,7 @@ mod tests {
             .open_generic_index("vector", indices[0].uuid.to_string().as_str())
             .await
             .unwrap();
-        let ivf_idx = idx.as_any().downcast_ref::<IVFIndex>().unwrap();
+        let ivf_idx = idx.as_any().downcast_ref::<v2::IvfPq>().unwrap();
 
         assert!(ivf_idx
             .ivf_model()
@@ -3052,16 +3050,10 @@ mod tests {
             .iter()
             .all(|v| (0.0..=1.0).contains(v)));
 
-        let pq_idx = ivf_idx
-            .sub_index
-            .as_any()
-            .downcast_ref::<PQIndex>()
-            .unwrap();
-
         // PQ code is on residual space
-        pq_idx
-            .pq
-            .codebook
+        let pq_store = ivf_idx.load_partition_storage(0).await.unwrap();
+        pq_store
+            .codebook()
             .values()
             .as_primitive::<Float32Type>()
             .values()

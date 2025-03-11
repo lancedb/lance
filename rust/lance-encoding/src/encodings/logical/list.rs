@@ -1459,7 +1459,8 @@ mod tests {
     use arrow::array::{Int64Builder, LargeListBuilder, StringBuilder};
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
-        Array, ArrayRef, BooleanArray, ListArray, StructArray, UInt64Array,
+        Array, ArrayRef, BooleanArray, DictionaryArray, LargeStringArray, ListArray, StructArray,
+        UInt64Array, UInt8Array,
     };
     use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields};
@@ -1642,6 +1643,33 @@ mod tests {
             .with_file_version(LanceFileVersion::V2_1);
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_simple_list_dict() {
+        let values = LargeStringArray::from_iter_values(["a", "bb", "ccc"]);
+        let indices = UInt8Array::from(vec![0, 1, 2, 0, 1, 2, 0, 1, 2]);
+        let dict_array = DictionaryArray::new(indices, Arc::new(values));
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(vec![0, 3, 5, 6, 9]));
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", dict_array.data_type().clone(), true)),
+            offsets,
+            Arc::new(dict_array),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..2)
+            .with_range(1..3)
+            .with_range(2..4)
+            .with_indices(vec![1])
+            .with_indices(vec![2]);
+        check_round_trip_encoding_of_data(
+            vec![Arc::new(list_array)],
+            &test_cases,
+            HashMap::default(),
+        )
+        .await;
     }
 
     #[rstest]

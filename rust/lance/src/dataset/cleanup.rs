@@ -49,6 +49,7 @@ use std::{
     future,
     sync::{Mutex, MutexGuard},
 };
+use tracing::info;
 
 use crate::{utils::temporal::utc_now, Dataset};
 
@@ -279,7 +280,12 @@ impl<'a> CleanupTask<'a> {
             .try_fold(0, |acc, size| async move { Ok(acc + (size as u64)) })
             .await;
 
-        let old_manifests_stream = stream::iter(old_manifests).map(Result::<Path>::Ok).boxed();
+        let old_manifests_stream = stream::iter(old_manifests)
+            .map(|path| {
+                info!(target: "file_audit", mode="delete", type="manifest", path = path.to_string());
+                Ok(path)
+            })
+            .boxed();
         let all_paths_to_remove =
             stream::iter(vec![unreferenced_paths, old_manifests_stream]).flatten();
 
@@ -325,12 +331,15 @@ impl<'a> CleanupTask<'a> {
                     .contains(uuid.as_ref())
                 {
                     return Ok(None);
-                } else if !maybe_in_progress
-                    || inspection
-                        .verified_files
-                        .index_uuids
-                        .contains(uuid.as_ref())
+                } else if !maybe_in_progress {
+                    info!(target: "file_audit", mode="delete_unverified", type="index", path = path.to_string());
+                    return Ok(Some(path));
+                } else if inspection
+                    .verified_files
+                    .index_uuids
+                    .contains(uuid.as_ref())
                 {
+                    info!(target: "file_audit", mode="delete", type="index", path = path.to_string());
                     return Ok(Some(path));
                 }
             } else {
@@ -346,12 +355,15 @@ impl<'a> CleanupTask<'a> {
                         .contains(&relative_path)
                     {
                         Ok(None)
-                    } else if !maybe_in_progress
-                        || inspection
-                            .verified_files
-                            .data_paths
-                            .contains(&relative_path)
+                    } else if !maybe_in_progress {
+                        info!(target: "file_audit", mode="delete_unverified", type="data", path = path.to_string());
+                        Ok(Some(path))
+                    } else if inspection
+                        .verified_files
+                        .data_paths
+                        .contains(&relative_path)
                     {
+                        info!(target: "file_audit", mode="delete", type="data", path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -373,12 +385,15 @@ impl<'a> CleanupTask<'a> {
                         .contains(&relative_path)
                     {
                         Ok(None)
-                    } else if !maybe_in_progress
-                        || inspection
-                            .verified_files
-                            .delete_paths
-                            .contains(&relative_path)
+                    } else if !maybe_in_progress {
+                        info!(target: "file_audit", mode="delete_unverified", type="deletion", path = path.to_string());
+                        Ok(Some(path))
+                    } else if inspection
+                        .verified_files
+                        .delete_paths
+                        .contains(&relative_path)
                     {
+                        info!(target: "file_audit", mode="delete", type="deletion", path = path.to_string());
                         Ok(Some(path))
                     } else {
                         Ok(None)
@@ -1023,7 +1038,7 @@ mod tests {
 
         let before_count = fixture.count_files().await.unwrap();
         // we store 2 files (index and quantized storage) for each index
-        assert_eq!(before_count.num_index_files, 1);
+        assert_eq!(before_count.num_index_files, 2);
         // Two user data files
         assert_eq!(before_count.num_data_files, 2);
         // Creating an index creates a new manifest so there are 3 total

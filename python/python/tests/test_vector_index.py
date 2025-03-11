@@ -558,6 +558,17 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     assert results["vector"].type == pa.list_(pa.list_(pa.float32(), 128))
     assert len(results["vector"][0]) == 5
 
+    query = [query, query]
+    doubled_results = indexed_multivec_dataset.to_table(
+        nearest={"column": "vector", "q": query, "k": 100}
+    )
+    assert len(results) == len(doubled_results)
+    for i in range(len(results)):
+        assert (
+            results["_distance"][i].as_py() * 2
+            == doubled_results["_distance"][i].as_py()
+        )
+
     # query with a vector that dim not match
     query = np.random.rand(256)
     with pytest.raises(ValueError, match="does not match index column size"):
@@ -578,6 +589,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     dataset_with_index = dataset.create_index(
         ["vector"],
         index_type="IVF_PQ",
+        metric="cosine",
         ivf_centroids=centroids,
         num_partitions=5,
         num_sub_vectors=8,
@@ -602,7 +614,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
         "index_type": "IVF_PQ",
         "uuid": index_uuid,
         "uri": expected_filepath,
-        "metric_type": "l2",
+        "metric_type": "cosine",
         "num_partitions": 5,
         "sub_index": {
             "dimension": 128,
@@ -610,6 +622,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
             "metric_type": "l2",
             "nbits": 8,
             "num_sub_vectors": 8,
+            "transposed": True,
         },
     }
 

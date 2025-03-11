@@ -2801,60 +2801,50 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] build_index: bool,
     ) {
-        for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
-                .await
-                .unwrap();
-            if *build_index {
-                test_ds.make_vector_index().await.unwrap();
-            }
-            let dataset = &test_ds.dataset;
-
-            let mut scan = dataset.scan();
-            let key: Float32Array = (32..64).map(|v| v as f32).collect();
-            scan.nearest("vec", &key, 5).unwrap();
-            scan.refine(5);
-
-            let results = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-
-            assert_eq!(results.len(), 1);
-            let batch = &results[0];
-
-            assert_eq!(batch.num_rows(), 5);
-            assert_eq!(
-                batch.schema().as_ref(),
-                &ArrowSchema::new(vec![
-                    ArrowField::new("i", DataType::Int32, true),
-                    ArrowField::new("s", DataType::Utf8, true),
-                    ArrowField::new(
-                        "vec",
-                        DataType::FixedSizeList(
-                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                            32,
-                        ),
-                        true,
-                    ),
-                    ArrowField::new(DIST_COL, DataType::Float32, true),
-                ])
-                .with_metadata([("dataset".into(), "vector".into())].into())
-            );
-
-            let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
-            let column_i = batch.column_by_name("i").unwrap();
-            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
-                .values()
-                .iter()
-                .copied()
-                .collect();
-            assert_eq!(expected_i, actual_i);
+        let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
+            .await
+            .unwrap();
+        if build_index {
+            test_ds.make_vector_index().await.unwrap();
         }
+        let dataset = &test_ds.dataset;
+
+        let mut scan = dataset.scan();
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.refine(5);
+
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new("s", DataType::Utf8, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
+                ),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
+            ])
+            .with_metadata([("dataset".into(), "vector".into())].into())
+        );
+
+        let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
+        let column_i = batch.column_by_name("i").unwrap();
+        let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(expected_i, actual_i);
     }
 
     #[rstest]
