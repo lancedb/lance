@@ -71,8 +71,7 @@ or :py:meth:`~lance.write_dataset` with ``mode=append``.
 
   >>> new_table = pa.Table.from_pylist([{"name": "Carla", "age": 37}])
   >>> ds.insert(new_table)
-  >>> tbl = lance.dataset("./insert_example.lance").to_table()
-  >>> tbl.to_pandas()
+  >>> ds.to_table().to_pandas()
       name  age
   0  Alice   20
   1    Bob   30
