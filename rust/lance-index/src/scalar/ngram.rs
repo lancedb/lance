@@ -841,7 +841,7 @@ impl NGramIndexBuilder {
         Ok(stream::try_unfold(0, move |offset| {
             let reader = reader.clone();
             async move {
-                // These are rediculously small batches but, in the worst case scenario, each row could
+                // These are small batches but, in the worst case scenario, each row could
                 // be massive (up to 128MB per row at 1B rows) and we end up breaking memory
                 let batch_size = std::cmp::min(num_rows - offset, 64);
                 if batch_size == 0 {
@@ -1080,6 +1080,20 @@ impl NGramIndexBuilder {
             .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
             .await?;
 
+        if spill_files.is_empty() {
+            if let Some(old_index) = old_index {
+                // An update with no new data, just copy the old index to the new store
+                old_index.copy_index_file(POSTINGS_FILENAME, store).await?;
+            } else {
+                // Training an index with no data, make an empty index
+                let mut writer = store
+                    .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+                    .await?;
+                writer.finish().await?;
+            }
+            return Ok(());
+        }
+
         let mut index_to_copy = self.merge_spills(spill_files).await?;
 
         if let Some(old_index) = old_index {
@@ -1310,13 +1324,17 @@ mod tests {
         assert_eq!(expected, res);
     }
 
+    fn test_data_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Utf8, true),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]))
+    }
+
     fn simple_data_with_nulls() -> SendableRecordBatchStream {
         let data = StringArray::from_iter(&[Some("cat"), Some("dog"), None, None, Some("cat dog")]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("values", DataType::Utf8, true),
-            Field::new("row_ids", DataType::UInt64, false),
-        ]));
+        let schema = test_data_schema();
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
         Box::pin(RecordBatchStreamAdapter::new(
@@ -1345,6 +1363,41 @@ mod tests {
         assert_eq!(null_posting_list, vec![2, 3]);
 
         // TODO: Support IS NULL queries
+    }
+
+    fn empty_data() -> SendableRecordBatchStream {
+        Box::pin(RecordBatchStreamAdapter::new(
+            test_data_schema(),
+            stream::empty::<lance_core::error::DataFusionResult<RecordBatch>>(),
+        ))
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_train_empty() {
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+
+        let (index, _tmpdir) = do_train(builder, empty_data()).await;
+        assert_eq!(index.tokens.len(), 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_update_empty() {
+        let data = simple_data_with_nulls();
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, empty_data()).await;
+
+        let new_tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        index.update(data, test_store.as_ref()).await.unwrap();
+
+        let index = NGramIndex::from_store(test_store).await.unwrap();
+        assert_eq!(index.tokens.len(), 3);
     }
 
     async fn row_ids_in_index(index: &NGramIndex) -> Vec<u64> {
