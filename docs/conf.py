@@ -1,11 +1,7 @@
 # Configuration file for the Sphinx documentation builder.
 
 import shutil
-import sys
-from pathlib import Path
 from datetime import datetime
-
-sys.path.insert(0, str(Path("..", "python/python").resolve()))
 
 
 def run_apidoc(_):
