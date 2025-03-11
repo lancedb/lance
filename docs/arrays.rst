@@ -99,7 +99,7 @@ are not read into memory automatically.
 :func:`lance.arrow.ImageURIArray.read_uris` will read images into memory and return
 them as a new :class:`lance.arrow.EncodedImageArray` object.
 
-.. code-block:: pytho
+.. code-block:: python
 
     from lance.arrow import ImageURIArray
 
