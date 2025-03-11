@@ -55,6 +55,7 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable/", None),
     "pyarrow": ("https://arrow.apache.org/docs/", None),
     "pandas": ("https://pandas.pydata.org/pandas-docs/stable/", None),
+    "ray": ("https://docs.ray.io/en/latest/", None),
 }
 
 
