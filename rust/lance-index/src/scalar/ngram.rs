@@ -228,6 +228,8 @@ pub struct NGramIndex {
     /// tokenizers used in an inverted index.
     tokenizer: TextAnalyzer,
     io_parallelism: usize,
+    /// The store that owns the index
+    store: Arc<dyn IndexStore>,
 }
 
 impl std::fmt::Debug for NGramIndex {
@@ -246,7 +248,7 @@ impl DeepSizeOf for NGramIndex {
 }
 
 impl NGramIndex {
-    async fn from_store(store: &dyn IndexStore) -> Result<Self> {
+    async fn from_store(store: Arc<dyn IndexStore>) -> Result<Self> {
         let tokens = store.open_index_file(POSTINGS_FILENAME).await?;
         let tokens = tokens
             .read_range(0..tokens.num_rows(), Some(&[TOKENS_COL]))
@@ -276,7 +278,48 @@ impl NGramIndex {
             tokens: tokens_map,
             list_reader: posting_reader,
             tokenizer: NGRAM_TOKENIZER.clone(),
+            store,
         })
+    }
+
+    fn remap_batch(
+        &self,
+        batch: RecordBatch,
+        mapping: &HashMap<u64, Option<u64>>,
+    ) -> Result<RecordBatch> {
+        let posting_lists_array = batch
+            .column_by_name(POSTING_LIST_COL)
+            .expect_ok()?
+            .as_binary::<i32>();
+
+        let new_posting_lists = posting_lists_array
+            .iter()
+            .map(|posting_list| {
+                let posting_list = posting_list.unwrap();
+                let posting_list = RoaringTreemap::deserialize_from(posting_list)?;
+                let new_posting_list =
+                    RoaringTreemap::from_iter(posting_list.into_iter().filter_map(|row_id| {
+                        match mapping.get(&row_id) {
+                            Some(Some(new_row_id)) => Some(*new_row_id),
+                            Some(None) => None,
+                            None => Some(row_id),
+                        }
+                    }));
+                let mut buf = Vec::with_capacity(new_posting_list.serialized_size());
+                new_posting_list.serialize_into(&mut buf)?;
+                Ok(buf)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let new_posting_lists_array = BinaryArray::from_iter_values(new_posting_lists);
+
+        Ok(RecordBatch::try_new(
+            POSTINGS_SCHEMA.clone(),
+            vec![
+                batch.column_by_name(TOKENS_COL).expect_ok()?.clone(),
+                Arc::new(new_posting_lists_array),
+            ],
+        )?)
     }
 }
 
@@ -380,23 +423,45 @@ impl ScalarIndex for NGramIndex {
     where
         Self: Sized,
     {
-        Ok(Arc::new(Self::from_store(store.as_ref()).await?))
+        Ok(Arc::new(Self::from_store(store).await?))
     }
 
     async fn remap(
         &self,
-        _mapping: &HashMap<u64, Option<u64>>,
-        _dest_store: &dyn IndexStore,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        todo!()
+        let reader = self.store.open_index_file(POSTINGS_FILENAME).await?;
+        let mut writer = dest_store
+            .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
+            .await?;
+
+        let mut offset = 0;
+        let num_rows = reader.num_rows();
+        const BATCH_SIZE: usize = 64;
+        while offset < num_rows {
+            let batch_size = BATCH_SIZE.min(num_rows - offset);
+            let batch = reader.read_range(offset..offset + batch_size, None).await?;
+            let batch = self.remap_batch(batch, mapping)?;
+            writer.write_record_batch(batch).await?;
+            offset += BATCH_SIZE;
+        }
+
+        writer.finish().await
     }
 
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
     ) -> Result<()> {
-        todo!()
+        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
+        let spill_files = builder.train(new_data).await?;
+
+        builder
+            .write_index(dest_store, spill_files, Some(self.store.clone()))
+            .await?;
+        Ok(())
     }
 }
 
@@ -767,15 +832,10 @@ impl NGramIndexBuilder {
         Ok(())
     }
 
-    async fn stream_spill(
+    async fn stream_spill_reader(
         &self,
-        id: usize,
+        reader: Arc<dyn IndexReader>,
     ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
-        let reader = self
-            .spill_store
-            .open_index_file(&Self::spill_filename(id))
-            .await?;
-
         let num_rows = reader.num_rows();
 
         Ok(stream::try_unfold(0, move |offset| {
@@ -794,6 +854,17 @@ impl NGramIndexBuilder {
             }
             .boxed()
         }))
+    }
+
+    async fn stream_spill(
+        &self,
+        id: usize,
+    ) -> Result<impl Stream<Item = Result<NGramIndexSpillState>>> {
+        let reader = self
+            .spill_store
+            .open_index_file(&Self::spill_filename(id))
+            .await?;
+        self.stream_spill_reader(reader).await
     }
 
     fn merge_spill_states(
@@ -973,16 +1044,47 @@ impl NGramIndexBuilder {
         spills_remaining.pop_front().expect_ok()
     }
 
+    async fn merge_old_index(
+        &mut self,
+        new_data_num: usize,
+        old_index: Arc<dyn IndexStore>,
+    ) -> Result<usize> {
+        info!("Merging old index into new index");
+        let final_num = new_data_num + 1;
+
+        let mut writer = self
+            .spill_store
+            .new_index_file(&Self::spill_filename(final_num), POSTINGS_SCHEMA.clone())
+            .await?;
+
+        let left_stream = self.stream_spill(new_data_num).await?;
+        let old_reader = old_index.open_index_file(POSTINGS_FILENAME).await?;
+        let right_stream = self.stream_spill_reader(old_reader).await?;
+
+        Self::merge_spill_streams(left_stream, right_stream, writer.as_mut()).await?;
+
+        self.spill_store
+            .delete_index_file(&Self::spill_filename(new_data_num))
+            .await?;
+
+        Ok(final_num)
+    }
+
     pub async fn write_index(
         mut self,
         store: &dyn IndexStore,
         spill_files: Vec<usize>,
+        old_index: Option<Arc<dyn IndexStore>>,
     ) -> Result<()> {
         let mut writer = store
             .new_index_file(POSTINGS_FILENAME, POSTINGS_SCHEMA.clone())
             .await?;
 
-        let index_to_copy = self.merge_spills(spill_files).await?;
+        let mut index_to_copy = self.merge_spills(spill_files).await?;
+
+        if let Some(old_index) = old_index {
+            index_to_copy = self.merge_old_index(index_to_copy, old_index).await?;
+        }
 
         let reader = self
             .spill_store
@@ -1012,12 +1114,15 @@ pub async fn train_ngram_index(
 
     let spill_files = builder.train(batches_source).await?;
 
-    builder.write_index(index_store, spill_files).await
+    builder.write_index(index_store, spill_files, None).await
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use arrow::datatypes::UInt64Type;
     use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
@@ -1027,12 +1132,13 @@ mod tests {
     };
     use datafusion_common::DataFusionError;
     use futures::{stream, TryStreamExt};
+    use itertools::Itertools;
     use lance_core::{cache::FileMetadataCache, utils::mask::RowIdTreeMap};
     use lance_datagen::{BatchCount, ByteCount, RowCount};
     use lance_io::object_store::ObjectStore;
     use object_store::path::Path;
     use tantivy::tokenizer::TextAnalyzer;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     use crate::scalar::{
         lance_format::LanceIndexStore,
@@ -1040,7 +1146,7 @@ mod tests {
         ScalarIndex, SearchResult, TextQuery,
     };
 
-    use super::{tokenize_visitor, NGRAM_TOKENIZER};
+    use super::{ngram_to_token, tokenize_visitor, NGRAM_TOKENIZER};
 
     fn collect_tokens(analyzer: &TextAnalyzer, text: &str) -> Vec<String> {
         let mut tokens = Vec::with_capacity(text.len() * 3);
@@ -1089,7 +1195,7 @@ mod tests {
     async fn do_train(
         mut builder: NGramIndexBuilder,
         data: SendableRecordBatchStream,
-    ) -> NGramIndex {
+    ) -> (NGramIndex, Arc<TempDir>) {
         let spill_files = builder.train(data).await.unwrap();
 
         let tmpdir = Arc::new(tempdir().unwrap());
@@ -1099,9 +1205,28 @@ mod tests {
             FileMetadataCache::no_cache(),
         );
 
-        builder.write_index(&test_store, spill_files).await.unwrap();
+        builder
+            .write_index(&test_store, spill_files, None)
+            .await
+            .unwrap();
 
-        NGramIndex::from_store(&test_store).await.unwrap()
+        (
+            NGramIndex::from_store(Arc::new(test_store)).await.unwrap(),
+            tmpdir,
+        )
+    }
+
+    async fn get_posting_list_for_trigram(index: &NGramIndex, trigram: &str) -> Vec<u64> {
+        let token = ngram_to_token(trigram, 3);
+        let row_offset = index.tokens[&token];
+        let list = index.list_reader.ngram_list(row_offset).await.unwrap();
+        list.bitmap.iter().sorted().collect()
+    }
+
+    async fn get_null_posting_list(index: &NGramIndex) -> Vec<u64> {
+        let row_offset = index.tokens[&0];
+        let list = index.list_reader.ngram_list(row_offset).await.unwrap();
+        list.bitmap.iter().sorted().collect()
     }
 
     #[test_log::test(tokio::test)]
@@ -1131,7 +1256,7 @@ mod tests {
 
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
 
-        let index = do_train(builder, data).await;
+        let (index, _tmpdir) = do_train(builder, data).await;
         assert_eq!(index.tokens.len(), 21);
 
         // Basic search
@@ -1185,10 +1310,87 @@ mod tests {
         assert_eq!(expected, res);
     }
 
-    #[test_log::test(tokio::test)]
-    async fn test_ngram_nulls() {
+    fn simple_data_with_nulls() -> SendableRecordBatchStream {
         let data = StringArray::from_iter(&[Some("cat"), Some("dog"), None, None, Some("cat dog")]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("values", DataType::Utf8, true),
+            Field::new("row_ids", DataType::UInt64, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(data), Arc::new(row_ids)]).unwrap();
+        Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(std::future::ready(Ok(data))),
+        ))
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_nulls() {
+        let data = simple_data_with_nulls();
+
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+
+        let (index, _tmpdir) = do_train(builder, data).await;
+        assert_eq!(index.tokens.len(), 3);
+
+        let res = index
+            .search(&TextQuery::StringContains("cat".to_string()))
+            .await
+            .unwrap();
+        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([0, 4]));
+        assert_eq!(expected, res);
+
+        let null_posting_list = get_null_posting_list(&index).await;
+        assert_eq!(null_posting_list, vec![2, 3]);
+
+        // TODO: Support IS NULL queries
+    }
+
+    async fn row_ids_in_index(index: &NGramIndex) -> Vec<u64> {
+        let mut row_ids = HashSet::new();
+        for row_offset in index.tokens.values() {
+            let list = index.list_reader.ngram_list(*row_offset).await.unwrap();
+            row_ids.extend(list.bitmap.iter());
+        }
+        row_ids.into_iter().sorted().collect()
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_index_remap() {
+        let data = simple_data_with_nulls();
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        let row_ids = row_ids_in_index(&index).await;
+        assert_eq!(row_ids, vec![0, 1, 2, 3, 4]);
+
+        let new_tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
+
+        let remapping = HashMap::from([(2, Some(100)), (3, None), (4, Some(101))]);
+        index.remap(&remapping, test_store.as_ref()).await.unwrap();
+
+        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let row_ids = row_ids_in_index(&index).await;
+        assert_eq!(row_ids, vec![0, 1, 100, 101]);
+
+        let null_posting_list = get_null_posting_list(&index).await;
+        assert_eq!(null_posting_list, vec![100]);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_ngram_index_merge() {
+        let data = simple_data_with_nulls();
+        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let (index, _tmpdir) = do_train(builder, data).await;
+
+        let data = StringArray::from_iter(&[Some("giraffe"), Some("cat"), None]);
+        let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
         let schema = Arc::new(Schema::new(vec![
             Field::new("values", DataType::Utf8, true),
             Field::new("row_ids", DataType::UInt64, false),
@@ -1200,19 +1402,30 @@ mod tests {
             stream::once(std::future::ready(Ok(data))),
         ));
 
-        let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+        let posting_list = get_posting_list_for_trigram(&index, "cat").await;
+        assert_eq!(posting_list, vec![0, 4]);
 
-        let index = do_train(builder, data).await;
-        assert_eq!(index.tokens.len(), 3);
+        let new_tmpdir = Arc::new(tempdir().unwrap());
+        let test_store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local(),
+            Path::from_filesystem_path(new_tmpdir.path()).unwrap(),
+            FileMetadataCache::no_cache(),
+        ));
 
-        let res = index
-            .search(&TextQuery::StringContains("cat".to_string()))
-            .await
-            .unwrap();
-        let expected = SearchResult::AtMost(RowIdTreeMap::from_iter([0, 4]));
-        assert_eq!(expected, res);
+        index.update(data, test_store.as_ref()).await.unwrap();
 
-        // TODO: Support IS NULL queries
+        let index = NGramIndex::from_store(test_store).await.unwrap();
+        let row_ids = row_ids_in_index(&index).await;
+        assert_eq!(row_ids, vec![0, 1, 2, 3, 4, 100, 101, 102]);
+
+        let posting_list = get_posting_list_for_trigram(&index, "cat").await;
+        assert_eq!(posting_list, vec![0, 4, 101]);
+
+        let posting_list = get_posting_list_for_trigram(&index, "ffe").await;
+        assert_eq!(posting_list, vec![100]);
+
+        let posting_list = get_null_posting_list(&index).await;
+        assert_eq!(posting_list, vec![2, 3, 102]);
     }
 
     #[test_log::test(tokio::test)]
@@ -1239,7 +1452,7 @@ mod tests {
         })
         .unwrap();
 
-        let index = do_train(builder, data).await;
+        let (index, _tmpdir) = do_train(builder, data).await;
 
         assert_eq!(index.tokens.len(), 29012);
     }

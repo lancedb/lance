@@ -161,9 +161,10 @@ pub trait LanceOptionExt<T> {
 impl<T> LanceOptionExt<T> for Option<T> {
     #[track_caller]
     fn expect_ok(self) -> Result<T> {
+        let location = std::panic::Location::caller().to_snafu_location();
         self.ok_or_else(|| Error::Internal {
             message: "Expected option to have value".to_string(),
-            location: std::panic::Location::caller().to_snafu_location(),
+            location,
         })
     }
 }
