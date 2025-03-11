@@ -50,6 +50,43 @@ You will need to provide a :py:class:`pyarrow.Schema` for the dataset in this ca
 :py:meth:`lance.write_dataset` supports writing :py:class:`pyarrow.Table`, :py:class:`pandas.DataFrame`,
 :py:class:`pyarrow.dataset.Dataset`, and ``Iterator[pyarrow.RecordBatch]``.
 
+Adding Rows
+-----------
+
+To insert data into your dataset, you can use either :py:meth:`LanceDataset.insert <lance.LanceDataset.insert>`
+or :py:meth:`~lance.write_dataset` with ``mode=append``.
+
+.. testsetup::
+
+  shutil.rmtree("./insert_example.lance", ignore_errors=True)
+
+.. doctest::
+
+  >>> import lance
+  >>> import pyarrow as pa
+
+  >>> table = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+  ...                               {"name": "Bob", "age": 30}])
+  >>> ds = lance.write_dataset(table, "./insert_example.lance")
+
+  >>> new_table = pa.Table.from_pylist([{"name": "Carla", "age": 37}])
+  >>> ds.insert(new_table)
+  >>> ds.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  2  Carla   37
+
+  >>> new_table2 = pa.Table.from_pylist([{"name": "David", "age": 42}])
+  >>> ds = lance.write_dataset(new_table2, ds, mode="append")
+  >>> ds.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  2  Carla   37
+  3  David   42
+
+
 Deleting rows
 -------------
 
@@ -123,7 +160,7 @@ more efficient to use the merge insert operation described below.
     dataset.update({"age": new_age}, where=f"name='{name}'")
 
 Merge Insert
-~~~~~~~~~~~~
+------------
 
 Lance supports a merge insert operation.  This can be used to add new data in bulk
 while also (potentially) matching against existing data.  This operation can be used

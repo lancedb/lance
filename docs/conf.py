@@ -1,18 +1,5 @@
 # Configuration file for the Sphinx documentation builder.
 
-import shutil
-
-
-def run_apidoc(_):
-    from sphinx.ext.apidoc import main
-
-    shutil.rmtree("api/python", ignore_errors=True)
-    main(["-f", "-o", "api/python", "../python/python/lance"])
-
-
-def setup(app):
-    app.connect("builder-inited", run_apidoc)
-
 
 # -- Project information -----------------------------------------------------
 
@@ -29,6 +16,7 @@ author = "Lance Developer"
 extensions = [
     "breathe",
     "sphinx_immaterial",
+    "sphinx_immaterial.apidoc.python.apigen",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
@@ -58,6 +46,19 @@ intersphinx_mapping = {
     "ray": ("https://docs.ray.io/en/latest/", None),
 }
 
+python_apigen_modules = {
+    "lance": "api/python/",
+}
+object_description_options = [
+    (
+        "py:.*",
+        dict(
+            include_object_type_in_xref_tooltip=False,
+            include_in_toc=False,
+            include_fields_in_toc=False,
+        ),
+    ),
+]
 
 # -- Options for HTML output -------------------------------------------------
 
@@ -96,7 +97,7 @@ html_theme_options = {
         },
     ],
 }
-include_in_toc = False
+
 
 # -- doctest configuration ---------------------------------------------------
 
