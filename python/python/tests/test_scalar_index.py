@@ -272,6 +272,11 @@ def test_full_text_search(dataset, with_position):
     for row in results:
         assert query in row.as_py()
 
+    with pytest.raises(ValueError, match="Cannot include deleted rows"):
+        dataset.to_table(
+            with_row_id=True, full_text_query=query, include_deleted_rows=True
+        )
+
 
 def test_filter_with_fts_index(dataset):
     dataset.create_scalar_index("doc", index_type="INVERTED", with_position=False)
