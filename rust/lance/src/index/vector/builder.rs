@@ -500,6 +500,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 if num_rows == 0 {
                     return Ok((0, 0));
                 }
+                for batch in batches.iter() {
+                    if batch.schema() != batches[0].schema() {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "batch schema mismatch: expected {:?}, got {:?}",
+                                batches[0].schema(),
+                                batch.schema()
+                            ),
+                            location!(),
+                        ));
+                    }
+                }
                 let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
 
                 Self::build_partition(
@@ -602,7 +614,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             //         Ok(batch.try_with_column(PART_ID_FIELD.clone(), Arc::new(part_ids))?)
             //     })
             //     .collect::<Result<Vec<_>>>()?;
-            batches.extend(part_batches);
+            batches.extend(part_batches.map(|b| b.with_metadata(HashMap::new()).unwrap()));
         }
 
         if reader.partition_size(part_id)? > 0 {

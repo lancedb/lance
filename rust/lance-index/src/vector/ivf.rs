@@ -25,7 +25,7 @@ use super::quantizer::Quantization;
 use super::residual::ResidualTransform;
 use super::sq::transform::SQTransformer;
 use super::sq::ScalarQuantizer;
-use super::transform::KeepFiniteVectors;
+use super::transform::{DropColumn, KeepFiniteVectors};
 use super::{quantizer::Quantizer, residual::compute_residual};
 use super::{PART_ID_COLUMN, PQ_CODE_COLUMN, SQ_CODE_COLUMN};
 
@@ -200,6 +200,7 @@ impl IvfTransformer {
             vector_column,
             PQ_CODE_COLUMN,
         )));
+
         Self::new(centroids, distance_type, transforms)
     }
 

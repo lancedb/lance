@@ -117,6 +117,7 @@ impl Shuffler for IvfShuffler {
                         .column_by_name(PART_ID_COLUMN)
                         .expect("Partition ID column not found")
                         .as_primitive();
+                    let batch = batch.drop_column(PART_ID_COLUMN)?;
 
                     let mut partition_buffers =
                         (0..num_partitions).map(|_| Vec::new()).collect::<Vec<_>>();
