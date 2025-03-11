@@ -783,6 +783,7 @@ fn get_centroids_4bit<T: Clone>(codebook: &[T], dimension: usize, codes: &[u8]) 
 
 #[cfg(test)]
 mod tests {
+    use crate::vector::quantizer::Quantization;
     use crate::vector::storage::StorageBuilder;
 
     use super::*;
@@ -804,10 +805,10 @@ mod tests {
 
         let schema = ArrowSchema::new(vec![
             Field::new(
-                "vectors",
+                PQ_CODE_COLUMN,
                 DataType::FixedSizeList(
-                    Field::new_list_field(DataType::Float32, true).into(),
-                    DIM as i32,
+                    Field::new_list_field(DataType::UInt8, true).into(),
+                    NUM_SUB_VECTORS as i32,
                 ),
                 true,
             ),
@@ -816,8 +817,8 @@ mod tests {
         let vectors = Float32Array::from_iter_values((0..TOTAL * DIM).map(|v| v as f32));
         let row_ids = UInt64Array::from_iter_values((0..TOTAL).map(|v| v as u64));
         let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
-        let batch =
-            RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
+        let codes = pq.quantize(&fsl).unwrap();
+        let batch = RecordBatch::try_new(schema.into(), vec![codes, Arc::new(row_ids)]).unwrap();
 
         StorageBuilder::new(pq.distance_type, pq)
             .unwrap()
