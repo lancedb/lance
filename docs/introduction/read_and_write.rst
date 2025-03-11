@@ -78,7 +78,7 @@ or :py:meth:`~lance.write_dataset` with ``mode=append``.
   2  Carla   37
 
   >>> new_table2 = pa.Table.from_pylist([{"name": "David", "age": 42}])
-  >>> ds = lance.write_dataset(new_table_2, ds, mode="append")
+  >>> ds = lance.write_dataset(new_table2, ds, mode="append")
   >>> ds.to_table().to_pandas()
       name  age
   0  Alice   20
