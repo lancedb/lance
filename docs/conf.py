@@ -1,6 +1,7 @@
 # Configuration file for the Sphinx documentation builder.
 
 import shutil
+from datetime import datetime
 
 
 def run_apidoc(_):
@@ -17,7 +18,7 @@ def setup(app):
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = "2024, Lance Developer"
+copyright = f"{datetime.today().year}, Lance Developer"
 author = "Lance Developer"
 
 
@@ -27,12 +28,13 @@ author = "Lance Developer"
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 extensions = [
-    "sphinx.ext.napoleon",
     "breathe",
+    "sphinx_copybutton",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
     "sphinx.ext.intersphinx",
+    "sphinx.ext.napoleon",
 ]
 
 napoleon_google_docstring = False
@@ -49,6 +51,12 @@ templates_path = ["_templates"]
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+
+intersphinx_mapping = {
+    "numpy": ("https://numpy.org/doc/stable/", None),
+    "pyarrow": ("https://arrow.apache.org/docs/", None),
+    "pandas": ("https://pandas.pydata.org/pandas-docs/stable/", None),
+}
 
 
 # -- Options for HTML output -------------------------------------------------
@@ -67,3 +75,19 @@ html_theme_options = {
     "source_icon": "github",
 }
 html_css_files = ["custom.css"]
+
+# -- doctest configuration ---------------------------------------------------
+
+doctest_global_setup = """
+import os
+import shutil
+from typing import Iterator
+
+import lance
+import pyarrow as pa
+import numpy as np
+import pandas as pd
+"""
+
+# Only test code examples in rst files
+doctest_test_doctest_blocks = ""

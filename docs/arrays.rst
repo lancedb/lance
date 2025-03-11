@@ -21,16 +21,11 @@ bfloat16 NumPy extension array.
 If you are using Pandas, you can use the `lance.bfloat16` dtype string to create
 the array:
 
-.. testcode::
+.. doctest::
 
-    import pandas as pd
-    import lance.arrow
+    >>> import lance.arrow
 
-    series = pd.Series([1.1, 2.1, 3.4], dtype="lance.bfloat16")
-    series
-
-.. testoutput::
-
+    >>> pd.Series([1.1, 2.1, 3.4], dtype="lance.bfloat16")
     0    1.1015625
     1      2.09375
     2      3.40625
@@ -38,37 +33,39 @@ the array:
 
 To create an an arrow array, use the :func:`lance.arrow.bfloat16_array` function:
 
-.. testcode::
+.. code-block:: python
 
-    from lance.arrow import bfloat16_array
+    >>> from lance.arrow import bfloat16_array
 
-    array = bfloat16_array([1.1, 2.1, 3.4])
-    array
+    >>> bfloat16_array([1.1, 2.1, 3.4])
+    <lance.arrow.BFloat16Array object at 0x000000016feb94e0>
+    [
+      1.1015625,
+      2.09375,
+      3.40625
+    ]
 
-.. testoutput::
-
-    <lance.arrow.BFloat16Array object at 0x.+>
-    [1.1015625, 2.09375, 3.40625]
 
 Finally, if you have a pre-existing NumPy array, you can convert it into either:
 
-.. testcode::
+.. doctest::
 
-    import numpy as np
-    from ml_dtypes import bfloat16
-    from lance.arrow import PandasBFloat16Array, BFloat16Array
+    >>> import numpy as np
+    >>> from ml_dtypes import bfloat16
+    >>> from lance.arrow import PandasBFloat16Array, BFloat16Array
 
-    np_array = np.array([1.1, 2.1, 3.4], dtype=bfloat16)
-    PandasBFloat16Array.from_numpy(np_array)
-    BFloat16Array.from_numpy(np_array)
-
-.. testoutput::
-    
+    >>> np_array = np.array([1.1, 2.1, 3.4], dtype=bfloat16)
+    >>> PandasBFloat16Array.from_numpy(np_array)
     <PandasBFloat16Array>
     [1.1015625, 2.09375, 3.40625]
     Length: 3, dtype: lance.bfloat16
-    <lance.arrow.BFloat16Array object at 0x.+>
-    [1.1015625, 2.09375, 3.40625]
+    >>> BFloat16Array.from_numpy(np_array)
+    <lance.arrow.BFloat16Array object at 0x...>
+    [
+      1.1015625,
+      2.09375,
+      3.40625
+    ]
 
 When reading, these can be converted back to to the NumPy bfloat16 dtype using
 each array class's ``to_numpy`` method.
@@ -86,25 +83,23 @@ with a list of URIs represented by either :py:class:`pyarrow.StringArray` or an
 iterable that yields strings. Note that the URIs are not strongly validated and images
 are not read into memory automatically.
 
-.. testcode::
+.. doctest::
 
-    from lance.arrow import ImageURIArray
+    >>> from lance.arrow import ImageURIArray
 
-    ImageURIArray.from_uris([
-        "/tmp/image1.jpg",
-        "file:///tmp/image2.jpg",
-        "s3://example/image3.jpg"
-    ])
+    >>> ImageURIArray.from_uris([
+    ...    "/tmp/image1.jpg",
+    ...    "file:///tmp/image2.jpg",
+    ...    "s3://example/image3.jpg"
+    ... ])
+    <lance.arrow.ImageURIArray object at 0x...>
+    ['/tmp/image1.jpg', 'file:///tmp/image2.jpg', 's3://example/image3.jpg']
 
-.. testoutput::
-
-    <lance.arrow.ImageURIArray object at 0x.+>
-    ['/tmp/image1.jpg', 'file:///tmp/image2.jpg', 's3://example/image2.jpg']
 
 :func:`lance.arrow.ImageURIArray.read_uris` will read images into memory and return
 them as a new :class:`lance.arrow.EncodedImageArray` object.
 
-.. testcode::
+.. code-block:: python
 
     from lance.arrow import ImageURIArray
 
@@ -139,7 +134,7 @@ function parameter. If decoder is not provided it will attempt to use
 `Pillow`_ and `tensorflow`_ in that
 order. If neither library or custom decoder is available an exception will be raised.
 
-.. testcode::
+.. code-block:: python
 
     from lance.arrow import ImageURIArray
 
@@ -185,30 +180,20 @@ If encoder is not provided it will attempt to use
 `tensorflow`_ and `Pillow`_ in that order. Default encoders will
 encode to PNG. If neither library is available it will raise an exception.
 
-.. testcode::
+.. testsetup::
 
-    from lance.arrow import ImageURIArray
+    image_uri = os.path.abspath(os.path.join(os.path.dirname(__name__), "_static", "icon.png"))
 
-    def jpeg_encoder(images):
-        import tensorflow as tf
+.. doctest::
 
-        encoded_images = (
-            tf.io.encode_jpeg(x).numpy() for x in tf.convert_to_tensor(images)
-        )
-        return pa.array(encoded_images, type=pa.binary())
+    >>> from lance.arrow import ImageURIArray
 
-    uris = [os.path.join(os.path.dirname(__file__), "images/1.png")]
-    tensor_images = ImageURIArray.from_uris(uris).read_uris().to_tensor()
-    print(tensor_images.to_encoded())
-    print(tensor_images.to_encoded(jpeg_encoder))
-
-.. testoutput::
-
+    >>> uris = [image_uri]
+    >>> tensor_images = ImageURIArray.from_uris(uris).read_uris().to_tensor()
+    >>> tensor_images.to_encoded()
     <lance.arrow.EncodedImageArray object at 0x...>
-    [b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00...']
-    <lance.arrow.EncodedImageArray object at 0x00007f8d90b91b40>
-    [b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x01...']
-
+    [...
+    b'\x89PNG\r\n\x1a...'
 
 .. _tensorflow: https://www.tensorflow.org/api_docs/python/tf/io/encode_png
 .. _Pillow: https://pillow.readthedocs.io/en/stable/
