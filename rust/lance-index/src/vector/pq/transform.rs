@@ -4,16 +4,21 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow::datatypes::UInt8Type;
+use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, Array, RecordBatch};
 use arrow_schema::Field;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use snafu::location;
 use tracing::instrument;
 
+use super::storage::{transpose, ProductQuantizationMetadata};
 use super::ProductQuantizer;
 use crate::vector::quantizer::Quantization;
+use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::vector::transform::Transformer;
+use crate::vector::PQ_CODE_COLUMN;
 
 /// Product Quantizer Transformer
 ///
@@ -68,6 +73,64 @@ impl Transformer for PQTransformer {
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
         let batch = batch.drop_column(&self.input_column)?;
+        Ok(batch)
+    }
+}
+
+#[derive(Debug)]
+pub struct TransposeTransformer {
+    metadata_json: String,
+    metadata: ProductQuantizationMetadata,
+}
+
+impl TransposeTransformer {
+    pub fn new(metadata_json: String) -> Result<Self> {
+        // the transposed flag is always true after transformation
+        let mut metadata: ProductQuantizationMetadata = serde_json::from_str(&metadata_json)?;
+        metadata.transposed = true;
+        let metadata_json = serde_json::to_string(&metadata)?;
+        Ok(Self {
+            metadata_json,
+            metadata,
+        })
+    }
+}
+
+impl Transformer for TransposeTransformer {
+    #[instrument(name = "TransposeTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let is_transposed = batch
+            .metadata()
+            .get(STORAGE_METADATA_KEY)
+            .map(|v| serde_json::from_str::<ProductQuantizationMetadata>(v))
+            .transpose()
+            .unwrap_or_default()
+            .map_or(false, |meta| meta.transposed);
+        if is_transposed {
+            return Ok(batch.clone());
+        }
+
+        let num_sub_vectors_in_byte = if self.metadata.nbits == 4 {
+            self.metadata.num_sub_vectors / 2
+        } else {
+            self.metadata.num_sub_vectors
+        };
+        let codes = &batch[PQ_CODE_COLUMN];
+        let transposed_codes = transpose(
+            codes
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>(),
+            batch.num_rows(),
+            num_sub_vectors_in_byte,
+        );
+        let transposed_codes = FixedSizeListArray::try_new_from_values(
+            transposed_codes,
+            num_sub_vectors_in_byte as i32,
+        )?;
+        let batch = batch
+            .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(transposed_codes))?
+            .add_metadata(STORAGE_METADATA_KEY.to_owned(), self.metadata_json.clone())?;
         Ok(batch)
     }
 }

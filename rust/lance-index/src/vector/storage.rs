@@ -22,6 +22,7 @@ use lance_linalg::distance::DistanceType;
 use prost::Message;
 use snafu::location;
 
+use crate::vector::pq::transform::TransposeTransformer;
 use crate::{
     pb,
     vector::{
@@ -30,8 +31,9 @@ use crate::{
     },
 };
 
-use super::quantizer::Quantizer;
-use super::{DISTANCE_TYPE_KEY, PART_ID_COLUMN};
+use super::quantizer::{QuantizationType, Quantizer};
+use super::transform::Transformer;
+use super::DISTANCE_TYPE_KEY;
 
 /// <section class="warning">
 ///  Internal API
@@ -141,23 +143,37 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
 pub struct StorageBuilder<Q: Quantization> {
     distance_type: DistanceType,
-    quantizer: Q,
+    _quantizer: Q,
+    transformers: Vec<Arc<dyn Transformer>>,
 }
 
 impl<Q: Quantization> StorageBuilder<Q> {
-    pub fn new(distance_type: DistanceType, quantizer: Q) -> Self {
-        Self {
+    pub fn new(distance_type: DistanceType, quantizer: Q) -> Result<Self> {
+        let transformers = if matches!(Q::quantization_type(), QuantizationType::Product) {
+            let metadata = quantizer.metadata(None)?;
+            vec![Arc::new(TransposeTransformer::new(metadata.to_string())?) as _]
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
             distance_type,
-            quantizer,
-        }
+            _quantizer: quantizer,
+            transformers,
+        })
     }
 
-    pub fn build(&self, batch: &RecordBatch) -> Result<Q::Storage> {
-        let batch = batch.drop_column(PART_ID_COLUMN)?;
-        let batch = batch.add_metadata(
-            STORAGE_METADATA_KEY.to_owned(),
-            self.quantizer.metadata(None)?.to_string(),
-        )?;
+    pub fn build(&self, batch: Vec<RecordBatch>) -> Result<Q::Storage> {
+        let batches = self
+            .transformers
+            .iter()
+            .try_fold(batch, |batches, transformer| {
+                batches
+                    .into_iter()
+                    .map(|b| transformer.transform(&b))
+                    .collect::<Result<Vec<_>>>()
+            })?;
+
+        let batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
         Q::Storage::try_from_batch(batch, self.distance_type)
     }
 }

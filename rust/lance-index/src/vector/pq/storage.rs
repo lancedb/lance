@@ -793,7 +793,8 @@ mod tests {
             RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
 
         StorageBuilder::new(pq.distance_type, pq)
-            .build(&batch)
+            .unwrap()
+            .build(vec![batch])
             .unwrap()
     }
 
