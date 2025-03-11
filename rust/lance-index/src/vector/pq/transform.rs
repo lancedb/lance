@@ -105,7 +105,7 @@ impl Transformer for TransposeTransformer {
             .map(|v| serde_json::from_str::<ProductQuantizationMetadata>(v))
             .transpose()
             .unwrap_or_default()
-            .map_or(false, |meta| meta.transposed);
+            .is_some_and(|meta| meta.transposed);
         if is_transposed {
             return Ok(batch.clone());
         }
