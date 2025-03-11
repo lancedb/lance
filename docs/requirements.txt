@@ -1,5 +1,6 @@
 pyarrow
 sphinx>=8
+sphinx-copybutton
 breathe
 cython
 pandas

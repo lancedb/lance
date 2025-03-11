@@ -33,6 +33,7 @@ author = "Lance Developer"
 # ones.
 extensions = [
     "breathe",
+    "sphinx_copybutton",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
@@ -89,4 +90,8 @@ from typing import Iterator
 import lance
 import pyarrow as pa
 import numpy as np
+import pandas as pd
 """
+
+# Only test code examples in rst files
+doctest_test_doctest_blocks = ""
