@@ -83,17 +83,13 @@ impl Transformer for PQTransformer {
 // then we can't directly concat the PQ codes from different batches.
 #[derive(Debug)]
 pub struct TransposeTransformer {
-    metadata_json: String,
     metadata: ProductQuantizationMetadata,
 }
 
 impl TransposeTransformer {
     pub fn new(metadata_json: String) -> Result<Self> {
         let metadata: ProductQuantizationMetadata = serde_json::from_str(&metadata_json)?;
-        Ok(Self {
-            metadata_json,
-            metadata,
-        })
+        Ok(Self { metadata })
     }
 }
 
