@@ -1729,25 +1729,22 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
             get_dict_opt::<HashMap<String, String>>(options, "file_writer_options")?
         {
             let mut file_writer_options = FileWriterOptions::default();
-            if let Some(max_page_bytes) = writer_options.get("max_page_bytes")
-            {
+            if let Some(max_page_bytes) = writer_options.get("max_page_bytes") {
                 file_writer_options.max_page_bytes = match max_page_bytes.parse::<u64>() {
                     Ok(n) => Some(n),
-                    Err(_e) => None
+                    Err(_e) => None,
                 }
             }
-            if let Some(data_cache_bytes) = writer_options.get("data_cache_bytes")
-            {
+            if let Some(data_cache_bytes) = writer_options.get("data_cache_bytes") {
                 file_writer_options.data_cache_bytes = match data_cache_bytes.parse::<u64>() {
                     Ok(n) => Some(n),
-                    Err(_e) => None
+                    Err(_e) => None,
                 }
             }
-            if let Some(keep_original_array) = writer_options.get("keep_original_array")
-            {
+            if let Some(keep_original_array) = writer_options.get("keep_original_array") {
                 file_writer_options.keep_original_array = match keep_original_array.parse::<bool>() {
                     Ok(n) => Some(n),
-                    Err(_e) => None
+                    Err(_e) => None,
                 }
             }
             p.file_writer_options = Some(file_writer_options);
