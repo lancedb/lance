@@ -5,7 +5,7 @@ use core::panic;
 use std::cmp::min;
 
 use itertools::Itertools;
-use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, DistanceType, Dot, L2};
+use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
@@ -82,61 +82,6 @@ pub fn build_distance_table_dot_impl<const NUM_BITS: u32, T: Dot>(
         })
         .exact_size(num_sub_vectors * num_centroids)
         .collect()
-}
-
-pub fn build_insample_distance_table<T: L2 + Dot + Copy>(
-    codebook: &[T],
-    num_bits: u32,
-    dim: usize,
-    num_sub_vectors: usize,
-    query: &[u8],
-    distance_type: DistanceType,
-) -> Vec<f32> {
-    match num_bits {
-        4 => build_insample_distance_table_impl::<4, T>(
-            codebook,
-            dim,
-            num_sub_vectors,
-            query,
-            distance_type,
-        ),
-        8 => build_insample_distance_table_impl::<8, T>(
-            codebook,
-            dim,
-            num_sub_vectors,
-            query,
-            distance_type,
-        ),
-        _ => unreachable!("Unsupported number of bits: {}", num_bits),
-    }
-}
-
-#[inline]
-pub fn build_insample_distance_table_impl<const NUM_BITS: u32, T: L2 + Dot + Copy>(
-    codebook: &[T],
-    dim: usize,
-    num_sub_vectors: usize,
-    query: &[u8],
-    distance_type: DistanceType,
-) -> Vec<f32> {
-    let query = query
-        .iter()
-        .map(|sub_vec_idx| {
-            get_sub_vector_centroids::<NUM_BITS, T>(
-                codebook,
-                dim,
-                num_sub_vectors,
-                *sub_vec_idx as usize,
-            )
-        })
-        .flatten()
-        .copied()
-        .collect::<Vec<_>>();
-    match distance_type {
-        DistanceType::L2 => build_distance_table_l2(codebook, NUM_BITS, num_sub_vectors, &query),
-        DistanceType::Dot => build_distance_table_dot(codebook, NUM_BITS, num_sub_vectors, &query),
-        _ => unreachable!("Unsupported distance type: {:?}", distance_type),
-    }
 }
 
 /// Compute L2 distance from the query to all code.
