@@ -68,7 +68,7 @@ html_theme = "sphinx_immaterial"
 html_static_path = ["_static"]
 
 html_favicon = "_static/favicon_64x64.png"
-# html_logo = "_static/high-res-icon.png"
+html_logo = "_static/high-res-icon.png"
 html_theme_options = {
     "icon": {
         "repo": "fontawesome/brands/github",
@@ -77,7 +77,12 @@ html_theme_options = {
     "site_url": "https://github.com/lancedb/lance",
     "repo_url": "https://github.com/lancedb/lance",
     "repo_name": "Lance",
-
+    "features": [
+        "navigation.expand",
+        # "navigation.tabs",
+        "content.tabs.link",
+        "content.code.copy",
+    ],
     "social": [
         {
             "icon": "fontawesome/brands/github",

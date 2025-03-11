@@ -14,24 +14,25 @@ It also supports configuring user dictionaries,
 which makes it convenient for users to expand their own dictionaries without retraining the language models.
 
 Language Models of Jieba
----------------
+------------------------
 
 Downloading the Model
-~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: bash
+
     python -m lance.download jieba
 
 The language model is stored by default in `${LANCE_LANGUAGE_MODEL_HOME}/jieba/default`.
 
 Using the Model
-~~~~~~~~~~~
+~~~~~~~~~~~~~~~
 
 .. code-block:: python
     ds.create_scalar_index("text", "INVERTED", base_tokenizer="jieba/default")
 
 User Dictionaries
-~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~
 Create a file named config.json in the root directory of the current model.
 
 .. code-block:: json
@@ -46,10 +47,10 @@ Create a file named config.json in the root directory of the current model.
 
 
 Language Models of Lindera
----------------
+--------------------------
 
 Downloading the Model
-~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: bash
 
@@ -60,14 +61,14 @@ Note that the language models of Lindera need to be compiled. Please install lin
 The language model is stored by default in ${LANCE_LANGUAGE_MODEL_HOME}/lindera/[ipadic|ko-dic|unidic]
 
 Using the Model
-~~~~~~~~~~~
+~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
     ds.create_scalar_index("text", "INVERTED", base_tokenizer="lindera/ipadic")
 
 User Dictionaries
-~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~
 
 Create a file named config.json in the root directory of the current model.
 
@@ -84,7 +85,7 @@ Create a file named config.json in the root directory of the current model.
 
 
 Create your own language model
----------------
+------------------------------
 
 Put your language model into `LANCE_LANGUAGE_MODEL_HOME`.
 

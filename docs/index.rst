@@ -39,7 +39,7 @@ Preview releases receive the same level of testing as regular releases.
 
 
 .. toctree::
-   :caption: Quickstart
+   :caption: Introduction
    :maxdepth: 2
 
    Quickstart <./notebooks/quickstart>
