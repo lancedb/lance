@@ -1742,7 +1742,8 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
                 }
             }
             if let Some(keep_original_array) = writer_options.get("keep_original_array") {
-                file_writer_options.keep_original_array = match keep_original_array.parse::<bool>() {
+                file_writer_options.keep_original_array = match keep_original_array.parse::<bool>()
+                {
                     Ok(n) => Some(n),
                     Err(_e) => None,
                 }
