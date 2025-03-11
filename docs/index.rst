@@ -39,15 +39,32 @@ Preview releases receive the same level of testing as regular releases.
 
 
 .. toctree::
-   :maxdepth: 1
+   :caption: Quickstart
+   :maxdepth: 2
 
    Quickstart <./notebooks/quickstart>
    ./read_and_write
-   Lance Formats <./format>
-   Arrays <./arrays>
+
+.. toctree::
+   :caption: Advanced Usage
+   :maxdepth: 1
+
+   Lance Format Spec <./format>
    Blob API <./blob>
-   Integrations <./integrations/integrations>
    Performance Guide <./performance>
+   Extension Arrays <./arrays>
+
+.. toctree::
+   :caption: Integrations
+
+   Huggingface <./integrations/huggingface>
+   Tensorflow <./integrations/tensorflow>
+   PyTorch <./integrations/pytorch>
+   Ray <./integrations/ray>
+
+.. toctree::
+   :maxdepth: 1
+
    API References <./api/api>
    Contributor Guide <./contributing>
    Examples <./examples/examples>

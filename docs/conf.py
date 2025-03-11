@@ -1,7 +1,6 @@
 # Configuration file for the Sphinx documentation builder.
 
 import shutil
-from datetime import datetime
 
 
 def run_apidoc(_):
@@ -18,7 +17,7 @@ def setup(app):
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = f"{datetime.today().year}, Lance Developer"
+copyright = "%Y, Lance Developer"
 author = "Lance Developer"
 
 
@@ -30,6 +29,7 @@ author = "Lance Developer"
 extensions = [
     "breathe",
     "sphinx_copybutton",
+    "sphinx_immaterial",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
@@ -61,7 +61,7 @@ intersphinx_mapping = {
 
 # -- Options for HTML output -------------------------------------------------
 
-html_theme = "piccolo_theme"
+html_theme = "sphinx_immaterial"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -71,10 +71,26 @@ html_static_path = ["_static"]
 html_favicon = "_static/favicon_64x64.png"
 # html_logo = "_static/high-res-icon.png"
 html_theme_options = {
-    "source_url": "https://github.com/lancedb/lance",
-    "source_icon": "github",
+    "icon": {
+        "repo": "fontawesome/brands/github",
+        "edit": "material/file-edit-outline",
+    },
+    "site_url": "https://github.com/lancedb/lance",
+    "repo_url": "https://github.com/lancedb/lance",
+    "repo_name": "Lance",
+    "social": [
+        {
+            "icon": "fontawesome/brands/github",
+            "link": "https://github.com/jbms/sphinx-immaterial",
+            "name": "Source on github.com",
+        },
+        {
+            "icon": "fontawesome/brands/python",
+            "link": "https://pypi.org/project/pylance/",
+        },
+    ],
 }
-html_css_files = ["custom.css"]
+include_in_toc = False
 
 # -- doctest configuration ---------------------------------------------------
 
