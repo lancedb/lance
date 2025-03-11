@@ -739,7 +739,11 @@ fn get_centroids<T: Clone>(
     // codebook[i][j] is the j-th centroid of the i-th sub-vector.
     // the codebook is stored as a flat array, codebook[i * num_centroids + j] = codebook[i][j]
 
-    let num_centroids: usize = 2_usize.pow(num_bits);
+    if num_bits == 4 {
+        return get_centroids_4bit(codebook, dimension, codes);
+    }
+
+    let num_centroids: usize = 2_usize.pow(8);
     let sub_vector_width = dimension / codes.len();
     let mut centroids = Vec::with_capacity(dimension);
     for (sub_vec_idx, centroid_idx) in codes.iter().enumerate() {
@@ -749,6 +753,30 @@ fn get_centroids<T: Clone>(
             ..sub_vec_idx * num_centroids * sub_vector_width
                 + (centroid_idx + 1) * sub_vector_width];
         centroids.extend_from_slice(centroid);
+    }
+    centroids
+}
+
+fn get_centroids_4bit<T: Clone>(codebook: &[T], dimension: usize, codes: &[u8]) -> Vec<T> {
+    let num_centroids: usize = 16;
+    let num_sub_vectors = codes.len() * 2;
+    let sub_vector_width = dimension / num_sub_vectors;
+    let mut centroids = Vec::with_capacity(dimension);
+    for (sub_vec_idx, centroid_idx) in codes.iter().enumerate() {
+        let centroid_idx = *centroid_idx as usize;
+
+        let current_idx = centroid_idx & 0x0F;
+        let current_centroid = &codebook[sub_vec_idx * num_centroids * sub_vector_width
+            + current_idx * sub_vector_width
+            ..sub_vec_idx * num_centroids * sub_vector_width
+                + (current_idx + 1) * sub_vector_width];
+        centroids.extend_from_slice(current_centroid);
+
+        let next_idx = centroid_idx >> 4;
+        let next_centroid = &codebook[sub_vec_idx * num_centroids * sub_vector_width
+            + next_idx * sub_vector_width
+            ..sub_vec_idx * num_centroids * sub_vector_width + (next_idx + 1) * sub_vector_width];
+        centroids.extend_from_slice(next_centroid);
     }
     centroids
 }
