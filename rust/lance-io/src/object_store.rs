@@ -22,6 +22,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
 use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
@@ -729,6 +730,12 @@ impl StorageOptions {
         if let Ok(value) = std::env::var("AWS_ALLOW_HTTP") {
             options.insert("allow_http".into(), value);
         }
+        if let Ok(value) = std::env::var("OBJECT_STORE_CLIENT_MAX_RETRIES") {
+            options.insert("client_max_retries".into(), value);
+        }
+        if let Ok(value) = std::env::var("OBJECT_STORE_CLIENT_RETRY_TIMEOUT") {
+            options.insert("client_retry_timeout".into(), value);
+        }
         Self(options)
     }
 
@@ -790,7 +797,7 @@ impl StorageOptions {
             .unwrap_or(3)
     }
 
-    /// Max retry times to set in RetryConfig for s3 client
+    /// Max retry times to set in RetryConfig for object store client
     pub fn client_max_retries(&self) -> usize {
         self.0
             .iter()
@@ -799,7 +806,7 @@ impl StorageOptions {
             .unwrap_or(10)
     }
 
-    /// Seconds of timeout to set in RetryConfig for s3 client
+    /// Seconds of timeout to set in RetryConfig for object store client
     pub fn client_retry_timeout(&self) -> u64 {
         self.0
             .iter()
@@ -865,6 +872,13 @@ async fn configure_store(
     // block size where we don't see a latency penalty.
     let file_block_size = options.block_size.unwrap_or(4 * 1024);
     let cloud_block_size = options.block_size.unwrap_or(64 * 1024);
+    let max_retries = storage_options.client_max_retries();
+    let retry_timeout = storage_options.client_retry_timeout();
+    let retry_config = RetryConfig {
+        backoff: Default::default(),
+        max_retries,
+        retry_timeout: Duration::from_secs(retry_timeout),
+    };
     match url.scheme() {
         "s3" | "s3+ddb" => {
             storage_options.with_env_s3();
@@ -877,13 +891,6 @@ async fn configure_store(
             //     });
             // }
 
-            let max_retries = storage_options.client_max_retries();
-            let retry_timeout = storage_options.client_retry_timeout();
-            let retry_config = RetryConfig {
-                backoff: Default::default(),
-                max_retries,
-                retry_timeout: Duration::from_secs(retry_timeout),
-            };
             let mut storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
@@ -938,7 +945,9 @@ async fn configure_store(
         }
         "gs" => {
             storage_options.with_env_gcs();
-            let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_ref());
+            let mut builder = GoogleCloudStorageBuilder::new()
+                .with_url(url.as_ref())
+                .with_retry(retry_config);
             for (key, value) in storage_options.as_gcs_options() {
                 builder = builder.with_config(key, value);
             }
@@ -965,7 +974,13 @@ async fn configure_store(
         }
         "az" => {
             storage_options.with_env_azure();
-            let (store, _) = parse_url_opts(&url, storage_options.as_azure_options())?;
+            let mut builder = MicrosoftAzureBuilder::new()
+                .with_url(url.as_ref())
+                .with_retry(retry_config);
+            for (key, value) in storage_options.as_azure_options() {
+                builder = builder.with_config(key, value);
+            }
+            let store = builder.build()?;
             let store = Arc::new(store).traced();
 
             Ok(ObjectStore {
