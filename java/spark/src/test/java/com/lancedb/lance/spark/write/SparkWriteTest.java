@@ -278,4 +278,20 @@ public class SparkWriteTest {
     spark.sql("CREATE OR REPLACE TABLE lance.`" + path + "` AS SELECT * FROM tmp_view");
     spark.sql("DROP TABLE lance.`" + path + "`");
   }
+
+  @Test
+  public void writeWithOptions(TestInfo testInfo) {
+    String datasetName = testInfo.getTestMethod().get().getName();
+    String filePath = LanceConfig.getDatasetUri(dbPath.toString(), datasetName);
+    testData
+        .repartition(1)
+        .write()
+        .format(LanceDataSource.name)
+        .option(LanceConfig.CONFIG_DATASET_URI, filePath)
+        .option("max_row_per_file", "2")
+        .save();
+
+    File directory = new File(filePath + "/data");
+    assertEquals(1, directory.listFiles().length);
+  }
 }
