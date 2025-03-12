@@ -633,6 +633,7 @@ mod tests {
     use lance_index::{DatasetIndexExt, IndexType};
     use lance_linalg::distance::hamming::hamming;
     use lance_linalg::distance::{multivec_distance, DistanceType};
+    use lance_linalg::kernels::normalize_fsl;
     use lance_testing::datagen::generate_random_array_with_range;
     use rand::distributions::uniform::SampleUniform;
     use rstest::rstest;
@@ -717,7 +718,10 @@ mod tests {
         let data_type = vectors.data_type().clone();
         let mut fields = vec![Field::new("id", DataType::UInt64, false)];
         let mut arrays: Vec<ArrayRef> = vec![ids];
-        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        if fsl.value_type() != DataType::UInt8 {
+            fsl = normalize_fsl(&fsl).unwrap();
+        }
         if is_multivector {
             let vector_field = Arc::new(Field::new(
                 "item",
@@ -1438,7 +1442,7 @@ mod tests {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
 
-        let nlist = 1000;
+        let nlist = 500;
         let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
 
         let ivf_params = IvfBuildParams::new(nlist);
