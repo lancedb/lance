@@ -2984,6 +2984,7 @@ def test_data_replacement(tmp_path: Path):
     )
     assert tbl == expected
 
+
 def test_schema_project_drop_column(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
     base_dir = tmp_path / "test"
@@ -3003,6 +3004,7 @@ def test_schema_project_drop_column(tmp_path: Path):
         }
     )
     assert tbl == expected
+
 
 def test_schema_project_rename_column(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
@@ -3025,6 +3027,7 @@ def test_schema_project_rename_column(tmp_path: Path):
     )
     assert tbl == expected
 
+
 def test_schema_project_swap_column(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
     base_dir = tmp_path / "test"
@@ -3045,6 +3048,7 @@ def test_schema_project_swap_column(tmp_path: Path):
         }
     )
     assert tbl == expected
+
 
 def test_empty_structs(tmp_path):
     schema = pa.schema([pa.field("id", pa.int32()), pa.field("empties", pa.struct([]))])

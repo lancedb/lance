@@ -3004,6 +3004,7 @@ class LanceOperation:
             )
             self.schema = LanceSchema.from_pyarrow(self.schema)
 
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
