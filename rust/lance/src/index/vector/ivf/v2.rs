@@ -614,8 +614,8 @@ mod tests {
     use arrow::datatypes::{UInt64Type, UInt8Type};
     use arrow::{array::AsArray, datatypes::Float32Type};
     use arrow_array::{
-        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, ListArray, RecordBatch,
-        RecordBatchIterator, UInt64Array,
+        Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, FixedSizeListArray, ListArray,
+        RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_buffer::OffsetBuffer;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -704,7 +704,7 @@ mod tests {
     where
         T::Native: SampleUniform,
     {
-        const VECTOR_NUM_PER_ROW: usize = 5;
+        const VECTOR_NUM_PER_ROW: usize = 3;
         let start_id = start_id.unwrap_or(0);
         let ids = Arc::new(UInt64Array::from_iter_values(
             start_id..start_id + num_rows as u64,
@@ -717,32 +717,20 @@ mod tests {
         let data_type = vectors.data_type().clone();
         let mut fields = vec![Field::new("id", DataType::UInt64, false)];
         let mut arrays: Vec<ArrayRef> = vec![ids];
-        let mut fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
-        if data_type != DataType::UInt8 {
-            fsl = lance_linalg::kernels::normalize_fsl(&fsl).unwrap();
-        }
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
         if is_multivector {
+            let vector_field = Arc::new(Field::new(
+                "item",
+                DataType::FixedSizeList(Arc::new(Field::new("item", data_type, true)), DIM as i32),
+                true,
+            ));
             fields.push(Field::new(
                 "vector",
-                DataType::List(Arc::new(Field::new(
-                    "item",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", data_type.clone(), true)),
-                        DIM as i32,
-                    ),
-                    true,
-                ))),
+                DataType::List(vector_field.clone()),
                 true,
             ));
             let array = Arc::new(ListArray::new(
-                Arc::new(Field::new(
-                    "item",
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", data_type, true)),
-                        DIM as i32,
-                    ),
-                    true,
-                )),
+                vector_field,
                 OffsetBuffer::from_lengths(std::iter::repeat(VECTOR_NUM_PER_ROW).take(num_rows)),
                 Arc::new(fsl),
                 None,
@@ -978,7 +966,7 @@ mod tests {
         params: VectorIndexParams,
         range: Range<T::Native>,
     ) where
-        T::Native: SampleUniform + std::ops::Add<Output = T::Native>,
+        T::Native: SampleUniform,
     {
         let test_dir = tempdir().unwrap();
         let test_uri = test_dir.path().to_str().unwrap();
@@ -1019,7 +1007,10 @@ mod tests {
         let mut count = 0;
         // append more rows and make delta index until hitting the retrain threshold
         loop {
-            let range = range.start..range.end + range.end + range.end + range.end + range.end;
+            let range = match count {
+                0 => range.clone(),
+                _ => range.end.neg_wrapping().sub_wrapping(range.end)..range.end.neg_wrapping(),
+            };
             append_dataset::<T>(&mut dataset, 500, range).await;
             dataset
                 .optimize_indices(&OptimizeOptions {
@@ -1032,7 +1023,21 @@ mod tests {
 
             let new_avg_loss = get_avg_loss(&dataset).await;
             if new_avg_loss / original_avg_loss >= *AVG_LOSS_RETRAIN_THRESHOLD {
+                if count <= 1 {
+                    // the first append is with the same data distribution, so the loss should be
+                    // very close to the original loss, then it shouldn't hit the retrain threshold
+                    panic!(
+                        "retrain threshold {} should not be hit",
+                        *AVG_LOSS_RETRAIN_THRESHOLD
+                    );
+                }
                 break;
+            }
+            if count >= 10 {
+                panic!(
+                    "failed to hit the retrain threshold {}",
+                    *AVG_LOSS_RETRAIN_THRESHOLD
+                );
             }
 
             // all delta indices should have the same centroids as the original index
@@ -1052,7 +1057,7 @@ mod tests {
             .await
             .unwrap();
         let stats = dataset.index_statistics("vector_idx").await.unwrap();
-        let stats = serde_json::to_value(stats).unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
         assert_eq!(stats["num_indices"], 1);
 
         let ivf_models = get_ivf_models(&dataset).await;
