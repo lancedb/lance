@@ -157,6 +157,12 @@ impl FromPyObject<'_> for PyLance<Operation> {
 
                 Ok(Self(op))
             }
+            "Project" => {
+                let schema = extract_schema(&ob.getattr("schema")?)?;
+
+                let op = Operation::Project { schema };
+                Ok(Self(op))
+            }
             unsupported => Err(PyValueError::new_err(format!(
                 "Unsupported operation: {unsupported}",
             ))),

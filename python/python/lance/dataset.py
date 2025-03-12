@@ -2957,6 +2957,52 @@ class LanceOperation:
 
         replacements: List[LanceOperation.DataReplacementGroup]
 
+    @dataclass
+    class Project(BaseOperation):
+        """
+        Operation that project columns. Use this operator for drop column or rename/swap column.
+
+        Attributes
+        ----------
+        schema: LanceSchema or pyarrow.Schema
+            The schema of the new dataset. Passing a LanceSchema is preferred,
+            and passing a pyarrow.Schema is deprecated.
+
+        Examples
+        --------
+        Use the projece operator to swap column:
+
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> import pyarrow.compute as pc
+        >>> table = pa.table({"a": [1, 2], "b": ["a", "b"], "b1": ["c", "d"]})
+        >>> dataset = lance.write_dataset(table, "example")
+        >>> dataset.to_table().to_pandas()
+           a  b b1
+        0  1  a  c
+        1  2  b  d
+        >>>
+        >>> ## rename column `b` into `b0` and rename b1 into `b`
+        >>> table = pa.table({"a": [3, 4], "b0": ["a", "b"], "b": ["c", "d"]})
+        >>> operation = lance.LanceOperation.Project(table.schema)
+        >>>
+        >>> dataset = lance.LanceDataset.commit("example", operation, read_version=1)
+        >>> dataset.to_table().to_pandas()
+           a b0  b
+        0  1  a  c
+        1  2  b  d
+        """
+
+        schema: LanceSchema | pa.Schema
+
+    def __post_init__(self):
+        if isinstance(self.schema, pa.Schema):
+            warnings.warn(
+                "Passing a pyarrow.Schema to Project is deprecated. "
+                "Please use a LanceSchema instead.",
+                DeprecationWarning,
+            )
+            self.schema = LanceSchema.from_pyarrow(self.schema)
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
