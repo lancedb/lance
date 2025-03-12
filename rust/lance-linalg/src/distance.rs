@@ -175,6 +175,7 @@ pub fn multivec_distance(
             })
             .unwrap_or(f32::NAN)
         })
+        .map(|sim| 1.0 - sim)
         .collect();
     Ok(dists)
 }
@@ -197,8 +198,8 @@ where
                 .as_primitive::<T>()
                 .values()
                 .chunks_exact(dim)
-                .map(|v| distance_type.func()(q, v))
-                .min_by(|a, b| a.partial_cmp(b).unwrap())
+                .map(|v| 1.0 - distance_type.func()(q, v))
+                .max_by(|a, b| a.total_cmp(b))
                 .unwrap()
         })
         .sum()

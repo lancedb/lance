@@ -65,6 +65,7 @@ use crate::index::scalar::detect_scalar_index_type;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type};
 use crate::index::DatasetIndexInternalExt;
 use crate::io::exec::fts::{FlatFtsExec, FtsExec};
+use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{get_physical_optimizer, LanceScanConfig};
 use crate::io::exec::{
@@ -90,6 +91,9 @@ pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
 lazy_static::lazy_static! {
     pub static ref DEFAULT_FRAGMENT_READAHEAD: Option<usize> = std::env::var("LANCE_DEFAULT_FRAGMENT_READAHEAD")
         .map(|val| Some(val.parse().unwrap())).unwrap_or(None);
+
+    pub static ref DEFAULT_XTR_OVERFETCH: u32 = std::env::var("LANCE_XTR_OVERFETCH")
+        .map(|val| val.parse().unwrap()).unwrap_or(10);
 }
 
 // We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
@@ -330,6 +334,9 @@ pub struct Scanner {
     /// This is essentially a weak consistency search. Users can run index or optimize index
     /// to make the index catch up with the latest data.
     fast_search: bool,
+
+    /// If true, the scanner will emit deleted rows
+    include_deleted_rows: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -368,6 +375,7 @@ impl Scanner {
             fragments: None,
             fast_search: false,
             use_scalar_index: true,
+            include_deleted_rows: false,
         }
     }
 
@@ -544,6 +552,21 @@ impl Scanner {
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Include deleted rows
+    ///
+    /// These are rows that have been deleted from the dataset but are still present in the
+    /// underlying storage.  These rows will have the `_rowid` column set to NULL.  The other columns
+    /// (include _rowaddr) will be set to their deleted values.
+    ///
+    /// This can be useful for generating aligned fragments or debugging
+    ///
+    /// Note: when entire fragments are deleted, the scanner will not emit any rows for that fragment
+    /// since the fragment is no longer present in the dataset.
+    pub fn include_deleted_rows(&mut self) -> &mut Self {
+        self.include_deleted_rows = true;
         self
     }
 
@@ -1231,6 +1254,14 @@ impl Scanner {
                 location: location!(),
             });
         }
+
+        if self.include_deleted_rows && !self.with_row_id {
+            return Err(Error::InvalidInput {
+                source: "include_deleted_rows is set but with_row_id is false".into(),
+                location: location!(),
+            });
+        }
+
         if let Some(first_blob_col) = self
             .projection_plan
             .physical_schema
@@ -1314,6 +1345,13 @@ impl Scanner {
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
             (Some(_), None) => {
+                if self.include_deleted_rows {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot include deleted rows in a nearest neighbor search".into(),
+                        location: location!(),
+                    });
+                }
+
                 // The source is an nearest neighbor search
                 if self.prefilter {
                     // If we are prefiltering then the knn node will take care of the filter
@@ -1328,6 +1366,13 @@ impl Scanner {
                 }
             }
             (None, Some(query)) => {
+                if self.include_deleted_rows {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot include deleted rows in an FTS search".into(),
+                        location: location!(),
+                    });
+                }
+
                 // The source is an FTS search
                 if self.prefilter {
                     // If we are prefiltering then the fts node will take care of the filter
@@ -1353,6 +1398,14 @@ impl Scanner {
                 } else {
                     self.use_stats
                 };
+
+                if filter_plan.index_query.is_some() && self.include_deleted_rows {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot include deleted rows in a scalar indexed scan".into(),
+                        location: location!(),
+                    });
+                }
+
                 match (
                     filter_plan.index_query.is_some(),
                     filter_plan.refine_expr.is_some(),
@@ -1402,7 +1455,7 @@ impl Scanner {
                         self.scan(
                             with_row_id,
                             self.with_row_address,
-                            false,
+                            self.include_deleted_rows,
                             scan_range,
                             eager_schema,
                         )
@@ -1692,13 +1745,13 @@ impl Scanner {
 
             // Find all deltas with the same index name.
             let deltas = self.dataset.load_indices_by_name(&index.name).await?;
-            let (ann_node, is_multivec) = match vector_type {
-                DataType::FixedSizeList(_, _) => (self.ann(q, &deltas, filter_plan).await?, false),
-                DataType::List(_) => (self.multivec_ann(q, &deltas, filter_plan).await?, true),
+            let ann_node = match vector_type {
+                DataType::FixedSizeList(_, _) => self.ann(q, &deltas, filter_plan).await?,
+                DataType::List(_) => self.multivec_ann(q, &deltas, filter_plan).await?,
                 _ => unreachable!(),
             };
 
-            let mut knn_node = if q.refine_factor.is_some() || is_multivec {
+            let mut knn_node = if q.refine_factor.is_some() {
                 let vector_projection = self
                     .dataset
                     .empty_projection()
@@ -2200,69 +2253,56 @@ impl Scanner {
         index: &[Index],
         filter_plan: &FilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // we split the query procedure into two steps:
+        // 1. collect the candidates by vector searching on each query vector
+        // 2. scoring the candidates
+
+        let over_fetch_factor = *DEFAULT_XTR_OVERFETCH;
+
+        let prefilter_source = self.prefilter_source(filter_plan).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
-        // split the query multivectors
+
         let num_queries = q.key.len() / dim;
         let new_queries = (0..num_queries)
             .map(|i| q.key.slice(i * dim, dim))
             .map(|query_vec| {
                 let mut new_query = q.clone();
                 new_query.key = query_vec;
+                // with XTR, we don't need to refine the result with original vectors,
+                // but here we really need to over-fetch the candidates to reach good enough recall.
+                // TODO: improve the recall with WARP, expose this parameter to the users.
+                new_query.refine_factor = Some(over_fetch_factor);
                 new_query
             });
         let mut ann_nodes = Vec::with_capacity(new_queries.len());
-        let prefilter_source = self.prefilter_source(filter_plan).await?;
         for query in new_queries {
+            // this produces `nprobes * k * over_fetch_factor * num_indices` candidates
             let ann_node = new_knn_exec(
                 self.dataset.clone(),
                 index,
                 &query,
                 prefilter_source.clone(),
             )?;
-            ann_nodes.push(ann_node);
+            let sort_expr = PhysicalSortExpr {
+                expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            };
+            let ann_node = Arc::new(
+                SortExec::new(LexOrdering::new(vec![sort_expr]), ann_node)
+                    .with_fetch(Some(q.k * over_fetch_factor as usize)),
+            );
+            ann_nodes.push(ann_node as Arc<dyn ExecutionPlan>);
         }
-        let ann_node = Arc::new(UnionExec::new(ann_nodes));
-        let ann_node = Arc::new(RepartitionExec::try_new(
-            ann_node,
-            datafusion::physical_plan::Partitioning::RoundRobinBatch(1),
-        )?);
-        let schema = ann_node.schema();
-        // unique by row ids, and get the min distance although it is not used.
-        let group_expr = vec![(
-            expressions::col(ROW_ID, schema.as_ref())?,
-            ROW_ID.to_string(),
-        )];
-        // for now multivector is always with cosine distance so here convert the distance to `1 - distance`
-        // and calculate the sum across all rows with the same row id.
-        let sum_expr = AggregateExprBuilder::new(
-            functions_aggregate::sum::sum_udaf(),
-            vec![expressions::binary(
-                expressions::lit(1.0),
-                datafusion_expr::Operator::Minus,
-                expressions::cast(
-                    expressions::col(DIST_COL, &schema)?,
-                    &schema,
-                    DataType::Float64,
-                )?,
-                &schema,
-            )?],
-        )
-        .schema(schema.clone())
-        .alias(DIST_COL)
-        .build()?;
-        let ann_node: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
-            AggregateMode::Single,
-            PhysicalGroupBy::new_single(group_expr),
-            vec![Arc::new(sum_expr)],
-            vec![None],
-            ann_node,
-            schema,
-        )?);
+
+        let ann_node = Arc::new(MultivectorScoringExec::try_new(ann_nodes, q.clone())?);
 
         let sort_expr = PhysicalSortExpr {
             expr: expressions::col(DIST_COL, ann_node.schema().as_ref())?,
             options: SortOptions {
-                descending: true,
+                descending: false,
                 nulls_first: false,
             },
         };
@@ -2810,60 +2850,50 @@ mod test {
         #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)]
         data_storage_version: LanceFileVersion,
         #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] build_index: bool,
     ) {
-        for build_index in &[true, false] {
-            let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
-                .await
-                .unwrap();
-            if *build_index {
-                test_ds.make_vector_index().await.unwrap();
-            }
-            let dataset = &test_ds.dataset;
-
-            let mut scan = dataset.scan();
-            let key: Float32Array = (32..64).map(|v| v as f32).collect();
-            scan.nearest("vec", &key, 5).unwrap();
-            scan.refine(5);
-
-            let results = scan
-                .try_into_stream()
-                .await
-                .unwrap()
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap();
-
-            assert_eq!(results.len(), 1);
-            let batch = &results[0];
-
-            assert_eq!(batch.num_rows(), 5);
-            assert_eq!(
-                batch.schema().as_ref(),
-                &ArrowSchema::new(vec![
-                    ArrowField::new("i", DataType::Int32, true),
-                    ArrowField::new("s", DataType::Utf8, true),
-                    ArrowField::new(
-                        "vec",
-                        DataType::FixedSizeList(
-                            Arc::new(ArrowField::new("item", DataType::Float32, true)),
-                            32,
-                        ),
-                        true,
-                    ),
-                    ArrowField::new(DIST_COL, DataType::Float32, true),
-                ])
-                .with_metadata([("dataset".into(), "vector".into())].into())
-            );
-
-            let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
-            let column_i = batch.column_by_name("i").unwrap();
-            let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
-                .values()
-                .iter()
-                .copied()
-                .collect();
-            assert_eq!(expected_i, actual_i);
+        let mut test_ds = TestVectorDataset::new(data_storage_version, stable_row_ids)
+            .await
+            .unwrap();
+        if build_index {
+            test_ds.make_vector_index().await.unwrap();
         }
+        let dataset = &test_ds.dataset;
+
+        let mut scan = dataset.scan();
+        let key: Float32Array = (32..64).map(|v| v as f32).collect();
+        scan.nearest("vec", &key, 5).unwrap();
+        scan.refine(5);
+
+        let batch = scan.try_into_batch().await.unwrap();
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(
+            batch.schema().as_ref(),
+            &ArrowSchema::new(vec![
+                ArrowField::new("i", DataType::Int32, true),
+                ArrowField::new("s", DataType::Utf8, true),
+                ArrowField::new(
+                    "vec",
+                    DataType::FixedSizeList(
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                        32,
+                    ),
+                    true,
+                ),
+                ArrowField::new(DIST_COL, DataType::Float32, true),
+            ])
+            .with_metadata([("dataset".into(), "vector".into())].into())
+        );
+
+        let expected_i = BTreeSet::from_iter(vec![1, 81, 161, 241, 321]);
+        let column_i = batch.column_by_name("i").unwrap();
+        let actual_i: BTreeSet<i32> = as_primitive_array::<Int32Type>(column_i.as_ref())
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(expected_i, actual_i);
     }
 
     #[rstest]

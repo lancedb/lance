@@ -41,7 +41,7 @@ pub fn rand_batches(
 }
 
 pub fn register_datagen(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let datagen = PyModule::new_bound(py, "datagen")?;
+    let datagen = PyModule::new(py, "datagen")?;
     datagen.add_wrapped(wrap_pyfunction!(is_datagen_supported))?;
     datagen.add_wrapped(wrap_pyfunction!(rand_batches))?;
     m.add_submodule(&datagen)?;

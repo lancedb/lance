@@ -10,11 +10,6 @@ Lance provides a high-level API to store and retrieve large binary objects (blob
 Lance serves large binary data using :py:class:`lance.BlobFile`, which
 is a file-like object that lazily reads large binary objects.
 
-.. autoclass:: lance.BlobFile
-    :members:
-    :show-inheritance:
-    :noindex:
-
 To fetch blobs from a Lance dataset, you can use :py:meth:`lance.dataset.LanceDataset.take_blobs`.
 
 For example, it's easy to use `BlobFile` to extract frames from a video file without

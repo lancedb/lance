@@ -327,6 +327,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        include_deleted_rows: Optional[bool] = None,
     ) -> LanceScanner:
         """Return a Scanner that can support various pushdowns.
 
@@ -338,7 +339,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter: pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
+            `Lance filter pushdown <https://lancedb.github.io/lance/introduction/read_and_write.html#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -424,6 +425,14 @@ class LanceDataset(pa.dataset.Dataset):
         fast_search:  bool, default False
             If True, then the search will only be performed on the indexed data, which
             yields faster search time.
+        include_deleted_rows: bool, default False
+            If True, then rows that have been deleted, but are still present in the
+            fragment, will be returned.  These rows will have the _rowid column set
+            to null.  All other columns will reflect the value stored on disk and may
+            not be null.
+
+            Note: if this is a search operation, or a take operation (including scalar
+            indexed scans) then deleted rows cannot be returned.
 
         Notes
         -----
@@ -473,6 +482,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.fast_search, fast_search)
+        setopt(builder.include_deleted_rows, include_deleted_rows)
 
         # columns=None has a special meaning. we can't treat it as "user didn't specify"
         if self._default_scan_options is None:
@@ -553,6 +563,7 @@ class LanceDataset(pa.dataset.Dataset):
         io_buffer_size: Optional[int] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        include_deleted_rows: Optional[bool] = None,
     ) -> pa.Table:
         """Read the data into memory as a :py:class:`pyarrow.Table`
 
@@ -564,7 +575,7 @@ class LanceDataset(pa.dataset.Dataset):
             All columns are fetched if None or unspecified.
         filter : pa.compute.Expression or str
             Expression or str that is a valid SQL where clause. See
-            `Lance filter pushdown <https://lancedb.github.io/lance/read_and_write.html#filter-push-down>`_
+            `Lance filter pushdown <https://lancedb.github.io/lance/introduction/read_and_write.html#filter-push-down>`_
             for valid SQL expressions.
         limit: int, default None
             Fetch up to this many rows. All rows if None or unspecified.
@@ -627,6 +638,14 @@ class LanceDataset(pa.dataset.Dataset):
                 QueryThenFetch: filter the results directly.
                 DfsQueryThenFetch: collect frequency of the indexed column first,
                     then filter the results. Cost more time but more accurate.
+        include_deleted_rows: bool, optional, default False
+            If True, then rows that have been deleted, but are still present in the
+            fragment, will be returned.  These rows will have the _rowid column set
+            to null.  All other columns will reflect the value stored on disk and may
+            not be null.
+
+            Note: if this is a search operation, or a take operation (including scalar
+            indexed scans) then deleted rows cannot be returned.
 
         Notes
         -----
@@ -654,6 +673,7 @@ class LanceDataset(pa.dataset.Dataset):
             use_stats=use_stats,
             fast_search=fast_search,
             full_text_query=full_text_query,
+            include_deleted_rows=include_deleted_rows,
         ).to_table()
 
     @property
@@ -1565,7 +1585,7 @@ class LanceDataset(pa.dataset.Dataset):
             )
 
 
-        There are 4 types of scalar indices available today.
+        There are 5 types of scalar indices available today.
 
         * ``BTREE``. The most common type is ``BTREE``. This index is inspired
           by the btree data structure although only the first few layers of the btree
@@ -1611,8 +1631,6 @@ class LanceDataset(pa.dataset.Dataset):
         replace : bool, default True
             Replace the existing index if it exists.
 
-        Optional Parameters
-        -------------------
         with_position: bool, default True
             This is for the ``INVERTED`` index. If True, the index will store the
             positions of the words in the document, so that you can conduct phrase
@@ -2272,6 +2290,7 @@ class LanceDataset(pa.dataset.Dataset):
                     metric,
                     accelerator=accelerator,
                     num_sub_vectors=num_sub_vectors,
+                    dtype=element_type.to_pandas_dtype(),
                 )
                 timers["pq_train:end"] = time.time()
                 pq_train_time = timers["pq_train:end"] - timers["pq_train:start"]
@@ -3116,6 +3135,7 @@ class ScannerBuilder:
         self._fast_search = False
         self._full_text_query = None
         self._use_scalar_index = None
+        self._include_deleted_rows = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
@@ -3393,6 +3413,15 @@ class ScannerBuilder:
         self._fast_search = flag
         return self
 
+    def include_deleted_rows(self, flag: bool) -> ScannerBuilder:
+        """Include deleted rows
+
+        Rows which have been deleted, but are still present in the fragment, will be
+        returned.  These rows will have all columns (except _rowaddr) set to null
+        """
+        self._include_deleted_rows = flag
+        return self
+
     def full_text_search(
         self,
         query: str,
@@ -3435,6 +3464,7 @@ class ScannerBuilder:
             self._full_text_query,
             self._late_materialization,
             self._use_scalar_index,
+            self._include_deleted_rows,
         )
         return LanceScanner(scanner, self.ds)
 

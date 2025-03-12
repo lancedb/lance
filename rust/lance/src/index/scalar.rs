@@ -142,7 +142,7 @@ impl TrainingRequest {
                 next_update += TRAINING_UPDATE_FREQ;
                 info!(
                     "Training index (job_id={}): {}/{}",
-                    training_uuid, self.column, rows_processed
+                    training_uuid, rows_processed, num_rows
                 );
             }
             batch

@@ -11,12 +11,9 @@
 //!
 //! The trait [CommitHandler] can be implemented to provide different commit
 //! strategies. The default implementation for most object stores is
-//! [RenameCommitHandler], which writes the manifest to a temporary path, then
+//! [ConditionalPutCommitHandler], which writes the manifest to a temporary path, then
 //! renames the temporary path to the final path if no object already exists
-//! at the final path. This is an atomic operation in most object stores, but
-//! not in AWS S3. So for AWS S3, the default commit handler is
-//! [UnsafeCommitHandler], which writes the manifest to the final path without
-//! any checks.
+//! at the final path.
 //!
 //! When providing your own commit handler, most often you are implementing in
 //! terms of a lock. The trait [CommitLock] can be implemented as a simpler
@@ -50,10 +47,12 @@ use crate::index::DatasetIndexInternalExt;
 use crate::session::Session;
 use crate::Dataset;
 
-#[cfg(all(feature = "dynamodb", test))]
+#[cfg(all(feature = "dynamodb_tests", test))]
 mod dynamodb;
 #[cfg(test)]
 mod external_manifest;
+#[cfg(all(feature = "dynamodb_tests", test))]
+mod s3_test;
 
 /// Read the transaction data from a transaction file.
 async fn read_transaction_file(

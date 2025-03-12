@@ -1434,7 +1434,7 @@ mod tests {
 
         dataset
             .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
+                num_indices_to_merge: 1, // merge the index with new data
                 ..Default::default()
             })
             .await
@@ -1445,11 +1445,10 @@ mod tests {
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
-        assert_eq!(stats["num_indices"], 2);
+        assert_eq!(stats["num_indices"], 1);
         let meta = get_meta(&dataset, "vec_idx").await;
-        assert_eq!(meta.len(), 2);
-        assert_eq!(get_bitmap(&meta[0]), vec![0]);
-        assert_eq!(get_bitmap(&meta[1]), vec![1]);
+        assert_eq!(meta.len(), 1);
+        assert_eq!(get_bitmap(&meta[0]), vec![0, 1]);
 
         dataset
             .optimize_indices(&OptimizeOptions {
@@ -1458,13 +1457,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let stats = get_stats(&dataset, "vec_idx").await;
+        let stats = get_stats(&dataset, "other_vec_idx").await;
         assert_eq!(stats["num_unindexed_rows"], 0);
         assert_eq!(stats["num_indexed_rows"], 1024);
         assert_eq!(stats["num_indexed_fragments"], 2);
         assert_eq!(stats["num_unindexed_fragments"], 0);
         assert_eq!(stats["num_indices"], 1);
-        let meta = get_meta(&dataset, "vec_idx").await;
+        let meta = get_meta(&dataset, "other_vec_idx").await;
         assert_eq!(meta.len(), 1);
         assert_eq!(get_bitmap(&meta[0]), vec![0, 1]);
     }

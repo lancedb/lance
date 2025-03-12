@@ -325,7 +325,13 @@ impl IoTrackingStore {
 }
 
 #[async_trait::async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStore for IoTrackingStore {
+    async fn put(&self, location: &Path, bytes: PutPayload) -> OSResult<PutResult> {
+        self.record_write(bytes.content_length() as u64);
+        self.target.put(location, bytes).await
+    }
+
     async fn put_opts(
         &self,
         location: &Path,
@@ -334,6 +340,14 @@ impl ObjectStore for IoTrackingStore {
     ) -> OSResult<PutResult> {
         self.record_write(bytes.content_length() as u64);
         self.target.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart(&self, location: &Path) -> OSResult<Box<dyn MultipartUpload>> {
+        let target = self.target.put_multipart(location).await?;
+        Ok(Box::new(IoTrackingMultipartUpload {
+            target,
+            stats: self.stats.clone(),
+        }))
     }
 
     async fn put_multipart_opts(
@@ -346,6 +360,15 @@ impl ObjectStore for IoTrackingStore {
             target,
             stats: self.stats.clone(),
         }))
+    }
+
+    async fn get(&self, location: &Path) -> OSResult<GetResult> {
+        let result = self.target.get(location).await;
+        if let Ok(result) = &result {
+            let num_bytes = result.range.end - result.range.start;
+            self.record_read(num_bytes as u64);
+        }
+        result
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
@@ -379,6 +402,7 @@ impl ObjectStore for IoTrackingStore {
     }
 
     async fn delete(&self, location: &Path) -> OSResult<()> {
+        self.record_write(0);
         self.target.delete(location).await
     }
 
@@ -394,6 +418,15 @@ impl ObjectStore for IoTrackingStore {
         self.target.list(prefix)
     }
 
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'_, OSResult<ObjectMeta>> {
+        self.record_read(0);
+        self.target.list_with_offset(prefix, offset)
+    }
+
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         self.record_read(0);
         self.target.list_with_delimiter(prefix).await
@@ -407,6 +440,11 @@ impl ObjectStore for IoTrackingStore {
     async fn rename(&self, from: &Path, to: &Path) -> OSResult<()> {
         self.record_write(0);
         self.target.rename(from, to).await
+    }
+
+    async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {
+        self.record_write(0);
+        self.target.rename_if_not_exists(from, to).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> OSResult<()> {

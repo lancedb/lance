@@ -72,7 +72,13 @@ mod test {
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_not_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+        async fn put_if_not_exists(
+            &self,
+            uri: &str,
+            version: u64,
+            path: &str,
+            _size: u64,
+        ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
@@ -92,7 +98,13 @@ mod test {
         }
 
         /// Put the manifest path for a given uri and version, should fail if the version already exists
-        async fn put_if_exists(&self, uri: &str, version: u64, path: &str) -> Result<()> {
+        async fn put_if_exists(
+            &self,
+            uri: &str,
+            version: u64,
+            path: &str,
+            _size: u64,
+        ) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let mut store = self.store.lock().await;
@@ -162,6 +174,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_can_create_dataset_with_external_store() {
         let sleepy_store = SleepyExternalManifestStore::new();
         let handler = ExternalManifestCommitHandler {
@@ -268,6 +281,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[cfg(not(windows))]
     async fn test_out_of_sync_dataset_can_recover() {
         let sleepy_store = SleepyExternalManifestStore::new();
         let inner_store = sleepy_store.store.clone();

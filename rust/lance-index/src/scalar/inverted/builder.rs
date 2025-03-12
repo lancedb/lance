@@ -53,7 +53,7 @@ lazy_static! {
     // it doesn't mean higher value will result in better performance,
     // because the bottleneck can be the IO once the number of shards is large enough,
     // it's 8 by default
-    static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
+    pub static ref LANCE_FTS_NUM_SHARDS: usize = std::env::var("LANCE_FTS_NUM_SHARDS")
         .unwrap_or_else(|_| "8".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_NUM_SHARDS");

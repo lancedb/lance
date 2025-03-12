@@ -47,7 +47,7 @@ use snafu::location;
 use tempfile::TempDir;
 
 use crate::vector::ivf::IvfTransformer;
-use crate::vector::transform::{KeepFiniteVectors, Transformer};
+use crate::vector::transform::Transformer;
 use crate::vector::PART_ID_COLUMN;
 
 const UNSORTED_BUFFER: &str = "unsorted.lance";
@@ -243,7 +243,6 @@ impl PartitionListBuilder {
 #[allow(clippy::too_many_arguments)]
 pub async fn shuffle_dataset(
     data: impl RecordBatchStream + Unpin + 'static,
-    column: &str,
     ivf: Arc<IvfTransformer>,
     precomputed_partitions: Option<HashMap<u64, u32>>,
     num_partitions: u32,
@@ -268,7 +267,6 @@ pub async fn shuffle_dataset(
         );
         let mut shuffler = IvfShuffler::try_new(num_partitions, None, true, None)?;
 
-        let column = column.to_owned();
         let precomputed_partitions = precomputed_partitions.map(Arc::new);
         let stream = data
             .zip(repeat_with(move || ivf.clone()))
@@ -279,7 +277,6 @@ pub async fn shuffle_dataset(
                     .as_ref()
                     .cloned()
                     .unwrap_or(Arc::new(HashMap::new()));
-                let nan_filter = KeepFiniteVectors::new(&column);
 
                 tokio::task::spawn(async move {
                     let mut batch = b?;
@@ -319,10 +316,6 @@ pub async fn shuffle_dataset(
                             batch = batch.take(&indices)?;
                         }
                     }
-
-                    // Filter out NaNs/Infs
-                    batch = nan_filter.transform(&batch)?;
-
                     ivf.transform(&batch)
                 })
             })

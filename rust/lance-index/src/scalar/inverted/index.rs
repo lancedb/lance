@@ -456,16 +456,6 @@ pub struct TokenSet {
 }
 
 impl TokenSet {
-    pub(crate) fn new(tokens: HashMap<String, u32>) -> Self {
-        let next_id = tokens.values().max().copied().unwrap_or(0) + 1;
-        let total_length = tokens.keys().map(|s| s.len()).sum();
-        Self {
-            tokens,
-            next_id,
-            total_length,
-        }
-    }
-
     pub fn num_tokens(&self) -> usize {
         self.tokens.len()
     }

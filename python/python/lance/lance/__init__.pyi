@@ -206,6 +206,7 @@ class _Dataset:
         full_text_query: Optional[dict] = None,
         late_materialization: Optional[bool | List[str]] = None,
         use_scalar_index: Optional[bool] = None,
+        include_deleted_rows: Optional[bool] = None,
     ) -> _Scanner: ...
     def count_rows(self, filter: Optional[str] = None) -> int: ...
     def take(

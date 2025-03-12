@@ -22,7 +22,7 @@ use lance_table::io::commit::{commit_handler_from_url, CommitHandler};
 use lance_table::io::manifest::ManifestDescribing;
 use object_store::path::Path;
 use snafu::location;
-use tracing::instrument;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::session::Session;
@@ -272,6 +272,7 @@ pub async fn do_write_fragments(
             || writer.as_mut().unwrap().tell().await? >= params.max_bytes_per_file as u64
         {
             let (num_rows, data_file) = writer.take().unwrap().finish().await?;
+            info!(target: "file_audit", mode="create", type="data", path = &data_file.path);
             debug_assert_eq!(num_rows, num_rows_in_current_file);
             params.progress.complete(fragments.last().unwrap()).await?;
             let last_fragment = fragments.last_mut().unwrap();
@@ -284,6 +285,7 @@ pub async fn do_write_fragments(
     // Complete the final writer
     if let Some(mut writer) = writer.take() {
         let (num_rows, data_file) = writer.finish().await?;
+        info!(target: "file_audit", mode="create", type="data", path = &data_file.path);
         let last_fragment = fragments.last_mut().unwrap();
         last_fragment.physical_rows = Some(num_rows as usize);
         last_fragment.files.push(data_file);

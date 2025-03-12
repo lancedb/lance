@@ -22,7 +22,7 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use object_store::aws::{
     AmazonS3ConfigKey, AwsCredential as ObjectStoreAwsCredential, AwsCredentialProvider,
 };
-use object_store::gcp::GoogleCloudStorageBuilder;
+use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
 use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
@@ -840,6 +840,10 @@ impl StorageOptions {
             })
             .collect()
     }
+
+    pub fn get(&self, key: &str) -> Option<&String> {
+        self.0.get(key)
+    }
 }
 
 impl From<HashMap<String, String>> for StorageOptions {
@@ -880,7 +884,7 @@ async fn configure_store(
                 max_retries,
                 retry_timeout: Duration::from_secs(retry_timeout),
             };
-            let storage_options = storage_options.as_s3_options();
+            let mut storage_options = storage_options.as_s3_options();
             let region = resolve_s3_region(&url, &storage_options).await?;
             let (aws_creds, region) = build_aws_credential(
                 options.s3_credentials_refresh_offset,
@@ -889,6 +893,12 @@ async fn configure_store(
                 region,
             )
             .await?;
+
+            // This will be default in next version of object store.
+            // https://github.com/apache/arrow-rs/pull/7181
+            storage_options
+                .entry(AmazonS3ConfigKey::ConditionalPut)
+                .or_insert_with(|| "etag".to_string());
 
             // Cloudflare does not support varying part sizes.
             let use_constant_size_upload_parts = storage_options
@@ -931,6 +941,14 @@ async fn configure_store(
             let mut builder = GoogleCloudStorageBuilder::new().with_url(url.as_ref());
             for (key, value) in storage_options.as_gcs_options() {
                 builder = builder.with_config(key, value);
+            }
+            let token_key = "google_storage_token";
+            if let Some(storage_token) = storage_options.get(token_key) {
+                let credential = GcpCredential {
+                    bearer: storage_token.to_string(),
+                };
+                let credential_provider = Arc::new(StaticCredentialProvider::new(credential)) as _;
+                builder = builder.with_credentials(credential_provider);
             }
             let store = builder.build()?;
             let store = Arc::new(store).traced();

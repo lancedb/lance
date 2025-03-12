@@ -1,6 +1,6 @@
 [package]
 name = "pylance"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 authors = ["Lance Devs <dev@lancedb.com>"]
 rust-version = "1.65"
@@ -12,15 +12,15 @@ name = "lance"
 crate-type = ["cdylib"]
 
 [dependencies]
-arrow = { version = "53.2", features = ["pyarrow"] }
-arrow-array = "53.2"
-arrow-data = "53.2"
-arrow-schema = "53.2"
-arrow-select = "53.2"
+arrow = { version = "54.1", features = ["pyarrow"] }
+arrow-array = "54.1"
+arrow-data = "54.1"
+arrow-schema = "54.1"
+arrow-select = "54.1"
 object_store = "0.11.2"
 async-trait = "0.1"
 chrono = "0.4.31"
-env_logger = "0.10"
+env_logger = "0.11.7"
 futures = "0.3"
 half = { version = "2.3", default-features = false, features = [
     "num-traits",
@@ -43,10 +43,9 @@ lance-table = { path = "../rust/lance-table" }
 lazy_static = "1"
 log = "0.4"
 prost = "0.13.2"
-pyo3 = { version = "0.22", features = [
+pyo3 = { version = "0.23", features = [
     "extension-module",
     "abi3-py39",
-    "gil-refs",
     "py-clone",
 ] }
 tokio = { version = "1.23", features = ["rt-multi-thread"] }
@@ -57,7 +56,7 @@ serde_yaml = "0.9.34"
 snafu = "0.8"
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.17"
-tracing = "0.1.37"
+tracing = { version = "0.1", features = ["log"] }
 url = "2.5.0"
 bytes = "1.4"
 
