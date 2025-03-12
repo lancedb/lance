@@ -2960,7 +2960,8 @@ class LanceOperation:
     @dataclass
     class Project(BaseOperation):
         """
-        Operation that project columns. Use this operator for drop column or rename/swap column.
+        Operation that project columns.
+        Use this operator for drop column or rename/swap column.
 
         Attributes
         ----------
