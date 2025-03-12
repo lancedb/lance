@@ -28,10 +28,8 @@ use object_store::{
     aws::AmazonS3Builder, azure::AzureConfigKey, gcp::GoogleConfigKey, local::LocalFileSystem,
     memory::InMemory, CredentialProvider, Error as ObjectStoreError, Result as ObjectStoreResult,
 };
-use object_store::{
-    parse_url_opts, ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider,
-};
 use object_store::{path::Path, ObjectMeta, ObjectStore as OSObjectStore};
+use object_store::{ClientOptions, DynObjectStore, RetryConfig, StaticCredentialProvider};
 use shellexpand::tilde;
 use snafu::location;
 use tokio::io::AsyncWriteExt;
