@@ -27,6 +27,14 @@ use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::Duration;
 
+use crate::error::PythonErrorExt;
+use crate::file::object_store_from_uri_or_path;
+use crate::fragment::FileFragment;
+use crate::schema::LanceSchema;
+use crate::session::Session;
+use crate::utils::PyLance;
+use crate::RT;
+use crate::{LanceReader, Scanner};
 use arrow_array::Array;
 use futures::{StreamExt, TryFutureExt};
 use lance::dataset::builder::DatasetBuilder;
@@ -50,6 +58,7 @@ use lance::dataset::{ColumnAlteration, ProjectionRequest};
 use lance::index::vector::utils::get_vector_type;
 use lance::index::{vector::VectorIndexParams, DatasetIndexInternalExt};
 use lance_arrow::as_fixed_size_list_array;
+use lance_file::v2::writer::FileWriterOptions;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::{
     optimize::OptimizeOptions,
@@ -76,15 +85,6 @@ use pyo3::{
 };
 use pyo3::{prelude::*, IntoPyObjectExt};
 use snafu::location;
-use lance_file::v2::writer::FileWriterOptions;
-use crate::error::PythonErrorExt;
-use crate::file::object_store_from_uri_or_path;
-use crate::fragment::FileFragment;
-use crate::schema::LanceSchema;
-use crate::session::Session;
-use crate::utils::PyLance;
-use crate::RT;
-use crate::{LanceReader, Scanner};
 
 use self::cleanup::CleanupStats;
 use self::commit::PyCommitLock;
