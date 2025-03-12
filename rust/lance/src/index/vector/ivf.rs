@@ -36,7 +36,7 @@ use lance_file::{
     format::MAGIC,
     writer::{FileWriter, FileWriterOptions},
 };
-use lance_index::vector::flat::index::{FlatIndex, FlatQuantizer};
+use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::storage::transpose;
 use lance_index::vector::quantizer::QuantizationType;
@@ -402,25 +402,46 @@ pub(crate) async fn optimize_vector_indices_v2(
     };
     let indices_to_merge = existing_indices[start_pos..].to_vec();
     let merged_num = indices_to_merge.len();
+
+    let (_, element_type) = get_vector_type(dataset.schema(), vector_column)?;
     match index_type {
         // IVF_FLAT
         (SubIndexType::Flat, QuantizationType::Flat) => {
-            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
-                dataset.clone(),
-                vector_column.to_owned(),
-                index_dir,
-                distance_type,
-                shuffler,
-                (),
-            )?
-            .with_ivf(ivf_model.clone())
-            .with_quantizer(quantizer.try_into()?)
-            .with_existing_indices(indices_to_merge)
-            .retrain(retrain)
-            .shuffle_data(unindexed)
-            .await?
-            .build()
-            .await?;
+            if element_type == DataType::UInt8 {
+                IvfIndexBuilder::<FlatIndex, FlatBinQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    (),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(indices_to_merge)
+                .retrain(retrain)
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?;
+            } else {
+                IvfIndexBuilder::<FlatIndex, FlatQuantizer>::new_incremental(
+                    dataset.clone(),
+                    vector_column.to_owned(),
+                    index_dir,
+                    distance_type,
+                    shuffler,
+                    (),
+                )?
+                .with_ivf(ivf_model.clone())
+                .with_quantizer(quantizer.try_into()?)
+                .with_existing_indices(indices_to_merge)
+                .retrain(retrain)
+                .shuffle_data(unindexed)
+                .await?
+                .build()
+                .await?;
+            }
         }
         // IVF_PQ
         (SubIndexType::Flat, QuantizationType::Product) => {
