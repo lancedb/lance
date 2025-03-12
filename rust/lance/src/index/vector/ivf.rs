@@ -380,12 +380,14 @@ pub(crate) async fn optimize_vector_indices_v2(
     let avg_loss = total_loss / total_rows as f64;
 
     let mut num_indices_to_merge = options.num_indices_to_merge;
+    let mut retrain = false;
     if let Some(original_avg_loss) = original_avg_loss {
         if avg_loss >= original_avg_loss * *AVG_LOSS_RETRAIN_THRESHOLD {
             warn!(
                 "average loss {} of the indices is too high (> {} * {}), retrain the index",
                 avg_loss, original_avg_loss, *AVG_LOSS_RETRAIN_THRESHOLD
             );
+            retrain = true;
             num_indices_to_merge = existing_indices.len();
         }
     }
@@ -414,6 +416,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
+            .retrain(retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -432,6 +435,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
+            .retrain(retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -453,6 +457,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
+            .retrain(retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -474,6 +479,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
+            .retrain(retrain)
             .shuffle_data(unindexed)
             .await?
             .build()

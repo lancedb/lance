@@ -738,7 +738,7 @@ mod tests {
                 Arc::new(Field::new(
                     "item",
                     DataType::FixedSizeList(
-                        Arc::new(Field::new("item", data_type.clone(), true)),
+                        Arc::new(Field::new("item", data_type, true)),
                         DIM as i32,
                     ),
                     true,
@@ -751,10 +751,7 @@ mod tests {
         } else {
             fields.push(Field::new(
                 "vector",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", data_type.clone(), true)),
-                    DIM as i32,
-                ),
+                DataType::FixedSizeList(Arc::new(Field::new("item", data_type, true)), DIM as i32),
                 true,
             ));
             let array = Arc::new(fsl);
