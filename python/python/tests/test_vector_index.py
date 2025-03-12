@@ -1121,6 +1121,19 @@ def test_optimize_indices(indexed_dataset):
     assert len(indices) == 2
 
 
+def test_no_include_deleted_rows(indexed_dataset):
+    with pytest.raises(ValueError, match="Cannot include deleted rows"):
+        indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+            },
+            with_row_id=True,
+            include_deleted_rows=True,
+        )
+
+
 def test_drop_indices(indexed_dataset):
     idx_name = indexed_dataset.list_indices()[0]["name"]
 
