@@ -43,7 +43,8 @@ Preview releases receive the same level of testing as regular releases.
    :maxdepth: 2
 
    Quickstart <./notebooks/quickstart>
-   ./read_and_write
+   ./introduction/read_and_write
+   ./introduction/schema_evolution
 
 .. toctree::
    :caption: Advanced Usage
@@ -51,6 +52,7 @@ Preview releases receive the same level of testing as regular releases.
 
    Lance Format Spec <./format>
    Blob API <./blob>
+   Object Store Configuration <./object_store>
    Performance Guide <./performance>
    Tokenizer <./tokenizer>
    Extension Arrays <./arrays>

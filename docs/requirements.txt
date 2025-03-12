@@ -11,3 +11,4 @@ jupyterlab
 fastai
 xmltodict
 tensorflow
+ray[data]
