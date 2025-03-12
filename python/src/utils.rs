@@ -282,8 +282,12 @@ pub fn class_name(ob: &Bound<'_, PyAny>) -> PyResult<String> {
     }
 }
 
-impl ToPyObject for PyLance<&i32> {
-    fn to_object(&self, py: Python) -> PyObject {
-        self.0.to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<&i32> {
+    type Target = PyAny;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        self.0.into_bound_py_any(py)
     }
 }

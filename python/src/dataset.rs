@@ -1182,7 +1182,7 @@ impl Dataset {
     #[pyo3(signature = (columns, index_type, name = None, replace = None, storage_options = None, fragment_ids = None, kwargs = None))]
     fn create_fragment_index(
         &mut self,
-        columns: Vec<&str>,
+        columns: Vec<PyBackedStr>,
         index_type: &str,
         name: Option<String>,
         replace: Option<bool>,
@@ -1190,6 +1190,7 @@ impl Dataset {
         fragment_ids: Option<Vec<u32>>,
         kwargs: Option<&Bound<PyDict>>,
     ) -> PyResult<PyLance<Index>> {
+        let columns: Vec<&str> = columns.iter().map(|s| &**s).collect();
         let index_type = index_type.to_uppercase();
         let idx_type = self.parse_index_type(&index_type)?;
         log::info!("Creating index: type={}", index_type);
@@ -1258,22 +1259,27 @@ impl Dataset {
     fn unindexed_fragments(&self, name: &str) -> PyResult<PyObject> {
         let result = RT
             .block_on(None, self.ds.unindexed_fragments(name))?
-            .map_err(|err| PyIOError::new_err(err.to_string()));
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
 
-        Python::with_gil(|py| result.map(|vec| export_vec(py, &vec).to_object(py)))
+        Python::with_gil(|py| {
+            let py_vec = export_vec(py, &result)?;
+            PyList::new(py, py_vec).map(|list| list.into())
+        })
     }
 
     fn indexed_fragments(&self, name: &str) -> PyResult<PyObject> {
         let result = RT
             .block_on(None, self.ds.indexed_fragments(name))?
-            .map_err(|err| PyIOError::new_err(err.to_string()));
+            .map_err(|err| PyIOError::new_err(err.to_string()))?;
         Python::with_gil(|py| {
-            result.map(|vec2| {
-                vec2.iter()
-                    .map(|vec| export_vec(py, vec).to_object(py))
-                    .collect::<Vec<_>>()
-                    .to_object(py)
-            })
+            let result = result
+                .iter()
+                .map(|vec| {
+                    let py_vec = export_vec(py, vec)?;
+                    PyList::new(py, py_vec).map(|list| list.into())
+                })
+                .collect::<Result<Vec<PyObject>, _>>()?;
+            PyList::new(py, result).map(|list| list.into())
         })
     }
 
@@ -1645,9 +1651,10 @@ impl Dataset {
                             .base_tokenizer(base_tokenizer.extract()?);
                     }
                     if let Some(language) = kwargs.get_item("language")? {
-                        let language = language.extract()?;
+                        let language: PyBackedStr =
+                            language.downcast::<PyString>()?.clone().try_into()?;
                         params.tokenizer_config =
-                            params.tokenizer_config.language(language).map_err(|e| {
+                            params.tokenizer_config.language(&language).map_err(|e| {
                                 PyValueError::new_err(format!(
                                     "can't set tokenizer language to {}: {:?}",
                                     language, e

@@ -9,8 +9,8 @@ use lance::dataset::transaction::{
 use lance::datatypes::Schema;
 use lance_table::format::{DataFile, Fragment, Index};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyDict, PyNone};
-use pyo3::{intern, prelude::*};
+use pyo3::types::{PyDict, PyList, PyNone, PySet};
+use pyo3::{intern, prelude::*, PyTypeCheck};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use uuid::Uuid;
 
@@ -49,19 +49,30 @@ impl<'py> IntoPyObject<'py> for PyLance<&DataReplacementGroup> {
 
 impl FromPyObject<'_> for PyLance<Index> {
     fn extract_bound(ob: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let uuid = ob.get_item("uuid")?.extract()?;
+        let uuid = ob.get_item("uuid")?.to_string();
         let name = ob.get_item("name")?.extract()?;
         let fields = ob.get_item("fields")?.extract()?;
         let dataset_version = ob.get_item("version")?.extract()?;
 
         let fragment_ids = ob.get_item("fragment_ids")?;
-        let fragment_ids = fragment_ids
-            .iter()?
-            .map(|id| id?.extract::<u32>())
-            .collect::<PyResult<Vec<u32>>>()?;
+        let fragment_ids = if PySet::type_check(&fragment_ids) {
+            let fragment_ids_ref: &Bound<'_, PySet> = fragment_ids.downcast()?;
+            fragment_ids_ref
+                .into_iter()
+                .map(|id| id.extract())
+                .collect::<PyResult<Vec<u32>>>()?
+        } else if PyList::type_check(&fragment_ids) {
+            let fragment_ids_ref: &Bound<'_, PyList> = fragment_ids.downcast()?;
+            fragment_ids_ref
+                .into_iter()
+                .map(|id| id.extract())
+                .collect::<PyResult<Vec<u32>>>()?
+        } else {
+            return Err(PyValueError::new_err("Invalid fragment_ids"));
+        };
         let fragment_bitmap = Some(fragment_ids.into_iter().collect());
         Ok(Self(Index {
-            uuid: Uuid::parse_str(uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
+            uuid: Uuid::parse_str(&uuid).map_err(|e| PyValueError::new_err(e.to_string()))?,
             name,
             fields,
             dataset_version,
@@ -73,30 +84,38 @@ impl FromPyObject<'_> for PyLance<Index> {
     }
 }
 
-impl ToPyObject for PyLance<&Index> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        let uuid = self.0.uuid.to_string().to_object(py);
-        let name = self.0.name.to_object(py);
-        let fields = export_vec(py, &self.0.fields).to_object(py);
-        let dataset_version = self.0.dataset_version.to_object(py);
+impl<'py> IntoPyObject<'py> for PyLance<&Index> {
+    type Target = PyDict;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        let uuid = self.0.uuid.to_string().into_pyobject(py)?;
+        let name = self.0.name.clone().into_pyobject(py)?;
+        let fields = export_vec(py, &self.0.fields)?;
+        let dataset_version = self.0.dataset_version.into_pyobject(py)?;
         let fragment_ids = match &self.0.fragment_bitmap {
-            Some(bitmap) => bitmap.into_iter().collect::<Vec<_>>().to_object(py),
-            None => PyNone::get_bound(py).to_object(py),
+            Some(bitmap) => bitmap.into_iter().collect::<Vec<_>>().into_pyobject(py)?,
+            None => PyNone::get(py).to_owned().into_any(),
         };
 
-        let kwargs = PyDict::new_bound(py);
+        let kwargs = PyDict::new(py);
         kwargs.set_item("uuid", uuid).unwrap();
         kwargs.set_item("name", name).unwrap();
         kwargs.set_item("fields", fields).unwrap();
         kwargs.set_item("version", dataset_version).unwrap();
         kwargs.set_item("fragment_ids", fragment_ids).unwrap();
-        kwargs.into()
+        Ok(kwargs)
     }
 }
 
-impl ToPyObject for PyLance<Index> {
-    fn to_object(&self, py: Python<'_>) -> PyObject {
-        PyLance(&self.0).to_object(py)
+impl<'py> IntoPyObject<'py> for PyLance<Index> {
+    type Target = PyDict;
+    type Output = Bound<'py, Self::Target>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        PyLance(&self.0).into_pyobject(py)
     }
 }
 
@@ -245,14 +264,12 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                 removed_indices,
                 new_indices,
             } => {
-                let removed_indices = export_vec(py, removed_indices.as_slice());
-                let new_indices = export_vec(py, new_indices.as_slice());
+                let removed_indices = export_vec(py, removed_indices.as_slice())?;
+                let new_indices = export_vec(py, new_indices.as_slice())?;
                 let cls = namespace
                     .getattr("CreateIndex")
                     .expect("Failed to get CreateIndex class");
                 cls.call1((removed_indices, new_indices))
-                    .unwrap()
-                    .to_object(py)
             }
             Operation::DataReplacement { replacements } => {
                 let replacements = export_vec(py, replacements.as_slice())?;
