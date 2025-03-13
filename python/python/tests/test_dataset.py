@@ -30,6 +30,7 @@ from helper import ProgressForTest
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.commit import CommitConflictError
 from lance.debug import format_fragment
+from lance.schema import LanceSchema
 from lance.util import validate_vector_index
 
 # Various valid inputs for write_dataset
@@ -3018,6 +3019,74 @@ def test_data_replacement(tmp_path: Path):
         {
             "a": list(range(100, 200)),
             "b": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_schema_project_drop_column(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    schema = pa.Table.from_pydict({"a": range(1)}).schema
+    lance_schema = LanceSchema.from_pyarrow(schema)
+
+    project = lance.LanceOperation.Project(lance_schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "a": list(range(100, 200)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_schema_project_rename_column(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    schema = pa.Table.from_pydict({"c": range(1), "d": range(1)}).schema
+    lance_schema = LanceSchema.from_pyarrow(schema)
+
+    project = lance.LanceOperation.Project(lance_schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "c": list(range(100, 200)),
+            "d": list(range(300, 400)),
+        }
+    )
+    assert tbl == expected
+
+
+def test_schema_project_swap_column(tmp_path: Path):
+    table = pa.Table.from_pydict({"a": range(100, 200), "b": range(300, 400)})
+    base_dir = tmp_path / "test"
+
+    dataset = lance.write_dataset(table, base_dir)
+
+    schema = pa.Table.from_pydict({"b": range(1), "a": range(1)}).schema
+    lance_schema = LanceSchema.from_pyarrow(schema)
+
+    project = lance.LanceOperation.Project(lance_schema)
+    dataset = lance.LanceDataset.commit(dataset, project, read_version=1)
+
+    tbl = dataset.to_table()
+
+    expected = pa.Table.from_pydict(
+        {
+            "b": list(range(100, 200)),
+            "a": list(range(300, 400)),
         }
     )
     assert tbl == expected
