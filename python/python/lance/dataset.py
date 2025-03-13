@@ -2976,6 +2976,7 @@ class LanceOperation:
         >>> import lance
         >>> import pyarrow as pa
         >>> import pyarrow.compute as pc
+        >>> from lance.schema import LanceSchema
         >>> table = pa.table({"a": [1, 2], "b": ["a", "b"], "b1": ["c", "d"]})
         >>> dataset = lance.write_dataset(table, "example")
         >>> dataset.to_table().to_pandas()
@@ -2985,8 +2986,8 @@ class LanceOperation:
         >>>
         >>> ## rename column `b` into `b0` and rename b1 into `b`
         >>> table = pa.table({"a": [3, 4], "b0": ["a", "b"], "b": ["c", "d"]})
-        >>> operation = lance.LanceOperation.Project(table.schema)
-        >>>
+        >>> lance_schema = LanceSchema.from_pyarrow(table.schema)
+        >>> operation = lance.LanceOperation.Project(lance_schema)
         >>> dataset = lance.LanceDataset.commit("example", operation, read_version=1)
         >>> dataset.to_table().to_pandas()
            a b0  b
@@ -2994,17 +2995,7 @@ class LanceOperation:
         1  2  b  d
         """
 
-        schema: LanceSchema | pa.Schema
-
-    def __post_init__(self):
-        if isinstance(self.schema, pa.Schema):
-            warnings.warn(
-                "Passing a pyarrow.Schema to Project is deprecated. "
-                "Please use a LanceSchema instead.",
-                DeprecationWarning,
-            )
-            self.schema = LanceSchema.from_pyarrow(self.schema)
-
+        schema: LanceSchema
 
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
