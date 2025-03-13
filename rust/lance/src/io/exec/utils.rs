@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use pin_project::pin_project;
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use arrow::array::AsArray;
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::physical_plan::metrics::BaselineMetrics;
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricValue,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, RecordBatchStream, SendableRecordBatchStream,
 };
@@ -207,14 +211,28 @@ pub struct InstrumentedRecordBatchStreamAdapter<S> {
     #[pin]
     stream: S,
     baseline_metrics: BaselineMetrics,
+    batch_count: Count,
 }
 
 impl<S> InstrumentedRecordBatchStreamAdapter<S> {
-    pub fn new(schema: SchemaRef, stream: S, baseline_metrics: BaselineMetrics) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        stream: S,
+        partition: usize,
+        metrics: &ExecutionPlanMetricsSet,
+    ) -> Self {
+        let batch_count = Count::new();
+        MetricBuilder::new(metrics)
+            .with_partition(partition)
+            .build(MetricValue::Count {
+                name: Cow::Borrowed("output_batches"),
+                count: batch_count.clone(),
+            });
         Self {
             schema,
             stream,
-            baseline_metrics,
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+            batch_count,
         }
     }
 }
@@ -233,6 +251,9 @@ where
         let timer = this.baseline_metrics.elapsed_compute().timer();
         let poll = this.stream.poll_next(cx);
         timer.done();
+        if let Poll::Ready(Some(Ok(_))) = &poll {
+            this.batch_count.add(1);
+        }
         this.baseline_metrics.record_poll(poll)
     }
 }

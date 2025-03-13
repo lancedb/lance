@@ -759,6 +759,15 @@ impl FileScheduler {
         }
     }
 
+    pub fn with_priority(&self, priority: u64) -> FileScheduler {
+        FileScheduler {
+            reader: self.reader.clone(),
+            root: self.root.clone(),
+            block_size: self.block_size,
+            base_priority: priority,
+        }
+    }
+
     /// Submit a single IOP to the reader
     ///
     /// If you have multiple IOPS to perform then [`Self::submit_request`] is going

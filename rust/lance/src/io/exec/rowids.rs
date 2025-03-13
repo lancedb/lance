@@ -9,7 +9,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::ColumnStatistics;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::StreamExt;
@@ -209,7 +209,6 @@ impl ExecutionPlan for AddRowAddrExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let index_prereq = self
             .row_id_index
             .get_or_init(|| {
@@ -248,7 +247,8 @@ impl ExecutionPlan for AddRowAddrExec {
         let stream = InstrumentedRecordBatchStreamAdapter::new(
             self.output_schema.clone(),
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         );
         Ok(Box::pin(stream))
     }
