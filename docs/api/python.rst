@@ -65,6 +65,4 @@ Indexing and Searching
 API Reference
 ~~~~~~~~~~~~~
 
-More information can be found in the :doc:`API reference <python/modules>`.
-
-.. _Lance Python API documentation: ./python/modules
+More information can be found in the :doc:`API reference <./python/modules>`.
