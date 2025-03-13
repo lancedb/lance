@@ -2965,9 +2965,8 @@ class LanceOperation:
 
         Attributes
         ----------
-        schema: LanceSchema or pyarrow.Schema
-            The schema of the new dataset. Passing a LanceSchema is preferred,
-            and passing a pyarrow.Schema is deprecated.
+        schema: LanceSchema
+            The lance schema of the new dataset.
 
         Examples
         --------
