@@ -2262,6 +2262,44 @@ def test_scanner_schemas(tmp_path: Path):
     assert scanner.projected_schema == pa.schema([pa.field("a", pa.int64())])
 
 
+def test_scan_deleted_rows(tmp_path: Path):
+    base_dir = tmp_path / "dataset"
+    df = pd.DataFrame({"a": range(100), "b": range(100)})
+    ds = lance.write_dataset(df, base_dir, max_rows_per_file=25)
+    ds.create_scalar_index("b", "BTREE")
+    ds.delete("a < 30")
+
+    assert ds.count_rows() == 70
+
+    assert ds.scanner(with_row_id=True).to_table().num_rows == 70
+    with_deleted = ds.scanner(with_row_id=True, include_deleted_rows=True).to_table()
+
+    assert with_deleted.num_rows == 75
+
+    assert with_deleted.slice(0, 5) == pa.table(
+        {
+            "a": range(25, 30),
+            "b": range(25, 30),
+            "_rowid": pa.array([None] * 5, pa.uint64()),
+        }
+    )
+
+    assert (
+        ds.scanner(with_row_id=True, include_deleted_rows=True, filter="a < 32")
+        .to_table()
+        .num_rows
+        == 7
+    )
+
+    with pytest.raises(ValueError, match="Cannot include deleted rows"):
+        ds.scanner(
+            include_deleted_rows=True, with_row_id=True, filter="b < 30"
+        ).to_table()
+
+    with pytest.raises(ValueError, match="with_row_id is false"):
+        ds.scanner(include_deleted_rows=True, filter="a < 30").to_table()
+
+
 def test_custom_commit_lock(tmp_path: Path):
     called_lock = False
     called_release = False

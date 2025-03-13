@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
+use arrow::datatypes::UInt8Type;
+use arrow_array::FixedSizeListArray;
 use arrow_array::{cast::AsArray, Array, RecordBatch};
 use arrow_schema::Field;
-use lance_arrow::RecordBatchExt;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::{Error, Result};
 use snafu::location;
 use tracing::instrument;
 
+use super::storage::{transpose, ProductQuantizationMetadata};
 use super::ProductQuantizer;
 use crate::vector::quantizer::Quantization;
+use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::vector::transform::Transformer;
+use crate::vector::PQ_CODE_COLUMN;
 
 /// Product Quantizer Transformer
 ///
@@ -68,6 +74,60 @@ impl Transformer for PQTransformer {
         let pq_field = Field::new(&self.output_column, pq_code.data_type().clone(), false);
         let batch = batch.try_with_column(pq_field, Arc::new(pq_code))?;
         let batch = batch.drop_column(&self.input_column)?;
+        Ok(batch)
+    }
+}
+
+// this transpose transformer would transform the PQ codes back to original codes,
+// we need this because if the PQ codes are stored in a transposed way,
+// then we can't directly concat the PQ codes from different batches.
+#[derive(Debug)]
+pub struct TransposeTransformer {
+    metadata: ProductQuantizationMetadata,
+}
+
+impl TransposeTransformer {
+    pub fn new(metadata_json: String) -> Result<Self> {
+        let metadata: ProductQuantizationMetadata = serde_json::from_str(&metadata_json)?;
+        Ok(Self { metadata })
+    }
+}
+
+impl Transformer for TransposeTransformer {
+    #[instrument(name = "TransposeTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let is_transposed = batch
+            .metadata()
+            .get(STORAGE_METADATA_KEY)
+            .map(|v| serde_json::from_str::<ProductQuantizationMetadata>(v))
+            .transpose()
+            .unwrap_or_default()
+            .is_some_and(|meta| meta.transposed);
+        if !is_transposed {
+            return Ok(batch.with_metadata(HashMap::new())?); // clear the metadata
+        }
+
+        let num_sub_vectors_in_byte = if self.metadata.nbits == 4 {
+            self.metadata.num_sub_vectors / 2
+        } else {
+            self.metadata.num_sub_vectors
+        };
+        let codes = &batch[PQ_CODE_COLUMN];
+        let transposed_codes = transpose(
+            codes
+                .as_fixed_size_list()
+                .values()
+                .as_primitive::<UInt8Type>(),
+            num_sub_vectors_in_byte,
+            batch.num_rows(),
+        );
+        let transposed_codes = FixedSizeListArray::try_new_from_values(
+            transposed_codes,
+            num_sub_vectors_in_byte as i32,
+        )?;
+        let batch = batch
+            .replace_column_by_name(PQ_CODE_COLUMN, Arc::new(transposed_codes))?
+            .with_metadata(HashMap::new())?; // clear the metadata
         Ok(batch)
     }
 }

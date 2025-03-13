@@ -334,6 +334,9 @@ pub struct Scanner {
     /// This is essentially a weak consistency search. Users can run index or optimize index
     /// to make the index catch up with the latest data.
     fast_search: bool,
+
+    /// If true, the scanner will emit deleted rows
+    include_deleted_rows: bool,
 }
 
 fn escape_column_name(name: &str) -> String {
@@ -372,6 +375,7 @@ impl Scanner {
             fragments: None,
             fast_search: false,
             use_scalar_index: true,
+            include_deleted_rows: false,
         }
     }
 
@@ -548,6 +552,21 @@ impl Scanner {
     /// Set the batch size.
     pub fn batch_size(&mut self, batch_size: usize) -> &mut Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Include deleted rows
+    ///
+    /// These are rows that have been deleted from the dataset but are still present in the
+    /// underlying storage.  These rows will have the `_rowid` column set to NULL.  The other columns
+    /// (include _rowaddr) will be set to their deleted values.
+    ///
+    /// This can be useful for generating aligned fragments or debugging
+    ///
+    /// Note: when entire fragments are deleted, the scanner will not emit any rows for that fragment
+    /// since the fragment is no longer present in the dataset.
+    pub fn include_deleted_rows(&mut self) -> &mut Self {
+        self.include_deleted_rows = true;
         self
     }
 
@@ -1235,6 +1254,14 @@ impl Scanner {
                 location: location!(),
             });
         }
+
+        if self.include_deleted_rows && !self.with_row_id {
+            return Err(Error::InvalidInput {
+                source: "include_deleted_rows is set but with_row_id is false".into(),
+                location: location!(),
+            });
+        }
+
         if let Some(first_blob_col) = self
             .projection_plan
             .physical_schema
@@ -1318,6 +1345,13 @@ impl Scanner {
         // Stage 1: source (either an (K|A)NN search, full text search or or a (full|indexed) scan)
         let mut plan: Arc<dyn ExecutionPlan> = match (&self.nearest, &self.full_text_query) {
             (Some(_), None) => {
+                if self.include_deleted_rows {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot include deleted rows in a nearest neighbor search".into(),
+                        location: location!(),
+                    });
+                }
+
                 // The source is an nearest neighbor search
                 if self.prefilter {
                     // If we are prefiltering then the knn node will take care of the filter
@@ -1332,6 +1366,13 @@ impl Scanner {
                 }
             }
             (None, Some(query)) => {
+                if self.include_deleted_rows {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot include deleted rows in an FTS search".into(),
+                        location: location!(),
+                    });
+                }
+
                 // The source is an FTS search
                 if self.prefilter {
                     // If we are prefiltering then the fts node will take care of the filter
@@ -1357,6 +1398,14 @@ impl Scanner {
                 } else {
                     self.use_stats
                 };
+
+                if filter_plan.index_query.is_some() && self.include_deleted_rows {
+                    return Err(Error::InvalidInput {
+                        source: "Cannot include deleted rows in a scalar indexed scan".into(),
+                        location: location!(),
+                    });
+                }
+
                 match (
                     filter_plan.index_query.is_some(),
                     filter_plan.refine_expr.is_some(),
@@ -1406,7 +1455,7 @@ impl Scanner {
                         self.scan(
                             with_row_id,
                             self.with_row_address,
-                            false,
+                            self.include_deleted_rows,
                             scan_range,
                             eager_schema,
                         )
