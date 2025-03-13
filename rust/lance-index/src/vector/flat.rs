@@ -19,6 +19,7 @@ use super::DIST_COL;
 
 pub mod index;
 pub mod storage;
+pub mod transform;
 
 fn distance_field() -> ArrowField {
     ArrowField::new(DIST_COL, DataType::Float32, true)

@@ -369,18 +369,6 @@ impl VectorStore for ScalarQuantizationStorage {
             storage: self,
         }
     }
-
-    fn distance_between(&self, a: u32, b: u32) -> f32 {
-        let (offset_a, chunk_a) = self.chunk(a);
-        let (offset_b, chunk_b) = self.chunk(b);
-        let a_slice = chunk_a.sq_code_slice(a - offset_a);
-        let b_slice = chunk_b.sq_code_slice(b - offset_b);
-        match self.distance_type {
-            DistanceType::L2 | DistanceType::Cosine => l2_distance_uint_scalar(a_slice, b_slice),
-            DistanceType::Dot => dot_distance(a_slice, b_slice),
-            _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
-        }
-    }
 }
 
 pub struct SQDistCalculator<'a> {
