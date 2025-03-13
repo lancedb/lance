@@ -49,6 +49,13 @@ jobs:
         run: |
           make nbconvert
           make html
+      - name: Check python api are auto generated
+        working-directory: docs
+        run: |
+          if [ ! -f "api/python/modules.rst" ]; then
+            echo "Error: api/python/modules.rst does not exist."
+            exit 1
+          fi
       - name: Check links
         working-directory: docs
         run: |
