@@ -14,7 +14,7 @@ use arrow_array::{
 use arrow_array::{Array, Float32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{metrics::BaselineMetrics, PlanProperties};
+use datafusion::physical_plan::PlanProperties;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     Statistics,
@@ -173,7 +173,6 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let key = self.query.clone();
         let column = self.column.clone();
         let dt = self.distance_type;
@@ -193,7 +192,8 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )) as SendableRecordBatchStream)
     }
 
@@ -390,7 +390,6 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let query = self.query.clone();
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let ds = self.dataset.clone();
         let stream = stream::iter(self.index_uuids.clone())
             .map(move |uuid| {
@@ -427,7 +426,8 @@ impl ExecutionPlan for ANNIvfPartitionExec {
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             schema,
             stream.boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )) as SendableRecordBatchStream)
     }
 }
@@ -565,7 +565,6 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DataFusionResult<datafusion::physical_plan::SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context.clone())?;
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
         let schema = self.schema();
         let query = self.query.clone();
         let ds = self.dataset.clone();
@@ -674,7 +673,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                 })
                 .buffered(get_num_compute_intensive_cpus())
                 .boxed(),
-            baseline_metrics,
+            partition,
+            &self.metrics,
         )))
     }
 
