@@ -20,7 +20,7 @@ arrow-select = "54.1"
 object_store = "0.11.2"
 async-trait = "0.1"
 chrono = "0.4.31"
-env_logger = "0.10"
+env_logger = "0.11.7"
 futures = "0.3"
 half = { version = "2.3", default-features = false, features = [
     "num-traits",

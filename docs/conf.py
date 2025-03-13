@@ -1,24 +1,10 @@
 # Configuration file for the Sphinx documentation builder.
 
-import shutil
-from datetime import datetime
-
-
-def run_apidoc(_):
-    from sphinx.ext.apidoc import main
-
-    shutil.rmtree("api/python", ignore_errors=True)
-    main(["-f", "-o", "api/python", "../python/python/lance"])
-
-
-def setup(app):
-    app.connect("builder-inited", run_apidoc)
-
 
 # -- Project information -----------------------------------------------------
 
 project = "Lance"
-copyright = f"{datetime.today().year}, Lance Developer"
+copyright = "%Y, Lance Developer"
 author = "Lance Developer"
 
 
@@ -29,7 +15,8 @@ author = "Lance Developer"
 # ones.
 extensions = [
     "breathe",
-    "sphinx_copybutton",
+    "sphinx_immaterial",
+    "sphinx_immaterial.apidoc.python.apigen",
     "sphinx.ext.autodoc",
     "sphinx.ext.doctest",
     "sphinx.ext.githubpages",
@@ -56,12 +43,26 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable/", None),
     "pyarrow": ("https://arrow.apache.org/docs/", None),
     "pandas": ("https://pandas.pydata.org/pandas-docs/stable/", None),
+    "ray": ("https://docs.ray.io/en/latest/", None),
 }
 
+python_apigen_modules = {
+    "lance": "api/python/",
+}
+object_description_options = [
+    (
+        "py:.*",
+        dict(
+            include_object_type_in_xref_tooltip=False,
+            include_in_toc=False,
+            include_fields_in_toc=False,
+        ),
+    ),
+]
 
 # -- Options for HTML output -------------------------------------------------
 
-html_theme = "piccolo_theme"
+html_theme = "sphinx_immaterial"
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -69,12 +70,34 @@ html_theme = "piccolo_theme"
 html_static_path = ["_static"]
 
 html_favicon = "_static/favicon_64x64.png"
-# html_logo = "_static/high-res-icon.png"
+html_logo = "_static/high-res-icon.png"
 html_theme_options = {
-    "source_url": "https://github.com/lancedb/lance",
-    "source_icon": "github",
+    "icon": {
+        "repo": "fontawesome/brands/github",
+        "edit": "material/file-edit-outline",
+    },
+    "site_url": "https://github.com/lancedb/lance",
+    "repo_url": "https://github.com/lancedb/lance",
+    "repo_name": "Lance",
+    "features": [
+        "navigation.expand",
+        # "navigation.tabs",
+        "content.tabs.link",
+        "content.code.copy",
+    ],
+    "social": [
+        {
+            "icon": "fontawesome/brands/github",
+            "link": "https://github.com/jbms/sphinx-immaterial",
+            "name": "Source on github.com",
+        },
+        {
+            "icon": "fontawesome/brands/python",
+            "link": "https://pypi.org/project/pylance/",
+        },
+    ],
 }
-html_css_files = ["custom.css"]
+
 
 # -- doctest configuration ---------------------------------------------------
 

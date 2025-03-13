@@ -802,8 +802,8 @@ def test_optimize_index_recall(tmp_path: Path):
 
     def check_index(has_knn_combined, delete_has_happened):
         for query in sample_queries:
-            results = dataset.to_table(nearest=query).column("vector")
-            assert has_target(query["q"], results)
+            results = dataset.to_table(nearest=query)
+            assert has_target(query["q"], results["vector"])
             plan = dataset.scanner(nearest=query).explain_plan(verbose=True)
             assert ("KNNVectorDistance" in plan) == has_knn_combined
         for query in sample_delete_queries:
@@ -1119,6 +1119,19 @@ def test_optimize_indices(indexed_dataset):
     indexed_dataset.optimize.optimize_indices(num_indices_to_merge=0)
     indices = indexed_dataset.list_indices()
     assert len(indices) == 2
+
+
+def test_no_include_deleted_rows(indexed_dataset):
+    with pytest.raises(ValueError, match="Cannot include deleted rows"):
+        indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+            },
+            with_row_id=True,
+            include_deleted_rows=True,
+        )
 
 
 def test_drop_indices(indexed_dataset):

@@ -1,6 +1,7 @@
 pyarrow
 sphinx>=8
 sphinx-copybutton
+sphinx-immaterial
 breathe
 cython
 pandas
@@ -10,3 +11,4 @@ jupyterlab
 fastai
 xmltodict
 tensorflow
+ray[data]

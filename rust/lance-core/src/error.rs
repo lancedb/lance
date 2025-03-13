@@ -151,6 +151,24 @@ impl Error {
     }
 }
 
+pub trait LanceOptionExt<T> {
+    /// Unwraps an option, returning an internal error if the option is None.
+    ///
+    /// Can be used when an option is expected to have a value.
+    fn expect_ok(self) -> Result<T>;
+}
+
+impl<T> LanceOptionExt<T> for Option<T> {
+    #[track_caller]
+    fn expect_ok(self) -> Result<T> {
+        let location = std::panic::Location::caller().to_snafu_location();
+        self.ok_or_else(|| Error::Internal {
+            message: "Expected option to have value".to_string(),
+            location,
+        })
+    }
+}
+
 trait ToSnafuLocation {
     fn to_snafu_location(&'static self) -> snafu::Location;
 }
