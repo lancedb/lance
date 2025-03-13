@@ -170,23 +170,37 @@ Bulk Update
 ^^^^^^^^^^^
 
 The :py:meth:`lance.LanceDataset.update` method is useful for updating rows based on
-a filter.  However, if we want to replace existing rows with new rows then a merge
-insert operation would be more efficient:
+a filter.  However, if we want to replace existing rows with new rows then a :py:meth:`lance.LanceDataset.merge_insert`
+operation would be more efficient:
 
-.. code-block:: python
+.. testsetup:: bulk_update
 
-  import lance
+    tbl = pa.Table.from_pylist([{"name": "Alice", "age": 20},
+                          {"name": "Bob", "age": 30}])
+    lance.write_dataset(tbl, "./alice_and_bob.lance", mode="overwrite")
 
-  # Change the ages of both Alice and Bob
-  new_table = pa.Table.from_pylist([{"name": "Alice", "age": 30},
-                                    {"name": "Bob", "age": 20}])
-  dataset = lance.dataset("./alice_and_bob.lance")
-  # This will use `name` as the key for matching rows.  Merge insert
-  # uses a JOIN internally and so you typically want this column to
-  # be a unique key or id of some kind.
-  dataset.merge_insert("name") \
-         .when_matched_update_all() \
-         .execute(new_table)
+.. doctest:: bulk_update
+
+  >>> import lance
+
+  >>> dataset = lance.dataset("./alice_and_bob.lance")
+  >>> dataset.to_table().to_pandas()
+      name  age
+  0  Alice   20
+  1    Bob   30
+  >>> # Change the ages of both Alice and Bob
+  >>> new_table = pa.Table.from_pylist([{"name": "Alice", "age": 2},
+  ...                                   {"name": "Bob", "age": 3}])
+  >>> # This will use `name` as the key for matching rows.  Merge insert
+  >>> # uses a JOIN internally and so you typically want this column to
+  >>> # be a unique key or id of some kind.
+  >>> rst = dataset.merge_insert("name") \
+  ...        .when_matched_update_all() \
+  ...        .execute(new_table)
+  >>> dataset.to_table().to_pandas()
+      name  age
+  0  Alice    2
+  1    Bob    3
 
 Note that, similar to the update operation, rows that are modified will
 be removed and inserted back into the table, changing their position to
