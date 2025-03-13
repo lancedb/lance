@@ -2997,6 +2997,7 @@ class LanceOperation:
 
         schema: LanceSchema
 
+
 class ScannerBuilder:
     def __init__(self, ds: LanceDataset):
         self.ds = ds
