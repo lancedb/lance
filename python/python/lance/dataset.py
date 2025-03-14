@@ -752,11 +752,11 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         **kwargs : dict, optional
-            Arguments for ``Scanner.from_dataset``.
+            Arguments for :py:meth:`~LanceDataset.scanner`.
 
         Returns
         -------
-        record_batches : Iterator of RecordBatch
+        record_batches : Iterator of :py:class:`~pyarrow.RecordBatch`
         """
         return self.scanner(
             columns=columns,
