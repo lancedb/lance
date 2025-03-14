@@ -72,13 +72,13 @@ and collect all serialized metadata on a single worker to execute the final comm
     import json
     from lance import FragmentMetadata, LanceOperation
 
-    # Serialize into JSON
+    # Serialize Fragments into JSON data
     fragments_json1 = [json.dumps(fragment.to_json()) for fragment in fragments_1]
     fragments_json2 = [json.dumps(fragment.to_json()) for fragment in fragments_2]
 
     # On one worker, collect all fragments
-    all_json = fragments_json1 + fragments_json2
-    all_fragments = [FragmentMetadata.from_json(f) for f in all_json]
+    all_fragments = [FragmentMetadata.from_json(f) for f in \
+        fragments_json1 + fragments_json2]
 
     # Commit the fragments into a single dataset
     op = lance.LanceOperation.Overwrite(schema, all_fragments)
