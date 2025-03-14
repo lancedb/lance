@@ -82,6 +82,7 @@ and collect all serialized metadata on a single worker to execute the final comm
         fragments_json1 + fragments_json2]
 
     # Commit the fragments into a single dataset
+    # Use LanceOperation.Overwrite to overwrite the dataset or create new dataset.
     op = lance.LanceOperation.Overwrite(schema, all_fragments)
     read_version = 0 # Because it is empty at the time.
     lance.LanceDataset.commit(
