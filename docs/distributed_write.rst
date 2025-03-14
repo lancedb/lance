@@ -24,7 +24,7 @@ A distributed write operation can be performed by two phrases:
 Write new data
 ~~~~~~~~~~~~~~~
 
-Writing or appending new data is simple: using :py:func:`~lance.fragment.write_fragments`.
+Writing or appending new data is straightforward with :py:func:`~lance.fragment.write_fragments`.
 
 .. testsetup:: new_data
 
@@ -68,6 +68,7 @@ Now, use :meth:`lance.fragment.FragmentMetadata.to_json` to serialize the fragme
 and collect all serialized metadata on a single worker to execute the final commit operation.
 
 .. testcode:: new_data
+    :emphasize-lines: 8,10,16
 
     import json
     from lance import FragmentMetadata, LanceOperation
@@ -88,4 +89,24 @@ and collect all serialized metadata on a single worker to execute the final comm
         op,
         read_version=read_version,
     )
+
+We can read the dataset using the Lance API:
+
+.. testcode:: new_data
+
+    dataset = lance.dataset(data_uri)
+    assert len(dataset.get_fragments()) == 2
+    assert dataset.version == 1
+    print(dataset.to_table().to_pandas())
+
+.. testoutput:: new_data
+
+        a  b
+     0  1  x
+     1  2  y
+     2  3  z
+     3  4  u
+     4  5  v
+     5  6  w
+
 
