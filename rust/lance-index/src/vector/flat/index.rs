@@ -85,22 +85,21 @@ impl IvfSubIndex for FlatIndex {
 
         let mut res: Vec<_> = match prefilter.is_empty() {
             true => {
-                let iter = dist_calc
-                    .distance_all()
-                    .into_iter()
-                    .zip(0..storage.len() as u32)
-                    .map(|(dist, id)| OrderedNode {
-                        id,
-                        dist: OrderedFloat(dist),
-                    });
-
                 if params.lower_bound.is_some() || params.upper_bound.is_some() {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN);
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX);
-                    iter.filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
+                    dist_calc
+                        .distance_all()
+                        .into_iter()
+                        .zip(0..storage.len() as u32)
+                        .map(|(dist, id)| OrderedNode {
+                            id,
+                            dist: OrderedFloat(dist),
+                        })
+                        .filter(|r| lower_bound <= r.dist.0 && r.dist.0 < upper_bound)
                         .collect()
                 } else {
-                    iter.collect()
+                    dist_calc.topk(k)
                 }
             }
             false => {

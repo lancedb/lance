@@ -3,12 +3,15 @@
 
 use core::panic;
 use std::cmp::min;
+use std::collections::BinaryHeap;
 
 use itertools::Itertools;
 use lance_linalg::distance::{dot_distance_batch, l2_distance_batch, Dot, L2};
 use lance_linalg::simd::u8::u8x16;
 use lance_linalg::simd::{Shuffle, SIMD};
 use lance_table::utils::LanceIteratorExtension;
+
+use crate::vector::graph::OrderedNode;
 
 use super::{num_centroids, utils::get_sub_vector_centroids};
 
@@ -105,9 +108,6 @@ pub(super) fn compute_pq_distance(
     num_sub_vectors: usize,
     code: &[u8],
 ) -> Vec<f32> {
-    if code.is_empty() {
-        return Vec::new();
-    }
     if num_bits == 4 {
         return compute_pq_distance_4bit(distance_table, num_sub_vectors, code);
     }
@@ -132,6 +132,110 @@ pub(super) fn compute_pq_distance(
     }
 
     distances
+}
+
+#[inline]
+pub(super) fn topk_pq_distance(
+    distance_table: &[f32],
+    num_bits: u32,
+    num_sub_vectors: usize,
+    code: &[u8],
+    k: usize,
+) -> Vec<OrderedNode> {
+    // here `code` has been transposed,
+    // so code[i][j] is the code of i-th sub-vector of the j-th vector,
+    // and `code` is a flatten array of [num_sub_vectors, num_vectors] u8,
+    // so code[i * num_vectors + j] is the code of i-th sub-vector of the j-th vector.
+
+    let num_vectors = code.len() / num_sub_vectors;
+
+    if k >= num_vectors {
+        return compute_pq_distance(distance_table, num_bits, num_sub_vectors, code)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, dist)| OrderedNode::new(idx as u32, dist.into()))
+            .collect();
+    }
+
+    // it must be 8
+    const NUM_CENTROIDS: usize = 2_usize.pow(8);
+
+    // compute the first k distances then we can have the threshold
+    let mut distances = vec![0.0_f32; num_vectors];
+    for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
+        let dist_table =
+            &distance_table[sub_vec_idx * NUM_CENTROIDS..(sub_vec_idx + 1) * NUM_CENTROIDS];
+        vec_indices
+            .iter()
+            .take(k)
+            .zip(distances.iter_mut())
+            .for_each(|(&centroid_idx, sum)| {
+                *sum += dist_table[centroid_idx as usize];
+            });
+    }
+
+    let mut results = BinaryHeap::from_iter(
+        distances
+            .iter()
+            .take(k)
+            .enumerate()
+            .map(|(id, dist)| OrderedNode::new(id as u32, (*dist).into())),
+    );
+
+    // warmup phase
+    let mut candidates = (k..num_vectors).collect::<Vec<_>>();
+    let mut sub_vec_idx = 0;
+    for vec_indices in code.chunks_exact(num_vectors) {
+        let dist_table =
+            &distance_table[sub_vec_idx * NUM_CENTROIDS..(sub_vec_idx + 1) * NUM_CENTROIDS];
+        let left_distances = &mut distances[k..];
+        vec_indices[k..]
+            .iter()
+            .zip(left_distances.iter_mut())
+            .for_each(|(&centroid_idx, sum)| {
+                *sum += dist_table[centroid_idx as usize];
+            });
+        sub_vec_idx += 1;
+
+        // try pruning,
+        // this is a little bit tricky, but I'd like to update the candidates in-place
+        let threshold = results.peek().unwrap().dist.0;
+        let mut idx = 0;
+        for i in 0..candidates.len() {
+            if distances[candidates[i]] < threshold {
+                candidates[idx] = candidates[i];
+                idx += 1;
+            }
+        }
+
+        // go prune phase if only 25% of candidates are left
+        if candidates.len() < num_vectors / 4 {
+            break;
+        }
+    }
+
+    // prune phase
+    for (sub_vec_idx, vec_indices) in code[sub_vec_idx * num_vectors..]
+        .chunks_exact(num_vectors)
+        .enumerate()
+    {
+        let dist_table =
+            &distance_table[sub_vec_idx * NUM_CENTROIDS..(sub_vec_idx + 1) * NUM_CENTROIDS];
+        for i in candidates.iter() {
+            let centroid_idx = vec_indices[*i] as usize;
+            distances[*i] += dist_table[centroid_idx];
+        }
+    }
+
+    for id in candidates.into_iter() {
+        let threshold = results.peek().unwrap().dist.0;
+        if distances[id] < threshold {
+            results.pop();
+            results.push(OrderedNode::new(id as u32, distances[id].into()));
+        }
+    }
+
+    results.into_vec()
 }
 
 #[inline]
