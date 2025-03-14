@@ -424,17 +424,19 @@ class LanceDataset(pa.dataset.Dataset):
             Note: if this is a search operation, or a take operation (including scalar
             indexed scans) then deleted rows cannot be returned.
 
-        Notes
-        -----
 
-        For now, if BOTH filter and nearest is specified, then:
+        .. note::
 
-        1. nearest is executed first.
-        2. The results are filtered afterwards.
+            For now, if BOTH filter and nearest is specified, then:
+
+            1. nearest is executed first.
+            2. The results are filtered afterwards.
+
 
         For debugging ANN results, you can choose to not use the index
         even if present by specifying ``use_index=False``. For example,
         the following will always return exact KNN results:
+
 
         .. code-block:: python
 
@@ -750,11 +752,11 @@ class LanceDataset(pa.dataset.Dataset):
         Parameters
         ----------
         **kwargs : dict, optional
-            Arguments for ``Scanner.from_dataset``.
+            Arguments for :py:meth:`~LanceDataset.scanner`.
 
         Returns
         -------
-        record_batches : Iterator of RecordBatch
+        record_batches : Iterator of :py:class:`~pyarrow.RecordBatch`
         """
         return self.scanner(
             columns=columns,
