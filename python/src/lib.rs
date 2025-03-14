@@ -39,14 +39,14 @@ use dataset::optimize::{
     PyCompaction, PyCompactionMetrics, PyCompactionPlan, PyCompactionTask, PyRewriteResult,
 };
 use dataset::MergeInsertBuilder;
-use env_logger::Env;
+use env_logger::{Builder, Env};
 use file::{
     LanceBufferDescriptor, LanceColumnMetadata, LanceFileMetadata, LanceFileReader,
     LanceFileStatistics, LanceFileWriter, LancePageMetadata,
 };
 use futures::StreamExt;
 use lance_index::DatasetIndexExt;
-use log::LevelFilter;
+use log::Level;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use session::Session;
@@ -106,14 +106,25 @@ lazy_static! {
     static ref RT: BackgroundExecutor = BackgroundExecutor::new();
 }
 
+pub fn init_logging(mut log_builder: Builder) {
+    let logger = log_builder.build();
+
+    let max_level = logger.filter();
+
+    let log_level = max_level.to_level().unwrap_or(Level::Error);
+
+    tracing::initialize_tracing(log_level);
+    log::set_boxed_logger(Box::new(logger)).unwrap();
+    log::set_max_level(max_level);
+}
+
 #[pymodule]
 fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let env = Env::new()
         .filter_or("LANCE_LOG", "warn")
         .write_style("LANCE_LOG_STYLE");
-    let mut log_builder = env_logger::Builder::from_env(env);
-    log_builder.filter_module("tracing::span", LevelFilter::Off);
-    log_builder.try_init().unwrap();
+    let log_builder = env_logger::Builder::from_env(env);
+    init_logging(log_builder);
 
     m.add_class::<Scanner>()?;
     m.add_class::<Dataset>()?;
