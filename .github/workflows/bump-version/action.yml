@@ -35,13 +35,17 @@ runs:
       run: |
         # Get current version
         current_version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
-        current_version=${current_version%\%}
+        current_version=${current_version%%}
+
+        base_version="${current_version%-*}"
+        if [[ "$current_version" == *-* ]]; then
+          suffix="-${current_version#*-}"
+        else
+          suffix=""
+        fi
 
         # Split the version into components using parameter expansion
-        major=${current_version%%.*}
-        minor=${current_version#*.}
-        minor=${minor%%.*}
-        patch=${current_version##*.}
+        IFS=. read major minor patch <<<"$base_version"
 
         case "${{ inputs.part }}" in
           patch)
@@ -62,6 +66,6 @@ runs:
             ;;
         esac
 
-        new_version="${major}.${minor}.${patch}"
+        new_version="${major}.${minor}.${patch}${suffix}"
 
         mvn versions:set versions:commit -DnewVersion=$new_version
