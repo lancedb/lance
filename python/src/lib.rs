@@ -113,7 +113,6 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         .write_style("LANCE_LOG_STYLE");
     let mut log_builder = env_logger::Builder::from_env(env);
     log_builder.filter_module("tracing::span", LevelFilter::Off);
-    log_builder.format_line_number(true);
     log_builder.try_init().unwrap();
 
     m.add_class::<Scanner>()?;
