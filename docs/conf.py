@@ -89,6 +89,7 @@ html_theme_options = {
         "content.tabs.link",
         "content.code.copy",
     ],
+    "navigation_depth": 4,
     "social": [
         {
             "icon": "fontawesome/brands/github",
