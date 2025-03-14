@@ -67,8 +67,29 @@ Writing or appending new data is straightforward with :py:func:`~lance.fragment.
 Now, use :meth:`lance.fragment.FragmentMetadata.to_json` to serialize the fragment metadata,
 and collect all serialized metadata on a single worker to execute the final commit operation.
 
+.. testsetup::
+
+    from lance.fragment import write_fragments
+
+    shutil.rmtree("./dist_write", ignore_errors=True)
+    data_uri = "./dist_write"
+    schema = pa.schema([
+        ("a", pa.int32()),
+        ("b", pa.string()),
+    ])
+
+    data1 = {
+        "a": [1, 2, 3],
+        "b": ["x", "y", "z"],
+    }
+    fragments_1 = write_fragments(data1, data_uri, schema=schema)
+    data2 = {
+        "a": [4, 5, 6],
+        "b": ["u", "v", "w"],
+    }
+    fragments_2 = write_fragments(data2, data_uri, schema=schema)
+
 .. testcode:: new_data
-    :emphasize-lines: 8,10,16
 
     import json
     from lance import FragmentMetadata, LanceOperation
@@ -91,10 +112,7 @@ and collect all serialized metadata on a single worker to execute the final comm
         read_version=read_version,
     )
 
-We can read the dataset using the Lance API:
-
-.. testcode:: new_data
-
+    # We can read the dataset using the Lance API:
     dataset = lance.dataset(data_uri)
     assert len(dataset.get_fragments()) == 2
     assert dataset.version == 1
