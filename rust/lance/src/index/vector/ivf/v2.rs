@@ -642,7 +642,6 @@ mod tests {
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::UpdateBuilder;
-    use crate::index::vector::ivf::IvfIndexStatistics;
     use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
@@ -1002,9 +1001,8 @@ mod tests {
             stats["indices"]
                 .as_array()
                 .unwrap()
-                .into_iter()
-                .map(|s| s.get("loss").map(|l| l.as_f64()))
-                .flatten()
+                .iter()
+                .flat_map(|s| s.get("loss").map(|l| l.as_f64()))
                 .collect()
         }
 
