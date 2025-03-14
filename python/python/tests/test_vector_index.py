@@ -643,6 +643,7 @@ def test_pre_populated_ivf_centroids(dataset, tmp_path: Path):
     idx_stats = actual_statistics["indices"][0]
     partitions = idx_stats.pop("partitions")
     idx_stats.pop("centroids")
+    idx_stats.pop("loss")
     assert idx_stats == expected_statistics
     assert len(partitions) == 5
     partition_keys = {"size"}
