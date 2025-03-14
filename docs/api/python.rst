@@ -7,11 +7,13 @@ multi-modal data processing.
 Lance Dataset
 -------------
 
-The core of Lance is the ``LanceDataset`` class. User can open a dataset by using
+The core of Lance is the :py:class:`~lance.dataset.LanceDataset` class. User can open a dataset by using
 :py:meth:`lance.dataset`.
 
 .. autofunction:: lance.dataset
-    :noindex:
+   :noindex:
+.. autofunction:: lance.write_dataset
+   :noindex:
 
 Basic IOs
 ~~~~~~~~~
@@ -63,6 +65,6 @@ Indexing and Searching
     :noindex:
 
 API Reference
-~~~~~~~~~~~~~
+-------------
 
-More information can be found in the :doc:`API reference <./python/modules>`.
+More information can be found in the :doc:`API reference <py_modules>`.
