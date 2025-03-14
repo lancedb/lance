@@ -22,7 +22,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_physical_expr::EquivalenceProperties;
 use futures::stream::{FuturesOrdered, Stream, StreamExt, TryStreamExt};
-use futures::{Future, FutureExt};
+use futures::FutureExt;
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::error::{DataFusionResult, LanceOptionExt};
@@ -150,100 +150,97 @@ impl TakeStream {
         }
     }
 
-    fn map_batch(
+    async fn map_batch(
         self: Arc<Self>,
         batch: RecordBatch,
         batch_number: u32,
-    ) -> impl Future<Output = DataFusionResult<RecordBatch>> + Send {
-        async move {
-            let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
-            let row_addrs_arr = self.get_row_addrs(&batch).await?;
-            let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
+    ) -> DataFusionResult<RecordBatch> {
+        let compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
+        let row_addrs_arr = self.get_row_addrs(&batch).await?;
+        let row_addrs = row_addrs_arr.as_primitive::<UInt64Type>();
 
-            // Check if the row addresses are already sorted to avoid unnecessary reorders
-            let is_sorted = row_addrs.values().windows(2).all(|w| w[0] <= w[1]);
+        // Check if the row addresses are already sorted to avoid unnecessary reorders
+        let is_sorted = row_addrs.values().windows(2).all(|w| w[0] <= w[1]);
 
-            let sorted_addrs: Arc<dyn Array>;
-            let (sorted_addrs, permutation) = if is_sorted {
-                (row_addrs, None)
-            } else {
-                let permutation =
-                    arrow::compute::sort_to_indices(&row_addrs_arr, None, None).unwrap();
-                sorted_addrs = arrow::compute::take(
-                    &row_addrs_arr,
-                    &permutation,
-                    Some(TakeOptions {
-                        check_bounds: false,
-                    }),
-                )
-                .unwrap();
-                // Calculate the inverse permutation to restore the original order
-                let mut inverse_permutation = vec![0; permutation.len()];
-                for (i, p) in permutation.values().iter().enumerate() {
-                    inverse_permutation[*p as usize] = i as u32;
+        let sorted_addrs: Arc<dyn Array>;
+        let (sorted_addrs, permutation) = if is_sorted {
+            (row_addrs, None)
+        } else {
+            let permutation = arrow::compute::sort_to_indices(&row_addrs_arr, None, None).unwrap();
+            sorted_addrs = arrow::compute::take(
+                &row_addrs_arr,
+                &permutation,
+                Some(TakeOptions {
+                    check_bounds: false,
+                }),
+            )
+            .unwrap();
+            // Calculate the inverse permutation to restore the original order
+            let mut inverse_permutation = vec![0; permutation.len()];
+            for (i, p) in permutation.values().iter().enumerate() {
+                inverse_permutation[*p as usize] = i as u32;
+            }
+            (
+                sorted_addrs.as_primitive::<UInt64Type>(),
+                Some(UInt32Array::from(inverse_permutation)),
+            )
+        };
+
+        let mut futures = FuturesOrdered::new();
+        let mut current_offsets = Vec::new();
+        let mut current_fragment_id = None;
+
+        for row_addr in sorted_addrs.values() {
+            let addr = RowAddress::new_from_u64(*row_addr);
+
+            if Some(addr.fragment_id()) != current_fragment_id {
+                // Start a new group
+                if let Some(fragment_id) = current_fragment_id {
+                    let reader = self.open_reader(fragment_id).await?;
+                    let offsets = std::mem::take(&mut current_offsets);
+                    futures.push_back(
+                        async move { reader.take_as_batch(&offsets, Some(batch_number)).await }
+                            .boxed(),
+                    );
                 }
-                (
-                    sorted_addrs.as_primitive::<UInt64Type>(),
-                    Some(UInt32Array::from(inverse_permutation)),
-                )
-            };
-
-            let mut futures = FuturesOrdered::new();
-            let mut current_offsets = Vec::new();
-            let mut current_fragment_id = None;
-
-            for row_addr in sorted_addrs.values() {
-                let addr = RowAddress::new_from_u64(*row_addr);
-
-                if Some(addr.fragment_id()) != current_fragment_id {
-                    // Start a new group
-                    if let Some(fragment_id) = current_fragment_id {
-                        let reader = self.open_reader(fragment_id).await?;
-                        let offsets = std::mem::take(&mut current_offsets);
-                        futures.push_back(
-                            async move { reader.take_as_batch(&offsets, Some(batch_number)).await }
-                                .boxed(),
-                        );
-                    }
-                    current_fragment_id = Some(addr.fragment_id());
-                }
-
-                current_offsets.push(addr.row_offset());
+                current_fragment_id = Some(addr.fragment_id());
             }
 
-            // Handle the last group
-            if let Some(fragment_id) = current_fragment_id {
-                let reader = self.open_reader(fragment_id).await?;
-                futures.push_back(
-                    async move {
-                        reader
-                            .take_as_batch(&current_offsets, Some(batch_number))
-                            .await
-                    }
-                    .boxed(),
-                );
-            }
-
-            // Stop the compute timer, don't count I/O time
-            drop(compute_timer);
-
-            let batches = futures.try_collect::<Vec<_>>().await?;
-
-            let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
-            let schema = batches.first().expect_ok()?.schema();
-            let mut new_data = concat_batches(&schema, batches.iter())?;
-
-            // Restore previous order (if addresses were out of order originally)
-            if let Some(permutation) = permutation {
-                new_data = arrow_select::take::take_record_batch(&new_data, &permutation).unwrap();
-            }
-
-            self.metrics
-                .baseline_metrics
-                .record_output(new_data.num_rows());
-            self.metrics.batches_processed.add(1);
-            Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
+            current_offsets.push(addr.row_offset());
         }
+
+        // Handle the last group
+        if let Some(fragment_id) = current_fragment_id {
+            let reader = self.open_reader(fragment_id).await?;
+            futures.push_back(
+                async move {
+                    reader
+                        .take_as_batch(&current_offsets, Some(batch_number))
+                        .await
+                }
+                .boxed(),
+            );
+        }
+
+        // Stop the compute timer, don't count I/O time
+        drop(compute_timer);
+
+        let batches = futures.try_collect::<Vec<_>>().await?;
+
+        let _compute_timer = self.metrics.baseline_metrics.elapsed_compute().timer();
+        let schema = batches.first().expect_ok()?.schema();
+        let mut new_data = concat_batches(&schema, batches.iter())?;
+
+        // Restore previous order (if addresses were out of order originally)
+        if let Some(permutation) = permutation {
+            new_data = arrow_select::take::take_record_batch(&new_data, &permutation).unwrap();
+        }
+
+        self.metrics
+            .baseline_metrics
+            .record_output(new_data.num_rows());
+        self.metrics.batches_processed.add(1);
+        Ok(batch.merge_with_schema(&new_data, self.output_schema.as_ref())?)
     }
 
     fn apply<S: Stream<Item = Result<RecordBatch>> + Send + 'static>(
@@ -628,16 +625,15 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TakeInput {
-        RowIds,
-        RowAddrs,
-        RowIdsAndAddrs,
+        Ids,
+        Addrs,
+        IdsAndAddrs,
     }
 
     #[rstest]
     #[tokio::test]
     async fn test_simple_take(
-        #[values(TakeInput::RowIds, TakeInput::RowAddrs, TakeInput::RowIdsAndAddrs)]
-        take_input: TakeInput,
+        #[values(TakeInput::Ids, TakeInput::Addrs, TakeInput::IdsAndAddrs)] take_input: TakeInput,
     ) {
         let TestFixture {
             dataset,
@@ -646,8 +642,8 @@ mod tests {
 
         let scan_schema = Arc::new(dataset.schema().project(&["i"]).unwrap());
         let config = LanceScanConfig {
-            with_row_address: take_input != TakeInput::RowIds,
-            with_row_id: take_input != TakeInput::RowAddrs,
+            with_row_address: take_input != TakeInput::Ids,
+            with_row_id: take_input != TakeInput::Addrs,
             ..Default::default()
         };
         let input = Arc::new(LanceScanExec::new(
@@ -668,10 +664,10 @@ mod tests {
         let schema = take_exec.schema();
 
         let mut expected_fields = vec!["i"];
-        if take_input != TakeInput::RowAddrs {
+        if take_input != TakeInput::Addrs {
             expected_fields.push(ROW_ID);
         }
-        if take_input != TakeInput::RowIds {
+        if take_input != TakeInput::Ids {
             expected_fields.push(ROW_ADDR);
         }
         expected_fields.push("s");

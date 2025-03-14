@@ -369,7 +369,7 @@ mod v2_adapter {
             )?;
 
             let reader = if let Some(take_priority) = take_priority {
-                let op_priority = (take_priority as u64) << 32 | self.default_priority as u64;
+                let op_priority = ((take_priority as u64) << 32) | self.default_priority as u64;
                 let scheduler = self.file_scheduler.with_priority(op_priority);
                 Arc::new(
                     self.reader
