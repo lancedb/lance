@@ -203,7 +203,26 @@ impl<'a> InsertBuilder<'a> {
         context: &WriteContext<'_>,
     ) -> Result<Transaction> {
         let operation = match context.params.mode {
-            WriteMode::Create | WriteMode::Overwrite => Operation::Overwrite {
+            WriteMode::Create => Operation::Overwrite {
+                // Use the full schema, not the written schema
+                schema,
+                fragments: written_frags.default.0,
+                config_upsert_values: Some(
+                    [
+                        (
+                            String::from("lance.auto_cleanup.interval"),
+                            String::from("20"), // TODO: make configurable?
+                        ),
+                        (
+                            String::from("lance.auto_cleanup.older_than"),
+                            String::from("14"),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            },
+            WriteMode::Overwrite => Operation::Overwrite {
                 // Use the full schema, not the written schema
                 schema,
                 fragments: written_frags.default.0,
