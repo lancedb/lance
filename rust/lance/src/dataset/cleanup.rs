@@ -1011,11 +1011,6 @@ mod tests {
             fixture.overwrite_some_data().await.unwrap();
         }
 
-        // let _ = fixture
-        //     .run_cleanup(utc_now() - TimeDelta::try_days(8).unwrap())
-        //     .await
-        //     .unwrap();
-
         let after_auto_clean_count = fixture.count_files().await.unwrap();
 
         assert_eq!(after_auto_clean_count.num_data_files, 5);
