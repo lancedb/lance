@@ -70,8 +70,7 @@ use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
 };
-use lazy_static::lazy_static;
-use log::{info, warn};
+use log::info;
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
@@ -93,13 +92,6 @@ use crate::{
     index::{pb, prefilter::PreFilter, vector::ivf::io::write_pq_partitions, INDEX_FILE_NAME},
     session::Session,
 };
-
-lazy_static! {
-    static ref AVG_LOSS_RETRAIN_THRESHOLD: f64 = std::env::var("LANCE_AVG_LOSS_RETRAIN_THRESHOLD")
-        .unwrap_or("1.1".to_string())
-        .parse()
-        .expect("LANCE_AVG_LOSS_RETRAIN_THRESHOLD must be a float number");
-}
 
 pub mod builder;
 pub mod io;
@@ -366,32 +358,11 @@ pub(crate) async fn optimize_vector_indices_v2(
     let num_partitions = ivf_model.num_partitions();
     let index_type = existing_indices[0].sub_index_type();
 
-    let original_avg_loss = ivf_model
-        .loss()
-        .map(|loss| loss / existing_indices[0].num_rows() as f64);
-    let total_loss = existing_indices
-        .iter()
-        .map(|idx| idx.ivf_model().loss().unwrap_or_default())
-        .sum::<f64>();
-    let total_rows = existing_indices
-        .iter()
-        .map(|idx| idx.num_rows())
-        .sum::<u64>();
-    let avg_loss = total_loss / total_rows as f64;
-
-    let mut num_indices_to_merge = options.num_indices_to_merge;
-    let mut retrain = false;
-    if let Some(original_avg_loss) = original_avg_loss {
-        if avg_loss >= original_avg_loss * *AVG_LOSS_RETRAIN_THRESHOLD {
-            warn!(
-                "average loss {} of the indices is too high (> {} * {}), retrain the index",
-                avg_loss, original_avg_loss, *AVG_LOSS_RETRAIN_THRESHOLD
-            );
-            retrain = true;
-            num_indices_to_merge = existing_indices.len();
-        }
-    }
-
+    let num_indices_to_merge = if options.retrain {
+        existing_indices.len()
+    } else {
+        options.num_indices_to_merge
+    };
     let temp_dir = tempfile::tempdir()?;
     let temp_dir_path = Path::from_filesystem_path(temp_dir.path())?;
     let shuffler = Box::new(IvfShuffler::new(temp_dir_path, num_partitions));
@@ -419,7 +390,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(indices_to_merge)
-                .retrain(retrain)
+                .retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -436,7 +407,7 @@ pub(crate) async fn optimize_vector_indices_v2(
                 .with_ivf(ivf_model.clone())
                 .with_quantizer(quantizer.try_into()?)
                 .with_existing_indices(indices_to_merge)
-                .retrain(retrain)
+                .retrain(options.retrain)
                 .shuffle_data(unindexed)
                 .await?
                 .build()
@@ -456,7 +427,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(retrain)
+            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -478,7 +449,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(retrain)
+            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -500,7 +471,7 @@ pub(crate) async fn optimize_vector_indices_v2(
             .with_ivf(ivf_model.clone())
             .with_quantizer(quantizer.try_into()?)
             .with_existing_indices(indices_to_merge)
-            .retrain(retrain)
+            .retrain(options.retrain)
             .shuffle_data(unindexed)
             .await?
             .build()
@@ -764,6 +735,7 @@ pub struct IvfIndexStatistics {
     sub_index: serde_json::Value,
     partitions: Vec<IvfIndexPartitionStatistics>,
     centroids: Vec<Vec<f32>>,
+    loss: Option<f64>,
 }
 
 fn centroids_to_vectors(centroids: &FixedSizeListArray) -> Result<Vec<Vec<f32>>> {
@@ -863,6 +835,7 @@ impl Index for IVFIndex {
             sub_index: self.sub_index.statistics()?,
             partitions: partitions_statistics,
             centroids: centroid_vecs,
+            loss: self.ivf.loss(),
         })?)
     }
 

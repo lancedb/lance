@@ -398,6 +398,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             sub_index: serde_json::Value::Object(sub_index_stats),
             partitions: partitions_statistics,
             centroids: centroid_vecs,
+            loss: self.ivf.loss(),
         })?)
     }
 
@@ -641,7 +642,7 @@ mod tests {
 
     use crate::dataset::optimize::{compact_files, CompactionOptions};
     use crate::dataset::UpdateBuilder;
-    use crate::index::vector::ivf::AVG_LOSS_RETRAIN_THRESHOLD;
+    use crate::index::vector::ivf::IvfIndexStatistics;
     use crate::index::DatasetIndexInternalExt;
     use crate::{index::vector::VectorIndexParams, Dataset};
 
@@ -995,19 +996,29 @@ mod tests {
             ivf_models
         }
 
-        async fn get_avg_loss(dataset: &Dataset) -> f64 {
-            let ivf_models = get_ivf_models(dataset).await;
-            let mut loss = 0.0;
-            for ivf in ivf_models {
-                loss += ivf.loss.unwrap_or_default();
-            }
-            let num_rows = dataset.count_rows(None).await.unwrap();
-            loss / num_rows as f64
+        async fn get_losses(dataset: &Dataset) -> Vec<Option<f64>> {
+            let stats = dataset.index_statistics("vector_idx").await.unwrap();
+            let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+            stats["indices"]
+                .as_array()
+                .unwrap()
+                .into_iter()
+                .map(|s| s.get("loss").map(|l| l.as_f64()))
+                .flatten()
+                .collect()
         }
 
-        let original_ivf = get_ivf_models(&dataset).await;
+        async fn get_avg_loss(dataset: &Dataset) -> f64 {
+            let losses = get_losses(dataset).await;
+            let total_loss = losses.iter().filter_map(|l| *l).sum::<f64>();
+            let num_rows = dataset.count_rows(None).await.unwrap();
+            total_loss / num_rows as f64
+        }
+
+        const AVG_LOSS_RETRAIN_THRESHOLD: f64 = 1.1;
+        let original_ivfs = get_ivf_models(&dataset).await;
         let original_avg_loss = get_avg_loss(&dataset).await;
-        let original_ivf = &original_ivf[0];
+        let original_ivf = &original_ivfs[0];
         let mut count = 0;
         // append more rows and make delta index until hitting the retrain threshold
         loop {
@@ -1017,30 +1028,28 @@ mod tests {
             };
             append_dataset::<T>(&mut dataset, 500, range).await;
             dataset
-                .optimize_indices(&OptimizeOptions {
-                    num_indices_to_merge: 0,
-                    index_names: None,
-                })
+                .optimize_indices(&OptimizeOptions::append())
                 .await
                 .unwrap();
             count += 1;
 
             let new_avg_loss = get_avg_loss(&dataset).await;
-            if new_avg_loss / original_avg_loss >= *AVG_LOSS_RETRAIN_THRESHOLD {
+            if new_avg_loss / original_avg_loss >= AVG_LOSS_RETRAIN_THRESHOLD {
                 if count <= 1 {
                     // the first append is with the same data distribution, so the loss should be
                     // very close to the original loss, then it shouldn't hit the retrain threshold
                     panic!(
                         "retrain threshold {} should not be hit",
-                        *AVG_LOSS_RETRAIN_THRESHOLD
+                        AVG_LOSS_RETRAIN_THRESHOLD
                     );
                 }
+
                 break;
             }
             if count >= 10 {
                 panic!(
                     "failed to hit the retrain threshold {}",
-                    *AVG_LOSS_RETRAIN_THRESHOLD
+                    AVG_LOSS_RETRAIN_THRESHOLD
                 );
             }
 
@@ -1054,10 +1063,7 @@ mod tests {
 
         // this optimize would merge all indices and retrain the IVF
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                index_names: None,
-            })
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
         let stats = dataset.index_statistics("vector_idx").await.unwrap();
