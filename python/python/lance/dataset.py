@@ -3561,6 +3561,15 @@ class DatasetOptimizer:
         index_names: List[str], default None
             The names of the indices to optimize.
             If None, all indices will be optimized.
+        retrain: bool, default False
+            Whether to retrain the whole index.
+            If true, the index will be retrained based on the current data,
+            `num_indices_to_merge` will be ignored,
+            and all indices will be merged into one.
+
+            This is useful when the data distribution has changed significantly,
+            and we want to retrain the index to improve the search quality.
+            This would be faster than re-create the index from scratch.
         """
         self._dataset._ds.optimize_indices(**kwargs)
 

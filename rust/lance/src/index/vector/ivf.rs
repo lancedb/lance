@@ -70,7 +70,7 @@ use lance_linalg::{
     distance::Normalize,
     kernels::{normalize_arrow, normalize_fsl},
 };
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use rand::{rngs::SmallRng, SeedableRng};
 use roaring::RoaringBitmap;
@@ -268,6 +268,12 @@ pub(crate) async fn optimize_vector_indices(
             options,
         )
         .await;
+    }
+
+    if options.retrain {
+        warn!(
+            "optimizing vector index: retrain is only supported for v3 vector indices, falling back to normal optimization. please re-create the index with lance>=0.25.0 to enable retrain."
+        );
     }
 
     let new_uuid = Uuid::new_v4();
