@@ -326,7 +326,7 @@ struct Footer {
 const FOOTER_LEN: usize = 40;
 
 impl FileReader {
-    pub fn with_scheduler(&self, scheduler: Arc<dyn EncodingsIo>) -> FileReader {
+    pub fn with_scheduler(&self, scheduler: Arc<dyn EncodingsIo>) -> Self {
         Self {
             scheduler,
             base_projection: self.base_projection.clone(),

@@ -1031,7 +1031,7 @@ impl Scanner {
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
                 LanceExecutionOptions {
-                    batch_size: self.batch_size.clone(),
+                    batch_size: self.batch_size,
                     ..Default::default()
                 },
             )?))
@@ -2401,7 +2401,7 @@ impl Scanner {
         analyze_plan(
             plan,
             LanceExecutionOptions {
-                batch_size: self.batch_size.clone(),
+                batch_size: self.batch_size,
                 ..Default::default()
             },
         )

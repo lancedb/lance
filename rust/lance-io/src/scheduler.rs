@@ -759,8 +759,8 @@ impl FileScheduler {
         }
     }
 
-    pub fn with_priority(&self, priority: u64) -> FileScheduler {
-        FileScheduler {
+    pub fn with_priority(&self, priority: u64) -> Self {
+        Self {
             reader: self.reader.clone(),
             root: self.root.clone(),
             block_size: self.block_size,
