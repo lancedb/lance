@@ -32,4 +32,4 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 
     # Or via Ray.data.read_lance
     pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
-    assert pdf.equals(pd_df)  # Check if the DataFrame is equal
+    assert pd.DataFrame(data).equals(pd_df)
