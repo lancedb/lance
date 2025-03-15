@@ -150,7 +150,7 @@ ensuring that the ``read_version`` is set to the current dataset's version.
 Add New Columns
 ---------------
 
-`Lance Format excels at operations such as adding columns <./format>`_.
+`Lance Format excels at operations such as adding columns <./format.rst>`_.
 Thanks to its two-dimensional layout
 (`see this blog post <https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/>`_),
 adding new columns is highly efficient since it avoids copying the existing data files.
