@@ -154,11 +154,13 @@ Add New Columns
 Thanks to its two-dimensional layout
 (`see this blog post <https://blog.lancedb.com/designing-a-table-format-for-ml-workloads/>`_),
 adding new columns is highly efficient since it avoids copying the existing data files.
-Instead, the process involves simply create new data files and linking it to the existing dataset using metadata-only operations.
+Instead, the process involves simply create new data files and linking it to the existing dataset
+using metadata-only operations.
 
 .. testcode::
 
-    
+
+
 
 
 
