@@ -792,3 +792,32 @@ def test_drop_index(tmp_path):
     assert ds.to_table(filter="bitmap = 1").num_rows == 1
     assert ds.to_table(filter="fts = 'a'").num_rows == test_table_size
     assert ds.to_table(filter="contains(ngram, 'a')").num_rows == test_table_size
+
+
+def test_nested_scalar_index(tmp_path):
+    tbl = pa.table(
+        {
+            "outer": [
+                {"inner": "a", "text": "Frodo was a puppy"},
+                {"inner": "b", "text": "There were several kittens playing"},
+            ],
+            "value": [1, 2],
+        }
+    )
+    ds = lance.write_dataset(tbl, tmp_path)
+    ds.create_scalar_index("outer.inner", index_type="BTREE")
+    ds.create_scalar_index("outer.text", index_type="INVERTED")
+
+    assert ds.to_table(filter="outer.inner = 'a'").num_rows == 1
+    assert (
+        ds.to_table(
+            full_text_query={"columns": ["outer.text"], "query": "foo"}
+        ).num_rows
+        == 0
+    )
+    assert (
+        ds.to_table(
+            full_text_query={"columns": ["outer.text"], "query": "puppy"}
+        ).num_rows
+        == 1
+    )
