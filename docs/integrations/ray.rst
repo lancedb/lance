@@ -28,11 +28,11 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 
     # It can be read via lance directly
     tbl = lance.dataset("./alice_bob_and_charlie.lance").to_table()
-    print(tbl.to_pandas())
-    assert tbl == pa.Table.from_pylist(data), f"{tbl} != {data}".format(
+    print("Table is: {}".format(tbl))
+    .. assert tbl == pa.Table.from_pylist(data), f"{tbl} != {data}".format(
         tbl, data)
 
     # Or via Ray.data.read_lance
-    pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
-    assert tbl.to_pandas().equals(pd_df), f"{tbl.to_pandas()} != {pd_df}".format(
-        tbl.to_pandas(), pd_df)
+    .. pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
+    .. assert tbl.to_pandas().equals(pd_df), f"{tbl.to_pandas()} != {pd_df}".format(
+    ..     tbl.to_pandas(), pd_df)
