@@ -22,7 +22,7 @@ A distributed write operation can be performed by two phrases:
 .. image:: ./_static/distributed_append.png
 
 Write new data
-~~~~~~~~~~~~~~~
+---------------
 
 Writing or appending new data is straightforward with :py:func:`~lance.fragment.write_fragments`.
 
@@ -128,4 +128,21 @@ and collect all serialized metadata on a single worker to execute the final comm
      4  5  v
      5  6  w
 
+Append data
+------------
 
+Appending additional data follows a similar process. Use :py:class:`lance.LanceOperation.Append` to commit the new fragments,
+ensuring that the ``read_version`` is set to the current dataset's version.
+
+.. code-block:: python
+    :emphasize-lines: 2,4,5
+
+    ds = lance.dataset(data_uri)
+    read_version = ds.version
+
+    op = lance.LanceOperation.Append(schema, all_fragments)
+    lance.LanceDataset.commit(
+        data_uri,
+        op,
+        read_version=read_version,
+    )
