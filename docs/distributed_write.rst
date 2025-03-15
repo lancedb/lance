@@ -193,11 +193,10 @@ using metadata-only operations.
     assert dataset.to_table().combine_chunks() == pa.Table.from_pydict({
         "name": ["alice", "bob", "charlie", "craig", "dave", "eve"],
         "age": [25, 33, 44, 55, 66, 77],
-    }, schema=schema), f"{dataset.to_table().combine_chunks()}"
+    }, schema=schema)
 
 
     def name_len(names: RecordBatch) -> RecordBatch:
-        """A function to run on each RecordBatch"""
         return RecordBatch.from_arrays(
             [pc.utf8_length(names["name"])],
             ["name_len"],
