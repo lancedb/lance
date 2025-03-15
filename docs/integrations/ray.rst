@@ -28,6 +28,7 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 
     # It can be read via lance directly
     tbl = lance.dataset("./alice_bob_and_charlie.lance").to_table()
+    print(tbl.to_pandas())
     assert tbl == pa.Table.from_pylist(data), f"{tbl} != {data}".format(
         tbl, data)
 
