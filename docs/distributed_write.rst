@@ -157,10 +157,79 @@ adding new columns is highly efficient since it avoids copying the existing data
 Instead, the process involves simply create new data files and linking it to the existing dataset
 using metadata-only operations.
 
-.. testcode::
+.. testsetup:: add_columns
+
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    import lance
+
+    shutil.rmtree("./add_columns_example", ignore_errors=True)
+
+    schema = pa.schema([
+        ("name", pa.string()),
+        ("age", pa.int32()),
+    ])
+    tbl = pa.Table.from_pydict({
+        "name": ["alice", "bob", "charlie"],
+        "age": [25, 33, 44],
+    }, schema=schema)
+    dataset = lance.write_dataset(tbl, "./add_columns_example")
+
+    tbl = pa.Table.from_pydict({
+        "name": ["craig", "dave", "eve"],
+        "age": [55, 66, 77],
+    }, schema=schema)
+    dataset = dataset.insert(tbl)
+
+.. testcode:: add_columns
+
+    from pyarrow import RecordBatch
+    import pyarrow.compute as pc
+
+    from lance import LanceFragment, LanceOperation
+
+    dataset = lance.dataset("./add_columns_example")
+    assert len(dataset.get_fragments()) == 2
+    assert dataset.to_table().combine_chunks() == pa.Table.from_pydict({
+        "name": ["alice", "bob", "charlie", "craig", "dave", "eve"],
+        "age": [25, 33, 44, 55, 66, 77],
+    }, schema=schema), f"{dataset.to_table().combine_chunks()}"
 
 
+    def name_len(names: RecordBatch) -> RecordBatch:
+        """A function to run on each RecordBatch"""
+        return RecordBatch.from_arrays(
+            [pc.utf8_length(names["name"])],
+            ["name_len"],
+        )
 
+    # On Worker 1
+    frag1 = dataset.get_fragments()[0]
+    new_fragment1, new_schema = frag1.merge_columns(name_len, ["name"])
 
+    # On Worker 2
+    frag2 = dataset.get_fragments()[1]
+    new_fragment2, _ = frag2.merge_columns(name_len, ["name"])
 
+    # On Worker 3 - Commit
+    all_fragments = [new_fragment1, new_fragment2]
+    op = lance.LanceOperation.Merge(all_fragments, schema=new_schema)
+    lance.LanceDataset.commit(
+        "./add_columns_example",
+        op,
+        read_version=dataset.version,
+    )
 
+    # Verify dataset
+    dataset = lance.dataset("./add_columns_example")
+    print(dataset.to_table().to_pandas())
+
+.. testoutput:: add_columns
+
+          name  age  name_len
+    0    alice   25         5
+    1      bob   33         3
+    2  charlie   44         7
+    3    craig   55         5
+    4     dave   66         4
+    5      eve   77         3
