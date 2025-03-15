@@ -21,7 +21,6 @@ use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion::physical_plan::empty::EmptyExec;
-use datafusion_physical_expr::{expressions, PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
@@ -38,6 +37,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_expr::{Operator, ScalarUDF};
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+use datafusion_physical_expr::{expressions, PhysicalExpr, ScalarFunctionExpr};
 use datafusion_physical_expr::{LexOrdering, Partitioning};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
@@ -1522,7 +1522,11 @@ impl Scanner {
                     let schema = plan.schema();
                     let mut expr = expressions::col(split[0], &schema)?;
                     for part in split[1..].iter() {
-                        expr = Arc::new(ScalarFunctionExpr::try_new(Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())), vec![expr, expressions::lit(part.to_string())], &schema)?);
+                        expr = Arc::new(ScalarFunctionExpr::try_new(
+                            Arc::new(ScalarUDF::new_from_impl(GetFieldFunc::default())),
+                            vec![expr, expressions::lit(part.to_string())],
+                            &schema,
+                        )?);
                     }
                     Ok(PhysicalSortExpr {
                         expr,

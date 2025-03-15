@@ -491,9 +491,7 @@ impl DatasetIndexExt for Dataset {
             .await?
             .iter()
             .filter(|idx| idx.fields.len() == 1)
-            .find(|idx| {
-                idx.fields[0] == field.id
-            })
+            .find(|idx| idx.fields[0] == field.id)
             .cloned())
     }
 
