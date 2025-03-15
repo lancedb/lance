@@ -9,20 +9,20 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 * Lance Data Source :py:meth:`ray.data.read_lance`
 * Lance Data Sink :py:meth:`ray.data.Dataste.write_lance`
 
-.. testsetup::
+.. testsetup:: ray
 
     shutil.rmtree("./alice_bob_and_charlie.lance", ignore_errors=True)
 
-.. testcode::
+.. testcode:: ray
 
     import ray
 
     ray.init()
 
     data = [
-        {"id": 1, "name": "alice"},
-        {"id": 2, "name": "bob"},
-        {"id": 3, "name": "charlie"}
+        {"age": 25, "name": "alice"},
+        {"age": 33, "name": "bob"},
+        {"age": 44, "name": "charlie"}
     ]
     ray.data.from_items(data).write_lance("./alice_bob_and_charlie.lance")
 
