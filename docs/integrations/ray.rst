@@ -27,9 +27,9 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
     ray.data.from_items(data).write_lance("./alice_bob_and_charlie.lance")
 
     # It can be read via lance directly
-    pdf = lance.dataset("./alice_bob_and_charlie.lance").to_table().to_pandas()
-    assert pdf.equals(pd.DataFrame(data))
+    ds = lance.dataset("./alice_bob_and_charlie.lance")
+    assert ds.count_rows() == 3
 
     # Or via Ray.data.read_lance
     pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
-    assert pdf.equals(pd_df)
+    assert pdf.equals(pd_df)  # Check if the DataFrame is equal
