@@ -292,7 +292,7 @@ impl ReaderProjection {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FileReaderOptions {
     validate_on_decode: bool,
 }
@@ -326,6 +326,18 @@ struct Footer {
 const FOOTER_LEN: usize = 40;
 
 impl FileReader {
+    pub fn with_scheduler(&self, scheduler: Arc<dyn EncodingsIo>) -> Self {
+        Self {
+            scheduler,
+            base_projection: self.base_projection.clone(),
+            cache: self.cache.clone(),
+            decoder_plugins: self.decoder_plugins.clone(),
+            metadata: self.metadata.clone(),
+            options: self.options.clone(),
+            num_rows: self.num_rows,
+        }
+    }
+
     pub fn num_rows(&self) -> u64 {
         self.num_rows
     }

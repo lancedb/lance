@@ -2088,7 +2088,7 @@ mod tests {
         for fragment in &fragments {
             assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
             let reader = fragment
-                .open(dataset.schema(), FragReadConfig::default(), None)
+                .open(dataset.schema(), FragReadConfig::default())
                 .await
                 .unwrap();
             // No group / batch concept in v2
