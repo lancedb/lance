@@ -13,6 +13,7 @@ use arrow_array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow_schema::SchemaRef;
 use deepsize::DeepSizeOf;
 use futures::prelude::stream::TryStreamExt;
+use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, Result};
 use lance_encoding::decoder::FilterExpression;
@@ -31,6 +32,7 @@ use crate::{
     },
 };
 
+use super::graph::OrderedNode;
 use super::quantizer::{QuantizationType, Quantizer};
 use super::transform::Transformer;
 use super::DISTANCE_TYPE_KEY;
@@ -43,6 +45,15 @@ use super::DISTANCE_TYPE_KEY;
 pub trait DistCalculator {
     fn distance(&self, id: u32) -> f32;
     fn distance_all(&self) -> Vec<f32>;
+    fn topk(&self, k: usize) -> Vec<OrderedNode> {
+        self.distance_all()
+            .into_iter()
+            .enumerate()
+            .map(|(id, dist)| OrderedNode::new(id as u32, dist.into()))
+            .sorted_unstable()
+            .take(k)
+            .collect()
+    }
     fn prefetch(&self, _id: u32) {}
 }
 

@@ -32,8 +32,11 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 
-use super::distance::{build_distance_table_dot, build_distance_table_l2, compute_pq_distance};
+use super::distance::{
+    build_distance_table_dot, build_distance_table_l2, compute_pq_distance, topk_pq_distance,
+};
 use super::ProductQuantizer;
+use crate::vector::graph::OrderedNode;
 use crate::vector::storage::STORAGE_METADATA_KEY;
 use crate::{
     pb,
@@ -712,6 +715,16 @@ impl DistCalculator for PQDistCalculator {
             ),
             _ => unimplemented!("distance type is not supported: {:?}", self.distance_type),
         }
+    }
+
+    fn topk(&self, k: usize) -> Vec<OrderedNode> {
+        topk_pq_distance(
+            &self.distance_table,
+            self.num_bits,
+            self.num_sub_vectors,
+            self.pq_code.values(),
+            k,
+        )
     }
 }
 
