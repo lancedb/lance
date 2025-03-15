@@ -33,4 +33,4 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
     # Or via Ray.data.read_lance
     pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
     assert tbl.to_pandas().equals(pd_df), f"{tbl.to_pandas()} != {pd_df}".format(
-        tbl.to_pandas(), pd_df   )
+        tbl.to_pandas(), pd_df)
