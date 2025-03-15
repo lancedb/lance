@@ -517,7 +517,7 @@ pub async fn open_writer(
     schema: &Schema,
     base_dir: &Path,
     storage_version: LanceFileVersion,
-    params: Option<&WriteParams>,
+    params: Option<WriteParams>,
 ) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", Uuid::new_v4());
 
@@ -588,7 +588,7 @@ impl WriterGenerator {
             &self.schema,
             &self.base_dir,
             self.storage_version,
-            Some(&self.params),
+            Some(self.params.clone()),
         )
         .await?;
 
