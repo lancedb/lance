@@ -65,6 +65,7 @@ ray = ["ray[data]<2.38; python_version<'3.12'"]
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
+lint.isort.order-by-type = true
 
 [tool.ruff.lint.per-file-ignores]
 "*.pyi" = ["E301", "E302"]
