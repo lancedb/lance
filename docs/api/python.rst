@@ -63,8 +63,6 @@ Indexing and Searching
     :noindex:
 
 API Reference
-~~~~~~~~~~~~~
+-------------
 
-More information can be found in the :doc:`API reference <python/modules>`.
-
-.. _Lance Python API documentation: ./python/modules
+More information can be found in the :doc:`API reference <./py_modules>`.

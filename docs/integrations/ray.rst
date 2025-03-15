@@ -9,27 +9,27 @@ Lance format is one of the official `Ray data sources <https://docs.ray.io/en/la
 * Lance Data Source :py:meth:`ray.data.read_lance`
 * Lance Data Sink :py:meth:`ray.data.Dataste.write_lance`
 
-.. testsetup::
+.. testsetup:: ray
 
     shutil.rmtree("./alice_bob_and_charlie.lance", ignore_errors=True)
 
-.. testcode::
+.. testcode:: ray
 
     import ray
 
     ray.init()
 
     data = [
-        {"id": 1, "name": "alice"},
-        {"id": 2, "name": "bob"},
-        {"id": 3, "name": "charlie"}
+        {"age": 25, "name": "alice"},
+        {"age": 33, "name": "bob"},
+        {"age": 44, "name": "charlie"}
     ]
     ray.data.from_items(data).write_lance("./alice_bob_and_charlie.lance")
 
     # It can be read via lance directly
     tbl = lance.dataset("./alice_bob_and_charlie.lance").to_table()
-    assert tbl == pa.Table.from_pylist(data)
+    assert tbl == pa.Table.from_pylist(data), f"{tbl} != {data}"
 
     # Or via Ray.data.read_lance
     pd_df = ray.data.read_lance("./alice_bob_and_charlie.lance").to_pandas()
-    assert tbl == pa.Table.from_pandas(pd_df)
+    assert tbl.to_pandas().equals(pd_df), f"{tbl.to_pandas()} != {pd_df}"
