@@ -293,6 +293,12 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         Ok(Box::pin(stream))
     }
 
+    fn num_rows(&self) -> u64 {
+        self.hnsw
+            .as_ref()
+            .map_or(0, |hnsw| hnsw.num_nodes(0) as u64)
+    }
+
     fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
         Box::new(self.storage.as_ref().unwrap().row_ids())
     }
@@ -304,7 +310,7 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
         })
     }
 
-    fn ivf_model(&self) -> IvfModel {
+    fn ivf_model(&self) -> &IvfModel {
         unimplemented!("only for IVF")
     }
 

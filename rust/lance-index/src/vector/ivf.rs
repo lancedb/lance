@@ -254,7 +254,10 @@ impl IvfTransformer {
 
     #[inline]
     pub fn compute_partitions(&self, data: &FixedSizeListArray) -> Result<UInt32Array> {
-        Ok(compute_partitions_arrow_array(&self.centroids, data, self.distance_type)?.into())
+        Ok(
+            compute_partitions_arrow_array(&self.centroids, data, self.distance_type)
+                .map(|(part_ids, _)| part_ids.into())?,
+        )
     }
 
     pub fn find_partitions(&self, query: &dyn Array, nprobes: usize) -> Result<UInt32Array> {

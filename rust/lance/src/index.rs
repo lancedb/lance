@@ -1359,10 +1359,7 @@ mod tests {
         assert_eq!(get_bitmap(&meta[0]), vec![0]);
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,   // Just create index for delta
-                index_names: Some(vec![]), // Optimize nothing
-            })
+            .optimize_indices(&OptimizeOptions::append().index_names(vec![])) // Does nothing because no index name is passed
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
@@ -1377,10 +1374,9 @@ mod tests {
 
         // optimize the other index
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0, // Just create index for delta
-                index_names: Some(vec!["other_vec_idx".to_string()]),
-            })
+            .optimize_indices(
+                &OptimizeOptions::append().index_names(vec!["other_vec_idx".to_owned()]),
+            )
             .await
             .unwrap();
         let stats = get_stats(&dataset, "vec_idx").await;
@@ -1586,10 +1582,7 @@ mod tests {
         assert_indexed_rows(&dataset, num_rows).await;
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                index_names: None,
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -1680,10 +1673,7 @@ mod tests {
         }
 
         dataset
-            .optimize_indices(&OptimizeOptions {
-                num_indices_to_merge: 0,
-                index_names: None,
-            })
+            .optimize_indices(&OptimizeOptions::append())
             .await
             .unwrap();
         let num_rows = dataset.count_all_rows().await.unwrap();

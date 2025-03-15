@@ -247,6 +247,10 @@ impl IvfQuantizationStorage {
         })
     }
 
+    pub fn num_rows(&self) -> u64 {
+        self.reader.num_rows()
+    }
+
     pub fn quantizer<Q: Quantization>(&self) -> Result<Quantizer> {
         let metadata = self.metadata::<Q>()?;
         Q::from_metadata(&metadata, self.distance_type)

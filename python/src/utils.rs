@@ -137,13 +137,15 @@ impl KMeans {
         };
         let values = fixed_size_arr.values().as_primitive();
         let centroids = kmeans.centroids.as_primitive();
-        let cluster_ids =
-            UInt32Array::from(compute_partitions::<
-                Float32Type,
-                KMeansAlgoFloat<Float32Type>,
-            >(
-                centroids, values, kmeans.dimension, kmeans.distance_type
-            ));
+        let cluster_ids = UInt32Array::from(
+            compute_partitions::<Float32Type, KMeansAlgoFloat<Float32Type>>(
+                centroids,
+                values,
+                kmeans.dimension,
+                kmeans.distance_type,
+            )
+            .0,
+        );
         cluster_ids.into_data().to_pyarrow(py)
     }
 
