@@ -479,18 +479,20 @@ impl DatasetIndexExt for Dataset {
     }
 
     async fn load_scalar_index_for_column(&self, col: &str) -> Result<Option<IndexMetadata>> {
+        let field = self.schema().field(col);
+        let Some(field) = field else {
+            return Err(Error::Index {
+                message: format!("Column {} does not exist", col),
+                location: location!(),
+            });
+        };
         Ok(self
             .load_indices()
             .await?
             .iter()
             .filter(|idx| idx.fields.len() == 1)
             .find(|idx| {
-                let field = self.schema().field_by_id(idx.fields[0]);
-                if let Some(field) = field {
-                    field.name == col
-                } else {
-                    false
-                }
+                idx.fields[0] == field.id
             })
             .cloned())
     }
